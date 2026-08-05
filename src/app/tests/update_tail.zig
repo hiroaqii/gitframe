@@ -9,6 +9,8 @@ const app_test_support = @import("../test_support.zig");
 const app_load = @import("../load.zig");
 const app_input = @import("../input.zig");
 const app_message = @import("../message.zig");
+const app_state = @import("../state.zig");
+const action_lifecycle = @import("../workflow/action_lifecycle.zig");
 const app_review_projection = @import("../review_projection.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const page = @import("../page.zig");
@@ -19,6 +21,7 @@ const repository_page = @import("../pages/repository.zig");
 const repository_selection = @import("../pages/repository/selection.zig");
 const review_page = @import("../pages/review.zig");
 const review_navigation = @import("../pages/review/navigation.zig");
+const review_reload = @import("../pages/review/reload.zig");
 const review_authority = @import("../diff_surface/authority.zig");
 const context = @import("../../context.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
@@ -40,7 +43,7 @@ const review_session = @import("../../review/session.zig");
 const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
 
 const App = app_mod.App;
-const app_testing = app_mod.testing;
+const OverlayKind = app_state.OverlayKind;
 const LoadedDiff = @import("../../loaded_diff.zig").LoadedDiff;
 const loaded_diff = @import("../../loaded_diff.zig");
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
@@ -75,6 +78,124 @@ const cached_projection_b_diff =
     \\+new b
     \\
 ;
+
+fn beginAcceptedTestAction(app: *App, kind: @import("../actions.zig").ActionKind) @import("../actions.zig").PendingAction {
+    const pending: @import("../actions.zig").PendingAction = .{ .generation = 1, .kind = kind };
+    action_lifecycle.testing.installAccepted(&app.action_runtime, pending);
+    return pending;
+}
+test "user actions clear previous ephemeral status" {
+    var app: App = .{};
+    app.status.set("staged: {s}", .{"src/app.zig"});
+
+    try app.update(.{ .review = .toggle_focus }, undefined);
+
+    try std.testing.expectEqualStrings("", app.status.text());
+}
+
+test "system events keep previous ephemeral status" {
+    var app: App = .{};
+    app.status.set("staged: {s}", .{"src/app.zig"});
+
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 40 } }, undefined);
+
+    try std.testing.expectEqualStrings("staged: src/app.zig", app.status.text());
+}
+
+test "git action spinner ticks keep previous ephemeral status" {
+    var app: App = .{};
+    app.status.set("pushing: {s}", .{"main -> origin/main"});
+    _ = beginAcceptedTestAction(&app, .push);
+    action_lifecycle.testing.setSpinner(&app.action_runtime, 0, true);
+
+    try app.update(.git_action_spinner_tick, undefined);
+
+    try std.testing.expectEqualStrings("pushing: main -> origin/main", app.status.text());
+    try std.testing.expectEqual(@as(u8, 1), action_lifecycle.testing.spinnerTick(&app.action_runtime));
+}
+
+test "git action spinner starts when pending action is visible after update" {
+    var app: App = .{};
+    _ = beginAcceptedTestAction(&app, .push);
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 40 } }, &tc.ctx);
+
+    try std.testing.expect(action_lifecycle.testing.spinnerTimerRunning(&app.action_runtime));
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
+}
+
+test "git action spinner self-cancels stale ticks without redraw" {
+    var app: App = .{};
+    action_lifecycle.testing.setSpinner(&app.action_runtime, 0, true);
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    try app.update(.git_action_spinner_tick, &tc.ctx);
+
+    try std.testing.expect(!action_lifecycle.testing.spinnerTimerRunning(&app.action_runtime));
+    try std.testing.expectEqual(@as(u8, 0), action_lifecycle.testing.spinnerTick(&app.action_runtime));
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
+    try std.testing.expect(tc.redrawSuppressed());
+}
+
+test "grouped result messages keep previous ephemeral status" {
+    try std.testing.expect(app_message.keepsEphemeralStatus(.{ .load_finished = undefined }));
+    try std.testing.expect(app_message.keepsEphemeralStatus(.{ .action_finished = undefined }));
+    try std.testing.expect(app_message.keepsEphemeralStatus(.git_action_spinner_tick));
+}
+
+test "modal transitions clear previous ephemeral status" {
+    var app: App = .{};
+    app.status.set("staged: {s}", .{"src/app.zig"});
+
+    try app.update(.open_help, undefined);
+
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqual(OverlayKind.help, app.overlay.kind);
+}
+
+test "repo switch clears pending reload anchor" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "repo", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "repo", allocator);
+    defer allocator.free(root);
+    var app: App = .{
+        .pages = .{ .review = .{
+            .pending_reload = .{
+                .generation = 9,
+                .kind = .manual,
+                .anchor = .{
+                    .path_key = try std.testing.allocator.dupe(u8, "a"),
+                    .sidebar_identity = .{ .file = try std.testing.allocator.dupe(u8, "a") },
+                    .selected_target_tag = .diff_file,
+                    .visible_sidebar_row = 0,
+                    .diff_cursor = .{ .metadata = 0 },
+                    .diff_cursor_offset = 0,
+                    .diff_scroll = 0,
+                    .diff_horizontal_scroll = 0,
+                    .sidebar_horizontal_scroll = 0,
+                    .search_coordinate = null,
+                },
+            },
+        } },
+    };
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.deinit(allocator);
+
+    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try commitDiscovery(
+        &app,
+        allocator,
+        try testSingleRepoDiscovery(allocator, root),
+        0,
+        .external_selection,
+    ));
+
+    try std.testing.expect(app.pages.review.pending_reload == null);
+}
 
 fn activateReview(app: *App) u64 {
     const source_member: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
@@ -124,6 +245,44 @@ fn reviewNavigation(app: *App) review_navigation.Controller {
         .layout = .{ .width = body.width, .height = body.height },
         .diagnostics = .{ .target = &app.pages.review.status },
     };
+}
+
+fn reviewReload(app: *App) review_reload.Controller {
+    const repo = app.repo_session.view();
+    return .{
+        .page = &app.pages.review,
+        .navigation = reviewNavigation(app),
+        .source = app.config.source,
+        .repo_root = repo.activeRoot(),
+        .repo_epoch = repo.epoch(),
+        .root_identity = repo.activeIdentity(),
+    };
+}
+
+fn repoSession(app: *App) repo_session.Controller {
+    return .{
+        .state = &app.repo_session,
+        .status = &app.status,
+        .active_page = app.active_page,
+        .source = app.config.source,
+        .home = null,
+        .action_pending = app.action_runtime.view().hasPending(),
+        .review = .{ .page = &app.pages.review, .navigation = reviewNavigation(app), .reload = reviewReload(app) },
+        .repository = .{ .page = &app.pages.repository },
+        .compare = .{ .page = &app.pages.compare },
+        .shell = app.remote_workflow.repositoryInvalidationPort(&app.overlay),
+    };
+}
+
+fn commitDiscovery(
+    app: *App,
+    allocator: std.mem.Allocator,
+    result: repo_discovery.DiscoveryResult,
+    active_index: usize,
+    origin: repo_session.CommitOrigin,
+) !repo_session.CommitOutcome {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    return repoSession(app).commitDiscovered(&ctx, result, active_index, origin);
 }
 
 test "Compare completion defers as one bundle during drag and applies afterward" {
@@ -180,7 +339,7 @@ test "repository commitment resets Compare and refreshes the new physical root" 
     defer app.pages.compare.deinit(allocator);
     defer app.repo_session.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
-    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    _ = app.pages.compare.activate(0);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
@@ -194,54 +353,24 @@ test "repository commitment resets Compare and refreshes the new physical root" 
     ) } } }, &ctx);
     try std.testing.expect(app.pages.compare.basis != null);
 
-    const outcome = try app_testing.commitDiscovery(
-        &app,
-        allocator,
-        try testSingleRepoDiscovery(allocator, roots.b),
-        0,
-        .external_selection,
-    );
-    try std.testing.expectEqual(repo_session.CommitOutcome.changed, outcome);
-    try std.testing.expect(app.pages.compare.basis == null);
-    try std.testing.expect(app.pages.compare.base_target == null);
-    try std.testing.expect(app.pages.compare.activation.state == .inactive);
-    try app_testing.applyRepoSessionCommit(&app, &ctx, outcome);
+    const review_activation = app.pages.review.activation.activate(0, .pending, .unavailable, .unavailable);
+    const discovery_generation = app.pages.review.load.beginRepoDiscovery();
+    app.pages.review.load.state = .loading;
+    try app.update(.{ .load_finished = .{ .coordinator = .{ .repo_discovery = .{
+        .identity = page.RequestIdentity.review(0, review_activation),
+        .generation = discovery_generation,
+        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.b) },
+    } } } }, &ctx);
 
+    try std.testing.expectEqual(@as(u64, 1), app.repo_session.view().epoch());
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
     try std.testing.expect(app.pages.compare.basis == null);
     try std.testing.expect(app.pages.compare.base_target == null);
     try std.testing.expect(app.pages.compare.activation.state == .active);
+    try std.testing.expectEqual(@as(u64, 1), app.pages.compare.activation.state.active.repo_epoch);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
     const task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     try std.testing.expect(task.root.identity.eql(app.repo_session.view().activeIdentity().?));
-
-    var async_app: App = .{
-        .allocator = allocator,
-        .active_page = .compare,
-        .repo_session = .{
-            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
-        },
-    };
-    defer async_app.pages.compare.deinit(allocator);
-    defer async_app.repo_session.deinit(allocator);
-    async_app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
-    _ = async_app.pages.compare.activate(0);
-    const review_activation = async_app.pages.review.activation.activate(0, .pending, .unavailable, .unavailable);
-    const discovery_generation = async_app.pages.review.load.beginRepoDiscovery();
-    async_app.pages.review.load.state = .loading;
-    var async_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&async_ctx, allocator);
-
-    try async_app.update(.{ .load_finished = .{ .coordinator = .{ .repo_discovery = .{
-        .identity = page.RequestIdentity.review(0, review_activation),
-        .generation = discovery_generation,
-        .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.b) },
-    } } } }, &async_ctx);
-
-    try std.testing.expectEqual(@as(u64, 1), async_app.repo_session.view().epoch());
-    try std.testing.expect(async_app.pages.compare.activation.state == .active);
-    try std.testing.expectEqual(@as(u64, 1), async_app.pages.compare.activation.state.active.repo_epoch);
-    try std.testing.expectEqual(@as(u8, 1), async_ctx._pending_tasks_with_len);
 }
 
 test "repository activation and manual reload route to page-owned manifest tasks" {
@@ -295,7 +424,7 @@ test "review repository transition active repository replacement rejects old own
     };
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.deinit(allocator);
-    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try app_testing.commitDiscovery(
+    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try commitDiscovery(
         &app,
         allocator,
         try testSingleRepoDiscovery(allocator, roots.a),
@@ -330,7 +459,7 @@ test "review repository transition active repository replacement rejects old own
     try std.testing.expect(old_root_identity.eql(root_a_identity));
     try std.testing.expectEqualStrings(roots.a, old_task.request.root_path);
 
-    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try app_testing.commitDiscovery(
+    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try commitDiscovery(
         &app,
         allocator,
         try testSingleRepoDiscovery(allocator, roots.b),

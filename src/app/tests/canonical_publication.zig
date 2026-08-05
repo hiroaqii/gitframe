@@ -16,6 +16,7 @@ const app_test_support = @import("../test_support.zig");
 const page = @import("../page.zig");
 const repo_session = @import("../repo_session.zig");
 const review_page = @import("../pages/review.zig");
+const review_action_fence = @import("../pages/review/action_fence.zig");
 const review_navigation = @import("../pages/review/navigation.zig");
 const review_authority = @import("../diff_surface/authority.zig");
 const review_operations = @import("../pages/review/operations.zig");
@@ -36,9 +37,9 @@ const git_ops = @import("../git_ops.zig");
 const loaded_diff = @import("../../loaded_diff.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
+const action_lifecycle = @import("../workflow/action_lifecycle.zig");
 
 const App = app_mod.App;
-const app_testing = app_mod.testing;
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
 const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(app_message.Msg);
@@ -87,22 +88,7 @@ fn activateReview(app: *App) u64 {
     );
 }
 
-fn mutableApp(handle: anytype) *App {
-    const Handle = @TypeOf(handle);
-    if (Handle == *App) return handle;
-    if (Handle == **App or Handle == *const *App) return handle.*;
-    @compileError("expected mutable App handle");
-}
-
-fn constApp(handle: anytype) *const App {
-    const Handle = @TypeOf(handle);
-    if (Handle == *App or Handle == *const App) return handle;
-    if (Handle == **App or Handle == *const *App or Handle == *const *const App) return handle.*;
-    @compileError("expected App handle");
-}
-
-fn reviewNavigation(handle: anytype) review_navigation.Controller {
-    const app = mutableApp(handle);
+fn reviewNavigation(app: *App) review_navigation.Controller {
     const body = app_shell_layout.compute(
         app.terminal_size,
         .{ .page_bar_visible = true },
@@ -118,8 +104,7 @@ fn reviewNavigation(handle: anytype) review_navigation.Controller {
     };
 }
 
-fn reviewNavigationView(handle: anytype) review_navigation.View {
-    const app = constApp(handle);
+fn reviewNavigationView(app: *const App) review_navigation.View {
     const body = app_shell_layout.compute(
         app.terminal_size,
         .{ .page_bar_visible = true },
@@ -134,8 +119,7 @@ fn reviewNavigationView(handle: anytype) review_navigation.View {
     };
 }
 
-fn reviewOperations(handle: anytype) review_operations.View {
-    const app = constApp(handle);
+fn reviewOperations(app: *const App) review_operations.View {
     return .{
         .page = &app.pages.review,
         .navigation = reviewNavigationView(app),
@@ -145,8 +129,7 @@ fn reviewOperations(handle: anytype) review_operations.View {
     };
 }
 
-fn reviewReload(handle: anytype) review_reload.Controller {
-    const app = mutableApp(handle);
+fn reviewReload(app: *App) review_reload.Controller {
     return .{
         .page = &app.pages.review,
         .navigation = reviewNavigation(app),
@@ -157,9 +140,51 @@ fn reviewReload(handle: anytype) review_reload.Controller {
     };
 }
 
+fn repoSession(app: *App) repo_session.Controller {
+    return .{
+        .state = &app.repo_session,
+        .status = &app.status,
+        .active_page = app.active_page,
+        .source = app.config.source,
+        .home = null,
+        .action_pending = app.action_runtime.view().hasPending(),
+        .review = .{ .page = &app.pages.review, .navigation = reviewNavigation(app), .reload = reviewReload(app) },
+        .repository = .{ .page = &app.pages.repository },
+        .compare = .{ .page = &app.pages.compare },
+        .shell = app.remote_workflow.repositoryInvalidationPort(&app.overlay),
+    };
+}
+
+fn commitDiscovery(
+    app: *App,
+    allocator: std.mem.Allocator,
+    result: repo_discovery.DiscoveryResult,
+    active_index: usize,
+    origin: repo_session.CommitOrigin,
+) !repo_session.CommitOutcome {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    return repoSession(app).commitDiscovered(&ctx, result, active_index, origin);
+}
+
 fn beginAcceptedTestAction(app: *App, kind: app_actions.ActionKind) app_actions.PendingAction {
     if (app.allocator == null) app.allocator = std.testing.allocator;
-    return app_testing.installAcceptedActionFixture(app, kind);
+    const prepared = actionLifecycle(app).prepare(kind);
+    return actionLifecycle(app).acceptSpawn(app.allocator.?, prepared).pending;
+}
+
+fn actionLifecycle(app: *App) action_lifecycle.Controller {
+    return .{ .runtime = &app.action_runtime, .fence = reviewActionFence(app) };
+}
+
+fn reviewActionFence(app: *App) review_action_fence.Controller {
+    return .{
+        .read_authority = &app.pages.review.repository_read_authority,
+        .activation = &app.pages.review.activation,
+        .action_cursor = &app.pages.review.action_cursor,
+        .auto_reload = &app.pages.review.auto_reload,
+        .review_projection = &app.pages.review.review_projection,
+        .deferred_projection_apply = &app.pages.review.deferred_projection_apply,
+    };
 }
 
 fn installTestActionCursor(
@@ -483,7 +508,7 @@ test "Review mutation read fence follows accepted action launch and exact termin
 
     const epoch_before_launch = app.pages.review.repository_read_authority.epoch;
     try app.update(.{ .review = .toggle_selected_file }, &ctx);
-    const pending = app_testing.actionView(&app).acceptedPending() orelse return error.ExpectedPendingAction;
+    const pending = app.action_runtime.view().acceptedPending() orelse return error.ExpectedPendingAction;
     const action_tasks = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), action_tasks.len);
 
@@ -501,7 +526,7 @@ test "Review mutation read fence follows accepted action launch and exact termin
         .path = try allocator.dupe(u8, "a"),
         .result = .{ .failed_static = "stale fixture" },
     } }), &ctx);
-    try std.testing.expect(app_testing.actionView(&app).isAccepted(pending));
+    try std.testing.expect(app.action_runtime.view().isAccepted(pending));
     try std.testing.expect(app.pages.review.repository_read_authority.ownsMutation(pending));
 
     const exact = action_tasks[0].failed(
@@ -511,7 +536,7 @@ test "Review mutation read fence follows accepted action launch and exact termin
     );
     try app.update(exact, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).isCurrent(pending));
+    try std.testing.expect(!app.action_runtime.view().isCurrent(pending));
     try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(app.pages.review.repository_read_authority.epoch.eql(epoch_before_launch.next()));
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
@@ -675,7 +700,7 @@ test "Review mutation read fence drains old production reads without publication
 
     try installPushCredentialPrompt(&app, allocator, roots.a);
     try app.update(.push_credential_submit, &task_ctx);
-    const pending = app_testing.actionView(&app).acceptedPending() orelse return error.ExpectedPendingAction;
+    const pending = app.action_runtime.view().acceptedPending() orelse return error.ExpectedPendingAction;
     const action_tasks = task_ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), action_tasks.len);
     var action_terminal = action_tasks[0].failed(
@@ -759,7 +784,7 @@ test "Review mutation read fence drains old production reads without publication
         app.pages.review.branch_status_load.pending == null and
         app.pages.review.auto_reload.background_cycle == null;
     try app.update(action_terminal, &delivery_ctx);
-    const exact_terminal = !app_testing.actionView(&app).isCurrent(pending);
+    const exact_terminal = !app.action_runtime.view().isCurrent(pending);
     const fence_reopened =
         app.pages.review.repository_read_authority.mayStartRepositoryRead();
 
@@ -1106,7 +1131,7 @@ test "repo picker capability rejection preserves Review navigation and does not 
     defer app.repo_session.deinit(allocator);
     defer app.pages.review.deinit(allocator);
     defer if (app.remote_workflow.branch_switch.hasState()) app.remote_workflow.branch_switch.deinit(allocator);
-    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try app_testing.commitDiscovery(
+    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try commitDiscovery(
         &app,
         allocator,
         try testSingleRepoDiscovery(allocator, roots.a),
@@ -2597,7 +2622,7 @@ fn expectRetainedCanonicalPublication(
     app: *const App,
     expected_hunks: [*]const diff_parser.Hunk,
 ) !void {
-    const retained = reviewNavigationView(&app).activeCombinedProjection() orelse
+    const retained = reviewNavigationView(app).activeCombinedProjection() orelse
         return error.ExpectedRetainedCanonicalPublication;
     try std.testing.expectEqual(expected_hunks, retained.displayFile().hunks.ptr);
 }
@@ -2607,12 +2632,12 @@ fn expectRetainedOrdinaryPrimaryPublication(
     expected_loaded: *const loaded_diff.LoadedDiff,
     expected_token: review_selection_model.ReviewContentToken,
 ) !void {
-    const primary = switch (reviewNavigationView(&app).displayedReviewBody()) {
+    const primary = switch (reviewNavigationView(app).displayedReviewBody()) {
         .primary => |value| value,
         else => return error.ExpectedRetainedOrdinaryPrimary,
     };
     try std.testing.expect(primary.loaded == expected_loaded);
-    const token = reviewNavigationView(&app).currentContentToken() orelse
+    const token = reviewNavigationView(app).currentContentToken() orelse
         return error.ExpectedReviewContentToken;
     try std.testing.expect(token.eql(expected_token));
 }
@@ -2622,14 +2647,14 @@ fn expectFreshCanonicalActionCapabilities(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
 ) !void {
-    switch (reviewOperations(&app).stageTarget()) {
+    switch (reviewOperations(app).stageTarget()) {
         .ready => |target| {
             try std.testing.expectEqualStrings(repo_root, target.repo_root);
             try std.testing.expectEqualStrings("a", target.path);
         },
         else => return error.ExpectedFreshFileStageCapability,
     }
-    switch (reviewOperations(&app).unstageTarget()) {
+    switch (reviewOperations(app).unstageTarget()) {
         .ready => |target| {
             try std.testing.expectEqualStrings(repo_root, target.repo_root);
             try std.testing.expectEqualStrings("a", target.path);
@@ -2639,7 +2664,7 @@ fn expectFreshCanonicalActionCapabilities(
 
     app.pages.review.viewer.diff_scroll = 0;
     app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
-    switch (reviewOperations(&app).selectedHunkUnstageTarget(allocator)) {
+    switch (reviewOperations(app).selectedHunkUnstageTarget(allocator)) {
         .ready => |target| {
             defer allocator.free(target.patch);
             try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
@@ -2649,7 +2674,7 @@ fn expectFreshCanonicalActionCapabilities(
     }
 
     app.pages.review.viewer.diff_cursor = .{ .hunk_header = 1 };
-    switch (reviewOperations(&app).selectedHunkStageTarget(allocator)) {
+    switch (reviewOperations(app).selectedHunkStageTarget(allocator)) {
         .ready => |target| {
             defer allocator.free(target.patch);
             try std.testing.expectEqual(@as(usize, 1), target.hunk_index);
@@ -2691,7 +2716,7 @@ fn expectFreshCanonicalPublication(
     try std.testing.expect(expected_presentation.owner == .combined_projection);
     try std.testing.expect(expected_presentation.content_token.eql(prior_content_token));
 
-    const published = reviewNavigationView(&app).activeCombinedProjection() orelse
+    const published = reviewNavigationView(app).activeCombinedProjection() orelse
         return error.ExpectedFreshCombinedPublication;
     try std.testing.expect(published.displayFile().hunks.ptr != prior_hunks);
     try std.testing.expect(published.presentation.content_token.eql(
@@ -2702,7 +2727,7 @@ fn expectFreshCanonicalPublication(
         published.authority.status_snapshot_revision,
     );
 
-    const authority = reviewNavigationView(&app).activeHunkAuthority() orelse
+    const authority = reviewNavigationView(app).activeHunkAuthority() orelse
         return error.ExpectedFreshHunkAuthority;
     try std.testing.expect(authority.authority == .combined);
     try std.testing.expectEqual(expected_status_revision, authority.authority.statusSnapshotRevision());
@@ -2758,32 +2783,32 @@ fn expectFreshCanonicalCachedPublication(
         return error.ExpectedPriorCanonicalPresentation;
     try std.testing.expect(expected_presentation.owner == .combined_projection);
     try std.testing.expect(expected_presentation.content_token.eql(prior_content_token));
-    try std.testing.expect(reviewNavigationView(&app).displayedReviewBody() == .cached);
-    try std.testing.expect(reviewNavigationView(&app).activeCachedDiffProjection() != null);
+    try std.testing.expect(reviewNavigationView(app).displayedReviewBody() == .cached);
+    try std.testing.expect(reviewNavigationView(app).activeCachedDiffProjection() != null);
 
-    switch (reviewOperations(&app).stageTarget()) {
+    switch (reviewOperations(app).stageTarget()) {
         .ready => |target| try std.testing.expectEqualStrings("a", target.path),
         else => return error.ExpectedFreshFileStageCapability,
     }
-    switch (reviewOperations(&app).unstageTarget()) {
+    switch (reviewOperations(app).unstageTarget()) {
         .ready => |target| try std.testing.expectEqualStrings("a", target.path),
         else => return error.ExpectedFreshFileUnstageCapability,
     }
 
     app.pages.review.viewer.diff_scroll = 0;
     app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
-    switch (reviewOperations(&app).selectedHunkToggleOperation()) {
+    switch (reviewOperations(app).selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(
             ToggleStageOperation.unstage,
             operation,
         ),
         else => return error.ExpectedFreshHunkUnstageOperation,
     }
-    switch (reviewOperations(&app).selectedHunkStageTarget(allocator)) {
+    switch (reviewOperations(app).selectedHunkStageTarget(allocator)) {
         .already_staged_hunk => {},
         else => return error.ExpectedAlreadyStagedHunk,
     }
-    switch (reviewOperations(&app).selectedHunkUnstageTarget(allocator)) {
+    switch (reviewOperations(app).selectedHunkUnstageTarget(allocator)) {
         .ready => |target| {
             defer allocator.free(target.patch);
             try std.testing.expectEqualStrings("a", target.path);

@@ -180,6 +180,28 @@ pub const Msg = union(enum) {
     }
 };
 
+/// System and completion messages preserve transient status text because they
+/// do not represent a new user intent. All other messages begin a fresh user
+/// interaction and clear ephemeral diagnostics at the root boundary.
+pub fn keepsEphemeralStatus(msg: Msg) bool {
+    return switch (msg) {
+        .terminal_resized,
+        .load_finished,
+        .action_finished,
+        .push_inspection_finished,
+        .shell_effect_finished,
+        .auto_reload_tick,
+        .focus_lost,
+        .git_action_spinner_tick,
+        => true,
+        .repository => |repository_msg| switch (repository_msg) {
+            .manifest_finished, .branch_finished => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
 test "undelivered action result releases owned payloads" {
     var msg = Msg.actionFinished(.{ .stage_file = .{
         .pending = .{ .generation = 1, .kind = .stage_file },

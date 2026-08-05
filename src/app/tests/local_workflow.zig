@@ -12,6 +12,7 @@ const app_shell_layout = @import("../shell_layout.zig");
 const app_state = @import("../state.zig");
 const app_test_support = @import("../test_support.zig");
 const review_page = @import("../pages/review.zig");
+const review_action_fence = @import("../pages/review/action_fence.zig");
 const review_navigation = @import("../pages/review/navigation.zig");
 const review_reload = @import("../pages/review/reload.zig");
 const review_authority = @import("../diff_surface/authority.zig");
@@ -22,9 +23,9 @@ const git_status = @import("../../git/status.zig");
 const loaded_diff = @import("../../loaded_diff.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
+const action_lifecycle = @import("../workflow/action_lifecycle.zig");
 
 const App = app_mod.App;
-const app_testing = app_mod.testing;
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
 const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
 const test_action_root_identity: repo_root_capability.Identity = .{ .device = 41, .inode = 73 };
@@ -67,7 +68,23 @@ fn reviewReload(app: *App) review_reload.Controller {
 
 fn beginAcceptedTestAction(app: *App, kind: app_actions.ActionKind) app_actions.PendingAction {
     if (app.allocator == null) app.allocator = std.testing.allocator;
-    return app_testing.installAcceptedActionFixture(app, kind);
+    const prepared = actionLifecycle(app).prepare(kind);
+    return actionLifecycle(app).acceptSpawn(app.allocator.?, prepared).pending;
+}
+
+fn actionLifecycle(app: *App) action_lifecycle.Controller {
+    return .{ .runtime = &app.action_runtime, .fence = reviewActionFence(app) };
+}
+
+fn reviewActionFence(app: *App) review_action_fence.Controller {
+    return .{
+        .read_authority = &app.pages.review.repository_read_authority,
+        .activation = &app.pages.review.activation,
+        .action_cursor = &app.pages.review.action_cursor,
+        .auto_reload = &app.pages.review.auto_reload,
+        .review_projection = &app.pages.review.review_projection,
+        .deferred_projection_apply = &app.pages.review.deferred_projection_apply,
+    };
 }
 
 fn installTestActionCursor(
@@ -368,7 +385,7 @@ test "status-only hunk refresh spawn rejection closes its exact owner" {
     });
     ctx._pending_tasks_with_len = 0;
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.status_load.pending == null);
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
 }

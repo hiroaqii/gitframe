@@ -5,6 +5,8 @@ pub fn include() void {
     _ = @import("../app.zig");
     _ = @import("../app_test.zig");
     _ = @import("effect_origin.zig");
+    _ = @import("initial_selection.zig");
+    _ = @import("load_test.zig");
     _ = @import("message.zig");
     _ = @import("shell_effects_test.zig");
     _ = @import("repo_session.zig");
@@ -14,10 +16,14 @@ pub fn include() void {
     _ = @import("page_coordinator_test.zig");
     _ = @import("pages/compare/coordinator_test.zig");
     _ = @import("pages/repository/coordinator_test.zig");
+    _ = @import("pages/review/content_app_test.zig");
+    _ = @import("pages/review/navigation_app_test.zig");
     _ = @import("pages/review/read_coordinator_test.zig");
     _ = @import("tests/page_transition.zig");
     _ = @import("tests/canonical_publication.zig");
     _ = @import("tests/local_workflow.zig");
     _ = @import("tests/remote_shell.zig");
+    _ = @import("tests/root_shell.zig");
+    _ = @import("tests/root_view.zig");
     _ = @import("tests/update_tail.zig");
 }

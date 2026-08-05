@@ -1,10 +1,13 @@
 const std = @import("std");
+const chasen = @import("chasen");
 
 const app_module = @import("app.zig");
 const page = @import("app/page.zig");
 const context = @import("context.zig");
 const git_status = @import("git/status.zig");
 const test_support = @import("app/test_support.zig");
+const action_lifecycle = @import("app/workflow/action_lifecycle.zig");
+const review_session = @import("review/session.zig");
 
 const App = app_module.App;
 
@@ -117,4 +120,136 @@ test "selectionContext returns null selected without a target" {
     try std.testing.expectEqual(context.SourceKind.unstaged, selection.source.kind);
     try std.testing.expectEqualStrings("unstaged changes", selection.source.label);
     try std.testing.expect(selection.selected == null);
+}
+test "quit waits for pending git action" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 7, .kind = .stage_file });
+    defer action_lifecycle.testing.clear(&app.action_runtime);
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    try app.update(.quit, &tc.ctx);
+
+    try std.testing.expect(!tc.ctx.shouldQuit());
+    try std.testing.expect(app.action_runtime.view().hasPending());
+    try std.testing.expectEqualStrings("finish current git action before quitting", app.status.text());
+}
+
+test "quit exits when no git action is pending" {
+    var app: App = .{ .allocator = std.testing.allocator };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.update(.quit, &ctx);
+
+    try std.testing.expect(ctx.shouldQuit());
+}
+
+test "review cancel remains available when source validation failed" {
+    var output: review_session.Output = .{};
+    defer output.deinit(std.testing.allocator);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .review_output = &output,
+    };
+    _ = app.pages.review.activation.activate(0, .failed, .unavailable, .unavailable);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.update(.{ .review = .finish_review_approved }, &ctx);
+    try std.testing.expect(!ctx.shouldQuit());
+    try std.testing.expect(!output.ready);
+    try std.testing.expectEqualStrings("review source is still being validated", app.pages.review.status.text());
+
+    try app.update(.{ .review = .finish_review_canceled }, &ctx);
+    try std.testing.expect(ctx.shouldQuit());
+    try std.testing.expect(output.ready);
+    try std.testing.expectEqual(@as(u8, 130), output.exit_code);
+}
+
+test "finishReview waits for pending git action before writing output" {
+    var output: review_session.Output = .{};
+    defer output.deinit(std.testing.allocator);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .review_output = &output,
+    };
+    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 7, .kind = .stage_file });
+    defer action_lifecycle.testing.clear(&app.action_runtime);
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    try app.update(.{ .review = .finish_review_canceled }, &tc.ctx);
+
+    try std.testing.expect(!tc.ctx.shouldQuit());
+    try std.testing.expect(!output.ready);
+    try std.testing.expect(app.action_runtime.view().hasPending());
+    try std.testing.expectEqualStrings("finish current git action before finishing review", app.pages.review.status.text());
+}
+
+test "finishReview writes output and quits when no git action is pending" {
+    var output: review_session.Output = .{};
+    defer output.deinit(std.testing.allocator);
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .review_output = &output,
+    };
+    _ = app.pages.review.activation.activate(0, .fresh, .unavailable, .unavailable);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try app.update(.{ .review = .finish_review_approved }, &ctx);
+
+    try std.testing.expect(ctx.shouldQuit());
+    try std.testing.expect(output.ready);
+    try std.testing.expectEqual(@as(u8, 0), output.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, output.json.items, "\"decision\":\"approved\"") != null);
+}
+
+test "selectionContext keeps status-only selection while status load is pending" {
+    var app: App = .{
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+            .status_load = .{ .generation = 9, .pending = .{ .generation = 9 } },
+        } },
+        .repo_session = .{
+            .repo_state = .{ .discovery = .{ .single_repo = .{
+                .label = "repo",
+                .display_path = "/repo",
+                .canonical_root = "/repo",
+            } } },
+        },
+    };
+    defer app.pages.review.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.pages.review.git_status.replace("/repo", &status_bundle);
+
+    const selection = app.selectionContext();
+    const status = selection.selected.?.status_only;
+    try std.testing.expectEqual(@as(usize, 0), status.status_index);
+    try std.testing.expectEqualStrings("src/new.zig", status.path_key.?);
+}
+
+test "selectionContext rejects stale status-only identities" {
+    var app: App = .{
+        .pages = .{ .review = .{
+            .viewer = .{ .selected_target = .{ .status_only = 0 } },
+        } },
+        .repo_session = .{
+            .repo_state = .{ .discovery = .{ .single_repo = .{
+                .label = "repo",
+                .display_path = "/repo",
+                .canonical_root = "/repo",
+            } } },
+        },
+    };
+    defer app.pages.review.git_status.deinit();
+
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.pages.review.git_status.replace("/other", &status_bundle);
+    try std.testing.expect(app.selectionContext().selected == null);
+
+    app.pages.review.git_status.deinit();
+    var matching = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
+    try app.pages.review.git_status.replace("/repo", &matching);
+    app.pages.review.viewer.selected_target = .{ .status_only = 1 };
+    try std.testing.expect(app.selectionContext().selected == null);
 }

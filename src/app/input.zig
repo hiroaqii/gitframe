@@ -1,6 +1,13 @@
+//! Concrete keyboard and paste mapping for the root shell.
+//!
+//! Mapping consumes a small immutable snapshot and returns `app_message.Msg`
+//! directly. Borrowed paste slices are valid only during synchronous event
+//! dispatch and are never retained here.
+
 const std = @import("std");
 const chasen = @import("chasen");
 const keymap = @import("keymap");
+const app_message = @import("message.zig");
 const key_input = @import("key_input.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
@@ -10,10 +17,13 @@ const repository_page = @import("pages/repository.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
+pub const ReviewContext = review_input.Context;
+pub const CompareContext = compare_input.Context;
+
 pub const KeyContext = struct {
     active_page: page.Id = .review,
-    review: review_input.Context = .{},
-    compare: compare_input.Context = .{},
+    review: ReviewContext = .{},
+    compare: CompareContext = .{},
     repository: repository_page.InputContext = .{},
     commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
@@ -86,88 +96,88 @@ const Action = enum {
     run_interactive_push,
 };
 
-pub fn eventToMsg(comptime Msg: type, context: KeyContext, event: chasen.Event) ?Msg {
+pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
     return switch (event) {
-        .key_press => |key| keyToMsg(Msg, context, key),
-        .paste => |text| pasteToMsg(Msg, context, text),
-        .winsize => |winsize| payloadMsg(Msg, "terminal_resized", chasen.Size{
+        .key_press => |key| keyToMsg(context, key),
+        .paste => |text| pasteToMsg(context, text),
+        .winsize => |winsize| .{ .terminal_resized = .{
             .width = winsize.cols,
             .height = winsize.rows,
-        }),
+        } },
         else => null,
     };
 }
 
-fn pasteToMsg(comptime Msg: type, context: KeyContext, text: []const u8) ?Msg {
+fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
     if (context.active_page == .review and (context.review.search_mode or context.review.file_search_mode)) {
         const review_msg = review_input.pasteToMsg(context.review, text) orelse return null;
-        return translateReviewMsg(Msg, review_msg);
+        return translateReviewMsg(review_msg);
     }
     if (context.active_page == .repository and (context.repository.source_search_mode or context.repository.file_search_mode)) {
         const repository_msg = repository_page.pasteToMsg(context.repository, text) orelse return null;
-        return payloadMsg(Msg, "repository", repository_msg);
+        return .{ .repository = repository_msg };
     }
     if (context.active_page == .compare and (context.compare.search_mode or context.compare.file_search_mode)) {
         const compare_msg = compare_input.pasteToMsg(context.compare, text) orelse return null;
-        return payloadMsg(Msg, "compare", compare_msg);
+        return .{ .compare = compare_msg };
     }
-    if (context.repo_picker_mode) return payloadMsg(Msg, "repo_picker_paste", text);
-    if (context.push_credential_mode) return payloadMsg(Msg, "push_credential_paste", text);
+    if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
+    if (context.push_credential_mode) return .{ .push_credential_paste = text };
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
-    if (context.commit_panel_mode) return payloadMsg(Msg, "commit_panel_paste", text);
+    if (context.commit_panel_mode) return .{ .commit_panel_paste = text };
     if (context.active_page == .review) {
         const review_msg = review_input.pasteToMsg(context.review, text) orelse return null;
-        return translateReviewMsg(Msg, review_msg);
+        return translateReviewMsg(review_msg);
     }
     return null;
 }
 
-pub fn keyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
+pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.active_page == .review and (context.review.search_mode or context.review.file_search_mode)) {
         const review_msg = review_input.keyToMsg(context.review, key) orelse return null;
-        return translateReviewMsg(Msg, review_msg);
+        return translateReviewMsg(review_msg);
     }
     if (context.active_page == .repository and (context.repository.source_search_mode or context.repository.file_search_mode)) {
         const repository_msg = repository_page.keyToMsg(context.repository, key) orelse return null;
-        return payloadMsg(Msg, "repository", repository_msg);
+        return .{ .repository = repository_msg };
     }
     if (context.active_page == .compare and
         (context.compare.search_mode or context.compare.file_search_mode or context.compare.base_picker_open))
     {
         const compare_msg = compare_input.keyToMsg(context.compare, key) orelse return null;
-        return payloadMsg(Msg, "compare", compare_msg);
+        return .{ .compare = compare_msg };
     }
-    if (context.repo_picker_mode) return repoPickerKeyToMsg(Msg, context, key);
-    if (context.help_mode) return helpKeyToMsg(Msg, context, key);
-    if (context.discard_confirmation_mode) return discardConfirmationKeyToMsg(Msg, key);
-    if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(Msg, key);
-    if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(Msg, key);
-    if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(Msg, key);
-    if (context.branch_switch_mode) return branchSwitchKeyToMsg(Msg, key);
-    if (context.push_error_mode) return pushErrorKeyToMsg(Msg, key);
-    if (context.push_credential_mode) return pushCredentialKeyToMsg(Msg, key);
-    if (context.commit_panel_mode) return commitPanelKeyToMsg(Msg, key);
-    if (pageForKey(context.keymap, key)) |target| return payloadMsg(Msg, "switch_page", target);
-    if (context.keymap.spec(.help)) |spec| if (spec.matches(key)) return voidMsg(Msg, "open_help");
-    if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(key)) return voidMsg(Msg, "enter_repo_picker");
-    if (context.keymap.spec(.reload)) |spec| if (spec.matches(key)) return voidMsg(Msg, "reload");
+    if (context.repo_picker_mode) return repoPickerKeyToMsg(context, key);
+    if (context.help_mode) return helpKeyToMsg(context, key);
+    if (context.discard_confirmation_mode) return discardConfirmationKeyToMsg(key);
+    if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(key);
+    if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(key);
+    if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(key);
+    if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
+    if (context.push_error_mode) return pushErrorKeyToMsg(key);
+    if (context.push_credential_mode) return pushCredentialKeyToMsg(key);
+    if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
+    if (pageForKey(context.keymap, key)) |target| return .{ .switch_page = target };
+    if (context.keymap.spec(.help)) |spec| if (spec.matches(key)) return app_message.Msg.open_help;
+    if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(key)) return app_message.Msg.enter_repo_picker;
+    if (context.keymap.spec(.reload)) |spec| if (spec.matches(key)) return app_message.Msg.reload;
     if (context.active_page == .review) {
         if (review_input.keyToMsg(context.review, key)) |review_msg| {
-            return translateReviewMsg(Msg, review_msg);
+            return translateReviewMsg(review_msg);
         }
     }
     if (context.active_page == .repository) {
         if (repository_page.keyToMsg(context.repository, key)) |repository_msg| {
-            return payloadMsg(Msg, "repository", repository_msg);
+            return .{ .repository = repository_msg };
         }
     }
     if (context.active_page == .compare) {
         if (compare_input.keyToMsg(context.compare, key)) |compare_msg| {
-            return payloadMsg(Msg, "compare", compare_msg);
+            return .{ .compare = compare_msg };
         }
     }
-    if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return voidMsg(Msg, "quit");
+    if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return app_message.Msg.quit;
     return null;
 }
 
@@ -185,122 +195,122 @@ fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
     return null;
 }
 
-fn translateReviewMsg(comptime Msg: type, msg: review_input.Msg) Msg {
-    return payloadMsg(Msg, "review", msg);
+fn translateReviewMsg(msg: review_input.Msg) app_message.Msg {
+    return .{ .review = msg };
 }
 
-fn repoPickerKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_repo_picker);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .submit_repo_picker);
+fn repoPickerKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(.cancel_repo_picker);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.submit_repo_picker);
 
     switch (context.repo_picker_input_mode) {
         .list => {
-            if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .close_repo_picker);
-            if (key.codepoint == '/' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_filter_input);
-            if (key.codepoint == 'p' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_enter_path_input);
-            if (key.codepoint == 'b' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_back);
-            if (key.codepoint == 'd' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .repo_picker_remove_recent);
-            if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .repo_picker_move_previous);
-            if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .repo_picker_move_next);
+            if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return actionToMsg(.close_repo_picker);
+            if (key.codepoint == '/' and !key_input.hasCommandModifier(key)) return actionToMsg(.repo_picker_enter_filter_input);
+            if (key.codepoint == 'p' and !key_input.hasCommandModifier(key)) return actionToMsg(.repo_picker_enter_path_input);
+            if (key.codepoint == 'b' and !key_input.hasCommandModifier(key)) return actionToMsg(.repo_picker_back);
+            if (key.codepoint == 'd' and !key_input.hasCommandModifier(key)) return actionToMsg(.repo_picker_remove_recent);
+            if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.repo_picker_move_previous);
+            if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.repo_picker_move_next);
         },
         .filter => {
-            if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .repo_picker_backspace);
-            if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .repo_picker_move_left);
-            if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
-            if (key.matches(chasen.Key.up, .{})) return actionToMsg(Msg, .repo_picker_move_previous);
-            if (key.matches(chasen.Key.down, .{})) return actionToMsg(Msg, .repo_picker_move_next);
-            if (key_input.textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
+            if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(.repo_picker_backspace);
+            if (key.matches(chasen.Key.left, .{})) return actionToMsg(.repo_picker_move_left);
+            if (key.matches(chasen.Key.right, .{})) return actionToMsg(.repo_picker_move_right);
+            if (key.matches(chasen.Key.up, .{})) return actionToMsg(.repo_picker_move_previous);
+            if (key.matches(chasen.Key.down, .{})) return actionToMsg(.repo_picker_move_next);
+            if (key_input.textInputCodepoint(key)) |codepoint| return .{ .repo_picker_insert = codepoint };
         },
         .path_input => {
-            if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .repo_picker_backspace);
-            if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .repo_picker_move_left);
-            if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .repo_picker_move_right);
+            if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(.repo_picker_backspace);
+            if (key.matches(chasen.Key.left, .{})) return actionToMsg(.repo_picker_move_left);
+            if (key.matches(chasen.Key.right, .{})) return actionToMsg(.repo_picker_move_right);
             if (key.matches(chasen.Key.up, .{}) or key.matches(chasen.Key.down, .{})) return null;
-            if (key_input.textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "repo_picker_insert", codepoint);
+            if (key_input.textInputCodepoint(key)) |codepoint| return .{ .repo_picker_insert = codepoint };
         },
     }
     return null;
 }
 
-fn helpKeyToMsg(comptime Msg: type, context: KeyContext, key: chasen.Key) ?Msg {
+fn helpKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.keymap.spec(.help)) |spec| {
-        if (spec.matches(key)) return actionToMsg(Msg, .close_help);
+        if (spec.matches(key)) return actionToMsg(.close_help);
     }
     if (context.keymap.spec(.commit)) |spec| {
-        if (spec.matches(key)) return translateReviewMsg(Msg, .enter_commit_panel);
+        if (spec.matches(key)) return translateReviewMsg(.enter_commit_panel);
     }
-    if (helpActionForKey(key)) |action| return actionToMsg(Msg, action);
+    if (helpActionForKey(key)) |action| return actionToMsg(action);
     return null;
 }
 
-fn discardConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_discard_file);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_discard_file);
+fn discardConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_discard_file);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_discard_file);
     return null;
 }
 
-fn amendConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_amend);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_amend);
+fn amendConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_amend);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_amend);
     return null;
 }
 
-fn pushConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_push);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_push);
+fn pushConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_push);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_push);
     return null;
 }
 
-fn pullConfirmationKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_pull);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_pull);
+fn pullConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_pull);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_pull);
     return null;
 }
 
-fn branchSwitchKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .cancel_branch_switch);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .confirm_branch_switch);
-    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .branch_switch_move_previous);
-    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .branch_switch_move_next);
+fn branchSwitchKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_branch_switch);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_branch_switch);
+    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.branch_switch_move_previous);
+    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.branch_switch_move_next);
     return null;
 }
 
-fn pushErrorKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(Msg, .close_push_error);
-    if (key.codepoint == 'c' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .open_push_credentials);
-    if (key.codepoint == 'i' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .run_interactive_push);
-    if (key.codepoint == 'y' and !key_input.hasCommandModifier(key)) return actionToMsg(Msg, .copy_popup);
-    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(Msg, .push_error_scroll_up);
-    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(Msg, .push_error_scroll_down);
-    if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(Msg, .push_error_page_up);
-    if (key.matches(chasen.Key.page_down, .{})) return actionToMsg(Msg, .push_error_page_down);
+fn pushErrorKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(.close_push_error);
+    if (key.codepoint == 'c' and !key_input.hasCommandModifier(key)) return actionToMsg(.open_push_credentials);
+    if (key.codepoint == 'i' and !key_input.hasCommandModifier(key)) return actionToMsg(.run_interactive_push);
+    if (key.codepoint == 'y' and !key_input.hasCommandModifier(key)) return actionToMsg(.copy_popup);
+    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.push_error_scroll_up);
+    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.push_error_scroll_down);
+    if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(.push_error_page_up);
+    if (key.matches(chasen.Key.page_down, .{})) return actionToMsg(.push_error_page_down);
     return null;
 }
 
-fn pushCredentialKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .push_credential_cancel);
-    if (key.matches(chasen.Key.tab, .{})) return actionToMsg(Msg, .push_credential_tab);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .push_credential_submit);
-    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .push_credential_backspace);
-    if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .push_credential_move_left);
-    if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .push_credential_move_right);
-    if (key_input.textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "push_credential_insert", codepoint);
+fn pushCredentialKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(.push_credential_cancel);
+    if (key.matches(chasen.Key.tab, .{})) return actionToMsg(.push_credential_tab);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.push_credential_submit);
+    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(.push_credential_backspace);
+    if (key.matches(chasen.Key.left, .{})) return actionToMsg(.push_credential_move_left);
+    if (key.matches(chasen.Key.right, .{})) return actionToMsg(.push_credential_move_right);
+    if (key_input.textInputCodepoint(key)) |codepoint| return .{ .push_credential_insert = codepoint };
     return null;
 }
 
-fn commitPanelKeyToMsg(comptime Msg: type, key: chasen.Key) ?Msg {
-    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(Msg, .cancel_commit_panel);
-    if (key.matches('g', .{ .ctrl = true })) return actionToMsg(Msg, .assist_commit_message);
-    if (key.matches('y', .{ .ctrl = true })) return actionToMsg(Msg, .copy_commit_message);
-    if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return actionToMsg(Msg, .submit_commit_panel);
-    if (key.matches(chasen.Key.tab, .{})) return actionToMsg(Msg, .commit_panel_tab);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(Msg, .commit_panel_enter);
-    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(Msg, .commit_panel_backspace);
-    if (key.matches(chasen.Key.left, .{})) return actionToMsg(Msg, .commit_panel_move_left);
-    if (key.matches(chasen.Key.right, .{})) return actionToMsg(Msg, .commit_panel_move_right);
-    if (key.matches(chasen.Key.up, .{})) return actionToMsg(Msg, .commit_panel_move_up);
-    if (key.matches(chasen.Key.down, .{})) return actionToMsg(Msg, .commit_panel_move_down);
-    if (key_input.textInputCodepoint(key)) |codepoint| return payloadMsg(Msg, "commit_panel_insert", codepoint);
+fn commitPanelKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(.cancel_commit_panel);
+    if (key.matches('g', .{ .ctrl = true })) return actionToMsg(.assist_commit_message);
+    if (key.matches('y', .{ .ctrl = true })) return actionToMsg(.copy_commit_message);
+    if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return actionToMsg(.submit_commit_panel);
+    if (key.matches(chasen.Key.tab, .{})) return actionToMsg(.commit_panel_tab);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.commit_panel_enter);
+    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(.commit_panel_backspace);
+    if (key.matches(chasen.Key.left, .{})) return actionToMsg(.commit_panel_move_left);
+    if (key.matches(chasen.Key.right, .{})) return actionToMsg(.commit_panel_move_right);
+    if (key.matches(chasen.Key.up, .{})) return actionToMsg(.commit_panel_move_up);
+    if (key.matches(chasen.Key.down, .{})) return actionToMsg(.commit_panel_move_down);
+    if (key_input.textInputCodepoint(key)) |codepoint| return .{ .commit_panel_insert = codepoint };
     return null;
 }
 
@@ -348,255 +358,179 @@ fn actionForKey(bindings: []const KeyBinding, key: chasen.Key) ?Action {
     return null;
 }
 
-fn actionToMsg(comptime Msg: type, action: Action) Msg {
+fn actionToMsg(action: Action) app_message.Msg {
     return switch (action) {
-        .cancel_commit_panel => voidMsg(Msg, "cancel_commit_panel"),
-        .submit_commit_panel => voidMsg(Msg, "submit_commit_panel"),
-        .assist_commit_message => voidMsg(Msg, "assist_commit_message"),
-        .copy_commit_message => voidMsg(Msg, "copy_commit_message"),
-        .commit_panel_tab => voidMsg(Msg, "commit_panel_tab"),
-        .commit_panel_enter => voidMsg(Msg, "commit_panel_enter"),
-        .commit_panel_backspace => voidMsg(Msg, "commit_panel_backspace"),
-        .commit_panel_move_left => voidMsg(Msg, "commit_panel_move_left"),
-        .commit_panel_move_right => voidMsg(Msg, "commit_panel_move_right"),
-        .commit_panel_move_up => voidMsg(Msg, "commit_panel_move_up"),
-        .commit_panel_move_down => voidMsg(Msg, "commit_panel_move_down"),
-        .cancel_repo_picker => voidMsg(Msg, "cancel_repo_picker"),
-        .close_repo_picker => voidMsg(Msg, "close_repo_picker"),
-        .submit_repo_picker => voidMsg(Msg, "submit_repo_picker"),
-        .repo_picker_enter_filter_input => voidMsg(Msg, "repo_picker_enter_filter_input"),
-        .repo_picker_enter_path_input => voidMsg(Msg, "repo_picker_enter_path_input"),
-        .repo_picker_back => voidMsg(Msg, "repo_picker_back"),
-        .repo_picker_remove_recent => voidMsg(Msg, "repo_picker_remove_recent"),
-        .repo_picker_backspace => voidMsg(Msg, "repo_picker_backspace"),
-        .repo_picker_move_previous => voidMsg(Msg, "repo_picker_move_previous"),
-        .repo_picker_move_next => voidMsg(Msg, "repo_picker_move_next"),
-        .repo_picker_move_left => voidMsg(Msg, "repo_picker_move_left"),
-        .repo_picker_move_right => voidMsg(Msg, "repo_picker_move_right"),
-        .close_help => voidMsg(Msg, "close_help"),
-        .help_scroll_up => voidMsg(Msg, "help_scroll_up"),
-        .help_scroll_down => voidMsg(Msg, "help_scroll_down"),
-        .help_page_up => voidMsg(Msg, "help_page_up"),
-        .help_page_down => voidMsg(Msg, "help_page_down"),
-        .push_error_scroll_up => voidMsg(Msg, "push_error_scroll_up"),
-        .push_error_scroll_down => voidMsg(Msg, "push_error_scroll_down"),
-        .push_error_page_up => voidMsg(Msg, "push_error_page_up"),
-        .push_error_page_down => voidMsg(Msg, "push_error_page_down"),
-        .copy_popup => voidMsg(Msg, "copy_popup"),
-        .push_credential_tab => voidMsg(Msg, "push_credential_tab"),
-        .push_credential_submit => voidMsg(Msg, "push_credential_submit"),
-        .push_credential_cancel => voidMsg(Msg, "push_credential_cancel"),
-        .push_credential_backspace => voidMsg(Msg, "push_credential_backspace"),
-        .push_credential_move_left => voidMsg(Msg, "push_credential_move_left"),
-        .push_credential_move_right => voidMsg(Msg, "push_credential_move_right"),
-        .confirm_discard_file => voidMsg(Msg, "confirm_discard_file"),
-        .cancel_discard_file => voidMsg(Msg, "cancel_discard_file"),
-        .confirm_amend => voidMsg(Msg, "confirm_amend"),
-        .cancel_amend => voidMsg(Msg, "cancel_amend"),
-        .confirm_push => voidMsg(Msg, "confirm_push"),
-        .cancel_push => voidMsg(Msg, "cancel_push"),
-        .confirm_pull => voidMsg(Msg, "confirm_pull"),
-        .cancel_pull => voidMsg(Msg, "cancel_pull"),
-        .branch_switch_move_previous => voidMsg(Msg, "branch_switch_move_previous"),
-        .branch_switch_move_next => voidMsg(Msg, "branch_switch_move_next"),
-        .confirm_branch_switch => voidMsg(Msg, "confirm_branch_switch"),
-        .cancel_branch_switch => voidMsg(Msg, "cancel_branch_switch"),
-        .close_push_error => voidMsg(Msg, "close_push_error"),
-        .open_push_credentials => voidMsg(Msg, "open_push_credentials"),
-        .run_interactive_push => voidMsg(Msg, "run_interactive_push"),
+        .cancel_commit_panel => app_message.Msg.cancel_commit_panel,
+        .submit_commit_panel => app_message.Msg.submit_commit_panel,
+        .assist_commit_message => app_message.Msg.assist_commit_message,
+        .copy_commit_message => app_message.Msg.copy_commit_message,
+        .commit_panel_tab => app_message.Msg.commit_panel_tab,
+        .commit_panel_enter => app_message.Msg.commit_panel_enter,
+        .commit_panel_backspace => app_message.Msg.commit_panel_backspace,
+        .commit_panel_move_left => app_message.Msg.commit_panel_move_left,
+        .commit_panel_move_right => app_message.Msg.commit_panel_move_right,
+        .commit_panel_move_up => app_message.Msg.commit_panel_move_up,
+        .commit_panel_move_down => app_message.Msg.commit_panel_move_down,
+        .cancel_repo_picker => app_message.Msg.cancel_repo_picker,
+        .close_repo_picker => app_message.Msg.close_repo_picker,
+        .submit_repo_picker => app_message.Msg.submit_repo_picker,
+        .repo_picker_enter_filter_input => app_message.Msg.repo_picker_enter_filter_input,
+        .repo_picker_enter_path_input => app_message.Msg.repo_picker_enter_path_input,
+        .repo_picker_back => app_message.Msg.repo_picker_back,
+        .repo_picker_remove_recent => app_message.Msg.repo_picker_remove_recent,
+        .repo_picker_backspace => app_message.Msg.repo_picker_backspace,
+        .repo_picker_move_previous => app_message.Msg.repo_picker_move_previous,
+        .repo_picker_move_next => app_message.Msg.repo_picker_move_next,
+        .repo_picker_move_left => app_message.Msg.repo_picker_move_left,
+        .repo_picker_move_right => app_message.Msg.repo_picker_move_right,
+        .close_help => app_message.Msg.close_help,
+        .help_scroll_up => app_message.Msg.help_scroll_up,
+        .help_scroll_down => app_message.Msg.help_scroll_down,
+        .help_page_up => app_message.Msg.help_page_up,
+        .help_page_down => app_message.Msg.help_page_down,
+        .push_error_scroll_up => app_message.Msg.push_error_scroll_up,
+        .push_error_scroll_down => app_message.Msg.push_error_scroll_down,
+        .push_error_page_up => app_message.Msg.push_error_page_up,
+        .push_error_page_down => app_message.Msg.push_error_page_down,
+        .copy_popup => app_message.Msg.copy_popup,
+        .push_credential_tab => app_message.Msg.push_credential_tab,
+        .push_credential_submit => app_message.Msg.push_credential_submit,
+        .push_credential_cancel => app_message.Msg.push_credential_cancel,
+        .push_credential_backspace => app_message.Msg.push_credential_backspace,
+        .push_credential_move_left => app_message.Msg.push_credential_move_left,
+        .push_credential_move_right => app_message.Msg.push_credential_move_right,
+        .confirm_discard_file => app_message.Msg.confirm_discard_file,
+        .cancel_discard_file => app_message.Msg.cancel_discard_file,
+        .confirm_amend => app_message.Msg.confirm_amend,
+        .cancel_amend => app_message.Msg.cancel_amend,
+        .confirm_push => app_message.Msg.confirm_push,
+        .cancel_push => app_message.Msg.cancel_push,
+        .confirm_pull => app_message.Msg.confirm_pull,
+        .cancel_pull => app_message.Msg.cancel_pull,
+        .branch_switch_move_previous => app_message.Msg.branch_switch_move_previous,
+        .branch_switch_move_next => app_message.Msg.branch_switch_move_next,
+        .confirm_branch_switch => app_message.Msg.confirm_branch_switch,
+        .cancel_branch_switch => app_message.Msg.cancel_branch_switch,
+        .close_push_error => app_message.Msg.close_push_error,
+        .open_push_credentials => app_message.Msg.open_push_credentials,
+        .run_interactive_push => app_message.Msg.run_interactive_push,
     };
 }
 
-fn voidMsg(comptime Msg: type, comptime tag: []const u8) Msg {
-    return @unionInit(Msg, tag, {});
-}
-
-fn payloadMsg(comptime Msg: type, comptime tag: []const u8, payload: anytype) Msg {
-    return @unionInit(Msg, tag, payload);
-}
-
-const TestMsg = union(enum) {
-    terminal_resized: chasen.Size,
-    switch_page: page.Id,
-    review: review_input.Msg,
-    compare: compare_input.Msg,
-    repository: repository_page.Msg,
-    cancel_commit_panel,
-    submit_commit_panel,
-    assist_commit_message,
-    copy_commit_message,
-    commit_panel_tab,
-    commit_panel_enter,
-    commit_panel_backspace,
-    commit_panel_move_left,
-    commit_panel_move_right,
-    commit_panel_move_up,
-    commit_panel_move_down,
-    commit_panel_insert: u21,
-    commit_panel_paste: []const u8,
-    cancel_repo_picker,
-    close_repo_picker,
-    submit_repo_picker,
-    repo_picker_enter_filter_input,
-    repo_picker_enter_path_input,
-    repo_picker_back,
-    repo_picker_remove_recent,
-    repo_picker_backspace,
-    repo_picker_move_previous,
-    repo_picker_move_next,
-    repo_picker_move_left,
-    repo_picker_move_right,
-    repo_picker_insert: u21,
-    repo_picker_paste: []const u8,
-    enter_repo_picker,
-    open_help,
-    close_help,
-    help_scroll_up,
-    help_scroll_down,
-    help_page_up,
-    help_page_down,
-    push_error_scroll_up,
-    push_error_scroll_down,
-    push_error_page_up,
-    push_error_page_down,
-    copy_popup,
-    push_credential_tab,
-    push_credential_submit,
-    push_credential_cancel,
-    push_credential_insert: u21,
-    push_credential_paste: []const u8,
-    push_credential_backspace,
-    push_credential_move_left,
-    push_credential_move_right,
-    confirm_discard_file,
-    cancel_discard_file,
-    confirm_amend,
-    cancel_amend,
-    confirm_push,
-    cancel_push,
-    confirm_pull,
-    cancel_pull,
-    branch_switch_move_previous,
-    branch_switch_move_next,
-    confirm_branch_switch,
-    cancel_branch_switch,
-    close_push_error,
-    open_push_credentials,
-    run_interactive_push,
-    quit,
-    reload,
-};
-
-fn reviewMsg(msg: review_input.Msg) TestMsg {
+fn reviewMsg(msg: review_input.Msg) app_message.Msg {
     return .{ .review = msg };
 }
 
+fn expectMsg(expected: app_message.Msg, actual: app_message.Msg) !void {
+    try std.testing.expectEqual(expected, actual);
+}
+
 test "normal page keys map after text and overlay precedence" {
-    try std.testing.expectEqual(TestMsg{ .switch_page = .review }, keyToMsg(TestMsg, .{}, .{ .codepoint = '1' }).?);
-    try std.testing.expectEqual(TestMsg{ .switch_page = .config }, keyToMsg(TestMsg, .{}, .{ .codepoint = '4' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = '2' }), keyToMsg(TestMsg, .{ .review = .{ .search_mode = true } }, .{ .codepoint = '2' }).?);
-    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = '3' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = '3' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = '2', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(TestMsg{ .repository = .move_down }, keyToMsg(TestMsg, .{ .active_page = .repository }, .{ .codepoint = 'j' }).?);
+    try expectMsg(.{ .switch_page = .review }, keyToMsg(.{}, .{ .codepoint = '1' }).?);
+    try expectMsg(.{ .switch_page = .config }, keyToMsg(.{}, .{ .codepoint = '4' }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .search_insert = '2' }), keyToMsg(.{ .review = .{ .search_mode = true } }, .{ .codepoint = '2' }).?);
+    try expectMsg(.{ .commit_panel_insert = '3' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = '3' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = '2', .mods = .{ .ctrl = true } }));
+    try expectMsg(.{ .repository = .move_down }, keyToMsg(.{ .active_page = .repository }, .{ .codepoint = 'j' }).?);
 
     var config: keymap.Config = .{};
     config.set(.page_repository, .{ .plain_codepoint = 'w' });
     const remapped = keymap.Effective.fromConfig(config);
-    try std.testing.expectEqual(TestMsg{ .switch_page = .repository }, keyToMsg(TestMsg, .{ .keymap = remapped }, .{ .codepoint = 'w' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .keymap = remapped }, .{ .codepoint = '2' }));
+    try expectMsg(.{ .switch_page = .repository }, keyToMsg(.{ .keymap = remapped }, .{ .codepoint = 'w' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .keymap = remapped }, .{ .codepoint = '2' }));
 }
 
 test "eventToMsg maps winsize event" {
-    const msg = eventToMsg(TestMsg, .{}, .{ .winsize = .{
+    const msg = eventToMsg(.{}, .{ .winsize = .{
         .cols = 120,
         .rows = 40,
         .x_pixel = 0,
         .y_pixel = 0,
     } }).?;
-    try std.testing.expectEqual(TestMsg{ .terminal_resized = .{ .width = 120, .height = 40 } }, msg);
+    try expectMsg(.{ .terminal_resized = .{ .width = 120, .height = 40 } }, msg);
 }
 
 test "eventToMsg routes paste by active text input mode" {
-    const search_msg = eventToMsg(TestMsg, .{ .review = .{ .search_mode = true } }, .{ .paste = "render" }).?;
+    const search_msg = eventToMsg(.{ .review = .{ .search_mode = true } }, .{ .paste = "render" }).?;
     try std.testing.expectEqualStrings("render", search_msg.review.search_paste);
 
-    const file_msg = eventToMsg(TestMsg, .{ .review = .{ .file_search_mode = true } }, .{ .paste = "app.zig" }).?;
+    const file_msg = eventToMsg(.{ .review = .{ .file_search_mode = true } }, .{ .paste = "app.zig" }).?;
     try std.testing.expectEqualStrings("app.zig", file_msg.review.file_search_paste);
 
-    const source_msg = eventToMsg(TestMsg, .{
+    const source_msg = eventToMsg(.{
         .active_page = .repository,
         .repository = .{ .source_search_mode = true },
     }, .{ .paste = "needle" }).?;
     try std.testing.expectEqualStrings("needle", source_msg.repository.source_search_paste);
 
-    const repo_msg = eventToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .paste = "/tmp/repo" }).?;
+    const repo_msg = eventToMsg(.{ .repo_picker_mode = true }, .{ .paste = "/tmp/repo" }).?;
     try std.testing.expectEqualStrings("/tmp/repo", repo_msg.repo_picker_paste);
 
-    const commit_msg = eventToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .paste = "subject" }).?;
+    const commit_msg = eventToMsg(.{ .commit_panel_mode = true }, .{ .paste = "subject" }).?;
     try std.testing.expectEqualStrings("subject", commit_msg.commit_panel_paste);
 }
 
 test "eventToMsg rejects invalid paste and ignores non-input modes" {
     const invalid = [_]u8{0xff};
-    try std.testing.expect(eventToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .paste = invalid[0..] }) == null);
-    try std.testing.expect(eventToMsg(TestMsg, .{}, .{ .paste = "ignored" }) == null);
-    try std.testing.expect(eventToMsg(TestMsg, .{ .help_mode = true }, .{ .paste = "ignored" }) == null);
-    try std.testing.expect(eventToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
-    try std.testing.expect(eventToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
+    try std.testing.expect(eventToMsg(.{ .commit_panel_mode = true }, .{ .paste = invalid[0..] }) == null);
+    try std.testing.expect(eventToMsg(.{}, .{ .paste = "ignored" }) == null);
+    try std.testing.expect(eventToMsg(.{ .help_mode = true }, .{ .paste = "ignored" }) == null);
+    try std.testing.expect(eventToMsg(.{ .discard_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
+    try std.testing.expect(eventToMsg(.{ .amend_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
 }
 
 test "shell nests Review void and payload messages under one route" {
-    try std.testing.expectEqual(reviewMsg(.toggle_directory), keyToMsg(TestMsg, .{ .review = .{ .focus = .sidebar } }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'x' }), keyToMsg(TestMsg, .{ .review = .{ .search_mode = true } }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(reviewMsg(.toggle_directory), keyToMsg(.{ .review = .{ .focus = .sidebar } }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'x' }), keyToMsg(.{ .review = .{ .search_mode = true } }, .{ .codepoint = 'x' }).?);
 }
 
 test "shell routes plain q by active Review context" {
-    try std.testing.expectEqual(TestMsg.quit, keyToMsg(TestMsg, .{}, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(reviewMsg(.finish_review_canceled), keyToMsg(TestMsg, .{ .review = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'q' }), keyToMsg(TestMsg, .{ .review = .{ .search_mode = true, .review_mode = true } }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true, .review = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.quit, keyToMsg(.{}, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(reviewMsg(.finish_review_canceled), keyToMsg(.{ .review = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'q' }), keyToMsg(.{ .review = .{ .search_mode = true, .review_mode = true } }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{ .help_mode = true, .review = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
 }
 
 test "shell owns help repo picker and reload before Review delegation" {
-    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{ .codepoint = '?' }).?);
-    try std.testing.expectEqual(TestMsg.enter_repo_picker, keyToMsg(TestMsg, .{}, .{ .codepoint = 'R' }).?);
-    try std.testing.expectEqual(TestMsg.reload, keyToMsg(TestMsg, .{}, .{ .codepoint = 'r' }).?);
+    try std.testing.expectEqual(app_message.Msg.open_help, keyToMsg(.{}, .{ .codepoint = '?' }).?);
+    try std.testing.expectEqual(app_message.Msg.enter_repo_picker, keyToMsg(.{}, .{ .codepoint = 'R' }).?);
+    try std.testing.expectEqual(app_message.Msg.reload, keyToMsg(.{}, .{ .codepoint = 'r' }).?);
 }
 
 test "keyToMsg maps discard confirmation flow" {
-    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(TestMsg, .{}, .{ .codepoint = 'D' }).?);
-    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(TestMsg, .{}, shiftedAscii('d', 'D')).?);
-    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(TestMsg, .{}, shiftedLowerOnly('d')).?);
-    try std.testing.expectEqual(TestMsg.confirm_discard_file, keyToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.cancel_discard_file, keyToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(TestMsg.cancel_discard_file, keyToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .discard_confirmation_mode = true }, .{ .codepoint = 'D' }));
+    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(.{}, .{ .codepoint = 'D' }).?);
+    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(.{}, shiftedAscii('d', 'D')).?);
+    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(.{}, shiftedLowerOnly('d')).?);
+    try std.testing.expectEqual(app_message.Msg.confirm_discard_file, keyToMsg(.{ .discard_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_discard_file, keyToMsg(.{ .discard_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_discard_file, keyToMsg(.{ .discard_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .discard_confirmation_mode = true }, .{ .codepoint = 'D' }));
 }
 
 test "keyToMsg maps commit panel command and routes panel input" {
-    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(TestMsg, .{}, .{ .codepoint = 'c' }).?);
-    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(TestMsg, .{}, .{ .codepoint = 'A' }).?);
-    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(TestMsg, .{}, shiftedAscii('a', 'A')).?);
-    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(TestMsg, .{}, shiftedLowerOnly('a')).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'a' }));
-    try std.testing.expectEqual(TestMsg.cancel_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter, .mods = .{ .ctrl = true } }).?);
-    try std.testing.expectEqual(TestMsg.submit_commit_panel, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
-    try std.testing.expectEqual(TestMsg.assist_commit_message, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'g', .mods = .{ .ctrl = true } }).?);
-    try std.testing.expectEqual(TestMsg.copy_commit_message, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y', .mods = .{ .ctrl = true } }).?);
-    try std.testing.expectEqual(TestMsg.commit_panel_tab, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.tab }).?);
-    try std.testing.expectEqual(TestMsg.commit_panel_enter, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.commit_panel_backspace, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.backspace }).?);
-    try std.testing.expectEqual(TestMsg.commit_panel_move_left, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.left }).?);
-    try std.testing.expectEqual(TestMsg.commit_panel_move_right, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.right }).?);
-    try std.testing.expectEqual(TestMsg.commit_panel_move_up, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.up }).?);
-    try std.testing.expectEqual(TestMsg.commit_panel_move_down, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.down }).?);
-    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'x' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'y' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'R' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'R' }).?);
-    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{}, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(.{}, .{ .codepoint = 'c' }).?);
+    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(.{}, .{ .codepoint = 'A' }).?);
+    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(.{}, shiftedAscii('a', 'A')).?);
+    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(.{}, shiftedLowerOnly('a')).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = 'a' }));
+    try std.testing.expectEqual(app_message.Msg.cancel_commit_panel, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.submit_commit_panel, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter, .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(app_message.Msg.submit_commit_panel, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(app_message.Msg.assist_commit_message, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'g', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(app_message.Msg.copy_commit_message, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'y', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(app_message.Msg.commit_panel_tab, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.tab }).?);
+    try std.testing.expectEqual(app_message.Msg.commit_panel_enter, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.commit_panel_backspace, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.backspace }).?);
+    try std.testing.expectEqual(app_message.Msg.commit_panel_move_left, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(app_message.Msg.commit_panel_move_right, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(app_message.Msg.commit_panel_move_up, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(app_message.Msg.commit_panel_move_down, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.down }).?);
+    try expectMsg(.{ .commit_panel_insert = 'x' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
+    try expectMsg(.{ .commit_panel_insert = 'y' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
+    try expectMsg(.{ .commit_panel_insert = 'R' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'R' }).?);
+    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'c' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
 }
 
 test "keyToMsg uses configured keys inside help mode" {
@@ -609,17 +543,17 @@ test "keyToMsg uses configured keys inside help mode" {
         .keymap = effective,
     };
 
-    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(TestMsg, context, .{ .codepoint = 'm' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, context, .{ .codepoint = 'c' }));
-    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, context, .{ .codepoint = 'z' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, context, .{ .codepoint = '?' }));
+    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(context, .{ .codepoint = 'm' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(context, .{ .codepoint = 'c' }));
+    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(context, .{ .codepoint = 'z' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(context, .{ .codepoint = '?' }));
 }
 
 test "keyToMsg maps amend confirmation flow" {
-    try std.testing.expectEqual(TestMsg.confirm_amend, keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .amend_confirmation_mode = true }, .{ .codepoint = 'A' }));
+    try std.testing.expectEqual(app_message.Msg.confirm_amend, keyToMsg(.{ .amend_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_amend, keyToMsg(.{ .amend_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_amend, keyToMsg(.{ .amend_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .amend_confirmation_mode = true }, .{ .codepoint = 'A' }));
 }
 
 test "keyToMsg prioritizes amend confirmation over open commit panel" {
@@ -628,9 +562,9 @@ test "keyToMsg prioritizes amend confirmation over open commit panel" {
         .amend_confirmation_mode = true,
     };
 
-    try std.testing.expectEqual(TestMsg.confirm_amend, keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(TestMsg.cancel_amend, keyToMsg(TestMsg, context, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.confirm_amend, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_amend, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_amend, keyToMsg(context, .{ .codepoint = 'q' }).?);
 }
 
 test "keyToMsg prioritizes discard confirmation over open commit panel" {
@@ -639,18 +573,18 @@ test "keyToMsg prioritizes discard confirmation over open commit panel" {
         .discard_confirmation_mode = true,
     };
 
-    try std.testing.expectEqual(TestMsg.confirm_discard_file, keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.cancel_discard_file, keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(TestMsg.cancel_discard_file, keyToMsg(TestMsg, context, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.confirm_discard_file, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_discard_file, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_discard_file, keyToMsg(context, .{ .codepoint = 'q' }).?);
 }
 
 test "keyToMsg treats colon as repo picker path text" {
     const context: KeyContext = .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input };
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, context, .{ .codepoint = ':' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, context, shiftedAscii(';', ':')).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ';' }, keyToMsg(TestMsg, context, shiftedLowerOnly(';')).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ';' }, keyToMsg(TestMsg, context, .{ .codepoint = ';' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'q' }, keyToMsg(TestMsg, context, .{ .codepoint = 'q' }).?);
+    try expectMsg(.{ .repo_picker_insert = ':' }, keyToMsg(context, .{ .codepoint = ':' }).?);
+    try expectMsg(.{ .repo_picker_insert = ':' }, keyToMsg(context, shiftedAscii(';', ':')).?);
+    try expectMsg(.{ .repo_picker_insert = ';' }, keyToMsg(context, shiftedLowerOnly(';')).?);
+    try expectMsg(.{ .repo_picker_insert = ';' }, keyToMsg(context, .{ .codepoint = ';' }).?);
+    try expectMsg(.{ .repo_picker_insert = 'q' }, keyToMsg(context, .{ .codepoint = 'q' }).?);
 }
 
 test "keyToMsg ignores special keys in text input modes" {
@@ -695,16 +629,16 @@ test "keyToMsg ignores special keys in text input modes" {
 
     for (common_cases) |key| {
         if (key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right) {
-            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .review = .{ .search_mode = true } }, key));
+            try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .review = .{ .search_mode = true } }, key));
         }
         if (!key.matches(chasen.Key.up, .{}) and !key.matches(chasen.Key.down, .{})) {
-            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .review = .{ .file_search_mode = true } }, key));
+            try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .review = .{ .file_search_mode = true } }, key));
         }
         if (key.codepoint != chasen.Key.tab and key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
-            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, key));
+            try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .commit_panel_mode = true }, key));
         }
         if (key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
-            try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, key));
+            try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .repo_picker_mode = true }, key));
         }
     }
 
@@ -741,58 +675,58 @@ test "keyToMsg ignores special keys in text input modes" {
         .{ .codepoint = chasen.Key.multicodepoint, .text = "ab" },
     };
     for (picker_list_text_cases) |key| {
-        try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, key));
+        try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .repo_picker_mode = true }, key));
     }
 }
 
 test "keyToMsg maps review file search candidate movement" {
     const context: KeyContext = .{ .review = .{ .file_search_mode = true } };
-    try std.testing.expectEqual(reviewMsg(.file_search_previous), keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.up }).?);
-    try std.testing.expectEqual(reviewMsg(.file_search_next), keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.down }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'k' }), keyToMsg(TestMsg, context, .{ .codepoint = 'k' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'j' }), keyToMsg(TestMsg, context, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(reviewMsg(.file_search_previous), keyToMsg(context, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(reviewMsg(.file_search_next), keyToMsg(context, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'k' }), keyToMsg(context, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'j' }), keyToMsg(context, .{ .codepoint = 'j' }).?);
 }
 
 test "keyToMsg maps repo picker cursor movement" {
     const input_context: KeyContext = .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input };
-    try std.testing.expectEqual(TestMsg.repo_picker_move_left, keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.left }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_right, keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.right }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.up }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, input_context, .{ .codepoint = chasen.Key.down }));
+    try std.testing.expectEqual(app_message.Msg.repo_picker_move_left, keyToMsg(input_context, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(app_message.Msg.repo_picker_move_right, keyToMsg(input_context, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(input_context, .{ .codepoint = chasen.Key.up }));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(input_context, .{ .codepoint = chasen.Key.down }));
     const filter_context: KeyContext = .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter };
-    try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, filter_context, .{ .codepoint = chasen.Key.up }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, filter_context, .{ .codepoint = chasen.Key.down }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.up }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.down }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_previous, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'k' }).?);
-    try std.testing.expectEqual(TestMsg.repo_picker_move_next, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(app_message.Msg.repo_picker_move_previous, keyToMsg(filter_context, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(app_message.Msg.repo_picker_move_next, keyToMsg(filter_context, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(app_message.Msg.repo_picker_move_previous, keyToMsg(.{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(app_message.Msg.repo_picker_move_next, keyToMsg(.{ .repo_picker_mode = true }, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(app_message.Msg.repo_picker_move_previous, keyToMsg(.{ .repo_picker_mode = true }, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(app_message.Msg.repo_picker_move_next, keyToMsg(.{ .repo_picker_mode = true }, .{ .codepoint = 'j' }).?);
 }
 
 test "keyToMsg maps repo picker recent removal only in list mode" {
-    try std.testing.expectEqual(TestMsg.repo_picker_remove_recent, keyToMsg(TestMsg, .{ .repo_picker_mode = true }, .{ .codepoint = 'd' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'd' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'd' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'd' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 'd' }).?);
+    try std.testing.expectEqual(app_message.Msg.repo_picker_remove_recent, keyToMsg(.{ .repo_picker_mode = true }, .{ .codepoint = 'd' }).?);
+    try expectMsg(.{ .repo_picker_insert = 'd' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'd' }).?);
+    try expectMsg(.{ .repo_picker_insert = 'd' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 'd' }).?);
 }
 
 test "keyToMsg ignores ctrl printable in text input modes" {
     const ctrl_c: chasen.Key = .{ .codepoint = 'c', .mods = .{ .ctrl = true } };
 
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .review = .{ .search_mode = true } }, ctrl_c));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .review = .{ .file_search_mode = true } }, ctrl_c));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .commit_panel_mode = true }, ctrl_c));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, ctrl_c));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .repo_picker_mode = true }, ctrl_c));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .review = .{ .search_mode = true } }, ctrl_c));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .review = .{ .file_search_mode = true } }, ctrl_c));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .commit_panel_mode = true }, ctrl_c));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .repo_picker_mode = true }, ctrl_c));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .repo_picker_mode = true }, ctrl_c));
 }
 
 test "keyToMsg keeps printable text input modes working" {
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'x' }), keyToMsg(TestMsg, .{ .review = .{ .search_mode = true } }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'x' }), keyToMsg(TestMsg, .{ .review = .{ .file_search_mode = true } }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'x' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'q' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 'x' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = ':' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = ':' }).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = 0x1F408 }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 0x1F408 }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'x' }), keyToMsg(.{ .review = .{ .search_mode = true } }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'x' }), keyToMsg(.{ .review = .{ .file_search_mode = true } }, .{ .codepoint = 'x' }).?);
+    try expectMsg(.{ .commit_panel_insert = 'x' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
+    try expectMsg(.{ .repo_picker_insert = 'x' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'x' }).?);
+    try expectMsg(.{ .repo_picker_insert = 'q' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'q' }).?);
+    try expectMsg(.{ .repo_picker_insert = 'x' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 'x' }).?);
+    try expectMsg(.{ .repo_picker_insert = ':' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = ':' }).?);
+    try expectMsg(.{ .repo_picker_insert = 0x1F408 }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, .{ .codepoint = 0x1F408 }).?);
 }
 
 test "keyToMsg prefers generated text for printable text input" {
@@ -801,92 +735,92 @@ test "keyToMsg prefers generated text for printable text input" {
         .text = "1",
     };
 
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = '1' }), keyToMsg(TestMsg, .{ .review = .{ .search_mode = true } }, keypad_one).?);
-    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = '1' }), keyToMsg(TestMsg, .{ .review = .{ .file_search_mode = true } }, keypad_one).?);
-    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = '1' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, keypad_one).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, keypad_one).?);
-    try std.testing.expectEqual(TestMsg{ .repo_picker_insert = '1' }, keyToMsg(TestMsg, .{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, keypad_one).?);
+    try std.testing.expectEqual(reviewMsg(.{ .search_insert = '1' }), keyToMsg(.{ .review = .{ .search_mode = true } }, keypad_one).?);
+    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = '1' }), keyToMsg(.{ .review = .{ .file_search_mode = true } }, keypad_one).?);
+    try expectMsg(.{ .commit_panel_insert = '1' }, keyToMsg(.{ .commit_panel_mode = true }, keypad_one).?);
+    try expectMsg(.{ .repo_picker_insert = '1' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, keypad_one).?);
+    try expectMsg(.{ .repo_picker_insert = '1' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, keypad_one).?);
 }
 
 test "push credential prompt accepts q as text and uses escape to cancel" {
-    try std.testing.expectEqual(TestMsg{ .push_credential_insert = 'q' }, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(TestMsg.push_credential_cancel, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try expectMsg(.{ .push_credential_insert = 'q' }, keyToMsg(.{ .push_credential_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.push_credential_cancel, keyToMsg(.{ .push_credential_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
 }
 
 test "keyToMsg maps push confirmation keys" {
-    try std.testing.expectEqual(TestMsg.confirm_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.cancel_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(TestMsg.cancel_push, keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .push_confirmation_mode = true }, .{ .codepoint = 'P' }));
+    try std.testing.expectEqual(app_message.Msg.confirm_push, keyToMsg(.{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_push, keyToMsg(.{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_push, keyToMsg(.{ .push_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .push_confirmation_mode = true }, .{ .codepoint = 'P' }));
 }
 
 test "keyToMsg maps pull confirmation keys" {
-    try std.testing.expectEqual(TestMsg.confirm_pull, keyToMsg(TestMsg, .{ .pull_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.cancel_pull, keyToMsg(TestMsg, .{ .pull_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(TestMsg.cancel_pull, keyToMsg(TestMsg, .{ .pull_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .pull_confirmation_mode = true }, .{ .codepoint = 'U' }));
+    try std.testing.expectEqual(app_message.Msg.confirm_pull, keyToMsg(.{ .pull_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_pull, keyToMsg(.{ .pull_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_pull, keyToMsg(.{ .pull_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .pull_confirmation_mode = true }, .{ .codepoint = 'U' }));
 }
 
 test "keyToMsg maps push error modal keys" {
-    try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(TestMsg.close_push_error, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(TestMsg.run_interactive_push, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'i' }).?);
-    try std.testing.expectEqual(TestMsg.copy_popup, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'k' }).?);
-    try std.testing.expectEqual(TestMsg.push_error_scroll_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'j' }).?);
-    try std.testing.expectEqual(TestMsg.push_error_scroll_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.up }).?);
-    try std.testing.expectEqual(TestMsg.push_error_scroll_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.down }).?);
-    try std.testing.expectEqual(TestMsg.push_error_page_up, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
-    try std.testing.expectEqual(TestMsg.push_error_page_down, keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .push_error_mode = true }, .{ .codepoint = 'P' }));
+    try std.testing.expectEqual(app_message.Msg.close_push_error, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.close_push_error, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.close_push_error, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.run_interactive_push, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'i' }).?);
+    try std.testing.expectEqual(app_message.Msg.copy_popup, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(app_message.Msg.push_error_scroll_up, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(app_message.Msg.push_error_scroll_down, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(app_message.Msg.push_error_scroll_up, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(app_message.Msg.push_error_scroll_down, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(app_message.Msg.push_error_page_up, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
+    try std.testing.expectEqual(app_message.Msg.push_error_page_down, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'P' }));
 }
 
 test "keyToMsg keeps printable y as editable popup input" {
-    try std.testing.expectEqual(TestMsg{ .commit_panel_insert = 'y' }, keyToMsg(TestMsg, .{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(TestMsg{ .push_credential_insert = 'y' }, keyToMsg(TestMsg, .{ .push_credential_mode = true }, .{ .codepoint = 'y' }).?);
+    try expectMsg(.{ .commit_panel_insert = 'y' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
+    try expectMsg(.{ .push_credential_insert = 'y' }, keyToMsg(.{ .push_credential_mode = true }, .{ .codepoint = 'y' }).?);
 }
 
 test "keyToMsg opens and closes help outside prompt modes" {
-    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{ .codepoint = '?' }).?);
-    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{
+    try std.testing.expectEqual(app_message.Msg.open_help, keyToMsg(.{}, .{ .codepoint = '?' }).?);
+    try std.testing.expectEqual(app_message.Msg.open_help, keyToMsg(.{}, .{
         .codepoint = '/',
         .shifted_codepoint = '?',
         .mods = .{ .shift = true },
     }).?);
-    try std.testing.expectEqual(TestMsg.open_help, keyToMsg(TestMsg, .{}, .{
+    try std.testing.expectEqual(app_message.Msg.open_help, keyToMsg(.{}, .{
         .codepoint = '/',
         .text = "?",
         .mods = .{ .shift = true },
     }).?);
-    try std.testing.expectEqual(reviewMsg(.enter_search), keyToMsg(TestMsg, .{}, .{
+    try std.testing.expectEqual(reviewMsg(.enter_search), keyToMsg(.{}, .{
         .codepoint = '/',
         .text = "/",
     }).?);
-    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = '?' }).?);
-    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{
+    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{ .help_mode = true }, .{ .codepoint = '?' }).?);
+    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{ .help_mode = true }, .{
         .codepoint = '/',
         .shifted_codepoint = '?',
         .mods = .{ .shift = true },
     }).?);
-    try std.testing.expectEqual(TestMsg.close_help, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(TestMsg.help_scroll_up, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'k' }).?);
-    try std.testing.expectEqual(TestMsg.help_scroll_down, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'j' }).?);
-    try std.testing.expectEqual(TestMsg.help_scroll_up, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.up }).?);
-    try std.testing.expectEqual(TestMsg.help_scroll_down, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.down }).?);
-    try std.testing.expectEqual(TestMsg.help_page_up, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
-    try std.testing.expectEqual(TestMsg.help_page_down, keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'x' }));
+    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.help_scroll_up, keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(app_message.Msg.help_scroll_down, keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(app_message.Msg.help_scroll_up, keyToMsg(.{ .help_mode = true }, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(app_message.Msg.help_scroll_down, keyToMsg(.{ .help_mode = true }, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(app_message.Msg.help_page_up, keyToMsg(.{ .help_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
+    try std.testing.expectEqual(app_message.Msg.help_page_down, keyToMsg(.{ .help_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'x' }));
 }
 
 test "keyToMsg ignores command modifiers for help overlay printable shortcuts" {
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'q', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'k', .mods = .{ .alt = true } }));
-    try std.testing.expectEqual(@as(?TestMsg, null), keyToMsg(TestMsg, .{ .help_mode = true }, .{ .codepoint = 'j', .mods = .{ .super = true } }));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'q', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'k', .mods = .{ .alt = true } }));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'j', .mods = .{ .super = true } }));
 }
 
 test "keyToMsg keeps prompt modes above help overlay" {
-    const msg = keyToMsg(TestMsg, .{ .review = .{ .search_mode = true }, .help_mode = true }, .{ .codepoint = '?' }).?;
+    const msg = keyToMsg(.{ .review = .{ .search_mode = true }, .help_mode = true }, .{ .codepoint = '?' }).?;
     try std.testing.expectEqual(reviewMsg(.{ .search_insert = '?' }), msg);
 }
 

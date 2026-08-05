@@ -9,16 +9,21 @@ const app_commit_panel = @import("../commit_panel.zig");
 const app_load = @import("../load.zig");
 const app_message = @import("../message.zig");
 const app_push_retry = @import("../push_retry.zig");
+const app_shell_layout = @import("../shell_layout.zig");
 const app_state = @import("../state.zig");
 const app_test_support = @import("../test_support.zig");
 const effect_origin = @import("../effect_origin.zig");
 const page = @import("../page.zig");
 const repo_session = @import("../repo_session.zig");
 const review_page = @import("../pages/review.zig");
+const review_action_fence = @import("../pages/review/action_fence.zig");
 const repository_selection = @import("../pages/repository/selection.zig");
 const review_selection_model = @import("../diff_surface/selection.zig");
 const review_reload = @import("../pages/review/reload.zig");
 const review_navigation = @import("../pages/review/navigation.zig");
+const review_operations = @import("../pages/review/operations.zig");
+const review_authority = @import("../diff_surface/authority.zig");
+const shell_effects = @import("../shell_effects.zig");
 const workflow_remote = @import("../workflow/remote.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_source = @import("../../diff/source.zig");
@@ -27,9 +32,9 @@ const git_ops = @import("../git_ops.zig");
 const git_status = @import("../../git/status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
+const action_lifecycle = @import("../workflow/action_lifecycle.zig");
 
 const App = app_mod.App;
-const app_testing = app_mod.testing;
 
 const test_action_root_identity: repo_root_capability.Identity = .{ .device = 41, .inode = 73 };
 
@@ -87,7 +92,199 @@ fn beginAcceptedTestAction(
     app: *App,
     kind: app_actions.ActionKind,
 ) app_actions.PendingAction {
-    return app_testing.installAcceptedActionFixture(app, kind);
+    if (app.allocator == null) app.allocator = std.testing.allocator;
+    const prepared = actionLifecycle(app).prepare(kind);
+    return actionLifecycle(app).acceptSpawn(app.allocator.?, prepared).pending;
+}
+
+fn actionLifecycle(app: *App) action_lifecycle.Controller {
+    return .{ .runtime = &app.action_runtime, .fence = reviewActionFence(app) };
+}
+
+fn reviewActionFence(app: *App) review_action_fence.Controller {
+    return .{
+        .read_authority = &app.pages.review.repository_read_authority,
+        .activation = &app.pages.review.activation,
+        .action_cursor = &app.pages.review.action_cursor,
+        .auto_reload = &app.pages.review.auto_reload,
+        .review_projection = &app.pages.review.review_projection,
+        .deferred_projection_apply = &app.pages.review.deferred_projection_apply,
+    };
+}
+
+fn activateReview(app: *App) u64 {
+    const source_member: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+        switch (app.pages.review.load.state) {
+            .loaded, .empty => .immutable,
+            .loading => .pending,
+            .failed => .failed,
+            .idle => .pending,
+        }
+    else
+        .pending;
+    const auxiliary: review_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
+    return app.pages.review.activation.activate(app.repo_session.view().epoch(), source_member, auxiliary, auxiliary);
+}
+
+fn reviewNavigationView(app: *const App) review_navigation.View {
+    const body = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true }).bodySize();
+    const repo = app.repo_session.view();
+    return .{
+        .page = &app.pages.review,
+        .repo_root = repo.activeRoot(),
+        .repo_epoch = repo.epoch(),
+        .root_identity = repo.activeIdentity(),
+        .source = app.config.source,
+        .layout = .{ .width = body.width, .height = body.height },
+    };
+}
+
+fn reviewNavigation(app: *App) review_navigation.Controller {
+    const view = reviewNavigationView(app);
+    return .{
+        .page = &app.pages.review,
+        .repo_root = view.repo_root,
+        .repo_epoch = view.repo_epoch,
+        .root_identity = view.root_identity,
+        .source = view.source,
+        .layout = view.layout,
+        .diagnostics = .{ .target = &app.pages.review.status },
+    };
+}
+
+fn reviewReload(app: *App) review_reload.Controller {
+    const repo = app.repo_session.view();
+    return .{
+        .page = &app.pages.review,
+        .navigation = reviewNavigation(app),
+        .source = app.config.source,
+        .repo_root = repo.activeRoot(),
+        .repo_epoch = repo.epoch(),
+        .root_identity = repo.activeIdentity(),
+    };
+}
+
+fn reviewOperations(app: *const App) review_operations.View {
+    return .{
+        .page = &app.pages.review,
+        .navigation = reviewNavigationView(app),
+        .source = app.config.source,
+        .repo_root = app.repo_session.view().activeRoot(),
+        .activation_state = app.pages.review.activation.state,
+    };
+}
+
+fn reviewOperationController(app: *App) review_operations.Controller {
+    return .{
+        .page = &app.pages.review,
+        .navigation = reviewNavigation(app),
+        .view_state = reviewOperations(app),
+    };
+}
+
+fn shellEffectOrigins(app: *const App) shell_effects.OriginContext {
+    const repo_epoch = app.repo_session.view().epoch();
+    const review_identity = app.pages.review.activation.currentIdentity();
+    const compare_identity = app.pages.compare.activation.currentIdentity();
+    return .{
+        .snapshot = .{
+            .active_page = app.active_page,
+            .repo_epoch = repo_epoch,
+            .review_activation_id = app.pages.review.activation.next_activation_id,
+            .repository_activation_id = app.pages.repository.activation_id,
+            .compare_activation_id = app.pages.compare.activation.next_activation_id,
+            .push_error_instance_id = if (app.overlay.isPushError()) app.overlay.push_error_instance_id else null,
+            .commit_panel_instance_id = app.local_workflow.view().commitPanelInstanceId(),
+        },
+        .review_repo_epoch = if (review_identity) |identity| identity.repo_epoch else repo_epoch,
+        .repository_repo_epoch = app.pages.repository.repo_epoch,
+        .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
+    };
+}
+
+fn currentReviewActionRoot(app: *const App) ?[]const u8 {
+    if (app.active_page != .review or app.pages.review.activation.currentIdentity() == null or diff_source.sourceIsOneShotInput(app.config.source)) return null;
+    return app.repo_session.view().activeRoot();
+}
+
+fn remoteWorkflow(app: *App) workflow_remote.Controller {
+    const origins = shellEffectOrigins(app);
+    return .{
+        .state = &app.remote_workflow,
+        .lifecycle = actionLifecycle(app),
+        .operations = reviewOperationController(app),
+        .repo_epoch = app.repo_session.view().epoch(),
+        .current_review_root = currentReviewActionRoot(app),
+        .env_map = app.env_map,
+        .active_page = app.active_page,
+        .review_origin = origins.review(),
+        .effect_snapshot = origins.snapshot,
+        .status = &app.pages.review.status,
+        .overlay = &app.overlay,
+        .redraw = .{ .skip_requested = &app.redraw_plan.skip_requested },
+    };
+}
+
+fn shellEffects(app: *App) shell_effects.Controller {
+    return .{
+        .state = &app.shell_effects_state,
+        .user_config = &app.user_config,
+        .env_map = app.env_map,
+        .origins = shellEffectOrigins(app),
+        .diagnostics = .{
+            .shell = &app.status,
+            .review = &app.pages.review.status,
+            .repository = &app.pages.repository.status,
+            .compare = &app.pages.compare.status,
+        },
+        .redraw = .{ .skip_requested = &app.redraw_plan.skip_requested },
+    };
+}
+
+fn copySourceSelection(app: *App, ctx: *chasen.Ctx(App.Msg), text: []const u8) void {
+    shellEffects(app).queueClipboard(ctx, .{
+        .origin = .{ .page = shellEffects(app).repositoryOrigin() },
+        .label = "source selection",
+        .text = text,
+    });
+}
+
+fn copySourceHeaderPath(app: *App, ctx: *chasen.Ctx(App.Msg), path: []const u8) void {
+    shellEffects(app).queueClipboard(ctx, .{
+        .origin = .{ .page = shellEffects(app).repositoryOrigin() },
+        .label = "file path",
+        .text = path,
+    });
+}
+
+fn repoSession(app: *App) repo_session.Controller {
+    const home = if (app.env_map) |map| blk: {
+        const value = map.get("HOME") orelse break :blk null;
+        break :blk if (value.len == 0) null else value;
+    } else null;
+    return .{
+        .state = &app.repo_session,
+        .status = &app.status,
+        .active_page = app.active_page,
+        .source = app.config.source,
+        .home = home,
+        .action_pending = app.action_runtime.view().hasPending(),
+        .review = .{ .page = &app.pages.review, .navigation = reviewNavigation(app), .reload = reviewReload(app) },
+        .repository = .{ .page = &app.pages.repository },
+        .compare = .{ .page = &app.pages.compare },
+        .shell = app.remote_workflow.repositoryInvalidationPort(&app.overlay),
+    };
+}
+
+fn commitDiscovery(
+    app: *App,
+    allocator: std.mem.Allocator,
+    result: repo_discovery.DiscoveryResult,
+    active_index: usize,
+    origin: repo_session.CommitOrigin,
+) !repo_session.CommitOutcome {
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    return repoSession(app).commitDiscovered(&ctx, result, active_index, origin);
 }
 
 fn mutationFenceRepoTestApp(
@@ -104,7 +301,7 @@ fn mutationFenceRepoTestApp(
     };
     errdefer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(repo_root);
-    app_testing.activateReview(&app);
+    _ = activateReview(&app);
     return app;
 }
 
@@ -124,7 +321,7 @@ fn replaceMutationFenceTestRepo(
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(repo_root);
     app.repo_session.repo_epoch +%= 1;
     app.pages.review.activation.deactivate();
-    app_testing.activateReview(app);
+    _ = activateReview(app);
 }
 
 fn installInteractivePushRetryForFenceTest(
@@ -133,7 +330,7 @@ fn installInteractivePushRetryForFenceTest(
     repo_root: []const u8,
     oid: []const u8,
 ) !void {
-    try app_testing.setPushErrorWithRetry(app, allocator, "failed", .{
+    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(app), allocator, "failed", .{
         .mode = .set_upstream,
         .repo_root = try allocator.dupe(u8, repo_root),
         .branch = try allocator.dupe(u8, "main"),
@@ -150,14 +347,15 @@ fn installTestActionCursor(
     path_key: []const u8,
     action_generation: u64,
 ) !void {
-    try app_testing.installActionCursor(
-        app,
+    const identity = app.repo_session.view().activeIdentity() orelse test_action_root_identity;
+    var prepared = try reviewNavigation(app).prepareActionCursor(
         allocator,
+        app.repo_session.view().epoch(),
+        identity,
         kind,
         path_key,
-        action_generation,
-        test_action_root_identity,
     );
+    reviewNavigation(app).installActionCursor(allocator, &prepared, action_generation);
 }
 
 fn testSessionHunkMarkKey(
@@ -327,7 +525,7 @@ test "Review mutation read fence follows interactive foreground queue and termin
         var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
         defer app.pages.review.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        defer app_testing.clearPushError(&app, allocator);
+        defer remoteWorkflow(&app).clearPushError(allocator);
         try installInteractivePushRetryForFenceTest(
             &app,
             allocator,
@@ -344,10 +542,10 @@ test "Review mutation read fence follows interactive foreground queue and termin
             .finished = DummyForeground.done,
         });
 
-        try app_testing.runInteractivePush(&app, &ctx);
+        try app.update(.run_interactive_push, &ctx);
         try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
 
-        try std.testing.expect(!app_testing.actionView(&app).hasPending());
+        try std.testing.expect(!app.action_runtime.view().hasPending());
         try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
         try std.testing.expect(
             app.pages.review.repository_read_authority.mayStartRepositoryRead(),
@@ -370,7 +568,7 @@ test "Review mutation read fence follows interactive foreground queue and termin
         var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
         defer app.pages.review.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        defer app_testing.clearPushError(&app, allocator);
+        defer remoteWorkflow(&app).clearPushError(allocator);
         try installInteractivePushRetryForFenceTest(
             &app,
             allocator,
@@ -383,7 +581,7 @@ test "Review mutation read fence follows interactive foreground queue and termin
         defer ctx.runtimeClearPendingEffectCopies();
         defer clearPendingRepositoryTasks(&ctx, allocator);
 
-        try app_testing.runInteractivePush(&app, &ctx);
+        try app.update(.run_interactive_push, &ctx);
         try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
         const fence_closed =
             !app.pages.review.repository_read_authority.mayStartRepositoryRead();
@@ -402,7 +600,7 @@ test "Review mutation read fence follows interactive foreground queue and termin
 
         try std.testing.expect(fence_closed);
         try std.testing.expect(epoch_advanced);
-        try std.testing.expect(!app_testing.actionView(&app).hasPending());
+        try std.testing.expect(!app.action_runtime.view().hasPending());
         try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
         try std.testing.expect(
             app.pages.review.repository_read_authority.mayStartRepositoryRead(),
@@ -419,7 +617,7 @@ test "Review mutation read fence follows interactive foreground queue and termin
         var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
         defer app.pages.review.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        defer app_testing.clearPushError(&app, allocator);
+        defer remoteWorkflow(&app).clearPushError(allocator);
         try installInteractivePushRetryForFenceTest(
             &app,
             allocator,
@@ -430,7 +628,7 @@ test "Review mutation read fence follows interactive foreground queue and termin
         defer ctx.runtimeClearPendingEffectCopies();
         defer clearPendingRepositoryTasks(&ctx, allocator);
 
-        try app_testing.runInteractivePush(&app, &ctx);
+        try app.update(.run_interactive_push, &ctx);
         try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
         const fence_closed =
             !app.pages.review.repository_read_authority.mayStartRepositoryRead();
@@ -445,13 +643,13 @@ test "Review mutation read fence follows interactive foreground queue and termin
         try app.update(completion, &ctx);
 
         try std.testing.expect(fence_closed);
-        try std.testing.expect(!app_testing.actionView(&app).hasPending());
+        try std.testing.expect(!app.action_runtime.view().hasPending());
         try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
         try std.testing.expect(
             app.pages.review.repository_read_authority.mayStartRepositoryRead(),
         );
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-        try std.testing.expectEqualStrings(roots.a, app_testing.repoView(&app).activeRoot().?);
+        try std.testing.expectEqualStrings(roots.a, app.repo_session.view().activeRoot().?);
     }
 }
 
@@ -459,15 +657,15 @@ test "Review mutation read fence follows credentialed push queue acceptance" {
     const allocator = std.testing.allocator;
     var app: App = .{ .allocator = allocator };
     defer app.pages.review.deinit(allocator);
-    defer app_testing.clearPushError(&app, allocator);
-    app_testing.activateReview(&app);
+    defer remoteWorkflow(&app).clearPushError(allocator);
+    _ = activateReview(&app);
     try installPushCredentialPromptForTest(&app, allocator);
     const epoch_before_launch = app.pages.review.repository_read_authority.epoch;
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer ctx.runtimeClearPendingEffectCopies();
-    try app_testing.submitPushCredentials(&app, &ctx);
-    const owner = app_testing.actionView(&app).acceptedPending() orelse return error.ExpectedPendingAction;
+    try app.update(.push_credential_submit, &ctx);
+    const owner = app.action_runtime.view().acceptedPending() orelse return error.ExpectedPendingAction;
     const fence_closed =
         !app.pages.review.repository_read_authority.mayStartRepositoryRead();
     const epoch_advanced =
@@ -485,7 +683,7 @@ test "Review mutation read fence follows credentialed push queue acceptance" {
     try std.testing.expectEqual(app_actions.ActionKind.push, owner.kind);
     try std.testing.expect(fence_closed);
     try std.testing.expect(epoch_advanced);
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 
@@ -525,7 +723,7 @@ test "Review mutation read fence follows credentialed push queue acceptance" {
 
     try std.testing.expectError(
         error.OutOfMemory,
-        app_testing.requestRemotePush(&failure_app, &failing_ctx),
+        failure_app.update(.{ .review = .request_push }, &failing_ctx),
     );
     try std.testing.expect(failure_app.local_workflow.discard_confirmation == null);
     try std.testing.expect(!failure_app.overlay.isDiscardFile());
@@ -553,7 +751,7 @@ test "Review mutation read fence follows credentialed push queue acceptance" {
 
     try std.testing.expectError(
         error.TaskLimitExceeded,
-        app_testing.requestRemoteBranchSwitch(&failure_app, &saturated_ctx),
+        failure_app.update(.{ .review = .request_branch_switch }, &saturated_ctx),
     );
     try std.testing.expect(failure_app.local_workflow.discard_confirmation == null);
     try std.testing.expect(!failure_app.remote_workflow.branch_switch.hasState());
@@ -578,7 +776,7 @@ test "repository selection copy uses Repository origin without opening AI UI" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
 
-    app_testing.copySourceSelection(&app, &ctx, "selected source");
+    copySourceSelection(&app, &ctx, "selected source");
 
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
     const entry = ctx._pending_clipboard_copies[0];
@@ -607,7 +805,7 @@ test "repository source header copy uses byte-exact Repository clipboard effect"
     defer ctx.runtimeClearPendingEffectCopies();
     const path = "src/\xff-main.zig";
 
-    app_testing.copySourceHeaderPath(&app, &ctx, path);
+    copySourceHeaderPath(&app, &ctx, path);
 
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
     const entry = ctx._pending_clipboard_copies[0];
@@ -661,7 +859,7 @@ test "repository selection clipboard queue failure retains page candidate" {
         });
     }
 
-    app_testing.copySourceSelection(&app, &ctx, app.pages.repository.completed_selection.?.text);
+    copySourceSelection(&app, &ctx, app.pages.repository.completed_selection.?.text);
 
     try std.testing.expectEqual(@as(u8, 4), ctx._pending_clipboard_copies_len);
     try std.testing.expectEqual(@as(usize, 0), app.shell_effects_state.clipboard_copies.count());
@@ -682,7 +880,7 @@ test "copyPopup queues push error message text" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
 
-    app_testing.copyPopup(&app, &ctx);
+    try app.update(.copy_popup, &ctx);
 
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
     const entry = ctx._pending_clipboard_copies[0];
@@ -697,7 +895,7 @@ test "copyPopup reports empty target outside copyable popup" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
 
-    app_testing.copyPopup(&app, &ctx);
+    try app.update(.copy_popup, &ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
     try std.testing.expectEqualStrings("nothing to copy: popup", app.status.text());
@@ -715,7 +913,7 @@ test "copyCommitMessage queues formatted commit message text" {
     app.local_workflow.commit_panel.open(.commit);
     app.local_workflow.commit_panel.replaceDraft("  subject  ", "  body\n\nline two  ");
 
-    app_testing.copyCommitMessage(&app, &ctx);
+    try app.update(.copy_commit_message, &ctx);
 
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
     const entry = ctx._pending_clipboard_copies[0];
@@ -737,7 +935,7 @@ test "copyCommitMessage uses same commit panel state for amend mode" {
     app.local_workflow.commit_panel.open(.amend);
     app.local_workflow.commit_panel.replaceDraft("amend subject", null);
 
-    app_testing.copyCommitMessage(&app, &ctx);
+    try app.update(.copy_commit_message, &ctx);
 
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
     try std.testing.expectEqualStrings("amend subject", ctx._pending_clipboard_copies[0].text);
@@ -755,7 +953,7 @@ test "copyCommitMessage preserves body-only formatMessage shape" {
     app.local_workflow.commit_panel.open(.commit);
     app.local_workflow.commit_panel.replaceDraft("", "body");
 
-    app_testing.copyCommitMessage(&app, &ctx);
+    try app.update(.copy_commit_message, &ctx);
 
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
     try std.testing.expectEqualStrings("\n\nbody", ctx._pending_clipboard_copies[0].text);
@@ -769,13 +967,13 @@ test "copyCommitMessage reports empty draft and closed panel" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
 
-    app_testing.copyCommitMessage(&app, &ctx);
+    try app.update(.copy_commit_message, &ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
     try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
 
     app.local_workflow.commit_panel.open(.commit);
-    app_testing.copyCommitMessage(&app, &ctx);
+    try app.update(.copy_commit_message, &ctx);
 
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
     try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
@@ -794,14 +992,14 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
             } } },
         },
     };
-    app_testing.activateReview(&app);
+    _ = activateReview(&app);
     defer app.pages.review.reviewed_store.deinit(allocator);
     defer app.pages.review.staged_hunks.deinit(allocator);
-    defer app_testing.clearActionCursor(&app, allocator);
+    defer reviewNavigation(&app).clearActionCursor(allocator);
     defer app.pages.review.tree_order.deinit(allocator);
     defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
 
-    try app.pages.review.reviewed_store.set(allocator, app_testing.repoView(&app).activeRoot(), app_test_support.files_two[0], true);
+    try app.pages.review.reviewed_store.set(allocator, app.repo_session.view().activeRoot(), app_test_support.files_two[0], true);
     try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", testSessionHunkMarkKey(1, 0));
     try installTestActionCursor(&app, allocator, .file, "a", 99);
     setDiffSearchQuery(&app, "needle");
@@ -810,16 +1008,16 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app_testing.finishSwitchBranch(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .switch_branch = .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .old_branch = try allocator.dupe(u8, "main"),
         .new_branch = try allocator.dupe(u8, "feature"),
         .result = .ok,
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
-    try std.testing.expect(!try app.pages.review.reviewed_store.containsFile(allocator, app_testing.repoView(&app).activeRoot(), app_test_support.files_two[0]));
+    try std.testing.expect(!app.action_runtime.view().hasPending());
+    try std.testing.expect(!try app.pages.review.reviewed_store.containsFile(allocator, app.repo_session.view().activeRoot(), app_test_support.files_two[0]));
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
     try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.query.len);
@@ -855,15 +1053,15 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
     const pending = beginAcceptedTestAction(&app, .switch_branch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    try app_testing.finishSwitchBranch(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .switch_branch = .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .old_branch = try allocator.dupe(u8, "main"),
         .new_branch = try allocator.dupe(u8, "feature"),
         .result = .ok,
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(!try app.pages.review.reviewed_store.containsFile(allocator, "/repo", app_test_support.files_two[0]));
     try std.testing.expect(try app.pages.review.reviewed_store.containsFile(allocator, "/other", app_test_support.files_two[1]));
     try std.testing.expect(!app.pages.review.staged_hunks.containsExact("/repo", "a", old_key));
@@ -886,7 +1084,7 @@ test "finishPush does not reload a stale active repository" {
     const pending = beginAcceptedTestAction(&app, .push);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app_testing.finishPush(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .push = .{
         .pending = pending,
         .mode = .set_upstream,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
@@ -895,9 +1093,9 @@ test "finishPush does not reload a stale active repository" {
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .ok,
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending == null);
     try std.testing.expectEqualStrings("pushed: /repo", app.pages.review.status.text());
 }
@@ -916,7 +1114,7 @@ test "finishPull does not reload a stale active repository" {
     const pending = beginAcceptedTestAction(&app, .pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app_testing.finishPull(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
@@ -924,9 +1122,9 @@ test "finishPull does not reload a stale active repository" {
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .ok,
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending == null);
     try std.testing.expectEqualStrings("pulled: /repo", app.pages.review.status.text());
 }
@@ -942,12 +1140,12 @@ test "finishPull reloads matching active repo after up-to-date success" {
             } } },
         },
     };
-    app_testing.activateReview(&app);
+    _ = activateReview(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
 
-    try app_testing.finishPull(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
@@ -955,9 +1153,9 @@ test "finishPull reloads matching active repo after up-to-date success" {
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .{ .ok_static = "nothing to pull" },
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending != null);
     try std.testing.expectEqualStrings("nothing to pull", app.pages.review.status.text());
 }
@@ -973,12 +1171,12 @@ test "finishPull reloads matching active repo after failure" {
             } } },
         },
     };
-    app_testing.activateReview(&app);
+    _ = activateReview(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
 
-    try app_testing.finishPull(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
@@ -986,9 +1184,9 @@ test "finishPull reloads matching active repo after failure" {
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .{ .failed_static = "remote unavailable" },
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending != null);
     try std.testing.expectEqualStrings("pull failed: remote unavailable", app.pages.review.status.text());
 }
@@ -1007,14 +1205,14 @@ test "finishFetch does not reload a stale active repository" {
     const pending = beginAcceptedTestAction(&app, .fetch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app_testing.finishFetch(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .fetch = .{
         .pending = pending,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .result = .ok,
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending == null);
     try std.testing.expectEqualStrings("fetched: /repo", app.pages.review.status.text());
 }
@@ -1030,19 +1228,19 @@ test "finishFetch reloads matching active repo after failure" {
             } } },
         },
     };
-    app_testing.activateReview(&app);
+    _ = activateReview(&app);
     const pending = beginAcceptedTestAction(&app, .fetch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
 
-    try app_testing.finishFetch(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .fetch = .{
         .pending = pending,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .result = .{ .failed_static = "remote unavailable" },
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending != null);
     try std.testing.expectEqualStrings("fetch failed: remote unavailable", app.pages.review.status.text());
 }
@@ -1053,15 +1251,15 @@ test "repository supersession invalidates an in-flight push inspection" {
     defer roots.deinit();
     var app: App = .{ .allocator = allocator };
     defer app.repo_session.deinit(allocator);
-    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try app_testing.commitDiscovery(
+    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try commitDiscovery(
         &app,
         allocator,
         try testSingleRepoDiscovery(allocator, roots.a),
         0,
         .external_selection,
     ));
-    app_testing.activateReview(&app);
-    try app_testing.setPushErrorWithRetry(&app, allocator, "failed", .{
+    _ = activateReview(&app);
+    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
         .mode = .upstream,
         .repo_root = try allocator.dupe(u8, "/missing/repo"),
         .branch = try allocator.dupe(u8, "main"),
@@ -1071,8 +1269,8 @@ test "repository supersession invalidates an in-flight push inspection" {
     }, false);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
-    try app_testing.runInteractivePush(&app, &ctx);
-    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try app_testing.commitDiscovery(
+    try app.update(.run_interactive_push, &ctx);
+    try std.testing.expectEqual(repo_session.CommitOutcome.changed, try commitDiscovery(
         &app,
         allocator,
         try testSingleRepoDiscovery(allocator, roots.b),
@@ -1082,15 +1280,15 @@ test "repository supersession invalidates an in-flight push inspection" {
     try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expectEqualStrings(roots.b, app_testing.repoView(&app).activeRoot().?);
+    try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
     try std.testing.expect(app.remote_workflow.push_error_message == null);
 }
 
 test "direct root quit remains allowed while push inspection is running" {
     const allocator = std.testing.allocator;
     var app: App = .{ .allocator = allocator };
-    defer app_testing.clearPushError(&app, allocator);
-    try app_testing.setPushErrorWithRetry(&app, allocator, "failed", .{
+    defer remoteWorkflow(&app).clearPushError(allocator);
+    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
         .mode = .upstream,
         .repo_root = try allocator.dupe(u8, "/missing/repo"),
         .branch = try allocator.dupe(u8, "main"),
@@ -1100,7 +1298,7 @@ test "direct root quit remains allowed while push inspection is running" {
     }, false);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
-    try app_testing.runInteractivePush(&app, &ctx);
+    try app.update(.run_interactive_push, &ctx);
     try app.update(.quit, &ctx);
 
     try std.testing.expect(ctx.shouldQuit());
@@ -1111,9 +1309,9 @@ test "direct root quit remains allowed while push inspection is running" {
 test "push inspection surface blocks page switching until canceled" {
     const allocator = std.testing.allocator;
     var app: App = .{ .allocator = allocator };
-    defer app_testing.clearPushError(&app, allocator);
-    app_testing.activateReview(&app);
-    try app_testing.setPushErrorWithRetry(&app, allocator, "failed", .{
+    defer remoteWorkflow(&app).clearPushError(allocator);
+    _ = activateReview(&app);
+    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
         .mode = .upstream,
         .repo_root = try allocator.dupe(u8, "/missing/repo"),
         .branch = try allocator.dupe(u8, "main"),
@@ -1123,12 +1321,12 @@ test "push inspection surface blocks page switching until canceled" {
     }, false);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
-    try app_testing.runInteractivePush(&app, &ctx);
+    try app.update(.run_interactive_push, &ctx);
     try app.update(.{ .switch_page = .repository }, &ctx);
 
     try std.testing.expectEqual(page.Id.review, app.active_page);
     try std.testing.expectEqualStrings("close push error before switching pages", app.status.text());
-    app_testing.clearPushError(&app, allocator);
+    remoteWorkflow(&app).clearPushError(allocator);
     try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
 
     app.status.clear();
@@ -1173,9 +1371,9 @@ test "push inspection surface blocks page switching until canceled" {
 test "inactive Review accepts push inspection diagnostic without redraw" {
     const allocator = std.testing.allocator;
     var app: App = .{ .allocator = allocator };
-    defer app_testing.clearPushError(&app, allocator);
-    app_testing.activateReview(&app);
-    try app_testing.setPushErrorWithRetry(&app, allocator, "failed", .{
+    defer remoteWorkflow(&app).clearPushError(allocator);
+    _ = activateReview(&app);
+    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
         .mode = .upstream,
         .repo_root = try allocator.dupe(u8, "/missing/repo"),
         .branch = try allocator.dupe(u8, "main"),
@@ -1185,7 +1383,7 @@ test "inactive Review accepts push inspection diagnostic without redraw" {
     }, false);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
-    try app_testing.runInteractivePush(&app, &ctx);
+    try app.update(.run_interactive_push, &ctx);
     app.active_page = .repository;
     try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
 
@@ -1206,7 +1404,7 @@ test "finishPushForeground reloads matching active repo after failure" {
             } } },
         },
     };
-    app_testing.activateReview(&app);
+    _ = activateReview(&app);
     const pending = beginAcceptedTestAction(&app, .push);
     app.remote_workflow.push_retry.state = .{ .foreground = .{
         .request_id = .{ .id = 9 },
@@ -1224,12 +1422,12 @@ test "finishPushForeground reloads matching active repo after failure" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app_testing.finishPushForeground(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .push_foreground = .{
         .request_id = .{ .id = 9 },
         .outcome = .{ .exited = 1 },
-    });
+    } } }, &ctx);
 
-    try std.testing.expect(!app_testing.actionView(&app).hasPending());
+    try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
     try std.testing.expectEqualStrings("interactive push exited: 1", app.pages.review.status.text());
@@ -1260,10 +1458,10 @@ test "inactive Review foreground completions retain diagnostics without effects"
     } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    try app_testing.finishPushForeground(&app, &ctx, .{
+    try app.update(.{ .action_finished = .{ .push_foreground = .{
         .request_id = .{ .id = 7 },
         .outcome = .{ .exited = 1 },
-    });
+    } } }, &ctx);
 
     try std.testing.expectEqualStrings("interactive push exited for /repo: 1", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
@@ -1274,10 +1472,10 @@ test "inactive Review foreground completions retain diagnostics without effects"
         .request_id = .{ .id = 8 },
         .origin = .{ .page_id = .review, .repo_epoch = 3, .activation_id = 0 },
     };
-    try app_testing.finishEditorCommand(&app, &ctx, .{
+    try app.update(.{ .shell_effect_finished = .{ .editor = .{
         .request_id = .{ .id = 8 },
         .outcome = .{ .exited = 0 },
-    });
+    } } }, &ctx);
 
     try std.testing.expectEqualStrings("editor closed", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
@@ -1301,10 +1499,10 @@ test "inactive Review foreground completions retain diagnostics without effects"
     var active_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&active_ctx, allocator);
 
-    try app_testing.finishEditorCommand(&active_app, &active_ctx, .{
+    try active_app.update(.{ .shell_effect_finished = .{ .editor = .{
         .request_id = .{ .id = 9 },
         .outcome = .{ .exited = 0 },
-    });
+    } } }, &active_ctx);
 
     try std.testing.expect(active_app.shell_effects_state.editor_foreground == null);
     try std.testing.expectEqualStrings("editor closed", active_app.pages.review.status.text());
