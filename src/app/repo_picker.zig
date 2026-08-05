@@ -13,11 +13,11 @@ pub const ItemSource = union(enum) {
 };
 
 pub const Item = struct {
-    label: []u8,
-    detail: []u8,
+    label: []const u8,
+    detail: []const u8,
     source: ItemSource,
 
-    pub fn deinit(self: *Item, allocator: std.mem.Allocator) void {
+    fn deinit(self: *Item, allocator: std.mem.Allocator) void {
         allocator.free(self.label);
         allocator.free(self.detail);
         self.* = undefined;
@@ -25,6 +25,21 @@ pub const Item = struct {
 };
 
 pub const ItemList = std.ArrayList(Item);
+
+pub const DiscoveryKind = enum {
+    none,
+    single_repo,
+    workspace,
+};
+
+pub fn discoveryKind(value: ?repo_discovery.DiscoveryResult) DiscoveryKind {
+    const result = value orelse return .none;
+    return switch (result) {
+        .none => .none,
+        .single_repo => .single_repo,
+        .workspace => .workspace,
+    };
+}
 
 pub const EditResult = enum {
     none,
@@ -40,8 +55,10 @@ pub fn refreshFilter(
     pending_discovery: ?repo_discovery.DiscoveryResult,
     active_discovery: ?repo_discovery.DiscoveryResult,
     recent: *const repo_state.RecentStore,
+    query: []const u8,
 ) !void {
-    clearItems(items, allocator);
+    var next_items: ItemList = .empty;
+    errdefer deinitItems(&next_items, allocator);
 
     var labels: std.ArrayList([]const u8) = .empty;
     defer labels.deinit(allocator);
@@ -50,7 +67,7 @@ pub fn refreshFilter(
         switch (discovery) {
             .workspace => |workspace| {
                 for (workspace.repos, 0..) |repo, index| {
-                    try appendItem(allocator, items, repo.label, repo.canonical_root, .{ .pending_workspace_repo = index });
+                    try appendItem(allocator, &next_items, repo.label, repo.canonical_root, .{ .pending_workspace_repo = index });
                 }
             },
             .single_repo, .none => {},
@@ -58,11 +75,11 @@ pub fn refreshFilter(
     } else if (active_discovery) |discovery| {
         switch (discovery) {
             .single_repo => |entry| {
-                try appendItem(allocator, items, entry.label, entry.canonical_root, .active_repo);
+                try appendItem(allocator, &next_items, entry.label, entry.canonical_root, .active_repo);
             },
             .workspace => |workspace| {
                 for (workspace.repos, 0..) |repo, index| {
-                    try appendItem(allocator, items, repo.label, repo.canonical_root, .{ .workspace_repo = index });
+                    try appendItem(allocator, &next_items, repo.label, repo.canonical_root, .{ .workspace_repo = index });
                 }
             },
             .none => {},
@@ -70,22 +87,32 @@ pub fn refreshFilter(
     }
 
     for (recent.entries.items, 0..) |entry, index| {
-        if (alreadyHasPath(pending_discovery, active_discovery, items.items, entry.path)) continue;
+        if (alreadyHasPath(pending_discovery, active_discovery, next_items.items, entry.path)) continue;
         const source: ItemSource = switch (entry.kind) {
             .repo => .{ .recent_repo = index },
             .workspace => .{ .recent_workspace = index },
         };
-        try appendItem(allocator, items, std.fs.path.basename(entry.path), entry.path, source);
+        try appendItem(allocator, &next_items, std.fs.path.basename(entry.path), entry.path, source);
     }
 
-    for (items.items) |item| {
+    for (next_items.items) |item| {
         try labels.append(allocator, item.label);
     }
 
     // ListFilter owns filtered indexes; labels remain borrowed from items,
     // which must outlive the filter until the picker is refreshed or closed.
-    const query = if (picker.input_mode == .filter) picker.list.input.slice() else "";
-    try picker.list.filter.apply(allocator, labels.items, query);
+    var next_filter: @TypeOf(picker.list.filter) = .{};
+    errdefer next_filter.deinit(allocator);
+    try next_filter.apply(allocator, labels.items, query);
+
+    var previous_items = items.*;
+    var previous_filter = picker.list.filter;
+    items.* = next_items;
+    next_items = .empty;
+    picker.list.filter = next_filter;
+    next_filter = .{};
+    previous_filter.deinit(allocator);
+    deinitItems(&previous_items, allocator);
 }
 
 pub fn focusOnActive(picker: *app_prompt.RepoPickerState, items: []const Item, active_index: usize) void {
@@ -206,24 +233,18 @@ pub fn hasPathInput(picker: *const app_prompt.RepoPickerState) bool {
 
 pub fn listTitle(
     allocator: std.mem.Allocator,
-    pending_discovery: ?repo_discovery.DiscoveryResult,
-    active_discovery: ?repo_discovery.DiscoveryResult,
-    recent: *const repo_state.RecentStore,
+    pending_workspace_root: ?[]const u8,
+    active_discovery_kind: DiscoveryKind,
+    has_recent: bool,
 ) ![]const u8 {
-    if (pending_discovery) |discovery| {
-        return switch (discovery) {
-            .workspace => |workspace| try std.fmt.allocPrint(allocator, "Repositories in {s}", .{workspace.current_root}),
-            .single_repo, .none => "Repositories",
-        };
+    if (pending_workspace_root) |root| {
+        return try std.fmt.allocPrint(allocator, "Repositories in {s}", .{root});
     }
-    if (active_discovery) |discovery| {
-        return switch (discovery) {
-            .workspace => "Workspace repositories",
-            .single_repo => if (recent.entries.items.len > 0) "Current and recent repositories" else "Current repository",
-            .none => "Recent repositories",
-        };
-    }
-    return "Recent repositories";
+    return switch (active_discovery_kind) {
+        .workspace => "Workspace repositories",
+        .single_repo => if (has_recent) "Current and recent repositories" else "Current repository",
+        .none => "Recent repositories",
+    };
 }
 
 pub fn appendItem(allocator: std.mem.Allocator, items: *ItemList, label: []const u8, detail: []const u8, source: ItemSource) !void {

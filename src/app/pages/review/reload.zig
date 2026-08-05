@@ -1539,6 +1539,11 @@ pub const Controller = struct {
         deferred.deinit(allocator);
     }
 
+    pub fn clearDeferredProjectionApply(self: Controller, allocator: std.mem.Allocator) void {
+        if (self.page.deferred_projection_apply) |*deferred| deferred.deinit(allocator);
+        self.page.deferred_projection_apply = null;
+    }
+
     /// Completes the deferred-source state machine entirely inside the Review
     /// owner. The returned value contains only shell-facing status/redraw data;
     /// this method consumes or transfers the deferred task payload itself.
@@ -2668,8 +2673,12 @@ pub const Controller = struct {
     ) !DiscoveryApply {
         if (!self.acceptsIdentity(result.identity)) return .{};
         self.page.auto_reload.finishMember(result.background_cycle_id, .source);
-        _ = self.page.load.finishPending(.{ .repo_discovery = result.generation });
+        if (!self.page.load.finishPending(.{ .repo_discovery = result.generation })) return .{};
         if (!self.page.load.isCurrent(result.generation)) return .{};
+        if (!self.page.activation.acceptsPageInstance(result.identity, self.repo_epoch)) {
+            if (self.page.load.state == .loading) self.page.load.state = .idle;
+            return .{};
+        }
 
         switch (result.result) {
             .empty => unreachable,
@@ -2677,8 +2686,14 @@ pub const Controller = struct {
                 result.result = .empty;
                 return .{ .commit_discovery = discovery };
             },
-            .failed => |message| try self.replaceSourceFailure(allocator, std.mem.trim(u8, message, " \t\r\n")),
-            .failed_static => |message| try self.replaceSourceFailure(allocator, message),
+            .failed => |message| {
+                try self.replaceSourceFailure(allocator, std.mem.trim(u8, message, " \t\r\n"));
+                _ = self.page.activation.finishMember(result.identity, .source, .failed);
+            },
+            .failed_static => |message| {
+                try self.replaceSourceFailure(allocator, message);
+                _ = self.page.activation.finishMember(result.identity, .source, .failed);
+            },
         }
         return .{};
     }
@@ -2701,6 +2716,23 @@ pub const Controller = struct {
             return .none;
         }
         return .start_initial_read;
+    }
+
+    /// Terminates a repository-discovery completion that Review accepted but
+    /// the repository coordinator could not commit. The discovery preparation
+    /// already cleared the old display, so no allocator-backed failure value
+    /// is needed to leave this route retryable and close source freshness.
+    pub fn rejectAppliedRepoDiscovery(
+        self: Controller,
+        identity: app_page.RequestIdentity,
+        generation: u64,
+    ) bool {
+        if (!self.page.activation.acceptsPageInstance(identity, self.repo_epoch) or
+            !self.page.load.isCurrent(generation) or
+            self.page.load.pending != null) return false;
+        if (self.page.load.state == .loading) self.page.load.state = .idle;
+        _ = self.page.activation.finishMember(identity, .source, .failed);
+        return true;
     }
 
     /// Accepts one status task result into the Review page. The caller retains
@@ -5956,6 +5988,7 @@ test "repository discovery transfers ownership only after Review acceptance" {
     const controller = testController(&page, &status_message, .unstaged);
     const identity = page.activation.currentIdentity().?;
     const generation = page.load.beginRepoDiscovery();
+    page.load.state = .loading;
 
     var finished: app_load.RepoDiscoveryFinished = .{
         .identity = identity,
@@ -5971,10 +6004,64 @@ test "repository discovery transfers ownership only after Review acceptance" {
     try std.testing.expect(finished.result == .empty);
     try std.testing.expect(page.load.pending == null);
 
+    var duplicate: app_load.RepoDiscoveryFinished = .{
+        .identity = identity,
+        .generation = generation,
+        .result = .{ .discovered = .{ .none = .{
+            .current_root = try allocator.dupe(u8, "/duplicate"),
+        } } },
+    };
+    defer duplicate.deinit(allocator);
+    var duplicate_applied = try controller.applyRepoDiscoveryFinished(allocator, &duplicate);
+    defer duplicate_applied.deinit(allocator);
+    try std.testing.expect(duplicate_applied.commit_discovery == null);
+    try std.testing.expect(duplicate.result == .discovered);
+
+    try std.testing.expect(controller.rejectAppliedRepoDiscovery(identity, generation));
+    try std.testing.expect(page.load.state == .idle);
+    try std.testing.expectEqual(authority.MemberFreshness.failed, page.activation.state.members().?.source);
+
     var discovery = applied.takeCommitDiscovery() orelse return error.ExpectedDiscoveryCommit;
     defer discovery.deinit(allocator);
     try std.testing.expectEqualStrings("/workspace", discovery.none.current_root);
     try std.testing.expect(applied.commit_discovery == null);
+
+    const reopened_activation = page.activation.activate(0, .pending, .pending, .pending);
+    page.load.state = .loading;
+    try std.testing.expect(!controller.rejectAppliedRepoDiscovery(identity, generation));
+    try std.testing.expect(page.load.state == .loading);
+    try std.testing.expectEqual(authority.MemberFreshness.pending, page.activation.state.members().?.source);
+
+    const stale_instance_generation = page.load.beginRepoDiscovery();
+    const current_activation = page.activation.activate(0, .pending, .pending, .pending);
+    var stale_instance: app_load.RepoDiscoveryFinished = .{
+        .identity = app_page.RequestIdentity.review(0, reopened_activation),
+        .generation = stale_instance_generation,
+        .result = .{ .discovered = .{ .none = .{
+            .current_root = try allocator.dupe(u8, "/stale-instance"),
+        } } },
+    };
+    defer stale_instance.deinit(allocator);
+    var stale_instance_applied = try controller.applyRepoDiscoveryFinished(allocator, &stale_instance);
+    defer stale_instance_applied.deinit(allocator);
+    try std.testing.expect(stale_instance_applied.commit_discovery == null);
+    try std.testing.expect(stale_instance.result == .discovered);
+    try std.testing.expect(page.load.pending == null);
+    try std.testing.expect(page.load.state == .idle);
+    try std.testing.expectEqual(authority.MemberFreshness.pending, page.activation.state.members().?.source);
+
+    const failed_generation = page.load.beginRepoDiscovery();
+    page.load.state = .loading;
+    var failed: app_load.RepoDiscoveryFinished = .{
+        .identity = app_page.RequestIdentity.review(0, current_activation),
+        .generation = failed_generation,
+        .result = .{ .failed_static = "discovery failed" },
+    };
+    defer failed.deinit(allocator);
+    var failed_applied = try controller.applyRepoDiscoveryFinished(allocator, &failed);
+    defer failed_applied.deinit(allocator);
+    try std.testing.expect(page.load.state == .failed);
+    try std.testing.expectEqual(authority.MemberFreshness.failed, page.activation.state.members().?.source);
 }
 
 test "stale repository epoch retains discovery ownership with task completion" {

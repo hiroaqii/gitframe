@@ -1,0 +1,10 @@
+//! Compiler-consumed manifest for tests that exercise the App surface.
+//! Keep this file free of test blocks; `include` is called by the package root.
+
+pub fn include() void {
+    _ = @import("../app.zig");
+    _ = @import("../app_test.zig");
+    _ = @import("effect_origin.zig");
+    _ = @import("message.zig");
+    _ = @import("repo_session.zig");
+}

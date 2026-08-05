@@ -15,7 +15,6 @@ const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const draw = @import("draw");
 const keymap = @import("keymap");
-const repo_discovery = @import("../repo/discovery.zig");
 const repo_state = @import("../repo/state.zig");
 const theme = @import("theme");
 const review_page = if (builtin.is_test) @import("pages/review.zig") else struct {};
@@ -75,11 +74,13 @@ pub const Context = struct {
     page_status: ?*const app_state.StatusMessage = null,
     commit_panel: *const app_commit_panel.State,
     repo_picker: *const app_prompt.RepoPickerState,
-    repo_picker_discovery: ?repo_discovery.DiscoveryResult,
-    repo_picker_items: *const app_repo_picker.ItemList,
-    recent_repos: *const repo_state.RecentStore,
+    repo_picker_pending_workspace_root: ?[]const u8,
+    repo_picker_items: []const app_repo_picker.Item,
+    repo_picker_has_recent: bool,
     overlay: *const app_state.OverlayState,
-    repo_state: *const repo_state.State,
+    committed_repo_discovery_kind: app_repo_picker.DiscoveryKind,
+    active_repo_index: usize,
+    has_active_repo: bool,
     discard_confirmation: ?app_state.DiscardFileConfirmation,
     amend_confirmation: ?app_state.AmendConfirmation,
     push_confirmation: ?app_state.PushConfirmation,
@@ -178,7 +179,7 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
         .review => review_view.view(app.review, surface),
         .repository => repository_page.view(app.repository, surface),
         .compare => compare_view.view(app.compare, surface),
-        .config => viewPlaceholderPage(app.active_page, app.repo_state.activeRoot() != null, app.theme, surface),
+        .config => viewPlaceholderPage(app.active_page, app.has_active_repo, app.theme, surface),
     };
 }
 
@@ -498,7 +499,12 @@ fn viewRepoPicker(app: Context, surface: *chasen.Surface) !void {
 
     if (size.height <= 3) return;
     const layout = repoPickerLayout(size.height, has_path_status);
-    const list_title = try app_repo_picker.listTitle(content.frameAllocator(), app.repo_picker_discovery, app.repo_state.discovery, app.recent_repos);
+    const list_title = try app_repo_picker.listTitle(
+        content.frameAllocator(),
+        app.repo_picker_pending_workspace_root,
+        app.committed_repo_discovery_kind,
+        app.repo_picker_has_recent,
+    );
     const list_title_style: chasen.TextStyle = if (app.repo_picker.input_mode == .path_input)
         .{ .fg = app.theme.color(.muted), .dim = true }
     else
@@ -534,13 +540,13 @@ fn viewRepoPicker(app: Context, surface: *chasen.Surface) !void {
     }) {
         const source_index = app.repo_picker.list.filter.sourceIndex(visible_index) orelse continue;
         const label = app.repo_picker.list.filter.labels[visible_index];
-        const item = if (source_index < app.repo_picker_items.items.len) app.repo_picker_items.items[source_index] else null;
+        const item = if (source_index < app.repo_picker_items.len) app.repo_picker_items[source_index] else null;
         const list_active = app.repo_picker.input_mode == .list or app.repo_picker.input_mode == .filter;
         const focused_row = list_active and visible_index == focused;
         const active = if (item) |repo_item|
             switch (repo_item.source) {
                 .active_repo => true,
-                .workspace_repo => |repo_index| repo_index == app.repo_state.active_index,
+                .workspace_repo => |repo_index| repo_index == app.active_repo_index,
                 .pending_workspace_repo, .recent_repo, .recent_workspace => false,
             }
         else
@@ -579,8 +585,8 @@ fn viewRepoPicker(app: Context, surface: *chasen.Surface) !void {
         const detail_text_width = detail_width -| detail_col;
         const focused_source_index = app.repo_picker.list.filter.sourceIndex(focused);
         if (focused_source_index) |source_index| {
-            if (source_index < app.repo_picker_items.items.len) {
-                const detail = app.repo_picker_items.items[source_index].detail;
+            if (source_index < app.repo_picker_items.len) {
+                const detail = app.repo_picker_items[source_index].detail;
                 var detail_area = content.child(.{
                     .col = detail_col,
                     .row = detail_row,
@@ -1679,11 +1685,13 @@ const ShellViewTestHarness = struct {
             .page_status = &self.review.status,
             .commit_panel = &self.commit_panel,
             .repo_picker = &self.repo_picker,
-            .repo_picker_discovery = null,
-            .repo_picker_items = &self.repo_picker_items,
-            .recent_repos = &self.recent_repos,
+            .repo_picker_pending_workspace_root = null,
+            .repo_picker_items = self.repo_picker_items.items,
+            .repo_picker_has_recent = self.recent_repos.entries.items.len > 0,
             .overlay = &self.overlay,
-            .repo_state = &self.repo_state,
+            .committed_repo_discovery_kind = app_repo_picker.discoveryKind(self.repo_state.discovery),
+            .active_repo_index = self.repo_state.active_index,
+            .has_active_repo = self.repo_state.activeRoot() != null,
             .discard_confirmation = null,
             .amend_confirmation = null,
             .push_confirmation = self.push_confirmation,

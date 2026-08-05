@@ -81,8 +81,10 @@ pub fn main(init: std.process.Init) !void {
             .env_map = init.environ_map,
             .review_output = review_output_ptr,
             .user_config = user_config.*,
-            .state_path = config_paths.state,
-            .recent_repos = app_recent_repos,
+            .repo_session = .{
+                .state_path = config_paths.state,
+                .recent_repos = app_recent_repos,
+            },
             .keymap = effective_keymap,
             .theme = palette,
         });
@@ -110,8 +112,10 @@ pub fn main(init: std.process.Init) !void {
         .env_map = init.environ_map,
         .review_output = review_output_ptr,
         .user_config = user_config.*,
-        .state_path = config_paths.state,
-        .recent_repos = app_recent_repos,
+        .repo_session = .{
+            .state_path = config_paths.state,
+            .recent_repos = app_recent_repos,
+        },
         .keymap = effective_keymap,
         .theme = palette,
     });

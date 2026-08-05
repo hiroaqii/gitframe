@@ -133,13 +133,41 @@ pub const RecentStore = struct {
         try self.remember(allocator, .workspace, path);
     }
 
+    pub fn prepareRememberWorkspace(
+        self: *const RecentStore,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+    ) !RecentStore {
+        var next = try self.clone(allocator);
+        errdefer next.deinit(allocator);
+        try next.rememberWorkspace(allocator, path);
+        return next;
+    }
+
+    pub fn prepareRemoval(
+        self: *const RecentStore,
+        allocator: std.mem.Allocator,
+        preferred_index: usize,
+        kind: RecentKind,
+        path: []const u8,
+    ) !?RecentStore {
+        var next = try self.clone(allocator);
+        errdefer next.deinit(allocator);
+        const removed = if (next.entryMatches(preferred_index, kind, path))
+            next.removeAt(allocator, preferred_index)
+        else
+            next.removeFirstMatching(allocator, kind, path);
+        if (!removed) {
+            next.deinit(allocator);
+            return null;
+        }
+        return next;
+    }
+
     pub fn rememberDiscovery(self: *RecentStore, allocator: std.mem.Allocator, discovery: repo_discovery.DiscoveryResult) !void {
         switch (discovery) {
             .single_repo => |entry| try self.rememberRepo(allocator, entry.canonical_root),
-            .workspace => |workspace| {
-                try self.rememberWorkspace(allocator, workspace.current_root);
-                if (workspace.repos.len > 0) try self.rememberRepo(allocator, workspace.repos[0].canonical_root);
-            },
+            .workspace => |workspace| try self.rememberWorkspaceDiscovery(allocator, workspace),
             .none => {},
         }
     }
@@ -200,6 +228,61 @@ pub const RecentStore = struct {
         errdefer allocator.free(owned);
         try self.entries.insert(allocator, 0, .{ .kind = kind, .path = owned });
         self.enforceCap(allocator);
+    }
+
+    fn rememberWorkspaceDiscovery(
+        self: *RecentStore,
+        allocator: std.mem.Allocator,
+        workspace: @FieldType(repo_discovery.DiscoveryResult, "workspace"),
+    ) !void {
+        const repo_path = if (workspace.repos.len > 0) workspace.repos[0].canonical_root else "";
+        var workspace_owned: ?[]u8 = null;
+        errdefer if (workspace_owned) |path| allocator.free(path);
+        var repo_owned: ?[]u8 = null;
+        errdefer if (repo_owned) |path| allocator.free(path);
+
+        if (workspace.current_root.len > 0 and self.find(.workspace, workspace.current_root) == null) {
+            workspace_owned = try allocator.dupe(u8, workspace.current_root);
+        }
+        if (repo_path.len > 0 and self.find(.repo, repo_path) == null) {
+            repo_owned = try allocator.dupe(u8, repo_path);
+        }
+
+        const additional: usize = @intFromBool(workspace_owned != null) + @intFromBool(repo_owned != null);
+        try self.entries.ensureUnusedCapacity(allocator, additional);
+        self.rememberPrepared(.workspace, workspace.current_root, &workspace_owned);
+        self.rememberPrepared(.repo, repo_path, &repo_owned);
+        self.enforceCap(allocator);
+    }
+
+    fn rememberPrepared(
+        self: *RecentStore,
+        kind: RecentKind,
+        path: []const u8,
+        owned_path: *?[]u8,
+    ) void {
+        if (path.len == 0) return;
+        if (self.find(kind, path)) |index| {
+            if (index == 0) return;
+            const entry = self.entries.orderedRemove(index);
+            self.entries.insertAssumeCapacity(0, entry);
+            return;
+        }
+        const owned = owned_path.* orelse unreachable;
+        owned_path.* = null;
+        self.entries.insertAssumeCapacity(0, .{ .kind = kind, .path = owned });
+    }
+
+    fn clone(self: *const RecentStore, allocator: std.mem.Allocator) !RecentStore {
+        var next: RecentStore = .{};
+        errdefer next.deinit(allocator);
+        try next.entries.ensureTotalCapacity(allocator, self.entries.items.len);
+        for (self.entries.items) |entry| {
+            const path = try allocator.dupe(u8, entry.path);
+            errdefer allocator.free(path);
+            next.entries.appendAssumeCapacity(.{ .kind = entry.kind, .path = path });
+        }
+        return next;
     }
 
     fn enforceCap(self: *RecentStore, allocator: std.mem.Allocator) void {
@@ -270,6 +353,20 @@ test "RecentStore owns and deduplicates paths" {
     try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
     try std.testing.expectEqualStrings("/tmp/one", store.entries.items[0].path);
     try std.testing.expectEqualStrings("/tmp/two", store.entries.items[1].path);
+
+    var repos = [_]repo_discovery.RepoEntry{.{
+        .label = "repo",
+        .display_path = "repo",
+        .canonical_root = "/tmp/work/repo",
+    }};
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, store.rememberDiscovery(failing.allocator(), .{ .workspace = .{
+        .current_root = "/tmp/work",
+        .repos = &repos,
+    } }));
+    try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
+    try std.testing.expectEqualStrings("/tmp/one", store.entries.items[0].path);
+    try std.testing.expectEqualStrings("/tmp/two", store.entries.items[1].path);
 }
 
 test "RecentStore loads persisted recent entries" {
@@ -309,6 +406,19 @@ test "RecentStore caps remembered entries" {
     try std.testing.expectEqual(@as(usize, max_recent_entries), store.entries.items.len);
     try std.testing.expectEqualStrings("/tmp/repo-34", store.entries.items[0].path);
     try std.testing.expectEqualStrings("/tmp/repo-3", store.entries.items[store.entries.items.len - 1].path);
+
+    var repos = [_]repo_discovery.RepoEntry{.{
+        .label = "existing-tail",
+        .display_path = "existing-tail",
+        .canonical_root = "/tmp/repo-3",
+    }};
+    try store.rememberDiscovery(allocator, .{ .workspace = .{
+        .current_root = "/tmp/workspace",
+        .repos = &repos,
+    } });
+    try std.testing.expectEqual(@as(usize, max_recent_entries), store.entries.items.len);
+    try std.testing.expectEqualStrings("/tmp/repo-3", store.entries.items[0].path);
+    try std.testing.expectEqualStrings("/tmp/workspace", store.entries.items[1].path);
 }
 
 test "RecentStore removes entries by index and matching identity" {

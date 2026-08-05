@@ -1,4 +1,5 @@
 const app = @import("app.zig");
+const build_options = @import("build_options");
 pub const config = @import("config.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
@@ -16,13 +17,18 @@ pub const freeSource = diff_source.freeSource;
 pub const preparePagerSource = diff_source.preparePagerSource;
 
 test {
+    @import("app/test_manifest.zig").include();
+    if (build_options.expected_package_root_test_count != 0) {
+        try @import("std").testing.expectEqual(
+            build_options.expected_package_root_test_count,
+            @import("builtin").test_functions.len,
+        );
+    }
     // Keep package-root-owned test modules directly reachable from this block.
     // Plain file-scope imports are insufficient for named-test discovery when
     // Zig's --test-filter is active.
     // Modules with dedicated test artifacts are discovered by those roots instead.
-    _ = @import("app.zig");
     _ = @import("app/test_support.zig");
-    _ = @import("app_test.zig");
     _ = @import("app/actions.zig");
     _ = @import("app/auto_reload.zig");
     _ = @import("app/branch_chrome.zig");

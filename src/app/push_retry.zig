@@ -10,20 +10,8 @@ const std = @import("std");
 const chasen = @import("chasen");
 
 const actions = @import("actions.zig");
-const page = @import("page.zig");
+const effect_origin = @import("effect_origin.zig");
 const app_state = @import("state.zig");
-
-pub const Origin = struct {
-    page_id: page.Id,
-    repo_epoch: u64,
-    activation_id: u64,
-
-    pub fn eql(left: Origin, right: Origin) bool {
-        return left.page_id == right.page_id and
-            left.repo_epoch == right.repo_epoch and
-            left.activation_id == right.activation_id;
-    }
-};
 
 pub const InspectionKind = enum {
     verify_snapshot,
@@ -56,7 +44,7 @@ pub const Available = struct {
 pub const Inspecting = struct {
     generation: u64,
     kind: InspectionKind,
-    origin: Origin,
+    origin: effect_origin.PageOrigin,
     repo_epoch: u64,
     target_identity: TargetIdentity,
 
@@ -72,7 +60,7 @@ pub const Inspecting = struct {
 pub const Foreground = struct {
     request_id: chasen.ForegroundCommandRequestId,
     pending: actions.PendingAction,
-    origin: Origin,
+    origin: effect_origin.PageOrigin,
     target: app_state.PushRetryTarget,
 
     pub fn deinit(self: *Foreground, allocator: std.mem.Allocator) void {
@@ -140,7 +128,7 @@ pub const Model = struct {
     pub fn beginInspection(
         self: *Model,
         kind: InspectionKind,
-        origin: Origin,
+        origin: effect_origin.PageOrigin,
     ) ?struct { target: app_state.PushRetryTarget, credentials_available: bool, metadata: Inspecting } {
         const available = switch (self.state) {
             .available => |available| available,
@@ -183,7 +171,7 @@ pub const Outcome = union(enum) {
 pub const Finished = struct {
     generation: u64,
     kind: InspectionKind,
-    origin: Origin,
+    origin: effect_origin.PageOrigin,
     repo_epoch: u64,
     target_identity: TargetIdentity,
     credentials_available: bool,
@@ -365,7 +353,7 @@ test "model moves the sole target owner into inspection metadata" {
 }
 
 test "inspection acceptance requires every correlation member" {
-    const origin: Origin = .{ .page_id = .review, .repo_epoch = 4, .activation_id = 7 };
+    const origin: effect_origin.PageOrigin = .{ .page_id = .review, .repo_epoch = 4, .activation_id = 7 };
     const inspecting: Inspecting = .{
         .generation = 2,
         .kind = .verify_snapshot,

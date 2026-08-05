@@ -1,0 +1,309 @@
+//! Concrete transport vocabulary shared by the application shell and its
+//! responsibility coordinators. This module depends only on leaf payloads;
+//! it never reaches application state.
+
+const std = @import("std");
+const chasen = @import("chasen");
+const actions = @import("actions.zig");
+const load = @import("load.zig");
+const page = @import("page.zig");
+const push_retry = @import("push_retry.zig");
+const compare_input = @import("pages/compare/input.zig");
+const repository_page = @import("pages/repository.zig");
+const review_message = @import("pages/review/message.zig");
+
+pub const LoadFinished = load.ReadFinished;
+
+pub const ActionFinished = union(enum) {
+    stage_file: actions.StageFileFinished,
+    stage_hunk: actions.StageHunkFinished,
+    unstage_file: actions.UnstageFileFinished,
+    unstage_hunk: actions.UnstageHunkFinished,
+    discard_file: actions.DiscardFileFinished,
+    commit: actions.CommitFinished,
+    assist_commit_message: actions.CommitMessageAssistFinished,
+    amend: actions.AmendFinished,
+    push: actions.PushFinished,
+    pull: actions.PullFinished,
+    fetch: actions.FetchFinished,
+    switch_branch: actions.SwitchBranchFinished,
+    push_foreground: chasen.ForegroundCommandResult,
+    editor: chasen.ForegroundCommandResult,
+
+    pub fn deinit(self: *ActionFinished, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .push_foreground, .editor => {},
+            inline else => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ClipboardCopyOutcome = union(enum) {
+    sent,
+    unsupported_runtime,
+    write_failed: []const u8,
+};
+
+pub const ClipboardCopyFinished = struct {
+    request_id: chasen.ClipboardCopyRequestId,
+    outcome: ClipboardCopyOutcome,
+};
+
+pub const Msg = union(enum) {
+    pub const undelivered_policy = .deinit;
+
+    terminal_resized: chasen.Size,
+    switch_page: page.Id,
+    load_finished: LoadFinished,
+    action_finished: ActionFinished,
+    push_inspection_finished: push_retry.Finished,
+    clipboard_copy_finished: ClipboardCopyFinished,
+    review: review_message.Msg,
+    compare: compare_input.Msg,
+    repository: repository_page.Msg,
+    cancel_commit_panel,
+    submit_commit_panel,
+    assist_commit_message,
+    copy_commit_message,
+    commit_panel_tab,
+    commit_panel_enter,
+    commit_panel_insert: u21,
+    /// Borrowed from `chasen.Event.paste`; valid only during synchronous dispatch.
+    commit_panel_paste: []const u8,
+    commit_panel_backspace,
+    commit_panel_move_left,
+    commit_panel_move_right,
+    commit_panel_move_up,
+    commit_panel_move_down,
+    enter_repo_picker,
+    cancel_repo_picker,
+    close_repo_picker,
+    submit_repo_picker,
+    repo_picker_enter_filter_input,
+    repo_picker_enter_path_input,
+    repo_picker_back,
+    repo_picker_remove_recent,
+    repo_picker_insert: u21,
+    /// Borrowed from `chasen.Event.paste`; valid only during synchronous dispatch.
+    repo_picker_paste: []const u8,
+    repo_picker_backspace,
+    repo_picker_move_previous,
+    repo_picker_move_next,
+    repo_picker_move_left,
+    repo_picker_move_right,
+    open_help,
+    close_help,
+    help_scroll_up,
+    help_scroll_down,
+    help_page_up,
+    help_page_down,
+    push_error_scroll_up,
+    push_error_scroll_down,
+    push_error_page_up,
+    push_error_page_down,
+    copy_popup,
+    push_credential_tab,
+    push_credential_submit,
+    push_credential_cancel,
+    push_credential_insert: u21,
+    push_credential_paste: []const u8,
+    push_credential_backspace,
+    push_credential_move_left,
+    push_credential_move_right,
+    confirm_discard_file,
+    cancel_discard_file,
+    confirm_amend,
+    cancel_amend,
+    confirm_push,
+    cancel_push,
+    confirm_pull,
+    cancel_pull,
+    branch_switch_move_previous,
+    branch_switch_move_next,
+    confirm_branch_switch,
+    cancel_branch_switch,
+    close_push_error,
+    open_push_credentials,
+    run_interactive_push,
+    reload,
+    auto_reload_tick,
+    focus_lost,
+    git_action_spinner_tick,
+    quit,
+
+    pub fn loadFinished(inner: LoadFinished) Msg {
+        return .{ .load_finished = inner };
+    }
+
+    pub fn actionFinished(inner: ActionFinished) Msg {
+        return .{ .action_finished = inner };
+    }
+
+    pub fn pushInspectionFinished(inner: push_retry.Finished) Msg {
+        return .{ .push_inspection_finished = inner };
+    }
+
+    pub fn editorFinished(result: chasen.ForegroundCommandResult) Msg {
+        return actionFinished(.{ .editor = result });
+    }
+
+    pub fn pushForegroundFinished(result: chasen.ForegroundCommandResult) Msg {
+        return actionFinished(.{ .push_foreground = result });
+    }
+
+    pub fn clipboardFinished(result: chasen.ClipboardCopyResult) Msg {
+        return .{ .clipboard_copy_finished = .{
+            .request_id = result.request_id,
+            .outcome = switch (result.outcome) {
+                .sent => .sent,
+                .unsupported_runtime => .unsupported_runtime,
+                .write_failed => |err| .{ .write_failed = err },
+            },
+        } };
+    }
+
+    /// Releases messages that the runtime cannot deliver during shutdown.
+    pub fn deinitUndelivered(self: *Msg, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .load_finished => |*finished| finished.deinit(allocator),
+            .action_finished => |*finished| finished.deinit(allocator),
+            .push_inspection_finished => |*finished| finished.deinit(allocator),
+            .repository => |*repository_msg| repository_msg.deinitUndelivered(allocator),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+test "undelivered action result releases owned payloads" {
+    var msg = Msg.actionFinished(.{ .stage_file = .{
+        .pending = .{ .generation = 1, .kind = .stage_file },
+        .path = try std.testing.allocator.dupe(u8, "src/app.zig"),
+        .result = .{ .failed = try std.testing.allocator.dupe(u8, "failed") },
+    } });
+
+    msg.deinitUndelivered(std.testing.allocator);
+}
+
+test "undelivered diff and status loads release owned payloads" {
+    const test_support = @import("test_support.zig");
+
+    var diff_msg = Msg.loadFinished(.{ .review = .{ .source = .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 1,
+        .result = .{ .loaded = try load.buildLoadedBundle(std.testing.allocator, test_support.diff_one) },
+    } } });
+    diff_msg.deinitUndelivered(std.testing.allocator);
+
+    var status_msg = Msg.loadFinished(.{ .review = .{ .status = .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 2,
+        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .result = .{ .failed = try std.testing.allocator.dupe(u8, "status failed") },
+    } } });
+    status_msg.deinitUndelivered(std.testing.allocator);
+}
+
+test "undelivered repo and projection loads release owned payloads" {
+    const review_projection = @import("review_projection.zig");
+
+    var repo_msg = Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 1,
+        .result = .{ .failed = try std.testing.allocator.dupe(u8, "discovery failed") },
+    } } });
+    repo_msg.deinitUndelivered(std.testing.allocator);
+
+    const request = try review_projection.testing.cloneRequest(
+        std.testing.allocator,
+        page.RequestIdentity.review(0, 1),
+        7,
+        "/repo",
+        "src/app.zig",
+        .generated_added_file,
+        .cached,
+        3,
+        4,
+    );
+    var projection_msg = Msg.loadFinished(.{ .review = .{ .projection = .{
+        .request = request,
+        .result = .{ .failed = try review_projection.statusBodyAlloc(
+            std.testing.allocator,
+            "src/app.zig",
+            "{s}",
+            .{"projection failed"},
+        ) },
+    } } });
+    projection_msg.deinitUndelivered(std.testing.allocator);
+}
+
+test "undelivered remaining read routes release owned payloads" {
+    const allocator = std.testing.allocator;
+
+    var branch_status_msg = Msg.loadFinished(.{ .review = .{ .branch_status = .{
+        .identity = page.RequestIdentity.review(0, 1),
+        .generation = 1,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed = try allocator.dupe(u8, "branch status failed") },
+    } } });
+    branch_status_msg.deinitUndelivered(allocator);
+
+    var repo_path_msg = Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = .{
+        .generation = 2,
+        .submitted_path = try allocator.dupe(u8, "/workspace"),
+        .result = .{ .failed = try allocator.dupe(u8, "path discovery failed") },
+    } } });
+    repo_path_msg.deinitUndelivered(allocator);
+
+    var branch_list_msg = Msg.loadFinished(.{ .shell = .{ .branch_list = .{
+        .origin = .review,
+        .repo_epoch = 3,
+        .activation_id = 5,
+        .generation = 4,
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .result = .{ .failed = try allocator.dupe(u8, "branch list failed") },
+    } } });
+    branch_list_msg.deinitUndelivered(allocator);
+
+    var compare_msg = Msg.loadFinished(.{ .compare = .{ .source = .{
+        .identity = page.RequestIdentity.compare(3, 5),
+        .generation = 4,
+        .result = .{ .loaded = .{
+            .basis = .{
+                .base = .{
+                    .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+                    .display_name = try allocator.dupe(u8, "main"),
+                    .kind = .local,
+                    .oid = .{},
+                },
+                .head_display = try allocator.dupe(u8, "feature"),
+                .merge_base_oid = .{},
+                .head_oid = .{},
+                .ahead_count = 1,
+            },
+            .diff = .empty,
+        } },
+    } } });
+    compare_msg.deinitUndelivered(allocator);
+}
+
+test "undelivered plain root message is a no-op" {
+    var msg: Msg = .quit;
+    msg.deinitUndelivered(std.testing.allocator);
+
+    const foreground: chasen.ForegroundCommandResult = .{
+        .request_id = .{ .id = 17 },
+        .outcome = .{ .exited = 0 },
+    };
+    const editor = Msg.editorFinished(foreground);
+    try std.testing.expectEqual(@as(u64, 17), editor.action_finished.editor.request_id.id);
+    const push = Msg.pushForegroundFinished(foreground);
+    try std.testing.expectEqual(@as(u64, 17), push.action_finished.push_foreground.request_id.id);
+    const clipboard = Msg.clipboardFinished(.{
+        .request_id = .{ .id = 23 },
+        .outcome = .unsupported_runtime,
+    });
+    try std.testing.expectEqual(@as(u64, 23), clipboard.clipboard_copy_finished.request_id.id);
+    try std.testing.expect(clipboard.clipboard_copy_finished.outcome == .unsupported_runtime);
+}

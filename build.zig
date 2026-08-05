@@ -51,6 +51,11 @@ pub fn build(b: *std.Build) void {
     });
     const build_options = b.addOptions();
     build_options.addOption(bool, "syntax_provider_flow_syntax", provider_enabled);
+    build_options.addOption(
+        usize,
+        "expected_package_root_test_count",
+        if (!provider_enabled and test_filters.len == 0) 1701 else 0,
+    );
 
     const mod = mod: {
         const base_imports: [6]std.Build.Module.Import = .{
@@ -121,6 +126,8 @@ pub fn build(b: *std.Build) void {
     });
     configureFlowSyntaxArtifact(mod_tests, target, provider_enabled);
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    const package_root_test_step = b.step("test-package-root", "Run only the package-root test artifact");
+    package_root_test_step.dependOn(&run_mod_tests.step);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,

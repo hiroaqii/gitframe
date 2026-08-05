@@ -257,6 +257,16 @@ pub const Lifecycle = struct {
         return self.owner.matches(identity.origin) and identity.repo_epoch == repo_epoch;
     }
 
+    /// Accepts work issued by the latest activation of this page instance,
+    /// including its retained inactive state, but rejects work from an older
+    /// activation after the page has been reopened in the same repository.
+    pub fn acceptsPageInstance(self: Lifecycle, identity: page.RequestIdentity, repo_epoch: u64) bool {
+        return self.owner.matches(identity.origin) and
+            identity.repo_epoch == repo_epoch and
+            identity.activation_id != 0 and
+            identity.activation_id == self.next_activation_id;
+    }
+
     fn memberPtr(vector: *MemberVector, member: Member) *MemberFreshness {
         return switch (member) {
             .source => &vector.source,

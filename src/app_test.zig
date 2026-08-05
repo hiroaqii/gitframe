@@ -12,7 +12,7 @@ test "App starts with Review as the only reachable page" {
     const app: App = .{};
 
     try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expectEqual(@as(u64, 0), app.repo_epoch);
+    try std.testing.expectEqual(@as(u64, 0), app.repo_session.repo_epoch);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
 }
 
@@ -26,11 +26,13 @@ test "selectionContext exposes selected diff file model coordinate" {
             },
         } },
         .config = .{ .source = .{ .range = "main...HEAD" } },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "gitframe",
-            .display_path = ".",
-            .canonical_root = "/repo/gitframe",
-        } } },
+        .repo_session = .{
+            .repo_state = .{ .discovery = .{ .single_repo = .{
+                .label = "gitframe",
+                .display_path = ".",
+                .canonical_root = "/repo/gitframe",
+            } } },
+        },
     };
 
     const selection = app.selectionContext();
@@ -66,11 +68,13 @@ test "selectionContext resolves status-only target without loaded diff" {
             .viewer = .{ .selected_target = .{ .status_only = 0 } },
         } },
         .config = .{ .source = .unstaged },
-        .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } },
+        .repo_session = .{
+            .repo_state = .{ .discovery = .{ .single_repo = .{
+                .label = "repo",
+                .display_path = "/repo",
+                .canonical_root = "/repo",
+            } } },
+        },
     };
     defer app.pages.review.git_status.deinit();
 
