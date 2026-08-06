@@ -66,6 +66,7 @@ test {
     _ = @import("app/pages/repository/selection.zig");
     _ = @import("app/pages/repository/source_header.zig");
     _ = @import("app/pages/repository/source_geometry.zig");
+    _ = @import("app/pages/repository/tasks.zig");
     _ = @import("app/pages/repository/tree_projection.zig");
     _ = @import("app/pages/repository/view.zig");
     _ = @import("app/prompt.zig");

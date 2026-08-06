@@ -11,12 +11,13 @@ const effect_origin = @import("../../effect_origin.zig");
 const page = @import("../../page.zig");
 const repo_session = @import("../../repo_session.zig");
 const repository_page = @import("../repository.zig");
+const repository_tasks = @import("tasks.zig");
 
-const ManifestTask = repository_page.ManifestTask(app_message.Msg);
-const BranchTask = repository_page.BranchTask(app_message.Msg);
-const DocumentTask = repository_page.DocumentTask(app_message.Msg);
-const SyntaxTask = repository_page.SyntaxTask(app_message.Msg);
-const ChangeMapTask = repository_page.ChangeMapTask(app_message.Msg);
+const ManifestTask = repository_tasks.ManifestTask(app_message.Msg);
+const BranchTask = repository_tasks.BranchTask(app_message.Msg);
+const DocumentTask = repository_tasks.DocumentTask(app_message.Msg);
+const SyntaxTask = repository_tasks.SyntaxTask(app_message.Msg);
+const ChangeMapTask = repository_tasks.ChangeMapTask(app_message.Msg);
 
 pub const Redraw = enum {
     default,
@@ -215,8 +216,7 @@ pub const Controller = struct {
         task.* = .{ .request = request, .env_map = self.env_map };
         request_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = BranchTask.run, .failed = BranchTask.failed }) catch {
-            task.request.deinit(ctx.allocator());
-            ctx.allocator().destroy(task);
+            task.destroy(ctx.allocator());
             self.page_state.rejectBranchSpawn(generation);
         };
     }

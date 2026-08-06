@@ -14,6 +14,7 @@ const repo_session = @import("../repo_session.zig");
 const compare_page = @import("../pages/compare.zig");
 const repository_page = @import("../pages/repository.zig");
 const repository_coordinator = @import("../pages/repository/coordinator.zig");
+const repository_tasks = @import("../pages/repository/tasks.zig");
 const repository_selection = @import("../pages/repository/selection.zig");
 const review_page = @import("../pages/review.zig");
 const review_authority = @import("../diff_surface/authority.zig");
@@ -44,11 +45,11 @@ const CompareLoadFinished = app_load.CompareLoadFinished;
 const CompareLoadTask = app_load.CompareLoadTask(app_message.Msg);
 const CompareBranchListFinished = app_load.CompareBranchListFinished;
 const CompareBranchListLoadTask = app_load.CompareBranchListLoadTask(app_message.Msg);
-const RepositoryManifestTask = repository_page.ManifestTask(app_message.Msg);
-const RepositoryBranchTask = repository_page.BranchTask(app_message.Msg);
-const RepositoryDocumentTask = repository_page.DocumentTask(app_message.Msg);
-const RepositorySyntaxTask = repository_page.SyntaxTask(app_message.Msg);
-const RepositoryChangeMapTask = repository_page.ChangeMapTask(app_message.Msg);
+const RepositoryManifestTask = repository_tasks.ManifestTask(app_message.Msg);
+const RepositoryBranchTask = repository_tasks.BranchTask(app_message.Msg);
+const RepositoryDocumentTask = repository_tasks.DocumentTask(app_message.Msg);
+const RepositorySyntaxTask = repository_tasks.SyntaxTask(app_message.Msg);
+const RepositoryChangeMapTask = repository_tasks.ChangeMapTask(app_message.Msg);
 
 fn activateReview(app: *App) u64 {
     const source_member: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
@@ -1082,7 +1083,7 @@ fn repositoryIncomingViewportReviewDiffForTest() LoadedDiff {
     };
 }
 
-fn repositoryIncomingViewportBundleForTest(allocator: std.mem.Allocator) !repository_page.Bundle {
+fn repositoryIncomingViewportBundleForTest(allocator: std.mem.Allocator) !repository_tasks.Bundle {
     const repository_manifest = @import("../../repository/manifest.zig");
     const repository_tree = @import("../../repository/tree.zig");
     var document = try repository_manifest.parseOwned(

@@ -8,15 +8,16 @@ const page_link = @import("../../page_link.zig");
 const repo_session = @import("../../repo_session.zig");
 const repository_page = @import("../repository.zig");
 const repository_coordinator = @import("coordinator.zig");
+const repository_tasks = @import("tasks.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 
-const RepositoryBranchTask = repository_page.BranchTask(app_message.Msg);
-const RepositoryDocumentTask = repository_page.DocumentTask(app_message.Msg);
-const RepositorySyntaxTask = repository_page.SyntaxTask(app_message.Msg);
-const RepositoryChangeMapTask = repository_page.ChangeMapTask(app_message.Msg);
+const RepositoryBranchTask = repository_tasks.BranchTask(app_message.Msg);
+const RepositoryDocumentTask = repository_tasks.DocumentTask(app_message.Msg);
+const RepositorySyntaxTask = repository_tasks.SyntaxTask(app_message.Msg);
+const RepositoryChangeMapTask = repository_tasks.ChangeMapTask(app_message.Msg);
 
 const RedrawPlan = struct {
     skip_requested: bool = false,
