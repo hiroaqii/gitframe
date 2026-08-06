@@ -198,7 +198,8 @@ pub const Controller = struct {
 
         const request_id = ctx.terminal().runForegroundCommand(.{
             .argv = argv.argv,
-            .cwd = target.repo_root,
+            .cwd = .{ .path = target.repo_root },
+            .environment = .inherit,
             .finished = app_message.Msg.editorFinished,
         }) catch |err| switch (err) {
             error.ForegroundCommandLimitExceeded => {
@@ -207,6 +208,15 @@ pub const Controller = struct {
             },
             error.ForegroundCommandEmptyArgv => {
                 self.diagnostics.review.set("editor command is empty", .{});
+                return;
+            },
+            error.ForegroundCommandCwdUnsupported,
+            error.ForegroundCommandInvalidCwd,
+            error.ForegroundCommandProcessFdQuotaExceeded,
+            error.ForegroundCommandSystemFdQuotaExceeded,
+            error.ForegroundCommandDuplicateCwdFailed,
+            => {
+                self.diagnostics.review.set("editor command could not be queued", .{});
                 return;
             },
             error.OutOfMemory => return err,

@@ -289,6 +289,8 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         defer ctx.runtimeClearPendingEffectCopies();
         _ = try ctx.terminal().runForegroundCommand(.{
             .argv = &.{"true"},
+            .cwd = .inherit,
+            .environment = .inherit,
             .finished = app_message.Msg.editorFinished,
         });
 
@@ -335,7 +337,13 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         defer ctx.runtimeClearPendingEffectCopies();
         const origin = app.shellEffects().reviewOrigin();
         try app.shellEffects().requestEditor(&ctx, ready, false, origin);
-        const request_id = ctx._pending_foreground_commands[0].request_id;
+        const entry = ctx._pending_foreground_commands[0];
+        const request_id = entry.request_id;
+        switch (entry.runtimeChildCwd()) {
+            .path => |path| try std.testing.expectEqualStrings("/repo", path),
+            else => return error.ExpectedEditorPathCwd,
+        }
+        try std.testing.expect(entry.runtimeChildEnvironment() == null);
 
         try std.testing.expectEqualStrings("opening editor: src/main.zig", app.pages.review.status.text());
         try std.testing.expectEqual(request_id.id, app.shell_state.editor_foreground.?.request_id.id);

@@ -6,6 +6,7 @@ const review_selection = @import("diff_surface/selection.zig");
 const session_hunk_mark = @import("pages/review/session_hunk_mark.zig");
 const text_edit = @import("text_edit.zig");
 const page = @import("page.zig");
+const remote_request = @import("remote_request.zig");
 
 pub const OverlayKind = enum {
     none,
@@ -176,6 +177,7 @@ pub const AmendConfirmation = struct {
 /// Branch status can reload while the popup is open, so the displayed and
 /// executed remote target must be copied when the prompt is created.
 pub const PushConfirmation = struct {
+    repository_identity: remote_request.RepositoryIdentity,
     mode: git_push.Mode,
     repo_root: []u8,
     branch: []u8,
@@ -323,6 +325,8 @@ pub const PushCredentialField = enum {
 };
 
 pub const PushRetryTarget = struct {
+    repo_epoch: u64,
+    root_identity: @import("../repo/root_capability.zig").Identity,
     mode: git_push.Mode,
     repo_root: []u8,
     branch: []u8,
@@ -333,6 +337,8 @@ pub const PushRetryTarget = struct {
 
     pub fn empty() PushRetryTarget {
         return .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
             .mode = .upstream,
             .repo_root = &.{},
             .branch = &.{},

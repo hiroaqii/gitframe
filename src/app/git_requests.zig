@@ -224,6 +224,11 @@ pub fn startPush(
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
+        .identity = .{
+            .repo_epoch = confirmation.repository_identity.repo_epoch,
+            .root_identity = confirmation.repository_identity.root_identity,
+            .operation_generation = pending.generation,
+        },
         .mode = confirmation.mode,
         .repo_root = confirmation.repo_root,
         .branch = confirmation.branch,
@@ -233,6 +238,10 @@ pub fn startPush(
         .env_map = env_map,
     };
     confirmation.* = .{
+        .repository_identity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+        },
         .mode = .upstream,
         .repo_root = &.{},
         .branch = &.{},
@@ -376,6 +385,11 @@ pub fn startCredentialedPush(
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
+        .identity = .{
+            .repo_epoch = target.repo_epoch,
+            .root_identity = target.root_identity,
+            .operation_generation = pending.generation,
+        },
         .mode = target.mode,
         .repo_root = target.repo_root,
         .branch = target.branch,
@@ -389,28 +403,14 @@ pub fn startCredentialedPush(
     // the function-level defer becomes a no-op for credentials on success or
     // spawn rollback.
     credentials.* = .{ .username = &.{}, .password = &.{} };
-    target.* = .{
-        .repo_root = &.{},
-        .branch = &.{},
-        .remote = &.{},
-        .remote_branch = &.{},
-        .oid = &.{},
-        .mode = .upstream,
-        .remote_url = target.remote_url,
-    };
+    const remote_url = target.remote_url;
+    target.* = app_state.PushRetryTarget.empty();
+    target.remote_url = remote_url;
     errdefer destroyPushTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-    if (target.remote_url) |remote_url| ctx.allocator().free(remote_url);
-    target.* = .{
-        .repo_root = &.{},
-        .branch = &.{},
-        .remote = &.{},
-        .remote_branch = &.{},
-        .oid = &.{},
-        .mode = .upstream,
-        .remote_url = null,
-    };
+    if (target.remote_url) |owned_remote_url| ctx.allocator().free(owned_remote_url);
+    target.* = app_state.PushRetryTarget.empty();
 }
 
 fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
@@ -442,6 +442,10 @@ fn consumePushConfirmation(allocator: std.mem.Allocator, confirmation: *app_stat
     if (confirmation.remote_branch.len > 0) allocator.free(confirmation.remote_branch);
     if (confirmation.oid.len > 0) allocator.free(confirmation.oid);
     confirmation.* = .{
+        .repository_identity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+        },
         .repo_root = &.{},
         .branch = &.{},
         .remote = &.{},

@@ -1,9 +1,41 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const git_ref = @import("ref.zig");
 const git_branch_status = @import("branch_status.zig");
 const git_push = @import("push.zig");
 const process_runner = @import("../process/runner.zig");
 const repository_change_map = @import("../repository/change_map.zig");
+
+pub const RemoteEnvironmentMode = enum {
+    inspection,
+    foreground,
+};
+
+pub const RemoteWarningSet = packed struct {
+    git_plaintext_store: bool = false,
+    gcm_plaintext_store: bool = false,
+    potential_plaintext_store: bool = false,
+    helper_policy_unknown: bool = false,
+    proxy_credentials_omitted: bool = false,
+
+    pub fn merge(self: *RemoteWarningSet, other: RemoteWarningSet) void {
+        self.git_plaintext_store = self.git_plaintext_store or other.git_plaintext_store;
+        self.gcm_plaintext_store = self.gcm_plaintext_store or other.gcm_plaintext_store;
+        self.potential_plaintext_store = self.potential_plaintext_store or other.potential_plaintext_store;
+        self.helper_policy_unknown = self.helper_policy_unknown or other.helper_policy_unknown;
+        self.proxy_credentials_omitted = self.proxy_credentials_omitted or other.proxy_credentials_omitted;
+    }
+};
+
+pub const OwnedRemoteEnvironment = struct {
+    map: std.process.Environ.Map,
+    warnings: RemoteWarningSet = .{},
+
+    pub fn deinit(self: *OwnedRemoteEnvironment) void {
+        self.map.deinit();
+        self.* = undefined;
+    }
+};
 
 pub const max_diff_bytes = 16 * 1024 * 1024;
 pub const max_status_bytes = 8 * 1024 * 1024;
@@ -3513,6 +3545,125 @@ fn verifyCleanWorktree(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
 
 const PushEnvironmentError = LoadError || error{InteractiveSshCommand};
 
+/// Build a remote-child environment from the reviewed non-secret allowlist.
+///
+/// This is intentionally not an ambient clone. The returned map owns every
+/// key/value and can be released immediately after a synchronous child call or
+/// after Chasen has deep-copied a foreground request.
+pub fn buildRemoteEnvironment(
+    allocator: std.mem.Allocator,
+    parent: ?*const std.process.Environ.Map,
+    mode: RemoteEnvironmentMode,
+) std.mem.Allocator.Error!OwnedRemoteEnvironment {
+    var owned: OwnedRemoteEnvironment = .{
+        .map = std.process.Environ.Map.init(allocator),
+    };
+    errdefer owned.deinit();
+
+    const source = parent orelse {
+        if (mode == .foreground) try owned.map.put("GCM_INTERACTIVE", "1");
+        return owned;
+    };
+
+    const common_exact = [_][]const u8{
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "GNUPGHOME",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "GCM_CREDENTIAL_STORE",
+        "GCM_CREDENTIAL_CACHE_OPTIONS",
+        "GCM_PLAINTEXT_STORE_PATH",
+        "GCM_DPAPI_STORE_PATH",
+        "GCM_GPG_PATH",
+        "GCM_PROVIDER",
+        "GCM_AUTODETECT_TIMEOUT",
+        "GCM_MSAUTH_FLOW",
+    };
+    for (common_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
+
+    for (source.keys(), source.values()) |key, value|
+        if (isLocaleEnvironmentKey(key)) try owned.map.put(key, value);
+
+    const proxy_keys = [_][]const u8{
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    };
+    for (proxy_keys) |key| {
+        const value = source.get(key) orelse continue;
+        if (proxyContainsUserInfo(value)) {
+            owned.warnings.proxy_credentials_omitted = true;
+        } else {
+            try owned.map.put(key, value);
+        }
+    }
+    if (mode == .foreground) {
+        const foreground_exact = [_][]const u8{
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_TYPE",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "BROWSER",
+            "TERM",
+            "COLORTERM",
+            "SSH_TTY",
+            "GPG_TTY",
+            "GCM_GUI_PROMPT",
+        };
+        for (foreground_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
+    }
+
+    if (mode == .foreground) try owned.map.put("GCM_INTERACTIVE", "1");
+    return owned;
+}
+
+fn copyRemoteEnvironmentKey(
+    destination: *std.process.Environ.Map,
+    source: *const std.process.Environ.Map,
+    key: []const u8,
+) std.mem.Allocator.Error!void {
+    if (source.get(key)) |value| try destination.put(key, value);
+}
+
+fn isLocaleEnvironmentKey(key: []const u8) bool {
+    return switch (builtin.os.tag) {
+        .windows => std.ascii.startsWithIgnoreCase(key, "LC_"),
+        else => std.mem.startsWith(u8, key, "LC_"),
+    };
+}
+
+fn proxyContainsUserInfo(value: []const u8) bool {
+    if (std.Uri.parse(value)) |uri| {
+        if (uri.user != null or uri.password != null) return true;
+        if (uri.host != null) return false;
+    } else |_| {}
+
+    var authority = value;
+    if (std.mem.indexOf(u8, authority, "://")) |scheme_end| authority = authority[scheme_end + 3 ..];
+    const authority_end = std.mem.indexOfAny(u8, authority, "/?#") orelse authority.len;
+    return std.mem.indexOfScalar(u8, authority[0..authority_end], '@') != null;
+}
+
 fn remoteOperationEnvironment(allocator: std.mem.Allocator, parent_env: ?*const std.process.Environ.Map) PushEnvironmentError!std.process.Environ.Map {
     var env = if (parent_env) |map|
         map.clone(allocator) catch return error.OutOfMemory
@@ -3849,6 +4000,122 @@ test "stdin admission Git mapping keeps writer error with zero-exit warning" {
         },
         else => return error.ExpectedGitStdinFailure,
     }
+}
+
+test "foreground remote environment owns the exact allowlist" {
+    const allocator = std.testing.allocator;
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", "/home/test");
+    try parent.put("LC_TIME", "C");
+    try parent.put("XDG_RUNTIME_DIR", "/run/user/test");
+    try parent.put("SSH_AUTH_SOCK", "/run/agent.sock");
+    try parent.put("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/dbus");
+    try parent.put("SSL_CERT_FILE", "/etc/certs.pem");
+    try parent.put("TERM", "xterm-256color");
+    try parent.put("DISPLAY", ":0");
+    try parent.put("GCM_GUI_PROMPT", "true");
+    try parent.put("GCM_CREDENTIAL_STORE", "secretservice");
+
+    try parent.put("XDG_STATE_HOME", "/forbidden/state");
+    try parent.put("GIT_DIR", "/forbidden/repo");
+    try parent.put("GIT_ASKPASS", "/forbidden/askpass");
+    try parent.put("SSH_ASKPASS_REQUIRE", "force");
+    try parent.put("GCM_TRACE", "1");
+    try parent.put("GCM_DEBUG", "1");
+    try parent.put("GCM_AZREPOS_SP_SECRET", "GCM-SECRET-CANARY");
+    try parent.put("GITHUB_TOKEN", "PROVIDER-SECRET-CANARY");
+    try parent.put("GCM_INTERACTIVE", "0");
+
+    var inspection = try buildRemoteEnvironment(allocator, &parent, .inspection);
+    defer inspection.deinit();
+    try std.testing.expectEqualStrings("/home/test", inspection.map.get("HOME").?);
+    try std.testing.expectEqualStrings("C", inspection.map.get("LC_TIME").?);
+    try std.testing.expect(inspection.map.get("TERM") == null);
+    try std.testing.expect(inspection.map.get("DISPLAY") == null);
+    try std.testing.expect(inspection.map.get("GCM_GUI_PROMPT") == null);
+    try std.testing.expect(inspection.map.get("GCM_INTERACTIVE") == null);
+
+    var foreground = try buildRemoteEnvironment(allocator, &parent, .foreground);
+    defer foreground.deinit();
+    try std.testing.expectEqualStrings("xterm-256color", foreground.map.get("TERM").?);
+    try std.testing.expectEqualStrings(":0", foreground.map.get("DISPLAY").?);
+    try std.testing.expectEqualStrings("true", foreground.map.get("GCM_GUI_PROMPT").?);
+    try std.testing.expectEqualStrings("1", foreground.map.get("GCM_INTERACTIVE").?);
+
+    const forbidden = [_][]const u8{
+        "XDG_STATE_HOME",
+        "GIT_DIR",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+        "GCM_TRACE",
+        "GCM_DEBUG",
+        "GCM_AZREPOS_SP_SECRET",
+        "GITHUB_TOKEN",
+    };
+    for (forbidden) |key| try std.testing.expect(foreground.map.get(key) == null);
+
+    try parent.put("HOME", "/changed");
+    try std.testing.expectEqualStrings("/home/test", foreground.map.get("HOME").?);
+}
+
+test "foreground remote environment omits credential-bearing proxies" {
+    const allocator = std.testing.allocator;
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+
+    try parent.put("HTTP_PROXY", "http://alice:PROXY-CANARY@proxy.test:8080");
+    try parent.put("https_proxy", "bob:SECOND-CANARY@proxy.test:8081");
+    try parent.put("HTTPS_PROXY", "http://proxy.test/path@not-userinfo");
+    try parent.put("ALL_PROXY", "socks5://proxy.test:1080");
+    try parent.put("NO_PROXY", "localhost,127.0.0.1");
+    try parent.put("no_proxy", "alice:NO-PROXY-CANARY@proxy.test");
+
+    var owned = try buildRemoteEnvironment(allocator, &parent, .foreground);
+    defer owned.deinit();
+    try std.testing.expect(owned.warnings.proxy_credentials_omitted);
+    try std.testing.expect(owned.map.get("HTTP_PROXY") == null);
+    try std.testing.expect(owned.map.get("https_proxy") == null);
+    try std.testing.expectEqualStrings("http://proxy.test/path@not-userinfo", owned.map.get("HTTPS_PROXY").?);
+    try std.testing.expectEqualStrings("socks5://proxy.test:1080", owned.map.get("ALL_PROXY").?);
+    try std.testing.expectEqualStrings("localhost,127.0.0.1", owned.map.get("NO_PROXY").?);
+    try std.testing.expect(owned.map.get("no_proxy") == null);
+    for (owned.map.values()) |value| {
+        try std.testing.expect(std.mem.indexOf(u8, value, "alice") == null);
+        try std.testing.expect(std.mem.indexOf(u8, value, "PROXY-CANARY") == null);
+        try std.testing.expect(std.mem.indexOf(u8, value, "SECOND-CANARY") == null);
+        try std.testing.expect(std.mem.indexOf(u8, value, "NO-PROXY-CANARY") == null);
+    }
+}
+
+fn exerciseForegroundRemoteEnvironmentAllocationFailure(
+    allocator: std.mem.Allocator,
+    parent: *const std.process.Environ.Map,
+) !void {
+    var owned = try buildRemoteEnvironment(allocator, parent, .foreground);
+    defer owned.deinit();
+    try std.testing.expectEqualStrings("1", owned.map.get("GCM_INTERACTIVE").?);
+    try std.testing.expect(owned.warnings.proxy_credentials_omitted);
+    try std.testing.expect(owned.map.get("HTTPS_PROXY") == null);
+}
+
+test "foreground remote environment releases partial construction on allocation failure" {
+    const allocator = std.testing.allocator;
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", "/home/test");
+    try parent.put("LC_ALL", "C.UTF-8");
+    try parent.put("TERM", "xterm-256color");
+    try parent.put("SSH_AUTH_SOCK", "/run/agent.sock");
+    try parent.put("HTTPS_PROXY", "http://alice:PROXY-CANARY@proxy.test:8080");
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        exerciseForegroundRemoteEnvironmentAllocationFailure,
+        .{&parent},
+    );
 }
 
 test "remote operation environment disables interactive credential prompts" {

@@ -12,6 +12,9 @@ const chasen = @import("chasen");
 const actions = @import("actions.zig");
 const effect_origin = @import("effect_origin.zig");
 const app_state = @import("state.zig");
+const remote_request = @import("remote_request.zig");
+const git_backend = @import("../git/backend.zig");
+const root_capability = @import("../repo/root_capability.zig");
 
 pub const InspectionKind = enum {
     verify_snapshot,
@@ -28,6 +31,9 @@ pub const TargetIdentity = struct {
 
 pub fn targetIdentity(target: app_state.PushRetryTarget) TargetIdentity {
     var digest = std.hash.Wyhash.hash(0, @tagName(target.mode));
+    digest = std.hash.Wyhash.hash(digest, std.mem.asBytes(&target.repo_epoch));
+    digest = std.hash.Wyhash.hash(digest, std.mem.asBytes(&target.root_identity.device));
+    digest = std.hash.Wyhash.hash(digest, std.mem.asBytes(&target.root_identity.inode));
     digest = std.hash.Wyhash.hash(digest, target.repo_root);
     digest = std.hash.Wyhash.hash(digest, target.branch);
     digest = std.hash.Wyhash.hash(digest, target.remote);
@@ -42,16 +48,14 @@ pub const Available = struct {
 };
 
 pub const Inspecting = struct {
-    generation: u64,
+    identity: remote_request.RemoteRequestIdentity,
     kind: InspectionKind,
     origin: effect_origin.PageOrigin,
-    repo_epoch: u64,
     target_identity: TargetIdentity,
 
     pub fn accepts(self: Inspecting, finished: Finished) bool {
-        return self.generation == finished.generation and
+        return self.identity.eql(finished.identity) and
             self.kind == finished.kind and
-            self.repo_epoch == finished.repo_epoch and
             self.target_identity.eql(finished.target_identity) and
             self.origin.eql(finished.origin);
     }
@@ -60,10 +64,14 @@ pub const Inspecting = struct {
 pub const Foreground = struct {
     request_id: chasen.ForegroundCommandRequestId,
     pending: actions.PendingAction,
+    identity: remote_request.RemoteRequestIdentity,
     origin: effect_origin.PageOrigin,
+    root: root_capability.RootCapability,
     target: app_state.PushRetryTarget,
+    warnings: git_backend.RemoteWarningSet,
 
     pub fn deinit(self: *Foreground, allocator: std.mem.Allocator) void {
+        self.root.deinit();
         self.target.deinit(allocator);
         self.* = undefined;
     }
@@ -137,10 +145,13 @@ pub const Model = struct {
         self.next_generation +%= 1;
         if (self.next_generation == 0) self.next_generation = 1;
         const metadata: Inspecting = .{
-            .generation = self.next_generation,
+            .identity = .{
+                .repo_epoch = available.target.repo_epoch,
+                .root_identity = available.target.root_identity,
+                .operation_generation = self.next_generation,
+            },
             .kind = kind,
             .origin = origin,
-            .repo_epoch = origin.repo_epoch,
             .target_identity = targetIdentity(available.target),
         };
         self.state = .{ .inspecting = metadata };
@@ -169,16 +180,24 @@ pub const Outcome = union(enum) {
 };
 
 pub const Finished = struct {
-    generation: u64,
+    identity: remote_request.RemoteRequestIdentity,
     kind: InspectionKind,
     origin: effect_origin.PageOrigin,
-    repo_epoch: u64,
     target_identity: TargetIdentity,
     credentials_available: bool,
+    root: ?root_capability.RootCapability,
     target: app_state.PushRetryTarget,
+    warnings: git_backend.RemoteWarningSet,
     outcome: Outcome,
 
+    pub fn takeRoot(self: *Finished) root_capability.RootCapability {
+        const root = self.root orelse @panic("push inspection root already moved");
+        self.root = null;
+        return root;
+    }
+
     pub fn deinit(self: *Finished, allocator: std.mem.Allocator) void {
+        if (self.root) |*root| root.deinit();
         self.target.deinit(allocator);
         self.* = undefined;
     }
@@ -188,6 +207,8 @@ pub fn startInspection(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
     metadata: Inspecting,
+    root: *?root_capability.RootCapability,
+    environment: *?git_backend.OwnedRemoteEnvironment,
     target: *app_state.PushRetryTarget,
     credentials_available: bool,
 ) !void {
@@ -196,9 +217,15 @@ pub fn startInspection(
     task.* = .{
         .metadata = metadata,
         .credentials_available = credentials_available,
+        .root = root.* orelse @panic("push inspection requires an owned root"),
+        .environment = environment.* orelse @panic("push inspection requires an owned environment"),
         .target = target.take(),
     };
+    root.* = null;
+    environment.* = null;
     errdefer {
+        root.* = task.root;
+        environment.* = task.environment;
         target.* = task.target.take();
         ctx.allocator().destroy(task);
     }
@@ -209,6 +236,8 @@ pub fn Task(comptime Msg: type) type {
     return struct {
         metadata: Inspecting,
         credentials_available: bool,
+        root: root_capability.RootCapability,
+        environment: git_backend.OwnedRemoteEnvironment,
         target: app_state.PushRetryTarget,
 
         const Self = @This();
@@ -216,11 +245,11 @@ pub fn Task(comptime Msg: type) type {
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *Self = @ptrCast(@alignCast(ctx_ptr));
             const outcome = switch (task.metadata.kind) {
-                .verify_snapshot => if (verifySnapshot(allocator, io, task.target)) |matches|
+                .verify_snapshot => if (verifySnapshot(allocator, io, task.root.dir(), &task.environment.map, task.target)) |matches|
                     if (matches) Outcome{ .snapshot_valid = {} } else Outcome{ .snapshot_changed = {} }
                 else |_|
                     Outcome{ .inspection_failed = "could not verify push retry target" },
-                .lookup_remote => lookupRemote(allocator, io, &task.target) catch
+                .lookup_remote => lookupRemote(allocator, io, task.root.dir(), &task.environment.map, &task.target) catch
                     Outcome{ .inspection_failed = "could not read push remote URL" },
             };
             return Msg.pushInspectionFinished(task.finish(allocator, outcome));
@@ -237,26 +266,37 @@ pub fn Task(comptime Msg: type) type {
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *Self, allocator: std.mem.Allocator, outcome: Outcome) Finished {
-            defer allocator.destroy(task);
+            defer {
+                task.environment.deinit();
+                allocator.destroy(task);
+            }
             return .{
-                .generation = task.metadata.generation,
+                .identity = task.metadata.identity,
                 .kind = task.metadata.kind,
                 .origin = task.metadata.origin,
-                .repo_epoch = task.metadata.repo_epoch,
                 .target_identity = task.metadata.target_identity,
                 .credentials_available = task.credentials_available,
+                .root = task.root,
                 .target = task.target.take(),
+                .warnings = task.environment.warnings,
                 .outcome = outcome,
             };
         }
     };
 }
 
-fn lookupRemote(allocator: std.mem.Allocator, io: std.Io, target: *app_state.PushRetryTarget) !Outcome {
+fn lookupRemote(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    target: *app_state.PushRetryTarget,
+) !Outcome {
     const argv = [_][]const u8{ "git", "remote", "get-url", target.remote };
     const result = try std.process.run(allocator, io, .{
         .argv = &argv,
-        .cwd = .{ .path = target.repo_root },
+        .cwd = .{ .dir = cwd },
+        .environ_map = environment,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
     });
@@ -283,11 +323,18 @@ fn isHttpsRemoteUrl(remote_url: []const u8) bool {
     return std.ascii.eqlIgnoreCase(uri.scheme, "https") and uri.host != null;
 }
 
-fn verifySnapshot(allocator: std.mem.Allocator, io: std.Io, target: app_state.PushRetryTarget) !bool {
+fn verifySnapshot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    target: app_state.PushRetryTarget,
+) !bool {
     const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
     const branch_result = try std.process.run(allocator, io, .{
         .argv = &branch_argv,
-        .cwd = .{ .path = target.repo_root },
+        .cwd = .{ .dir = cwd },
+        .environ_map = environment,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
     });
@@ -302,7 +349,8 @@ fn verifySnapshot(allocator: std.mem.Allocator, io: std.Io, target: app_state.Pu
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
     const oid_result = try std.process.run(allocator, io, .{
         .argv = &oid_argv,
-        .cwd = .{ .path = target.repo_root },
+        .cwd = .{ .dir = cwd },
+        .environ_map = environment,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
     });
@@ -317,6 +365,8 @@ fn verifySnapshot(allocator: std.mem.Allocator, io: std.Io, target: app_state.Pu
 
 test "target identity covers the semantic failed-push snapshot" {
     const base: app_state.PushRetryTarget = .{
+        .repo_epoch = 4,
+        .root_identity = .{ .device = 7, .inode = 9 },
         .mode = .upstream,
         .repo_root = @constCast("/repo"),
         .branch = @constCast("main"),
@@ -335,6 +385,8 @@ test "model moves the sole target owner into inspection metadata" {
     defer model.deinit(allocator);
     model.state = .{ .available = .{
         .target = .{
+            .repo_epoch = 4,
+            .root_identity = .{ .device = 7, .inode = 9 },
             .mode = .upstream,
             .repo_root = try allocator.dupe(u8, "/repo"),
             .branch = try allocator.dupe(u8, "main"),
@@ -348,34 +400,45 @@ test "model moves the sole target owner into inspection metadata" {
     var started = model.beginInspection(.verify_snapshot, .{ .page_id = .review, .repo_epoch = 4, .activation_id = 7 }).?;
     defer started.target.deinit(allocator);
     try std.testing.expect(model.state == .inspecting);
-    try std.testing.expectEqual(@as(u64, 4), started.metadata.repo_epoch);
+    try std.testing.expectEqual(@as(u64, 4), started.metadata.identity.repo_epoch);
+    try std.testing.expectEqual(@as(u64, 1), started.metadata.identity.operation_generation);
     try std.testing.expect(started.credentials_available);
+
+    model.restoreAvailable(allocator, started.target.take(), started.credentials_available);
+    var second = model.beginInspection(.lookup_remote, .{ .page_id = .review, .repo_epoch = 4, .activation_id = 7 }).?;
+    defer second.target.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), second.metadata.identity.operation_generation);
+    try std.testing.expectEqual(InspectionKind.lookup_remote, second.metadata.kind);
 }
 
 test "inspection acceptance requires every correlation member" {
     const origin: effect_origin.PageOrigin = .{ .page_id = .review, .repo_epoch = 4, .activation_id = 7 };
     const inspecting: Inspecting = .{
-        .generation = 2,
+        .identity = .{
+            .repo_epoch = 4,
+            .root_identity = .{ .device = 7, .inode = 9 },
+            .operation_generation = 2,
+        },
         .kind = .verify_snapshot,
         .origin = origin,
-        .repo_epoch = 4,
         .target_identity = .{ .digest = 99 },
     };
     const target = app_state.PushRetryTarget.empty();
     const base: Finished = .{
-        .generation = 2,
+        .identity = inspecting.identity,
         .kind = .verify_snapshot,
         .origin = origin,
-        .repo_epoch = 4,
         .target_identity = .{ .digest = 99 },
         .credentials_available = false,
+        .root = null,
         .target = target,
+        .warnings = .{},
         .outcome = .snapshot_valid,
     };
     try std.testing.expect(inspecting.accepts(base));
 
     var changed = base;
-    changed.generation = 3;
+    changed.identity.operation_generation = 3;
     try std.testing.expect(!inspecting.accepts(changed));
     changed = base;
     changed.kind = .lookup_remote;
@@ -384,7 +447,10 @@ test "inspection acceptance requires every correlation member" {
     changed.origin.activation_id = 8;
     try std.testing.expect(!inspecting.accepts(changed));
     changed = base;
-    changed.repo_epoch = 5;
+    changed.identity.repo_epoch = 5;
+    try std.testing.expect(!inspecting.accepts(changed));
+    changed = base;
+    changed.identity.root_identity.inode = 10;
     try std.testing.expect(!inspecting.accepts(changed));
     changed = base;
     changed.target_identity.digest = 100;

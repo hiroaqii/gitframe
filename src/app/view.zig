@@ -1914,6 +1914,7 @@ test "push confirmation renders ahead behind for upstream push" {
 
     var app: ShellViewTestHarness = .{};
     app.push_confirmation = .{
+        .repository_identity = .{ .repo_epoch = 0, .root_identity = .{ .device = 0, .inode = 0 } },
         .mode = .upstream,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
@@ -1940,6 +1941,7 @@ test "push confirmation renders set-upstream detail without fake ahead behind" {
 
     var app: ShellViewTestHarness = .{};
     app.push_confirmation = .{
+        .repository_identity = .{ .repo_epoch = 0, .root_identity = .{ .device = 0, .inode = 0 } },
         .mode = .set_upstream,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature/topic"),

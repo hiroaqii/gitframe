@@ -6,6 +6,7 @@ const git_ops = @import("git_ops.zig");
 const external_action = @import("../external/action.zig");
 const process_runner = @import("../process/runner.zig");
 const context_export = @import("../context_export.zig");
+const remote_request = @import("remote_request.zig");
 
 /// Git operation categories that can become App-facing actions.
 ///
@@ -274,6 +275,7 @@ pub const AmendFinished = struct {
 
 pub const PushFinished = struct {
     pending: PendingAction,
+    identity: remote_request.RemoteRequestIdentity,
     mode: git_push.Mode,
     repo_root: []u8,
     branch: []u8,
@@ -291,6 +293,11 @@ pub const PushFinished = struct {
         self.result.deinit(allocator);
         self.* = .{
             .pending = .{ .generation = 0, .kind = .push },
+            .identity = .{
+                .repo_epoch = 0,
+                .root_identity = .{ .device = 0, .inode = 0 },
+                .operation_generation = 0,
+            },
             .mode = .upstream,
             .repo_root = &.{},
             .branch = &.{},
@@ -765,6 +772,7 @@ pub fn AmendTask(comptime Msg: type) type {
 pub fn PushTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
+        identity: remote_request.RemoteRequestIdentity,
         mode: git_push.Mode,
         repo_root: []u8,
         branch: []u8,
@@ -809,6 +817,7 @@ pub fn PushTask(comptime Msg: type) type {
             task.oid = &.{};
             return Msg.actionFinished(.{ .push = PushFinished{
                 .pending = task.pending,
+                .identity = task.identity,
                 .mode = mode,
                 .repo_root = repo_root,
                 .branch = branch,

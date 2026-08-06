@@ -23,6 +23,7 @@ const diff_source = @import("../../../diff/source.zig");
 const auto_reload = @import("../../auto_reload.zig");
 const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
+const remote_request = @import("../../remote_request.zig");
 const action_fence = @import("action_fence.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
@@ -72,6 +73,7 @@ pub const OwnedHunkProposal = struct {
 };
 
 pub const OwnedPushProposal = struct {
+    repository_identity: remote_request.RepositoryIdentity,
     mode: git_ops.PushMode,
     repo_root: []u8,
     branch: []u8,
@@ -392,8 +394,13 @@ pub const View = struct {
         return .{ .unstage_hunk = try consumeHunkProposal(allocator, target) };
     }
 
-    pub fn ownPushProposal(_: View, allocator: std.mem.Allocator, target: git_ops.PushTarget) !OwnedOperationProposal {
-        return .{ .push = try clonePushProposal(allocator, target) };
+    pub fn ownPushProposal(
+        _: View,
+        allocator: std.mem.Allocator,
+        repository_identity: remote_request.RepositoryIdentity,
+        target: git_ops.PushTarget,
+    ) !OwnedOperationProposal {
+        return .{ .push = try clonePushProposal(allocator, repository_identity, target) };
     }
 
     pub fn ownPullProposal(_: View, allocator: std.mem.Allocator, target: git_ops.PullTarget) !OwnedOperationProposal {
@@ -806,7 +813,11 @@ fn sourceIsCached(source: diff_source.SourceMode) bool {
     };
 }
 
-fn clonePushProposal(allocator: std.mem.Allocator, target: git_ops.PushTarget) !OwnedPushProposal {
+fn clonePushProposal(
+    allocator: std.mem.Allocator,
+    repository_identity: remote_request.RepositoryIdentity,
+    target: git_ops.PushTarget,
+) !OwnedPushProposal {
     const repo_root = try allocator.dupe(u8, target.repo_root);
     errdefer allocator.free(repo_root);
     const branch = try allocator.dupe(u8, target.branch);
@@ -816,6 +827,7 @@ fn clonePushProposal(allocator: std.mem.Allocator, target: git_ops.PushTarget) !
     const remote_branch = try allocator.dupe(u8, target.remote_branch);
     errdefer allocator.free(remote_branch);
     return .{
+        .repository_identity = repository_identity,
         .mode = target.mode,
         .repo_root = repo_root,
         .branch = branch,
@@ -890,6 +902,9 @@ test "owned operation proposal frees every cloned field" {
     const allocator = std.testing.allocator;
     const view: View = undefined;
     var proposal = try view.ownPushProposal(allocator, .{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+    }, .{
         .mode = .upstream,
         .repo_root = "/repo",
         .branch = "main",
@@ -908,6 +923,9 @@ test "owned operation proposal construction frees partial clones" {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         const view: View = undefined;
         const result = view.ownPushProposal(failing.allocator(), .{
+            .repo_epoch = 1,
+            .root_identity = .{ .device = 2, .inode = 3 },
+        }, .{
             .mode = .upstream,
             .repo_root = "/repo",
             .branch = "main",

@@ -451,6 +451,8 @@ fn installPushCredentialPrompt(
     var target = app_state.PushRetryTarget.empty();
     var target_owned = true;
     defer if (target_owned) target.deinit(allocator);
+    target.repo_epoch = app.repo_session.view().epoch();
+    target.root_identity = app.repo_session.view().activeIdentity().?;
     target.repo_root = try allocator.dupe(u8, repo_root);
     target.branch = try allocator.dupe(u8, "main");
     target.remote = try allocator.dupe(u8, "origin");

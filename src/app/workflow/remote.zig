@@ -19,12 +19,15 @@ const app_load_state = @import("../load_state.zig");
 const app_message = @import("../message.zig");
 const page = @import("../page.zig");
 const app_push_retry = @import("../push_retry.zig");
+const remote_request = @import("../remote_request.zig");
+const repo_session = @import("../repo_session.zig");
 const app_state = @import("../state.zig");
 const review_action_fence = @import("../pages/review/action_fence.zig");
 const review_operations = @import("../pages/review/operations.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 const remote_state = @import("remote_state.zig");
 const git_backend = @import("../../git/backend.zig");
+const root_capability = @import("../../repo/root_capability.zig");
 
 const BranchListLoadFinished = app_load.BranchListLoadFinished;
 const BranchListLoadTask = app_load.BranchListLoadTask(app_message.Msg);
@@ -88,7 +91,7 @@ pub const Controller = struct {
     state: *State,
     lifecycle: action_lifecycle.Controller,
     operations: review_operations.Controller,
-    repo_epoch: u64,
+    repo: repo_session.View,
     current_review_root: ?[]const u8,
     env_map: ?*std.process.Environ.Map,
     active_page: page.Id,
@@ -121,16 +124,23 @@ pub const Controller = struct {
             .pull_first => return self.reject("push blocked: pull/rebase remote changes first"),
             .nothing_to_push => return self.reject("nothing to push"),
         };
+        const repository_identity = self.currentRepositoryIdentity() orelse
+            return self.reject("push unavailable: repository authority changed");
+        const active_root = self.repo.activeRoot() orelse
+            return self.reject("push unavailable: no repository");
+        if (!std.mem.eql(u8, active_root, target.repo_root))
+            return self.reject("push unavailable: repository authority changed");
 
         self.cancelPushConfirmation(allocator);
         self.cancelPullConfirmation(allocator);
         self.clearPushError(allocator);
 
-        var proposal = try self.operations.view().ownPushProposal(allocator, target);
+        var proposal = try self.operations.view().ownPushProposal(allocator, repository_identity, target);
         var proposal_consumed = false;
         defer if (!proposal_consumed) proposal.deinit(allocator);
         const owned = proposal.push;
         self.state.push_confirmation = .{
+            .repository_identity = owned.repository_identity,
             .mode = owned.mode,
             .repo_root = owned.repo_root,
             .branch = owned.branch,
@@ -152,8 +162,19 @@ pub const Controller = struct {
         }
         var confirmation = self.state.push_confirmation orelse return;
         self.state.push_confirmation = null;
+        var confirmation_consumed = false;
+        defer if (!confirmation_consumed) confirmation.deinit(ctx.allocator());
+        if (!self.repositoryMatches(confirmation.repository_identity) or
+            self.repo.activeRoot() == null or
+            !std.mem.eql(u8, self.repo.activeRoot().?, confirmation.repo_root))
+        {
+            self.setStatus("push unavailable: repository authority changed", .{});
+            if (self.overlay.isPushBranch()) self.overlay.close();
+            return;
+        }
         self.setStatus("pushing: {s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
         const prepared = self.lifecycle.prepare(.push);
+        confirmation_consumed = true;
         app_git_requests.startPush(app_message.Msg, ctx, prepared.pending, self.env_map, &confirmation) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start push task", .{});
@@ -318,7 +339,7 @@ pub const Controller = struct {
         const task = try ctx.allocator().create(BranchListLoadTask);
         task.* = .{
             .origin = .review,
-            .repo_epoch = self.repo_epoch,
+            .repo_epoch = self.repo.epoch(),
             .activation_id = self.review_origin.activation_id,
             .repo_root = &.{},
             .generation = generation,
@@ -449,6 +470,13 @@ pub const Controller = struct {
             return;
         }
         if (self.lifecycle.view().hasPending()) return self.rejectVoid("another git action is running");
+        if (!self.repositoryMatches(.{
+            .repo_epoch = prompt.target.repo_epoch,
+            .root_identity = prompt.target.root_identity,
+        })) {
+            self.cancelPushCredentialPrompt(ctx.allocator());
+            return self.rejectVoid("credential retry unavailable: repository authority changed");
+        }
 
         var username = try ctx.allocator().dupe(u8, prompt.username.secret());
         errdefer app_actions.secureFree(ctx.allocator(), username);
@@ -473,6 +501,8 @@ pub const Controller = struct {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
+        if (!self.remoteRequestMatches(result.identity) or
+            result.identity.operation_generation != result.pending.generation) return .{};
         const active_matches = terminal.target == .current_review;
         switch (result.result) {
             .ok, .ok_static => {
@@ -565,7 +595,7 @@ pub const Controller = struct {
     pub fn finishBranchListLoad(self: Controller, allocator: std.mem.Allocator, finished: BranchListLoadFinished) !void {
         var result = finished;
         defer result.deinit(allocator);
-        if (result.repo_epoch != self.repo_epoch) return;
+        if (result.repo_epoch != self.repo.epoch()) return;
         switch (app_load_state.acceptBranchListResult(
             &self.state.branch_switch_load_pending,
             self.state.branch_switch.hasState(),
@@ -622,7 +652,7 @@ pub const Controller = struct {
         };
         if (!inspecting.accepts(result)) return;
         self.state.push_retry.state = .idle;
-        if (result.repo_epoch != self.repo_epoch) return;
+        if (!self.remoteRequestMatches(result.identity)) return;
         const origin: effect_origin.Origin = .{ .page = result.origin };
         if (effect_origin.classify(origin, self.effect_snapshot) == .stale) {
             self.clearPushErrorPresentation(ctx.allocator());
@@ -632,7 +662,15 @@ pub const Controller = struct {
             .snapshot_valid => if (result.kind != .verify_snapshot) {
                 self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
                 self.setStatus("push retry inspection returned an invalid result", .{});
-            } else try self.startInteractivePushAfterInspection(ctx, result.origin, result.target.take(), result.credentials_available),
+            } else try self.startInteractivePushAfterInspection(
+                ctx,
+                result.identity,
+                result.origin,
+                result.takeRoot(),
+                result.target.take(),
+                result.credentials_available,
+                result.warnings,
+            ),
             .snapshot_changed => {
                 self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
                 self.setStatus("push retry unavailable: branch changed; reload and try again", .{});
@@ -646,6 +684,8 @@ pub const Controller = struct {
                     self.setStatus("could not open push credential prompt", .{});
                     return err;
                 };
+                var inspected_root = result.takeRoot();
+                inspected_root.deinit();
                 prompt.* = .{ .target = result.target.take() };
                 self.state.push_retry.state = .{ .credential_prompt = prompt };
                 self.clearPushErrorPresentation(ctx.allocator());
@@ -673,6 +713,7 @@ pub const Controller = struct {
         self.state.push_retry.state = .idle;
         defer foreground.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, foreground.pending, foreground.target.repo_root) orelse return .{};
+        if (!self.remoteRequestMatches(foreground.identity)) return .{};
         const active_matches = terminal.target == .current_review;
         const origin: effect_origin.Origin = .{ .page = foreground.origin };
         const liveness = effect_origin.classify(origin, self.effect_snapshot);
@@ -682,11 +723,11 @@ pub const Controller = struct {
         }
         switch (result.outcome) {
             .exited => |code| if (code == 0) {
-                if (active_matches) self.setStatus("pushed interactively: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch }) else self.setStatus("pushed interactively: {s}", .{foreground.target.repo_root});
-            } else if (active_matches) self.setStatus("interactive push exited: {d}", .{code}) else self.setStatus("interactive push exited for {s}: {d}", .{ foreground.target.repo_root, code }),
-            .signaled => |signal| if (active_matches) self.setStatus("interactive push signal: {d}", .{signal}) else self.setStatus("interactive push signal for {s}: {d}", .{ foreground.target.repo_root, signal }),
-            .spawn_failed => |err| if (active_matches) self.setStatus("interactive push spawn failed: {s}", .{err}) else self.setStatus("interactive push spawn failed for {s}: {s}", .{ foreground.target.repo_root, err }),
-            .wait_failed => |err| if (active_matches) self.setStatus("interactive push wait failed: {s}", .{err}) else self.setStatus("interactive push wait failed for {s}: {s}", .{ foreground.target.repo_root, err }),
+                if (active_matches) self.setForegroundStatus(foreground.warnings, "pushed interactively: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch }) else self.setForegroundStatus(foreground.warnings, "pushed interactively: {s}", .{foreground.target.repo_root});
+            } else if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push exited: {d}", .{code}) else self.setForegroundStatus(foreground.warnings, "interactive push exited for {s}: {d}", .{ foreground.target.repo_root, code }),
+            .signaled => |signal| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push signal: {d}", .{signal}) else self.setForegroundStatus(foreground.warnings, "interactive push signal for {s}: {d}", .{ foreground.target.repo_root, signal }),
+            .spawn_failed => |err| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push spawn failed: {s}", .{err}) else self.setForegroundStatus(foreground.warnings, "interactive push spawn failed for {s}: {s}", .{ foreground.target.repo_root, err }),
+            .wait_failed => |err| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push wait failed: {s}", .{err}) else self.setForegroundStatus(foreground.warnings, "interactive push wait failed for {s}: {s}", .{ foreground.target.repo_root, err }),
         }
         if (liveness == .live_inactive) {
             self.redraw.requestSkip();
@@ -697,8 +738,28 @@ pub const Controller = struct {
 
     fn startPushInspection(self: Controller, ctx: *chasen.Ctx(app_message.Msg), kind: app_push_retry.InspectionKind, unavailable_message: []const u8) !void {
         if (self.state.push_retry.state == .inspecting) return self.rejectVoid("push retry inspection already running");
+        const available_target = self.state.push_retry.state.availableTarget() orelse
+            return self.rejectVoid(unavailable_message);
+        const repository_identity: remote_request.RepositoryIdentity = .{
+            .repo_epoch = available_target.repo_epoch,
+            .root_identity = available_target.root_identity,
+        };
+        if (!self.repositoryMatches(repository_identity))
+            return self.rejectVoid("push retry unavailable: repository authority changed");
+        const capability = self.repo.activeCapability() orelse
+            return self.rejectVoid("push retry unavailable: repository authority changed");
+        var root: ?root_capability.RootCapability = capability.duplicate() catch {
+            return self.rejectVoid("push retry unavailable: repository authority could not be retained");
+        };
+        defer if (root) |*owned| owned.deinit();
+        var environment: ?git_backend.OwnedRemoteEnvironment = try git_backend.buildRemoteEnvironment(
+            ctx.allocator(),
+            self.env_map,
+            .inspection,
+        );
+        defer if (environment) |*owned| owned.deinit();
         var started = self.state.push_retry.beginInspection(kind, self.review_origin) orelse return self.rejectVoid(unavailable_message);
-        app_push_retry.startInspection(app_message.Msg, ctx, started.metadata, &started.target, started.credentials_available) catch |err| {
+        app_push_retry.startInspection(app_message.Msg, ctx, started.metadata, &root, &environment, &started.target, started.credentials_available) catch |err| {
             self.restorePushRetryTarget(ctx.allocator(), started.target.take(), started.credentials_available);
             self.setStatus("could not start push retry inspection", .{});
             return err;
@@ -709,31 +770,72 @@ pub const Controller = struct {
         }
     }
 
-    fn startInteractivePushAfterInspection(self: Controller, ctx: *chasen.Ctx(app_message.Msg), origin: effect_origin.PageOrigin, owned_target: app_state.PushRetryTarget, credentials_available: bool) !void {
+    fn startInteractivePushAfterInspection(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        identity: remote_request.RemoteRequestIdentity,
+        origin: effect_origin.PageOrigin,
+        owned_root: root_capability.RootCapability,
+        owned_target: app_state.PushRetryTarget,
+        credentials_available: bool,
+        inspection_warnings: git_backend.RemoteWarningSet,
+    ) !void {
+        var root: ?root_capability.RootCapability = owned_root;
+        defer if (root) |*owned| owned.deinit();
         var target = owned_target;
         errdefer target.deinit(ctx.allocator());
         if (self.lifecycle.view().hasPending()) {
             self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
-            return self.rejectVoid("another git action is running");
+            self.setForegroundStatus(inspection_warnings, "another git action is running", .{});
+            return;
         }
-        const refspec = std.fmt.allocPrint(ctx.allocator(), "{s}:refs/heads/{s}", .{ target.oid, target.remote_branch }) catch |err| {
+        const refspec = std.fmt.allocPrint(ctx.allocator(), "{s}:refs/heads/{s}", .{ target.oid, target.remote_branch }) catch {
             self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
-            return err;
+            self.setForegroundStatus(inspection_warnings, "interactive push could not be queued", .{});
+            return;
         };
         defer ctx.allocator().free(refspec);
-        const argv = [_][]const u8{ "git", "push", target.remote, refspec };
+        const argv = [_][]const u8{
+            "git",
+            "-c",
+            "credential.trace=false",
+            "-c",
+            "credential.traceSecrets=false",
+            "-c",
+            "credential.traceMsAuth=false",
+            "-c",
+            "credential.debug=false",
+            "push",
+            "--",
+            target.remote,
+            refspec,
+        };
+        var environment = git_backend.buildRemoteEnvironment(ctx.allocator(), self.env_map, .foreground) catch {
+            self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
+            self.setForegroundStatus(inspection_warnings, "interactive push could not be queued", .{});
+            return;
+        };
+        defer environment.deinit();
+        environment.warnings.merge(inspection_warnings);
         const prepared = self.lifecycle.prepare(.push);
         const request_id = ctx.terminal().runForegroundCommand(.{
             .argv = &argv,
-            .cwd = target.repo_root,
+            .cwd = .{ .dir = root.?.dir() },
+            .environment = .{ .replace = &environment.map },
             .finished = app_message.Msg.pushForegroundFinished,
         }) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
             switch (err) {
-                error.ForegroundCommandLimitExceeded => self.setStatus("interactive push already queued", .{}),
-                error.ForegroundCommandEmptyArgv => self.setStatus("interactive push command is empty", .{}),
-                error.OutOfMemory => return err,
+                error.ForegroundCommandLimitExceeded => self.setForegroundStatus(environment.warnings, "interactive push already queued", .{}),
+                error.ForegroundCommandEmptyArgv => self.setForegroundStatus(environment.warnings, "interactive push command is empty", .{}),
+                error.ForegroundCommandCwdUnsupported => self.setForegroundStatus(environment.warnings, "interactive push unavailable on this platform", .{}),
+                error.ForegroundCommandInvalidCwd => self.setForegroundStatus(environment.warnings, "interactive push repository authority is invalid", .{}),
+                error.ForegroundCommandProcessFdQuotaExceeded,
+                error.ForegroundCommandSystemFdQuotaExceeded,
+                error.ForegroundCommandDuplicateCwdFailed,
+                => self.setForegroundStatus(environment.warnings, "interactive push could not retain repository authority", .{}),
+                error.OutOfMemory => self.setForegroundStatus(environment.warnings, "interactive push could not be queued", .{}),
             }
             return;
         };
@@ -741,9 +843,13 @@ pub const Controller = struct {
         self.state.push_retry.state = .{ .foreground = .{
             .request_id = request_id,
             .pending = accepted.pending,
+            .identity = identity,
             .origin = origin,
+            .root = root.?,
             .target = target.take(),
+            .warnings = environment.warnings,
         } };
+        root = null;
         const foreground = &self.state.push_retry.state.foreground;
         self.clearPushErrorPresentation(ctx.allocator());
         self.setStatus("running interactive push: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
@@ -784,6 +890,25 @@ pub const Controller = struct {
         };
     }
 
+    fn currentRepositoryIdentity(self: Controller) ?remote_request.RepositoryIdentity {
+        const identity = self.repo.activeIdentity() orelse return null;
+        const capability = self.repo.activeCapability() orelse return null;
+        if (!capability.identity.eql(identity)) return null;
+        return .{
+            .repo_epoch = self.repo.epoch(),
+            .root_identity = identity,
+        };
+    }
+
+    fn repositoryMatches(self: Controller, expected: remote_request.RepositoryIdentity) bool {
+        const current = self.currentRepositoryIdentity() orelse return false;
+        return current.eql(expected);
+    }
+
+    fn remoteRequestMatches(self: Controller, expected: remote_request.RemoteRequestIdentity) bool {
+        return self.repositoryMatches(expected.repository());
+    }
+
     fn acceptTerminal(self: Controller, allocator: std.mem.Allocator, pending: app_actions.PendingAction, repo_root: []const u8) ?action_lifecycle.AcceptedTerminal {
         return switch (self.lifecycle.finishExact(allocator, pending, repo_root, self.current_review_root)) {
             .rejected => null,
@@ -811,6 +936,19 @@ pub const Controller = struct {
 
     fn setStatus(self: Controller, comptime fmt: []const u8, args: anytype) void {
         self.status.set(fmt, args);
+    }
+
+    fn setForegroundStatus(
+        self: Controller,
+        warnings: git_backend.RemoteWarningSet,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) void {
+        if (warnings.proxy_credentials_omitted) {
+            self.status.set("credential-bearing proxy omitted; " ++ fmt, args);
+        } else {
+            self.status.set(fmt, args);
+        }
     }
 };
 
@@ -850,6 +988,8 @@ fn wrapIndex(current: usize, len: usize, delta: isize) usize {
 
 fn pushRetryTargetFromFinished(allocator: std.mem.Allocator, finished: app_actions.PushFinished) !app_state.PushRetryTarget {
     var target: app_state.PushRetryTarget = .{
+        .repo_epoch = finished.identity.repo_epoch,
+        .root_identity = finished.identity.root_identity,
         .mode = finished.mode,
         .repo_root = try allocator.dupe(u8, finished.repo_root),
         .branch = &.{},

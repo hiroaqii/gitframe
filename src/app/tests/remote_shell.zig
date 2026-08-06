@@ -213,7 +213,7 @@ fn remoteWorkflow(app: *App) workflow_remote.Controller {
         .state = &app.remote_workflow,
         .lifecycle = actionLifecycle(app),
         .operations = reviewOperationController(app),
-        .repo_epoch = app.repo_session.view().epoch(),
+        .repo = app.repo_session.view(),
         .current_review_root = currentReviewActionRoot(app),
         .env_map = app.env_map,
         .active_page = app.active_page,
@@ -330,7 +330,10 @@ fn installInteractivePushRetryForFenceTest(
     repo_root: []const u8,
     oid: []const u8,
 ) !void {
+    const repository = app.repo_session.view();
     try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(app), allocator, "failed", .{
+        .repo_epoch = repository.epoch(),
+        .root_identity = repository.activeIdentity().?,
         .mode = .set_upstream,
         .repo_root = try allocator.dupe(u8, repo_root),
         .branch = try allocator.dupe(u8, "main"),
@@ -385,7 +388,9 @@ fn installPushCredentialPromptForTest(app: *App, allocator: std.mem.Allocator) !
     var target = app_state.PushRetryTarget.empty();
     var target_owned = true;
     defer if (target_owned) target.deinit(allocator);
-    target.repo_root = try allocator.dupe(u8, "/repo");
+    target.repo_epoch = app.repo_session.view().epoch();
+    target.root_identity = app.repo_session.view().activeIdentity().?;
+    target.repo_root = try allocator.dupe(u8, app.repo_session.view().activeRoot().?);
     target.branch = try allocator.dupe(u8, "main");
     target.remote = try allocator.dupe(u8, "origin");
     target.remote_branch = try allocator.dupe(u8, "main");
@@ -538,7 +543,8 @@ test "Review mutation read fence follows interactive foreground queue and termin
         defer ctx.runtimeClearPendingEffectCopies();
         _ = try ctx.terminal().runForegroundCommand(.{
             .argv = &.{"true"},
-            .cwd = repo.repo_root,
+            .cwd = .inherit,
+            .environment = .inherit,
             .finished = DummyForeground.done,
         });
 
@@ -655,15 +661,18 @@ test "Review mutation read fence follows interactive foreground queue and termin
 
 test "Review mutation read fence follows credentialed push queue acceptance" {
     const allocator = std.testing.allocator;
-    var app: App = .{ .allocator = allocator };
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
     defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
     defer remoteWorkflow(&app).clearPushError(allocator);
-    _ = activateReview(&app);
     try installPushCredentialPromptForTest(&app, allocator);
     const epoch_before_launch = app.pages.review.repository_read_authority.epoch;
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer ctx.runtimeClearPendingEffectCopies();
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
     try app.update(.push_credential_submit, &ctx);
     const owner = app.action_runtime.view().acceptedPending() orelse return error.ExpectedPendingAction;
     const fence_closed =
@@ -685,24 +694,14 @@ test "Review mutation read fence follows credentialed push queue acceptance" {
     try std.testing.expect(epoch_advanced);
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
 
     // A valid remote request owns the confirmation-exclusivity boundary even
     // when its first allocation fails. Local state must not survive only
     // because the typed success outcome could not be returned.
-    var failure_app: App = .{
-        .allocator = allocator,
-        .active_page = .review,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
-        },
-    };
-    defer failure_app.pages.review.branch_status.deinit();
-    defer failure_app.pages.review.git_status.deinit();
+    var failure_app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer failure_app.pages.review.deinit(allocator);
+    defer failure_app.repo_session.repo_state.deinit(allocator);
     defer failure_app.remote_workflow.deinit(allocator);
     defer if (failure_app.local_workflow.discard_confirmation) |*confirmation| confirmation.deinit(allocator);
     var branch = try branchStatusBundleForRemoteRootTest(
@@ -711,10 +710,10 @@ test "Review mutation read fence follows credentialed push queue acceptance" {
         "feature",
         "origin/main",
     );
-    try failure_app.pages.review.branch_status.replace("/repo", &branch);
-    _ = failure_app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    try failure_app.pages.review.branch_status.replace(roots.a, &branch);
+    _ = failure_app.pages.review.activation.activate(failure_app.repo_session.repo_epoch, .fresh, .fresh, .fresh);
     failure_app.local_workflow.discard_confirmation = .{
-        .repo_root = try allocator.dupe(u8, "/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "src/app.zig"),
     };
     failure_app.overlay.openDiscardFile();
@@ -730,10 +729,10 @@ test "Review mutation read fence follows credentialed push queue acceptance" {
     try std.testing.expect(failure_app.remote_workflow.push_confirmation == null);
 
     var status = try git_status.StatusBundle.parseOwned(allocator, "");
-    try failure_app.pages.review.git_status.replace("/repo", &status);
-    _ = failure_app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    try failure_app.pages.review.git_status.replace(roots.a, &status);
+    _ = failure_app.pages.review.activation.activate(failure_app.repo_session.repo_epoch, .fresh, .fresh, .fresh);
     failure_app.local_workflow.discard_confirmation = .{
-        .repo_root = try allocator.dupe(u8, "/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "src/app.zig"),
     };
     failure_app.overlay.openDiscardFile();
@@ -1086,6 +1085,11 @@ test "finishPush does not reload a stale active repository" {
 
     try app.update(.{ .action_finished = .{ .push = .{
         .pending = pending,
+        .identity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+            .operation_generation = pending.generation,
+        },
         .mode = .set_upstream,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
@@ -1097,7 +1101,7 @@ test "finishPush does not reload a stale active repository" {
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending == null);
-    try std.testing.expectEqualStrings("pushed: /repo", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
 }
 
 test "finishPull does not reload a stale active repository" {
@@ -1260,8 +1264,10 @@ test "repository supersession invalidates an in-flight push inspection" {
     ));
     _ = activateReview(&app);
     try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
+        .repo_epoch = app.repo_session.view().epoch(),
+        .root_identity = app.repo_session.view().activeIdentity().?,
         .mode = .upstream,
-        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .branch = try allocator.dupe(u8, "main"),
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
@@ -1286,11 +1292,17 @@ test "repository supersession invalidates an in-flight push inspection" {
 
 test "direct root quit remains allowed while push inspection is running" {
     const allocator = std.testing.allocator;
-    var app: App = .{ .allocator = allocator };
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
     defer remoteWorkflow(&app).clearPushError(allocator);
     try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
+        .repo_epoch = app.repo_session.view().epoch(),
+        .root_identity = app.repo_session.view().activeIdentity().?,
         .mode = .upstream,
-        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .branch = try allocator.dupe(u8, "main"),
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
@@ -1308,12 +1320,17 @@ test "direct root quit remains allowed while push inspection is running" {
 
 test "push inspection surface blocks page switching until canceled" {
     const allocator = std.testing.allocator;
-    var app: App = .{ .allocator = allocator };
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
     defer remoteWorkflow(&app).clearPushError(allocator);
-    _ = activateReview(&app);
     try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
+        .repo_epoch = app.repo_session.view().epoch(),
+        .root_identity = app.repo_session.view().activeIdentity().?,
         .mode = .upstream,
-        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .branch = try allocator.dupe(u8, "main"),
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
@@ -1348,19 +1365,28 @@ test "push inspection surface blocks page switching until canceled" {
     app.remote_workflow.push_retry.state = .{ .foreground = .{
         .request_id = .{ .id = 42 },
         .pending = .{ .generation = 99, .kind = .push },
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = 1,
+        },
         .origin = .{
             .page_id = .review,
             .repo_epoch = app.repo_session.repo_epoch,
             .activation_id = app.pages.review.activation.next_activation_id,
         },
+        .root = try app.repo_session.view().activeCapability().?.duplicate(),
         .target = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
             .mode = .upstream,
-            .repo_root = try allocator.dupe(u8, "/repo"),
+            .repo_root = try allocator.dupe(u8, roots.a),
             .branch = try allocator.dupe(u8, "main"),
             .remote = try allocator.dupe(u8, "origin"),
             .remote_branch = try allocator.dupe(u8, "main"),
             .oid = try allocator.dupe(u8, "abc123"),
         },
+        .warnings = .{},
     } };
     try app.update(.{ .switch_page = .repository }, &ctx);
 
@@ -1370,12 +1396,17 @@ test "push inspection surface blocks page switching until canceled" {
 
 test "inactive Review accepts push inspection diagnostic without redraw" {
     const allocator = std.testing.allocator;
-    var app: App = .{ .allocator = allocator };
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
     defer remoteWorkflow(&app).clearPushError(allocator);
-    _ = activateReview(&app);
     try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
+        .repo_epoch = app.repo_session.view().epoch(),
+        .root_identity = app.repo_session.view().activeIdentity().?,
         .mode = .upstream,
-        .repo_root = try allocator.dupe(u8, "/missing/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .branch = try allocator.dupe(u8, "main"),
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
@@ -1388,36 +1419,39 @@ test "inactive Review accepts push inspection diagnostic without redraw" {
     try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
 
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
-    try std.testing.expectEqualStrings("could not verify push retry target", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("push retry unavailable: branch changed; reload and try again", app.pages.review.status.text());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "finishPushForeground reloads matching active repo after failure" {
     const allocator = std.testing.allocator;
-    var app: App = .{
-        .allocator = allocator,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
-        },
-    };
-    _ = activateReview(&app);
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
     const pending = beginAcceptedTestAction(&app, .push);
     app.remote_workflow.push_retry.state = .{ .foreground = .{
         .request_id = .{ .id = 9 },
         .pending = pending,
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = 1,
+        },
         .origin = .{ .page_id = .review, .repo_epoch = app.repo_session.repo_epoch, .activation_id = app.pages.review.activation.next_activation_id },
+        .root = try app.repo_session.view().activeCapability().?.duplicate(),
         .target = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
             .mode = .upstream,
-            .repo_root = try allocator.dupe(u8, "/repo"),
+            .repo_root = try allocator.dupe(u8, roots.a),
             .branch = try allocator.dupe(u8, "main"),
             .remote = try allocator.dupe(u8, "origin"),
             .remote_branch = try allocator.dupe(u8, "main"),
             .oid = try allocator.dupe(u8, "abc123"),
         },
+        .warnings = .{},
     } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
@@ -1435,26 +1469,34 @@ test "finishPushForeground reloads matching active repo after failure" {
 
 test "inactive Review foreground completions retain diagnostics without effects" {
     const allocator = std.testing.allocator;
-    var app: App = .{
-        .allocator = allocator,
-        .active_page = .repository,
-        .repo_session = .{
-            .repo_epoch = 3,
-        },
-    };
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    defer app.pages.review.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    app.active_page = .repository;
     const pending = beginAcceptedTestAction(&app, .push);
     app.remote_workflow.push_retry.state = .{ .foreground = .{
         .request_id = .{ .id = 7 },
         .pending = pending,
-        .origin = .{ .page_id = .review, .repo_epoch = 3, .activation_id = 0 },
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = 1,
+        },
+        .origin = .{ .page_id = .review, .repo_epoch = app.repo_session.repo_epoch, .activation_id = app.pages.review.activation.next_activation_id },
+        .root = try app.repo_session.view().activeCapability().?.duplicate(),
         .target = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
             .mode = .upstream,
-            .repo_root = try allocator.dupe(u8, "/repo"),
+            .repo_root = try allocator.dupe(u8, roots.a),
             .branch = try allocator.dupe(u8, "main"),
             .remote = try allocator.dupe(u8, "origin"),
             .remote_branch = try allocator.dupe(u8, "main"),
             .oid = try allocator.dupe(u8, "abc123"),
         },
+        .warnings = .{},
     } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
@@ -1463,14 +1505,20 @@ test "inactive Review foreground completions retain diagnostics without effects"
         .outcome = .{ .exited = 1 },
     } } }, &ctx);
 
-    try std.testing.expectEqualStrings("interactive push exited for /repo: 1", app.pages.review.status.text());
+    const expected_status = try std.fmt.allocPrint(allocator, "interactive push exited for {s}: 1", .{roots.a});
+    defer allocator.free(expected_status);
+    try std.testing.expectEqualStrings(expected_status, app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.redraw_plan = .{};
     app.shell_effects_state.editor_foreground = .{
         .request_id = .{ .id = 8 },
-        .origin = .{ .page_id = .review, .repo_epoch = 3, .activation_id = 0 },
+        .origin = .{
+            .page_id = .review,
+            .repo_epoch = app.repo_session.repo_epoch,
+            .activation_id = app.pages.review.activation.next_activation_id,
+        },
     };
     try app.update(.{ .shell_effect_finished = .{ .editor = .{
         .request_id = .{ .id = 8 },
