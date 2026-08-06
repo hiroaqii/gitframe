@@ -39,8 +39,6 @@ const oversized_display_message = std.fmt.comptimePrint(
     .{selected_document.max_text_mib},
 );
 
-pub const InputContext = repository_input.Context;
-
 pub const LoadState = enum { idle, no_repository, loading, loaded, empty, failed };
 
 pub const DisplayedDocument = struct {
@@ -2340,14 +2338,6 @@ fn navigationDismissesIncoming(msg: Msg) bool {
 fn optionalPathEql(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
-}
-
-pub fn keyToMsg(context: repository_input.Context, key: chasen.Key) ?Msg {
-    return repository_input.keyToMsg(Msg, context, key);
-}
-
-pub fn pasteToMsg(context: repository_input.Context, text: []const u8) ?Msg {
-    return repository_input.pasteToMsg(Msg, context, text);
 }
 
 pub const ViewContext = struct {
@@ -6047,7 +6037,7 @@ test "Repository branch renders read-only facts without moving tree geometry" {
     try std.testing.expectEqual(@as(u16, 3), layout.header_rows);
     try std.testing.expectEqual(@as(u16, 5), layout.treeRows(size.height));
     try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, size).?);
-    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'P' }) == null);
+    try std.testing.expect(repository_input.keyToMsg(Msg, .{}, .{ .codepoint = 'P' }) == null);
 
     installRepositoryBranchSnapshotForTest(&state, .{ .head = .detached }, .fresh);
     test_surface.surface.clearAll();
@@ -6440,7 +6430,7 @@ test "repository filter discoverability header follows effective keymap and clip
     var config: keymap.Config = .{};
     config.set(.changed_file_filter, .{ .plain_codepoint = 'z' });
     const effective = keymap.Effective.fromConfig(config);
-    const toggle = keyToMsg(state.inputContext(effective), .{ .codepoint = 'z' }) orelse
+    const toggle = repository_input.keyToMsg(Msg, state.inputContext(effective), .{ .codepoint = 'z' }) orelse
         return error.ExpectedConfiguredFilterToggle;
     try std.testing.expectEqual(Msg.toggle_changed_filter, toggle);
     _ = state.applyNavigation(allocator, toggle, .{ .width = 70, .height = 8 });
@@ -6462,7 +6452,7 @@ test "repository filter discoverability header follows effective keymap and clip
 
     var unbound = effective;
     unbound.bindings[@intFromEnum(keymap.PublicAction.changed_file_filter)] = null;
-    try std.testing.expect(keyToMsg(state.inputContext(unbound), .{ .codepoint = 'z' }) == null);
+    try std.testing.expect(repository_input.keyToMsg(Msg, state.inputContext(unbound), .{ .codepoint = 'z' }) == null);
     {
         var test_surface: chasen.testing.TestSurface = undefined;
         try test_surface.init(70, 8);
@@ -6559,7 +6549,7 @@ test "repository filter discoverability distinguishes loading unavailable and no
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed-file status unavailable") != null);
     }
 
-    const toggle = keyToMsg(state.inputContext(.{}), .{ .codepoint = 'F' }) orelse
+    const toggle = repository_input.keyToMsg(Msg, state.inputContext(.{}), .{ .codepoint = 'F' }) orelse
         return error.ExpectedDefaultFilterToggle;
     _ = state.applyNavigation(allocator, toggle, .{ .width = 120, .height = 8 });
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);

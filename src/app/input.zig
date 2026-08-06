@@ -14,6 +14,7 @@ const page = @import("page.zig");
 const review_input = @import("pages/review/input.zig");
 const compare_input = @import("pages/compare/input.zig");
 const repository_page = @import("pages/repository.zig");
+const repository_input = @import("pages/repository/input.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
@@ -24,7 +25,7 @@ pub const KeyContext = struct {
     active_page: page.Id = .review,
     review: ReviewContext = .{},
     compare: CompareContext = .{},
-    repository: repository_page.InputContext = .{},
+    repository: repository_input.Context = .{},
     commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode = .list,
@@ -115,7 +116,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         return translateReviewMsg(review_msg);
     }
     if (context.active_page == .repository and (context.repository.source_search_mode or context.repository.file_search_mode)) {
-        const repository_msg = repository_page.pasteToMsg(context.repository, text) orelse return null;
+        const repository_msg = repository_input.pasteToMsg(repository_page.Msg, context.repository, text) orelse return null;
         return .{ .repository = repository_msg };
     }
     if (context.active_page == .compare and (context.compare.search_mode or context.compare.file_search_mode)) {
@@ -139,7 +140,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         return translateReviewMsg(review_msg);
     }
     if (context.active_page == .repository and (context.repository.source_search_mode or context.repository.file_search_mode)) {
-        const repository_msg = repository_page.keyToMsg(context.repository, key) orelse return null;
+        const repository_msg = repository_input.keyToMsg(repository_page.Msg, context.repository, key) orelse return null;
         return .{ .repository = repository_msg };
     }
     if (context.active_page == .compare and
@@ -168,7 +169,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         }
     }
     if (context.active_page == .repository) {
-        if (repository_page.keyToMsg(context.repository, key)) |repository_msg| {
+        if (repository_input.keyToMsg(repository_page.Msg, context.repository, key)) |repository_msg| {
             return .{ .repository = repository_msg };
         }
     }

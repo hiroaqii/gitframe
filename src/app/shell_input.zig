@@ -19,6 +19,7 @@ const keymap = @import("keymap");
 const loaded_diff = @import("../loaded_diff.zig");
 const page = @import("page.zig");
 const repository_page = @import("pages/repository.zig");
+const repository_input = @import("pages/repository/input.zig");
 const repository_layout = @import("pages/repository/layout.zig");
 const review_layout = @import("pages/review/layout.zig");
 const review_message = @import("pages/review/message.zig");
@@ -61,7 +62,7 @@ pub const CompareContext = struct {
 };
 
 pub const RepositoryContext = struct {
-    key: repository_page.InputContext,
+    key: repository_input.Context,
     page_state: *const repository_page.RepositoryPageState,
 };
 
