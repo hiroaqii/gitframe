@@ -19,6 +19,7 @@ const keymap = @import("keymap");
 const loaded_diff = @import("../loaded_diff.zig");
 const page = @import("page.zig");
 const repository_page = @import("pages/repository.zig");
+const repository_layout = @import("pages/repository/layout.zig");
 const review_layout = @import("pages/review/layout.zig");
 const review_message = @import("pages/review/message.zig");
 
@@ -122,11 +123,11 @@ pub const View = struct {
         }
 
         if (self.repository.page_state.activeMouseOwner()) {
-            const body_point: ?repository_page.BodyPoint = if (self.bodyMousePoint(mouse)) |point|
+            const body_point: ?repository_layout.BodyPoint = if (self.bodyMousePoint(mouse)) |point|
                 .{ .col = point.col, .row = point.row }
             else
                 null;
-            const source_point = repository_page.sourceGesturePoint(
+            const source_point = repository_layout.sourceGesturePoint(
                 body_point,
                 self.layout.bodySize(),
                 self.repository.page_state.viewer.tree_width,

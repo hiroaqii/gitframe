@@ -14,6 +14,7 @@ const repo_session = @import("../repo_session.zig");
 const compare_page = @import("../pages/compare.zig");
 const repository_page = @import("../pages/repository.zig");
 const repository_coordinator = @import("../pages/repository/coordinator.zig");
+const repository_layout = @import("../pages/repository/layout.zig");
 const repository_tasks = @import("../pages/repository/tasks.zig");
 const repository_selection = @import("../pages/repository/selection.zig");
 const review_page = @import("../pages/review.zig");
@@ -151,7 +152,7 @@ test "repository selection drag routes first and outside release terminates" {
     try std.testing.expect(app.pages.repository.activeSourceRange());
     const shell = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
     const body_size = shell.bodySize();
-    const tree_width = repository_page.bodyLayout(
+    const tree_width = repository_layout.bodyLayout(
         body_size,
         app.pages.repository.viewer.tree_width,
         app.pages.repository.viewer.tree_hidden,
@@ -165,7 +166,7 @@ test "repository selection drag routes first and outside release terminates" {
     switch (drag) {
         .repository => |message| switch (message) {
             .mouse_owner_drag => |point| try std.testing.expectEqual(
-                repository_page.BodyPoint{ .col = 4, .row = 2 },
+                repository_layout.BodyPoint{ .col = 4, .row = 2 },
                 point.?,
             ),
             else => return error.ExpectedRepositoryDrag,

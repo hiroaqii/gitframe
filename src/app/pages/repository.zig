@@ -120,10 +120,10 @@ pub const Msg = union(enum) {
     scroll_right,
     mouse_row: usize,
     mouse_toggle_row: usize,
-    mouse_source_header_press: BodyPoint,
-    mouse_source_press: BodyPoint,
-    mouse_owner_drag: ?BodyPoint,
-    mouse_owner_release: ?BodyPoint,
+    mouse_source_header_press: repository_layout.BodyPoint,
+    mouse_source_press: repository_layout.BodyPoint,
+    mouse_owner_drag: ?repository_layout.BodyPoint,
+    mouse_owner_release: ?repository_layout.BodyPoint,
     cancel_mouse_owner,
     mouse_source_wheel_up,
     mouse_source_wheel_down,
@@ -208,54 +208,6 @@ pub const RepositoryUpdate = struct {
 pub const ApplyOutcome = enum { discarded, unchanged, changed, failed };
 
 pub const MouseButton = enum { left, wheel_up, wheel_down };
-
-pub const BodyPoint = struct { col: u16, row: u16 };
-
-pub const BodyLayout = struct {
-    tree_width: u16,
-    tree_visible: bool,
-    source_col: u16,
-    source_width: u16,
-    /// Rows 0-1 intentionally mirror Review's spacer before the row-2 Files
-    /// heading. Projected root/tree navigation begins at row 3.
-    header_rows: u16 = 3,
-
-    pub fn treeRows(self: BodyLayout, body_height: u16) u16 {
-        return body_height -| self.header_rows;
-    }
-
-    pub fn treeBodyRow(self: BodyLayout, point: BodyPoint) ?usize {
-        if (!self.tree_visible or point.col >= self.tree_width or point.row < self.header_rows) return null;
-        return point.row - self.header_rows;
-    }
-};
-
-pub fn bodyLayout(size: chasen.Size, preferred_tree_width: ?u16, tree_hidden: bool) BodyLayout {
-    if (tree_hidden) return .{
-        .tree_width = 0,
-        .tree_visible = false,
-        .source_col = 0,
-        .source_width = size.width,
-    };
-    const tree_width = repository_layout.treeWidth(size.width, preferred_tree_width);
-    const source_col = if (tree_width < size.width) tree_width + 1 else size.width;
-    return .{
-        .tree_width = tree_width,
-        .tree_visible = true,
-        .source_col = source_col,
-        .source_width = size.width -| source_col,
-    };
-}
-
-/// Converts shell-body coordinates to source-pane-local coordinates. A point
-/// in the tree, separator, or outside the body is intentionally `null`, which
-/// lets a live drag leave the pane without mutating its logical endpoint.
-pub fn sourceGesturePoint(point: ?BodyPoint, size: chasen.Size, preferred_tree_width: ?u16, tree_hidden: bool) ?BodyPoint {
-    const body_point = point orelse return null;
-    const layout = bodyLayout(size, preferred_tree_width, tree_hidden);
-    if (body_point.col < layout.source_col or body_point.col >= size.width) return null;
-    return .{ .col = body_point.col - layout.source_col, .row = body_point.row };
-}
 
 /// Page-owned state for the read-only current working-tree browser. The zero
 /// value allocates nothing and is safe to deinitialize before first activation.
@@ -1532,7 +1484,7 @@ pub const RepositoryPageState = struct {
             else => self.cancelMouseOwner(),
         }
         const previous = self.selected_path;
-        const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+        const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         const body_height = layout.treeRows(body_size.height);
         const source = self.currentSource();
         const source_geometry = if (source) |document|
@@ -1989,7 +1941,7 @@ pub const RepositoryPageState = struct {
     }
 
     fn placeIncomingTreeForBodySize(self: *RepositoryPageState, body_size: chasen.Size) void {
-        const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+        const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         self.viewer.tree_vertical_scroll = 0;
         const rows = layout.treeRows(body_size.height);
         if (rows == 0) return;
@@ -1997,7 +1949,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn clampForBodySize(self: *RepositoryPageState, body_size: chasen.Size) void {
-        const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+        const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         self.clampScroll(layout.treeRows(body_size.height));
         if (self.currentSource()) |document| {
             repository_navigation.clampSource(
@@ -2074,7 +2026,7 @@ pub const RepositoryPageState = struct {
     }
 
     fn sourceGeometry(self: *const RepositoryPageState, body_size: chasen.Size, document: *const source_document.Document) repository_source_geometry.SourceGeometry {
-        const layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+        const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         return .init(
             .{ .width = layout.source_width, .height = body_size.height },
             document,
@@ -2113,7 +2065,7 @@ pub const RepositoryPageState = struct {
 
     fn sourceHeaderPathHit(
         self: *const RepositoryPageState,
-        point: BodyPoint,
+        point: repository_layout.BodyPoint,
         body_size: chasen.Size,
     ) ?repository_selection.SourceHeaderIdentity {
         if (self.incomingUnavailable() != null or
@@ -2127,7 +2079,7 @@ pub const RepositoryPageState = struct {
             .loading => if (self.file_visibility == .all) return null,
             .empty, .loaded => {},
         }
-        const page_layout = bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+        const page_layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         if (page_layout.source_width == 0 or point.col >= page_layout.source_width) return null;
         const identity = self.currentSourceHeaderIdentity() orelse return null;
         const presentation = sourceHeaderPresentation(self, identity.path);
@@ -2136,13 +2088,13 @@ pub const RepositoryPageState = struct {
         return identity;
     }
 
-    fn pressSourceHeader(self: *RepositoryPageState, point: BodyPoint, body_size: chasen.Size) void {
+    fn pressSourceHeader(self: *RepositoryPageState, point: repository_layout.BodyPoint, body_size: chasen.Size) void {
         const identity = self.sourceHeaderPathHit(point, body_size) orelse return;
         if (self.currentSource() != null) self.viewer.focus = .source;
         self.selection_owner = .{ .source_header = .{ .identity = identity } };
     }
 
-    fn dragMouseOwner(self: *RepositoryPageState, point: ?BodyPoint, body_size: chasen.Size) void {
+    fn dragMouseOwner(self: *RepositoryPageState, point: ?repository_layout.BodyPoint, body_size: chasen.Size) void {
         switch (self.selection_owner) {
             .none => {},
             .source => self.dragSourceSelection(point, body_size),
@@ -2155,7 +2107,7 @@ pub const RepositoryPageState = struct {
     fn releaseMouseOwner(
         self: *RepositoryPageState,
         allocator: std.mem.Allocator,
-        point: ?BodyPoint,
+        point: ?repository_layout.BodyPoint,
         body_size: chasen.Size,
     ) ?Command {
         return switch (self.selection_owner) {
@@ -2197,7 +2149,7 @@ pub const RepositoryPageState = struct {
         };
     }
 
-    fn pressSourceSelection(self: *RepositoryPageState, point: BodyPoint, body_size: chasen.Size) void {
+    fn pressSourceSelection(self: *RepositoryPageState, point: repository_layout.BodyPoint, body_size: chasen.Size) void {
         if (self.source_search.mode or self.file_search.mode) return;
         const document = self.currentSource() orelse return;
         const geometry = self.sourceGeometry(body_size, document);
@@ -2227,7 +2179,7 @@ pub const RepositoryPageState = struct {
         ) };
     }
 
-    fn dragSourceSelection(self: *RepositoryPageState, point: ?BodyPoint, body_size: chasen.Size) void {
+    fn dragSourceSelection(self: *RepositoryPageState, point: ?repository_layout.BodyPoint, body_size: chasen.Size) void {
         var live = self.selection_owner.activeSource() orelse return;
         const local = point orelse return;
         const document = self.currentSource() orelse {
@@ -2265,7 +2217,7 @@ pub const RepositoryPageState = struct {
     fn releaseSourceSelection(
         self: *RepositoryPageState,
         allocator: std.mem.Allocator,
-        point: ?BodyPoint,
+        point: ?repository_layout.BodyPoint,
         body_size: chasen.Size,
     ) ?Command {
         if (!self.activeSourceRange()) return null;
@@ -2329,8 +2281,8 @@ pub const RepositoryPageState = struct {
         return .{ .copy_source_selection = clipboard };
     }
 
-    pub fn mouseToMsg(self: *const RepositoryPageState, point: BodyPoint, button: MouseButton, size: chasen.Size) ?Msg {
-        const layout = bodyLayout(size, self.viewer.tree_width, self.viewer.tree_hidden);
+    pub fn mouseToMsg(self: *const RepositoryPageState, point: repository_layout.BodyPoint, button: MouseButton, size: chasen.Size) ?Msg {
+        const layout = repository_layout.bodyLayout(size, self.viewer.tree_width, self.viewer.tree_hidden);
         if (layout.tree_visible and point.col < layout.tree_width) return switch (button) {
             .wheel_up => .wheel_up,
             .wheel_down => .wheel_down,
@@ -2349,7 +2301,7 @@ pub const RepositoryPageState = struct {
             },
         };
         if (point.col < layout.source_col) return null;
-        const source_point = sourceGesturePoint(point, size, self.viewer.tree_width, self.viewer.tree_hidden) orelse return null;
+        const source_point = repository_layout.sourceGesturePoint(point, size, self.viewer.tree_width, self.viewer.tree_hidden) orelse return null;
         return switch (button) {
             .wheel_up => if (self.currentSource() != null) .mouse_source_wheel_up else null,
             .wheel_down => if (self.currentSource() != null) .mouse_source_wheel_down else null,
@@ -2440,7 +2392,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         .loaded => {},
     }
 
-    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const tree = &state.bundle.?.tree;
     if (layout.tree_visible) {
         var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
@@ -3310,7 +3262,7 @@ test "repository file search takeover suppresses and restores tree cursor backgr
 
     const palette = repositorySearchCursorPaletteForTest();
     const size: chasen.Size = .{ .width = 60, .height = 10 };
-    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const alpha_row = layout.header_rows + @as(u16, @intCast(alpha_visible));
 
     var test_surface: chasen.testing.TestSurface = undefined;
@@ -3419,7 +3371,7 @@ test "repository hidden tree gives source full geometry and restores retained fo
     try std.testing.expectEqual(@as(usize, 2), state.viewer.tree_vertical_scroll);
     try std.testing.expectEqual(@as(usize, 7), state.viewer.tree_horizontal_scroll);
     try std.testing.expectEqualStrings(selected, state.selected_path.?);
-    const hidden_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const hidden_layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     try std.testing.expect(!hidden_layout.tree_visible);
     try std.testing.expectEqual(@as(u16, 0), hidden_layout.source_col);
     try std.testing.expectEqual(size.width, hidden_layout.source_width);
@@ -3429,8 +3381,8 @@ test "repository hidden tree gives source full geometry and restores retained fo
         state.mouseToMsg(.{ .col = 0, .row = 0 }, .left, size).?,
     );
     try std.testing.expectEqual(
-        BodyPoint{ .col = 4, .row = 2 },
-        sourceGesturePoint(.{ .col = 4, .row = 2 }, size, state.viewer.tree_width, true).?,
+        repository_layout.BodyPoint{ .col = 4, .row = 2 },
+        repository_layout.sourceGesturePoint(.{ .col = 4, .row = 2 }, size, state.viewer.tree_width, true).?,
     );
 
     var hidden_surface: chasen.testing.TestSurface = undefined;
@@ -3477,7 +3429,7 @@ test "repository hidden-tree file search restores on cancel and commits visible 
 
     _ = state.applyNavigation(allocator, .enter_file_search, size);
     for ("target") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
-    const search_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const search_layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     var search_surface: chasen.testing.TestSurface = undefined;
     try search_surface.init(size.width, size.height);
     defer search_surface.deinit();
@@ -3604,7 +3556,7 @@ test "repository changed file search retains its transaction when status basis i
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
     try std.testing.expectEqualStrings("target.zig", state.selected_path.?);
 
-    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(size.width, size.height);
     defer test_surface.deinit();
@@ -4020,13 +3972,13 @@ test "repository source header copies a loading byte-exact path and excludes chr
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.firstFilePath();
     const size: chasen.Size = .{ .width = 72, .height = 8 };
-    const page_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const page_layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const header_layout = repository_source_header.layout(
         page_layout.source_width,
         sourceHeaderPresentation(&state, state.selected_path.?),
     );
     const target = header_layout.path_target orelse return error.ExpectedPathTarget;
-    const local: BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
+    const local: repository_layout.BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
     const press = state.mouseToMsg(.{
         .col = page_layout.source_col + local.col,
         .row = local.row,
@@ -4070,15 +4022,15 @@ test "repository source header locks gesture kind and revalidates release identi
     var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
     defer state.deinit(allocator);
     const size: chasen.Size = .{ .width = 72, .height = 8 };
-    const page_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const page_layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const header_layout = repository_source_header.layout(
         page_layout.source_width,
         sourceHeaderPresentation(&state, state.selected_path.?),
     );
     const target = header_layout.path_target orelse return error.ExpectedPathTarget;
-    const header_point: BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
+    const header_point: repository_layout.BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
     const source_geometry = state.sourceGeometry(size, state.currentSource().?);
-    const body_point: BodyPoint = .{ .col = source_geometry.text_col, .row = source_geometry.body_first_row };
+    const body_point: repository_layout.BodyPoint = .{ .col = source_geometry.text_col, .row = source_geometry.body_first_row };
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
     _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = body_point }, size);
@@ -4116,12 +4068,12 @@ test "repository source header bounds clone failure and retains exact unchanged 
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.firstFilePath();
     const size: chasen.Size = .{ .width = 72, .height = 8 };
-    const page_layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const page_layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const target = repository_source_header.layout(
         page_layout.source_width,
         sourceHeaderPresentation(&state, state.selected_path.?),
     ).path_target orelse return error.ExpectedPathTarget;
-    const header_point: BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
+    const header_point: repository_layout.BodyPoint = .{ .col = target.col, .row = repository_source_geometry.source_path_row };
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
     state.generation = 9;
@@ -4685,7 +4637,7 @@ test "repository tree cursor background follows active focus and preserves seman
     };
     const palette = theme.Palette.fromConfig(FocusPalette{});
     const size: chasen.Size = .{ .width = 60, .height = 10 };
-    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const directory_node = tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
     const directory_visible = state.tree_projection.visibleIndexForTarget(tree, .{ .manifest_node = directory_node }) orelse
         return error.ExpectedDirectory;
@@ -5457,7 +5409,7 @@ test "repository page owns source focus navigation search and mouse geometry" {
     try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
     try std.testing.expect(state.source_search.match != null);
 
-    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const geometry = state.sourceGeometry(size, state.currentSource().?);
     try std.testing.expectEqual(Msg.focus_source, state.mouseToMsg(.{ .col = layout.tree_width + 1, .row = geometry.body_first_row - 1 }, .left, size).?);
     try std.testing.expectEqual(
@@ -6012,7 +5964,7 @@ test "repository empty root renders without disclosure and mouse activation is i
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "empty-repo") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "▾ empty-repo") == null);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Repository has no") != null);
-    const expanded_layout = bodyLayout(full_size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const expanded_layout = repository_layout.bodyLayout(full_size, state.viewer.tree_width, state.viewer.tree_hidden);
     const no_file_cell = expanded_surface.surface.readCell(expanded_layout.source_col + 1, repository_source_geometry.source_path_row) orelse
         return error.ExpectedNoFileSelectedCell;
     try std.testing.expect(no_file_cell.style.fg.eql(theme.Palette.default().color(.muted)));
@@ -6091,7 +6043,7 @@ test "Repository branch renders read-only facts without moving tree geometry" {
     try std.testing.expect(branch_cell.style.fg.eql(palette.color(.info)));
     try std.testing.expect(!branch_cell.style.dim);
 
-    const layout = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     try std.testing.expectEqual(@as(u16, 3), layout.header_rows);
     try std.testing.expectEqual(@as(u16, 5), layout.treeRows(size.height));
     try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, size).?);
@@ -6331,7 +6283,7 @@ test "repository root renders without disclosure and activation preserves opened
     try test_surface.expectCellText(0, 3, " ");
     try test_surface.expectCellText(1, 3, "i");
     state.viewer.tree_horizontal_scroll = 0;
-    const layout = bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
+    const layout = repository_layout.bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
     try test_surface.expectCellText(
         layout.tree_width + 2,
         repository_source_geometry.source_body_first_row,
@@ -6445,7 +6397,7 @@ test "repository page anchors inert checkpoint below source header rule" {
     defer test_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
 
-    const layout = bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
+    const layout = repository_layout.bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
     try test_surface.expectCellText(
         layout.tree_width + 2,
         repository_source_geometry.source_body_first_row,
@@ -6537,7 +6489,7 @@ test "repository filter discoverability header follows effective keymap and clip
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [chan") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "…") == null);
-        try std.testing.expectEqual(@as(u16, 12), bodyLayout(
+        try std.testing.expectEqual(@as(u16, 12), repository_layout.bodyLayout(
             test_surface.surface.size(),
             state.viewer.tree_width,
             state.viewer.tree_hidden,
@@ -6582,7 +6534,7 @@ test "repository filter discoverability distinguishes loading unavailable and no
         try test_surface.expectCellText(0, 2, " ");
         try test_surface.expectCellText(1, 2, "F");
         try test_surface.expectCellText(28, 2, ")");
-        const layout = bodyLayout(.{ .width = 120, .height = 8 }, state.viewer.tree_width, state.viewer.tree_hidden);
+        const layout = repository_layout.bodyLayout(.{ .width = 120, .height = 8 }, state.viewer.tree_width, state.viewer.tree_hidden);
         const message_cell = test_surface.surface.readCell(0, layout.header_rows + 1) orelse
             return error.ExpectedChangedFilesMessage;
         try std.testing.expect(message_cell.style.fg.eql(palette.color(.muted)));
@@ -6676,7 +6628,7 @@ test "repository minimum tree disclosure page layout and mouse mapping share tre
     defer state.deinit(std.testing.allocator);
 
     const wide = chasen.Size{ .width = 60, .height = 10 };
-    const wide_layout = bodyLayout(wide, state.viewer.tree_width, state.viewer.tree_hidden);
+    const wide_layout = repository_layout.bodyLayout(wide, state.viewer.tree_width, state.viewer.tree_hidden);
     try std.testing.expectEqual(@as(u16, 28), wide_layout.tree_width);
     try std.testing.expectEqual(@as(u16, 3), wide_layout.header_rows);
     try std.testing.expectEqual(@as(u16, 7), wide_layout.treeRows(wide.height));
@@ -6700,7 +6652,7 @@ test "repository minimum tree disclosure page layout and mouse mapping share tre
     try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
 
     const narrow = chasen.Size{ .width = 20, .height = 6 };
-    try std.testing.expectEqual(narrow.width, bodyLayout(narrow, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
+    try std.testing.expectEqual(narrow.width, repository_layout.bodyLayout(narrow, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
     try std.testing.expectEqual(Msg{ .mouse_row = 2 }, state.mouseToMsg(.{ .col = 19, .row = 5 }, .left, narrow).?);
 }
 
@@ -6711,14 +6663,14 @@ test "repository tree width controls share rendering mouse and source geometry" 
     state.viewer.focus = .source;
 
     const size = chasen.Size{ .width = 104, .height = 10 };
-    try std.testing.expectEqual(@as(u16, 34), bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
+    try std.testing.expectEqual(@as(u16, 34), repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
 
     _ = state.applyNavigation(allocator, .decrease_tree_width, size);
     try std.testing.expectEqual(@as(?u16, 30), state.viewer.tree_width);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqualStrings("main.zig", state.selected_path.?);
 
-    const adjusted = bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    const adjusted = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     try std.testing.expectEqual(@as(u16, 30), adjusted.tree_width);
     try std.testing.expectEqual(@as(u16, 73), state.sourceGeometry(size, state.currentSource().?).width);
     try std.testing.expect(state.mouseToMsg(.{ .col = adjusted.tree_width, .row = 0 }, .left, size) == null);
@@ -6727,8 +6679,8 @@ test "repository tree width controls share rendering mouse and source geometry" 
         state.mouseToMsg(.{ .col = adjusted.tree_width + 1, .row = 0 }, .left, size).?,
     );
     try std.testing.expectEqual(
-        BodyPoint{ .col = 4, .row = 2 },
-        sourceGesturePoint(.{ .col = adjusted.tree_width + 1 + 4, .row = 2 }, size, state.viewer.tree_width, state.viewer.tree_hidden).?,
+        repository_layout.BodyPoint{ .col = 4, .row = 2 },
+        repository_layout.sourceGesturePoint(.{ .col = adjusted.tree_width + 1 + 4, .row = 2 }, size, state.viewer.tree_width, state.viewer.tree_hidden).?,
     );
 
     var test_surface: chasen.testing.TestSurface = undefined;

@@ -6,6 +6,7 @@
 //! one Repository-owned authority without coupling the two page domains.
 
 const std = @import("std");
+const chasen = @import("chasen");
 
 pub const tree_width_step: u16 = 4;
 pub const max_tree_width: u16 = 48;
@@ -13,6 +14,59 @@ pub const min_source_width: u16 = 24;
 const min_tree_width: u16 = 18;
 
 pub const WidthDirection = enum { shrink, grow };
+
+pub const BodyPoint = struct { col: u16, row: u16 };
+
+pub const BodyLayout = struct {
+    tree_width: u16,
+    tree_visible: bool,
+    source_col: u16,
+    source_width: u16,
+    /// Rows 0-1 intentionally mirror Review's spacer before the row-2 Files
+    /// heading. Projected root/tree navigation begins at row 3.
+    header_rows: u16 = 3,
+
+    pub fn treeRows(self: BodyLayout, body_height: u16) u16 {
+        return body_height -| self.header_rows;
+    }
+
+    pub fn treeBodyRow(self: BodyLayout, point: BodyPoint) ?usize {
+        if (!self.tree_visible or point.col >= self.tree_width or point.row < self.header_rows) return null;
+        return point.row - self.header_rows;
+    }
+};
+
+pub fn bodyLayout(size: chasen.Size, preferred_tree_width: ?u16, tree_hidden: bool) BodyLayout {
+    if (tree_hidden) return .{
+        .tree_width = 0,
+        .tree_visible = false,
+        .source_col = 0,
+        .source_width = size.width,
+    };
+    const tree_width = treeWidth(size.width, preferred_tree_width);
+    const source_col = if (tree_width < size.width) tree_width + 1 else size.width;
+    return .{
+        .tree_width = tree_width,
+        .tree_visible = true,
+        .source_col = source_col,
+        .source_width = size.width -| source_col,
+    };
+}
+
+/// Converts shell-body coordinates to source-pane-local coordinates. A point
+/// in the tree, separator, or outside the body is intentionally `null`, which
+/// lets a live drag leave the pane without mutating its logical endpoint.
+pub fn sourceGesturePoint(
+    point: ?BodyPoint,
+    size: chasen.Size,
+    preferred_tree_width: ?u16,
+    tree_hidden: bool,
+) ?BodyPoint {
+    const body_point = point orelse return null;
+    const layout = bodyLayout(size, preferred_tree_width, tree_hidden);
+    if (body_point.col < layout.source_col or body_point.col >= size.width) return null;
+    return .{ .col = body_point.col - layout.source_col, .row = body_point.row };
+}
 
 pub fn treeWidth(total_width: u16, preferred_width: ?u16) u16 {
     return clampTreeWidth(total_width, preferred_width orelse defaultTreeWidth(total_width));
