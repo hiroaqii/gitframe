@@ -11,7 +11,7 @@ const shell_layout = @import("shell_layout.zig");
 const view_primitives = @import("view_primitives.zig");
 const review_view = @import("pages/review/view.zig");
 const compare_view = @import("pages/compare/view.zig");
-const repository_page = @import("pages/repository.zig");
+const repository_view = @import("pages/repository/view.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const draw = @import("draw");
@@ -20,6 +20,7 @@ const repo_state = @import("../repo/state.zig");
 const theme = @import("theme");
 const review_page = if (builtin.is_test) @import("pages/review.zig") else struct {};
 const compare_page = if (builtin.is_test) @import("pages/compare.zig") else struct {};
+const repository_page = if (builtin.is_test) @import("pages/repository.zig") else struct {};
 
 /// Rendering-only helpers for App.
 ///
@@ -63,7 +64,7 @@ const StateMessage = struct {
 pub const Context = struct {
     review: review_view.Context,
     compare: compare_view.Context,
-    repository: repository_page.ViewContext,
+    repository: repository_view.ViewContext,
     active_page: page.Id,
     page_bar_visible: bool,
     theme: theme.Palette,
@@ -177,7 +178,7 @@ fn shellFrameOptions(palette: theme.Palette) ui.Panel.ViewOptions {
 fn viewBody(app: Context, surface: *chasen.Surface) !void {
     return switch (app.active_page) {
         .review => review_view.view(app.review, surface),
-        .repository => repository_page.view(app.repository, surface),
+        .repository => repository_view.view(app.repository, surface),
         .compare => compare_view.view(app.compare, surface),
         .config => viewPlaceholderPage(app.active_page, app.has_active_repo, app.theme, surface),
     };
