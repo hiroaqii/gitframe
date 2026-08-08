@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Error = error{
     EmptyArgv,
@@ -15,6 +16,118 @@ pub const Options = struct {
     stdin: []const u8 = &.{},
     stdout_limit: std.Io.Limit = .unlimited,
     stderr_limit: std.Io.Limit = .unlimited,
+};
+
+/// Selects whether captured bytes have ordinary or zeroizing ownership.
+pub const CaptureMode = enum {
+    ordinary,
+    sensitive,
+};
+
+/// A generation-scoped cancellation signal borrowed for the duration of a
+/// controlled process run. Generation zero is reserved as "not canceled".
+pub const CancellationView = struct {
+    canceled_generation: *const std.atomic.Value(u64),
+    generation: u64,
+
+    pub fn requested(self: CancellationView) bool {
+        return self.generation != 0 and self.canceled_generation.load(.acquire) == self.generation;
+    }
+};
+
+/// Bounds one process run with an operation-wide absolute deadline and/or a
+/// generation-scoped cancellation view.
+pub const ProcessControl = struct {
+    deadline: ?std.Io.Clock.Timestamp = null,
+    cancellation: ?CancellationView = null,
+};
+
+/// Captured bytes whose entire allocation is securely cleared before free.
+///
+/// The storage is represented as a pointer and scalar lengths so generic
+/// debug formatting cannot reflect the captured contents.
+pub const SensitiveBytes = struct {
+    allocator: std.mem.Allocator,
+    storage: ?[*]u8,
+    len: usize,
+    capacity: usize,
+
+    pub fn bytes(self: *const SensitiveBytes) []const u8 {
+        const ptr = self.storage orelse return &.{};
+        return ptr[0..self.len];
+    }
+
+    pub fn deinit(self: *SensitiveBytes) void {
+        if (self.storage) |ptr| {
+            const allocation = ptr[0..self.capacity];
+            std.crypto.secureZero(u8, allocation);
+            // Allocator.free poisons memory before calling the allocator
+            // vtable. Use rawFree so the final observable write is the secure
+            // zeroization above.
+            self.allocator.rawFree(allocation, .of(u8), @returnAddress());
+        }
+        self.storage = null;
+        self.len = 0;
+        self.capacity = 0;
+    }
+};
+
+pub const SensitiveResult = struct {
+    term: std.process.Child.Term,
+    stdout: SensitiveBytes,
+    stderr: SensitiveBytes,
+
+    pub fn deinit(self: *SensitiveResult) void {
+        self.stdout.deinit();
+        self.stderr.deinit();
+    }
+};
+
+pub const CapturedResult = union(CaptureMode) {
+    ordinary: Result,
+    sensitive: SensitiveResult,
+
+    pub fn deinit(self: *CapturedResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .ordinary => |result| result.deinit(allocator),
+            .sensitive => |*result| result.deinit(),
+        }
+    }
+};
+
+pub const ControlledFailure = union(enum) {
+    empty_argv,
+    unsupported_process_control,
+    spawn: anyerror,
+    control_start: std.Io.ConcurrentError,
+    capture: anyerror,
+    terminate: anyerror,
+    wait: anyerror,
+
+    pub fn errorName(self: ControlledFailure) []const u8 {
+        return switch (self) {
+            .empty_argv => "EmptyArgv",
+            .unsupported_process_control => "UnsupportedProcessControl",
+            inline .spawn, .control_start, .capture, .terminate, .wait => |err| @errorName(err),
+        };
+    }
+};
+
+/// A controlled run returns captured output only when the direct child
+/// completes before cancellation or timeout is accepted.
+pub const ControlledResult = union(enum) {
+    completed: CapturedResult,
+    canceled,
+    timed_out,
+    failed: ControlledFailure,
+
+    pub fn deinit(self: *ControlledResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .completed => |*result| result.deinit(allocator),
+            .canceled, .timed_out, .failed => {},
+        }
+        self.* = .{ .failed = .empty_argv };
+    }
 };
 
 pub const Result = struct {
@@ -235,6 +348,571 @@ fn pumpStdin(file: std.Io.File, io: std.Io, stdin: []const u8) ?anyerror {
     writer.interface.writeAll(stdin) catch |err| return writer.err orelse err;
     writer.interface.flush() catch |err| return writer.err orelse err;
     return null;
+}
+
+const ControlTerminal = enum {
+    canceled,
+    timed_out,
+};
+
+const ControlledTestHooks = struct {
+    terminate_grace: std.Io.Duration = .fromSeconds(1),
+    wait_failure_after_reap: ?anyerror = null,
+    lifecycle_audit: ?*ControlledLifecycleAudit = null,
+    ready_race: ?*ControlledReadyRace = null,
+    synchronize_final_signal_after_child_exit: bool = false,
+};
+
+const ControlledLifecycleAudit = struct {
+    signal_attempts: usize = 0,
+    signal_attempts_after_reap: usize = 0,
+    wait_calls: usize = 0,
+    reaps: usize = 0,
+    signal_attempts_after_child_exit: usize = 0,
+    child_exit_observed: std.atomic.Value(bool) = .init(false),
+};
+
+const ControlledReadyRace = struct {
+    canceled_generation: *std.atomic.Value(u64),
+    generation: u64,
+    child_observed: std.atomic.Value(bool) = .init(false),
+    control_observed: std.atomic.Value(bool) = .init(false),
+};
+
+const WaitPhaseResult = union(enum) {
+    completed: std.process.Child.Term,
+    stopped: ControlTerminal,
+    failed: ControlledFailure,
+};
+
+const ChildReadyResult = anyerror!void;
+const ControlWatchResult = std.Io.Cancelable!ControlTerminal;
+const WaitEvent = union(enum) {
+    child_ready: ChildReadyResult,
+    control: ControlWatchResult,
+};
+
+const DarwinWaitId = struct {
+    extern "c" fn waitid(id_type: c_uint, id: u32, info: *std.c.siginfo_t, options: c_int) c_int;
+};
+
+const ZeroizingAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *ZeroizingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ZeroizingAllocator = @ptrCast(@alignCast(context));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = context;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return false;
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = context;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return null;
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ZeroizingAllocator = @ptrCast(@alignCast(context));
+        std.crypto.secureZero(u8, memory);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+fn supportsControlledProcessGroups() bool {
+    return switch (builtin.os.tag) {
+        .linux, .macos => true,
+        else => false,
+    };
+}
+
+fn pollControl(io: std.Io, control: ProcessControl) ?ControlTerminal {
+    if (control.cancellation) |cancellation| {
+        if (cancellation.requested()) return .canceled;
+    }
+    if (control.deadline) |deadline| {
+        const now = std.Io.Clock.Timestamp.now(io, deadline.clock);
+        if (deadline.compare(.lte, now)) return .timed_out;
+    }
+    return null;
+}
+
+fn captureTimeout(io: std.Io, control: ProcessControl) std.Io.Timeout {
+    if (control.cancellation == null) {
+        return if (control.deadline) |deadline| .{ .deadline = deadline } else .none;
+    }
+
+    const clock = if (control.deadline) |deadline| deadline.clock else std.Io.Clock.awake;
+    const poll_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(8),
+        .clock = clock,
+    });
+    if (control.deadline) |deadline| {
+        if (deadline.compare(.lte, poll_deadline)) return .{ .deadline = deadline };
+    }
+    return .{ .deadline = poll_deadline };
+}
+
+fn watchControl(io: std.Io, control: ProcessControl, hooks: ControlledTestHooks) ControlWatchResult {
+    while (true) {
+        if (pollControl(io, control)) |terminal| {
+            if (hooks.ready_race) |race| {
+                race.control_observed.store(true, .release);
+                while (!race.child_observed.load(.acquire)) {
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                // Let the non-reaping child observer publish its event first.
+                // This test-only barrier proves the real concurrent boundary
+                // without depending on scheduler timing.
+                try io.sleep(.fromMilliseconds(10), .awake);
+            }
+            return terminal;
+        }
+        try captureTimeout(io, control).sleep(io);
+    }
+}
+
+fn childExitedWithoutReaping(pid: std.posix.pid_t) anyerror!bool {
+    return switch (builtin.os.tag) {
+        .linux => linux: {
+            const linux_os = std.os.linux;
+            var info: linux_os.siginfo_t = std.mem.zeroes(linux_os.siginfo_t);
+            while (true) switch (linux_os.errno(linux_os.waitid(
+                .PID,
+                pid,
+                &info,
+                linux_os.W.EXITED | linux_os.W.NOWAIT | linux_os.W.NOHANG,
+                null,
+            ))) {
+                .SUCCESS => break :linux info.fields.common.first.piduid.pid != 0,
+                .INTR => continue,
+                .CHILD => return error.ChildAlreadyReaped,
+                else => |err| return std.posix.unexpectedErrno(err),
+            };
+        },
+        .macos => darwin: {
+            var info: std.c.siginfo_t = std.mem.zeroes(std.c.siginfo_t);
+            while (true) switch (std.c.errno(DarwinWaitId.waitid(
+                1, // P_PID
+                @intCast(pid),
+                &info,
+                0x00000001 | // WNOHANG
+                    0x00000004 | // WEXITED
+                    0x00000020, // WNOWAIT
+            ))) {
+                .SUCCESS => break :darwin info.pid != 0,
+                .INTR => continue,
+                .CHILD => return error.ChildAlreadyReaped,
+                else => |err| return std.posix.unexpectedErrno(err),
+            };
+        },
+        else => unreachable,
+    };
+}
+
+fn observeChildExit(
+    io: std.Io,
+    pid: std.posix.pid_t,
+    hooks: ControlledTestHooks,
+) ChildReadyResult {
+    while (!try childExitedWithoutReaping(pid)) {
+        try io.sleep(.fromMilliseconds(8), .awake);
+    }
+    if (hooks.lifecycle_audit) |audit| audit.child_exit_observed.store(true, .release);
+    if (hooks.ready_race) |race| {
+        race.canceled_generation.store(race.generation, .release);
+        race.child_observed.store(true, .release);
+        while (!race.control_observed.load(.acquire)) {
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+}
+
+fn childReadyResultFromEvents(events: []const WaitEvent) ?ChildReadyResult {
+    for (events) |event| switch (event) {
+        .child_ready => |result| return result,
+        .control => {},
+    };
+    return null;
+}
+
+fn controlResultFromEvents(events: []const WaitEvent) ?ControlWatchResult {
+    for (events) |event| switch (event) {
+        .child_ready => {},
+        .control => |result| return result,
+    };
+    return null;
+}
+
+fn recordSignalAttempt(child: *const std.process.Child, hooks: ControlledTestHooks) void {
+    if (hooks.lifecycle_audit) |audit| {
+        audit.signal_attempts += 1;
+        if (child.id == null) audit.signal_attempts_after_reap += 1;
+        if (audit.child_exit_observed.load(.acquire)) audit.signal_attempts_after_child_exit += 1;
+    }
+}
+
+fn signalProcessGroup(
+    child: *const std.process.Child,
+    pid: std.posix.pid_t,
+    signal: std.posix.SIG,
+    hooks: ControlledTestHooks,
+) ?anyerror {
+    recordSignalAttempt(child, hooks);
+    std.posix.kill(-pid, signal) catch |err| switch (err) {
+        error.ProcessNotFound => return null,
+        else => |signal_error| return signal_error,
+    };
+    return null;
+}
+
+fn signalDirectChild(
+    child: *const std.process.Child,
+    pid: std.posix.pid_t,
+    signal: std.posix.SIG,
+    hooks: ControlledTestHooks,
+) ?anyerror {
+    recordSignalAttempt(child, hooks);
+    std.posix.kill(pid, signal) catch |err| switch (err) {
+        error.ProcessNotFound => return null,
+        else => |signal_error| return signal_error,
+    };
+    return null;
+}
+
+fn beginGroupTermination(
+    child: *const std.process.Child,
+    pid: std.posix.pid_t,
+    hooks: ControlledTestHooks,
+) ?anyerror {
+    return signalProcessGroup(child, pid, .TERM, hooks);
+}
+
+fn finishGroupTermination(
+    child: *const std.process.Child,
+    pid: std.posix.pid_t,
+    hooks: ControlledTestHooks,
+) ?anyerror {
+    const group_error = signalProcessGroup(child, pid, .KILL, hooks);
+    if (signalDirectChild(child, pid, .KILL, hooks)) |direct_error| {
+        if (group_error == null) return direct_error;
+    }
+    return group_error;
+}
+
+fn reapChild(
+    child: *std.process.Child,
+    io: std.Io,
+    hooks: ControlledTestHooks,
+) anyerror!std.process.Child.Term {
+    if (hooks.lifecycle_audit) |audit| audit.wait_calls += 1;
+    const term = try child.wait(io);
+    if (hooks.lifecycle_audit) |audit| {
+        if (child.id == null) audit.reaps += 1;
+    }
+    if (hooks.wait_failure_after_reap) |err| return err;
+    return term;
+}
+
+fn synchronizeFinalSignal(io: std.Io, hooks: ControlledTestHooks) void {
+    if (!hooks.synchronize_final_signal_after_child_exit) return;
+    const audit = hooks.lifecycle_audit orelse return;
+    for (0..1000) |_| {
+        if (audit.child_exit_observed.load(.acquire)) return;
+        io.sleep(.fromMilliseconds(1), .awake) catch unreachable;
+    }
+}
+
+fn terminateGroupAndReap(
+    child: *std.process.Child,
+    io: std.Io,
+    pid: std.posix.pid_t,
+    hooks: ControlledTestHooks,
+) ?ControlledFailure {
+    var terminate_error = beginGroupTermination(child, pid, hooks);
+    io.sleep(hooks.terminate_grace, .awake) catch unreachable;
+    synchronizeFinalSignal(io, hooks);
+    if (finishGroupTermination(child, pid, hooks)) |err| {
+        if (terminate_error == null) terminate_error = err;
+    }
+
+    _ = reapChild(child, io, hooks) catch |err| return .{ .wait = err };
+    if (terminate_error) |err| return .{ .terminate = err };
+    return null;
+}
+
+fn waitForControlledChild(
+    child: *std.process.Child,
+    io: std.Io,
+    pid: std.posix.pid_t,
+    control: ProcessControl,
+    hooks: ControlledTestHooks,
+) WaitPhaseResult {
+    if (control.deadline == null and control.cancellation == null) {
+        const term = reapChild(child, io, hooks) catch |err| return .{ .failed = .{ .wait = err } };
+        return .{ .completed = term };
+    }
+
+    var event_storage: [2]WaitEvent = undefined;
+    var select: std.Io.Select(WaitEvent) = .init(io, &event_storage);
+    select.concurrent(.control, watchControl, .{ io, control, hooks }) catch |err| {
+        if (terminateGroupAndReap(child, io, pid, hooks)) |cleanup_failure| {
+            return .{ .failed = cleanup_failure };
+        }
+        return .{ .failed = .{ .control_start = err } };
+    };
+    select.concurrent(.child_ready, observeChildExit, .{ io, pid, hooks }) catch |err| {
+        select.cancelDiscard();
+        if (terminateGroupAndReap(child, io, pid, hooks)) |cleanup_failure| {
+            return .{ .failed = cleanup_failure };
+        }
+        return .{ .failed = .{ .control_start = err } };
+    };
+    defer select.cancelDiscard();
+
+    var ready: [2]WaitEvent = undefined;
+    const ready_len = select.awaitMany(&ready, 1) catch unreachable;
+
+    // A non-reaping direct-child observation already present in the same
+    // ready batch wins the completion/control race. Cancel the watcher before
+    // the single destructive wait so no signal can follow identity release.
+    if (childReadyResultFromEvents(ready[0..ready_len])) |child_ready_result| {
+        _ = child_ready_result catch |err| {
+            if (terminateGroupAndReap(child, io, pid, hooks)) |cleanup_failure| {
+                return .{ .failed = cleanup_failure };
+            }
+            return .{ .failed = .{ .wait = err } };
+        };
+        select.cancelDiscard();
+        const term = reapChild(child, io, hooks) catch |err| return .{ .failed = .{ .wait = err } };
+        return .{ .completed = term };
+    }
+
+    const control_result = controlResultFromEvents(ready[0..ready_len]).?;
+    const terminal = control_result catch unreachable;
+    var terminate_error = beginGroupTermination(child, pid, hooks);
+    io.sleep(hooks.terminate_grace, .awake) catch unreachable;
+    synchronizeFinalSignal(io, hooks);
+    // The observer uses WNOWAIT, so the direct child remains the original
+    // PID/PGID anchor through the final group and direct-child signals even
+    // when TERM made it a zombie during the grace period.
+    if (finishGroupTermination(child, pid, hooks)) |err| {
+        if (terminate_error == null) terminate_error = err;
+    }
+    select.cancelDiscard();
+    _ = reapChild(child, io, hooks) catch |err| return .{ .failed = .{ .wait = err } };
+    if (terminate_error) |err| return .{ .failed = .{ .terminate = err } };
+    return .{ .stopped = terminal };
+}
+
+fn takeSensitiveBytes(multi_reader: *std.Io.File.MultiReader, index: usize, allocator: std.mem.Allocator) SensitiveBytes {
+    const reader = multi_reader.reader(index);
+    std.debug.assert(reader.seek == 0);
+    const allocation = reader.buffer;
+    const result: SensitiveBytes = .{
+        .allocator = allocator,
+        .storage = if (allocation.len == 0) null else allocation.ptr,
+        .len = reader.end,
+        .capacity = allocation.len,
+    };
+    reader.buffer = &.{};
+    reader.seek = 0;
+    reader.end = 0;
+    return result;
+}
+
+fn finishControlledCapture(
+    allocator: std.mem.Allocator,
+    multi_reader: *std.Io.File.MultiReader,
+    capture_mode: CaptureMode,
+    term: std.process.Child.Term,
+) ControlledResult {
+    return switch (capture_mode) {
+        .ordinary => ordinary: {
+            const stdout = multi_reader.toOwnedSlice(0) catch |err| {
+                break :ordinary .{ .failed = .{ .capture = err } };
+            };
+            const stderr = multi_reader.toOwnedSlice(1) catch |err| {
+                allocator.free(stdout);
+                break :ordinary .{ .failed = .{ .capture = err } };
+            };
+            break :ordinary .{ .completed = .{ .ordinary = .{
+                .term = term,
+                .stdout = stdout,
+                .stderr = stderr,
+            } } };
+        },
+        .sensitive => .{ .completed = .{ .sensitive = .{
+            .term = term,
+            .stdout = takeSensitiveBytes(multi_reader, 0, allocator),
+            .stderr = takeSensitiveBytes(multi_reader, 1, allocator),
+        } } },
+    };
+}
+
+/// Run a child in a dedicated process group with captured stdout/stderr.
+///
+/// As with `runCaptured`, `options.stdin` is ignored and the child receives
+/// immediate EOF on stdin.
+/// Cancellation and timeout send TERM to the group, wait one second, send
+/// KILL, and always wait/reap the direct child. Sensitive capture uses a
+/// zeroizing allocator from the first growth buffer onward. The existing
+/// unbounded runner entry points intentionally remain separate.
+pub fn runCapturedControlled(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    capture_mode: CaptureMode,
+    control: ProcessControl,
+) ControlledResult {
+    return runCapturedControlledInternal(allocator, io, options, capture_mode, control, .{});
+}
+
+fn runCapturedControlledInternal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    capture_mode: CaptureMode,
+    control: ProcessControl,
+    hooks: ControlledTestHooks,
+) ControlledResult {
+    if (options.argv.len == 0) return .{ .failed = .empty_argv };
+    if (comptime !supportsControlledProcessGroups()) {
+        return .{ .failed = .unsupported_process_control };
+    }
+
+    const previous_cancel_protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous_cancel_protection);
+
+    if (pollControl(io, control)) |terminal| return switch (terminal) {
+        .canceled => .canceled,
+        .timed_out => .timed_out,
+    };
+
+    var child = std.process.spawn(io, .{
+        .argv = options.argv,
+        .cwd = options.cwd,
+        .environ_map = options.environ_map,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    }) catch |err| return .{ .failed = .{ .spawn = err } };
+    const pid = child.id.?;
+    var child_owned = true;
+    defer if (child_owned) child.kill(io);
+
+    child.stdin.?.close(io);
+    child.stdin = null;
+
+    var zeroizing_allocator: ZeroizingAllocator = .{ .child = allocator };
+    const capture_allocator = switch (capture_mode) {
+        .ordinary => allocator,
+        .sensitive => zeroizing_allocator.allocator(),
+    };
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(capture_allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    var multi_reader_active = true;
+    defer if (multi_reader_active) multi_reader.deinit();
+
+    var capture_error: ?anyerror = null;
+    var stopped: ?ControlTerminal = null;
+    capture: while (true) {
+        multi_reader.checkAnyError() catch |err| {
+            capture_error = err;
+            break :capture;
+        };
+        multi_reader.fill(64, captureTimeout(io, control)) catch |err| switch (err) {
+            error.Timeout => {
+                if (pollControl(io, control)) |terminal| {
+                    stopped = terminal;
+                    break :capture;
+                }
+                continue :capture;
+            },
+            error.EndOfStream => break :capture,
+            else => |fill_error| {
+                capture_error = fill_error;
+                break :capture;
+            },
+        };
+        multi_reader.checkAnyError() catch |err| {
+            capture_error = err;
+            break :capture;
+        };
+
+        const stdout_reader = multi_reader.reader(0);
+        const stderr_reader = multi_reader.reader(1);
+        if (options.stdout_limit.toInt()) |limit| {
+            if (stdout_reader.buffered().len > limit) {
+                capture_error = error.StreamTooLong;
+                break :capture;
+            }
+        }
+        if (options.stderr_limit.toInt()) |limit| {
+            if (stderr_reader.buffered().len > limit) {
+                capture_error = error.StreamTooLong;
+                break :capture;
+            }
+        }
+        if (pollControl(io, control)) |terminal| {
+            stopped = terminal;
+            break :capture;
+        }
+    }
+
+    if (capture_error == null and stopped == null) {
+        multi_reader.checkAnyError() catch |err| {
+            capture_error = err;
+        };
+    }
+
+    if (capture_error != null or stopped != null) {
+        multi_reader.deinit();
+        multi_reader_active = false;
+        const cleanup_failure = terminateGroupAndReap(&child, io, pid, hooks);
+        child_owned = false;
+        if (cleanup_failure) |failure| return .{ .failed = failure };
+        if (capture_error) |err| return .{ .failed = .{ .capture = err } };
+        return switch (stopped.?) {
+            .canceled => .canceled,
+            .timed_out => .timed_out,
+        };
+    }
+
+    const wait_result = waitForControlledChild(&child, io, pid, control, hooks);
+    child_owned = false;
+    return switch (wait_result) {
+        .completed => |term| finishControlledCapture(allocator, &multi_reader, capture_mode, term),
+        .stopped => |terminal| switch (terminal) {
+            .canceled => .canceled,
+            .timed_out => .timed_out,
+        },
+        .failed => |failure| .{ .failed = failure },
+    };
 }
 
 const TestWatchResult = union(enum) {
@@ -528,4 +1206,449 @@ test "runWithStdin rejects empty argv" {
     try std.testing.expectError(error.EmptyArgv, runWithStdin(std.testing.allocator, std.testing.io, .{
         .argv = &.{},
     }));
+}
+
+const ZeroAuditAllocator = struct {
+    child: std.mem.Allocator,
+    free_count: usize = 0,
+    observed_nonzero_free: bool = false,
+
+    fn allocator(self: *ZeroAuditAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ZeroAuditAllocator = @ptrCast(@alignCast(context));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ZeroAuditAllocator = @ptrCast(@alignCast(context));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ZeroAuditAllocator = @ptrCast(@alignCast(context));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ZeroAuditAllocator = @ptrCast(@alignCast(context));
+        self.free_count += 1;
+        for (memory) |byte| {
+            if (byte != 0) {
+                self.observed_nonzero_free = true;
+            }
+        }
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+fn requireControlledProcessTest() !void {
+    if (!supportsControlledProcessGroups()) return error.SkipZigTest;
+}
+
+fn cancellationAfter(
+    io: std.Io,
+    canceled_generation: *std.atomic.Value(u64),
+    generation: u64,
+) std.Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(40), .awake);
+    canceled_generation.store(generation, .release);
+}
+
+fn readTestPid(dir: std.Io.Dir, io: std.Io, name: []const u8) !std.posix.pid_t {
+    const bytes = try dir.readFileAlloc(io, name, std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(bytes);
+    return try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \r\n\t"), 10);
+}
+
+fn processExists(pid: std.posix.pid_t) !bool {
+    const signal_zero: std.posix.SIG = @enumFromInt(0);
+    std.posix.kill(pid, signal_zero) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        error.PermissionDenied => return true,
+        else => |unexpected| return unexpected,
+    };
+    return true;
+}
+
+fn expectProcessGone(io: std.Io, pid: std.posix.pid_t) !void {
+    for (0..100) |_| {
+        if (!try processExists(pid)) return;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.ProcessStillExists;
+}
+
+test "process group controlled ordinary capture preserves existing result ownership" {
+    try requireControlledProcessTest();
+
+    const argv = [_][]const u8{ "sh", "-c", "printf out; printf err >&2" };
+    var controlled = runCapturedControlled(std.testing.allocator, std.testing.io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    }, .ordinary, .{});
+    defer controlled.deinit(std.testing.allocator);
+
+    const result = switch (controlled) {
+        .completed => |captured| switch (captured) {
+            .ordinary => |result| result,
+            .sensitive => return error.ExpectedOrdinaryCapture,
+        },
+        else => return error.ExpectedControlledCompletion,
+    };
+    try std.testing.expectEqualStrings("out", result.stdout);
+    try std.testing.expectEqualStrings("err", result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+}
+
+test "process cancel is generation scoped before and during a controlled run" {
+    try requireControlledProcessTest();
+
+    var canceled_generation: std.atomic.Value(u64) = .init(7);
+    const quick_argv = [_][]const u8{ "sh", "-c", "printf completed" };
+    var mismatched = runCapturedControlled(std.testing.allocator, std.testing.io, .{
+        .argv = &quick_argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    }, .ordinary, .{ .cancellation = .{
+        .canceled_generation = &canceled_generation,
+        .generation = 8,
+    } });
+    defer mismatched.deinit(std.testing.allocator);
+    switch (mismatched) {
+        .completed => |captured| switch (captured) {
+            .ordinary => |result| try std.testing.expectEqualStrings("completed", result.stdout),
+            .sensitive => return error.ExpectedOrdinaryCapture,
+        },
+        else => return error.GenerationMismatchCanceledRun,
+    }
+
+    const should_not_spawn_argv = [_][]const u8{"/definitely/not/a/gitframe-command"};
+    var canceled_before_spawn = runCapturedControlled(std.testing.allocator, std.testing.io, .{
+        .argv = &should_not_spawn_argv,
+    }, .ordinary, .{ .cancellation = .{
+        .canceled_generation = &canceled_generation,
+        .generation = 7,
+    } });
+    defer canceled_before_spawn.deinit(std.testing.allocator);
+    try std.testing.expect(canceled_before_spawn == .canceled);
+
+    canceled_generation.store(0, .release);
+    var cancel_future = try std.testing.io.concurrent(cancellationAfter, .{
+        std.testing.io,
+        &canceled_generation,
+        9,
+    });
+    defer _ = cancel_future.cancel(std.testing.io) catch {};
+
+    const hanging_argv = [_][]const u8{ "sh", "-c", "trap '' TERM; while :; do sleep 1; done" };
+    var canceled = runCapturedControlledInternal(std.testing.allocator, std.testing.io, .{
+        .argv = &hanging_argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    }, .ordinary, .{ .cancellation = .{
+        .canceled_generation = &canceled_generation,
+        .generation = 9,
+    } }, .{ .terminate_grace = .fromMilliseconds(20) });
+    defer canceled.deinit(std.testing.allocator);
+    try cancel_future.await(std.testing.io);
+    try std.testing.expect(canceled == .canceled);
+}
+
+test "process timeout uses an absolute deadline before spawn and while running" {
+    try requireControlledProcessTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const marker_argv = [_][]const u8{ "sh", "-c", "printf started > marker" };
+    const expired_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .raw = .fromMilliseconds(-1),
+        .clock = .awake,
+    });
+    var expired = runCapturedControlled(std.testing.allocator, std.testing.io, .{
+        .argv = &marker_argv,
+        .cwd = .{ .dir = tmp.dir },
+    }, .ordinary, .{ .deadline = expired_deadline });
+    defer expired.deinit(std.testing.allocator);
+    try std.testing.expect(expired == .timed_out);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "marker", .{}));
+
+    const hanging_argv = [_][]const u8{ "sh", "-c", "trap '' TERM; while :; do sleep 1; done" };
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .raw = .fromMilliseconds(50),
+        .clock = .awake,
+    });
+    var timed_out = runCapturedControlledInternal(std.testing.allocator, std.testing.io, .{
+        .argv = &hanging_argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    }, .ordinary, .{ .deadline = deadline }, .{ .terminate_grace = .fromMilliseconds(20) });
+    defer timed_out.deinit(std.testing.allocator);
+    try std.testing.expect(timed_out == .timed_out);
+}
+
+test "process cancel completion race prefers a ready child result" {
+    try requireControlledProcessTest();
+
+    var canceled_generation: std.atomic.Value(u64) = .init(0);
+    var race: ControlledReadyRace = .{
+        .canceled_generation = &canceled_generation,
+        .generation = 17,
+    };
+    var audit: ControlledLifecycleAudit = .{};
+    const argv = [_][]const u8{ "sh", "-c", "exit 0" };
+    var result = runCapturedControlledInternal(std.testing.allocator, std.testing.io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    }, .ordinary, .{ .cancellation = .{
+        .canceled_generation = &canceled_generation,
+        .generation = 17,
+    } }, .{
+        .lifecycle_audit = &audit,
+        .ready_race = &race,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    const term = switch (result) {
+        .completed => |captured| switch (captured) {
+            .ordinary => |ordinary| ordinary.term,
+            .sensitive => return error.ExpectedOrdinaryCapture,
+        },
+        else => return error.ExpectedControlledCompletion,
+    };
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try std.testing.expect(race.child_observed.load(.acquire));
+    try std.testing.expect(race.control_observed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), audit.signal_attempts);
+    try std.testing.expectEqual(@as(usize, 0), audit.signal_attempts_after_reap);
+    try std.testing.expectEqual(@as(usize, 1), audit.wait_calls);
+    try std.testing.expectEqual(@as(usize, 1), audit.reaps);
+}
+
+test "process group timeout kills TERM ignoring leader and descendant and reaps direct child" {
+    try requireControlledProcessTest();
+
+    {
+        var audit: ControlledLifecycleAudit = .{};
+        const cooperative_argv = [_][]const u8{
+            "sh",
+            "-c",
+            "exec 1>&- 2>&-; trap 'exit 0' TERM; while :; do :; done",
+        };
+        const cooperative_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+            .raw = .fromMilliseconds(200),
+            .clock = .awake,
+        });
+        var cooperative = runCapturedControlledInternal(std.testing.allocator, std.testing.io, .{
+            .argv = &cooperative_argv,
+            .stdout_limit = .limited(64),
+            .stderr_limit = .limited(64),
+        }, .ordinary, .{ .deadline = cooperative_deadline }, .{
+            .terminate_grace = .fromMilliseconds(20),
+            .lifecycle_audit = &audit,
+            .synchronize_final_signal_after_child_exit = true,
+        });
+        defer cooperative.deinit(std.testing.allocator);
+        try std.testing.expect(cooperative == .timed_out);
+        try std.testing.expect(audit.child_exit_observed.load(.acquire));
+        try std.testing.expect(audit.signal_attempts_after_child_exit >= 2);
+        try std.testing.expectEqual(@as(usize, 0), audit.signal_attempts_after_reap);
+        try std.testing.expectEqual(@as(usize, 1), audit.wait_calls);
+        try std.testing.expectEqual(@as(usize, 1), audit.reaps);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const argv = [_][]const u8{
+        "sh",
+        "-c",
+        \\trap '' TERM
+        \\sh -c 'trap "" TERM; printf "%s" "$$" > descendant.pid; while :; do sleep 1; done' &
+        \\printf "%s" "$$" > leader.pid
+        \\while :; do sleep 1; done
+        ,
+    };
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .raw = .fromMilliseconds(200),
+        .clock = .awake,
+    });
+    var result = runCapturedControlledInternal(std.testing.allocator, std.testing.io, .{
+        .argv = &argv,
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    }, .ordinary, .{ .deadline = deadline }, .{ .terminate_grace = .fromMilliseconds(50) });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result == .timed_out);
+
+    const leader_pid = try readTestPid(tmp.dir, std.testing.io, "leader.pid");
+    const descendant_pid = try readTestPid(tmp.dir, std.testing.io, "descendant.pid");
+    try expectProcessGone(std.testing.io, leader_pid);
+    try expectProcessGone(std.testing.io, descendant_pid);
+}
+
+test "process group sensitive capture zeroizes success partial failure OOM timeout and wait failure" {
+    try requireControlledProcessTest();
+
+    {
+        var audit: ZeroAuditAllocator = .{ .child = std.testing.allocator };
+        const argv = [_][]const u8{ "sh", "-c", "yes secret | head -c 8192; printf diagnostic >&2" };
+        var result = runCapturedControlled(audit.allocator(), std.testing.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(16 * 1024),
+            .stderr_limit = .limited(1024),
+        }, .sensitive, .{});
+        switch (result) {
+            .completed => |*captured| switch (captured.*) {
+                .sensitive => |*sensitive| {
+                    try std.testing.expect(std.mem.startsWith(u8, sensitive.stdout.bytes(), "secret"));
+                    try std.testing.expectEqualStrings("diagnostic", sensitive.stderr.bytes());
+                },
+                .ordinary => return error.ExpectedSensitiveCapture,
+            },
+            else => return error.ExpectedControlledCompletion,
+        }
+        result.deinit(audit.allocator());
+        try std.testing.expect(audit.free_count > 2);
+        try std.testing.expect(!audit.observed_nonzero_free);
+    }
+
+    {
+        var audit: ZeroAuditAllocator = .{ .child = std.testing.allocator };
+        const argv = [_][]const u8{ "sh", "-c", "printf secretsecret" };
+        var result = runCapturedControlled(audit.allocator(), std.testing.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(3),
+            .stderr_limit = .limited(64),
+        }, .sensitive, .{});
+        defer result.deinit(audit.allocator());
+        switch (result) {
+            .failed => |failure| switch (failure) {
+                .capture => |err| try std.testing.expectEqual(error.StreamTooLong, err),
+                else => return error.ExpectedCaptureFailure,
+            },
+            else => return error.ExpectedCaptureFailure,
+        }
+        try std.testing.expect(audit.free_count >= 2);
+        try std.testing.expect(!audit.observed_nonzero_free);
+    }
+
+    {
+        var audit: ZeroAuditAllocator = .{ .child = std.testing.allocator };
+        var failing = std.testing.FailingAllocator.init(audit.allocator(), .{ .fail_index = 2 });
+        const argv = [_][]const u8{ "sh", "-c", "yes secret | head -c 1048576" };
+        const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+            .raw = .fromMilliseconds(500),
+            .clock = .awake,
+        });
+        var result = runCapturedControlledInternal(failing.allocator(), std.testing.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(2 * 1024 * 1024),
+            .stderr_limit = .limited(64),
+        }, .sensitive, .{ .deadline = deadline }, .{ .terminate_grace = .fromMilliseconds(10) });
+        defer result.deinit(failing.allocator());
+        switch (result) {
+            .failed => |failure| switch (failure) {
+                .capture => |err| try std.testing.expectEqual(error.OutOfMemory, err),
+                else => return error.ExpectedCaptureFailure,
+            },
+            else => return error.ExpectedCaptureFailure,
+        }
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(!audit.observed_nonzero_free);
+    }
+
+    {
+        var audit: ZeroAuditAllocator = .{ .child = std.testing.allocator };
+        const argv = [_][]const u8{ "sh", "-c", "printf secret; trap '' TERM; while :; do sleep 1; done" };
+        const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+            .raw = .fromMilliseconds(50),
+            .clock = .awake,
+        });
+        var result = runCapturedControlledInternal(audit.allocator(), std.testing.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(64),
+            .stderr_limit = .limited(64),
+        }, .sensitive, .{ .deadline = deadline }, .{ .terminate_grace = .fromMilliseconds(10) });
+        defer result.deinit(audit.allocator());
+        try std.testing.expect(result == .timed_out);
+        try std.testing.expect(audit.free_count >= 2);
+        try std.testing.expect(!audit.observed_nonzero_free);
+    }
+
+    {
+        var audit: ZeroAuditAllocator = .{ .child = std.testing.allocator };
+        var canceled_generation: std.atomic.Value(u64) = .init(0);
+        var cancel_future = try std.testing.io.concurrent(cancellationAfter, .{
+            std.testing.io,
+            &canceled_generation,
+            11,
+        });
+        defer _ = cancel_future.cancel(std.testing.io) catch {};
+
+        const argv = [_][]const u8{ "sh", "-c", "printf secret; trap '' TERM; while :; do sleep 1; done" };
+        var result = runCapturedControlledInternal(audit.allocator(), std.testing.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(64),
+            .stderr_limit = .limited(64),
+        }, .sensitive, .{ .cancellation = .{
+            .canceled_generation = &canceled_generation,
+            .generation = 11,
+        } }, .{ .terminate_grace = .fromMilliseconds(10) });
+        defer result.deinit(audit.allocator());
+        try cancel_future.await(std.testing.io);
+        try std.testing.expect(result == .canceled);
+        try std.testing.expect(audit.free_count >= 2);
+        try std.testing.expect(!audit.observed_nonzero_free);
+    }
+
+    {
+        var audit: ZeroAuditAllocator = .{ .child = std.testing.allocator };
+        const argv = [_][]const u8{ "sh", "-c", "printf secret" };
+        var result = runCapturedControlledInternal(audit.allocator(), std.testing.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(64),
+            .stderr_limit = .limited(64),
+        }, .sensitive, .{}, .{ .wait_failure_after_reap = error.InjectedWaitFailure });
+        defer result.deinit(audit.allocator());
+        switch (result) {
+            .failed => |failure| switch (failure) {
+                .wait => |err| try std.testing.expectEqual(error.InjectedWaitFailure, err),
+                else => return error.ExpectedWaitFailure,
+            },
+            else => return error.ExpectedWaitFailure,
+        }
+        try std.testing.expect(audit.free_count >= 2);
+        try std.testing.expect(!audit.observed_nonzero_free);
+    }
+
+    {
+        var audit: ZeroAuditAllocator = .{ .child = std.testing.allocator };
+        const argv = [_][]const u8{"/definitely/not/a/gitframe-command"};
+        var result = runCapturedControlled(audit.allocator(), std.testing.io, .{
+            .argv = &argv,
+        }, .sensitive, .{});
+        defer result.deinit(audit.allocator());
+        switch (result) {
+            .failed => |failure| switch (failure) {
+                .spawn => {},
+                else => return error.ExpectedSpawnFailure,
+            },
+            else => return error.ExpectedSpawnFailure,
+        }
+        try std.testing.expectEqual(@as(usize, 0), audit.free_count);
+        try std.testing.expect(!audit.observed_nonzero_free);
+    }
 }
