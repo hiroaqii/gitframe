@@ -4,7 +4,6 @@ const git_push = @import("../git/push.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const review_selection = @import("diff_surface/selection.zig");
 const session_hunk_mark = @import("pages/review/session_hunk_mark.zig");
-const text_edit = @import("text_edit.zig");
 const page = @import("page.zig");
 const remote_request = @import("remote_request.zig");
 
@@ -17,7 +16,6 @@ pub const OverlayKind = enum {
     pull_branch,
     switch_branch,
     push_error,
-    push_credentials,
 };
 
 pub const OverlayMouseMode = enum {
@@ -69,16 +67,12 @@ pub const OverlayState = struct {
         return self.kind == .push_error;
     }
 
-    pub fn isPushCredentials(self: OverlayState) bool {
-        return self.kind == .push_credentials;
-    }
-
     pub fn mouseMode(self: OverlayState) OverlayMouseMode {
         return switch (self.kind) {
             .none => .passthrough,
             .help => .scroll_help,
             .push_error => .scroll_push_error,
-            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch, .push_credentials => .block,
+            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch => .block,
         };
     }
 
@@ -123,11 +117,6 @@ pub const OverlayState = struct {
         self.kind = .push_error;
         self.owner_page = .review;
         self.push_error_scroll = 0;
-    }
-
-    pub fn openPushCredentials(self: *OverlayState) void {
-        self.kind = .push_credentials;
-        self.owner_page = .review;
     }
 
     pub fn close(self: *OverlayState) void {
@@ -260,74 +249,6 @@ pub const BranchSwitchState = struct {
     }
 };
 
-/// Secret text input for short-lived credentials.
-///
-/// This is intentionally separate from normal bounded text inputs: callers
-/// should pass it by pointer only and avoid whole-value copies. `clear` and
-/// `deinit` zero the whole backing buffer with `std.crypto.secureZero`.
-///
-/// Normal text inputs are value types and are fine to copy in tests/UI state.
-/// That pattern is unsafe for secrets because each copy leaves another buffer
-/// that would also need explicit wiping.
-pub const SecretInput = struct {
-    pub const InsertError = error{BufferFull};
-
-    buffer: [512]u8 = undefined,
-    len: usize = 0,
-    cursor: usize = 0,
-
-    pub fn secret(self: *const SecretInput) []const u8 {
-        return self.buffer[0..self.len];
-    }
-
-    pub fn insert(self: *SecretInput, codepoint: u21) InsertError!void {
-        var bytes: [4]u8 = undefined;
-        const written = std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
-        try self.insertSlice(bytes[0..written]);
-    }
-
-    pub fn insertSlice(self: *SecretInput, text: []const u8) InsertError!void {
-        if (text.len == 0) return;
-        std.debug.assert(std.unicode.utf8ValidateSlice(text));
-        if (self.len + text.len > self.buffer.len) return error.BufferFull;
-        std.mem.copyBackwards(u8, self.buffer[self.cursor + text.len .. self.len + text.len], self.buffer[self.cursor..self.len]);
-        @memcpy(self.buffer[self.cursor .. self.cursor + text.len], text);
-        self.len += text.len;
-        self.cursor += text.len;
-    }
-
-    pub fn backspace(self: *SecretInput) void {
-        if (self.cursor == 0) return;
-        const previous = text_edit.previousBoundary(self.secret(), self.cursor);
-        std.mem.copyForwards(u8, self.buffer[previous .. self.len - (self.cursor - previous)], self.buffer[self.cursor..self.len]);
-        self.len -= self.cursor - previous;
-        self.cursor = previous;
-    }
-
-    pub fn moveLeft(self: *SecretInput) void {
-        self.cursor = text_edit.previousBoundary(self.secret(), self.cursor);
-    }
-
-    pub fn moveRight(self: *SecretInput) void {
-        self.cursor = text_edit.nextBoundary(self.secret(), self.cursor);
-    }
-
-    pub fn clear(self: *SecretInput) void {
-        std.crypto.secureZero(u8, self.buffer[0..]);
-        self.len = 0;
-        self.cursor = 0;
-    }
-
-    pub fn deinit(self: *SecretInput) void {
-        self.clear();
-    }
-};
-
-pub const PushCredentialField = enum {
-    username,
-    password,
-};
-
 pub const PushRetryTarget = struct {
     repo_epoch: u64,
     root_identity: @import("../repo/root_capability.zig").Identity,
@@ -337,7 +258,6 @@ pub const PushRetryTarget = struct {
     remote: []u8,
     remote_branch: []u8,
     oid: []u8,
-    remote_url: ?[]u8 = null,
 
     pub fn empty() PushRetryTarget {
         return .{
@@ -349,7 +269,6 @@ pub const PushRetryTarget = struct {
             .remote = &.{},
             .remote_branch = &.{},
             .oid = &.{},
-            .remote_url = null,
         };
     }
 
@@ -365,23 +284,7 @@ pub const PushRetryTarget = struct {
         if (self.remote.len > 0) allocator.free(self.remote);
         if (self.remote_branch.len > 0) allocator.free(self.remote_branch);
         if (self.oid.len > 0) allocator.free(self.oid);
-        if (self.remote_url) |remote_url| allocator.free(remote_url);
         self.* = empty();
-    }
-};
-
-/// Heap-owned so opening/closing overlays does not copy `SecretInput` buffers.
-pub const PushCredentialPrompt = struct {
-    target: PushRetryTarget,
-    username: SecretInput = .{},
-    password: SecretInput = .{},
-    active_field: PushCredentialField = .username,
-
-    pub fn deinit(self: *PushCredentialPrompt, allocator: std.mem.Allocator) void {
-        self.username.deinit();
-        self.password.deinit();
-        self.target.deinit(allocator);
-        self.* = undefined;
     }
 };
 
@@ -798,14 +701,4 @@ test "StagedHunkMarks deduplicates rebind and preserves unrelated exact lineages
     try std.testing.expect(marks.containsExact("/repo", "src/other.zig", .{ .content = from, .display_hunk_index = 1 }));
     try std.testing.expect(marks.containsExact("/other", "src/app.zig", .{ .content = from, .display_hunk_index = 1 }));
     try std.testing.expectEqual(@as(usize, 3), marks.items.items.len);
-}
-
-test "SecretInput clear zeroes backing buffer" {
-    var input: SecretInput = .{};
-    try input.insertSlice("token");
-    input.clear();
-
-    try std.testing.expectEqual(@as(usize, 0), input.len);
-    try std.testing.expectEqual(@as(usize, 0), input.cursor);
-    for (input.buffer) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }

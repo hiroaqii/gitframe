@@ -1,7 +1,7 @@
 //! Review remote-operation workflow and foreground push ownership.
 //!
 //! This controller owns push, pull, fetch, branch-switch, retry inspection,
-//! credential, and interactive-push state. Review supplies synchronous target
+//! interactive-push, and upstream-finalization state. Review supplies synchronous target
 //! and outcome ports; the root shell consumes typed reload intent. The module
 //! never imports the root App, local workflow, read coordinator, or shell
 //! effects.
@@ -53,16 +53,8 @@ pub const View = struct {
         return self.state.push_retry.state.availableTarget();
     }
 
-    pub fn pushRetryCredentialsAvailable(self: View) bool {
-        return self.state.push_retry.state.credentialsAvailable();
-    }
-
     pub fn pushRetryInspecting(self: View) bool {
         return self.state.push_retry.state == .inspecting;
-    }
-
-    pub fn pushCredentialPrompt(self: View) ?*const app_state.PushCredentialPrompt {
-        return self.state.push_retry.state.credentialPrompt();
     }
 
     pub fn branchSwitch(self: View) *const app_state.BranchSwitchState {
@@ -71,6 +63,10 @@ pub const View = struct {
 
     pub fn hasForeground(self: View) bool {
         return self.state.push_retry.state.hasForeground();
+    }
+
+    pub fn isFinalizing(self: View) bool {
+        return self.state.push_retry.state.isFinalizing();
     }
 
     pub fn canceling(self: View) bool {
@@ -119,6 +115,11 @@ pub const Controller = struct {
     /// owner or reopening its read fence. The exact terminal does both.
     pub fn cancelActiveRemote(self: Controller, defer_quit: bool) bool {
         const pending = self.lifecycle.view().acceptedPending() orelse return false;
+        if (self.state.push_retry.state.isFinalizing() and pending.kind == .push) {
+            if (defer_quit) self.state.quit_after_remote_terminal = true;
+            self.setStatus("finalizing upstream...", .{});
+            return defer_quit;
+        }
         if (!isBackgroundRemoteKind(pending.kind)) return false;
         if (!self.state.action_control.isActive(pending.generation)) return false;
         if (defer_quit) self.state.quit_after_remote_terminal = true;
@@ -538,96 +539,7 @@ pub const Controller = struct {
 
     pub fn runInteractivePush(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         if (self.lifecycle.view().hasPending()) return self.rejectVoid("another git action is running");
-        try self.startPushInspection(ctx, .verify_snapshot, "interactive push retry is not available for this failure");
-    }
-
-    pub fn openPushCredentialPrompt(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (!self.state.push_retry.state.credentialsAvailable()) {
-            return self.rejectVoid("credential retry is not available for this push failure");
-        }
-        try self.startPushInspection(ctx, .lookup_remote, "credential retry target is no longer available");
-    }
-
-    pub fn cancelPushCredentialPrompt(self: Controller, allocator: std.mem.Allocator) void {
-        if (self.state.push_retry.state == .credential_prompt) self.state.push_retry.state.deinit(allocator);
-        if (self.overlay.isPushCredentials()) self.overlay.close();
-    }
-
-    pub fn togglePushCredentialField(self: Controller) void {
-        const prompt = self.mutablePushCredentialPrompt() orelse return;
-        prompt.active_field = switch (prompt.active_field) {
-            .username => .password,
-            .password => .username,
-        };
-    }
-
-    pub fn insertPushCredential(self: Controller, codepoint: u21) void {
-        const input = self.activePushCredentialInput() orelse return;
-        input.insert(codepoint) catch self.setStatus("credential field is too long", .{});
-    }
-
-    pub fn pastePushCredential(self: Controller, text: []const u8) void {
-        const input = self.activePushCredentialInput() orelse return;
-        input.insertSlice(text) catch self.setStatus("credential field is too long", .{});
-    }
-
-    pub fn backspacePushCredential(self: Controller) void {
-        const input = self.activePushCredentialInput() orelse return;
-        input.backspace();
-    }
-
-    pub fn movePushCredentialLeft(self: Controller) void {
-        const input = self.activePushCredentialInput() orelse return;
-        input.moveLeft();
-    }
-
-    pub fn movePushCredentialRight(self: Controller) void {
-        const input = self.activePushCredentialInput() orelse return;
-        input.moveRight();
-    }
-
-    pub fn submitPushCredentials(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        const prompt = self.mutablePushCredentialPrompt() orelse return;
-        if (prompt.active_field == .username) {
-            prompt.active_field = .password;
-            return;
-        }
-        if (prompt.username.len == 0) {
-            self.setStatus("Username is required", .{});
-            prompt.active_field = .username;
-            return;
-        }
-        if (prompt.password.len == 0) {
-            self.setStatus("Password or token is required", .{});
-            prompt.active_field = .password;
-            return;
-        }
-        if (self.lifecycle.view().hasPending()) return self.rejectVoid("another git action is running");
-        if (!self.repositoryMatches(.{
-            .repo_epoch = prompt.target.repo_epoch,
-            .root_identity = prompt.target.root_identity,
-        })) {
-            self.cancelPushCredentialPrompt(ctx.allocator());
-            return self.rejectVoid("credential retry unavailable: repository authority changed");
-        }
-
-        var username = try ctx.allocator().dupe(u8, prompt.username.secret());
-        errdefer app_actions.secureFree(ctx.allocator(), username);
-        var password = try ctx.allocator().dupe(u8, prompt.password.secret());
-        errdefer app_actions.secureFree(ctx.allocator(), password);
-        var credentials: app_actions.PushCredentials = .{ .username = username, .password = password };
-        username = &.{};
-        password = &.{};
-        var target = prompt.target.take();
-        self.setStatus("retrying push with credentials: {s} -> {s}/{s}", .{ target.branch, target.remote, target.remote_branch });
-        self.cancelPushCredentialPrompt(ctx.allocator());
-        const prepared = self.lifecycle.prepare(.push);
-        app_git_requests.startCredentialedPush(app_message.Msg, ctx, prepared.pending, self.env_map, &target, &credentials) catch |err| {
-            self.lifecycle.rejectSpawn(prepared);
-            target.deinit(ctx.allocator());
-            return err;
-        };
-        _ = self.lifecycle.acceptSpawn(ctx.allocator(), prepared);
+        try self.startPushInspection(ctx, "interactive push retry is not available for this failure");
     }
 
     pub fn finishPush(self: Controller, allocator: std.mem.Allocator, finished: app_actions.PushFinished) !Outcome {
@@ -635,73 +547,36 @@ pub const Controller = struct {
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
         const active_matches = terminal.target == .current_review;
-        switch (result.result) {
-            .credentialed => |credentialed| {
-                if (!self.remoteRequestMatches(result.identity) or
-                    result.identity.operation_generation != result.pending.generation) return .{};
-                switch (credentialed) {
-                    .ok, .ok_static => {
-                        if (active_matches) {
-                            self.setStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-                            return .{ .reload = .source_and_aux };
-                        }
-                        self.setStatus("pushed: {s}", .{result.repo_root});
-                    },
-                    .failed => |message| {
-                        const detail = git_ops.trimGitOutput(message);
-                        self.setStatus("push failed: {s}", .{git_ops.pushFailureHint(detail) orelse detail});
-                        const retry_target = try pushRetryTargetFromFinished(allocator, result);
-                        errdefer {
-                            var target = retry_target;
-                            target.deinit(allocator);
-                        }
-                        try self.setPushErrorWithRetry(allocator, detail, retry_target, pushCredentialFailureLikely(detail));
-                    },
-                    .failed_static => |message| {
-                        self.setStatus("push failed: {s}", .{message});
-                        try self.setPushErrorWithRetry(allocator, message, null, false);
-                    },
+        const quit_after_terminal = self.finishRemoteControl(result.pending);
+        if (!self.remoteRequestMatches(result.identity) or
+            result.identity.operation_generation != result.pending.generation)
+            return .{ .quit_after_terminal = quit_after_terminal };
+        switch (result.result.outcome) {
+            .ok => {
+                if (active_matches) {
+                    self.setRemoteStatus(result.result.warnings, "pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
+                    return .{ .reload = .source_and_aux, .quit_after_terminal = quit_after_terminal };
                 }
-                return .{};
+                self.setRemoteStatus(result.result.warnings, "pushed: {s}", .{result.repo_root});
             },
-            .background => |background| {
-                const quit_after_terminal = self.finishRemoteControl(result.pending);
-                if (!self.remoteRequestMatches(result.identity) or
-                    result.identity.operation_generation != result.pending.generation)
-                    return .{ .quit_after_terminal = quit_after_terminal };
-                switch (background.outcome) {
-                    .ok => {
-                        if (active_matches) {
-                            self.setRemoteStatus(background.warnings, "pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-                            return .{ .reload = .source_and_aux, .quit_after_terminal = quit_after_terminal };
-                        }
-                        self.setRemoteStatus(background.warnings, "pushed: {s}", .{result.repo_root});
-                    },
-                    .failed => |failure| {
-                        self.setRemoteFailureStatus(background.warnings, .push, failure);
-                        const retry_allowed = failure != .http_userinfo_rejected and !remoteOutcomeUnknown(failure);
-                        const retry_target = if (retry_allowed) try pushRetryTargetFromFinished(allocator, result) else null;
-                        errdefer if (retry_target) |owned_target| {
-                            var target = owned_target;
-                            target.deinit(allocator);
-                        };
-                        const presentation = try remoteFailurePresentationAlloc(allocator, .push, failure, background.warnings);
-                        defer allocator.free(presentation);
-                        try self.setPushErrorWithRetry(
-                            allocator,
-                            presentation,
-                            retry_target,
-                            failure == .authentication_required,
-                        );
-                        return .{
-                            .reload = if (active_matches and remoteOutcomeUnknown(failure)) .source_and_aux else .none,
-                            .quit_after_terminal = quit_after_terminal,
-                        };
-                    },
-                }
-                return .{ .quit_after_terminal = quit_after_terminal };
+            .failed => |failure| {
+                self.setRemoteFailureStatus(result.result.warnings, .push, failure);
+                const retry_allowed = failure != .http_userinfo_rejected and !remoteOutcomeUnknown(failure);
+                const retry_target = if (retry_allowed) try pushRetryTargetFromFinished(allocator, result) else null;
+                errdefer if (retry_target) |owned_target| {
+                    var target = owned_target;
+                    target.deinit(allocator);
+                };
+                const presentation = try remoteFailurePresentationAlloc(allocator, .push, failure, result.result.warnings);
+                defer allocator.free(presentation);
+                try self.setPushErrorWithRetry(allocator, presentation, retry_target);
+                return .{
+                    .reload = if (active_matches and remoteOutcomeUnknown(failure)) .source_and_aux else .none,
+                    .quit_after_terminal = quit_after_terminal,
+                };
             },
         }
+        return .{ .quit_after_terminal = quit_after_terminal };
     }
 
     pub fn finishPull(self: Controller, allocator: std.mem.Allocator, finished: app_actions.PullFinished) Outcome {
@@ -759,7 +634,7 @@ pub const Controller = struct {
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
         const active_matches = terminal.target == .current_review;
         switch (result.result) {
-            .ok, .ok_static => {
+            .ok => {
                 const applied = self.operations.applyAcceptedOutcome(allocator, .{ .switch_branch = .{ .repo_root = result.repo_root } }, active_matches);
                 if (active_matches) {
                     self.setStatus("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
@@ -845,64 +720,118 @@ pub const Controller = struct {
             return;
         }
         switch (result.outcome) {
-            .snapshot_valid => if (result.kind != .verify_snapshot) {
-                self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
-                self.setStatus("push retry inspection returned an invalid result", .{});
-            } else try self.startInteractivePushAfterInspection(
+            .ready => try self.startInteractivePushAfterInspection(
                 ctx,
                 result.identity,
                 result.origin,
                 result.takeRoot(),
                 result.target.take(),
-                result.credentials_available,
                 result.warnings,
             ),
-            .snapshot_changed => {
-                self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
-                self.setStatus("push retry unavailable: branch changed; reload and try again", .{});
+            .branch_changed => {
+                self.restorePushRetryTarget(ctx.allocator(), result.target.take());
+                self.setForegroundStatus(result.warnings, "push retry unavailable: branch changed; reload and try again", .{});
             },
-            .remote_ready => if (result.kind != .lookup_remote or result.target.remote_url == null) {
-                self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
-                self.setStatus("push retry inspection returned an invalid remote", .{});
-            } else {
-                const prompt = ctx.allocator().create(app_state.PushCredentialPrompt) catch |err| {
-                    self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
-                    self.setStatus("could not open push credential prompt", .{});
-                    return err;
-                };
-                var inspected_root = result.takeRoot();
-                inspected_root.deinit();
-                prompt.* = .{ .target = result.target.take() };
-                self.state.push_retry.state = .{ .credential_prompt = prompt };
-                self.clearPushErrorPresentation(ctx.allocator());
-                self.operations.navigation.clearDiffSelection();
-                self.overlay.openPushCredentials();
+            .oid_changed => {
+                self.restorePushRetryTarget(ctx.allocator(), result.target.take());
+                self.setForegroundStatus(result.warnings, "push retry unavailable: commit changed; reload and try again", .{});
             },
-            .remote_not_https => {
-                self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
-                self.setStatus("credential prompt is only available for HTTPS remotes", .{});
-            },
-            .inspection_failed => |message| {
-                self.restorePushRetryTarget(ctx.allocator(), result.target.take(), result.credentials_available);
-                self.setStatus("{s}", .{message});
+            .failed => |failure| {
+                self.restorePushRetryTarget(ctx.allocator(), result.target.take());
+                self.setRemoteFailureStatus(result.warnings, .push, failure);
             },
         }
         if (self.active_page != result.origin.page_id) self.redraw.requestSkip();
     }
 
-    pub fn finishPushForeground(self: Controller, allocator: std.mem.Allocator, result: chasen.ForegroundCommandResult) Outcome {
+    pub fn finishPushForeground(self: Controller, ctx: *chasen.Ctx(app_message.Msg), result: chasen.ForegroundCommandResult) !Outcome {
+        const allocator = ctx.allocator();
         var foreground = switch (self.state.push_retry.state) {
             .foreground => |foreground| foreground,
             else => return .{},
         };
         if (foreground.request_id.id != result.request_id.id) return .{};
         self.state.push_retry.state = .idle;
+
+        const origin: effect_origin.Origin = .{ .page = foreground.origin };
+        const liveness = effect_origin.classify(origin, self.effect_snapshot);
+        const set_upstream_succeeded = foreground.target.mode == .set_upstream and switch (result.outcome) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (set_upstream_succeeded) {
+            if (!self.lifecycle.view().isAccepted(foreground.pending)) {
+                foreground.deinit(allocator);
+                return .{};
+            }
+            if (!self.remoteRequestMatches(foreground.identity) or liveness == .stale) {
+                const outcome = self.finishUpstreamPartial(
+                    allocator,
+                    foreground.pending,
+                    foreground.target.repo_root,
+                    foreground.identity,
+                    foreground.origin,
+                    foreground.warnings,
+                );
+                foreground.deinit(allocator);
+                return outcome;
+            }
+
+            var environment: ?git_backend.OwnedRemoteEnvironment = git_backend.buildRemoteEnvironment(
+                allocator,
+                self.env_map,
+                .local_finalizer,
+            ) catch {
+                const outcome = self.finishUpstreamPartial(
+                    allocator,
+                    foreground.pending,
+                    foreground.target.repo_root,
+                    foreground.identity,
+                    foreground.origin,
+                    foreground.warnings,
+                );
+                foreground.deinit(allocator);
+                return outcome;
+            };
+            defer if (environment) |*owned| owned.deinit();
+            environment.?.warnings.merge(foreground.warnings);
+
+            var root: ?root_capability.RootCapability = foreground.root;
+            defer if (root) |*owned| owned.deinit();
+            var target = foreground.target.take();
+            defer target.deinit(allocator);
+            const metadata: app_push_retry.Finalizing = .{
+                .pending = foreground.pending,
+                .identity = foreground.identity,
+                .origin = foreground.origin,
+            };
+            app_push_retry.startFinalization(
+                app_message.Msg,
+                ctx,
+                metadata,
+                &root,
+                &environment,
+                &target,
+                foreground.warnings,
+            ) catch {
+                return self.finishUpstreamPartial(
+                    allocator,
+                    foreground.pending,
+                    target.repo_root,
+                    foreground.identity,
+                    foreground.origin,
+                    foreground.warnings,
+                );
+            };
+            self.state.push_retry.state = .{ .finalizing = metadata };
+            self.setStatus("finalizing upstream...", .{});
+            return .{};
+        }
+
         defer foreground.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, foreground.pending, foreground.target.repo_root) orelse return .{};
         if (!self.remoteRequestMatches(foreground.identity)) return .{};
         const active_matches = terminal.target == .current_review;
-        const origin: effect_origin.Origin = .{ .page = foreground.origin };
-        const liveness = effect_origin.classify(origin, self.effect_snapshot);
         if (liveness == .stale) {
             self.redraw.requestSkip();
             return .{};
@@ -922,7 +851,50 @@ pub const Controller = struct {
         return .{ .reload = if (active_matches) .source_and_aux else .none };
     }
 
-    fn startPushInspection(self: Controller, ctx: *chasen.Ctx(app_message.Msg), kind: app_push_retry.InspectionKind, unavailable_message: []const u8) !void {
+    pub fn finishPushUpstreamFinalize(self: Controller, allocator: std.mem.Allocator, result: app_push_retry.FinalizeFinished) Outcome {
+        const finalizing = switch (self.state.push_retry.state) {
+            .finalizing => |finalizing| finalizing,
+            else => return .{},
+        };
+        if (!finalizing.accepts(result)) return .{};
+        self.state.push_retry.state = .idle;
+        const request_matches = self.remoteRequestMatches(result.identity);
+        const terminal = self.acceptTerminal(
+            allocator,
+            finalizing.pending,
+            if (request_matches) self.current_review_root orelse "" else "",
+        ) orelse return .{};
+        const quit_after_terminal = self.takeDeferredQuit();
+        if (!request_matches) {
+            self.redraw.requestSkip();
+            return .{ .quit_after_terminal = quit_after_terminal };
+        }
+        const origin: effect_origin.Origin = .{ .page = finalizing.origin };
+        const liveness = effect_origin.classify(origin, self.effect_snapshot);
+        if (liveness == .stale) {
+            self.redraw.requestSkip();
+            return .{ .quit_after_terminal = quit_after_terminal };
+        }
+        switch (result.outcome) {
+            .configured, .already_configured => self.setRemoteStatus(
+                result.warnings,
+                "push completed; local upstream configured",
+                .{},
+            ),
+            else => self.setRemoteStatus(
+                result.warnings,
+                "push succeeded; local upstream was not configured; repository reload required",
+                .{},
+            ),
+        }
+        if (liveness == .live_inactive) self.redraw.requestSkip();
+        return .{
+            .reload = if (terminal.target == .current_review) .source_and_aux else .none,
+            .quit_after_terminal = quit_after_terminal,
+        };
+    }
+
+    fn startPushInspection(self: Controller, ctx: *chasen.Ctx(app_message.Msg), unavailable_message: []const u8) !void {
         if (self.state.push_retry.state == .inspecting) return self.rejectVoid("push retry inspection already running");
         const available_target = self.state.push_retry.state.availableTarget() orelse
             return self.rejectVoid(unavailable_message);
@@ -944,16 +916,13 @@ pub const Controller = struct {
             .inspection,
         );
         defer if (environment) |*owned| owned.deinit();
-        var started = self.state.push_retry.beginInspection(kind, self.review_origin) orelse return self.rejectVoid(unavailable_message);
-        app_push_retry.startInspection(app_message.Msg, ctx, started.metadata, &root, &environment, &started.target, started.credentials_available) catch |err| {
-            self.restorePushRetryTarget(ctx.allocator(), started.target.take(), started.credentials_available);
+        var started = self.state.push_retry.beginInspection(self.review_origin) orelse return self.rejectVoid(unavailable_message);
+        app_push_retry.startInspection(app_message.Msg, ctx, started.metadata, &root, &environment, &started.target) catch |err| {
+            self.restorePushRetryTarget(ctx.allocator(), started.target.take());
             self.setStatus("could not start push retry inspection", .{});
             return err;
         };
-        switch (kind) {
-            .verify_snapshot => self.setStatus("checking push retry target...", .{}),
-            .lookup_remote => self.setStatus("reading push remote URL...", .{}),
-        }
+        self.setStatus("checking push retry target...", .{});
     }
 
     fn startInteractivePushAfterInspection(
@@ -963,7 +932,6 @@ pub const Controller = struct {
         origin: effect_origin.PageOrigin,
         owned_root: root_capability.RootCapability,
         owned_target: app_state.PushRetryTarget,
-        credentials_available: bool,
         inspection_warnings: git_backend.RemoteWarningSet,
     ) !void {
         var root: ?root_capability.RootCapability = owned_root;
@@ -971,12 +939,12 @@ pub const Controller = struct {
         var target = owned_target;
         errdefer target.deinit(ctx.allocator());
         if (self.lifecycle.view().hasPending()) {
-            self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
+            self.restorePushRetryTarget(ctx.allocator(), target.take());
             self.setForegroundStatus(inspection_warnings, "another git action is running", .{});
             return;
         }
         const refspec = std.fmt.allocPrint(ctx.allocator(), "{s}:refs/heads/{s}", .{ target.oid, target.remote_branch }) catch {
-            self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
+            self.restorePushRetryTarget(ctx.allocator(), target.take());
             self.setForegroundStatus(inspection_warnings, "interactive push could not be queued", .{});
             return;
         };
@@ -997,7 +965,7 @@ pub const Controller = struct {
             refspec,
         };
         var environment = git_backend.buildRemoteEnvironment(ctx.allocator(), self.env_map, .foreground) catch {
-            self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
+            self.restorePushRetryTarget(ctx.allocator(), target.take());
             self.setForegroundStatus(inspection_warnings, "interactive push could not be queued", .{});
             return;
         };
@@ -1011,7 +979,7 @@ pub const Controller = struct {
             .finished = app_message.Msg.pushForegroundFinished,
         }) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
-            self.restorePushRetryTarget(ctx.allocator(), target.take(), credentials_available);
+            self.restorePushRetryTarget(ctx.allocator(), target.take());
             switch (err) {
                 error.ForegroundCommandLimitExceeded => self.setForegroundStatus(environment.warnings, "interactive push already queued", .{}),
                 error.ForegroundCommandEmptyArgv => self.setForegroundStatus(environment.warnings, "interactive push command is empty", .{}),
@@ -1041,10 +1009,10 @@ pub const Controller = struct {
         self.setStatus("running interactive push: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
     }
 
-    fn setPushErrorWithRetry(self: Controller, allocator: std.mem.Allocator, message: []const u8, retry_target: ?app_state.PushRetryTarget, credentials_available: bool) !void {
+    fn setPushErrorWithRetry(self: Controller, allocator: std.mem.Allocator, message: []const u8, retry_target: ?app_state.PushRetryTarget) !void {
         self.clearPushError(allocator);
         self.state.push_error_message = try allocator.dupe(u8, message);
-        if (retry_target) |target| self.state.push_retry.state = .{ .available = .{ .target = target, .credentials_available = credentials_available } };
+        if (retry_target) |target| self.state.push_retry.state = .{ .available = .{ .target = target } };
         self.operations.navigation.clearDiffSelection();
         self.overlay.openPushError();
     }
@@ -1055,24 +1023,32 @@ pub const Controller = struct {
         if (self.overlay.isPushError()) self.overlay.close();
     }
 
-    fn restorePushRetryTarget(self: Controller, allocator: std.mem.Allocator, target: app_state.PushRetryTarget, credentials_available: bool) void {
-        self.state.push_retry.restoreAvailable(allocator, target, credentials_available);
+    fn restorePushRetryTarget(self: Controller, allocator: std.mem.Allocator, target: app_state.PushRetryTarget) void {
+        self.state.push_retry.restoreAvailable(allocator, target);
         self.operations.navigation.clearDiffSelection();
         self.overlay.openPushError();
     }
 
-    fn mutablePushCredentialPrompt(self: Controller) ?*app_state.PushCredentialPrompt {
-        return switch (self.state.push_retry.state) {
-            .credential_prompt => |prompt| prompt,
-            else => null,
-        };
-    }
-
-    fn activePushCredentialInput(self: Controller) ?*app_state.SecretInput {
-        const prompt = self.mutablePushCredentialPrompt() orelse return null;
-        return switch (prompt.active_field) {
-            .username => &prompt.username,
-            .password => &prompt.password,
+    fn finishUpstreamPartial(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        pending: app_actions.PendingAction,
+        repo_root: []const u8,
+        identity: remote_request.RemoteRequestIdentity,
+        origin_page: effect_origin.PageOrigin,
+        warnings: git_backend.RemoteWarningSet,
+    ) Outcome {
+        const terminal = self.acceptTerminal(allocator, pending, repo_root) orelse return .{};
+        const quit_after_terminal = self.takeDeferredQuit();
+        const origin: effect_origin.Origin = .{ .page = origin_page };
+        const liveness = effect_origin.classify(origin, self.effect_snapshot);
+        if (self.remoteRequestMatches(identity) and liveness != .stale) {
+            self.setRemoteStatus(warnings, "push succeeded; local upstream was not configured; repository reload required", .{});
+        }
+        if (liveness != .live_active) self.redraw.requestSkip();
+        return .{
+            .reload = if (liveness != .stale and terminal.target == .current_review and self.remoteRequestMatches(identity)) .source_and_aux else .none,
+            .quit_after_terminal = quit_after_terminal,
         };
     }
 
@@ -1108,6 +1084,10 @@ pub const Controller = struct {
     fn finishRemoteControl(self: Controller, pending: app_actions.PendingAction) bool {
         if (!self.state.action_control.finish(pending.generation)) return false;
         self.state.canceling_generation = null;
+        return self.takeDeferredQuit();
+    }
+
+    fn takeDeferredQuit(self: Controller) bool {
         const quit_after_terminal = self.state.quit_after_remote_terminal;
         self.state.quit_after_remote_terminal = false;
         return quit_after_terminal;
@@ -1131,7 +1111,7 @@ pub const Controller = struct {
 
     fn setActionFailureStatus(self: Controller, comptime prefix: []const u8, result: app_actions.FileActionTaskResult) bool {
         switch (result) {
-            .ok, .ok_static => return false,
+            .ok => return false,
             .failed => |message| self.setStatus(prefix ++ " failed: {s}", .{git_ops.trimGitOutput(message)}),
             .failed_static => |message| self.setStatus(prefix ++ " failed: {s}", .{message}),
         }
@@ -1189,11 +1169,13 @@ pub const Controller = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        if (warnings.proxy_credentials_omitted) {
-            self.status.set("credential-bearing proxy omitted; " ++ fmt, args);
-        } else {
+        const warning = remoteWarningMessage(warnings) orelse {
             self.status.set(fmt, args);
-        }
+            return;
+        };
+        var buffer: [112]u8 = undefined;
+        const message = std.fmt.bufPrint(&buffer, fmt, args) catch "interactive push completed";
+        self.status.set("{s}; {s}", .{ warning, message });
     }
 };
 
@@ -1303,34 +1285,14 @@ fn pushRetryTargetFromFinished(allocator: std.mem.Allocator, finished: app_actio
     return target;
 }
 
-fn pushCredentialFailureLikely(detail: []const u8) bool {
-    const needles = [_][]const u8{
-        "could not read Username",
-        "could not read Password",
-        "Authentication failed",
-        "terminal prompts disabled",
-        "HTTP Basic: Access denied",
-        "Support for password authentication was removed",
-        "The requested URL returned error: 403",
-    };
-    for (needles) |needle| if (std.mem.indexOf(u8, detail, needle) != null) return true;
-    return false;
-}
-
 pub const testing = if (builtin.is_test) struct {
     pub fn setPushErrorWithRetry(
         controller: Controller,
         allocator: std.mem.Allocator,
         message: []const u8,
         retry_target: ?app_state.PushRetryTarget,
-        credentials_available: bool,
     ) !void {
-        try controller.setPushErrorWithRetry(
-            allocator,
-            message,
-            retry_target,
-            credentials_available,
-        );
+        try controller.setPushErrorWithRetry(allocator, message, retry_target);
     }
 
     pub fn clearForeground(state: *State, allocator: std.mem.Allocator) void {

@@ -1028,7 +1028,7 @@ pub const Controller = struct {
 
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return null;
         switch (result.result) {
-            .ok, .ok_static => {
+            .ok => {
                 const applied = self.operations.applyAcceptedOutcome(
                     allocator,
                     .{ .commit = .{ .repo_root = result.repo_root } },
@@ -1115,7 +1115,7 @@ pub const Controller = struct {
 
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return null;
         switch (result.result) {
-            .ok, .ok_static => {
+            .ok => {
                 const applied = self.operations.applyAcceptedOutcome(
                     allocator,
                     .{ .commit = .{ .repo_root = result.repo_root } },
@@ -1189,7 +1189,7 @@ pub const Controller = struct {
         result: app_actions.FileActionTaskResult,
     ) bool {
         switch (result) {
-            .ok, .ok_static => return false,
+            .ok => return false,
             .failed => |message| self.setStatus(prefix ++ " failed: {s}", .{git_ops.trimGitOutput(message)}),
             .failed_static => |message| self.setStatus(prefix ++ " failed: {s}", .{message}),
         }

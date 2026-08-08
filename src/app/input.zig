@@ -36,7 +36,6 @@ pub const KeyContext = struct {
     pull_confirmation_mode: bool = false,
     branch_switch_mode: bool = false,
     push_error_mode: bool = false,
-    push_credential_mode: bool = false,
     remote_action_cancelable: bool = false,
     keymap: keymap.Effective = .{},
 };
@@ -75,12 +74,6 @@ const Action = enum {
     push_error_page_up,
     push_error_page_down,
     copy_popup,
-    push_credential_tab,
-    push_credential_submit,
-    push_credential_cancel,
-    push_credential_backspace,
-    push_credential_move_left,
-    push_credential_move_right,
     confirm_discard_file,
     cancel_discard_file,
     confirm_amend,
@@ -94,7 +87,6 @@ const Action = enum {
     confirm_branch_switch,
     cancel_branch_switch,
     close_push_error,
-    open_push_credentials,
     run_interactive_push,
 };
 
@@ -125,7 +117,6 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         return .{ .compare = compare_msg };
     }
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
-    if (context.push_credential_mode) return .{ .push_credential_paste = text };
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return .{ .commit_panel_paste = text };
     if (context.active_page == .review) {
@@ -160,7 +151,6 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(key);
     if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
     if (context.push_error_mode) return pushErrorKeyToMsg(key);
-    if (context.push_credential_mode) return pushCredentialKeyToMsg(key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
     if (pageForKey(context.keymap, key)) |target| return .{ .switch_page = target };
     if (context.keymap.spec(.help)) |spec| if (spec.matches(key)) return app_message.Msg.open_help;
@@ -281,24 +271,12 @@ fn branchSwitchKeyToMsg(key: chasen.Key) ?app_message.Msg {
 
 fn pushErrorKeyToMsg(key: chasen.Key) ?app_message.Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(.close_push_error);
-    if (key.codepoint == 'c' and !key_input.hasCommandModifier(key)) return actionToMsg(.open_push_credentials);
     if (key.codepoint == 'i' and !key_input.hasCommandModifier(key)) return actionToMsg(.run_interactive_push);
     if (key.codepoint == 'y' and !key_input.hasCommandModifier(key)) return actionToMsg(.copy_popup);
     if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.push_error_scroll_up);
     if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.push_error_scroll_down);
     if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(.push_error_page_up);
     if (key.matches(chasen.Key.page_down, .{})) return actionToMsg(.push_error_page_down);
-    return null;
-}
-
-fn pushCredentialKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{})) return actionToMsg(.push_credential_cancel);
-    if (key.matches(chasen.Key.tab, .{})) return actionToMsg(.push_credential_tab);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.push_credential_submit);
-    if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(.push_credential_backspace);
-    if (key.matches(chasen.Key.left, .{})) return actionToMsg(.push_credential_move_left);
-    if (key.matches(chasen.Key.right, .{})) return actionToMsg(.push_credential_move_right);
-    if (key_input.textInputCodepoint(key)) |codepoint| return .{ .push_credential_insert = codepoint };
     return null;
 }
 
@@ -397,12 +375,6 @@ fn actionToMsg(action: Action) app_message.Msg {
         .push_error_page_up => app_message.Msg.push_error_page_up,
         .push_error_page_down => app_message.Msg.push_error_page_down,
         .copy_popup => app_message.Msg.copy_popup,
-        .push_credential_tab => app_message.Msg.push_credential_tab,
-        .push_credential_submit => app_message.Msg.push_credential_submit,
-        .push_credential_cancel => app_message.Msg.push_credential_cancel,
-        .push_credential_backspace => app_message.Msg.push_credential_backspace,
-        .push_credential_move_left => app_message.Msg.push_credential_move_left,
-        .push_credential_move_right => app_message.Msg.push_credential_move_right,
         .confirm_discard_file => app_message.Msg.confirm_discard_file,
         .cancel_discard_file => app_message.Msg.cancel_discard_file,
         .confirm_amend => app_message.Msg.confirm_amend,
@@ -416,7 +388,6 @@ fn actionToMsg(action: Action) app_message.Msg {
         .confirm_branch_switch => app_message.Msg.confirm_branch_switch,
         .cancel_branch_switch => app_message.Msg.cancel_branch_switch,
         .close_push_error => app_message.Msg.close_push_error,
-        .open_push_credentials => app_message.Msg.open_push_credentials,
         .run_interactive_push => app_message.Msg.run_interactive_push,
     };
 }
@@ -746,11 +717,6 @@ test "keyToMsg prefers generated text for printable text input" {
     try expectMsg(.{ .repo_picker_insert = '1' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, keypad_one).?);
 }
 
-test "push credential prompt accepts q as text and uses escape to cancel" {
-    try expectMsg(.{ .push_credential_insert = 'q' }, keyToMsg(.{ .push_credential_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(app_message.Msg.push_credential_cancel, keyToMsg(.{ .push_credential_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-}
-
 test "keyToMsg maps push confirmation keys" {
     try std.testing.expectEqual(app_message.Msg.confirm_push, keyToMsg(.{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(app_message.Msg.cancel_push, keyToMsg(.{ .push_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
@@ -781,6 +747,7 @@ test "keyToMsg maps push error modal keys" {
     try std.testing.expectEqual(app_message.Msg.close_push_error, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(app_message.Msg.close_push_error, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(app_message.Msg.run_interactive_push, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'i' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'c' }));
     try std.testing.expectEqual(app_message.Msg.copy_popup, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'y' }).?);
     try std.testing.expectEqual(app_message.Msg.push_error_scroll_up, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'k' }).?);
     try std.testing.expectEqual(app_message.Msg.push_error_scroll_down, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'j' }).?);
@@ -793,7 +760,6 @@ test "keyToMsg maps push error modal keys" {
 
 test "keyToMsg keeps printable y as editable popup input" {
     try expectMsg(.{ .commit_panel_insert = 'y' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
-    try expectMsg(.{ .push_credential_insert = 'y' }, keyToMsg(.{ .push_credential_mode = true }, .{ .codepoint = 'y' }).?);
 }
 
 test "keyToMsg opens and closes help outside prompt modes" {

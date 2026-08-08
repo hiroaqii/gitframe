@@ -11,6 +11,7 @@ pub const RemoteEnvironmentMode = enum {
     background,
     inspection,
     foreground,
+    local_finalizer,
 };
 
 pub const RemoteWarningSet = packed struct {
@@ -201,10 +202,6 @@ pub const BranchListLoadResult = union(enum) {
 
 pub const OperationResult = union(enum) {
     ok,
-    /// Non-owned success message for operations that completed without a
-    /// content-changing action, for example fetch-first pull finding the branch
-    /// already up to date.
-    ok_static: []const u8,
     /// Allocated error message from Git. Caller owns and must call `deinit`.
     failed: []u8,
     /// Non-owned fallback error message, used when allocation itself fails.
@@ -212,7 +209,7 @@ pub const OperationResult = union(enum) {
 
     pub fn deinit(self: OperationResult, allocator: std.mem.Allocator) void {
         switch (self) {
-            .ok, .ok_static, .failed_static => {},
+            .ok, .failed_static => {},
             .failed => |message| allocator.free(message),
         }
     }
@@ -263,6 +260,53 @@ pub const RemoteOperationRequest = struct {
     environment: *const OwnedRemoteEnvironment,
     control: process_runner.ProcessControl,
     kind: RemoteOperationKind,
+};
+
+pub const ForegroundPushInspectionOutcome = union(enum) {
+    ready,
+    branch_changed,
+    oid_changed,
+    failed: RemoteFailure,
+};
+
+pub const ForegroundPushInspectionResult = struct {
+    outcome: ForegroundPushInspectionOutcome,
+    warnings: RemoteWarningSet = .{},
+};
+
+/// Descriptor-bound, raw-free admission result for a native foreground push.
+/// The audit and snapshot verification run in one task immediately before the
+/// App queues the terminal child; no URL or config bytes cross this boundary.
+pub const ForegroundPushInspectionRequest = struct {
+    root: *const root_capability.RootCapability,
+    environment: *const OwnedRemoteEnvironment,
+    control: process_runner.ProcessControl,
+    push: PushRequest,
+};
+
+pub const PushUpstreamFinalizeOutcome = enum {
+    configured,
+    already_configured,
+    context_changed,
+    branch_changed,
+    oid_changed,
+    upstream_conflict,
+    config_write_failed,
+    config_verification_failed,
+    tracking_unknown,
+};
+
+/// One local-only finalization attempt after a fixed-OID native push has
+/// already succeeded. Every child uses the retained descriptor and strict
+/// replacement environment supplied by the owning task.
+pub const PushUpstreamFinalizeRequest = struct {
+    root: *const root_capability.RootCapability,
+    environment: *const OwnedRemoteEnvironment,
+    control: process_runner.ProcessControl,
+    branch: []const u8,
+    remote: []const u8,
+    remote_branch: []const u8,
+    oid: []const u8,
 };
 
 /// Git-command diff kinds only.
@@ -467,9 +511,6 @@ pub const OperationKind = union(enum) {
     unstage_patch: StagePatchRequest,
     commit: CommitRequest,
     amend: CommitRequest,
-    push: PushRequest,
-    pull_refresh_ff_only: PullRequest,
-    fetch: FetchRequest,
     switch_branch: SwitchBranchRequest,
 };
 
@@ -487,10 +528,9 @@ pub const PushRequest = struct {
     branch: []const u8,
     remote: []const u8,
     remote_branch: []const u8,
-    /// Commit snapshot used by the pre-push safety check. The push argv uses
-    /// the branch refspec; this OID only proves the branch has not moved.
+    /// Commit snapshot used by the pre-push safety check. Foreground callers
+    /// also use it as the immutable source of their native refspec.
     oid: []const u8,
-    credentials: ?PushCredentials = null,
 };
 
 pub const PullRequest = struct {
@@ -514,11 +554,6 @@ pub const SwitchBranchRequest = struct {
     target_oid: []const u8,
 };
 
-pub const PushCredentials = struct {
-    username: []const u8,
-    password: []const u8,
-};
-
 /// Request for a write operation executed in a concrete repository.
 ///
 /// The app snapshots `repo_root` and paths before spawning the task so a later
@@ -526,7 +561,6 @@ pub const PushCredentials = struct {
 pub const OperationRequest = struct {
     repo_root: []const u8,
     kind: OperationKind,
-    env_map: ?*const std.process.Environ.Map = null,
 };
 
 pub const LocalCommandBackend = struct {
@@ -582,22 +616,35 @@ pub const LocalCommandBackend = struct {
             .unstage_patch => |patch| runGitApplyCachedReverse(allocator, io, request.repo_root, patch.patch),
             .commit => |commit| runGitCommit(allocator, io, request.repo_root, commit),
             .amend => |commit| runGitAmend(allocator, io, request.repo_root, commit),
-            .push => |push| runGitPush(allocator, io, request.repo_root, request.env_map, push),
-            .pull_refresh_ff_only => |pull| runGitPullRefresh(allocator, io, request.repo_root, request.env_map, pull),
-            .fetch => |fetch| runGitFetch(allocator, io, request.repo_root, request.env_map, fetch),
             .switch_branch => |switch_branch| runGitSwitchBranch(allocator, io, request.repo_root, switch_branch),
         };
     }
 
-    /// Runs the credentialless background path. Unlike `runOperation`, this
-    /// API accepts only a retained root descriptor and returns no child-owned
-    /// diagnostic bytes.
+    /// Runs the credentialless background remote path. This is the sole backend
+    /// entry point that executes background push, pull, or fetch: it accepts a
+    /// retained root descriptor and returns no child-owned diagnostic bytes.
     pub fn runRemoteOperation(
         allocator: std.mem.Allocator,
         io: std.Io,
         request: RemoteOperationRequest,
     ) RemoteOperationResult {
         return runSecureRemoteOperation(allocator, io, request);
+    }
+
+    pub fn inspectForegroundPush(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        request: ForegroundPushInspectionRequest,
+    ) ForegroundPushInspectionResult {
+        return runForegroundPushInspection(allocator, io, request);
+    }
+
+    pub fn finalizePushUpstream(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        request: PushUpstreamFinalizeRequest,
+    ) PushUpstreamFinalizeOutcome {
+        return runPushUpstreamFinalizer(allocator, io, request);
     }
 };
 
@@ -2985,93 +3032,6 @@ fn runGitAmend(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, 
     return runGitCommitLike(allocator, io, repo_root, request, true);
 }
 
-const AskpassSetup = struct {
-    base_dir: std.Io.Dir,
-    base_dir_owned: bool = false,
-    dir_name: []u8,
-    helper_path: []u8,
-    username_path: []u8,
-    password_path: []u8,
-
-    fn deinit(self: *AskpassSetup, allocator: std.mem.Allocator, io: std.Io) void {
-        self.base_dir.deleteTree(io, self.dir_name) catch {};
-        if (self.base_dir_owned) self.base_dir.close(io);
-        allocator.free(self.dir_name);
-        allocator.free(self.helper_path);
-        allocator.free(self.username_path);
-        allocator.free(self.password_path);
-        self.* = undefined;
-    }
-};
-
-// Keep the helper fail-closed: unknown prompt strings must not receive the
-// password/token. Prefix matching also avoids treating "Password for
-// 'https://myusername@host'" as a username prompt.
-const askpass_helper_script =
-    \\#!/bin/sh
-    \\case "$1" in
-    \\  Username*|username*) cat "$GITFRAME_ASKPASS_USERNAME_FILE" ;;
-    \\  Password*|password*) cat "$GITFRAME_ASKPASS_PASSWORD_FILE" ;;
-    \\  *) exit 1 ;;
-    \\esac
-    \\
-;
-
-fn setupAskpass(allocator: std.mem.Allocator, io: std.Io, parent_env: ?*const std.process.Environ.Map, credentials: PushCredentials) LoadError!AskpassSetup {
-    // Prefer XDG_RUNTIME_DIR because it is normally user-private and often
-    // tmpfs-backed. Fall back to /tmp for non-conforming or unavailable values,
-    // but still create a 0700 per-attempt directory before writing secrets.
-    const configured_base_path = if (parent_env) |env| env.get("XDG_RUNTIME_DIR") orelse "/tmp" else "/tmp";
-    const base_path = if (std.fs.path.isAbsolute(configured_base_path)) configured_base_path else "/tmp";
-    var actual_base_path = base_path;
-    var base_dir = std.Io.Dir.openDirAbsolute(io, base_path, .{}) catch blk: {
-        actual_base_path = "/tmp";
-        break :blk std.Io.Dir.openDirAbsolute(io, "/tmp", .{}) catch return error.SpawnFailed;
-    };
-    var base_dir_owned = true;
-    errdefer if (base_dir_owned) base_dir.close(io);
-
-    const now = std.Io.Clock.now(.awake, io).nanoseconds;
-    const dir_name = std.fmt.allocPrint(allocator, "gitframe-askpass-{d}", .{now}) catch return error.OutOfMemory;
-    errdefer allocator.free(dir_name);
-
-    base_dir.createDir(io, dir_name, .fromMode(0o700)) catch return error.SpawnFailed;
-    errdefer base_dir.deleteTree(io, dir_name) catch {};
-
-    var temp_dir = base_dir.openDir(io, dir_name, .{}) catch return error.SpawnFailed;
-    defer temp_dir.close(io);
-
-    // Git askpass takes credentials via a program callback. Store the actual
-    // secret bytes in 0600 files and pass only paths through the environment so
-    // the token does not appear in argv, remote URLs, or environment values.
-    try writeAskpassFile(io, temp_dir, "username", credentials.username, .fromMode(0o600));
-    try writeAskpassFile(io, temp_dir, "password", credentials.password, .fromMode(0o600));
-    try writeAskpassFile(io, temp_dir, "askpass.sh", askpass_helper_script, .fromMode(0o700));
-
-    const helper_path = std.fmt.allocPrint(allocator, "{s}/{s}/askpass.sh", .{ actual_base_path, dir_name }) catch return error.OutOfMemory;
-    errdefer allocator.free(helper_path);
-    const username_path = std.fmt.allocPrint(allocator, "{s}/{s}/username", .{ actual_base_path, dir_name }) catch return error.OutOfMemory;
-    errdefer allocator.free(username_path);
-    const password_path = std.fmt.allocPrint(allocator, "{s}/{s}/password", .{ actual_base_path, dir_name }) catch return error.OutOfMemory;
-    errdefer allocator.free(password_path);
-
-    base_dir_owned = false;
-    return .{
-        .base_dir = base_dir,
-        .base_dir_owned = true,
-        .dir_name = dir_name,
-        .helper_path = helper_path,
-        .username_path = username_path,
-        .password_path = password_path,
-    };
-}
-
-fn writeAskpassFile(io: std.Io, dir: std.Io.Dir, name: []const u8, contents: []const u8, permissions: std.Io.File.Permissions) LoadError!void {
-    var file = dir.createFile(io, name, .{ .exclusive = true, .permissions = permissions }) catch return error.SpawnFailed;
-    defer file.close(io);
-    file.writeStreamingAll(io, contents) catch return error.SpawnFailed;
-}
-
 const max_remote_diagnostic_bytes = 256 * 1024;
 
 const SensitiveRemoteCommand = union(enum) {
@@ -3514,6 +3474,532 @@ fn nulSingleValueEquals(bytes: []const u8, expected: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), expected);
 }
 
+fn runForegroundPushInspection(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: ForegroundPushInspectionRequest,
+) ForegroundPushInspectionResult {
+    var warnings = request.environment.warnings;
+    if (auditRemoteUrls(
+        allocator,
+        io,
+        request.root.dir(),
+        &request.environment.map,
+        request.control,
+        request.push.remote,
+        .push,
+    )) |failure| return .{ .outcome = .{ .failed = failure }, .warnings = warnings };
+    if (classifyCredentialPolicy(
+        allocator,
+        io,
+        request.root.dir(),
+        &request.environment.map,
+        request.control,
+        &warnings,
+    )) |failure| return .{ .outcome = .{ .failed = failure }, .warnings = warnings };
+
+    const refs = validatePushRefNames(
+        allocator,
+        io,
+        request.root.dir(),
+        &request.environment.map,
+        request.control,
+        request.push.branch,
+        request.push.remote_branch,
+    );
+    switch (refs) {
+        .valid => {},
+        .invalid => return .{ .outcome = .branch_changed, .warnings = warnings },
+        .failed => |failure| return .{ .outcome = .{ .failed = failure }, .warnings = warnings },
+    }
+
+    return .{
+        .outcome = switch (inspectCurrentBranchAndOid(
+            allocator,
+            io,
+            request.root.dir(),
+            &request.environment.map,
+            request.control,
+            request.push.branch,
+            request.push.oid,
+        )) {
+            .matches => .ready,
+            .context_changed, .branch_changed => .branch_changed,
+            .oid_changed => .oid_changed,
+            .failed => |failure| .{ .failed = failure },
+        },
+        .warnings = warnings,
+    };
+}
+
+const RefValidation = union(enum) {
+    valid,
+    invalid,
+    failed: RemoteFailure,
+};
+
+fn validatePushRefNames(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    control: process_runner.ProcessControl,
+    branch: []const u8,
+    remote_branch: []const u8,
+) RefValidation {
+    const branch_argv = [_][]const u8{ "git", "check-ref-format", "--branch", branch };
+    var branch_command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &branch_argv);
+    defer branch_command.deinit();
+    switch (sensitiveExitCode(&branch_command)) {
+        .code => |code| if (code != 0) return .invalid,
+        .failure => |failure| return .{ .failed = failure },
+    }
+
+    const remote_ref = std.fmt.allocPrint(allocator, "refs/heads/{s}", .{remote_branch}) catch
+        return .{ .failed = .failed };
+    defer allocator.free(remote_ref);
+    const remote_argv = [_][]const u8{ "git", "check-ref-format", remote_ref };
+    var remote_command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &remote_argv);
+    defer remote_command.deinit();
+    return switch (sensitiveExitCode(&remote_command)) {
+        .code => |code| if (code == 0) .valid else .invalid,
+        .failure => |failure| .{ .failed = failure },
+    };
+}
+
+const SensitiveExitCode = union(enum) {
+    code: u8,
+    failure: RemoteFailure,
+};
+
+fn sensitiveExitCode(command: *const SensitiveRemoteCommand) SensitiveExitCode {
+    return switch (command.*) {
+        .completed => |result| switch (result.term) {
+            .exited => |code| .{ .code = code },
+            else => .{ .failure = .failed },
+        },
+        .canceled => .{ .failure = .canceled_outcome_unknown },
+        .timed_out => .{ .failure = .timed_out_outcome_unknown },
+        .failed => |failure| .{ .failure = failure },
+    };
+}
+
+const BranchOidInspection = union(enum) {
+    matches,
+    context_changed,
+    branch_changed,
+    oid_changed,
+    failed: RemoteFailure,
+};
+
+fn inspectCurrentBranchAndOid(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    control: process_runner.ProcessControl,
+    branch: []const u8,
+    oid: []const u8,
+) BranchOidInspection {
+    const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "HEAD" };
+    var branch_command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &branch_argv);
+    defer branch_command.deinit();
+    switch (sensitiveExitCode(&branch_command)) {
+        .failure => |failure| return switch (failure) {
+            .failed => .context_changed,
+            else => .{ .failed = failure },
+        },
+        .code => |code| if (code != 0) return .context_changed,
+    }
+    const expected_branch = std.fmt.allocPrint(allocator, "refs/heads/{s}", .{branch}) catch
+        return .{ .failed = .failed };
+    defer allocator.free(expected_branch);
+    const actual_branch = switch (branch_command) {
+        .completed => |*result| trimLineEnd(result.stdout.bytes()),
+        else => unreachable,
+    };
+    if (!std.mem.eql(u8, actual_branch, expected_branch)) return .branch_changed;
+
+    const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
+    var oid_command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &oid_argv);
+    defer oid_command.deinit();
+    switch (sensitiveExitCode(&oid_command)) {
+        .failure => |failure| return switch (failure) {
+            .failed => .oid_changed,
+            else => .{ .failed = failure },
+        },
+        .code => |code| if (code != 0) return .oid_changed,
+    }
+    const actual_oid = switch (oid_command) {
+        .completed => |*result| trimLineEnd(result.stdout.bytes()),
+        else => unreachable,
+    };
+    return if (std.mem.eql(u8, actual_oid, oid)) .matches else .oid_changed;
+}
+
+const ConfigRelation = enum {
+    missing,
+    expected,
+    other,
+    multiple,
+    invalid,
+};
+
+const BooleanRelation = enum {
+    missing,
+    true_value,
+    false_value,
+    multiple,
+    invalid,
+};
+
+const FinalizerReadError = error{
+    VerificationFailed,
+    TrackingUnknown,
+};
+
+const TrackingSnapshot = struct {
+    local_remote: ConfigRelation,
+    effective_remote: ConfigRelation,
+    local_merge: ConfigRelation,
+    effective_merge: ConfigRelation,
+    local_rebase: BooleanRelation,
+    effective_rebase: BooleanRelation,
+
+    fn pairMissing(self: TrackingSnapshot) bool {
+        return self.local_remote == .missing and self.effective_remote == .missing and
+            self.local_merge == .missing and self.effective_merge == .missing;
+    }
+
+    fn pairExpected(self: TrackingSnapshot) bool {
+        return (self.local_remote == .missing or self.local_remote == .expected) and
+            self.effective_remote == .expected and
+            (self.local_merge == .missing or self.local_merge == .expected) and
+            self.effective_merge == .expected;
+    }
+
+    fn localAndEffectivePairExpected(self: TrackingSnapshot) bool {
+        return self.local_remote == .expected and self.effective_remote == .expected and
+            self.local_merge == .expected and self.effective_merge == .expected;
+    }
+
+    fn valuesAreUnambiguous(self: TrackingSnapshot) bool {
+        return self.local_remote != .multiple and self.local_remote != .invalid and
+            self.effective_remote != .multiple and self.effective_remote != .invalid and
+            self.local_merge != .multiple and self.local_merge != .invalid and
+            self.effective_merge != .multiple and self.effective_merge != .invalid and
+            self.local_rebase != .multiple and self.local_rebase != .invalid and
+            self.effective_rebase != .multiple and self.effective_rebase != .invalid;
+    }
+};
+
+const FinalizerKeys = struct {
+    expected_head: []u8,
+    expected_merge: []u8,
+    remote: []u8,
+    merge: []u8,
+    rebase: []u8,
+
+    fn init(allocator: std.mem.Allocator, request: PushUpstreamFinalizeRequest) !FinalizerKeys {
+        const expected_head = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{request.branch});
+        errdefer allocator.free(expected_head);
+        const expected_merge = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{request.remote_branch});
+        errdefer allocator.free(expected_merge);
+        const remote = try std.fmt.allocPrint(allocator, "branch.{s}.remote", .{request.branch});
+        errdefer allocator.free(remote);
+        const merge = try std.fmt.allocPrint(allocator, "branch.{s}.merge", .{request.branch});
+        errdefer allocator.free(merge);
+        const rebase = try std.fmt.allocPrint(allocator, "branch.{s}.rebase", .{request.branch});
+        return .{
+            .expected_head = expected_head,
+            .expected_merge = expected_merge,
+            .remote = remote,
+            .merge = merge,
+            .rebase = rebase,
+        };
+    }
+
+    fn deinit(self: *FinalizerKeys, allocator: std.mem.Allocator) void {
+        allocator.free(self.expected_head);
+        allocator.free(self.expected_merge);
+        allocator.free(self.remote);
+        allocator.free(self.merge);
+        allocator.free(self.rebase);
+        self.* = undefined;
+    }
+};
+
+fn runPushUpstreamFinalizer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: PushUpstreamFinalizeRequest,
+) PushUpstreamFinalizeOutcome {
+    var keys = FinalizerKeys.init(allocator, request) catch return .config_verification_failed;
+    defer keys.deinit(allocator);
+
+    switch (validatePushRefNames(
+        allocator,
+        io,
+        request.root.dir(),
+        &request.environment.map,
+        request.control,
+        request.branch,
+        request.remote_branch,
+    )) {
+        .valid => {},
+        .invalid => return .context_changed,
+        .failed => |failure| return finalizerFailureBeforeWrite(failure),
+    }
+
+    if (finalizerContextOutcome(allocator, io, request, false)) |outcome| return outcome;
+    const desired_rebase = readAutoSetupRebase(allocator, io, request, false) catch |err|
+        return finalizerReadOutcome(err);
+    var snapshot = readTrackingSnapshot(allocator, io, request, &keys, false) catch |err|
+        return finalizerReadOutcome(err);
+    if (!snapshot.valuesAreUnambiguous()) return .config_verification_failed;
+
+    if (snapshot.pairExpected()) {
+        if (desired_rebase and snapshot.effective_rebase != .true_value)
+            return .upstream_conflict;
+        return .already_configured;
+    }
+    if (!snapshot.pairMissing()) return .upstream_conflict;
+
+    if (finalizerContextOutcome(allocator, io, request, false)) |outcome| return outcome;
+    snapshot = readTrackingSnapshot(allocator, io, request, &keys, false) catch |err|
+        return finalizerReadOutcome(err);
+    if (!snapshot.valuesAreUnambiguous()) return .config_verification_failed;
+    if (snapshot.pairExpected()) return .upstream_conflict;
+    if (!snapshot.pairMissing()) return .upstream_conflict;
+
+    switch (writeLocalConfig(allocator, io, request, keys.remote, request.remote)) {
+        .written => {},
+        .failed => return .config_write_failed,
+        .unknown => return .tracking_unknown,
+    }
+
+    if (finalizerContextOutcome(allocator, io, request, true)) |outcome| return outcome;
+    snapshot = readTrackingSnapshot(allocator, io, request, &keys, true) catch |err|
+        return finalizerReadOutcome(err);
+    if (!snapshot.valuesAreUnambiguous()) return .tracking_unknown;
+    if (snapshot.local_remote != .expected or snapshot.effective_remote != .expected or
+        snapshot.local_merge != .missing or snapshot.effective_merge != .missing)
+        return .upstream_conflict;
+
+    switch (writeLocalConfig(allocator, io, request, keys.merge, keys.expected_merge)) {
+        .written => {},
+        .failed => return .config_write_failed,
+        .unknown => return .tracking_unknown,
+    }
+
+    if (finalizerContextOutcome(allocator, io, request, true)) |outcome| return outcome;
+    snapshot = readTrackingSnapshot(allocator, io, request, &keys, true) catch |err|
+        return finalizerReadOutcome(err);
+    if (!snapshot.valuesAreUnambiguous() or !snapshot.localAndEffectivePairExpected())
+        return .upstream_conflict;
+
+    if (desired_rebase and snapshot.effective_rebase != .true_value) {
+        if (snapshot.effective_rebase != .missing and snapshot.effective_rebase != .false_value)
+            return .upstream_conflict;
+        switch (writeLocalConfig(allocator, io, request, keys.rebase, "true")) {
+            .written => {},
+            .failed => return .config_write_failed,
+            .unknown => return .tracking_unknown,
+        }
+    }
+
+    if (finalizerContextOutcome(allocator, io, request, true)) |outcome| return outcome;
+    snapshot = readTrackingSnapshot(allocator, io, request, &keys, true) catch |err|
+        return finalizerReadOutcome(err);
+    if (!snapshot.valuesAreUnambiguous() or !snapshot.localAndEffectivePairExpected())
+        return .config_verification_failed;
+    if (desired_rebase and
+        (snapshot.local_rebase != .true_value or snapshot.effective_rebase != .true_value))
+        return .config_verification_failed;
+    return .configured;
+}
+
+fn finalizerFailureBeforeWrite(failure: RemoteFailure) PushUpstreamFinalizeOutcome {
+    return switch (failure) {
+        .canceled_outcome_unknown, .timed_out_outcome_unknown => .tracking_unknown,
+        else => .config_verification_failed,
+    };
+}
+
+fn finalizerReadOutcome(err: FinalizerReadError) PushUpstreamFinalizeOutcome {
+    return switch (err) {
+        error.VerificationFailed => .config_verification_failed,
+        error.TrackingUnknown => .tracking_unknown,
+    };
+}
+
+fn finalizerContextOutcome(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: PushUpstreamFinalizeRequest,
+    mutation_started: bool,
+) ?PushUpstreamFinalizeOutcome {
+    return switch (inspectCurrentBranchAndOid(
+        allocator,
+        io,
+        request.root.dir(),
+        &request.environment.map,
+        request.control,
+        request.branch,
+        request.oid,
+    )) {
+        .matches => null,
+        .context_changed => .context_changed,
+        .branch_changed => .branch_changed,
+        .oid_changed => .oid_changed,
+        .failed => |failure| if (mutation_started)
+            .tracking_unknown
+        else
+            finalizerFailureBeforeWrite(failure),
+    };
+}
+
+fn readAutoSetupRebase(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: PushUpstreamFinalizeRequest,
+    mutation_started: bool,
+) FinalizerReadError!bool {
+    const argv = [_][]const u8{ "git", "config", "--null", "--get-all", "branch.autoSetupRebase" };
+    var command = runSensitiveRemoteCommand(allocator, io, request.root.dir(), &request.environment.map, request.control, &argv);
+    defer command.deinit();
+    switch (sensitiveExitCode(&command)) {
+        .failure => |failure| return finalizerReadFailure(failure, mutation_started),
+        .code => |code| {
+            if (code == 1) return false;
+            if (code != 0) return error.VerificationFailed;
+        },
+    }
+    const bytes = switch (command) {
+        .completed => |*result| result.stdout.bytes(),
+        else => unreachable,
+    };
+    const value = singleNulValue(bytes) orelse return error.VerificationFailed;
+    if (std.ascii.eqlIgnoreCase(value, "remote") or std.ascii.eqlIgnoreCase(value, "always")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "never") or std.ascii.eqlIgnoreCase(value, "local")) return false;
+    return error.VerificationFailed;
+}
+
+fn readTrackingSnapshot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: PushUpstreamFinalizeRequest,
+    keys: *const FinalizerKeys,
+    mutation_started: bool,
+) FinalizerReadError!TrackingSnapshot {
+    return .{
+        .local_remote = try readConfigRelation(allocator, io, request, true, keys.remote, request.remote, mutation_started),
+        .effective_remote = try readConfigRelation(allocator, io, request, false, keys.remote, request.remote, mutation_started),
+        .local_merge = try readConfigRelation(allocator, io, request, true, keys.merge, keys.expected_merge, mutation_started),
+        .effective_merge = try readConfigRelation(allocator, io, request, false, keys.merge, keys.expected_merge, mutation_started),
+        .local_rebase = try readBooleanRelation(allocator, io, request, true, keys.rebase, mutation_started),
+        .effective_rebase = try readBooleanRelation(allocator, io, request, false, keys.rebase, mutation_started),
+    };
+}
+
+fn readConfigRelation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: PushUpstreamFinalizeRequest,
+    local: bool,
+    key: []const u8,
+    expected: []const u8,
+    mutation_started: bool,
+) FinalizerReadError!ConfigRelation {
+    const local_argv = [_][]const u8{ "git", "config", "--local", "--null", "--get-all", key };
+    const effective_argv = [_][]const u8{ "git", "config", "--null", "--get-all", key };
+    const argv: []const []const u8 = if (local) &local_argv else &effective_argv;
+    var command = runSensitiveRemoteCommand(allocator, io, request.root.dir(), &request.environment.map, request.control, argv);
+    defer command.deinit();
+    switch (sensitiveExitCode(&command)) {
+        .failure => |failure| return finalizerReadFailure(failure, mutation_started),
+        .code => |code| {
+            if (code == 1) return .missing;
+            if (code != 0) return error.VerificationFailed;
+        },
+    }
+    const bytes = switch (command) {
+        .completed => |*result| result.stdout.bytes(),
+        else => unreachable,
+    };
+    return configRelationFromBytes(bytes, expected);
+}
+
+fn readBooleanRelation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: PushUpstreamFinalizeRequest,
+    local: bool,
+    key: []const u8,
+    mutation_started: bool,
+) FinalizerReadError!BooleanRelation {
+    const local_argv = [_][]const u8{ "git", "config", "--local", "--bool", "--null", "--get-all", key };
+    const effective_argv = [_][]const u8{ "git", "config", "--bool", "--null", "--get-all", key };
+    const argv: []const []const u8 = if (local) &local_argv else &effective_argv;
+    var command = runSensitiveRemoteCommand(allocator, io, request.root.dir(), &request.environment.map, request.control, argv);
+    defer command.deinit();
+    switch (sensitiveExitCode(&command)) {
+        .failure => |failure| return finalizerReadFailure(failure, mutation_started),
+        .code => |code| {
+            if (code == 1) return .missing;
+            if (code != 0) return error.VerificationFailed;
+        },
+    }
+    const bytes = switch (command) {
+        .completed => |*result| result.stdout.bytes(),
+        else => unreachable,
+    };
+    const value = singleNulValue(bytes) orelse return if (countNulValues(bytes) > 1) .multiple else .invalid;
+    if (std.ascii.eqlIgnoreCase(value, "true")) return .true_value;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return .false_value;
+    return .invalid;
+}
+
+fn finalizerReadFailure(failure: RemoteFailure, mutation_started: bool) FinalizerReadError {
+    if (mutation_started or failure == .canceled_outcome_unknown or failure == .timed_out_outcome_unknown)
+        return error.TrackingUnknown;
+    return error.VerificationFailed;
+}
+
+fn configRelationFromBytes(bytes: []const u8, expected: []const u8) ConfigRelation {
+    const value = singleNulValue(bytes) orelse return if (countNulValues(bytes) > 1) .multiple else .invalid;
+    return if (std.mem.eql(u8, value, expected)) .expected else .other;
+}
+
+fn singleNulValue(bytes: []const u8) ?[]const u8 {
+    if (bytes.len == 0 or bytes[bytes.len - 1] != 0) return null;
+    if (std.mem.indexOfScalar(u8, bytes[0 .. bytes.len - 1], 0) != null) return null;
+    return bytes[0 .. bytes.len - 1];
+}
+
+fn countNulValues(bytes: []const u8) usize {
+    if (bytes.len == 0 or bytes[bytes.len - 1] != 0) return 0;
+    return std.mem.count(u8, bytes, &.{0});
+}
+
+const ConfigWriteResult = enum { written, failed, unknown };
+
+fn writeLocalConfig(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: PushUpstreamFinalizeRequest,
+    key: []const u8,
+    value: []const u8,
+) ConfigWriteResult {
+    const argv = [_][]const u8{ "git", "config", "--local", "--replace-all", key, value };
+    var command = runSensitiveRemoteCommand(allocator, io, request.root.dir(), &request.environment.map, request.control, &argv);
+    defer command.deinit();
+    return switch (sensitiveExitCode(&command)) {
+        .code => |code| if (code == 0) .written else .failed,
+        .failure => |failure| if (failure == .spawn_failed) .failed else .unknown,
+    };
+}
+
 fn runSecureGitPush(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3680,213 +4166,6 @@ fn secureRemoteBranchSnapshotMatches(
     return if (std.mem.eql(u8, actual_oid, oid)) .matches else .mismatch;
 }
 
-fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: PushRequest) LoadError!OperationResult {
-    if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.branch, request.oid)) {
-        return .{ .failed_static = "Branch changed before push; reload and try again" };
-    }
-    if (remoteEnvironmentRejectedInteractiveSsh(parent_env)) {
-        return .{ .failed_static = "Push requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" };
-    }
-
-    var env = remoteOperationEnvironment(allocator, parent_env) catch |err| switch (err) {
-        error.InteractiveSshCommand => return .{ .failed_static = "Push requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" },
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SpawnFailed => return error.SpawnFailed,
-        error.StreamTooLong => return error.StreamTooLong,
-    };
-    defer env.deinit();
-
-    var askpass = if (request.credentials) |credentials| try setupAskpass(allocator, io, parent_env, credentials) else null;
-    defer if (askpass) |*setup| setup.deinit(allocator, io);
-    if (askpass) |setup| {
-        env.put("GIT_ASKPASS", setup.helper_path) catch return error.OutOfMemory;
-        env.put("GITFRAME_ASKPASS_USERNAME_FILE", setup.username_path) catch return error.OutOfMemory;
-        env.put("GITFRAME_ASKPASS_PASSWORD_FILE", setup.password_path) catch return error.OutOfMemory;
-    }
-
-    const refspec = std.fmt.allocPrint(allocator, "refs/heads/{s}:refs/heads/{s}", .{ request.branch, request.remote_branch }) catch return error.OutOfMemory;
-    defer allocator.free(refspec);
-
-    const argv_upstream = [_][]const u8{ "git", "push", request.remote, refspec };
-    const argv_set_upstream = [_][]const u8{ "git", "push", "--set-upstream", request.remote, refspec };
-    const argv: []const []const u8 = switch (request.mode) {
-        .upstream => &argv_upstream,
-        .set_upstream => &argv_set_upstream,
-    };
-    const result = std.process.run(allocator, io, .{
-        .argv = argv,
-        .cwd = .{ .path = repo_root },
-        .environ_map = &env,
-        .stdout_limit = .limited(128 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (result.stderr.len > 0) {
-        const message = try pushFailureWithDiagnostics(allocator, io, &env, result.stderr);
-        return .{ .failed = message };
-    }
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git push failed: {any}", .{result.term}) catch return error.OutOfMemory };
-}
-
-fn runGitPullRefresh(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: PullRequest) LoadError!OperationResult {
-    if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.branch, request.oid)) {
-        return .{ .failed_static = "Branch changed before pull; reload and try again" };
-    }
-    if (!try verifyConfirmedUpstream(allocator, io, repo_root, request.remote, request.remote_branch)) {
-        return .{ .failed_static = "Upstream changed before pull; reload and try again" };
-    }
-    if (!try verifyCleanWorktree(allocator, io, repo_root)) {
-        return .{ .failed_static = "Worktree changed before pull; reload and resolve local changes first" };
-    }
-    if (remoteEnvironmentRejectedInteractiveSsh(parent_env)) {
-        return .{ .failed_static = "Pull requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" };
-    }
-
-    var env = remoteOperationEnvironment(allocator, parent_env) catch |err| switch (err) {
-        error.InteractiveSshCommand => return .{ .failed_static = "Pull requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" },
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SpawnFailed => return error.SpawnFailed,
-        error.StreamTooLong => return error.StreamTooLong,
-    };
-    defer env.deinit();
-
-    const fetch_argv = [_][]const u8{ "git", "fetch", request.remote };
-    const fetch_result = std.process.run(allocator, io, .{
-        .argv = &fetch_argv,
-        .cwd = .{ .path = repo_root },
-        .environ_map = &env,
-        .stdout_limit = .limited(128 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    allocator.free(fetch_result.stdout);
-    switch (fetch_result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(fetch_result.stderr);
-        } else {
-            if (fetch_result.stderr.len > 0) return .{ .failed = fetch_result.stderr };
-            allocator.free(fetch_result.stderr);
-            return .{ .failed = std.fmt.allocPrint(allocator, "git fetch failed: {any}", .{fetch_result.term}) catch return error.OutOfMemory };
-        },
-        else => {
-            if (fetch_result.stderr.len > 0) return .{ .failed = fetch_result.stderr };
-            allocator.free(fetch_result.stderr);
-            return .{ .failed = std.fmt.allocPrint(allocator, "git fetch failed: {any}", .{fetch_result.term}) catch return error.OutOfMemory };
-        },
-    }
-
-    // Fetch can take long enough for local state or branch config to change.
-    // Re-check the confirmed identity before deciding whether to fast-forward.
-    if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.branch, request.oid)) {
-        return .{ .failed_static = "Branch changed before pull; reload and try again" };
-    }
-    if (!try verifyConfirmedUpstream(allocator, io, repo_root, request.remote, request.remote_branch)) {
-        return .{ .failed_static = "Upstream changed before pull; reload and try again" };
-    }
-    if (!try verifyCleanWorktree(allocator, io, repo_root)) {
-        return .{ .failed_static = "Worktree changed before pull; reload and resolve local changes first" };
-    }
-
-    const remote_ref = try confirmedRemoteTrackingRef(allocator, request.remote, request.remote_branch);
-    defer allocator.free(remote_ref);
-    const ahead_behind = try explicitAheadBehind(allocator, io, repo_root, remote_ref);
-    if (ahead_behind.ahead == 0 and ahead_behind.behind == 0) return .{ .ok_static = "nothing to pull" };
-    if (ahead_behind.ahead > 0 and ahead_behind.behind == 0) {
-        return .{ .failed_static = "local commits are ahead; push or resolve outside GitFrame" };
-    }
-    if (ahead_behind.ahead > 0 and ahead_behind.behind > 0) {
-        return .{ .failed_static = "branch has diverged; merge or rebase outside GitFrame" };
-    }
-
-    const merge_argv = [_][]const u8{ "git", "merge", "--ff-only", remote_ref };
-    const merge_result = std.process.run(allocator, io, .{
-        .argv = &merge_argv,
-        .cwd = .{ .path = repo_root },
-        .environ_map = &env,
-        .stdout_limit = .limited(128 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    allocator.free(merge_result.stdout);
-    switch (merge_result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(merge_result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (merge_result.stderr.len > 0) return .{ .failed = merge_result.stderr };
-    allocator.free(merge_result.stderr);
-    return .{ .failed = std.fmt.allocPrint(allocator, "git merge --ff-only failed: {any}", .{merge_result.term}) catch return error.OutOfMemory };
-}
-
-fn runGitFetch(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: FetchRequest) LoadError!OperationResult {
-    // Background fetch must never take over the terminal for credentials. Keep
-    // it on the same non-interactive remote path as pull/push, and reject an
-    // explicit BatchMode=no override before spawning git.
-    if (remoteEnvironmentRejectedInteractiveSsh(parent_env)) {
-        return .{ .failed_static = "Fetch requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" };
-    }
-
-    var env = remoteOperationEnvironment(allocator, parent_env) catch |err| switch (err) {
-        error.InteractiveSshCommand => return .{ .failed_static = "Fetch requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND" },
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SpawnFailed => return error.SpawnFailed,
-        error.StreamTooLong => return error.StreamTooLong,
-    };
-    defer env.deinit();
-
-    const argv = [_][]const u8{ "git", "fetch", request.remote };
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
-        .cwd = .{ .path = repo_root },
-        .environ_map = &env,
-        .stdout_limit = .limited(128 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .ok;
-        },
-        else => {},
-    }
-
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-    return .{ .failed = std.fmt.allocPrint(allocator, "git fetch failed: {any}", .{result.term}) catch return error.OutOfMemory };
-}
-
 fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: SwitchBranchRequest) LoadError!OperationResult {
     if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.expected_branch, request.expected_oid)) {
         return .{ .failed_static = "Branch changed before switch; reload and try again" };
@@ -3924,212 +4203,6 @@ fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, repo_root: []con
     return .{ .failed = std.fmt.allocPrint(allocator, "git switch failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
-fn pushFailureWithDiagnostics(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, stderr: []u8) LoadError![]u8 {
-    if (!isSshPublicKeyFailure(stderr)) return stderr;
-    errdefer allocator.free(stderr);
-
-    const normalized = try normalizeSshPublicKeyFailureForDisplay(allocator, stderr);
-    defer allocator.free(normalized);
-
-    const diagnosis = try sshPublicKeyFailureDiagnosis(allocator, io, env);
-    const combined = std.fmt.allocPrint(
-        allocator,
-        "{s}\n\nGitFrame diagnosis:\n  {s}\n\nSuggested fix:\n{s}",
-        .{ trimLineEnd(normalized), diagnosis.message, diagnosis.suggestion },
-    ) catch return error.OutOfMemory;
-    allocator.free(stderr);
-    return combined;
-}
-
-fn isSshPublicKeyFailure(message: []const u8) bool {
-    return std.mem.indexOf(u8, message, "Permission denied (publickey)") != null;
-}
-
-fn normalizeSshPublicKeyFailureForDisplay(allocator: std.mem.Allocator, stderr: []const u8) LoadError![]u8 {
-    const line_normalized = try normalizeLineEndings(allocator, stderr);
-    defer allocator.free(line_normalized);
-
-    const fatal_separated = try insertLineBeforeToken(allocator, line_normalized, "fatal:");
-    defer allocator.free(fatal_separated);
-
-    return replaceAll(
-        allocator,
-        fatal_separated,
-        "Please make sure you have the correct access rights\nand the repository exists.",
-        "Please make sure you have the correct access rights and the repository exists.",
-    );
-}
-
-fn normalizeLineEndings(allocator: std.mem.Allocator, text: []const u8) LoadError![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < text.len) {
-        if (text[i] == '\r') {
-            try out.append(allocator, '\n');
-            i += 1;
-            if (i < text.len and text[i] == '\n') i += 1;
-            continue;
-        }
-        try out.append(allocator, text[i]);
-        i += 1;
-    }
-
-    return out.toOwnedSlice(allocator);
-}
-
-fn insertLineBeforeToken(allocator: std.mem.Allocator, text: []const u8, token: []const u8) LoadError![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var index: usize = 0;
-    while (std.mem.indexOfPos(u8, text, index, token)) |token_index| {
-        try out.appendSlice(allocator, text[index..token_index]);
-        if (token_index > 0 and text[token_index - 1] != '\n') {
-            try out.append(allocator, '\n');
-        }
-        try out.appendSlice(allocator, token);
-        index = token_index + token.len;
-    }
-    try out.appendSlice(allocator, text[index..]);
-
-    return out.toOwnedSlice(allocator);
-}
-
-fn replaceAll(allocator: std.mem.Allocator, text: []const u8, needle: []const u8, replacement: []const u8) LoadError![]u8 {
-    if (needle.len == 0) return allocator.dupe(u8, text) catch return error.OutOfMemory;
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var index: usize = 0;
-    while (std.mem.indexOfPos(u8, text, index, needle)) |match_index| {
-        try out.appendSlice(allocator, text[index..match_index]);
-        try out.appendSlice(allocator, replacement);
-        index = match_index + needle.len;
-    }
-    try out.appendSlice(allocator, text[index..]);
-
-    return out.toOwnedSlice(allocator);
-}
-
-const SshPublicKeyDiagnostic = struct {
-    message: []const u8,
-    suggestion: []const u8,
-};
-
-const ssh_agent_not_visible_suggestion =
-    \\  1. Check whether ssh-agent is visible:
-    \\     echo $SSH_AUTH_SOCK
-    \\  2. If it is empty, start ssh-agent:
-    \\     eval "$(ssh-agent -s)"
-    \\  3. Add the key used for this repository:
-    \\     ssh-add <path-to-your-git-ssh-key>
-    \\     Example: ssh-add ~/.ssh/id_ed25519
-    \\  4. Start GitFrame again from the same shell.
-;
-
-fn sshPublicKeyFailureDiagnosis(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) LoadError!SshPublicKeyDiagnostic {
-    // `env` is the effective push environment: remoteOperationEnvironment mutates Git
-    // prompt settings, but preserves SSH_AUTH_SOCK for this diagnostic.
-    const auth_sock = env.get("SSH_AUTH_SOCK") orelse return .{
-        .message = "SSH_AUTH_SOCK is not set; ssh-agent is not visible to GitFrame",
-        .suggestion = ssh_agent_not_visible_suggestion,
-    };
-    if (auth_sock.len == 0) return .{
-        .message = "SSH_AUTH_SOCK is empty; ssh-agent is not visible to GitFrame",
-        .suggestion = ssh_agent_not_visible_suggestion,
-    };
-
-    const argv = [_][]const u8{ "ssh-add", "-l" };
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
-        .environ_map = env,
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => .{
-            .message = "could not inspect ssh-agent with ssh-add -l",
-            .suggestion =
-            \\  1. Check whether ssh-agent is visible:
-            \\     echo $SSH_AUTH_SOCK
-            \\  2. Check whether it is usable:
-            \\     ssh-add -l
-            \\  3. Start GitFrame again from the same shell after ssh-add succeeds.
-            ,
-        },
-    };
-    defer freeRunResult(allocator, result);
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code == 0) {
-                return .{
-                    .message = "ssh-agent is reachable and has identities",
-                    .suggestion =
-                    \\  1. Check the loaded SSH keys:
-                    \\     ssh-add -l
-                    \\  2. Confirm the key is registered with GitHub.
-                    \\  3. Confirm this account can push to the repository.
-                    \\  4. Check ~/.ssh/config if this host uses a custom key.
-                    ,
-                };
-            }
-            if (std.mem.indexOf(u8, result.stdout, "The agent has no identities") != null or
-                std.mem.indexOf(u8, result.stderr, "The agent has no identities") != null)
-            {
-                return .{
-                    .message = "ssh-agent is reachable but has no identities loaded",
-                    .suggestion =
-                    \\  1. Check loaded keys:
-                    \\     ssh-add -l
-                    \\  2. Add the key used for this repository:
-                    \\     ssh-add <path-to-your-git-ssh-key>
-                    \\     Example: ssh-add ~/.ssh/id_ed25519
-                    \\  3. Start GitFrame again from the same shell.
-                    ,
-                };
-            }
-            if (std.mem.indexOf(u8, result.stderr, "Could not open a connection to your authentication agent") != null) {
-                return .{
-                    .message = "SSH_AUTH_SOCK is set, but ssh-add cannot connect to the agent",
-                    .suggestion =
-                    \\  1. Check whether ssh-agent is usable:
-                    \\     ssh-add -l
-                    \\  2. If it cannot connect, restart ssh-agent:
-                    \\     eval "$(ssh-agent -s)"
-                    \\  3. Add the key used for this repository:
-                    \\     ssh-add <path-to-your-git-ssh-key>
-                    \\     Example: ssh-add ~/.ssh/id_ed25519
-                    \\  4. Start GitFrame again from the same shell.
-                    ,
-                };
-            }
-            return .{
-                .message = "ssh-add -l could not confirm a usable key",
-                .suggestion =
-                \\  1. Check whether ssh-agent is usable:
-                \\     ssh-add -l
-                \\  2. Check GitHub key registration and repository access.
-                \\  3. Check ~/.ssh/config if this host uses a custom key.
-                ,
-            };
-        },
-        else => return .{
-            .message = "ssh-add -l did not exit normally",
-            .suggestion =
-            \\  1. Check whether ssh-agent is visible:
-            \\     echo $SSH_AUTH_SOCK
-            \\  2. Check whether it is usable:
-            \\     ssh-add -l
-            \\  3. Start GitFrame again from the same shell after ssh-add succeeds.
-            ,
-        },
-    }
-}
-
 fn verifyRemoteBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, branch: []const u8, oid: []const u8) LoadError!bool {
     const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
     const branch_result = try runGitBranchStatusCommand(allocator, io, repo_root, &branch_argv);
@@ -4163,40 +4236,6 @@ fn verifyBranchOid(allocator: std.mem.Allocator, io: std.Io, repo_root: []const 
     return std.mem.eql(u8, trimLineEnd(result.stdout), oid);
 }
 
-fn verifyConfirmedUpstream(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, remote: []const u8, remote_branch: []const u8) LoadError!bool {
-    const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
-    const upstream_result = try runGitBranchStatusCommand(allocator, io, repo_root, &upstream_argv);
-    defer upstream_result.deinit(allocator);
-    switch (upstream_result.term) {
-        .exited => |code| if (code != 0) return false,
-        else => return false,
-    }
-    var builder = git_branch_status.Builder.init(allocator);
-    defer builder.deinit();
-    builder.setUpstream(trimLineEnd(upstream_result.stdout)) catch return error.OutOfMemory;
-    var bundle = builder.finish();
-    defer bundle.deinit();
-    const upstream = bundle.status.upstream orelse return false;
-    return std.mem.eql(u8, upstream.remote, remote) and std.mem.eql(u8, upstream.remote_branch, remote_branch);
-}
-
-fn confirmedRemoteTrackingRef(allocator: std.mem.Allocator, remote: []const u8, remote_branch: []const u8) LoadError![]u8 {
-    return std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ remote, remote_branch }) catch return error.OutOfMemory;
-}
-
-fn explicitAheadBehind(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, remote_ref: []const u8) LoadError!RevListAheadBehind {
-    const spec = std.fmt.allocPrint(allocator, "HEAD...{s}", .{remote_ref}) catch return error.OutOfMemory;
-    defer allocator.free(spec);
-    const argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", spec };
-    const result = try runGitBranchStatusCommand(allocator, io, repo_root, &argv);
-    defer result.deinit(allocator);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return parseRevListAheadBehind(result.stdout),
-        else => {},
-    }
-    return error.SpawnFailed;
-}
-
 fn verifyCleanWorktree(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!bool {
     // Include untracked files to enforce the "clean worktree only" contract.
     // This is stricter than Git's overwrite protection, but avoids a
@@ -4210,8 +4249,6 @@ fn verifyCleanWorktree(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
     }
     return status_result.stdout.len == 0;
 }
-
-const PushEnvironmentError = LoadError || error{InteractiveSshCommand};
 
 /// Build a remote-child environment from the reviewed non-secret allowlist.
 ///
@@ -4229,13 +4266,9 @@ pub fn buildRemoteEnvironment(
     errdefer owned.deinit();
 
     if (parent) |source| {
-        const common_exact = [_][]const u8{
+        const local_exact = [_][]const u8{
             "PATH",
             "HOME",
-            "USER",
-            "LOGNAME",
-            "SHELL",
-            "TMPDIR",
             "LANG",
             "LANGUAGE",
             "TZ",
@@ -4243,6 +4276,16 @@ pub fn buildRemoteEnvironment(
             "XDG_DATA_HOME",
             "XDG_CACHE_HOME",
             "XDG_RUNTIME_DIR",
+        };
+        for (local_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
+        for (source.keys(), source.values()) |key, value|
+            if (isLocaleEnvironmentKey(key)) try owned.map.put(key, value);
+
+        const remote_exact = [_][]const u8{
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TMPDIR",
             "SSH_AUTH_SOCK",
             "SSH_AGENT_PID",
             "GNUPGHOME",
@@ -4258,27 +4301,26 @@ pub fn buildRemoteEnvironment(
             "GCM_AUTODETECT_TIMEOUT",
             "GCM_MSAUTH_FLOW",
         };
-        for (common_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
+        if (mode != .local_finalizer) {
+            for (remote_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
 
-        for (source.keys(), source.values()) |key, value|
-            if (isLocaleEnvironmentKey(key)) try owned.map.put(key, value);
-
-        const proxy_keys = [_][]const u8{
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        };
-        for (proxy_keys) |key| {
-            const value = source.get(key) orelse continue;
-            if (proxyContainsUserInfo(value)) {
-                owned.warnings.proxy_credentials_omitted = true;
-            } else {
-                try owned.map.put(key, value);
+            const proxy_keys = [_][]const u8{
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "NO_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "no_proxy",
+            };
+            for (proxy_keys) |key| {
+                const value = source.get(key) orelse continue;
+                if (proxyContainsUserInfo(value)) {
+                    owned.warnings.proxy_credentials_omitted = true;
+                } else {
+                    try owned.map.put(key, value);
+                }
             }
         }
         if (mode == .foreground) {
@@ -4306,6 +4348,11 @@ pub fn buildRemoteEnvironment(
             try owned.map.put("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
         },
         .foreground => try owned.map.put("GCM_INTERACTIVE", "1"),
+        .local_finalizer => {
+            try owned.map.put("GIT_TERMINAL_PROMPT", "0");
+            try owned.map.put("GCM_INTERACTIVE", "0");
+            try owned.map.put("GCM_GUI_PROMPT", "0");
+        },
     }
     return owned;
 }
@@ -4335,57 +4382,6 @@ fn proxyContainsUserInfo(value: []const u8) bool {
     if (std.mem.indexOf(u8, authority, "://")) |scheme_end| authority = authority[scheme_end + 3 ..];
     const authority_end = std.mem.indexOfAny(u8, authority, "/?#") orelse authority.len;
     return std.mem.indexOfScalar(u8, authority[0..authority_end], '@') != null;
-}
-
-fn remoteOperationEnvironment(allocator: std.mem.Allocator, parent_env: ?*const std.process.Environ.Map) PushEnvironmentError!std.process.Environ.Map {
-    var env = if (parent_env) |map|
-        map.clone(allocator) catch return error.OutOfMemory
-    else
-        std.process.Environ.Map.init(allocator);
-    errdefer env.deinit();
-
-    // Background remote operations run inside the TUI event loop. Disable Git
-    // prompts and force SSH batch mode so credential/passphrase requests fail
-    // instead of hanging the interface; reviewed foreground/credential paths
-    // must opt in separately.
-    env.put("GIT_TERMINAL_PROMPT", "0") catch return error.OutOfMemory;
-
-    const existing_ssh = env.get("GIT_SSH_COMMAND");
-    const ssh_command = if (existing_ssh) |value|
-        switch (sshBatchModeState(value)) {
-            .batch => allocator.dupe(u8, value) catch return error.OutOfMemory,
-            .interactive => return error.InteractiveSshCommand,
-            .unspecified => std.fmt.allocPrint(allocator, "{s} -o BatchMode=yes", .{value}) catch return error.OutOfMemory,
-        }
-    else
-        allocator.dupe(u8, "ssh -o BatchMode=yes") catch return error.OutOfMemory;
-    defer allocator.free(ssh_command);
-    env.put("GIT_SSH_COMMAND", ssh_command) catch return error.OutOfMemory;
-
-    return env;
-}
-
-fn remoteEnvironmentRejectedInteractiveSsh(parent_env: ?*const std.process.Environ.Map) bool {
-    const env = parent_env orelse return false;
-    const ssh_command = env.get("GIT_SSH_COMMAND") orelse return false;
-    return sshBatchModeState(ssh_command) == .interactive;
-}
-
-const SshBatchModeState = enum {
-    unspecified,
-    batch,
-    interactive,
-};
-
-fn sshBatchModeState(command: []const u8) SshBatchModeState {
-    if (indexOfIgnoreCase(command, "batchmode=no") != null) return .interactive;
-    if (indexOfIgnoreCase(command, "batchmode no") != null) return .interactive;
-    if (indexOfIgnoreCase(command, "batchmode=yes") != null) return .batch;
-    if (indexOfIgnoreCase(command, "batchmode yes") != null) return .batch;
-    // A bare/unknown BatchMode spelling is ambiguous, so keep push fail-fast
-    // instead of trying to override a user-provided SSH command.
-    if (indexOfIgnoreCase(command, "batchmode") != null) return .interactive;
-    return .unspecified;
 }
 
 fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -4484,20 +4480,6 @@ test "OperationRequest represents supported operation inputs" {
         .kind = .{ .amend = .{ .subject = "subject", .body = null } },
     };
     try std.testing.expectEqualStrings("subject", amend_request.kind.amend.subject);
-
-    const push_request: OperationRequest = .{
-        .repo_root = "/repo",
-        .kind = .{ .push = .{
-            .branch = "feature",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = "abc123",
-        } },
-    };
-    try std.testing.expectEqualStrings("feature", push_request.kind.push.branch);
-    try std.testing.expectEqualStrings("origin", push_request.kind.push.remote);
-    try std.testing.expectEqualStrings("main", push_request.kind.push.remote_branch);
-    try std.testing.expectEqualStrings("abc123", push_request.kind.push.oid);
 }
 
 test "concurrent stdin Git operation mapping keeps stderr on writer failure" {
@@ -4738,9 +4720,6 @@ test "foreground and background remote operation environment own the exact allow
     try parent.put("GIT_CONFIG_COUNT", "1");
     try parent.put("GIT_CONFIG_KEY_0", "http.extraHeader");
     try parent.put("GIT_CONFIG_VALUE_0", "Authorization: CONFIG-SECRET-CANARY");
-    try parent.put("GIT_ASKPASS", "/forbidden/askpass");
-    try parent.put("SSH_ASKPASS", "/forbidden/ssh-askpass");
-    try parent.put("SSH_ASKPASS_REQUIRE", "force");
     try parent.put("GCM_TRACE", "1");
     try parent.put("GCM_DEBUG", "1");
     try parent.put("GCM_AZREPOS_SP_SECRET", "GCM-SECRET-CANARY");
@@ -4769,6 +4748,31 @@ test "foreground and background remote operation environment own the exact allow
     try std.testing.expectEqualStrings("true", foreground.map.get("GCM_GUI_PROMPT").?);
     try std.testing.expectEqualStrings("1", foreground.map.get("GCM_INTERACTIVE").?);
 
+    var local_finalizer = try buildRemoteEnvironment(allocator, &parent, .local_finalizer);
+    defer local_finalizer.deinit();
+    try std.testing.expectEqualStrings("/usr/bin:/bin", local_finalizer.map.get("PATH").?);
+    try std.testing.expectEqualStrings("/home/test", local_finalizer.map.get("HOME").?);
+    try std.testing.expectEqualStrings("C", local_finalizer.map.get("LC_TIME").?);
+    try std.testing.expectEqualStrings("/run/user/test", local_finalizer.map.get("XDG_RUNTIME_DIR").?);
+    try std.testing.expectEqualStrings("0", local_finalizer.map.get("GIT_TERMINAL_PROMPT").?);
+    try std.testing.expectEqualStrings("0", local_finalizer.map.get("GCM_INTERACTIVE").?);
+    try std.testing.expectEqualStrings("0", local_finalizer.map.get("GCM_GUI_PROMPT").?);
+    const local_forbidden = [_][]const u8{
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SSL_CERT_FILE",
+        "GCM_CREDENTIAL_STORE",
+        "GCM_PROVIDER",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "TERM",
+        "DISPLAY",
+        "GIT_DIR",
+        "GIT_CONFIG_COUNT",
+    };
+    for (local_forbidden) |key| try std.testing.expect(local_finalizer.map.get(key) == null);
+
     const forbidden = [_][]const u8{
         "XDG_STATE_HOME",
         "GIT_DIR",
@@ -4776,9 +4780,6 @@ test "foreground and background remote operation environment own the exact allow
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_KEY_0",
         "GIT_CONFIG_VALUE_0",
-        "GIT_ASKPASS",
-        "SSH_ASKPASS",
-        "SSH_ASKPASS_REQUIRE",
         "GCM_TRACE",
         "GCM_DEBUG",
         "GCM_AZREPOS_SP_SECRET",
@@ -4831,7 +4832,6 @@ test "remote authentication blocks GUI interaction and bounds a noncooperating c
     try parent.put("COLORTERM", "truecolor-canary");
     try parent.put("SSH_TTY", "/dev/pts/canary");
     try parent.put("GPG_TTY", "/dev/pts/gpg-canary");
-    try parent.put("GIT_ASKPASS", "/forbidden/askpass");
     var environment = try buildRemoteEnvironment(allocator, &parent, .background);
     defer environment.deinit();
 
@@ -5490,157 +5490,7 @@ test "foreground remote environment releases partial construction on allocation 
     );
 }
 
-test "remote operation environment disables interactive credential prompts" {
-    var env = try remoteOperationEnvironment(std.testing.allocator, null);
-    defer env.deinit();
-
-    try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
-    try std.testing.expectEqualStrings("ssh -o BatchMode=yes", env.get("GIT_SSH_COMMAND").?);
-}
-
-test "askpass helper returns only recognized prompts" {
-    var parent = std.process.Environ.Map.init(std.testing.allocator);
-    defer parent.deinit();
-    try parent.put("XDG_RUNTIME_DIR", "/tmp");
-
-    var setup = try setupAskpass(std.testing.allocator, std.testing.io, &parent, .{
-        .username = "user",
-        .password = "token",
-    });
-    defer setup.deinit(std.testing.allocator, std.testing.io);
-
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("GITFRAME_ASKPASS_USERNAME_FILE", setup.username_path);
-    try env.put("GITFRAME_ASKPASS_PASSWORD_FILE", setup.password_path);
-    try std.testing.expect(!std.mem.eql(u8, env.get("GITFRAME_ASKPASS_PASSWORD_FILE").?, "token"));
-
-    const username_result = try std.process.run(std.testing.allocator, std.testing.io, .{
-        .argv = &[_][]const u8{ setup.helper_path, "Username for 'https://host':" },
-        .environ_map = &env,
-    });
-    defer std.testing.allocator.free(username_result.stdout);
-    defer std.testing.allocator.free(username_result.stderr);
-    try std.testing.expectEqualStrings("user", username_result.stdout);
-
-    const password_result = try std.process.run(std.testing.allocator, std.testing.io, .{
-        .argv = &[_][]const u8{ setup.helper_path, "Password for 'https://host':" },
-        .environ_map = &env,
-    });
-    defer std.testing.allocator.free(password_result.stdout);
-    defer std.testing.allocator.free(password_result.stderr);
-    try std.testing.expectEqualStrings("token", password_result.stdout);
-
-    const password_with_username_result = try std.process.run(std.testing.allocator, std.testing.io, .{
-        .argv = &[_][]const u8{ setup.helper_path, "Password for 'https://myusername@host':" },
-        .environ_map = &env,
-    });
-    defer std.testing.allocator.free(password_with_username_result.stdout);
-    defer std.testing.allocator.free(password_with_username_result.stderr);
-    try std.testing.expectEqualStrings("token", password_with_username_result.stdout);
-
-    const unknown_result = try std.process.run(std.testing.allocator, std.testing.io, .{
-        .argv = &[_][]const u8{ setup.helper_path, "Proxy prompt:" },
-        .environ_map = &env,
-    });
-    defer std.testing.allocator.free(unknown_result.stdout);
-    defer std.testing.allocator.free(unknown_result.stderr);
-    try std.testing.expectEqualStrings("", unknown_result.stdout);
-    try std.testing.expect(unknown_result.term != .exited or unknown_result.term.exited != 0);
-}
-
-test "askpass setup falls back when XDG_RUNTIME_DIR is relative" {
-    var parent = std.process.Environ.Map.init(std.testing.allocator);
-    defer parent.deinit();
-    try parent.put("XDG_RUNTIME_DIR", "relative-runtime");
-
-    var setup = try setupAskpass(std.testing.allocator, std.testing.io, &parent, .{
-        .username = "user",
-        .password = "token",
-    });
-    defer setup.deinit(std.testing.allocator, std.testing.io);
-
-    try std.testing.expect(std.mem.startsWith(u8, setup.helper_path, "/tmp/"));
-    try std.testing.expect(std.mem.startsWith(u8, setup.username_path, "/tmp/"));
-    try std.testing.expect(std.mem.startsWith(u8, setup.password_path, "/tmp/"));
-}
-
-test "remote operation environment preserves existing ssh command while adding BatchMode" {
-    var parent = std.process.Environ.Map.init(std.testing.allocator);
-    defer parent.deinit();
-    try parent.put("GIT_SSH_COMMAND", "ssh -i /tmp/key");
-    try parent.put("HOME", "/home/test");
-
-    var env = try remoteOperationEnvironment(std.testing.allocator, &parent);
-    defer env.deinit();
-
-    try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
-    try std.testing.expectEqualStrings("ssh -i /tmp/key -o BatchMode=yes", env.get("GIT_SSH_COMMAND").?);
-    try std.testing.expectEqualStrings("/home/test", env.get("HOME").?);
-}
-
-test "remote operation environment preserves existing BatchMode yes and rejects BatchMode no" {
-    var parent_yes = std.process.Environ.Map.init(std.testing.allocator);
-    defer parent_yes.deinit();
-    try parent_yes.put("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -i /tmp/key");
-
-    var env = try remoteOperationEnvironment(std.testing.allocator, &parent_yes);
-    defer env.deinit();
-    try std.testing.expectEqualStrings("ssh -o BatchMode=yes -i /tmp/key", env.get("GIT_SSH_COMMAND").?);
-
-    var parent_no = std.process.Environ.Map.init(std.testing.allocator);
-    defer parent_no.deinit();
-    try parent_no.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
-    try std.testing.expectError(error.InteractiveSshCommand, remoteOperationEnvironment(std.testing.allocator, &parent_no));
-}
-
-test "pushFailureWithDiagnostics explains missing ssh-agent socket" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-
-    const stderr = try std.testing.allocator.dupe(
-        u8,
-        "git@github.com: Permission denied (publickey).fatal: Could not read from remote repository.\r\n\r\n" ++
-            "Please make sure you have the correct access rights\nand the repository exists.\n",
-    );
-    const message = try pushFailureWithDiagnostics(std.testing.allocator, std.testing.io, &env, stderr);
-    defer std.testing.allocator.free(message);
-
-    try std.testing.expect(std.mem.indexOf(u8, message, "Permission denied (publickey).\nfatal:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "Please make sure you have the correct access rights and the repository exists.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "GitFrame diagnosis:\n  SSH_AUTH_SOCK is not set") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "Suggested fix:\n  1. Check whether ssh-agent is visible:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "  3. Add the key used for this repository:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "     ssh-add <path-to-your-git-ssh-key>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "     Example: ssh-add ~/.ssh/id_ed25519") != null);
-}
-
-test "pushFailureWithDiagnostics explains empty ssh-agent socket" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("SSH_AUTH_SOCK", "");
-
-    const stderr = try std.testing.allocator.dupe(u8, "git@github.com: Permission denied (publickey).\n");
-    const message = try pushFailureWithDiagnostics(std.testing.allocator, std.testing.io, &env, stderr);
-    defer std.testing.allocator.free(message);
-
-    try std.testing.expect(std.mem.indexOf(u8, message, "GitFrame diagnosis:\n  SSH_AUTH_SOCK is empty") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "Suggested fix:\n  1. Check whether ssh-agent is visible:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "  4. Start GitFrame again from the same shell.") != null);
-}
-
-test "pushFailureWithDiagnostics leaves non-publickey failures unchanged" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-
-    const stderr = try std.testing.allocator.dupe(u8, "fatal: non-fast-forward\n");
-    const message = try pushFailureWithDiagnostics(std.testing.allocator, std.testing.io, &env, stderr);
-    defer std.testing.allocator.free(message);
-
-    try std.testing.expectEqualStrings("fatal: non-fast-forward\n", message);
-}
-
-test "LocalCommandBackend push rejects stale oid before contacting remote" {
+test "LocalCommandBackend foreground push inspection rejects stale oid before admission" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5650,6 +5500,7 @@ test "LocalCommandBackend push rejects stale oid before contacting remote" {
     defer work.close(io);
 
     try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", "." }, work);
     try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
     try runTestGit(io, &.{ "git", "add", "README.md" }, work);
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
@@ -5657,24 +5508,29 @@ test "LocalCommandBackend push rejects stale oid before contacting remote" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo_root,
-        .kind = .{ .push = .{
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", repo_root);
+    var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .inspection);
+    defer environment.deinit();
+    var root = try root_capability.RootCapability.openCanonical(repo_root);
+    defer root.deinit();
+    const result = LocalCommandBackend.inspectForegroundPush(std.testing.allocator, io, .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .push = .{
             .branch = "main",
-            .remote = "missing",
+            .remote = "origin",
             .remote_branch = "main",
             .oid = "not-the-current-oid",
-        } },
+        },
     });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("Branch changed before push; reload and try again", message),
-        else => return error.ExpectedStalePushFailure,
-    }
+    try std.testing.expectEqual(ForegroundPushInspectionOutcome.oid_changed, result.outcome);
 }
 
-test "LocalCommandBackend push reports remote failure after snapshot check passes" {
+test "LocalCommandBackend foreground push inspection rejects a missing remote" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5693,24 +5549,29 @@ test "LocalCommandBackend push reports remote failure after snapshot check passe
     const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
     defer std.testing.allocator.free(oid);
 
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo_root,
-        .kind = .{ .push = .{
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", repo_root);
+    var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .inspection);
+    defer environment.deinit();
+    var root = try root_capability.RootCapability.openCanonical(repo_root);
+    defer root.deinit();
+    const result = LocalCommandBackend.inspectForegroundPush(std.testing.allocator, io, .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .push = .{
             .branch = "main",
             .remote = "missing",
             .remote_branch = "main",
             .oid = trimLineEnd(oid),
-        } },
+        },
     });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed => |message| try std.testing.expect(message.len > 0),
-        else => return error.ExpectedRemotePushFailure,
-    }
+    try std.testing.expectEqual(ForegroundPushInspectionOutcome{ .failed = .failed }, result.outcome);
 }
 
-test "LocalCommandBackend push succeeds to a local bare remote" {
+test "LocalCommandBackend foreground push inspection accepts a local bare remote" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5734,18 +5595,26 @@ test "LocalCommandBackend push succeeds to a local bare remote" {
     const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
     defer std.testing.allocator.free(oid);
 
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo_root,
-        .kind = .{ .push = .{
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", repo_root);
+    var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .inspection);
+    defer environment.deinit();
+    var root = try root_capability.RootCapability.openCanonical(repo_root);
+    defer root.deinit();
+    const result = LocalCommandBackend.inspectForegroundPush(std.testing.allocator, io, .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .push = .{
             .branch = "main",
             .remote = "origin",
             .remote_branch = "main",
             .oid = trimLineEnd(oid),
-        } },
+        },
     });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(OperationResult.ok, result);
+    try std.testing.expectEqual(ForegroundPushInspectionOutcome.ready, result.outcome);
 
     const config_result = try std.process.run(std.testing.allocator, io, .{
         .argv = &[_][]const u8{ "git", "config", "--get", "branch.main.remote" },
@@ -5757,7 +5626,7 @@ test "LocalCommandBackend push succeeds to a local bare remote" {
     try std.testing.expect(config_result.term == .exited and config_result.term.exited != 0);
 }
 
-test "LocalCommandBackend set-upstream push configures local branch upstream" {
+test "LocalCommandBackend upstream finalization configures local tracking after fixed oid push" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5785,19 +5654,30 @@ test "LocalCommandBackend set-upstream push configures local branch upstream" {
     const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
     defer std.testing.allocator.free(oid);
 
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo_root,
-        .kind = .{ .push = .{
-            .mode = .set_upstream,
-            .branch = "feature/topic",
-            .remote = "origin",
-            .remote_branch = "feature/topic",
-            .oid = trimLineEnd(oid),
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(OperationResult.ok, result);
+    try runTestGit(io, &.{ "git", "push", "--", "origin", "refs/heads/feature/topic:refs/heads/feature/topic" }, work);
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", repo_root);
+    var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .local_finalizer);
+    defer environment.deinit();
+    var root = try root_capability.RootCapability.openCanonical(repo_root);
+    defer root.deinit();
+    const request: PushUpstreamFinalizeRequest = .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .branch = "feature/topic",
+        .remote = "origin",
+        .remote_branch = "feature/topic",
+        .oid = trimLineEnd(oid),
+    };
+    const result = LocalCommandBackend.finalizePushUpstream(std.testing.allocator, io, request);
+    try std.testing.expectEqual(PushUpstreamFinalizeOutcome.configured, result);
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.already_configured,
+        LocalCommandBackend.finalizePushUpstream(std.testing.allocator, io, request),
+    );
 
     const remote_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "refs/remotes/origin/feature/topic" });
     defer std.testing.allocator.free(remote_oid);
@@ -5812,366 +5692,269 @@ test "LocalCommandBackend set-upstream push configures local branch upstream" {
     try std.testing.expectEqualStrings("refs/heads/feature/topic", trimLineEnd(upstream_merge));
 }
 
-test "LocalCommandBackend pull refresh fetches and fast-forwards from local bare remote" {
+test "LocalCommandBackend upstream finalization has conflict-safe typed terminals" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    var updater = try tmp.dir.openDir(io, "updater", .{});
-    defer updater.close(io);
-    try updater.writeFile(io, .{ .sub_path = "README.md", .data = "updated\n" });
-    try runTestGit(io, &.{ "git", "add", "README.md" }, updater);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "update" }, updater);
-    try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = fixture.oid,
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqual(OperationResult.ok, result);
-
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    const head = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
-    defer std.testing.allocator.free(head);
-    const remote = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/remotes/origin/main" });
-    defer std.testing.allocator.free(remote);
-    try std.testing.expectEqualStrings(trimLineEnd(remote), trimLineEnd(head));
-}
-
-test "LocalCommandBackend pull refresh reports nothing to pull as success" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    const fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = fixture.oid,
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .ok_static => |message| try std.testing.expectEqualStrings("nothing to pull", message),
-        else => return error.ExpectedPullRefreshNoop,
-    }
-}
-
-test "LocalCommandBackend pull refresh rejects stale oid before fetch" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    const fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = "not-the-current-oid",
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("Branch changed before pull; reload and try again", message),
-        else => return error.ExpectedPullRefreshStaleOidFailure,
-    }
-}
-
-test "LocalCommandBackend pull refresh rejects local commits ahead" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    var fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    try work.writeFile(io, .{ .sub_path = "LOCAL.md", .data = "local\n" });
-    try runTestGit(io, &.{ "git", "add", "LOCAL.md" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "local" }, work);
-    std.testing.allocator.free(fixture.oid);
-    const local_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
-    fixture.oid = try std.testing.allocator.dupe(u8, trimLineEnd(local_oid));
-    std.testing.allocator.free(local_oid);
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = fixture.oid,
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("local commits are ahead; push or resolve outside GitFrame", message),
-        else => return error.ExpectedPullRefreshAheadFailure,
-    }
-}
-
-test "LocalCommandBackend pull refresh rejects diverged branch" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    var fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    try work.writeFile(io, .{ .sub_path = "LOCAL.md", .data = "local\n" });
-    try runTestGit(io, &.{ "git", "add", "LOCAL.md" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "local" }, work);
-    std.testing.allocator.free(fixture.oid);
-    const local_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
-    fixture.oid = try std.testing.allocator.dupe(u8, trimLineEnd(local_oid));
-    std.testing.allocator.free(local_oid);
-
-    var updater = try tmp.dir.openDir(io, "updater", .{});
-    defer updater.close(io);
-    try updater.writeFile(io, .{ .sub_path = "REMOTE.md", .data = "remote\n" });
-    try runTestGit(io, &.{ "git", "add", "REMOTE.md" }, updater);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "remote" }, updater);
-    try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = fixture.oid,
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("branch has diverged; merge or rebase outside GitFrame", message),
-        else => return error.ExpectedPullRefreshDivergedFailure,
-    }
-}
-
-test "LocalCommandBackend pull refresh rejects changed upstream" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    const fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    try runTestGit(io, &.{ "git", "init", "--bare", "other.git" }, tmp.dir);
-    const other_root = try tmp.dir.realPathFileAlloc(io, "other.git", std.testing.allocator);
-    defer std.testing.allocator.free(other_root);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    try runTestGit(io, &.{ "git", "remote", "add", "other", other_root }, work);
-    try runTestGit(io, &.{ "git", "push", "-u", "other", "main" }, work);
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = fixture.oid,
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("Upstream changed before pull; reload and try again", message),
-        else => return error.ExpectedPullRefreshUpstreamChangedFailure,
-    }
-}
-
-test "LocalCommandBackend pull refresh rejects dirty worktree before fetch" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    const fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    try work.writeFile(io, .{ .sub_path = "README.md", .data = "local change\n" });
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = fixture.oid,
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("Worktree changed before pull; reload and resolve local changes first", message),
-        else => return error.ExpectedPullRefreshDirtyFailure,
-    }
-}
-
-test "LocalCommandBackend pull refresh rejects untracked worktree before fetch" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    const fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    try work.writeFile(io, .{ .sub_path = "new.txt", .data = "untracked\n" });
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = fixture.oid,
-        } },
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("Worktree changed before pull; reload and resolve local changes first", message),
-        else => return error.ExpectedPullRefreshUntrackedFailure,
-    }
-}
-
-test "LocalCommandBackend pull refresh rejects interactive ssh command" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    const fixture = try setupPullRefreshFixture(io, &tmp);
-    defer fixture.deinit();
-
-    var parent = std.process.Environ.Map.init(std.testing.allocator);
-    defer parent.deinit();
-    try parent.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = fixture.repo_root,
-        .kind = .{ .pull_refresh_ff_only = .{
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = fixture.oid,
-        } },
-        .env_map = &parent,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("Pull requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND", message),
-        else => return error.ExpectedInteractiveSshPullRefreshFailure,
-    }
-}
-
-test "LocalCommandBackend fetch rejects interactive ssh command" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    const repo = try setupPullWorkRepoForTest(io, &tmp);
-    defer std.testing.allocator.free(repo.repo_root);
-    defer std.testing.allocator.free(repo.oid);
-
-    var parent = std.process.Environ.Map.init(std.testing.allocator);
-    defer parent.deinit();
-    try parent.put("GIT_SSH_COMMAND", "ssh -o BatchMode=no -i /tmp/key");
-
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo.repo_root,
-        .kind = .{ .fetch = .{ .remote = "missing" } },
-        .env_map = &parent,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("Fetch requires non-interactive SSH; remove BatchMode=no from GIT_SSH_COMMAND", message),
-        else => return error.ExpectedInteractiveSshFetchFailure,
-    }
-}
-
-test "LocalCommandBackend fetch updates remote tracking refs from local bare remote" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.testing.io;
-    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
     try tmp.dir.createDir(io, "work", .default_dir);
-    try tmp.dir.createDir(io, "updater", .default_dir);
     var work = try tmp.dir.openDir(io, "work", .{});
     defer work.close(io);
-    var updater = try tmp.dir.openDir(io, "updater", .{});
-    defer updater.close(io);
-
-    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
-    defer std.testing.allocator.free(remote_root);
-    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
-    defer std.testing.allocator.free(repo_root);
-
     try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
-    try work.writeFile(io, .{ .sub_path = "README.md", .data = "initial\n" });
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
     try runTestGit(io, &.{ "git", "add", "README.md" }, work);
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
-    try runTestGit(io, &.{ "git", "push", "origin", "main" }, work);
-    try runTestGit(io, &.{ "git", "fetch", "origin" }, work);
-    const before = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/remotes/origin/main" });
-    defer std.testing.allocator.free(before);
 
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, updater);
-    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, updater);
-    try runTestGit(io, &.{ "git", "pull", "--ff-only", "origin", "main" }, updater);
-    try updater.writeFile(io, .{ .sub_path = "README.md", .data = "updated\n" });
-    try runTestGit(io, &.{ "git", "add", "README.md" }, updater);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "update" }, updater);
-    try runTestGit(io, &.{ "git", "push", "origin", "main" }, updater);
+    const repo_root = try tmp.dir.realPathFileAlloc(io, "work", allocator);
+    defer allocator.free(repo_root);
+    const oid_bytes = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer allocator.free(oid_bytes);
+    const oid = trimLineEnd(oid_bytes);
 
-    const result = try LocalCommandBackend.runOperation(std.testing.allocator, io, .{
-        .repo_root = repo_root,
-        .kind = .{ .fetch = .{ .remote = "origin" } },
-    });
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqual(OperationResult.ok, result);
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", repo_root);
+    var environment = try buildRemoteEnvironment(allocator, &parent, .local_finalizer);
+    defer environment.deinit();
+    var root = try root_capability.RootCapability.openCanonical(repo_root);
+    defer root.deinit();
+    var request: PushUpstreamFinalizeRequest = .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .branch = "main",
+        .remote = "origin",
+        .remote_branch = "main",
+        .oid = oid,
+    };
 
-    const after = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/remotes/origin/main" });
-    defer std.testing.allocator.free(after);
-    const remote = try gitOutputAlloc(io, work, &.{ "git", "ls-remote", "origin", "refs/heads/main" });
-    defer std.testing.allocator.free(remote);
+    try runTestGit(io, &.{ "git", "switch", "-c", "other" }, work);
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.branch_changed,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    try runTestGit(io, &.{ "git", "switch", "main" }, work);
 
-    try std.testing.expect(!std.mem.eql(u8, trimLineEnd(before), trimLineEnd(after)));
-    try std.testing.expect(std.mem.indexOf(u8, remote, trimLineEnd(after)) != null);
+    request.oid = "0000000000000000000000000000000000000000";
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.oid_changed,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    request.oid = oid;
+
+    try runTestGit(io, &.{ "git", "switch", "--detach" }, work);
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.context_changed,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    try runTestGit(io, &.{ "git", "switch", "main" }, work);
+
+    try runTestGit(io, &.{ "git", "config", "--local", "--add", "branch.main.remote", "origin" }, work);
+    try runTestGit(io, &.{ "git", "config", "--local", "--add", "branch.main.remote", "origin" }, work);
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.config_verification_failed,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    try runTestGit(io, &.{ "git", "config", "--local", "--unset-all", "branch.main.remote" }, work);
+
+    try runTestGit(io, &.{ "git", "config", "--local", "branch.main.remote", "other" }, work);
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.upstream_conflict,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    try runTestGit(io, &.{ "git", "config", "--local", "--unset-all", "branch.main.remote" }, work);
+
+    var lock = try work.createFile(io, ".git/config.lock", .{ .exclusive = true });
+    lock.close(io);
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.config_write_failed,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    try work.deleteFile(io, ".git/config.lock");
+
+    var canceled_generation: std.atomic.Value(u64) = .init(7);
+    request.control = .{ .cancellation = .{
+        .canceled_generation = &canceled_generation,
+        .generation = 7,
+    } };
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.tracking_unknown,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    request.control = .{};
+
+    try runTestGit(io, &.{ "git", "config", "--local", "branch.autoSetupRebase", "remote" }, work);
+    try runTestGit(io, &.{ "git", "config", "--local", "branch.main.rebase", "false" }, work);
+    request.remote = ".";
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.configured,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    const configured_remote = try gitOutputAlloc(io, work, &.{ "git", "config", "--get", "branch.main.remote" });
+    defer allocator.free(configured_remote);
+    try std.testing.expectEqualStrings(".", trimLineEnd(configured_remote));
+    const configured_rebase = try gitOutputAlloc(io, work, &.{ "git", "config", "--bool", "--get", "branch.main.rebase" });
+    defer allocator.free(configured_rebase);
+    try std.testing.expectEqualStrings("true", trimLineEnd(configured_rebase));
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.already_configured,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    try runTestGit(io, &.{ "git", "config", "--local", "branch.main.rebase", "false" }, work);
+    try std.testing.expectEqual(
+        PushUpstreamFinalizeOutcome.upstream_conflict,
+        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+    );
+    const conflicting_rebase = try gitOutputAlloc(io, work, &.{ "git", "config", "--bool", "--get", "branch.main.rebase" });
+    defer allocator.free(conflicting_rebase);
+    try std.testing.expectEqualStrings("false", trimLineEnd(conflicting_rebase));
+}
+
+const UpstreamFinalizerFault = enum {
+    second_write,
+    rebase_write,
+    postcondition_mismatch,
+};
+
+fn injectUpstreamFinalizerFault(
+    io: std.Io,
+    work: std.Io.Dir,
+    fault: UpstreamFinalizerFault,
+) !void {
+    for (0..5_000) |_| {
+        const config = work.readFileAlloc(io, ".git/config", std.testing.allocator, .limited(64 * 1024)) catch {
+            try io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        };
+        const has_remote = std.mem.indexOf(u8, config, "remote = origin") != null;
+        const has_merge = std.mem.indexOf(u8, config, "merge = refs/heads/main") != null;
+        const has_rebase_true = std.mem.indexOf(u8, config, "rebase = true") != null;
+        std.testing.allocator.free(config);
+
+        const ready = switch (fault) {
+            .second_write => has_remote and !has_merge,
+            .rebase_write => has_remote and has_merge,
+            .postcondition_mismatch => has_remote and has_merge and has_rebase_true,
+        };
+        if (!ready) {
+            try io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        }
+
+        switch (fault) {
+            .second_write, .rebase_write => {
+                var lock = work.createFile(io, ".git/config.lock", .{ .exclusive = true }) catch {
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                };
+                lock.close(io);
+                return;
+            },
+            .postcondition_mismatch => {
+                runTestGit(io, &.{ "git", "config", "--local", "branch.main.rebase", "false" }, work) catch {
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                };
+                return;
+            },
+        }
+    }
+    return error.FinalizerFaultInjectionMissed;
+}
+
+fn exerciseUpstreamFinalizerFault(
+    io: std.Io,
+    tmp: std.Io.Dir,
+    fault: UpstreamFinalizerFault,
+) !void {
+    const allocator = std.testing.allocator;
+    const case_name = @tagName(fault);
+    try tmp.createDir(io, case_name, .default_dir);
+    var fixture = try tmp.openDir(io, case_name, .{});
+    defer fixture.close(io);
+    try fixture.createDir(io, "work", .default_dir);
+    var work = try fixture.openDir(io, "work", .{});
+    defer work.close(io);
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
+
+    switch (fault) {
+        .second_write => {},
+        .rebase_write, .postcondition_mismatch => {
+            try runTestGit(io, &.{ "git", "config", "--local", "branch.autoSetupRebase", "remote" }, work);
+            try runTestGit(io, &.{ "git", "config", "--local", "branch.main.rebase", "false" }, work);
+        },
+    }
+
+    const repo_root = try fixture.realPathFileAlloc(io, "work", allocator);
+    defer allocator.free(repo_root);
+    const oid_bytes = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer allocator.free(oid_bytes);
+
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", repo_root);
+    var environment = try buildRemoteEnvironment(allocator, &parent, .local_finalizer);
+    defer environment.deinit();
+    var root = try root_capability.RootCapability.openCanonical(repo_root);
+    defer root.deinit();
+    const request: PushUpstreamFinalizeRequest = .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .branch = "main",
+        .remote = "origin",
+        .remote_branch = "main",
+        .oid = trimLineEnd(oid_bytes),
+    };
+
+    const expected: PushUpstreamFinalizeOutcome = switch (fault) {
+        .second_write, .rebase_write => .config_write_failed,
+        .postcondition_mismatch => .config_verification_failed,
+    };
+    var fault_future = try io.concurrent(injectUpstreamFinalizerFault, .{ io, work, fault });
+    defer _ = fault_future.cancel(io) catch {};
+    const outcome = LocalCommandBackend.finalizePushUpstream(allocator, io, request);
+    try fault_future.await(io);
+    try std.testing.expectEqual(expected, outcome);
+
+    const configured_remote = try gitOutputAlloc(io, work, &.{ "git", "config", "--get", "branch.main.remote" });
+    defer allocator.free(configured_remote);
+    try std.testing.expectEqualStrings("origin", trimLineEnd(configured_remote));
+    switch (fault) {
+        .second_write => try runTestGitFailure(io, &.{ "git", "config", "--get", "branch.main.merge" }, work),
+        .rebase_write => {
+            const configured_merge = try gitOutputAlloc(io, work, &.{ "git", "config", "--get", "branch.main.merge" });
+            defer allocator.free(configured_merge);
+            try std.testing.expectEqualStrings("refs/heads/main", trimLineEnd(configured_merge));
+            const configured_rebase = try gitOutputAlloc(io, work, &.{ "git", "config", "--bool", "--get", "branch.main.rebase" });
+            defer allocator.free(configured_rebase);
+            try std.testing.expectEqualStrings("false", trimLineEnd(configured_rebase));
+        },
+        .postcondition_mismatch => {
+            const configured_merge = try gitOutputAlloc(io, work, &.{ "git", "config", "--get", "branch.main.merge" });
+            defer allocator.free(configured_merge);
+            try std.testing.expectEqualStrings("refs/heads/main", trimLineEnd(configured_merge));
+            const configured_rebase = try gitOutputAlloc(io, work, &.{ "git", "config", "--bool", "--get", "branch.main.rebase" });
+            defer allocator.free(configured_rebase);
+            try std.testing.expectEqualStrings("false", trimLineEnd(configured_rebase));
+        },
+    }
+}
+
+test "LocalCommandBackend upstream finalization reports later write and postcondition faults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    inline for (std.meta.tags(UpstreamFinalizerFault)) |fault| {
+        try exerciseUpstreamFinalizerFault(std.testing.io, tmp.dir, fault);
+    }
 }
 
 test "LocalCommandBackend loads local branch list without record separator newlines" {
@@ -7116,28 +6899,6 @@ fn containsNulPath(bytes: []const u8, expected: []const u8) bool {
     return false;
 }
 
-fn setupPullWorkRepoForTest(io: std.Io, tmp: *std.testing.TmpDir) !struct { repo_root: []u8, oid: []u8 } {
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
-    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
-
-    const repo_root_z = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
-    defer std.testing.allocator.free(repo_root_z);
-    const repo_root = try std.testing.allocator.dupe(u8, repo_root_z);
-    errdefer std.testing.allocator.free(repo_root);
-    const oid_output = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
-    errdefer std.testing.allocator.free(oid_output);
-    const oid = try std.testing.allocator.dupe(u8, trimLineEnd(oid_output));
-    std.testing.allocator.free(oid_output);
-
-    return .{ .repo_root = repo_root, .oid = oid };
-}
-
 const BranchSwitchFixture = struct {
     repo_root: []u8,
     main_oid: []u8,
@@ -7232,51 +6993,6 @@ fn branchByFullRef(branches: []const BranchListItem, full_ref: []const u8) ?*con
         if (std.mem.eql(u8, branch.full_ref, full_ref)) return branch;
     }
     return null;
-}
-
-const PullRefreshFixture = struct {
-    repo_root: []u8,
-    oid: []u8,
-
-    fn deinit(self: PullRefreshFixture) void {
-        std.testing.allocator.free(self.repo_root);
-        std.testing.allocator.free(self.oid);
-    }
-};
-
-fn setupPullRefreshFixture(io: std.Io, tmp: *std.testing.TmpDir) !PullRefreshFixture {
-    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
-    try tmp.dir.createDir(io, "work", .default_dir);
-    try tmp.dir.createDir(io, "updater", .default_dir);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    var updater = try tmp.dir.openDir(io, "updater", .{});
-    defer updater.close(io);
-
-    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
-    defer std.testing.allocator.free(remote_root);
-
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
-    try work.writeFile(io, .{ .sub_path = "README.md", .data = "initial\n" });
-    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
-    try runTestGit(io, &.{ "git", "push", "-u", "origin", "main" }, work);
-
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, updater);
-    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, updater);
-    try runTestGit(io, &.{ "git", "pull", "--ff-only", "origin", "main" }, updater);
-
-    const repo_root_z = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
-    defer std.testing.allocator.free(repo_root_z);
-    const repo_root = try std.testing.allocator.dupe(u8, repo_root_z);
-    errdefer std.testing.allocator.free(repo_root);
-    const oid_output = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
-    errdefer std.testing.allocator.free(oid_output);
-    const oid = try std.testing.allocator.dupe(u8, trimLineEnd(oid_output));
-    std.testing.allocator.free(oid_output);
-
-    return .{ .repo_root = repo_root, .oid = oid };
 }
 
 fn gitOutputAlloc(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {

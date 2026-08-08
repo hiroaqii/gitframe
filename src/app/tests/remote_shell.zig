@@ -345,7 +345,7 @@ fn installInteractivePushRetryForFenceTest(
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, oid),
-    }, true);
+    });
 }
 
 fn installTestActionCursor(
@@ -387,32 +387,6 @@ fn setDiffSearchQuery(app: *App, query: []const u8) void {
     @memcpy(app.pages.review.search.input.buffer[0..query.len], query);
     app.pages.review.search.input.len = query.len;
     app.pages.review.search.input.cursor = query.len;
-}
-
-fn installPushCredentialPromptForTest(app: *App, allocator: std.mem.Allocator) !void {
-    var target = app_state.PushRetryTarget.empty();
-    var target_owned = true;
-    defer if (target_owned) target.deinit(allocator);
-    target.repo_epoch = app.repo_session.view().epoch();
-    target.root_identity = app.repo_session.view().activeIdentity().?;
-    target.repo_root = try allocator.dupe(u8, app.repo_session.view().activeRoot().?);
-    target.branch = try allocator.dupe(u8, "main");
-    target.remote = try allocator.dupe(u8, "origin");
-    target.remote_branch = try allocator.dupe(u8, "main");
-    target.oid = try allocator.dupe(u8, "abc123");
-    target.remote_url = try allocator.dupe(u8, "https://example.test/owner/repo.git");
-    const prompt = try allocator.create(app_state.PushCredentialPrompt);
-    var prompt_owned = true;
-    defer if (prompt_owned) {
-        prompt.deinit(allocator);
-        allocator.destroy(prompt);
-    };
-    prompt.* = .{ .target = target, .active_field = .password };
-    target_owned = false;
-    try prompt.username.insertSlice("alice");
-    try prompt.password.insertSlice("secret-token");
-    app.remote_workflow.push_retry.state = .{ .credential_prompt = prompt };
-    prompt_owned = false;
 }
 
 fn runOnlyPushInspectionTaskForTest(
@@ -498,10 +472,15 @@ fn setupPushRetryRepoForTest(
     io: std.Io,
     tmp: *std.testing.TmpDir,
 ) !struct { repo_root: []u8, oid: []u8 } {
+    try tmp.dir.createDir(io, "remote.git", .default_dir);
+    var remote = try tmp.dir.openDir(io, "remote.git", .{});
+    defer remote.close(io);
+    try runAppTestGit(allocator, io, &.{ "git", "init", "--bare" }, remote);
     try tmp.dir.createDir(io, "work", .default_dir);
     var work = try tmp.dir.openDir(io, "work", .{});
     defer work.close(io);
     try runAppTestGit(allocator, io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runAppTestGit(allocator, io, &.{ "git", "remote", "add", "origin", "../remote.git" }, work);
     try work.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
     try runAppTestGit(allocator, io, &.{ "git", "add", "README.md" }, work);
     try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, work);
@@ -664,42 +643,10 @@ test "Review mutation read fence follows interactive foreground queue and termin
     }
 }
 
-test "Review mutation read fence follows credentialed push queue acceptance" {
+test "remote request preparation failures clear prior local confirmation" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
-    var app = try mutationFenceRepoTestApp(allocator, roots.a);
-    defer app.pages.review.deinit(allocator);
-    defer app.repo_session.repo_state.deinit(allocator);
-    defer remoteWorkflow(&app).clearPushError(allocator);
-    try installPushCredentialPromptForTest(&app, allocator);
-    const epoch_before_launch = app.pages.review.repository_read_authority.epoch;
-
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
-    try app.update(.push_credential_submit, &ctx);
-    const owner = app.action_runtime.view().acceptedPending() orelse return error.ExpectedPendingAction;
-    const fence_closed =
-        !app.pages.review.repository_read_authority.mayStartRepositoryRead();
-    const epoch_advanced =
-        app.pages.review.repository_read_authority.epoch.eql(epoch_before_launch.next());
-
-    const queued = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), queued.len);
-    const completion = queued[0].failed(
-        queued[0].ctx,
-        .runtime_abandoned,
-        allocator,
-    );
-    try app.update(completion, &ctx);
-
-    try std.testing.expectEqual(app_actions.ActionKind.push, owner.kind);
-    try std.testing.expect(fence_closed);
-    try std.testing.expect(epoch_advanced);
-    try std.testing.expect(!app.action_runtime.view().hasPending());
-    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
 
     // A valid remote request owns the confirmation-exclusivity boundary even
     // when its first allocation fails. Local state must not survive only
@@ -1101,7 +1048,7 @@ test "finishPush does not reload a stale active repository" {
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
-        .result = .{ .credentialed = .ok },
+        .result = .{ .outcome = .{ .ok = .completed } },
     } } }, &ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
@@ -1244,9 +1191,9 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
-        .result = .{ .background = .{
+        .result = .{
             .outcome = .{ .failed = .authentication_required },
-        } },
+        },
     } } }, &ctx);
 
     const fixed_message = "authentication is required; press i to continue in the native terminal";
@@ -1403,7 +1350,7 @@ test "repository supersession invalidates an in-flight push inspection" {
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
-    }, false);
+    });
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.update(.run_interactive_push, &ctx);
@@ -1438,7 +1385,7 @@ test "direct root quit remains allowed while push inspection is running" {
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
-    }, false);
+    });
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.update(.run_interactive_push, &ctx);
@@ -1466,7 +1413,7 @@ test "push inspection surface blocks page switching until canceled" {
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
-    }, false);
+    });
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.update(.run_interactive_push, &ctx);
@@ -1527,27 +1474,31 @@ test "push inspection surface blocks page switching until canceled" {
 
 test "inactive Review accepts push inspection diagnostic without redraw" {
     const allocator = std.testing.allocator;
-    var roots = try TestRepoPair.init();
-    defer roots.deinit();
-    var app = try mutationFenceRepoTestApp(allocator, roots.a);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try setupPushRetryRepoForTest(allocator, io, &tmp);
+    defer allocator.free(repo.repo_root);
+    defer allocator.free(repo.oid);
+    var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     defer remoteWorkflow(&app).clearPushError(allocator);
     try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
         .repo_epoch = app.repo_session.view().epoch(),
         .root_identity = app.repo_session.view().activeIdentity().?,
-        .mode = .upstream,
-        .repo_root = try allocator.dupe(u8, roots.a),
-        .branch = try allocator.dupe(u8, "main"),
+        .mode = .set_upstream,
+        .repo_root = try allocator.dupe(u8, repo.repo_root),
+        .branch = try allocator.dupe(u8, "stale-branch"),
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
-        .oid = try allocator.dupe(u8, "abc123"),
-    }, false);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+        .oid = try allocator.dupe(u8, repo.oid),
+    });
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
 
     try app.update(.run_interactive_push, &ctx);
     app.active_page = .repository;
-    try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
 
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
     try std.testing.expectEqualStrings("push retry unavailable: branch changed; reload and try again", app.pages.review.status.text());

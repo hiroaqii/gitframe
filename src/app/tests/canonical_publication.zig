@@ -443,37 +443,6 @@ fn publicStageFileTestApp(
     return app;
 }
 
-fn installPushCredentialPrompt(
-    app: *App,
-    allocator: std.mem.Allocator,
-    repo_root: []const u8,
-) !void {
-    var target = app_state.PushRetryTarget.empty();
-    var target_owned = true;
-    defer if (target_owned) target.deinit(allocator);
-    target.repo_epoch = app.repo_session.view().epoch();
-    target.root_identity = app.repo_session.view().activeIdentity().?;
-    target.repo_root = try allocator.dupe(u8, repo_root);
-    target.branch = try allocator.dupe(u8, "main");
-    target.remote = try allocator.dupe(u8, "origin");
-    target.remote_branch = try allocator.dupe(u8, "main");
-    target.oid = try allocator.dupe(u8, "abc123");
-    target.remote_url = try allocator.dupe(u8, "https://example.test/owner/repo.git");
-
-    const prompt = try allocator.create(app_state.PushCredentialPrompt);
-    var prompt_owned = true;
-    defer if (prompt_owned) {
-        prompt.deinit(allocator);
-        allocator.destroy(prompt);
-    };
-    prompt.* = .{ .target = target, .active_field = .password };
-    target_owned = false;
-    try prompt.username.insertSlice("alice");
-    try prompt.password.insertSlice("secret-token");
-    app.remote_workflow.push_retry.state = .{ .credential_prompt = prompt };
-    prompt_owned = false;
-}
-
 fn publishPathDiscovery(
     app: *App,
     ctx: *chasen.Ctx(App.Msg),
@@ -700,17 +669,22 @@ test "Review mutation read fence drains old production reads without publication
     diff_source.freeLoadRequest(allocator, source_task.request);
     allocator.destroy(source_task);
 
-    try installPushCredentialPrompt(&app, allocator, roots.a);
-    try app.update(.push_credential_submit, &task_ctx);
-    const pending = app.action_runtime.view().acceptedPending() orelse return error.ExpectedPendingAction;
-    const action_tasks = task_ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), action_tasks.len);
-    var action_terminal = action_tasks[0].failed(
-        action_tasks[0].ctx,
-        .runtime_abandoned,
-        allocator,
-    );
-    action_terminal.action_finished.push.result = .{ .credentialed = .ok };
+    const pending = beginAcceptedTestAction(&app, .push);
+    const action_terminal = App.Msg.actionFinished(.{ .push = .{
+        .pending = pending,
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+        .result = .{ .outcome = .{ .ok = .completed } },
+    } });
 
     const fence_closed =
         !app.pages.review.repository_read_authority.mayStartRepositoryRead();

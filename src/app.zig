@@ -198,7 +198,6 @@ pub const App = struct {
                 .commit_input = self.localWorkflowView().commitPanelOpen(),
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
                     self.overlay.isPushBranch() or self.overlay.isPullBranch(),
-                .credential_input = self.overlay.isPushCredentials(),
                 .branch_switch = self.overlay.isSwitchBranch(),
                 .push_error = self.overlay.isPushError(),
                 .git_action = self.actionLifecycleView().hasPending(),
@@ -458,6 +457,10 @@ pub const App = struct {
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
             .push_inspection_finished => |finished| try self.remoteWorkflow().finishPushInspection(ctx, finished),
+            .push_upstream_finalize_finished => |finished| try self.applyRemoteOutcome(
+                ctx,
+                self.remoteWorkflow().finishPushUpstreamFinalize(ctx.allocator(), finished),
+            ),
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
             .review => |review_msg| try self.updateReview(ctx, review_msg),
             .compare => |compare_msg| {
@@ -550,14 +553,6 @@ pub const App = struct {
             .push_error_page_up => self.overlayScroll().pagePushError(-1),
             .push_error_page_down => self.overlayScroll().pagePushError(1),
             .copy_popup => self.copyPopup(ctx),
-            .push_credential_tab => self.remoteWorkflow().togglePushCredentialField(),
-            .push_credential_submit => try self.remoteWorkflow().submitPushCredentials(ctx),
-            .push_credential_cancel => self.remoteWorkflow().cancelPushCredentialPrompt(ctx.allocator()),
-            .push_credential_insert => |codepoint| self.remoteWorkflow().insertPushCredential(codepoint),
-            .push_credential_paste => |text| self.remoteWorkflow().pastePushCredential(text),
-            .push_credential_backspace => self.remoteWorkflow().backspacePushCredential(),
-            .push_credential_move_left => self.remoteWorkflow().movePushCredentialLeft(),
-            .push_credential_move_right => self.remoteWorkflow().movePushCredentialRight(),
             .confirm_discard_file => try self.localWorkflow().confirmDiscardFile(ctx),
             .cancel_discard_file => self.localWorkflow().cancelDiscardConfirmation(ctx.allocator()),
             .confirm_amend => try self.localWorkflow().confirmAmend(ctx),
@@ -571,7 +566,6 @@ pub const App = struct {
             .confirm_branch_switch => try self.remoteWorkflow().confirmBranchSwitch(ctx),
             .cancel_branch_switch => self.remoteWorkflow().clearBranchSwitch(ctx.allocator()),
             .close_push_error => self.remoteWorkflow().clearPushError(ctx.allocator()),
-            .open_push_credentials => try self.remoteWorkflow().openPushCredentialPrompt(ctx),
             .run_interactive_push => try self.remoteWorkflow().runInteractivePush(ctx),
             .reload => switch (self.active_page) {
                 .review => {
@@ -722,7 +716,7 @@ pub const App = struct {
             .pull => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishPull(ctx.allocator(), result)),
             .fetch => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishFetch(ctx.allocator(), result)),
             .switch_branch => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishSwitchBranch(ctx.allocator(), result)),
-            .push_foreground => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishPushForeground(ctx.allocator(), result)),
+            .push_foreground => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPushForeground(ctx, result)),
         }
     }
 
@@ -856,9 +850,7 @@ pub const App = struct {
             .pull_confirmation = remote.pullConfirmation(),
             .push_error_message = remote.pushErrorMessage(),
             .push_retry_target = remote.pushRetryTarget(),
-            .push_retry_credentials_available = remote.pushRetryCredentialsAvailable(),
             .push_retry_inspecting = remote.pushRetryInspecting(),
-            .push_credential_prompt = remote.pushCredentialPrompt(),
             .branch_switch = remote.branchSwitch(),
             .staged_summary = switch (self.reviewOperations().commitSummary()) {
                 .unavailable => .unavailable,

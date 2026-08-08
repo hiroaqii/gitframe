@@ -91,9 +91,7 @@ pub const Context = struct {
     pull_confirmation: ?app_state.PullConfirmation,
     push_error_message: ?[]const u8,
     push_retry_target: ?*const app_state.PushRetryTarget,
-    push_retry_credentials_available: bool,
     push_retry_inspecting: bool,
-    push_credential_prompt: ?*const app_state.PushCredentialPrompt,
     branch_switch: *const app_state.BranchSwitchState,
     staged_summary: app_commit_panel.StagedSummary,
 };
@@ -158,9 +156,6 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     }
     if (app.overlay.isPushError() and app.overlay.visibleOn(app.active_page)) {
         try viewPushError(app, surface);
-    }
-    if (app.overlay.isPushCredentials() and app.overlay.visibleOn(app.active_page)) {
-        try viewPushCredentials(app, surface);
     }
     if (app.active_page == .compare and app.compare.page.base_picker.open) {
         try compare_view.viewBasePicker(app.compare, surface);
@@ -1009,56 +1004,12 @@ fn viewPushError(app: Context, surface: *chasen.Surface) !void {
     if (size.height > 0) {
         const footer = if (app.push_retry_inspecting)
             "checking push target...    Enter/Esc/q: cancel"
-        else if (app.push_retry_target != null and app.push_retry_credentials_available)
-            "i: interactive    c: credentials    Enter/Esc/q: close"
         else if (app.push_retry_target != null)
             "i: interactive    Enter/Esc/q: close"
         else
             "Enter/Esc/q: close";
         try draw.copyClippedTextAt(&content, 0, size.height - 1, footer, app.theme.style(.danger));
     }
-}
-
-fn viewPushCredentials(app: Context, surface: *chasen.Surface) !void {
-    const prompt = app.push_credential_prompt orelse return;
-    const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, confirmation_dialog_width),
-        .dialog_height = @min(surface.size().height, 13),
-        .title = "Push credentials",
-        .backdrop = false,
-        .border = .rounded,
-        .title_style = app.theme.boldStyle(.accent),
-        .border_style = app.theme.style(.accent),
-    };
-    const frame = ui.Modal.frame(surface, opts) orelse return;
-    fillModalDialog(frame);
-    frame.view();
-    var content = frame.contentSurface();
-    const size = content.size();
-
-    const target = try std.fmt.allocPrint(content.frameAllocator(), "{s} -> {s}/{s}", .{ prompt.target.branch, prompt.target.remote, prompt.target.remote_branch });
-    if (size.height > 0) try draw.copyClippedTextAt(&content, 0, 0, target, app.theme.boldStyle(.accent));
-
-    const username_style = if (prompt.active_field == .username) app.theme.boldStyle(.accent) else app.theme.style(.prompt);
-    const password_style = if (prompt.active_field == .password) app.theme.boldStyle(.accent) else app.theme.style(.prompt);
-    if (size.height > 3) {
-        try draw.copyClippedTextAt(&content, 0, 3, "Username:", app.theme.style(.muted));
-        try draw.copyClippedTextAt(&content, 11, 3, prompt.username.secret(), username_style);
-    }
-    if (size.height > 5) {
-        const masked = try maskedSecret(content.frameAllocator(), prompt.password.len);
-        try draw.copyClippedTextAt(&content, 0, 5, "Token:", app.theme.style(.muted));
-        try draw.copyClippedTextAt(&content, 11, 5, masked, password_style);
-    }
-    if (size.height > 0) {
-        try draw.copyClippedTextAt(&content, 0, size.height - 1, "Tab: field    Enter: submit    Esc: cancel", app.theme.style(.accent));
-    }
-}
-
-fn maskedSecret(allocator: std.mem.Allocator, len: usize) ![]u8 {
-    const masked = try allocator.alloc(u8, len);
-    @memset(masked, '*');
-    return masked;
 }
 
 fn pushErrorModalOptions(size: chasen.Size, message: []const u8) struct { dialog_width: u16, dialog_height: u16 } {
@@ -1605,23 +1556,6 @@ test "footer shows pending spinner with current status label" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc: cancel") != null);
 }
 
-test "credentialed push spinner does not advertise background cancellation" {
-    var app: ShellViewTestHarness = .{};
-    app.status.set("retrying push with credentials", .{});
-    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 1, .kind = .push });
-    action_lifecycle.testing.setSpinner(&app.action_runtime, 1, false);
-
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(96, 1);
-    defer ts.deinit();
-    viewFooter(app.context(), &ts.surface);
-    const snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(snapshot);
-
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "retrying push with credentials") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc: cancel") == null);
-}
-
 test "remote cancel spinner replaces the action label with canceling guidance" {
     var app: ShellViewTestHarness = .{};
     app.remote_cancelable = true;
@@ -1785,9 +1719,7 @@ const ShellViewTestHarness = struct {
             .pull_confirmation = null,
             .push_error_message = null,
             .push_retry_target = null,
-            .push_retry_credentials_available = false,
             .push_retry_inspecting = false,
-            .push_credential_prompt = null,
             .branch_switch = &self.branch_switch,
             .staged_summary = .unavailable,
         };

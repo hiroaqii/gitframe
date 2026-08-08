@@ -62,6 +62,7 @@ pub const Msg = union(enum) {
     load_finished: LoadFinished,
     action_finished: ActionFinished,
     push_inspection_finished: push_retry.Finished,
+    push_upstream_finalize_finished: push_retry.FinalizeFinished,
     shell_effect_finished: ShellEffectFinished,
     review: review_message.Msg,
     compare: compare_input.Msg,
@@ -107,14 +108,6 @@ pub const Msg = union(enum) {
     push_error_page_up,
     push_error_page_down,
     copy_popup,
-    push_credential_tab,
-    push_credential_submit,
-    push_credential_cancel,
-    push_credential_insert: u21,
-    push_credential_paste: []const u8,
-    push_credential_backspace,
-    push_credential_move_left,
-    push_credential_move_right,
     confirm_discard_file,
     cancel_discard_file,
     confirm_amend,
@@ -128,7 +121,6 @@ pub const Msg = union(enum) {
     confirm_branch_switch,
     cancel_branch_switch,
     close_push_error,
-    open_push_credentials,
     run_interactive_push,
     reload,
     auto_reload_tick,
@@ -147,6 +139,10 @@ pub const Msg = union(enum) {
 
     pub fn pushInspectionFinished(inner: push_retry.Finished) Msg {
         return .{ .push_inspection_finished = inner };
+    }
+
+    pub fn pushUpstreamFinalizeFinished(inner: push_retry.FinalizeFinished) Msg {
+        return .{ .push_upstream_finalize_finished = inner };
     }
 
     pub fn editorFinished(result: chasen.ForegroundCommandResult) Msg {
@@ -190,6 +186,7 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         .load_finished,
         .action_finished,
         .push_inspection_finished,
+        .push_upstream_finalize_finished,
         .shell_effect_finished,
         .auto_reload_tick,
         .focus_lost,

@@ -53,10 +53,10 @@ pub const State = struct {
     ) void {
         if (self.push_error_message) |message| allocator.free(message);
         self.push_error_message = null;
-        if (overlay.isPushError() or overlay.isPushCredentials()) overlay.close();
+        if (overlay.isPushError()) overlay.close();
         switch (self.push_retry.state) {
-            .available, .inspecting, .credential_prompt => self.push_retry.state.deinit(allocator),
-            .idle, .foreground => {},
+            .available, .inspecting => self.push_retry.state.deinit(allocator),
+            .idle, .foreground, .finalizing => {},
         }
         self.clearBranchSwitch(allocator, overlay);
     }

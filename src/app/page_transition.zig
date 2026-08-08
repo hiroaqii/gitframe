@@ -24,7 +24,6 @@ pub const Blocker = enum {
     help,
     commit_input,
     confirmation,
-    credential_input,
     branch_switch,
     compare_base_picker,
     push_error,
@@ -50,7 +49,6 @@ pub const Blocker = enum {
             .help => "close help before switching pages",
             .commit_input => "close commit input before switching pages",
             .confirmation => "finish confirmation before switching pages",
-            .credential_input => "close credential input before switching pages",
             .branch_switch => "finish branch switch before switching pages",
             .compare_base_picker => "close Compare base picker before switching pages",
             .push_error => "close push error before switching pages",
@@ -78,7 +76,6 @@ pub const Snapshot = struct {
     help: bool = false,
     commit_input: bool = false,
     confirmation: bool = false,
-    credential_input: bool = false,
     branch_switch: bool = false,
     compare_base_picker: bool = false,
     push_error: bool = false,
@@ -104,7 +101,6 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.help) return .{ .blocked = .help };
     if (snapshot.commit_input) return .{ .blocked = .commit_input };
     if (snapshot.confirmation) return .{ .blocked = .confirmation };
-    if (snapshot.credential_input) return .{ .blocked = .credential_input };
     if (snapshot.branch_switch) return .{ .blocked = .branch_switch };
     if (snapshot.compare_base_picker) return .{ .blocked = .compare_base_picker };
     if (snapshot.push_error) return .{ .blocked = .push_error };
@@ -187,7 +183,6 @@ test "Review Repository transitions reject every blocker in both directions" {
         .{ .blocker = .help, .snapshot = .{ .help = true } },
         .{ .blocker = .commit_input, .snapshot = .{ .commit_input = true } },
         .{ .blocker = .confirmation, .snapshot = .{ .confirmation = true } },
-        .{ .blocker = .credential_input, .snapshot = .{ .credential_input = true } },
         .{ .blocker = .branch_switch, .snapshot = .{ .branch_switch = true } },
         .{ .blocker = .compare_base_picker, .snapshot = .{ .compare_base_picker = true } },
         .{ .blocker = .push_error, .snapshot = .{ .push_error = true } },

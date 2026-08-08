@@ -103,7 +103,6 @@ pub const View = struct {
             .pull_confirmation_mode = self.overlay.isPullBranch(),
             .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
-            .push_credential_mode = self.overlay.isPushCredentials(),
             .remote_action_cancelable = self.remote_action_cancelable,
             .keymap = self.keymap,
         };
