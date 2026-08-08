@@ -71,6 +71,8 @@ pub const Context = struct {
     keymap: keymap.Effective,
     terminal_size: chasen.Size,
     action: action_lifecycle.View,
+    remote_cancelable: bool = false,
+    remote_canceling: bool = false,
     /// Shell notifications temporarily win over the active page diagnostic.
     status: *const app_state.StatusMessage,
     page_status: ?*const app_state.StatusMessage = null,
@@ -236,13 +238,13 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     var footer_key_buffers: [8][16]u8 = undefined;
     const hint_items = footerItems(app, &footer_item_storage, &footer_key_buffers);
     const hint_width = ui.key_hint.width(hint_items, footerKeyHintOptions(app.theme));
-    const hint_col = if (hint_items.len == 0)
+    var hint_col = if (hint_items.len == 0)
         width
     else if (width > hint_width + 1)
         width - hint_width - 1
     else
         0;
-    const left_limit = if (hint_items.len == 0 or hint_col == 0) width else hint_col;
+    var left_limit = if (hint_items.len == 0 or hint_col == 0) width else hint_col;
 
     var footer_segments = FooterSegments{};
     footer_segments.append(.{
@@ -302,6 +304,13 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     });
 
     footer_segments.fit(left_limit);
+    // A terminal outcome is transient and can carry recovery instructions;
+    // let it use the footer row before reserving space for normal key hints.
+    if (hint_items.len > 0 and hint_col > 0 and footer_segments.requiredWidth() > left_limit) {
+        hint_col = 0;
+        left_limit = width;
+        footer_segments.fit(left_limit);
+    }
     var left_area = surface.child(.{
         .col = 0,
         .row = 0,
@@ -395,12 +404,29 @@ const FooterSegments = struct {
 
 fn gitActionSpinnerText(app: Context, allocator: std.mem.Allocator) ?[]const u8 {
     const presentation = app.action.spinnerPresentation() orelse return null;
+    const spinner = ui.Spinner.init(.{});
+    if (isRemoteActionKind(presentation.kind) and app.remote_cancelable) {
+        if (app.remote_canceling) {
+            return std.fmt.allocPrint(allocator, "{s} canceling...", .{spinner.frameAt(presentation.tick)}) catch "canceling...";
+        }
+        const remote_label = if (visibleStatus(app).len > 0)
+            visibleStatus(app)
+        else
+            pendingActionFallbackLabel(presentation.kind);
+        return std.fmt.allocPrint(allocator, "{s} {s}  Esc: cancel", .{ spinner.frameAt(presentation.tick), remote_label }) catch remote_label;
+    }
     const label = if (visibleStatus(app).len > 0)
         visibleStatus(app)
     else
         pendingActionFallbackLabel(presentation.kind);
-    const spinner = ui.Spinner.init(.{});
     return std.fmt.allocPrint(allocator, "{s} {s}", .{ spinner.frameAt(presentation.tick), label }) catch label;
+}
+
+fn isRemoteActionKind(kind: app_actions.ActionKind) bool {
+    return switch (kind) {
+        .push, .pull, .fetch => true,
+        else => false,
+    };
 }
 
 fn visibleStatus(app: Context) []const u8 {
@@ -1562,6 +1588,7 @@ test "footer segment fit includes left inset" {
 
 test "footer shows pending spinner with current status label" {
     var app: ShellViewTestHarness = .{};
+    app.remote_cancelable = true;
     app.status.set("pushing: main -> origin/main", .{});
     action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 1, .kind = .push });
     action_lifecycle.testing.setSpinner(&app.action_runtime, 1, false);
@@ -1575,6 +1602,64 @@ test "footer shows pending spinner with current status label" {
     defer std.testing.allocator.free(snapshot);
 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "/ pushing: main -> origin/main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc: cancel") != null);
+}
+
+test "credentialed push spinner does not advertise background cancellation" {
+    var app: ShellViewTestHarness = .{};
+    app.status.set("retrying push with credentials", .{});
+    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 1, .kind = .push });
+    action_lifecycle.testing.setSpinner(&app.action_runtime, 1, false);
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(96, 1);
+    defer ts.deinit();
+    viewFooter(app.context(), &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "retrying push with credentials") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc: cancel") == null);
+}
+
+test "remote cancel spinner replaces the action label with canceling guidance" {
+    var app: ShellViewTestHarness = .{};
+    app.remote_cancelable = true;
+    app.status.set("pushing: raw-child-output-canary", .{});
+    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 1, .kind = .push });
+    action_lifecycle.testing.setSpinner(&app.action_runtime, 2, false);
+    var context = app.context();
+    context.remote_canceling = true;
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(96, 1);
+    defer ts.deinit();
+    viewFooter(context, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "canceling...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "raw-child-output-canary") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc: cancel") == null);
+
+    action_lifecycle.testing.clear(&app.action_runtime);
+    app.terminal_size = .{ .width = 120, .height = 36 };
+    app.status.clear();
+    app.review.status.set(
+        "pull failed: remote operation canceled; outcome is unknown; repository reload required; warning: credential.helper may store credentials in plaintext",
+        .{},
+    );
+
+    var terminal: chasen.testing.TestSurface = undefined;
+    try terminal.init(120, 1);
+    defer terminal.deinit();
+    viewFooter(app.context(), &terminal.surface);
+    const terminal_snapshot = try terminal.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(terminal_snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, terminal_snapshot, "outcome is unknown; repository reload required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_snapshot, "warning: credential") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_snapshot, "q: quit") == null);
 }
 
 test "footer falls back to pending kind when status is empty" {
@@ -1650,6 +1735,7 @@ const ShellViewTestHarness = struct {
     repo_state: repo_state.State = .{},
     branch_switch: app_state.BranchSwitchState = .{},
     push_confirmation: ?app_state.PushConfirmation = null,
+    remote_cancelable: bool = false,
 
     fn context(self: *const ShellViewTestHarness) Context {
         const navigation: @import("pages/review/navigation.zig").View = .{
@@ -1681,6 +1767,7 @@ const ShellViewTestHarness = struct {
             .keymap = self.keymap,
             .terminal_size = self.terminal_size,
             .action = self.action_runtime.view(),
+            .remote_cancelable = self.remote_cancelable,
             .status = &self.status,
             .page_status = &self.review.status,
             .commit_panel = &self.commit_panel,

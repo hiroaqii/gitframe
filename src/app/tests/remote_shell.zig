@@ -94,7 +94,12 @@ fn beginAcceptedTestAction(
 ) app_actions.PendingAction {
     if (app.allocator == null) app.allocator = std.testing.allocator;
     const prepared = actionLifecycle(app).prepare(kind);
-    return actionLifecycle(app).acceptSpawn(app.allocator.?, prepared).pending;
+    const pending = actionLifecycle(app).acceptSpawn(app.allocator.?, prepared).pending;
+    switch (kind) {
+        .pull, .fetch => app.remote_workflow.action_control.begin(pending.generation),
+        else => {},
+    }
+    return pending;
 }
 
 fn actionLifecycle(app: *App) action_lifecycle.Controller {
@@ -1096,7 +1101,7 @@ test "finishPush does not reload a stale active repository" {
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
-        .result = .ok,
+        .result = .{ .credentialed = .ok },
     } } }, &ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
@@ -1125,25 +1130,25 @@ test "finishPull does not reload a stale active repository" {
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
-        .result = .ok,
+        .result = .{ .outcome = .{ .ok = .completed } },
     } } }, &ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending == null);
-    try std.testing.expectEqualStrings("pulled: /repo", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
 }
 
 test "finishPull reloads matching active repo after up-to-date success" {
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: App = .{
         .allocator = std.testing.allocator,
         .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(std.testing.allocator, roots.a) },
         },
     };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(std.testing.allocator);
     _ = activateReview(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -1151,30 +1156,35 @@ test "finishPull reloads matching active repo after up-to-date success" {
 
     try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
-        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .repo_root = try std.testing.allocator.dupe(u8, roots.a),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
-        .result = .{ .ok_static = "nothing to pull" },
+        .result = .{ .outcome = .{ .ok = .already_up_to_date } },
     } } }, &ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending != null);
-    try std.testing.expectEqualStrings("nothing to pull", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("already up to date", app.pages.review.status.text());
 }
 
 test "finishPull reloads matching active repo after failure" {
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: App = .{
         .allocator = std.testing.allocator,
         .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(std.testing.allocator, roots.a) },
         },
     };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(std.testing.allocator);
     _ = activateReview(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -1182,17 +1192,85 @@ test "finishPull reloads matching active repo after failure" {
 
     try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
-        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .repo_root = try std.testing.allocator.dupe(u8, roots.a),
         .branch = try std.testing.allocator.dupe(u8, "feature"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
-        .result = .{ .failed_static = "remote unavailable" },
+        .result = .{ .outcome = .{ .failed = .failed } },
     } } }, &ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending != null);
-    try std.testing.expectEqualStrings("pull failed: remote unavailable", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("pull failed: remote operation failed; retry in an external terminal", app.pages.review.status.text());
+}
+
+test "sensitive diagnostic typed push failure publishes only fixed status overlay and clipboard text" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .repo_session = .{
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        },
+    };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer remoteWorkflow(&app).clearPushError(allocator);
+    defer app.shell_effects_state.clipboard_copies.deinit(allocator);
+    _ = activateReview(&app);
+    const pending = beginAcceptedTestAction(&app, .push);
+    app.remote_workflow.action_control.begin(pending.generation);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try app.update(.{ .action_finished = .{ .push = .{
+        .pending = pending,
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+        .result = .{ .background = .{
+            .outcome = .{ .failed = .authentication_required },
+        } },
+    } } }, &ctx);
+
+    const fixed_message = "authentication is required; press i to continue in the native terminal";
+    try std.testing.expect(!app.action_runtime.view().hasPending());
+    try std.testing.expect(!app.remote_workflow.action_control.isActive(pending.generation));
+    try std.testing.expect(app.overlay.isPushError());
+    try std.testing.expectEqualStrings(fixed_message, app.remote_workflow.push_error_message.?);
+    try std.testing.expectEqualStrings("push failed: authentication is required; press i to continue in the native terminal", app.pages.review.status.text());
+
+    try app.update(.copy_popup, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings(fixed_message, ctx._pending_clipboard_copies[0].text);
+
+    const canaries = [_][]const u8{
+        "https://alice:RAW-URL-CANARY@example.invalid/repo.git",
+        "Authorization: Bearer RAW-AUTH-CANARY",
+        "password=RAW-PASSWORD-CANARY",
+        "RAW-ARBITRARY-CANARY",
+    };
+    for (canaries) |canary| {
+        try std.testing.expect(std.mem.indexOf(u8, app.pages.review.status.text(), canary) == null);
+        try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.push_error_message.?, canary) == null);
+        try std.testing.expect(std.mem.indexOf(u8, ctx._pending_clipboard_copies[0].text, canary) == null);
+    }
 }
 
 test "finishFetch does not reload a stale active repository" {
@@ -1213,25 +1291,25 @@ test "finishFetch does not reload a stale active repository" {
         .pending = pending,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
-        .result = .ok,
+        .result = .{ .outcome = .{ .ok = .completed } },
     } } }, &ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending == null);
-    try std.testing.expectEqualStrings("fetched: /repo", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.pages.review.status.text());
 }
 
 test "finishFetch reloads matching active repo after failure" {
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: App = .{
         .allocator = std.testing.allocator,
         .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(std.testing.allocator, roots.a) },
         },
     };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(std.testing.allocator);
     _ = activateReview(&app);
     const pending = beginAcceptedTestAction(&app, .fetch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -1239,14 +1317,67 @@ test "finishFetch reloads matching active repo after failure" {
 
     try app.update(.{ .action_finished = .{ .fetch = .{
         .pending = pending,
-        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .repo_root = try std.testing.allocator.dupe(u8, roots.a),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
-        .result = .{ .failed_static = "remote unavailable" },
+        .result = .{ .outcome = .{ .failed = .failed } },
     } } }, &ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.load.pending != null);
-    try std.testing.expectEqualStrings("fetch failed: remote unavailable", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("fetch failed: remote operation failed; retry in an external terminal", app.pages.review.status.text());
+}
+
+test "remote cancel defers quit until the exact unknown-outcome terminal" {
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .repo_session = .{
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(std.testing.allocator, roots.a) },
+        },
+    };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(std.testing.allocator);
+    _ = activateReview(&app);
+    const pending = beginAcceptedTestAction(&app, .pull);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try app.update(.quit, &ctx);
+    try std.testing.expect(!app.teardown_requested);
+    try std.testing.expectEqualStrings("canceling...", app.pages.review.status.text());
+
+    try app.update(.{ .action_finished = .{ .pull = .{
+        .pending = pending,
+        .identity = .{
+            .repo_epoch = app.repo_session.view().epoch(),
+            .root_identity = app.repo_session.view().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .repo_root = try std.testing.allocator.dupe(u8, roots.a),
+        .branch = try std.testing.allocator.dupe(u8, "main"),
+        .remote = try std.testing.allocator.dupe(u8, "origin"),
+        .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+        .oid = try std.testing.allocator.dupe(u8, "abc123"),
+        .result = .{
+            .outcome = .{ .failed = .canceled_outcome_unknown },
+            .warnings = .{ .git_plaintext_store = true },
+        },
+    } } }, &ctx);
+
+    try std.testing.expect(app.teardown_requested);
+    try std.testing.expect(!app.action_runtime.view().hasPending());
+    try std.testing.expect(app.pages.review.load.pending != null);
+    try std.testing.expectEqualStrings(
+        "pull failed: remote operation canceled; outcome is unknown; repository reload required; warning: credential.helper may store credentials in plaintext",
+        app.pages.review.status.text(),
+    );
 }
 
 test "repository supersession invalidates an in-flight push inspection" {

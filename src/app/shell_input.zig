@@ -74,6 +74,7 @@ pub const View = struct {
     commit_panel_mode: bool,
     repo_picker_mode: bool,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode,
+    remote_action_cancelable: bool = false,
     keymap: keymap.Effective,
     overlay: *const app_state.OverlayState,
     layout: app_shell_layout.Layout,
@@ -103,6 +104,7 @@ pub const View = struct {
             .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
             .push_credential_mode = self.overlay.isPushCredentials(),
+            .remote_action_cancelable = self.remote_action_cancelable,
             .keymap = self.keymap,
         };
     }

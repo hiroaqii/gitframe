@@ -134,6 +134,7 @@ pub const Msg = union(enum) {
     auto_reload_tick,
     focus_lost,
     git_action_spinner_tick,
+    cancel_remote_action,
     quit,
 
     pub fn loadFinished(inner: LoadFinished) Msg {

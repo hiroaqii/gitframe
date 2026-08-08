@@ -203,6 +203,10 @@ pub const PushConfirmation = struct {
 /// and re-checks branch/upstream/clean state before deciding whether to
 /// fast-forward.
 pub const PullConfirmation = struct {
+    repository_identity: remote_request.RepositoryIdentity = .{
+        .repo_epoch = 0,
+        .root_identity = .{ .device = 0, .inode = 0 },
+    },
     repo_root: []u8,
     branch: []u8,
     remote: []u8,

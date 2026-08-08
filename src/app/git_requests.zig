@@ -13,7 +13,11 @@ const chasen = @import("chasen");
 
 const actions = @import("actions.zig");
 const git_ops = @import("git_ops.zig");
+const remote_request = @import("remote_request.zig");
 const app_state = @import("state.zig");
+const git_backend = @import("../git/backend.zig");
+const process_runner = @import("../process/runner.zig");
+const root_capability = @import("../repo/root_capability.zig");
 
 pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.StageTarget) !void {
     requireKind(pending, .stage_file);
@@ -214,7 +218,9 @@ pub fn startPush(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
     pending: actions.PendingAction,
-    env_map: ?*const std.process.Environ.Map,
+    root: *?root_capability.RootCapability,
+    environment: *?git_backend.OwnedRemoteEnvironment,
+    cancellation: process_runner.CancellationView,
     confirmation: *app_state.PushConfirmation,
 ) !void {
     defer consumePushConfirmation(ctx.allocator(), confirmation);
@@ -235,8 +241,12 @@ pub fn startPush(
         .remote = confirmation.remote,
         .remote_branch = confirmation.remote_branch,
         .oid = confirmation.oid,
-        .env_map = env_map,
+        .root = root.* orelse @panic("background push requires an owned root"),
+        .environment = environment.* orelse @panic("background push requires an owned environment"),
+        .cancellation = cancellation,
     };
+    root.* = null;
+    environment.* = null;
     confirmation.* = .{
         .repository_identity = .{
             .repo_epoch = 0,
@@ -259,7 +269,9 @@ pub fn startPull(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
     pending: actions.PendingAction,
-    env_map: ?*const std.process.Environ.Map,
+    root: *?root_capability.RootCapability,
+    environment: *?git_backend.OwnedRemoteEnvironment,
+    cancellation: process_runner.CancellationView,
     confirmation: *app_state.PullConfirmation,
 ) !void {
     defer consumePullConfirmation(ctx.allocator(), confirmation);
@@ -269,14 +281,27 @@ pub fn startPull(
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
+        .identity = .{
+            .repo_epoch = confirmation.repository_identity.repo_epoch,
+            .root_identity = confirmation.repository_identity.root_identity,
+            .operation_generation = pending.generation,
+        },
         .repo_root = confirmation.repo_root,
         .branch = confirmation.branch,
         .remote = confirmation.remote,
         .remote_branch = confirmation.remote_branch,
         .oid = confirmation.oid,
-        .env_map = env_map,
+        .root = root.* orelse @panic("background pull requires an owned root"),
+        .environment = environment.* orelse @panic("background pull requires an owned environment"),
+        .cancellation = cancellation,
     };
+    root.* = null;
+    environment.* = null;
     confirmation.* = .{
+        .repository_identity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+        },
         .repo_root = &.{},
         .branch = &.{},
         .remote = &.{},
@@ -291,6 +316,10 @@ pub fn startPull(
 }
 
 pub const FetchRequest = struct {
+    repository_identity: remote_request.RepositoryIdentity = .{
+        .repo_epoch = 0,
+        .root_identity = .{ .device = 0, .inode = 0 },
+    },
     repo_root: []u8,
     remote: []u8,
 
@@ -303,7 +332,9 @@ pub fn startFetch(
     comptime Msg: type,
     ctx: *chasen.Ctx(Msg),
     pending: actions.PendingAction,
-    env_map: ?*const std.process.Environ.Map,
+    root: *?root_capability.RootCapability,
+    environment: *?git_backend.OwnedRemoteEnvironment,
+    cancellation: process_runner.CancellationView,
     request: *FetchRequest,
 ) !void {
     defer consumeFetchRequest(ctx.allocator(), request);
@@ -313,11 +344,27 @@ pub fn startFetch(
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
+        .identity = .{
+            .repo_epoch = request.repository_identity.repo_epoch,
+            .root_identity = request.repository_identity.root_identity,
+            .operation_generation = pending.generation,
+        },
         .repo_root = request.repo_root,
         .remote = request.remote,
-        .env_map = env_map,
+        .root = root.* orelse @panic("background fetch requires an owned root"),
+        .environment = environment.* orelse @panic("background fetch requires an owned environment"),
+        .cancellation = cancellation,
     };
-    request.* = .{ .repo_root = &.{}, .remote = &.{} };
+    root.* = null;
+    environment.* = null;
+    request.* = .{
+        .repository_identity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+        },
+        .repo_root = &.{},
+        .remote = &.{},
+    };
     errdefer destroyFetchTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
@@ -463,6 +510,10 @@ fn consumePullConfirmation(allocator: std.mem.Allocator, confirmation: *app_stat
     if (confirmation.remote_branch.len > 0) allocator.free(confirmation.remote_branch);
     if (confirmation.oid.len > 0) allocator.free(confirmation.oid);
     confirmation.* = .{
+        .repository_identity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+        },
         .repo_root = &.{},
         .branch = &.{},
         .remote = &.{},
@@ -479,18 +530,29 @@ fn destroyPullTask(comptime Task: type, allocator: std.mem.Allocator, task: *Tas
     if (task.remote.len > 0) allocator.free(task.remote);
     if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
     if (task.oid.len > 0) allocator.free(task.oid);
+    if (task.root) |*root| root.deinit();
+    if (task.environment) |*environment| environment.deinit();
     allocator.destroy(task);
 }
 
 fn consumeFetchRequest(allocator: std.mem.Allocator, request: *FetchRequest) void {
     if (request.repo_root.len > 0) allocator.free(request.repo_root);
     if (request.remote.len > 0) allocator.free(request.remote);
-    request.* = .{ .repo_root = &.{}, .remote = &.{} };
+    request.* = .{
+        .repository_identity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+        },
+        .repo_root = &.{},
+        .remote = &.{},
+    };
 }
 
 fn destroyFetchTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.remote.len > 0) allocator.free(task.remote);
+    if (task.root) |*root| root.deinit();
+    if (task.environment) |*environment| environment.deinit();
     allocator.destroy(task);
 }
 
@@ -539,5 +601,7 @@ fn destroyPushTask(comptime Task: type, allocator: std.mem.Allocator, task: *Tas
     if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
     if (task.oid.len > 0) allocator.free(task.oid);
     if (task.credentials) |*credentials| credentials.deinit(allocator);
+    if (task.root) |*root| root.deinit();
+    if (task.environment) |*environment| environment.deinit();
     allocator.destroy(task);
 }

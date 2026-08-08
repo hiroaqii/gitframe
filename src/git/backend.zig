@@ -4,9 +4,11 @@ const git_ref = @import("ref.zig");
 const git_branch_status = @import("branch_status.zig");
 const git_push = @import("push.zig");
 const process_runner = @import("../process/runner.zig");
+const root_capability = @import("../repo/root_capability.zig");
 const repository_change_map = @import("../repository/change_map.zig");
 
 pub const RemoteEnvironmentMode = enum {
+    background,
     inspection,
     foreground,
 };
@@ -214,6 +216,53 @@ pub const OperationResult = union(enum) {
             .failed => |message| allocator.free(message),
         }
     }
+};
+
+/// App-safe terminal vocabulary for a background remote operation. Raw child
+/// output is deliberately absent: the backend classifies it while it is held
+/// by SensitiveBytes and destroys it before returning across this boundary.
+pub const RemoteFailure = enum {
+    authentication_required,
+    ssh_public_key,
+    http_userinfo_rejected,
+    canceled_outcome_unknown,
+    timed_out_outcome_unknown,
+    spawn_failed,
+    failed,
+};
+
+pub const RemoteSuccess = enum {
+    completed,
+    already_up_to_date,
+};
+
+pub const RemoteOperationOutcome = union(enum) {
+    ok: RemoteSuccess,
+    failed: RemoteFailure,
+};
+
+pub const RemoteOperationResult = struct {
+    outcome: RemoteOperationOutcome,
+    warnings: RemoteWarningSet = .{},
+};
+
+pub const RemoteOperationKind = union(enum) {
+    push: PushRequest,
+    pull_refresh_ff_only: PullRequest,
+    fetch: FetchRequest,
+};
+
+/// Descriptor-bound authority for one background remote operation.
+///
+/// `root` and `environment` are borrowed for the synchronous call. The App
+/// task owns both values for its entire run. `control.deadline` is one absolute
+/// timestamp shared by URL/config preflight, snapshot verification, and every
+/// network or merge child.
+pub const RemoteOperationRequest = struct {
+    root: *const root_capability.RootCapability,
+    environment: *const OwnedRemoteEnvironment,
+    control: process_runner.ProcessControl,
+    kind: RemoteOperationKind,
 };
 
 /// Git-command diff kinds only.
@@ -538,6 +587,17 @@ pub const LocalCommandBackend = struct {
             .fetch => |fetch| runGitFetch(allocator, io, request.repo_root, request.env_map, fetch),
             .switch_branch => |switch_branch| runGitSwitchBranch(allocator, io, request.repo_root, switch_branch),
         };
+    }
+
+    /// Runs the credentialless background path. Unlike `runOperation`, this
+    /// API accepts only a retained root descriptor and returns no child-owned
+    /// diagnostic bytes.
+    pub fn runRemoteOperation(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        request: RemoteOperationRequest,
+    ) RemoteOperationResult {
+        return runSecureRemoteOperation(allocator, io, request);
     }
 };
 
@@ -3012,6 +3072,614 @@ fn writeAskpassFile(io: std.Io, dir: std.Io.Dir, name: []const u8, contents: []c
     file.writeStreamingAll(io, contents) catch return error.SpawnFailed;
 }
 
+const max_remote_diagnostic_bytes = 256 * 1024;
+
+const SensitiveRemoteCommand = union(enum) {
+    completed: process_runner.SensitiveResult,
+    canceled,
+    timed_out,
+    failed: RemoteFailure,
+
+    fn deinit(self: *SensitiveRemoteCommand) void {
+        switch (self.*) {
+            .completed => |*result| result.deinit(),
+            .canceled, .timed_out, .failed => {},
+        }
+        self.* = .{ .failed = .failed };
+    }
+};
+
+const RemoteUrlUse = enum { fetch, push };
+const UrlAudit = enum { accepted, userinfo, invalid };
+const RemoteCheck = union(enum) {
+    matches,
+    mismatch,
+    failed: RemoteFailure,
+};
+
+fn runSecureRemoteOperation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: RemoteOperationRequest,
+) RemoteOperationResult {
+    var warnings = request.environment.warnings;
+    const remote_and_use: struct { remote: []const u8, use: RemoteUrlUse } = switch (request.kind) {
+        .push => |push| .{ .remote = push.remote, .use = .push },
+        .pull_refresh_ff_only => |pull| .{ .remote = pull.remote, .use = .fetch },
+        .fetch => |fetch| .{ .remote = fetch.remote, .use = .fetch },
+    };
+
+    if (auditRemoteUrls(
+        allocator,
+        io,
+        request.root.dir(),
+        &request.environment.map,
+        request.control,
+        remote_and_use.remote,
+        remote_and_use.use,
+    )) |failure| return remoteFailureResult(failure, warnings);
+
+    if (classifyCredentialPolicy(
+        allocator,
+        io,
+        request.root.dir(),
+        &request.environment.map,
+        request.control,
+        &warnings,
+    )) |failure| return remoteFailureResult(failure, warnings);
+
+    return switch (request.kind) {
+        .push => |push| runSecureGitPush(allocator, io, request, push, warnings),
+        .pull_refresh_ff_only => |pull| runSecureGitPull(allocator, io, request, pull, warnings),
+        .fetch => |fetch| runSecureGitFetch(allocator, io, request, fetch, warnings),
+    };
+}
+
+fn remoteFailureResult(failure: RemoteFailure, warnings: RemoteWarningSet) RemoteOperationResult {
+    return .{ .outcome = .{ .failed = failure }, .warnings = warnings };
+}
+
+fn remoteSuccessResult(success: RemoteSuccess, warnings: RemoteWarningSet) RemoteOperationResult {
+    return .{ .outcome = .{ .ok = success }, .warnings = warnings };
+}
+
+fn runSensitiveRemoteCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    control: process_runner.ProcessControl,
+    argv: []const []const u8,
+) SensitiveRemoteCommand {
+    const controlled = process_runner.runCapturedControlled(allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .environ_map = environment,
+        .stdout_limit = .limited(max_remote_diagnostic_bytes),
+        .stderr_limit = .limited(max_remote_diagnostic_bytes),
+    }, .sensitive, control);
+    return switch (controlled) {
+        .completed => |captured| switch (captured) {
+            .sensitive => |result| .{ .completed = result },
+            .ordinary => unreachable,
+        },
+        .canceled => .canceled,
+        .timed_out => .timed_out,
+        .failed => |failure| .{ .failed = switch (failure) {
+            .spawn => .spawn_failed,
+            else => .failed,
+        } },
+    };
+}
+
+fn commandExited(command: *const SensitiveRemoteCommand, expected_code: u8) bool {
+    return switch (command.*) {
+        .completed => |result| switch (result.term) {
+            .exited => |code| code == expected_code,
+            else => false,
+        },
+        .canceled, .timed_out, .failed => false,
+    };
+}
+
+fn commandFailure(command: *const SensitiveRemoteCommand, diagnose: bool) ?RemoteFailure {
+    return switch (command.*) {
+        .canceled => .canceled_outcome_unknown,
+        .timed_out => .timed_out_outcome_unknown,
+        .failed => |failure| failure,
+        .completed => |result| switch (result.term) {
+            .exited => |code| if (code == 0)
+                null
+            else if (diagnose)
+                diagnoseRemoteFailure(result.stdout.bytes(), result.stderr.bytes())
+            else
+                .failed,
+            else => if (diagnose)
+                diagnoseRemoteFailure(result.stdout.bytes(), result.stderr.bytes())
+            else
+                .failed,
+        },
+    };
+}
+
+fn diagnoseRemoteFailure(stdout: []const u8, stderr: []const u8) RemoteFailure {
+    const public_key_patterns = [_][]const u8{
+        "permission denied (publickey",
+        "no supported authentication methods available",
+    };
+    for (public_key_patterns) |pattern| {
+        if (indexOfIgnoreCase(stdout, pattern) != null or indexOfIgnoreCase(stderr, pattern) != null)
+            return .ssh_public_key;
+    }
+
+    const authentication_patterns = [_][]const u8{
+        "authentication failed",
+        "authentication required",
+        "could not read username",
+        "terminal prompts disabled",
+        "http 401",
+        "returned error: 401",
+        "access denied",
+    };
+    for (authentication_patterns) |pattern| {
+        if (indexOfIgnoreCase(stdout, pattern) != null or indexOfIgnoreCase(stderr, pattern) != null)
+            return .authentication_required;
+    }
+    return .failed;
+}
+
+fn auditRemoteUrls(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    control: process_runner.ProcessControl,
+    remote: []const u8,
+    use: RemoteUrlUse,
+) ?RemoteFailure {
+    const effective_argv = switch (use) {
+        .fetch => &[_][]const u8{ "git", "remote", "get-url", "--all", "--", remote },
+        .push => &[_][]const u8{ "git", "remote", "get-url", "--push", "--all", "--", remote },
+    };
+    var effective = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, effective_argv);
+    defer effective.deinit();
+    if (commandFailure(&effective, false)) |failure| return failure;
+    const effective_bytes = switch (effective) {
+        .completed => |*result| result.stdout.bytes(),
+        else => unreachable,
+    };
+    switch (auditLineFramedUrls(effective_bytes)) {
+        .accepted => {},
+        .userinfo => return .http_userinfo_rejected,
+        .invalid => return .failed,
+    }
+
+    const url_key = std.fmt.allocPrint(allocator, "remote.{s}.url", .{remote}) catch return .failed;
+    defer allocator.free(url_key);
+    if (auditConfigUrlValues(allocator, io, cwd, environment, control, url_key, false)) |failure| return failure;
+
+    const pushurl_key = std.fmt.allocPrint(allocator, "remote.{s}.pushurl", .{remote}) catch return .failed;
+    defer allocator.free(pushurl_key);
+    if (auditConfigUrlValues(allocator, io, cwd, environment, control, pushurl_key, true)) |failure| return failure;
+    return null;
+}
+
+fn auditConfigUrlValues(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    control: process_runner.ProcessControl,
+    key: []const u8,
+    optional: bool,
+) ?RemoteFailure {
+    const argv = [_][]const u8{ "git", "config", "--null", "--get-all", key };
+    var command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &argv);
+    defer command.deinit();
+    if (optional and commandExited(&command, 1)) return null;
+    if (commandFailure(&command, false)) |failure| return failure;
+    const bytes = switch (command) {
+        .completed => |*result| result.stdout.bytes(),
+        else => unreachable,
+    };
+    switch (auditNulFramedUrls(bytes)) {
+        .accepted => return null,
+        .userinfo => return .http_userinfo_rejected,
+        .invalid => return .failed,
+    }
+}
+
+fn auditLineFramedUrls(bytes: []const u8) UrlAudit {
+    if (bytes.len == 0 or std.mem.indexOfScalar(u8, bytes, 0) != null) return .invalid;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const relative_end = std.mem.indexOfScalar(u8, bytes[start..], '\n');
+        const end = if (relative_end) |offset| start + offset else bytes.len;
+        const line = bytes[start..end];
+        if (line.len == 0 or std.mem.indexOfScalar(u8, line, '\r') != null) return .invalid;
+        count += 1;
+        switch (auditRemoteUrlValue(line)) {
+            .accepted => {},
+            .userinfo => return .userinfo,
+            .invalid => return .invalid,
+        }
+        start = if (relative_end == null) bytes.len else end + 1;
+    }
+    return if (count > 0) .accepted else .invalid;
+}
+
+fn auditNulFramedUrls(bytes: []const u8) UrlAudit {
+    if (bytes.len == 0 or bytes[bytes.len - 1] != 0) return .invalid;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const relative_end = std.mem.indexOfScalar(u8, bytes[start..], 0) orelse return .invalid;
+        const end = start + relative_end;
+        const value = bytes[start..end];
+        if (value.len == 0 or std.mem.indexOfAny(u8, value, "\r\n") != null) return .invalid;
+        count += 1;
+        switch (auditRemoteUrlValue(value)) {
+            .accepted => {},
+            .userinfo => return .userinfo,
+            .invalid => return .invalid,
+        }
+        start = end + 1;
+    }
+    return if (count > 0) .accepted else .invalid;
+}
+
+fn auditRemoteUrlValue(url: []const u8) UrlAudit {
+    for (url) |byte| if (byte < 0x20 or byte == 0x7f) return .invalid;
+    const scheme_len: usize = if (std.ascii.startsWithIgnoreCase(url, "http://"))
+        "http://".len
+    else if (std.ascii.startsWithIgnoreCase(url, "https://"))
+        "https://".len
+    else
+        return .accepted;
+    const uri = std.Uri.parse(url) catch return .invalid;
+    if ((!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(uri.scheme, "https")) or uri.host == null)
+        return .invalid;
+    const authority = url[scheme_len .. std.mem.indexOfAnyPos(u8, url, scheme_len, "/?#") orelse url.len];
+    if (uri.user != null or uri.password != null or std.mem.indexOfScalar(u8, authority, '@') != null)
+        return .userinfo;
+    return .accepted;
+}
+
+fn classifyCredentialPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    control: process_runner.ProcessControl,
+    warnings: *RemoteWarningSet,
+) ?RemoteFailure {
+    const helper_argv = [_][]const u8{ "git", "config", "--null", "--get-all", "credential.helper" };
+    var helpers = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &helper_argv);
+    defer helpers.deinit();
+    if (!commandExited(&helpers, 1)) {
+        if (commandFailure(&helpers, false)) |failure| return failure;
+        const bytes = switch (helpers) {
+            .completed => |*result| result.stdout.bytes(),
+            else => unreachable,
+        };
+        if (!classifyHelperRecords(bytes, warnings)) return .failed;
+    }
+
+    const origin_argv = [_][]const u8{ "git", "config", "--show-origin", "--null", "--get-all", "credential.helper" };
+    var origins = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &origin_argv);
+    defer origins.deinit();
+    if (!commandExited(&origins, 1)) {
+        if (commandFailure(&origins, false)) |failure| return failure;
+        const bytes = switch (origins) {
+            .completed => |*result| result.stdout.bytes(),
+            else => unreachable,
+        };
+        if (!classifyHelperOrigins(bytes, warnings)) return .failed;
+    }
+
+    const scoped_argv = [_][]const u8{ "git", "config", "--null", "--get-regexp", "^credential\\..*\\.helper$" };
+    var scoped = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &scoped_argv);
+    defer scoped.deinit();
+    if (!commandExited(&scoped, 1)) {
+        if (commandFailure(&scoped, false)) |failure| return failure;
+        const bytes = switch (scoped) {
+            .completed => |*result| result.stdout.bytes(),
+            else => unreachable,
+        };
+        if (!classifyScopedHelperRecords(bytes, warnings)) return .failed;
+    }
+
+    const store_argv = [_][]const u8{ "git", "config", "--null", "--get", "credential.credentialStore" };
+    var store = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &store_argv);
+    defer store.deinit();
+    if (!commandExited(&store, 1)) {
+        if (commandFailure(&store, false)) |failure| return failure;
+        const bytes = switch (store) {
+            .completed => |*result| result.stdout.bytes(),
+            else => unreachable,
+        };
+        if (nulSingleValueEquals(bytes, "plaintext")) warnings.gcm_plaintext_store = true;
+    }
+    if (environment.get("GCM_CREDENTIAL_STORE")) |value| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "plaintext"))
+            warnings.gcm_plaintext_store = true;
+    }
+    return null;
+}
+
+fn classifyHelperRecords(bytes: []const u8, warnings: *RemoteWarningSet) bool {
+    if (bytes.len == 0) return true;
+    if (bytes[bytes.len - 1] != 0) return false;
+    var plaintext_active = false;
+    var unknown_active = false;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const relative_end = std.mem.indexOfScalar(u8, bytes[start..], 0) orelse return false;
+        const end = start + relative_end;
+        const value = std.mem.trim(u8, bytes[start..end], " \t");
+        if (value.len == 0) {
+            plaintext_active = false;
+            unknown_active = false;
+        } else if (helperIsPlaintextStore(value)) {
+            plaintext_active = true;
+        } else if (!helperIsKnownNonPlaintext(value)) {
+            unknown_active = true;
+        }
+        start = end + 1;
+    }
+    if (plaintext_active) warnings.git_plaintext_store = true;
+    if (unknown_active) warnings.helper_policy_unknown = true;
+    return true;
+}
+
+fn classifyHelperOrigins(bytes: []const u8, warnings: *RemoteWarningSet) bool {
+    if (bytes.len == 0) return true;
+    if (bytes[bytes.len - 1] != 0) return false;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const origin_end_offset = std.mem.indexOfScalar(u8, bytes[start..], 0) orelse return false;
+        const origin_end = start + origin_end_offset;
+        const origin = bytes[start..origin_end];
+        start = origin_end + 1;
+        if (start >= bytes.len) return false;
+        const value_end_offset = std.mem.indexOfScalar(u8, bytes[start..], 0) orelse return false;
+        const value = std.mem.trim(u8, bytes[start .. start + value_end_offset], " \t");
+        start += value_end_offset + 1;
+        if (!std.mem.startsWith(u8, origin, "file:.git/config")) {
+            if (helperIsPlaintextStore(value)) {
+                warnings.potential_plaintext_store = true;
+            } else if (value.len > 0 and !helperIsKnownNonPlaintext(value)) {
+                warnings.helper_policy_unknown = true;
+            }
+        }
+    }
+    return true;
+}
+
+fn classifyScopedHelperRecords(bytes: []const u8, warnings: *RemoteWarningSet) bool {
+    if (bytes.len == 0) return true;
+    if (bytes[bytes.len - 1] != 0) return false;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const end_offset = std.mem.indexOfScalar(u8, bytes[start..], 0) orelse return false;
+        const end = start + end_offset;
+        const record = bytes[start..end];
+        const separator = std.mem.indexOfScalar(u8, record, '\n') orelse return false;
+        if (separator == 0) return false;
+        const value = std.mem.trim(u8, record[separator + 1 ..], " \t");
+        if (helperIsPlaintextStore(value)) {
+            warnings.potential_plaintext_store = true;
+        } else if (value.len > 0 and !helperIsKnownNonPlaintext(value)) {
+            warnings.helper_policy_unknown = true;
+        }
+        start = end + 1;
+    }
+    return true;
+}
+
+fn helperIsPlaintextStore(value: []const u8) bool {
+    const token = helperCommandToken(value) orelse return false;
+    if (std.ascii.eqlIgnoreCase(token, "store")) return true;
+    const base = std.fs.path.basename(token);
+    return std.ascii.eqlIgnoreCase(base, "git-credential-store");
+}
+
+fn helperIsKnownNonPlaintext(value: []const u8) bool {
+    const token = helperCommandToken(value) orelse return false;
+    const base = std.fs.path.basename(token);
+    const known = [_][]const u8{ "cache", "manager", "manager-core", "libsecret", "osxkeychain", "wincred", "oauth" };
+    for (known) |candidate| {
+        if (std.ascii.eqlIgnoreCase(token, candidate) or
+            std.ascii.eqlIgnoreCase(base, candidate) or
+            (std.mem.startsWith(u8, base, "git-credential-") and
+                std.ascii.eqlIgnoreCase(base["git-credential-".len..], candidate))) return true;
+    }
+    return false;
+}
+
+fn helperCommandToken(value: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len == 0 or trimmed[0] == '!' or trimmed[0] == '\'' or trimmed[0] == '"') return null;
+    for (trimmed) |byte| if (byte < 0x20 and byte != '\t') return null;
+    const end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+    return trimmed[0..end];
+}
+
+fn nulSingleValueEquals(bytes: []const u8, expected: []const u8) bool {
+    if (bytes.len == 0) return false;
+    const value = if (bytes[bytes.len - 1] == 0) bytes[0 .. bytes.len - 1] else bytes;
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), expected);
+}
+
+fn runSecureGitPush(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    operation: RemoteOperationRequest,
+    request: PushRequest,
+    warnings: RemoteWarningSet,
+) RemoteOperationResult {
+    switch (secureRemoteBranchSnapshotMatches(allocator, io, operation, request.branch, request.oid)) {
+        .matches => {},
+        .mismatch => return remoteFailureResult(.failed, warnings),
+        .failed => |failure| return remoteFailureResult(failure, warnings),
+    }
+
+    const refspec = std.fmt.allocPrint(allocator, "refs/heads/{s}:refs/heads/{s}", .{ request.branch, request.remote_branch }) catch
+        return remoteFailureResult(.failed, warnings);
+    defer allocator.free(refspec);
+    const upstream_argv = [_][]const u8{
+        "git",   "-c",                           "credential.interactive=false", "-c",                     "credential.trace=false", "-c", "credential.traceSecrets=false",
+        "-c",    "credential.traceMsAuth=false", "-c",                           "credential.debug=false", "push",                   "--", request.remote,
+        refspec,
+    };
+    const set_upstream_argv = [_][]const u8{
+        "git",          "-c",                           "credential.interactive=false", "-c",                     "credential.trace=false", "-c",             "credential.traceSecrets=false",
+        "-c",           "credential.traceMsAuth=false", "-c",                           "credential.debug=false", "push",                   "--set-upstream", "--",
+        request.remote, refspec,
+    };
+    const argv: []const []const u8 = if (request.mode == .set_upstream) &set_upstream_argv else &upstream_argv;
+    var command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, argv);
+    defer command.deinit();
+    if (commandFailure(&command, true)) |failure| return remoteFailureResult(failure, warnings);
+    return remoteSuccessResult(.completed, warnings);
+}
+
+fn runSecureGitFetch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    operation: RemoteOperationRequest,
+    request: FetchRequest,
+    warnings: RemoteWarningSet,
+) RemoteOperationResult {
+    const argv = [_][]const u8{
+        "git", "-c",                           "credential.interactive=false", "-c",                     "credential.trace=false", "-c", "credential.traceSecrets=false",
+        "-c",  "credential.traceMsAuth=false", "-c",                           "credential.debug=false", "fetch",                  "--", request.remote,
+    };
+    var command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &argv);
+    defer command.deinit();
+    if (commandFailure(&command, true)) |failure| return remoteFailureResult(failure, warnings);
+    return remoteSuccessResult(.completed, warnings);
+}
+
+fn runSecureGitPull(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    operation: RemoteOperationRequest,
+    request: PullRequest,
+    warnings: RemoteWarningSet,
+) RemoteOperationResult {
+    switch (securePullPreconditionsMatch(allocator, io, operation, request)) {
+        .matches => {},
+        .mismatch => return remoteFailureResult(.failed, warnings),
+        .failed => |failure| return remoteFailureResult(failure, warnings),
+    }
+
+    const fetch_argv = [_][]const u8{
+        "git", "-c",                           "credential.interactive=false", "-c",                     "credential.trace=false", "-c", "credential.traceSecrets=false",
+        "-c",  "credential.traceMsAuth=false", "-c",                           "credential.debug=false", "fetch",                  "--", request.remote,
+    };
+    var fetch = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &fetch_argv);
+    defer fetch.deinit();
+    if (commandFailure(&fetch, true)) |failure| return remoteFailureResult(failure, warnings);
+
+    switch (securePullPreconditionsMatch(allocator, io, operation, request)) {
+        .matches => {},
+        .mismatch => return remoteFailureResult(.failed, warnings),
+        .failed => |failure| return remoteFailureResult(failure, warnings),
+    }
+
+    const remote_ref = std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ request.remote, request.remote_branch }) catch
+        return remoteFailureResult(.failed, warnings);
+    defer allocator.free(remote_ref);
+    const spec = std.fmt.allocPrint(allocator, "HEAD...{s}", .{remote_ref}) catch
+        return remoteFailureResult(.failed, warnings);
+    defer allocator.free(spec);
+    const ahead_behind_argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", spec };
+    var ahead_behind_command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &ahead_behind_argv);
+    defer ahead_behind_command.deinit();
+    if (commandFailure(&ahead_behind_command, false)) |failure| return remoteFailureResult(failure, warnings);
+    const ahead_behind_bytes = switch (ahead_behind_command) {
+        .completed => |*result| result.stdout.bytes(),
+        else => unreachable,
+    };
+    const ahead_behind = parseRevListAheadBehind(ahead_behind_bytes) catch
+        return remoteFailureResult(.failed, warnings);
+    if (ahead_behind.ahead == 0 and ahead_behind.behind == 0)
+        return remoteSuccessResult(.already_up_to_date, warnings);
+    if (ahead_behind.ahead != 0) return remoteFailureResult(.failed, warnings);
+
+    const merge_argv = [_][]const u8{ "git", "merge", "--ff-only", remote_ref };
+    var merge = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &merge_argv);
+    defer merge.deinit();
+    if (commandFailure(&merge, false)) |failure| return remoteFailureResult(failure, warnings);
+    return remoteSuccessResult(.completed, warnings);
+}
+
+fn securePullPreconditionsMatch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    operation: RemoteOperationRequest,
+    request: PullRequest,
+) RemoteCheck {
+    switch (secureRemoteBranchSnapshotMatches(allocator, io, operation, request.branch, request.oid)) {
+        .matches => {},
+        .mismatch => return .mismatch,
+        .failed => |failure| return .{ .failed = failure },
+    }
+
+    const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
+    var upstream = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &upstream_argv);
+    defer upstream.deinit();
+    if (commandFailure(&upstream, false)) |failure| return .{ .failed = failure };
+    const actual = switch (upstream) {
+        .completed => |*result| trimLineEnd(result.stdout.bytes()),
+        else => unreachable,
+    };
+    const expected = std.fmt.allocPrint(allocator, "{s}/{s}", .{ request.remote, request.remote_branch }) catch return .{ .failed = .failed };
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, actual, expected)) return .mismatch;
+
+    const status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
+    var status = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &status_argv);
+    defer status.deinit();
+    if (commandFailure(&status, false)) |failure| return .{ .failed = failure };
+    return switch (status) {
+        .completed => |*result| if (result.stdout.bytes().len == 0) .matches else .mismatch,
+        else => unreachable,
+    };
+}
+
+fn secureRemoteBranchSnapshotMatches(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    operation: RemoteOperationRequest,
+    branch: []const u8,
+    oid: []const u8,
+) RemoteCheck {
+    const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
+    var branch_command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &branch_argv);
+    defer branch_command.deinit();
+    if (commandFailure(&branch_command, false)) |failure| return .{ .failed = failure };
+    const actual_branch = switch (branch_command) {
+        .completed => |*result| trimLineEnd(result.stdout.bytes()),
+        else => unreachable,
+    };
+    if (!std.mem.eql(u8, actual_branch, branch)) return .mismatch;
+
+    const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
+    var oid_command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &oid_argv);
+    defer oid_command.deinit();
+    if (commandFailure(&oid_command, false)) |failure| return .{ .failed = failure };
+    const actual_oid = switch (oid_command) {
+        .completed => |*result| trimLineEnd(result.stdout.bytes()),
+        else => unreachable,
+    };
+    return if (std.mem.eql(u8, actual_oid, oid)) .matches else .mismatch;
+}
+
 fn runGitPush(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, parent_env: ?*const std.process.Environ.Map, request: PushRequest) LoadError!OperationResult {
     if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.branch, request.oid)) {
         return .{ .failed_static = "Branch changed before push; reload and try again" };
@@ -3560,80 +4228,85 @@ pub fn buildRemoteEnvironment(
     };
     errdefer owned.deinit();
 
-    const source = parent orelse {
-        if (mode == .foreground) try owned.map.put("GCM_INTERACTIVE", "1");
-        return owned;
-    };
+    if (parent) |source| {
+        const common_exact = [_][]const u8{
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TMPDIR",
+            "LANG",
+            "LANGUAGE",
+            "TZ",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "GNUPGHOME",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "GCM_CREDENTIAL_STORE",
+            "GCM_CREDENTIAL_CACHE_OPTIONS",
+            "GCM_PLAINTEXT_STORE_PATH",
+            "GCM_DPAPI_STORE_PATH",
+            "GCM_GPG_PATH",
+            "GCM_PROVIDER",
+            "GCM_AUTODETECT_TIMEOUT",
+            "GCM_MSAUTH_FLOW",
+        };
+        for (common_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
 
-    const common_exact = [_][]const u8{
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "TMPDIR",
-        "LANG",
-        "LANGUAGE",
-        "TZ",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_RUNTIME_DIR",
-        "SSH_AUTH_SOCK",
-        "SSH_AGENT_PID",
-        "GNUPGHOME",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "GCM_CREDENTIAL_STORE",
-        "GCM_CREDENTIAL_CACHE_OPTIONS",
-        "GCM_PLAINTEXT_STORE_PATH",
-        "GCM_DPAPI_STORE_PATH",
-        "GCM_GPG_PATH",
-        "GCM_PROVIDER",
-        "GCM_AUTODETECT_TIMEOUT",
-        "GCM_MSAUTH_FLOW",
-    };
-    for (common_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
+        for (source.keys(), source.values()) |key, value|
+            if (isLocaleEnvironmentKey(key)) try owned.map.put(key, value);
 
-    for (source.keys(), source.values()) |key, value|
-        if (isLocaleEnvironmentKey(key)) try owned.map.put(key, value);
-
-    const proxy_keys = [_][]const u8{
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    };
-    for (proxy_keys) |key| {
-        const value = source.get(key) orelse continue;
-        if (proxyContainsUserInfo(value)) {
-            owned.warnings.proxy_credentials_omitted = true;
-        } else {
-            try owned.map.put(key, value);
+        const proxy_keys = [_][]const u8{
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        };
+        for (proxy_keys) |key| {
+            const value = source.get(key) orelse continue;
+            if (proxyContainsUserInfo(value)) {
+                owned.warnings.proxy_credentials_omitted = true;
+            } else {
+                try owned.map.put(key, value);
+            }
+        }
+        if (mode == .foreground) {
+            const foreground_exact = [_][]const u8{
+                "XDG_CURRENT_DESKTOP",
+                "XDG_SESSION_TYPE",
+                "DISPLAY",
+                "WAYLAND_DISPLAY",
+                "BROWSER",
+                "TERM",
+                "COLORTERM",
+                "SSH_TTY",
+                "GPG_TTY",
+                "GCM_GUI_PROMPT",
+            };
+            for (foreground_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
         }
     }
-    if (mode == .foreground) {
-        const foreground_exact = [_][]const u8{
-            "XDG_CURRENT_DESKTOP",
-            "XDG_SESSION_TYPE",
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "BROWSER",
-            "TERM",
-            "COLORTERM",
-            "SSH_TTY",
-            "GPG_TTY",
-            "GCM_GUI_PROMPT",
-        };
-        for (foreground_exact) |key| try copyRemoteEnvironmentKey(&owned.map, source, key);
-    }
 
-    if (mode == .foreground) try owned.map.put("GCM_INTERACTIVE", "1");
+    switch (mode) {
+        .background, .inspection => {
+            try owned.map.put("GIT_TERMINAL_PROMPT", "0");
+            try owned.map.put("GCM_INTERACTIVE", "0");
+            try owned.map.put("GCM_GUI_PROMPT", "0");
+            try owned.map.put("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        },
+        .foreground => try owned.map.put("GCM_INTERACTIVE", "1"),
+    }
     return owned;
 }
 
@@ -4002,7 +4675,47 @@ test "stdin admission Git mapping keeps writer error with zero-exit warning" {
     }
 }
 
-test "foreground remote environment owns the exact allowlist" {
+fn writeExecutableRemoteTestScript(
+    io: std.Io,
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    contents: []const u8,
+) !void {
+    try dir.writeFile(io, .{
+        .sub_path = sub_path,
+        .data = contents,
+        .flags = .{ .permissions = .executable_file },
+    });
+}
+
+fn runBackgroundCredentialFill(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const std.process.Environ.Map,
+    control: process_runner.ProcessControl,
+) SensitiveRemoteCommand {
+    const argv = [_][]const u8{
+        "sh",
+        "-c",
+        "printf 'protocol=https\\nhost=example.invalid\\n\\n' | git -c credential.interactive=false credential fill",
+    };
+    return runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &argv);
+}
+
+fn configureRemoteTestHelper(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    work: std.Io.Dir,
+    helper_path: []const u8,
+) !void {
+    const helper = try std.fmt.allocPrint(allocator, "!{s}", .{helper_path});
+    defer allocator.free(helper);
+    try runTestGit(io, &.{ "git", "config", "--local", "--replace-all", "credential.helper", "" }, work);
+    try runTestGit(io, &.{ "git", "config", "--local", "--add", "credential.helper", helper }, work);
+}
+
+test "foreground and background remote operation environment own the exact allowlist" {
     const allocator = std.testing.allocator;
     var parent = std.process.Environ.Map.init(allocator);
     defer parent.deinit();
@@ -4021,7 +4734,12 @@ test "foreground remote environment owns the exact allowlist" {
 
     try parent.put("XDG_STATE_HOME", "/forbidden/state");
     try parent.put("GIT_DIR", "/forbidden/repo");
+    try parent.put("GIT_WORK_TREE", "/forbidden/worktree");
+    try parent.put("GIT_CONFIG_COUNT", "1");
+    try parent.put("GIT_CONFIG_KEY_0", "http.extraHeader");
+    try parent.put("GIT_CONFIG_VALUE_0", "Authorization: CONFIG-SECRET-CANARY");
     try parent.put("GIT_ASKPASS", "/forbidden/askpass");
+    try parent.put("SSH_ASKPASS", "/forbidden/ssh-askpass");
     try parent.put("SSH_ASKPASS_REQUIRE", "force");
     try parent.put("GCM_TRACE", "1");
     try parent.put("GCM_DEBUG", "1");
@@ -4029,14 +4747,20 @@ test "foreground remote environment owns the exact allowlist" {
     try parent.put("GITHUB_TOKEN", "PROVIDER-SECRET-CANARY");
     try parent.put("GCM_INTERACTIVE", "0");
 
-    var inspection = try buildRemoteEnvironment(allocator, &parent, .inspection);
-    defer inspection.deinit();
-    try std.testing.expectEqualStrings("/home/test", inspection.map.get("HOME").?);
-    try std.testing.expectEqualStrings("C", inspection.map.get("LC_TIME").?);
-    try std.testing.expect(inspection.map.get("TERM") == null);
-    try std.testing.expect(inspection.map.get("DISPLAY") == null);
-    try std.testing.expect(inspection.map.get("GCM_GUI_PROMPT") == null);
-    try std.testing.expect(inspection.map.get("GCM_INTERACTIVE") == null);
+    var background = try buildRemoteEnvironment(allocator, &parent, .background);
+    defer background.deinit();
+    try std.testing.expectEqualStrings("/home/test", background.map.get("HOME").?);
+    try std.testing.expectEqualStrings("C", background.map.get("LC_TIME").?);
+    try std.testing.expectEqualStrings("/run/agent.sock", background.map.get("SSH_AUTH_SOCK").?);
+    try std.testing.expectEqualStrings("unix:path=/run/dbus", background.map.get("DBUS_SESSION_BUS_ADDRESS").?);
+    try std.testing.expectEqualStrings("/etc/certs.pem", background.map.get("SSL_CERT_FILE").?);
+    try std.testing.expectEqualStrings("secretservice", background.map.get("GCM_CREDENTIAL_STORE").?);
+    try std.testing.expect(background.map.get("TERM") == null);
+    try std.testing.expect(background.map.get("DISPLAY") == null);
+    try std.testing.expectEqualStrings("0", background.map.get("GCM_GUI_PROMPT").?);
+    try std.testing.expectEqualStrings("0", background.map.get("GCM_INTERACTIVE").?);
+    try std.testing.expectEqualStrings("0", background.map.get("GIT_TERMINAL_PROMPT").?);
+    try std.testing.expectEqualStrings("ssh -o BatchMode=yes", background.map.get("GIT_SSH_COMMAND").?);
 
     var foreground = try buildRemoteEnvironment(allocator, &parent, .foreground);
     defer foreground.deinit();
@@ -4048,17 +4772,665 @@ test "foreground remote environment owns the exact allowlist" {
     const forbidden = [_][]const u8{
         "XDG_STATE_HOME",
         "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
         "GIT_ASKPASS",
+        "SSH_ASKPASS",
         "SSH_ASKPASS_REQUIRE",
         "GCM_TRACE",
         "GCM_DEBUG",
         "GCM_AZREPOS_SP_SECRET",
         "GITHUB_TOKEN",
     };
-    for (forbidden) |key| try std.testing.expect(foreground.map.get(key) == null);
+    for (forbidden) |key| {
+        try std.testing.expect(background.map.get(key) == null);
+        try std.testing.expect(foreground.map.get(key) == null);
+    }
 
     try parent.put("HOME", "/changed");
     try std.testing.expectEqualStrings("/home/test", foreground.map.get("HOME").?);
+}
+
+test "remote authentication blocks GUI interaction and bounds a noncooperating credential helper" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "home", .default_dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+
+    try writeExecutableRemoteTestScript(io, tmp.dir, "cooperating-helper", "#!/bin/sh\n" ++
+        ": > \"$HOME/helper-invoked\"\n" ++
+        "if [ -n \"${DISPLAY:-}${WAYLAND_DISPLAY:-}${BROWSER:-}${COLORTERM:-}${SSH_TTY:-}${GPG_TTY:-}\" ]; then\n" ++
+        "  : > \"$HOME/gui-attempted\"\n" ++
+        "fi\n" ++
+        "if [ \"${GIT_TERMINAL_PROMPT:-}\" != 0 ] || [ \"${GCM_INTERACTIVE:-}\" != 0 ] || [ \"${GCM_GUI_PROMPT:-}\" != 0 ]; then\n" ++
+        "  : > \"$HOME/interaction-enabled\"\n" ++
+        "fi\n" ++
+        "exit 1\n");
+    const helper_path = try tmp.dir.realPathFileAlloc(io, "cooperating-helper", allocator);
+    defer allocator.free(helper_path);
+    try configureRemoteTestHelper(allocator, io, work, helper_path);
+
+    const home_root = try tmp.dir.realPathFileAlloc(io, "home", allocator);
+    defer allocator.free(home_root);
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", home_root);
+    try parent.put("DISPLAY", ":99");
+    try parent.put("WAYLAND_DISPLAY", "wayland-canary");
+    try parent.put("BROWSER", "browser-canary");
+    try parent.put("TERM", "xterm-canary");
+    try parent.put("COLORTERM", "truecolor-canary");
+    try parent.put("SSH_TTY", "/dev/pts/canary");
+    try parent.put("GPG_TTY", "/dev/pts/gpg-canary");
+    try parent.put("GIT_ASKPASS", "/forbidden/askpass");
+    var environment = try buildRemoteEnvironment(allocator, &parent, .background);
+    defer environment.deinit();
+
+    var denied = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{});
+    defer denied.deinit();
+    try std.testing.expectEqual(RemoteFailure.failed, commandFailure(&denied, true).?);
+    try tmp.dir.access(io, "home/helper-invoked", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/gui-attempted", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/interaction-enabled", .{}));
+
+    try writeExecutableRemoteTestScript(io, tmp.dir, "hanging-helper", "#!/bin/sh\n" ++
+        ": > \"$HOME/hanging-helper-invoked\"\n" ++
+        "trap '' TERM\n" ++
+        "while :; do sleep 1; done\n");
+    const hanging_path = try tmp.dir.realPathFileAlloc(io, "hanging-helper", allocator);
+    defer allocator.free(hanging_path);
+    try configureRemoteTestHelper(allocator, io, work, hanging_path);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(250),
+        .clock = .awake,
+    });
+    var timed_out = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{ .deadline = deadline });
+    defer timed_out.deinit();
+    try std.testing.expect(timed_out == .timed_out);
+    try tmp.dir.access(io, "home/hanging-helper-invoked", .{});
+}
+
+test "remote authentication uses a DBus cached libsecret-equivalent helper without GUI discovery" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "home", .default_dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+
+    try writeExecutableRemoteTestScript(io, tmp.dir, "libsecret-fixture", "#!/bin/sh\n" ++
+        "if [ -n \"${DISPLAY:-}${WAYLAND_DISPLAY:-}${BROWSER:-}${GPG_TTY:-}\" ]; then\n" ++
+        "  : > \"$HOME/libsecret-gui-attempted\"\n" ++
+        "  exit 1\n" ++
+        "fi\n" ++
+        "[ \"${DBUS_SESSION_BUS_ADDRESS:-}\" = \"unix:path=$HOME/session-bus\" ] || exit 1\n" ++
+        "printf 'username=dbus-user\\npassword=DBUS-CACHED-CREDENTIAL-CANARY\\n'\n");
+    const helper_path = try tmp.dir.realPathFileAlloc(io, "libsecret-fixture", allocator);
+    defer allocator.free(helper_path);
+    try configureRemoteTestHelper(allocator, io, work, helper_path);
+
+    const home_root = try tmp.dir.realPathFileAlloc(io, "home", allocator);
+    defer allocator.free(home_root);
+    const dbus_address = try std.fmt.allocPrint(allocator, "unix:path={s}/session-bus", .{home_root});
+    defer allocator.free(dbus_address);
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", home_root);
+    try parent.put("DBUS_SESSION_BUS_ADDRESS", dbus_address);
+    try parent.put("DISPLAY", ":99");
+    try parent.put("BROWSER", "browser-canary");
+    try parent.put("TERM", "terminal-canary");
+    var environment = try buildRemoteEnvironment(allocator, &parent, .background);
+    defer environment.deinit();
+
+    try std.testing.expectEqualStrings(dbus_address, environment.map.get("DBUS_SESSION_BUS_ADDRESS").?);
+    var command = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{});
+    defer command.deinit();
+    try std.testing.expect(commandFailure(&command, true) == null);
+    const output = switch (command) {
+        .completed => |*result| result.stdout.bytes(),
+        else => return error.ExpectedDbusCredential,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, output, "username=dbus-user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "password=DBUS-CACHED-CREDENTIAL-CANARY") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/libsecret-gui-attempted", .{}));
+}
+
+test "credential helper requiring an omitted key returns only a fixed sensitive diagnostic" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "home", .default_dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+
+    try writeExecutableRemoteTestScript(io, tmp.dir, "custom-key-helper", "#!/bin/sh\n" ++
+        "if [ -n \"${CUSTOM_HELPER_TOKEN:-}\" ]; then\n" ++
+        "  printf 'username=ambient-user\\npassword=%s\\n' \"$CUSTOM_HELPER_TOKEN\"\n" ++
+        "  exit 0\n" ++
+        "fi\n" ++
+        "printf '%s\\n' 'Authorization: Bearer OMITTED-AUTH-CANARY' 'password=OMITTED-PASSWORD-CANARY' 'OMITTED-ARBITRARY-CANARY' >&2\n" ++
+        "exit 1\n");
+    const helper_path = try tmp.dir.realPathFileAlloc(io, "custom-key-helper", allocator);
+    defer allocator.free(helper_path);
+    try configureRemoteTestHelper(allocator, io, work, helper_path);
+
+    const home_root = try tmp.dir.realPathFileAlloc(io, "home", allocator);
+    defer allocator.free(home_root);
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", home_root);
+    try parent.put("CUSTOM_HELPER_TOKEN", "AMBIENT-CREDENTIAL-CANARY");
+    var environment = try buildRemoteEnvironment(allocator, &parent, .background);
+    defer environment.deinit();
+    try std.testing.expect(environment.map.get("CUSTOM_HELPER_TOKEN") == null);
+
+    var command = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{});
+    defer command.deinit();
+    const failure = commandFailure(&command, true) orelse return error.ExpectedCredentialFailure;
+    try std.testing.expectEqual(RemoteFailure.failed, failure);
+    const raw = switch (command) {
+        .completed => |*result| result.stderr.bytes(),
+        else => return error.ExpectedSensitiveDiagnostic,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, raw, "OMITTED-AUTH-CANARY") != null);
+    const safe_result = remoteFailureResult(failure, environment.warnings);
+    const formatted = try std.fmt.allocPrint(allocator, "{any}", .{safe_result});
+    defer allocator.free(formatted);
+    const canaries = [_][]const u8{
+        "AMBIENT-CREDENTIAL-CANARY",
+        "OMITTED-AUTH-CANARY",
+        "OMITTED-PASSWORD-CANARY",
+        "OMITTED-ARBITRARY-CANARY",
+    };
+    for (canaries) |canary| try std.testing.expect(std.mem.indexOf(u8, formatted, canary) == null);
+}
+
+test "remote URL audit rejects every fetch URL pushurl and effective push URL before network" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "bin", .default_dir);
+    try tmp.dir.createDir(io, "home", .default_dir);
+    try writeExecutableRemoteTestScript(io, tmp.dir, "bin/git-remote-networkmarker", "#!/bin/sh\n" ++
+        ": > \"$HOME/network-started\"\n" ++
+        "exit 1\n");
+    const bin_root = try tmp.dir.realPathFileAlloc(io, "bin", allocator);
+    defer allocator.free(bin_root);
+    const home_root = try tmp.dir.realPathFileAlloc(io, "home", allocator);
+    defer allocator.free(home_root);
+    const path = try std.fmt.allocPrint(allocator, "{s}:/usr/bin:/bin", .{bin_root});
+    defer allocator.free(path);
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+    try parent.put("PATH", path);
+    try parent.put("HOME", home_root);
+    var environment = try buildRemoteEnvironment(allocator, &parent, .background);
+    defer environment.deinit();
+
+    try tmp.dir.createDir(io, "fetch-work", .default_dir);
+    var fetch_work = try tmp.dir.openDir(io, "fetch-work", .{});
+    defer fetch_work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, fetch_work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", "networkmarker::first-fetch-url" }, fetch_work);
+    try runTestGit(io, &.{ "git", "config", "--local", "--add", "remote.origin.url", "https://alice:FETCH-URL-CANARY@127.0.0.1:1/repo.git" }, fetch_work);
+    const fetch_root_path = try tmp.dir.realPathFileAlloc(io, "fetch-work", allocator);
+    defer allocator.free(fetch_root_path);
+    var fetch_root = try root_capability.RootCapability.openCanonical(fetch_root_path);
+    defer fetch_root.deinit();
+    const fetch_result = LocalCommandBackend.runRemoteOperation(allocator, io, .{
+        .root = &fetch_root,
+        .environment = &environment,
+        .control = .{},
+        .kind = .{ .fetch = .{ .remote = "origin" } },
+    });
+    try std.testing.expectEqual(RemoteOperationOutcome{ .failed = .http_userinfo_rejected }, fetch_result.outcome);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/network-started", .{}));
+
+    try tmp.dir.createDir(io, "pushurl-work", .default_dir);
+    var pushurl_work = try tmp.dir.openDir(io, "pushurl-work", .{});
+    defer pushurl_work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, pushurl_work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", "networkmarker::default-push-url" }, pushurl_work);
+    try runTestGit(io, &.{ "git", "config", "--local", "--add", "remote.origin.pushurl", "networkmarker::first-pushurl" }, pushurl_work);
+    try runTestGit(io, &.{ "git", "config", "--local", "--add", "remote.origin.pushurl", "https://bob:PUSHURL-CANARY@127.0.0.1:1/repo.git" }, pushurl_work);
+    const pushurl_root_path = try tmp.dir.realPathFileAlloc(io, "pushurl-work", allocator);
+    defer allocator.free(pushurl_root_path);
+    var pushurl_root = try root_capability.RootCapability.openCanonical(pushurl_root_path);
+    defer pushurl_root.deinit();
+    const pushurl_result = LocalCommandBackend.runRemoteOperation(allocator, io, .{
+        .root = &pushurl_root,
+        .environment = &environment,
+        .control = .{},
+        .kind = .{ .push = .{
+            .mode = .upstream,
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = "deadbeef",
+        } },
+    });
+    try std.testing.expectEqual(RemoteOperationOutcome{ .failed = .http_userinfo_rejected }, pushurl_result.outcome);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/network-started", .{}));
+
+    try tmp.dir.createDir(io, "effective-push-work", .default_dir);
+    var effective_work = try tmp.dir.openDir(io, "effective-push-work", .{});
+    defer effective_work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, effective_work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", "fixture-alias:repo" }, effective_work);
+    try runTestGit(io, &.{ "git", "config", "--local", "url.https://carol:EFFECTIVE-PUSH-CANARY@127.0.0.1:1/.pushInsteadOf", "fixture-alias:" }, effective_work);
+    const effective_root_path = try tmp.dir.realPathFileAlloc(io, "effective-push-work", allocator);
+    defer allocator.free(effective_root_path);
+    var effective_root = try root_capability.RootCapability.openCanonical(effective_root_path);
+    defer effective_root.deinit();
+    const effective_result = LocalCommandBackend.runRemoteOperation(allocator, io, .{
+        .root = &effective_root,
+        .environment = &environment,
+        .control = .{},
+        .kind = .{ .push = .{
+            .mode = .upstream,
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = "deadbeef",
+        } },
+    });
+    try std.testing.expectEqual(RemoteOperationOutcome{ .failed = .http_userinfo_rejected }, effective_result.outcome);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/network-started", .{}));
+}
+
+test "sensitive diagnostic from a production remote helper cannot cross the typed result boundary" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "bin", .default_dir);
+    try tmp.dir.createDir(io, "home", .default_dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    try writeExecutableRemoteTestScript(io, tmp.dir, "bin/git-remote-redactfixture", "#!/bin/sh\n" ++
+        ": > \"$HOME/raw-helper-invoked\"\n" ++
+        "printf '%s\\n' 'https://alice:RAW-URL-CANARY@example.invalid/repo.git' 'Authorization: Bearer RAW-AUTH-CANARY' 'password=RAW-PASSWORD-CANARY' 'RAW-ARBITRARY-CANARY' >&2\n" ++
+        "exit 1\n");
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", "redactfixture::opaque" }, work);
+
+    const bin_root = try tmp.dir.realPathFileAlloc(io, "bin", allocator);
+    defer allocator.free(bin_root);
+    const home_root = try tmp.dir.realPathFileAlloc(io, "home", allocator);
+    defer allocator.free(home_root);
+    const path = try std.fmt.allocPrint(allocator, "{s}:/usr/bin:/bin", .{bin_root});
+    defer allocator.free(path);
+    var parent = std.process.Environ.Map.init(allocator);
+    defer parent.deinit();
+    try parent.put("PATH", path);
+    try parent.put("HOME", home_root);
+    var environment = try buildRemoteEnvironment(allocator, &parent, .background);
+    defer environment.deinit();
+    const work_root_path = try tmp.dir.realPathFileAlloc(io, "work", allocator);
+    defer allocator.free(work_root_path);
+    var root = try root_capability.RootCapability.openCanonical(work_root_path);
+    defer root.deinit();
+
+    const result = LocalCommandBackend.runRemoteOperation(allocator, io, .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .kind = .{ .fetch = .{ .remote = "origin" } },
+    });
+    try std.testing.expectEqual(RemoteOperationOutcome{ .failed = .failed }, result.outcome);
+    try tmp.dir.access(io, "home/raw-helper-invoked", .{});
+    const formatted = try std.fmt.allocPrint(allocator, "{any}", .{result});
+    defer allocator.free(formatted);
+    const canaries = [_][]const u8{
+        "RAW-URL-CANARY",
+        "RAW-AUTH-CANARY",
+        "RAW-PASSWORD-CANARY",
+        "RAW-ARBITRARY-CANARY",
+    };
+    for (canaries) |canary| try std.testing.expect(std.mem.indexOf(u8, formatted, canary) == null);
+}
+
+test "remote URL audit rejects HTTP userinfo without exposing the sensitive diagnostic" {
+    try std.testing.expectEqual(UrlAudit.accepted, auditLineFramedUrls(
+        "https://example.invalid/owner/repo.git\nssh://git@example.invalid/repo.git\n",
+    ));
+    try std.testing.expectEqual(UrlAudit.userinfo, auditLineFramedUrls(
+        "https://alice:REMOTE-URL-CANARY@example.invalid/owner/repo.git\n",
+    ));
+    try std.testing.expectEqual(UrlAudit.userinfo, auditNulFramedUrls(
+        "http://alice@example.invalid/repo.git\x00",
+    ));
+    try std.testing.expectEqual(UrlAudit.invalid, auditLineFramedUrls(
+        "https://example.invalid/repo.git\r\n",
+    ));
+    try std.testing.expectEqual(UrlAudit.invalid, auditNulFramedUrls(
+        "https://example.invalid/repo.git",
+    ));
+    try std.testing.expectEqual(UrlAudit.invalid, auditLineFramedUrls(
+        "https://[invalid/repo.git\n",
+    ));
+    try std.testing.expectEqual(UrlAudit.invalid, auditLineFramedUrls(
+        "https://exam\x01ple.invalid/repo.git\n",
+    ));
+}
+
+test "credential helper classification honors reset and plaintext store" {
+    var warnings: RemoteWarningSet = .{};
+    try std.testing.expect(classifyHelperRecords("store\x00\x00cache\x00", &warnings));
+    try std.testing.expect(!warnings.git_plaintext_store);
+    try std.testing.expect(!warnings.helper_policy_unknown);
+
+    warnings = .{};
+    try std.testing.expect(classifyHelperRecords("cache\x00store\x00", &warnings));
+    try std.testing.expect(warnings.git_plaintext_store);
+
+    warnings = .{};
+    try std.testing.expect(classifyHelperRecords("store --file /tmp/credentials\x00", &warnings));
+    try std.testing.expect(warnings.git_plaintext_store);
+
+    warnings = .{};
+    try std.testing.expect(classifyHelperRecords("!custom wrapper\x00", &warnings));
+    try std.testing.expect(warnings.helper_policy_unknown);
+
+    warnings = .{};
+    try std.testing.expect(classifyHelperRecords("!custom wrapper\x00\x00cache\x00", &warnings));
+    try std.testing.expect(!warnings.helper_policy_unknown);
+
+    warnings = .{};
+    try std.testing.expect(classifyHelperOrigins("file:.git/config\x00cache\x00file:/tmp/included.conf\x00store\x00", &warnings));
+    try std.testing.expect(warnings.potential_plaintext_store);
+    try std.testing.expect(nulSingleValueEquals("plaintext\x00", "plaintext"));
+
+    warnings = .{};
+    try std.testing.expect(classifyScopedHelperRecords(
+        "credential.https://example.invalid.helper\ncache --timeout 60\x00" ++
+            "credential.https://other.invalid.helper\nstore --file /tmp/credentials\x00" ++
+            "credential.https://third.invalid.helper\n!custom wrapper\x00",
+        &warnings,
+    ));
+    try std.testing.expect(warnings.potential_plaintext_store);
+    try std.testing.expect(warnings.helper_policy_unknown);
+}
+
+test "remote authentication failure becomes a typed sensitive diagnostic" {
+    const canary = "Authorization: Basic SENSITIVE-DIAGNOSTIC-CANARY";
+    try std.testing.expectEqual(
+        RemoteFailure.authentication_required,
+        diagnoseRemoteFailure(canary, "fatal: could not read Username: terminal prompts disabled"),
+    );
+    try std.testing.expectEqual(
+        RemoteFailure.ssh_public_key,
+        diagnoseRemoteFailure(canary, "git@example.invalid: Permission denied (publickey)."),
+    );
+    try std.testing.expectEqual(
+        RemoteFailure.failed,
+        diagnoseRemoteFailure(canary, "arbitrary remote failure"),
+    );
+}
+
+test "remote cancel is observed before a sensitive child spawn" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var canceled_generation: std.atomic.Value(u64) = .init(9);
+    const argv = [_][]const u8{ "sh", "-c", "exit 0" };
+    var result = runSensitiveRemoteCommand(
+        std.testing.allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        &environment,
+        .{ .cancellation = .{
+            .canceled_generation = &canceled_generation,
+            .generation = 9,
+        } },
+        &argv,
+    );
+    defer result.deinit();
+    try std.testing.expect(result == .canceled);
+}
+
+fn requestRemoteCancellation(
+    io: std.Io,
+    canceled_generation: *std.atomic.Value(u64),
+    generation: u64,
+) std.Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(40), .awake);
+    canceled_generation.store(generation, .release);
+}
+
+test "remote cancel contains a running TERM-ignoring helper process group" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("PATH", "/usr/bin:/bin");
+    var canceled_generation: std.atomic.Value(u64) = .init(0);
+    var cancel_future = try std.testing.io.concurrent(requestRemoteCancellation, .{
+        std.testing.io,
+        &canceled_generation,
+        23,
+    });
+    defer _ = cancel_future.cancel(std.testing.io) catch {};
+
+    const argv = [_][]const u8{
+        "sh",
+        "-c",
+        "trap '' TERM; sh -c 'trap \"\" TERM; while :; do sleep 1; done' & while :; do sleep 1; done",
+    };
+    var result = runSensitiveRemoteCommand(
+        std.testing.allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        &environment,
+        .{ .cancellation = .{
+            .canceled_generation = &canceled_generation,
+            .generation = 23,
+        } },
+        &argv,
+    );
+    defer result.deinit();
+    try cancel_future.await(std.testing.io);
+    try std.testing.expect(result == .canceled);
+}
+
+test "remote timeout is observed before a sensitive child spawn" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    const argv = [_][]const u8{ "sh", "-c", "exit 0" };
+    const expired = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .raw = .fromMilliseconds(-1),
+        .clock = .awake,
+    });
+    var result = runSensitiveRemoteCommand(
+        std.testing.allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        &environment,
+        .{ .deadline = expired },
+        &argv,
+    );
+    defer result.deinit();
+    try std.testing.expect(result == .timed_out);
+}
+
+test "credential helper plaintext warning survives descriptor-bound remote authentication success" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
+    defer std.testing.allocator.free(remote_root);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
+    try runTestGit(io, &.{ "git", "config", "--local", "credential.helper", "store" }, work);
+
+    const work_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(work_root);
+    var root = try root_capability.RootCapability.openCanonical(work_root);
+    defer root.deinit();
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .background);
+    defer environment.deinit();
+
+    const result = LocalCommandBackend.runRemoteOperation(std.testing.allocator, io, .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .kind = .{ .fetch = .{ .remote = "origin" } },
+    });
+    try std.testing.expectEqual(RemoteOperationOutcome{ .ok = .completed }, result.outcome);
+    try std.testing.expect(result.warnings.git_plaintext_store);
+}
+
+test "remote authentication uses a cached noninteractive HTTPS credential helper" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "home", .default_dir);
+    var home = try tmp.dir.openDir(io, "home", .{});
+    defer home.close(io);
+    try home.writeFile(io, .{
+        .sub_path = ".git-credentials",
+        .data = "https://alice:CACHED-HTTPS-CREDENTIAL-CANARY@example.invalid\n",
+    });
+    const home_root = try tmp.dir.realPathFileAlloc(io, "home", std.testing.allocator);
+    defer std.testing.allocator.free(home_root);
+
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    try parent.put("HOME", home_root);
+    try parent.put("DISPLAY", ":99");
+    try parent.put("BROWSER", "GUI-CANARY");
+    var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .background);
+    defer environment.deinit();
+    try std.testing.expect(environment.map.get("DISPLAY") == null);
+    try std.testing.expect(environment.map.get("BROWSER") == null);
+
+    const argv = [_][]const u8{
+        "sh",
+        "-c",
+        "printf 'protocol=https\\nhost=example.invalid\\n\\n' | git -c credential.interactive=false -c credential.helper=store credential fill",
+    };
+    var command = runSensitiveRemoteCommand(
+        std.testing.allocator,
+        io,
+        tmp.dir,
+        &environment.map,
+        .{},
+        &argv,
+    );
+    defer command.deinit();
+    try std.testing.expect(commandFailure(&command, false) == null);
+    const output = switch (command) {
+        .completed => |*result| result.stdout.bytes(),
+        else => return error.ExpectedCachedCredential,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, output, "username=alice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "password=CACHED-HTTPS-CREDENTIAL-CANARY") != null);
+}
+
+test "remote authentication descriptor cwd survives repository path replacement" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    const remote_root = try tmp.dir.realPathFileAlloc(io, "remote.git", std.testing.allocator);
+    defer std.testing.allocator.free(remote_root);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", remote_root }, work);
+
+    const work_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(work_root);
+    var root = try root_capability.RootCapability.openCanonical(work_root);
+    defer root.deinit();
+    try tmp.dir.rename("work", tmp.dir, "pinned-work", io);
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var replacement = try tmp.dir.openDir(io, "work", .{});
+    defer replacement.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", "https://alice:REPLACEMENT-CANARY@127.0.0.1:1/repo.git" }, replacement);
+
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .background);
+    defer environment.deinit();
+    const result = LocalCommandBackend.runRemoteOperation(std.testing.allocator, io, .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .kind = .{ .fetch = .{ .remote = "origin" } },
+    });
+    try std.testing.expectEqual(RemoteOperationOutcome{ .ok = .completed }, result.outcome);
+}
+
+test "remote URL userinfo is rejected before background authentication network access" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "work", .default_dir);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+    try runTestGit(io, &.{ "git", "remote", "add", "origin", "https://alice:REMOTE-URL-NETWORK-CANARY@127.0.0.1:1/owner/repo.git" }, work);
+
+    const work_root = try tmp.dir.realPathFileAlloc(io, "work", std.testing.allocator);
+    defer std.testing.allocator.free(work_root);
+    var root = try root_capability.RootCapability.openCanonical(work_root);
+    defer root.deinit();
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PATH", "/usr/bin:/bin");
+    var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .background);
+    defer environment.deinit();
+
+    const result = LocalCommandBackend.runRemoteOperation(std.testing.allocator, io, .{
+        .root = &root,
+        .environment = &environment,
+        .control = .{},
+        .kind = .{ .fetch = .{ .remote = "origin" } },
+    });
+    try std.testing.expectEqual(
+        RemoteOperationOutcome{ .failed = .http_userinfo_rejected },
+        result.outcome,
+    );
 }
 
 test "foreground remote environment omits credential-bearing proxies" {

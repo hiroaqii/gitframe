@@ -595,6 +595,7 @@ pub const App = struct {
                 .config => {},
             },
             .git_action_spinner_tick => if (self.actionLifecycle().tick(ctx)) self.redraw_plan.requestSkip(),
+            .cancel_remote_action => _ = self.remoteWorkflow().cancelActiveRemote(false),
             .quit => self.requestQuit(ctx),
         }
         self.reviewRead().retireSupersededActionCursor(ctx, self.actionLifecycleView().generation());
@@ -620,6 +621,7 @@ pub const App = struct {
 
     fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
         if (self.actionLifecycleView().hasPending()) {
+            if (self.remoteWorkflow().cancelActiveRemote(true)) return;
             self.setStatus("finish current git action before quitting", .{});
             return;
         }
@@ -748,6 +750,10 @@ pub const App = struct {
         if (outcome.reload != .none) {
             try self.reviewRead().applyEffectReload(ctx, outcome.reload);
         }
+        if (outcome.quit_after_terminal) {
+            self.teardown_requested = true;
+            ctx.quit();
+        }
     }
 
     fn requestRemotePush(self: *App, ctx: *chasen.Ctx(Msg)) !void {
@@ -831,6 +837,8 @@ pub const App = struct {
             .keymap = self.keymap,
             .terminal_size = self.terminal_size,
             .action = self.actionLifecycleView(),
+            .remote_cancelable = remote.canCancel(self.actionLifecycleView().acceptedPending()),
+            .remote_canceling = remote.canceling(),
             .status = &self.status,
             .page_status = self.activePageStatus(),
             .commit_panel = local.commitPanel(),
@@ -946,6 +954,7 @@ pub const App = struct {
             .commit_panel_mode = self.localWorkflowView().commitPanelOpen(),
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
+            .remote_action_cancelable = self.remoteWorkflowView().canCancel(self.actionLifecycleView().acceptedPending()),
             .keymap = self.keymap,
             .overlay = &self.overlay,
             .layout = layout,

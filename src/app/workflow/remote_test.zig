@@ -517,6 +517,41 @@ fn repositoryIdentityForTest(app: *const RemoteHarness) remote_request.Repositor
     };
 }
 
+fn installPushConfirmationForTest(
+    app: *RemoteHarness,
+    allocator: std.mem.Allocator,
+) !void {
+    const repository = repositoryIdentityForTest(app);
+    app.remote_workflow.push_confirmation = .{
+        .repository_identity = repository,
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, app.repoSessionView().activeRoot().?),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+        .ahead_behind = .{ .ahead = 1, .behind = 0 },
+    };
+    app.overlay.openPushBranch();
+}
+
+fn installFetchTargetForTest(
+    app: *RemoteHarness,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    const repo_root = try installCurrentRepoForTest(app, allocator);
+    var bundle = try branchStatusBundleForTest(allocator, .{
+        .oid = "abc123",
+        .branch = "main",
+        .upstream = "origin/main",
+        .ahead = 0,
+        .behind = 0,
+    });
+    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    syncTestActivation(app);
+    return repo_root;
+}
+
 const RetryTargetSpec = struct {
     mode: git_ops.PushMode = .upstream,
     branch: []const u8 = "main",
@@ -734,16 +769,9 @@ test "requestPush snapshots set-upstream target for branch without upstream" {
 }
 
 test "requestPull snapshots the active branch target" {
-    var app: RemoteHarness = .{
-        .allocator = std.testing.allocator,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
-        },
-    };
+    var app: RemoteHarness = .{ .allocator = std.testing.allocator };
+    const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
+    defer app.repo_session.repo_state.deinit(std.testing.allocator);
     defer app.pages.review.branch_status.deinit();
     defer app.pages.review.git_status.deinit();
     defer app.cancelPullConfirmation(std.testing.allocator);
@@ -755,16 +783,16 @@ test "requestPull snapshots the active branch target" {
         .ahead = 0,
         .behind = 2,
     });
-    try app.pages.review.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace(repo_root, &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace(repo_root, &status_bundle);
     syncTestActivation(&app);
 
     try app.requestPull(std.testing.allocator);
 
     try std.testing.expect(app.overlay.isPullBranch());
     const confirmation = app.remote_workflow.pull_confirmation orelse return error.ExpectedPullConfirmation;
-    try std.testing.expectEqualStrings("/repo", confirmation.repo_root);
+    try std.testing.expectEqualStrings(repo_root, confirmation.repo_root);
     try std.testing.expectEqualStrings("feature", confirmation.branch);
     try std.testing.expectEqualStrings("origin", confirmation.remote);
     try std.testing.expectEqualStrings("main", confirmation.remote_branch);
@@ -774,16 +802,9 @@ test "requestPull snapshots the active branch target" {
 }
 
 test "requestPull opens confirmation before remote refresh regardless of stale ahead behind" {
-    var app: RemoteHarness = .{
-        .allocator = std.testing.allocator,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
-        },
-    };
+    var app: RemoteHarness = .{ .allocator = std.testing.allocator };
+    const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
+    defer app.repo_session.repo_state.deinit(std.testing.allocator);
     defer app.pages.review.branch_status.deinit();
     defer app.pages.review.git_status.deinit();
     defer app.cancelPullConfirmation(std.testing.allocator);
@@ -795,9 +816,9 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
         .ahead = 1,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace("/repo", &bundle);
+    try app.pages.review.branch_status.replace(repo_root, &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.git_status.replace(repo_root, &status_bundle);
     syncTestActivation(&app);
 
     try app.requestPull(std.testing.allocator);
@@ -1177,6 +1198,113 @@ test "requestFetch rejects while another action is pending" {
     try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
 }
 
+test "remote authentication fetch preparation and task terminals release request ownership" {
+    const backing = std.testing.allocator;
+    const DummyTask = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) RemoteHarness.Msg {
+            return .quit;
+        }
+
+        fn failed(_: chasen.TaskFailure) RemoteHarness.Msg {
+            return .quit;
+        }
+    };
+
+    // A failed descriptor duplicate happens after the proposal has moved into
+    // FetchRequest but before startFetch can consume it.
+    {
+        var app: RemoteHarness = .{ .allocator = backing };
+        _ = try installFetchTargetForTest(&app, backing);
+        defer app.repo_session.repo_state.deinit(backing);
+        defer app.pages.review.branch_status.deinit();
+
+        const original_handle = app.repo_session.repo_state.root.?.handle;
+        app.repo_session.repo_state.root.?.handle = -1;
+        var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = backing };
+        const result = app.requestFetch(&ctx);
+        app.repo_session.repo_state.root.?.handle = original_handle;
+
+        try std.testing.expectError(error.InvalidRootCapability, result);
+        try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+        try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqualStrings("fetch unavailable: repository authority could not be retained", app.pages.review.status.text());
+    }
+
+    // Two proposal clones precede the environment map. Failing allocation 4
+    // reaches a partially initialized first map entry and exercises both its
+    // errdefer and the still-caller-owned FetchRequest defer.
+    {
+        var app: RemoteHarness = .{ .allocator = backing };
+        _ = try installFetchTargetForTest(&app, backing);
+        defer app.repo_session.repo_state.deinit(backing);
+        defer app.pages.review.branch_status.deinit();
+
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 4 });
+        var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = failing.allocator() };
+        try std.testing.expectError(error.OutOfMemory, app.requestFetch(&ctx));
+
+        try std.testing.expect(failing.has_induced_failure);
+        try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+        try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqualStrings("could not prepare background fetch", app.pages.review.status.text());
+    }
+
+    // startFetch is the transfer boundary. Queue rejection consumes the
+    // request and destroys the initialized task; no controller owner remains.
+    {
+        var app: RemoteHarness = .{ .allocator = backing };
+        _ = try installFetchTargetForTest(&app, backing);
+        defer app.repo_session.repo_state.deinit(backing);
+        defer app.pages.review.branch_status.deinit();
+
+        var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = backing };
+        for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+        try std.testing.expectError(error.TaskLimitExceeded, app.requestFetch(&ctx));
+
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+        try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
+        try std.testing.expectEqual(@as(usize, 16), ctx.takePendingTasks().len);
+        try std.testing.expectEqualStrings("could not start fetch task", app.pages.review.status.text());
+    }
+
+    // Accepted ownership closes through the same task epilogue when Chasen
+    // abandons a queued-but-unstarted task during runtime unwind.
+    {
+        var app: RemoteHarness = .{ .allocator = backing };
+        const repo_root = try installFetchTargetForTest(&app, backing);
+        defer app.repo_session.repo_state.deinit(backing);
+        defer app.pages.review.branch_status.deinit();
+
+        var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = backing };
+        try app.requestFetch(&ctx);
+        const pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedPendingAction;
+        const queued = ctx.takePendingTasksWith();
+        try std.testing.expectEqual(@as(usize, 1), queued.len);
+        const Task = app_actions.FetchTask(RemoteHarness.Msg);
+        const task: *Task = @ptrCast(@alignCast(queued[0].ctx));
+        const root_observer = task.root.?;
+        const msg = queued[0].failed(queued[0].ctx, .runtime_abandoned, backing);
+        const finished = switch (msg) {
+            .action_finished => |action| switch (action) {
+                .fetch => |fetch| fetch,
+                else => return error.ExpectedFetchTerminal,
+            },
+            else => return error.ExpectedFetchTerminal,
+        };
+        _ = app.remoteWorkflow().finishFetch(backing, finished);
+
+        try expectRootCapabilityClosed(root_observer);
+        try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+        try std.testing.expect(!app.remote_workflow.action_control.isActive(pending.generation));
+        try std.testing.expectEqualStrings(repo_root, app.repoSessionView().activeRoot().?);
+    }
+}
+
 test "confirmPush keeps confirmation when another action is pending" {
     var app: RemoteHarness = .{
         .allocator = std.testing.allocator,
@@ -1265,6 +1393,57 @@ test "confirmPush rejects a proposal with a stale root identity" {
     try std.testing.expectEqualStrings("push unavailable: repository authority changed", app.pages.review.status.text());
 }
 
+test "background remote task rejection and abandonment release owned authorities" {
+    const allocator = std.testing.allocator;
+    const DummyTask = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) RemoteHarness.Msg {
+            return .quit;
+        }
+
+        fn failed(_: chasen.TaskFailure) RemoteHarness.Msg {
+            return .quit;
+        }
+    };
+
+    {
+        var app: RemoteHarness = .{ .allocator = allocator };
+        _ = try installCurrentRepoForTest(&app, allocator);
+        defer app.repo_session.repo_state.deinit(allocator);
+        defer app.cancelPushConfirmation(allocator);
+        try installPushConfirmationForTest(&app, allocator);
+        var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
+        for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+
+        try std.testing.expectError(error.TaskLimitExceeded, app.confirmPush(&ctx));
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+        try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
+        try std.testing.expect(app.remote_workflow.push_confirmation == null);
+        try std.testing.expect(!app.overlay.isPushBranch());
+        try std.testing.expectEqual(@as(usize, 16), ctx.takePendingTasks().len);
+    }
+
+    {
+        var app: RemoteHarness = .{ .allocator = allocator };
+        _ = try installCurrentRepoForTest(&app, allocator);
+        defer app.repo_session.repo_state.deinit(allocator);
+        defer app.clearPushError(allocator);
+        try installPushConfirmationForTest(&app, allocator);
+        var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
+
+        try app.confirmPush(&ctx);
+        const owner = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedPendingAction;
+        try std.testing.expect(app.remote_workflow.action_control.isActive(owner.generation));
+        const queued = ctx.takePendingTasksWith();
+        try std.testing.expectEqual(@as(usize, 1), queued.len);
+        const abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+        try app.update(abandoned, &ctx);
+
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+        try std.testing.expect(!app.remote_workflow.action_control.isActive(owner.generation));
+        try std.testing.expect(app.remote_workflow.push_error_message != null);
+    }
+}
+
 test "confirmPull keeps confirmation when another action is pending" {
     var app: RemoteHarness = .{
         .allocator = std.testing.allocator,
@@ -1313,7 +1492,7 @@ test "finishPush failed preserves retry target oid for credential prompt" {
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
-        .result = .{ .failed = try std.testing.allocator.dupe(u8, "fatal: could not read Username for 'https://host': terminal prompts disabled") },
+        .result = .{ .credentialed = .{ .failed = try std.testing.allocator.dupe(u8, "fatal: could not read Username for 'https://host': terminal prompts disabled") } },
     });
 
     const target = app.remote_workflow.push_retry.state.availableTarget() orelse return error.ExpectedPushRetryTarget;
@@ -1345,13 +1524,90 @@ test "finishPush retires an exact action before dropping a mismatched operation 
         .remote = try allocator.dupe(u8, "origin"),
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
-        .result = .ok,
+        .result = .{ .credentialed = .ok },
     });
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expectEqualStrings("unchanged", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+test "remote cancel terminal drops retry authority and requires reload before deferred quit" {
+    const allocator = std.testing.allocator;
+    var app: RemoteHarness = .{ .allocator = allocator };
+    const repo_root = try installCurrentRepoForTest(&app, allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.clearPushError(allocator);
+    activateReview(&app);
+
+    const pending = beginAcceptedTestAction(&app, .push);
+    app.remote_workflow.action_control.begin(pending.generation);
+    const controller = app.remoteWorkflow();
+    try std.testing.expect(controller.cancelActiveRemote(true));
+    try std.testing.expect(controller.view().canceling());
+    try std.testing.expectEqualStrings("canceling...", app.pages.review.status.text());
+    try std.testing.expect(controller.cancelActiveRemote(true));
+
+    const outcome = try controller.finishPush(allocator, .{
+        .pending = pending,
+        .identity = .{
+            .repo_epoch = app.repoSessionView().epoch(),
+            .root_identity = app.repoSessionView().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+        .result = .{ .background = .{
+            .outcome = .{ .failed = .canceled_outcome_unknown },
+        } },
+    });
+
+    try std.testing.expectEqual(review_action_fence.ReloadIntent.source_and_aux, outcome.reload);
+    try std.testing.expect(outcome.quit_after_terminal);
+    try std.testing.expect(!app.actionLifecycleView().hasPending());
+    try std.testing.expect(!controller.view().canceling());
+    try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
+    try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.push_error_message.?, "outcome is unknown") != null);
+}
+
+test "remote timeout terminal drops retry authority and requires reload" {
+    const allocator = std.testing.allocator;
+    var app: RemoteHarness = .{ .allocator = allocator };
+    const repo_root = try installCurrentRepoForTest(&app, allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.clearPushError(allocator);
+    activateReview(&app);
+
+    const pending = beginAcceptedTestAction(&app, .push);
+    app.remote_workflow.action_control.begin(pending.generation);
+    const outcome = try app.remoteWorkflow().finishPush(allocator, .{
+        .pending = pending,
+        .identity = .{
+            .repo_epoch = app.repoSessionView().epoch(),
+            .root_identity = app.repoSessionView().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .mode = .upstream,
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+        .result = .{ .background = .{
+            .outcome = .{ .failed = .timed_out_outcome_unknown },
+        } },
+    });
+
+    try std.testing.expectEqual(review_action_fence.ReloadIntent.source_and_aux, outcome.reload);
+    try std.testing.expect(!outcome.quit_after_terminal);
+    try std.testing.expect(!app.actionLifecycleView().hasPending());
+    try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
+    try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.push_error_message.?, "timed out") != null);
 }
 
 test "credentialed push launch and runtime failure cross common action boundaries" {

@@ -5,6 +5,7 @@ const git_push = @import("../git/push.zig");
 const git_ops = @import("git_ops.zig");
 const external_action = @import("../external/action.zig");
 const process_runner = @import("../process/runner.zig");
+const root_capability = @import("../repo/root_capability.zig");
 const context_export = @import("../context_export.zig");
 const remote_request = @import("remote_request.zig");
 
@@ -282,7 +283,7 @@ pub const PushFinished = struct {
     remote: []u8,
     remote_branch: []u8,
     oid: []u8,
-    result: FileActionTaskResult,
+    result: PushActionTaskResult,
 
     pub fn deinit(self: *PushFinished, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
@@ -304,19 +305,26 @@ pub const PushFinished = struct {
             .remote = &.{},
             .remote_branch = &.{},
             .oid = &.{},
-            .result = .ok,
+            .result = .{ .background = .{
+                .outcome = .{ .failed = .failed },
+            } },
         };
     }
 };
 
 pub const PullFinished = struct {
     pending: PendingAction,
+    identity: remote_request.RemoteRequestIdentity = .{
+        .repo_epoch = 0,
+        .root_identity = .{ .device = 0, .inode = 0 },
+        .operation_generation = 0,
+    },
     repo_root: []u8,
     branch: []u8,
     remote: []u8,
     remote_branch: []u8,
     oid: []u8,
-    result: FileActionTaskResult,
+    result: git_backend.RemoteOperationResult,
 
     pub fn deinit(self: *PullFinished, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
@@ -324,34 +332,47 @@ pub const PullFinished = struct {
         allocator.free(self.remote);
         allocator.free(self.remote_branch);
         allocator.free(self.oid);
-        self.result.deinit(allocator);
         self.* = .{
             .pending = .{ .generation = 0, .kind = .pull },
+            .identity = .{
+                .repo_epoch = 0,
+                .root_identity = .{ .device = 0, .inode = 0 },
+                .operation_generation = 0,
+            },
             .repo_root = &.{},
             .branch = &.{},
             .remote = &.{},
             .remote_branch = &.{},
             .oid = &.{},
-            .result = .ok,
+            .result = .{ .outcome = .{ .failed = .failed } },
         };
     }
 };
 
 pub const FetchFinished = struct {
     pending: PendingAction,
+    identity: remote_request.RemoteRequestIdentity = .{
+        .repo_epoch = 0,
+        .root_identity = .{ .device = 0, .inode = 0 },
+        .operation_generation = 0,
+    },
     repo_root: []u8,
     remote: []u8,
-    result: FileActionTaskResult,
+    result: git_backend.RemoteOperationResult,
 
     pub fn deinit(self: *FetchFinished, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
         allocator.free(self.remote);
-        self.result.deinit(allocator);
         self.* = .{
             .pending = .{ .generation = 0, .kind = .fetch },
+            .identity = .{
+                .repo_epoch = 0,
+                .root_identity = .{ .device = 0, .inode = 0 },
+                .operation_generation = 0,
+            },
             .repo_root = &.{},
             .remote = &.{},
-            .result = .ok,
+            .result = .{ .outcome = .{ .failed = .failed } },
         };
     }
 };
@@ -388,6 +409,20 @@ pub const FileActionTaskResult = union(enum) {
         switch (self) {
             .ok, .ok_static, .failed_static => {},
             .failed => |message| allocator.free(message),
+        }
+    }
+};
+
+/// S2 keeps the reviewed credential retry path until S3 removes it, while the
+/// normal background path crosses only the redacted typed backend boundary.
+pub const PushActionTaskResult = union(enum) {
+    background: git_backend.RemoteOperationResult,
+    credentialed: FileActionTaskResult,
+
+    pub fn deinit(self: PushActionTaskResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .background => {},
+            .credentialed => |result| result.deinit(allocator),
         }
     }
 };
@@ -781,20 +816,45 @@ pub fn PushTask(comptime Msg: type) type {
         oid: []u8,
         env_map: ?*const std.process.Environ.Map = null,
         credentials: ?PushCredentials = null,
+        root: ?root_capability.RootCapability = null,
+        environment: ?git_backend.OwnedRemoteEnvironment = null,
+        cancellation: ?process_runner.CancellationView = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runPush(task.mode, task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, if (task.credentials) |credentials| credentials else null, allocator, io));
+            const result: PushActionTaskResult = if (task.credentials) |credentials| blk: {
+                break :blk .{ .credentialed = runPush(task.mode, task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, credentials, allocator, io) };
+            } else blk: {
+                const root = if (task.root) |*owned| owned else @panic("background push requires root authority");
+                const environment = if (task.environment) |*owned| owned else @panic("background push requires an environment");
+                break :blk .{ .background = runBackgroundPush(
+                    root,
+                    environment,
+                    task.cancellation orelse @panic("background push requires cancellation authority"),
+                    task.mode,
+                    task.branch,
+                    task.remote,
+                    task.remote_branch,
+                    task.oid,
+                    allocator,
+                    io,
+                ) };
+            };
+            return task.finish(allocator, result);
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+            const result: PushActionTaskResult = if (task.credentials != null)
+                .{ .credentialed = .{ .failed_static = taskFailureMessage(failure) } }
+            else
+                .{ .background = remoteTaskSpawnFailure(if (task.environment) |environment| environment.warnings else .{}) };
+            return task.finish(allocator, result);
         }
 
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: PushActionTaskResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.branch.len > 0) allocator.free(task.branch);
@@ -802,6 +862,8 @@ pub fn PushTask(comptime Msg: type) type {
                 if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
                 allocator.free(task.oid);
                 if (task.credentials) |*credentials| credentials.deinit(allocator);
+                if (task.root) |*root| root.deinit();
+                if (task.environment) |*environment| environment.deinit();
                 allocator.destroy(task);
             }
             const mode = task.mode;
@@ -833,32 +895,55 @@ pub fn PushTask(comptime Msg: type) type {
 pub fn PullTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
+        identity: remote_request.RemoteRequestIdentity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+            .operation_generation = 0,
+        },
         repo_root: []u8,
         branch: []u8,
         remote: []u8,
         remote_branch: []u8,
         oid: []u8,
         env_map: ?*const std.process.Environ.Map = null,
+        root: ?root_capability.RootCapability = null,
+        environment: ?git_backend.OwnedRemoteEnvironment = null,
+        cancellation: ?process_runner.CancellationView = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runPullRefresh(task.repo_root, task.branch, task.remote, task.remote_branch, task.oid, task.env_map, allocator, io));
+            const root = if (task.root) |*owned| owned else @panic("background pull requires root authority");
+            const environment = if (task.environment) |*owned| owned else @panic("background pull requires an environment");
+            return task.finish(allocator, runBackgroundPull(
+                root,
+                environment,
+                task.cancellation orelse @panic("background pull requires cancellation authority"),
+                task.branch,
+                task.remote,
+                task.remote_branch,
+                task.oid,
+                allocator,
+                io,
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            _ = failure;
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+            return task.finish(allocator, remoteTaskSpawnFailure(if (task.environment) |environment| environment.warnings else .{}));
         }
 
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_backend.RemoteOperationResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.branch.len > 0) allocator.free(task.branch);
                 if (task.remote.len > 0) allocator.free(task.remote);
                 if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
                 allocator.free(task.oid);
+                if (task.root) |*root| root.deinit();
+                if (task.environment) |*environment| environment.deinit();
                 allocator.destroy(task);
             }
             const repo_root = task.repo_root;
@@ -873,6 +958,7 @@ pub fn PullTask(comptime Msg: type) type {
             task.oid = &.{};
             return Msg.actionFinished(.{ .pull = PullFinished{
                 .pending = task.pending,
+                .identity = task.identity,
                 .repo_root = repo_root,
                 .branch = branch,
                 .remote = remote,
@@ -887,26 +973,46 @@ pub fn PullTask(comptime Msg: type) type {
 pub fn FetchTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
+        identity: remote_request.RemoteRequestIdentity = .{
+            .repo_epoch = 0,
+            .root_identity = .{ .device = 0, .inode = 0 },
+            .operation_generation = 0,
+        },
         repo_root: []u8,
         remote: []u8,
         env_map: ?*const std.process.Environ.Map = null,
+        root: ?root_capability.RootCapability = null,
+        environment: ?git_backend.OwnedRemoteEnvironment = null,
+        cancellation: ?process_runner.CancellationView = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runFetch(task.repo_root, task.remote, task.env_map, allocator, io));
+            const root = if (task.root) |*owned| owned else @panic("background fetch requires root authority");
+            const environment = if (task.environment) |*owned| owned else @panic("background fetch requires an environment");
+            return task.finish(allocator, runBackgroundFetch(
+                root,
+                environment,
+                task.cancellation orelse @panic("background fetch requires cancellation authority"),
+                task.remote,
+                allocator,
+                io,
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            _ = failure;
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+            return task.finish(allocator, remoteTaskSpawnFailure(if (task.environment) |environment| environment.warnings else .{}));
         }
 
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_backend.RemoteOperationResult) Msg {
             defer {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 allocator.free(task.remote);
+                if (task.root) |*root| root.deinit();
+                if (task.environment) |*environment| environment.deinit();
                 allocator.destroy(task);
             }
             const repo_root = task.repo_root;
@@ -915,6 +1021,7 @@ pub fn FetchTask(comptime Msg: type) type {
             task.remote = &.{};
             return Msg.actionFinished(.{ .fetch = FetchFinished{
                 .pending = task.pending,
+                .identity = task.identity,
                 .repo_root = repo_root,
                 .remote = remote,
                 .result = result,
@@ -1283,6 +1390,91 @@ pub fn runPush(mode: git_push.Mode, repo_root: []const u8, branch: []const u8, r
         } },
         .env_map = env_map,
     }, allocator, io);
+}
+
+const remote_operation_timeout = std.Io.Duration.fromSeconds(120);
+
+fn remoteProcessControl(io: std.Io, cancellation: process_runner.CancellationView) process_runner.ProcessControl {
+    return .{
+        .deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = remote_operation_timeout,
+            .clock = .awake,
+        }),
+        .cancellation = cancellation,
+    };
+}
+
+pub fn runBackgroundPush(
+    root: *const root_capability.RootCapability,
+    environment: *const git_backend.OwnedRemoteEnvironment,
+    cancellation: process_runner.CancellationView,
+    mode: git_push.Mode,
+    branch: []const u8,
+    remote: []const u8,
+    remote_branch: []const u8,
+    oid: []const u8,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) git_backend.RemoteOperationResult {
+    return git_backend.LocalCommandBackend.runRemoteOperation(allocator, io, .{
+        .root = root,
+        .environment = environment,
+        .control = remoteProcessControl(io, cancellation),
+        .kind = .{ .push = .{
+            .mode = mode,
+            .branch = branch,
+            .remote = remote,
+            .remote_branch = remote_branch,
+            .oid = oid,
+        } },
+    });
+}
+
+pub fn runBackgroundPull(
+    root: *const root_capability.RootCapability,
+    environment: *const git_backend.OwnedRemoteEnvironment,
+    cancellation: process_runner.CancellationView,
+    branch: []const u8,
+    remote: []const u8,
+    remote_branch: []const u8,
+    oid: []const u8,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) git_backend.RemoteOperationResult {
+    return git_backend.LocalCommandBackend.runRemoteOperation(allocator, io, .{
+        .root = root,
+        .environment = environment,
+        .control = remoteProcessControl(io, cancellation),
+        .kind = .{ .pull_refresh_ff_only = .{
+            .branch = branch,
+            .remote = remote,
+            .remote_branch = remote_branch,
+            .oid = oid,
+        } },
+    });
+}
+
+pub fn runBackgroundFetch(
+    root: *const root_capability.RootCapability,
+    environment: *const git_backend.OwnedRemoteEnvironment,
+    cancellation: process_runner.CancellationView,
+    remote: []const u8,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) git_backend.RemoteOperationResult {
+    return git_backend.LocalCommandBackend.runRemoteOperation(allocator, io, .{
+        .root = root,
+        .environment = environment,
+        .control = remoteProcessControl(io, cancellation),
+        .kind = .{ .fetch = .{ .remote = remote } },
+    });
+}
+
+fn remoteTaskSpawnFailure(warnings: git_backend.RemoteWarningSet) git_backend.RemoteOperationResult {
+    return .{
+        .outcome = .{ .failed = .spawn_failed },
+        .warnings = warnings,
+    };
 }
 
 pub fn runPullRefresh(repo_root: []const u8, branch: []const u8, remote: []const u8, remote_branch: []const u8, oid: []const u8, env_map: ?*const std.process.Environ.Map, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {

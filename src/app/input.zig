@@ -37,6 +37,7 @@ pub const KeyContext = struct {
     branch_switch_mode: bool = false,
     push_error_mode: bool = false,
     push_credential_mode: bool = false,
+    remote_action_cancelable: bool = false,
     keymap: keymap.Effective = .{},
 };
 
@@ -135,6 +136,8 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 }
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
+    if (context.remote_action_cancelable and key.matches(chasen.Key.escape, .{}))
+        return app_message.Msg.cancel_remote_action;
     if (context.active_page == .review and (context.review.search_mode or context.review.file_search_mode)) {
         const review_msg = review_input.keyToMsg(context.review, key) orelse return null;
         return translateReviewMsg(review_msg);
@@ -760,6 +763,17 @@ test "keyToMsg maps pull confirmation keys" {
     try std.testing.expectEqual(app_message.Msg.cancel_pull, keyToMsg(.{ .pull_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(app_message.Msg.cancel_pull, keyToMsg(.{ .pull_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .pull_confirmation_mode = true }, .{ .codepoint = 'U' }));
+}
+
+test "remote cancel Escape takes priority while a background action is active" {
+    try std.testing.expectEqual(
+        app_message.Msg.cancel_remote_action,
+        keyToMsg(.{ .remote_action_cancelable = true }, .{ .codepoint = chasen.Key.escape }).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg.quit,
+        keyToMsg(.{ .remote_action_cancelable = true }, .{ .codepoint = 'q' }).?,
+    );
 }
 
 test "keyToMsg maps push error modal keys" {

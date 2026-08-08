@@ -710,7 +710,7 @@ test "Review mutation read fence drains old production reads without publication
         .runtime_abandoned,
         allocator,
     );
-    action_terminal.action_finished.push.result = .ok;
+    action_terminal.action_finished.push.result = .{ .credentialed = .ok };
 
     const fence_closed =
         !app.pages.review.repository_read_authority.mayStartRepositoryRead();

@@ -5,6 +5,7 @@
 const std = @import("std");
 
 const app_push_retry = @import("../push_retry.zig");
+const remote_request = @import("../remote_request.zig");
 const app_state = @import("../state.zig");
 
 pub const State = struct {
@@ -15,6 +16,9 @@ pub const State = struct {
     branch_switch: app_state.BranchSwitchState = .{},
     branch_switch_load_generation: u64 = 0,
     branch_switch_load_pending: ?u64 = null,
+    action_control: remote_request.RemoteActionControl = .{},
+    canceling_generation: ?u64 = null,
+    quit_after_remote_terminal: bool = false,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         if (self.push_confirmation) |*confirmation| confirmation.deinit(allocator);

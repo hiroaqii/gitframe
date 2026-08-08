@@ -72,6 +72,15 @@ pub const View = struct {
     pub fn hasForeground(self: View) bool {
         return self.state.push_retry.state.hasForeground();
     }
+
+    pub fn canceling(self: View) bool {
+        return self.state.canceling_generation != null;
+    }
+
+    pub fn canCancel(self: View, pending: ?app_actions.PendingAction) bool {
+        const action = pending orelse return false;
+        return isBackgroundRemoteKind(action.kind) and self.state.action_control.isActive(action.generation);
+    }
 };
 
 pub const RedrawSink = struct {
@@ -85,6 +94,7 @@ pub const RedrawSink = struct {
 pub const Outcome = struct {
     reload: review_action_fence.ReloadIntent = .none,
     cancel_local_confirmations: bool = false,
+    quit_after_terminal: bool = false,
 };
 
 pub const Controller = struct {
@@ -103,6 +113,20 @@ pub const Controller = struct {
 
     pub fn view(self: Controller) View {
         return .{ .state = self.state };
+    }
+
+    /// Requests generation-scoped cancellation without retiring the action
+    /// owner or reopening its read fence. The exact terminal does both.
+    pub fn cancelActiveRemote(self: Controller, defer_quit: bool) bool {
+        const pending = self.lifecycle.view().acceptedPending() orelse return false;
+        if (!isBackgroundRemoteKind(pending.kind)) return false;
+        if (!self.state.action_control.isActive(pending.generation)) return false;
+        if (defer_quit) self.state.quit_after_remote_terminal = true;
+        if (self.state.action_control.requestCancel(pending.generation)) {
+            self.state.canceling_generation = pending.generation;
+            self.setStatus("canceling...", .{});
+        }
+        return true;
     }
 
     pub fn requestPush(self: Controller, allocator: std.mem.Allocator) !Outcome {
@@ -174,8 +198,34 @@ pub const Controller = struct {
         }
         self.setStatus("pushing: {s} -> {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
         const prepared = self.lifecycle.prepare(.push);
+        var root: ?root_capability.RootCapability = self.retainBackgroundRoot() catch |err| {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("push unavailable: repository authority could not be retained", .{});
+            return err;
+        };
+        defer if (root) |*owned| owned.deinit();
+        var environment: ?git_backend.OwnedRemoteEnvironment = git_backend.buildRemoteEnvironment(
+            ctx.allocator(),
+            self.env_map,
+            .background,
+        ) catch |err| {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("could not prepare background push", .{});
+            return err;
+        };
+        defer if (environment) |*owned| owned.deinit();
+        self.beginRemoteControl(prepared.pending);
         confirmation_consumed = true;
-        app_git_requests.startPush(app_message.Msg, ctx, prepared.pending, self.env_map, &confirmation) catch |err| {
+        app_git_requests.startPush(
+            app_message.Msg,
+            ctx,
+            prepared.pending,
+            &root,
+            &environment,
+            self.state.action_control.cancellationView(prepared.pending.generation),
+            &confirmation,
+        ) catch |err| {
+            _ = self.state.action_control.finish(prepared.pending.generation);
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start push task", .{});
             if (self.overlay.isPushBranch()) self.overlay.close();
@@ -211,6 +261,12 @@ pub const Controller = struct {
             .dirty_worktree => return self.reject("pull blocked: commit, stage, or discard local changes first"),
             .untracked_files_present => return self.reject("pull blocked: untracked files present"),
         };
+        const repository_identity = self.currentRepositoryIdentity() orelse
+            return self.reject("pull unavailable: repository authority changed");
+        const active_root = self.repo.activeRoot() orelse
+            return self.reject("pull unavailable: no repository");
+        if (!std.mem.eql(u8, active_root, target.repo_root))
+            return self.reject("pull unavailable: repository authority changed");
 
         self.cancelPushConfirmation(allocator);
         self.cancelPullConfirmation(allocator);
@@ -220,6 +276,7 @@ pub const Controller = struct {
         defer if (!proposal_consumed) proposal.deinit(allocator);
         const owned = proposal.pull;
         self.state.pull_confirmation = .{
+            .repository_identity = repository_identity,
             .repo_root = owned.repo_root,
             .branch = owned.branch,
             .remote = owned.remote,
@@ -241,9 +298,46 @@ pub const Controller = struct {
         }
         var confirmation = self.state.pull_confirmation orelse return;
         self.state.pull_confirmation = null;
+        var confirmation_consumed = false;
+        defer if (!confirmation_consumed) confirmation.deinit(ctx.allocator());
+        if (!self.repositoryMatches(confirmation.repository_identity) or
+            self.repo.activeRoot() == null or
+            !std.mem.eql(u8, self.repo.activeRoot().?, confirmation.repo_root))
+        {
+            self.setStatus("pull unavailable: repository authority changed", .{});
+            if (self.overlay.isPullBranch()) self.overlay.close();
+            return;
+        }
         self.setStatus("pulling: {s} <- {s}/{s}", .{ confirmation.branch, confirmation.remote, confirmation.remote_branch });
         const prepared = self.lifecycle.prepare(.pull);
-        app_git_requests.startPull(app_message.Msg, ctx, prepared.pending, self.env_map, &confirmation) catch |err| {
+        var root: ?root_capability.RootCapability = self.retainBackgroundRoot() catch |err| {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("pull unavailable: repository authority could not be retained", .{});
+            return err;
+        };
+        defer if (root) |*owned| owned.deinit();
+        var environment: ?git_backend.OwnedRemoteEnvironment = git_backend.buildRemoteEnvironment(
+            ctx.allocator(),
+            self.env_map,
+            .background,
+        ) catch |err| {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("could not prepare background pull", .{});
+            return err;
+        };
+        defer if (environment) |*owned| owned.deinit();
+        self.beginRemoteControl(prepared.pending);
+        confirmation_consumed = true;
+        app_git_requests.startPull(
+            app_message.Msg,
+            ctx,
+            prepared.pending,
+            &root,
+            &environment,
+            self.state.action_control.cancellationView(prepared.pending.generation),
+            &confirmation,
+        ) catch |err| {
+            _ = self.state.action_control.finish(prepared.pending.generation);
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start pull task", .{});
             if (self.overlay.isPullBranch()) self.overlay.close();
@@ -274,18 +368,57 @@ pub const Controller = struct {
             .no_upstream => return self.rejectVoid("fetch unavailable: no upstream remote"),
             .upstream_not_remote => return self.rejectVoid("fetch unavailable: unsupported upstream"),
         };
+        const repository_identity = self.currentRepositoryIdentity() orelse
+            return self.rejectVoid("fetch unavailable: repository authority changed");
+        const active_root = self.repo.activeRoot() orelse
+            return self.rejectVoid("fetch unavailable: no repository");
+        if (!std.mem.eql(u8, active_root, target.repo_root))
+            return self.rejectVoid("fetch unavailable: repository authority changed");
+
         var proposal = try self.operations.view().ownFetchProposal(ctx.allocator(), target);
         var proposal_consumed = false;
         defer if (!proposal_consumed) proposal.deinit(ctx.allocator());
         const owned = proposal.fetch;
         var request: app_git_requests.FetchRequest = .{
+            .repository_identity = repository_identity,
             .repo_root = owned.repo_root,
             .remote = owned.remote,
         };
         proposal_consumed = true;
+        var request_consumed = false;
+        defer if (!request_consumed) request.deinit(ctx.allocator());
         self.setStatus("fetching: {s}", .{target.remote});
         const prepared = self.lifecycle.prepare(.fetch);
-        app_git_requests.startFetch(app_message.Msg, ctx, prepared.pending, self.env_map, &request) catch |err| {
+        var root: ?root_capability.RootCapability = self.retainBackgroundRoot() catch |err| {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("fetch unavailable: repository authority could not be retained", .{});
+            return err;
+        };
+        defer if (root) |*owned_root| owned_root.deinit();
+        var environment: ?git_backend.OwnedRemoteEnvironment = git_backend.buildRemoteEnvironment(
+            ctx.allocator(),
+            self.env_map,
+            .background,
+        ) catch |err| {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("could not prepare background fetch", .{});
+            return err;
+        };
+        defer if (environment) |*owned_environment| owned_environment.deinit();
+        self.beginRemoteControl(prepared.pending);
+        // startFetch consumes the request on both task admission success and
+        // rejection; until this call the controller remains its owner.
+        request_consumed = true;
+        app_git_requests.startFetch(
+            app_message.Msg,
+            ctx,
+            prepared.pending,
+            &root,
+            &environment,
+            self.state.action_control.cancellationView(prepared.pending.generation),
+            &request,
+        ) catch |err| {
+            _ = self.state.action_control.finish(prepared.pending.generation);
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start fetch task", .{});
             return err;
@@ -501,70 +634,123 @@ pub const Controller = struct {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
-        if (!self.remoteRequestMatches(result.identity) or
-            result.identity.operation_generation != result.pending.generation) return .{};
         const active_matches = terminal.target == .current_review;
         switch (result.result) {
-            .ok, .ok_static => {
-                if (active_matches) {
-                    self.setStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-                    return .{ .reload = .source_and_aux };
+            .credentialed => |credentialed| {
+                if (!self.remoteRequestMatches(result.identity) or
+                    result.identity.operation_generation != result.pending.generation) return .{};
+                switch (credentialed) {
+                    .ok, .ok_static => {
+                        if (active_matches) {
+                            self.setStatus("pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
+                            return .{ .reload = .source_and_aux };
+                        }
+                        self.setStatus("pushed: {s}", .{result.repo_root});
+                    },
+                    .failed => |message| {
+                        const detail = git_ops.trimGitOutput(message);
+                        self.setStatus("push failed: {s}", .{git_ops.pushFailureHint(detail) orelse detail});
+                        const retry_target = try pushRetryTargetFromFinished(allocator, result);
+                        errdefer {
+                            var target = retry_target;
+                            target.deinit(allocator);
+                        }
+                        try self.setPushErrorWithRetry(allocator, detail, retry_target, pushCredentialFailureLikely(detail));
+                    },
+                    .failed_static => |message| {
+                        self.setStatus("push failed: {s}", .{message});
+                        try self.setPushErrorWithRetry(allocator, message, null, false);
+                    },
                 }
-                self.setStatus("pushed: {s}", .{result.repo_root});
+                return .{};
             },
-            .failed => |message| {
-                const detail = git_ops.trimGitOutput(message);
-                self.setStatus("push failed: {s}", .{git_ops.pushFailureHint(detail) orelse detail});
-                const retry_target = try pushRetryTargetFromFinished(allocator, result);
-                errdefer {
-                    var target = retry_target;
-                    target.deinit(allocator);
+            .background => |background| {
+                const quit_after_terminal = self.finishRemoteControl(result.pending);
+                if (!self.remoteRequestMatches(result.identity) or
+                    result.identity.operation_generation != result.pending.generation)
+                    return .{ .quit_after_terminal = quit_after_terminal };
+                switch (background.outcome) {
+                    .ok => {
+                        if (active_matches) {
+                            self.setRemoteStatus(background.warnings, "pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
+                            return .{ .reload = .source_and_aux, .quit_after_terminal = quit_after_terminal };
+                        }
+                        self.setRemoteStatus(background.warnings, "pushed: {s}", .{result.repo_root});
+                    },
+                    .failed => |failure| {
+                        self.setRemoteFailureStatus(background.warnings, .push, failure);
+                        const retry_allowed = failure != .http_userinfo_rejected and !remoteOutcomeUnknown(failure);
+                        const retry_target = if (retry_allowed) try pushRetryTargetFromFinished(allocator, result) else null;
+                        errdefer if (retry_target) |owned_target| {
+                            var target = owned_target;
+                            target.deinit(allocator);
+                        };
+                        const presentation = try remoteFailurePresentationAlloc(allocator, .push, failure, background.warnings);
+                        defer allocator.free(presentation);
+                        try self.setPushErrorWithRetry(
+                            allocator,
+                            presentation,
+                            retry_target,
+                            failure == .authentication_required,
+                        );
+                        return .{
+                            .reload = if (active_matches and remoteOutcomeUnknown(failure)) .source_and_aux else .none,
+                            .quit_after_terminal = quit_after_terminal,
+                        };
+                    },
                 }
-                try self.setPushErrorWithRetry(allocator, detail, retry_target, pushCredentialFailureLikely(detail));
-            },
-            .failed_static => |message| {
-                self.setStatus("push failed: {s}", .{message});
-                try self.setPushErrorWithRetry(allocator, message, null, false);
+                return .{ .quit_after_terminal = quit_after_terminal };
             },
         }
-        return .{};
     }
 
     pub fn finishPull(self: Controller, allocator: std.mem.Allocator, finished: app_actions.PullFinished) Outcome {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
+        const quit_after_terminal = self.finishRemoteControl(result.pending);
+        if (!self.remoteRequestMatches(result.identity) or
+            result.identity.operation_generation != result.pending.generation)
+            return .{ .quit_after_terminal = quit_after_terminal };
         const active_matches = terminal.target == .current_review;
-        switch (result.result) {
-            .ok => if (active_matches) {
-                self.setStatus("pulled: {s} <- {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-            } else {
-                self.setStatus("pulled: {s}", .{result.repo_root});
+        switch (result.result.outcome) {
+            .ok => |success| switch (success) {
+                .completed => if (active_matches) {
+                    self.setRemoteStatus(result.result.warnings, "pulled: {s} <- {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
+                } else {
+                    self.setRemoteStatus(result.result.warnings, "pulled: {s}", .{result.repo_root});
+                },
+                .already_up_to_date => self.setRemoteStatus(result.result.warnings, "already up to date", .{}),
             },
-            .ok_static => |message| if (active_matches) {
-                self.setStatus("{s}", .{message});
-            } else {
-                self.setStatus("{s}: {s}", .{ message, result.repo_root });
-            },
-            .failed, .failed_static => _ = self.setActionFailureStatus("pull", result.result),
+            .failed => |failure| self.setRemoteFailureStatus(result.result.warnings, .pull, failure),
         }
-        return .{ .reload = if (active_matches) .source_and_aux else .none };
+        return .{
+            .reload = if (active_matches) .source_and_aux else .none,
+            .quit_after_terminal = quit_after_terminal,
+        };
     }
 
     pub fn finishFetch(self: Controller, allocator: std.mem.Allocator, finished: app_actions.FetchFinished) Outcome {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
+        const quit_after_terminal = self.finishRemoteControl(result.pending);
+        if (!self.remoteRequestMatches(result.identity) or
+            result.identity.operation_generation != result.pending.generation)
+            return .{ .quit_after_terminal = quit_after_terminal };
         const active_matches = terminal.target == .current_review;
-        switch (result.result) {
-            .ok, .ok_static => if (active_matches) {
-                self.setStatus("fetched: {s}", .{result.remote});
+        switch (result.result.outcome) {
+            .ok => if (active_matches) {
+                self.setRemoteStatus(result.result.warnings, "fetched: {s}", .{result.remote});
             } else {
-                self.setStatus("fetched: {s}", .{result.repo_root});
+                self.setRemoteStatus(result.result.warnings, "fetched: {s}", .{result.repo_root});
             },
-            .failed, .failed_static => _ = self.setActionFailureStatus("fetch", result.result),
+            .failed => |failure| self.setRemoteFailureStatus(result.result.warnings, .fetch, failure),
         }
-        return .{ .reload = if (active_matches) .source_and_aux else .none };
+        return .{
+            .reload = if (active_matches) .source_and_aux else .none,
+            .quit_after_terminal = quit_after_terminal,
+        };
     }
 
     pub fn finishSwitchBranch(self: Controller, allocator: std.mem.Allocator, finished: app_actions.SwitchBranchFinished) Outcome {
@@ -900,6 +1086,33 @@ pub const Controller = struct {
         };
     }
 
+    fn retainBackgroundRoot(self: Controller) !root_capability.RootCapability {
+        const identity = self.currentRepositoryIdentity() orelse return error.RepositoryAuthorityChanged;
+        const capability = self.repo.activeCapability() orelse return error.RepositoryAuthorityChanged;
+        const duplicate = try capability.duplicate();
+        if (!duplicate.identity.eql(identity.root_identity)) {
+            var invalid = duplicate;
+            invalid.deinit();
+            return error.RepositoryAuthorityChanged;
+        }
+        return duplicate;
+    }
+
+    fn beginRemoteControl(self: Controller, pending: app_actions.PendingAction) void {
+        std.debug.assert(isBackgroundRemoteKind(pending.kind));
+        self.state.canceling_generation = null;
+        self.state.quit_after_remote_terminal = false;
+        self.state.action_control.begin(pending.generation);
+    }
+
+    fn finishRemoteControl(self: Controller, pending: app_actions.PendingAction) bool {
+        if (!self.state.action_control.finish(pending.generation)) return false;
+        self.state.canceling_generation = null;
+        const quit_after_terminal = self.state.quit_after_remote_terminal;
+        self.state.quit_after_remote_terminal = false;
+        return quit_after_terminal;
+    }
+
     fn repositoryMatches(self: Controller, expected: remote_request.RepositoryIdentity) bool {
         const current = self.currentRepositoryIdentity() orelse return false;
         return current.eql(expected);
@@ -938,6 +1151,38 @@ pub const Controller = struct {
         self.status.set(fmt, args);
     }
 
+    fn setRemoteStatus(
+        self: Controller,
+        warnings: git_backend.RemoteWarningSet,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) void {
+        const warning = remoteWarningMessage(warnings) orelse {
+            self.status.set(fmt, args);
+            return;
+        };
+        var buffer: [112]u8 = undefined;
+        const message = std.fmt.bufPrint(&buffer, fmt, args) catch "remote operation completed";
+        self.status.set("{s}; {s}", .{ warning, message });
+    }
+
+    fn setRemoteFailureStatus(
+        self: Controller,
+        warnings: git_backend.RemoteWarningSet,
+        kind: RemotePresentationKind,
+        failure: git_backend.RemoteFailure,
+    ) void {
+        if (!remoteOutcomeUnknown(failure)) {
+            self.setRemoteStatus(warnings, "{s} failed: {s}", .{ @tagName(kind), remoteFailureMessage(kind, failure) });
+            return;
+        }
+        const warning = remoteWarningMessage(warnings) orelse {
+            self.status.set("{s} failed: {s}", .{ @tagName(kind), remoteFailureMessage(kind, failure) });
+            return;
+        };
+        self.status.set("{s} failed: {s}; {s}", .{ @tagName(kind), remoteFailureMessage(kind, failure), warning });
+    }
+
     fn setForegroundStatus(
         self: Controller,
         warnings: git_backend.RemoteWarningSet,
@@ -951,6 +1196,59 @@ pub const Controller = struct {
         }
     }
 };
+
+fn isBackgroundRemoteKind(kind: app_actions.ActionKind) bool {
+    return switch (kind) {
+        .push, .pull, .fetch => true,
+        else => false,
+    };
+}
+
+fn remoteOutcomeUnknown(failure: git_backend.RemoteFailure) bool {
+    return failure == .canceled_outcome_unknown or failure == .timed_out_outcome_unknown;
+}
+
+const RemotePresentationKind = enum { push, pull, fetch };
+
+fn remoteFailureMessage(kind: RemotePresentationKind, failure: git_backend.RemoteFailure) []const u8 {
+    return switch (failure) {
+        .authentication_required => if (kind == .push)
+            "authentication is required; press i to continue in the native terminal"
+        else
+            "authentication is required; configure a credential helper or retry in an external terminal",
+        .ssh_public_key => "SSH public-key authentication failed; check ssh-agent and repository access",
+        .http_userinfo_rejected => "remote URL contains embedded user information; replace it with a credential-free URL",
+        .canceled_outcome_unknown => "remote operation canceled; outcome is unknown; repository reload required",
+        .timed_out_outcome_unknown => "remote operation timed out; outcome is unknown; repository reload required",
+        .spawn_failed => "remote command could not be started",
+        .failed => if (kind == .push)
+            "remote operation failed; press i to retry in the native terminal"
+        else
+            "remote operation failed; retry in an external terminal",
+    };
+}
+
+fn remoteWarningMessage(warnings: git_backend.RemoteWarningSet) ?[]const u8 {
+    if (warnings.git_plaintext_store) return "warning: credential.helper may store credentials in plaintext";
+    if (warnings.gcm_plaintext_store) return "warning: Git Credential Manager plaintext storage is configured";
+    if (warnings.potential_plaintext_store) return "warning: scoped credential helpers may store credentials in plaintext";
+    if (warnings.helper_policy_unknown) return "warning: credential helper storage policy is unknown";
+    if (warnings.proxy_credentials_omitted) return "warning: credential-bearing proxy was omitted";
+    return null;
+}
+
+fn remoteFailurePresentationAlloc(
+    allocator: std.mem.Allocator,
+    kind: RemotePresentationKind,
+    failure: git_backend.RemoteFailure,
+    warnings: git_backend.RemoteWarningSet,
+) ![]u8 {
+    const message = remoteFailureMessage(kind, failure);
+    if (remoteWarningMessage(warnings)) |warning| {
+        return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, warning });
+    }
+    return allocator.dupe(u8, message);
+}
 
 fn copyBranchSwitchItems(allocator: std.mem.Allocator, source: []const git_backend.BranchListItem) ![]app_state.BranchSwitchItem {
     const items = try allocator.alloc(app_state.BranchSwitchItem, source.len);
