@@ -1,4 +1,6 @@
 const std = @import("std");
+const git_command = @import("../git/command.zig");
+const root_capability = @import("root_capability.zig");
 
 pub const RepoEntry = struct {
     /// Owned short label used in the picker. Usually the repository directory name.
@@ -53,21 +55,30 @@ pub const PathDiscoveryError = error{
 /// The returned `DiscoveryResult` is owned by the caller. The temporary cwd
 /// allocation used by this convenience wrapper is not transferred into the
 /// result and is always released before returning.
-pub fn discover(allocator: std.mem.Allocator, io: std.Io) !DiscoveryResult {
+pub fn discover(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const git_command.LocalGitEnvironment,
+) !DiscoveryResult {
     const cwd = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(cwd);
-    return discoverRoot(allocator, io, cwd);
+    return discoverRoot(allocator, io, cwd, environment);
 }
 
 /// Discover repositories from a borrowed root path.
 ///
 /// `root_path` is only borrowed for the duration of the call. Any path stored
 /// in the returned `DiscoveryResult` is separately owned by the result.
-pub fn discoverRoot(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8) !DiscoveryResult {
+pub fn discoverRoot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    environment: *const git_command.LocalGitEnvironment,
+) !DiscoveryResult {
     const current_root = try realPathAbsoluteAlloc(allocator, io, root_path);
     errdefer allocator.free(current_root);
 
-    if (resolveRepoRoot(allocator, io, current_root)) |repo_root| {
+    if (resolveRepoRoot(allocator, io, current_root, environment)) |repo_root| {
         const entry = try repoEntryFromRoot(allocator, ".", repo_root);
         allocator.free(current_root);
         return .{ .single_repo = entry };
@@ -76,7 +87,7 @@ pub fn discoverRoot(allocator: std.mem.Allocator, io: std.Io, root_path: []const
         else => return err,
     }
 
-    const repos = try discoverChildRepos(allocator, io, current_root);
+    const repos = try discoverChildRepos(allocator, io, current_root, environment);
     errdefer {
         for (repos) |entry| freeRepoEntry(allocator, entry);
         allocator.free(repos);
@@ -97,21 +108,31 @@ pub fn discoverRoot(allocator: std.mem.Allocator, io: std.Io, root_path: []const
 /// Unlike `discoverRoot`, a directory with no repository is a user-facing
 /// error here: path submit should keep the current repo open and show an
 /// inline message instead of replacing discovery with `.none`.
-pub fn discoverInputPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) PathDiscoveryError!DiscoveryResult {
+pub fn discoverInputPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    environment: *const git_command.LocalGitEnvironment,
+) PathDiscoveryError!DiscoveryResult {
     const current_root = realPathAbsoluteAlloc(allocator, io, path) catch |err| return mapRealPathError(err);
     defer allocator.free(current_root);
 
     var dir = std.Io.Dir.openDirAbsolute(io, current_root, .{ .iterate = true }) catch |err| return mapOpenDirError(err);
     dir.close(io);
 
-    var result = discoverRoot(allocator, io, current_root) catch |err| return mapDiscoveryError(err);
+    var result = discoverRoot(allocator, io, current_root, environment) catch |err| return mapDiscoveryError(err);
     errdefer result.deinit(allocator);
 
     if (result == .none) return error.NoGitRepositoriesFound;
     return result;
 }
 
-fn discoverChildRepos(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8) ![]RepoEntry {
+fn discoverChildRepos(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    environment: *const git_command.LocalGitEnvironment,
+) ![]RepoEntry {
     var root_dir = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .iterate = true });
     defer root_dir.close(io);
 
@@ -129,7 +150,7 @@ fn discoverChildRepos(allocator: std.mem.Allocator, io: std.Io, root_path: []con
         const child_path = try std.fs.path.join(allocator, &.{ root_path, entry.name });
         defer allocator.free(child_path);
 
-        const repo_root = resolveRepoRoot(allocator, io, child_path) catch |err| switch (err) {
+        const repo_root = resolveRepoRoot(allocator, io, child_path, environment) catch |err| switch (err) {
             error.NotARepository => continue,
             else => return err,
         };
@@ -151,17 +172,34 @@ const ResolveRepoRootError = error{
     SpawnFailed,
 };
 
-fn resolveRepoRoot(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ResolveRepoRootError![]u8 {
-    const result = std.process.run(allocator, io, .{
-        .argv = &.{ "git", "rev-parse", "--show-toplevel" },
-        .cwd = .{ .path = path },
-        .stdout_limit = .limited(16 * 1024),
-        .stderr_limit = .limited(16 * 1024),
-    }) catch |err| return switch (err) {
+fn resolveRepoRoot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    environment: *const git_command.LocalGitEnvironment,
+) ResolveRepoRootError![]u8 {
+    const canonical_candidate = realPathAbsoluteAlloc(allocator, io, path) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
         else => error.SpawnFailed,
     };
+    defer allocator.free(canonical_candidate);
+
+    var root = root_capability.RootCapability.openCanonical(canonical_candidate) catch return error.SpawnFailed;
+    defer root.deinit();
+    return resolveRepoRootInDir(allocator, io, root.dir(), environment);
+}
+
+fn resolveRepoRootInDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environment: *const git_command.LocalGitEnvironment,
+) ResolveRepoRootError![]u8 {
+    const result = try git_command.runCaptured(allocator, io, .{ .cwd = cwd, .environment = environment }, .{
+        .argv = &.{ "git", "rev-parse", "--show-toplevel" },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    });
     defer allocator.free(result.stderr);
 
     switch (result.term) {
@@ -294,7 +332,9 @@ test "RepoEntry sort uses display path" {
 }
 
 test "discover owns and releases temporary cwd on success" {
-    var result = discover(std.testing.allocator, std.testing.io) catch |err| switch (err) {
+    var environment = try testEnvironment(std.testing.allocator);
+    defer environment.deinit();
+    var result = discover(std.testing.allocator, std.testing.io, &environment) catch |err| switch (err) {
         error.SpawnFailed => return error.SkipZigTest,
         else => return err,
     };
@@ -313,17 +353,64 @@ test "discoverRoot returns none for a directory without repos" {
 }
 
 test "discoverRoot returns single repo for the root repo" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var root = try TestRoot.create(std.testing.allocator);
     defer root.cleanup(std.testing.allocator);
     try gitInitOrSkip(root.path);
 
-    var result = try discoverRootOrSkip(root.path);
-    defer result.deinit(std.testing.allocator);
+    const redirect_path = try std.fs.path.join(allocator, &.{ root.path, "redirect" });
+    defer allocator.free(redirect_path);
+    try std.Io.Dir.createDirAbsolute(io, redirect_path, .default_dir);
+    try gitInitOrSkip(redirect_path);
+    const redirect_git_dir = try std.fs.path.join(allocator, &.{ redirect_path, ".git" });
+    defer allocator.free(redirect_git_dir);
+
+    var parent = try std.testing.environ.createMap(allocator);
+    defer parent.deinit();
+    try parent.put("GIT_DIR", redirect_git_dir);
+    try parent.put("GIT_WORK_TREE", redirect_path);
+    try parent.put("GIT_CONFIG_COUNT", "1");
+    try parent.put("GIT_CONFIG_KEY_0", "core.bare");
+    try parent.put("GIT_CONFIG_VALUE_0", "true");
+
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent);
+    defer environment.deinit();
+    var result = discoverRoot(allocator, io, root.path, &environment) catch |err| switch (err) {
+        error.SpawnFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    defer result.deinit(allocator);
 
     try std.testing.expect(result == .single_repo);
     try std.testing.expectEqualStrings(".", result.single_repo.display_path);
     try std.testing.expect(result.single_repo.label.len > 0);
-    try std.testing.expect(result.single_repo.canonical_root.len > 0);
+    const canonical_root = try realPathAbsoluteAlloc(allocator, io, root.path);
+    defer allocator.free(canonical_root);
+    try std.testing.expectEqualStrings(canonical_root, result.single_repo.canonical_root);
+
+    const candidate_path = try std.fs.path.join(allocator, &.{ root.path, "candidate" });
+    defer allocator.free(candidate_path);
+    const replacement_path = try std.fs.path.join(allocator, &.{ root.path, "replacement" });
+    defer allocator.free(replacement_path);
+    const accepted_path = try std.fs.path.join(allocator, &.{ root.path, "accepted" });
+    defer allocator.free(accepted_path);
+    try std.Io.Dir.createDirAbsolute(io, candidate_path, .default_dir);
+    try std.Io.Dir.createDirAbsolute(io, replacement_path, .default_dir);
+    try gitInitOrSkip(candidate_path);
+    try gitInitOrSkip(replacement_path);
+
+    var accepted = try root_capability.RootCapability.openCanonical(candidate_path);
+    defer accepted.deinit();
+    var root_dir = try std.Io.Dir.openDirAbsolute(io, root.path, .{});
+    defer root_dir.close(io);
+    try root_dir.rename("candidate", root_dir, "accepted", io);
+    try root_dir.rename("replacement", root_dir, "candidate", io);
+
+    const resolved = try resolveRepoRootInDir(allocator, io, accepted.dir(), &environment);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(accepted_path, resolved);
+    try std.testing.expect(!std.mem.eql(u8, candidate_path, resolved));
 }
 
 test "discoverRoot returns workspace for direct child repos" {
@@ -368,7 +455,9 @@ const TestRoot = struct {
         errdefer allocator.free(sub_path);
 
         try parent_dir.createDirPath(std.testing.io, sub_path);
-        const path = try std.fs.path.join(allocator, &.{ "/tmp", sub_path });
+        const alias_path = try std.fs.path.join(allocator, &.{ "/tmp", sub_path });
+        defer allocator.free(alias_path);
+        const path = try realPathAbsoluteAlloc(allocator, std.testing.io, alias_path);
         errdefer allocator.free(path);
 
         return .{
@@ -388,10 +477,18 @@ const TestRoot = struct {
 };
 
 fn discoverRootOrSkip(root_path: []const u8) !DiscoveryResult {
-    return discoverRoot(std.testing.allocator, std.testing.io, root_path) catch |err| switch (err) {
+    var environment = try testEnvironment(std.testing.allocator);
+    defer environment.deinit();
+    return discoverRoot(std.testing.allocator, std.testing.io, root_path, &environment) catch |err| switch (err) {
         error.SpawnFailed => error.SkipZigTest,
         else => err,
     };
+}
+
+fn testEnvironment(allocator: std.mem.Allocator) !git_command.LocalGitEnvironment {
+    var parent = try std.testing.environ.createMap(allocator);
+    defer parent.deinit();
+    return git_command.LocalGitEnvironment.initFromParent(allocator, &parent);
 }
 
 fn gitInitOrSkip(path: []const u8) !void {

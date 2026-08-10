@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (config.export_context) {
-        exportContext(init.io, init.gpa, config) catch |err| {
+        exportContext(init.io, init.gpa, init.environ_map, config) catch |err| {
             try printLoadError(init.io, err);
             return err;
         };
@@ -217,11 +217,16 @@ fn printHelp(io: std.Io) !void {
     try stdout.flush();
 }
 
-fn exportContext(io: std.Io, allocator: std.mem.Allocator, config: gitframe.CliConfig) !void {
+fn exportContext(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env_map: ?*const std.process.Environ.Map,
+    config: gitframe.CliConfig,
+) !void {
     var buffer: [4096]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const stdout = &stdout_file_writer.interface;
-    try gitframe.exportInitialSelectionContextJson(allocator, io, config, stdout);
+    try gitframe.exportInitialSelectionContextJson(allocator, io, env_map, config, stdout);
     try stdout.flush();
 }
 

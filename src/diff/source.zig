@@ -1,5 +1,6 @@
 const std = @import("std");
 const git_backend = @import("../git/backend.zig");
+const git_command = @import("../git/command.zig");
 
 /// User-selected source for the raw unified diff text.
 ///
@@ -148,7 +149,7 @@ pub const ParseArgsError = error{
     UnsupportedWatchSource,
 };
 
-pub const LoadError = git_backend.LoadError || error{
+pub const LoadError = git_command.Error || error{
     ReadFailed,
     MissingRepoRoot,
 };

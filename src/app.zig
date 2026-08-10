@@ -154,6 +154,7 @@ pub const App = struct {
             .active_page = self.active_page,
             .source = self.config.source,
             .home = home,
+            .env_map = self.env_map,
             .action_pending = self.actionLifecycleView().hasPending(),
             .review = self.reviewRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
@@ -1099,8 +1100,14 @@ pub const App = struct {
         self.pages.review.status.set(fmt, args);
     }
 
-    pub fn exportInitialSelectionContextJson(allocator: std.mem.Allocator, io: std.Io, config: CliConfig, writer: *std.Io.Writer) !void {
-        return initial_selection.exportContextJson(allocator, io, config, writer);
+    pub fn exportInitialSelectionContextJson(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        parent_environment: ?*const std.process.Environ.Map,
+        config: CliConfig,
+        writer: *std.Io.Writer,
+    ) !void {
+        return initial_selection.exportContextJson(allocator, io, parent_environment, config, writer);
     }
 
     /// Applies only the shell effects authorized by a completed repository

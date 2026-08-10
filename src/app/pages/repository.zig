@@ -11,6 +11,7 @@ const content_fingerprint = @import("../../content_fingerprint.zig");
 const page = @import("../page.zig");
 const page_link = @import("../page_link.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
+const git_command = @import("../../git/command.zig");
 const process_runner = @import("../../process/runner.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const selected_document = @import("../../repository/document.zig");
@@ -3815,6 +3816,10 @@ fn runRepositoryTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !
 test "repository real reload updates status color and selected source" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var parent_environment = try std.testing.environ.createMap(allocator);
+    defer parent_environment.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment);
+    defer environment.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(io, "repo", .default_dir);
@@ -3849,6 +3854,7 @@ test "repository real reload updates status color and selected source" {
         .generation = initial_request.generation,
         .result = repository_tasks.runManifestLoad(
             initial_request.root.dir(),
+            &environment,
             initial_request.expected_fingerprint,
             initial_request.expected_status_fingerprint,
             allocator,
@@ -3888,6 +3894,7 @@ test "repository real reload updates status color and selected source" {
         .generation = reload_request.generation,
         .result = repository_tasks.runManifestLoad(
             reload_request.root.dir(),
+            &environment,
             reload_request.expected_fingerprint,
             reload_request.expected_status_fingerprint,
             allocator,

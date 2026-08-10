@@ -23,6 +23,7 @@ const review_reload = @import("reload.zig");
 const review_repository_session = @import("repository_session.zig");
 const diff_source = @import("../../../diff/source.zig");
 const git_backend = @import("../../../git/backend.zig");
+const git_command = @import("../../../git/command.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
@@ -232,6 +233,12 @@ pub const Controller = struct {
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const discovery = &command.repo_discovery;
         const generation = discovery.generation;
+        var environment = git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map) catch |err| {
+            self.reloadOwner().rejectRepoDiscoverySpawn(generation);
+            return err;
+        };
+        var environment_consumed = false;
+        defer if (!environment_consumed) environment.deinit();
         const task = ctx.allocator().create(RepoDiscoveryTask) catch |err| {
             self.reloadOwner().rejectRepoDiscoverySpawn(generation);
             return err;
@@ -240,7 +247,9 @@ pub const Controller = struct {
             .identity = discovery.identity,
             .generation = discovery.generation,
             .background_cycle_id = discovery.background_cycle_id,
+            .environment = environment,
         };
+        environment_consumed = true;
         command_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
             task.destroy(ctx.allocator());

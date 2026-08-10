@@ -16,6 +16,7 @@ const diff_syntax_view = @import("../diff/syntax_view.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
 const git_backend = @import("../git/backend.zig");
+const git_command = @import("../git/command.zig");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
@@ -418,10 +419,11 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
         identity: page.RequestIdentity,
         generation: u64,
         background_cycle_id: ?u64 = null,
+        environment: git_command.LocalGitEnvironment,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runDiscovery(allocator, io));
+            return task.finish(allocator, runDiscovery(&task.environment, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -432,6 +434,7 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
         /// Spawn-failure counterpart of the terminal epilogue: releases the
         /// task-owned payload without producing a Msg.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.environment.deinit();
             allocator.destroy(task);
         }
 
@@ -439,6 +442,7 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: RepoDiscoveryTaskResult) Msg {
             defer allocator.destroy(task);
+            defer task.environment.deinit();
             return Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = RepoDiscoveryFinished{
                 .identity = task.identity,
                 .generation = task.generation,
@@ -449,8 +453,12 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
     };
 }
 
-pub fn runDiscovery(allocator: std.mem.Allocator, io: std.Io) RepoDiscoveryTaskResult {
-    const result = repo_discovery.discover(allocator, io) catch |err| {
+pub fn runDiscovery(
+    environment: *const git_command.LocalGitEnvironment,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) RepoDiscoveryTaskResult {
+    const result = repo_discovery.discover(allocator, io, environment) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Repo discovery failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Repo discovery failed: OutOfMemory" },
@@ -463,10 +471,11 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
     return struct {
         path: []u8,
         generation: u64,
+        environment: git_command.LocalGitEnvironment,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runPathDiscovery(task.path, allocator, io));
+            return task.finish(allocator, runPathDiscovery(task.path, &task.environment, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -474,10 +483,19 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
             return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
+        /// Spawn-failure counterpart of the terminal epilogue: releases every
+        /// field accepted by the queued task without producing a Msg.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            allocator.free(task.path);
+            task.environment.deinit();
+            allocator.destroy(task);
+        }
+
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: RepoPathDiscoveryTaskResult) Msg {
             defer allocator.destroy(task);
+            defer task.environment.deinit();
             const submitted_path = task.path;
             task.path = &.{};
             return Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = RepoPathDiscoveryFinished{
@@ -489,8 +507,13 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
     };
 }
 
-pub fn runPathDiscovery(path: []const u8, allocator: std.mem.Allocator, io: std.Io) RepoPathDiscoveryTaskResult {
-    const result = repo_discovery.discoverInputPath(allocator, io, path) catch |err| {
+pub fn runPathDiscovery(
+    path: []const u8,
+    environment: *const git_command.LocalGitEnvironment,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) RepoPathDiscoveryTaskResult {
+    const result = repo_discovery.discoverInputPath(allocator, io, path, environment) catch |err| {
         return switch (err) {
             error.PathDoesNotExist,
             error.PathIsNotDirectory,

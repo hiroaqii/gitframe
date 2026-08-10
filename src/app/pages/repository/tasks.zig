@@ -10,6 +10,7 @@ const actions = @import("../../actions.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const page = @import("../../page.zig");
 const git_backend = @import("../../../git/backend.zig");
+const git_command = @import("../../../git/command.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const process_runner = @import("../../../process/runner.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
@@ -222,6 +223,7 @@ pub const DocumentFinished = struct {
 pub fn ManifestTask(comptime AppMsg: type) type {
     return struct {
         request: Request,
+        environment: git_command.LocalGitEnvironment,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -230,6 +232,7 @@ pub fn ManifestTask(comptime AppMsg: type) type {
                 task.request.root,
                 task.request.expected_fingerprint,
                 task.request.expected_status_fingerprint,
+                &task.environment,
                 allocator,
                 io,
             ));
@@ -243,15 +246,21 @@ pub fn ManifestTask(comptime AppMsg: type) type {
         /// Spawn-failure counterpart of the terminal epilogue: releases the
         /// task-owned payload without producing a Msg.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.deinitOwned(allocator);
+        }
+
+        /// One epilogue owns request/root/environment cleanup for every task
+        /// exit, including rejection before the runtime accepts the task.
+        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
+            task.environment.deinit();
             allocator.destroy(task);
         }
 
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: TaskResult) AppMsg {
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
+            defer task.deinitOwned(allocator);
             const finished = ManifestFinished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root.identity,
@@ -394,11 +403,12 @@ fn runManifestLoadChecked(
     root: root_capability.RootCapability,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
     expected_status_fingerprint: ?content_fingerprint.Fingerprint,
+    environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) TaskResult {
     if (!root_capability.pathMatches(root_path, root.identity)) return .{ .failed_static = "Repository root changed" };
-    var result = runManifestLoad(root.dir(), expected_fingerprint, expected_status_fingerprint, allocator, io);
+    var result = runManifestLoad(root.dir(), environment, expected_fingerprint, expected_status_fingerprint, allocator, io);
     if (!root_capability.pathMatches(root_path, root.identity)) {
         result.deinit(allocator);
         return .{ .failed_static = "Repository root changed" };
@@ -538,18 +548,25 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
 pub fn ChangeMapTask(comptime AppMsg: type) type {
     return struct {
         request: ChangeMapRequest,
+        environment: git_command.LocalGitEnvironment,
 
         /// Spawn-failure counterpart of the terminal epilogue: releases the
         /// task-owned payload without producing a Msg.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.deinitOwned(allocator);
+        }
+
+        /// One epilogue owns request/root/environment cleanup for every task
+        /// exit, including rejection before the runtime accepts the task.
+        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
+            task.environment.deinit();
             allocator.destroy(task);
         }
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
+            defer task.deinitOwned(allocator);
 
             var fingerprint = task.request.expected_fingerprint;
             var content_line_count = task.request.expected_content_line_count;
@@ -569,6 +586,7 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
                             allocator,
                             io,
                             task.request.root.dir(),
+                            &task.environment,
                             task.request.path,
                             source,
                             task.request.temp_base_path,
@@ -595,8 +613,7 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
 
         pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
+            defer task.deinitOwned(allocator);
             const finished = ChangeMapFinished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root.identity,
@@ -618,12 +635,14 @@ fn loadChangeMap(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
+    environment: *const git_command.LocalGitEnvironment,
     path: []const u8,
     source: *const source_document.Document,
     temp_base_path: []const u8,
 ) ChangeMapResult {
     const loaded = git_backend.LocalCommandBackend.loadRepositoryFileChange(allocator, io, .{
         .cwd = cwd,
+        .environment = environment,
         .path = path,
         .source_bytes = source.bytes,
         .temp_base_path = temp_base_path,
@@ -640,14 +659,21 @@ fn loadChangeMap(
 
 pub fn runManifestLoad(
     cwd: std.Io.Dir,
+    environment: *const git_command.LocalGitEnvironment,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
     expected_status_fingerprint: ?content_fingerprint.Fingerprint,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) TaskResult {
-    const raw_manifest = git_backend.LocalCommandBackend.loadRepositoryManifest(allocator, io, .{ .cwd = cwd }) catch
+    const raw_manifest = git_backend.LocalCommandBackend.loadRepositoryManifest(allocator, io, .{
+        .cwd = cwd,
+        .environment = environment,
+    }) catch
         return .{ .failed_static = "Repository manifest could not be loaded" };
-    const raw_status = git_backend.LocalCommandBackend.loadRepositoryFileStatus(allocator, io, .{ .cwd = cwd }) catch null;
+    const raw_status = git_backend.LocalCommandBackend.loadRepositoryFileStatus(allocator, io, .{
+        .cwd = cwd,
+        .environment = environment,
+    }) catch null;
     return buildManifestTaskResult(allocator, raw_manifest, raw_status, expected_fingerprint, expected_status_fingerprint);
 }
 
@@ -929,6 +955,12 @@ fn runTaskTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !void {
     return error.RepositoryTestGitFailed;
 }
 
+fn testingLocalGitEnvironment(allocator: std.mem.Allocator) !git_command.LocalGitEnvironment {
+    var parent = try std.testing.environ.createMap(allocator);
+    defer parent.deinit();
+    return git_command.LocalGitEnvironment.initFromParent(allocator, &parent);
+}
+
 const TaskTestRepositoryMsg = union(enum) {
     manifest_finished: ManifestFinished,
     branch_finished: repository_branch.Finished,
@@ -1056,6 +1088,10 @@ test "repository tasks derive completion root identity from their descriptor" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const expected_identity = root_b.capability.identity;
+    var parent_environment = try std.testing.environ.createMap(allocator);
+    defer parent_environment.deinit();
+    try parent_environment.put("GIT_mixed_case_selector", "redirect");
+    try parent_environment.put("GITFRAME_S1_CANARY", "preserved");
 
     const Manifest = ManifestTask(TaskTestMsg);
     const manifest_task = try allocator.create(Manifest);
@@ -1067,7 +1103,10 @@ test "repository tasks derive completion root identity from their descriptor" {
             .root = try root_b.capability.duplicate(),
             .expected_fingerprint = null,
         },
+        .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment),
     };
+    try std.testing.expectEqualStrings("preserved", manifest_task.environment.borrow().get("GITFRAME_S1_CANARY").?);
+    try std.testing.expect(manifest_task.environment.borrow().get("GIT_mixed_case_selector") == null);
     var manifest_message = Manifest.run(manifest_task, allocator, io);
     defer manifest_message.repository.deinitUndelivered(allocator);
     switch (manifest_message.repository) {
@@ -1077,6 +1116,33 @@ test "repository tasks derive completion root identity from their descriptor" {
         },
         else => return error.ExpectedManifestCompletion,
     }
+
+    const manifest_failed_task = try allocator.create(Manifest);
+    manifest_failed_task.* = .{
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+            .generation = 6,
+            .root_path = try allocator.dupe(u8, root_a.path),
+            .root = try root_b.capability.duplicate(),
+            .expected_fingerprint = null,
+        },
+        .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment),
+    };
+    var manifest_failed_message = Manifest.failed(manifest_failed_task, .runtime_abandoned, allocator);
+    defer manifest_failed_message.repository.deinitUndelivered(allocator);
+
+    const manifest_destroyed_task = try allocator.create(Manifest);
+    manifest_destroyed_task.* = .{
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+            .generation = 7,
+            .root_path = try allocator.dupe(u8, root_a.path),
+            .root = try root_b.capability.duplicate(),
+            .expected_fingerprint = null,
+        },
+        .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment),
+    };
+    Manifest.destroy(manifest_destroyed_task, allocator);
 
     const Document = DocumentTask(TaskTestMsg);
     const document_task = try allocator.create(Document);
@@ -1137,7 +1203,10 @@ test "repository tasks derive completion root identity from their descriptor" {
             .root = try root_b.capability.duplicate(),
             .temp_base_path = try allocator.dupe(u8, "/tmp"),
         },
+        .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment),
     };
+    try std.testing.expectEqualStrings("preserved", change_map_task.environment.borrow().get("GITFRAME_S1_CANARY").?);
+    try std.testing.expect(change_map_task.environment.borrow().get("GIT_mixed_case_selector") == null);
     var change_map_message = ChangeMap.run(change_map_task, allocator, io);
     defer change_map_message.repository.deinitUndelivered(allocator);
     switch (change_map_message.repository) {
@@ -1148,6 +1217,41 @@ test "repository tasks derive completion root identity from their descriptor" {
         },
         else => return error.ExpectedChangeMapCompletion,
     }
+
+    const change_map_failed_task = try allocator.create(ChangeMap);
+    change_map_failed_task.* = .{
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+            .generation = 14,
+            .manifest_revision = 15,
+            .source_revision = 16,
+            .expected_fingerprint = .init(source_bytes),
+            .expected_content_line_count = 1,
+            .path = try allocator.dupe(u8, "main.zig"),
+            .root = try root_b.capability.duplicate(),
+            .temp_base_path = try allocator.dupe(u8, "/tmp"),
+        },
+        .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment),
+    };
+    var change_map_failed_message = ChangeMap.failed(change_map_failed_task, .runtime_abandoned, allocator);
+    defer change_map_failed_message.repository.deinitUndelivered(allocator);
+
+    const change_map_destroyed_task = try allocator.create(ChangeMap);
+    change_map_destroyed_task.* = .{
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+            .generation = 17,
+            .manifest_revision = 18,
+            .source_revision = 19,
+            .expected_fingerprint = .init(source_bytes),
+            .expected_content_line_count = 1,
+            .path = try allocator.dupe(u8, "main.zig"),
+            .root = try root_b.capability.duplicate(),
+            .temp_base_path = try allocator.dupe(u8, "/tmp"),
+        },
+        .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment),
+    };
+    ChangeMap.destroy(change_map_destroyed_task, allocator);
 }
 
 test "repository document task builds the bounded source model before delivery" {
@@ -1290,7 +1394,9 @@ test "repository manifest root liveness check rejects stable path replacement" {
     try tmp.dir.rename("repo", tmp.dir, "old-repo", io);
     try tmp.dir.symLink(io, "outside", "repo", .{ .is_directory = true });
 
-    var result = runManifestLoadChecked(root_path, root, null, null, allocator, io);
+    var environment = try testingLocalGitEnvironment(allocator);
+    defer environment.deinit();
+    var result = runManifestLoadChecked(root_path, root, null, null, &environment, allocator, io);
     defer result.deinit(allocator);
     switch (result) {
         .failed_static => |message| try std.testing.expectEqualStrings("Repository root changed", message),

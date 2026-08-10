@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const git_ref = @import("ref.zig");
 const git_branch_status = @import("branch_status.zig");
 const git_push = @import("push.zig");
+const git_command = @import("command.zig");
 const process_runner = @import("../process/runner.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const repository_change_map = @import("../repository/change_map.zig");
@@ -44,12 +45,6 @@ pub const max_diff_bytes = 16 * 1024 * 1024;
 pub const max_status_bytes = 8 * 1024 * 1024;
 pub const max_repository_manifest_bytes = 16 * 1024 * 1024;
 pub const max_branch_list_bytes = 4 * 1024 * 1024;
-
-pub const LoadError = error{
-    StreamTooLong,
-    OutOfMemory,
-    SpawnFailed,
-};
 
 pub const LoadResult = union(enum) {
     /// Allocated raw diff text. Caller owns and must call `deinit`.
@@ -357,16 +352,22 @@ pub const GitStatusRequest = struct {
 pub const RepositoryManifestRequest = struct {
     /// Borrowed descriptor cwd. The caller keeps it alive through command wait.
     cwd: std.Io.Dir,
+    /// Borrowed controlled environment owned by the synchronous caller/task.
+    environment: *const git_command.LocalGitEnvironment,
 };
 
 pub const RepositoryFileStatusRequest = struct {
     /// Borrowed descriptor cwd. The caller keeps it alive through command wait.
     cwd: std.Io.Dir,
+    /// Borrowed controlled environment shared with the manifest read.
+    environment: *const git_command.LocalGitEnvironment,
 };
 
 pub const RepositoryFileChangeRequest = struct {
     /// Borrowed descriptor cwd kept alive by the synchronous task call.
     cwd: std.Io.Dir,
+    /// Borrowed controlled environment shared by repository and temp commands.
+    environment: *const git_command.LocalGitEnvironment,
     /// Borrowed byte-exact manifest path; every Git pathspec command is literal.
     path: []const u8,
     /// Borrowed immutable descriptor-safe task snapshot, never page memory.
@@ -567,7 +568,7 @@ pub const LocalCommandBackend = struct {
     const git_diff_unstaged = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
     const git_diff_cached = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
 
-    pub fn loadDiff(allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) LoadError!LoadResult {
+    pub fn loadDiff(allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) git_command.Error!LoadResult {
         return switch (request.kind) {
             .unstaged => loadGitDiff(allocator, io, repoRoot(request), &git_diff_unstaged),
             .cached => loadGitDiff(allocator, io, repoRoot(request), &git_diff_cached),
@@ -577,35 +578,35 @@ pub const LocalCommandBackend = struct {
         };
     }
 
-    pub fn loadStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
+    pub fn loadStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) git_command.Error!StatusLoadResult {
         return loadGitStatus(allocator, io, request);
     }
 
-    pub fn loadRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) LoadError!RepositoryManifestLoadResult {
-        return loadGitRepositoryManifest(allocator, io, request.cwd);
+    pub fn loadRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) git_command.Error!RepositoryManifestLoadResult {
+        return loadGitRepositoryManifest(allocator, io, request);
     }
 
-    pub fn loadRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) LoadError!RepositoryFileStatusLoadResult {
-        return loadGitRepositoryFileStatus(allocator, io, request.cwd);
+    pub fn loadRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) git_command.Error!RepositoryFileStatusLoadResult {
+        return loadGitRepositoryFileStatus(allocator, io, request);
     }
 
-    pub fn loadRepositoryFileChange(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) LoadError!RepositoryFileChangeLoadResult {
+    pub fn loadRepositoryFileChange(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) git_command.Error!RepositoryFileChangeLoadResult {
         return loadGitRepositoryFileChange(allocator, io, request);
     }
 
-    pub fn loadBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
+    pub fn loadBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) git_command.Error!BranchStatusLoadResult {
         return loadGitBranchStatus(allocator, io, request);
     }
 
-    pub fn loadBranchList(allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
+    pub fn loadBranchList(allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) git_command.Error!BranchListLoadResult {
         return loadGitBranchList(allocator, io, request);
     }
 
-    pub fn loadCompareSnapshot(allocator: std.mem.Allocator, io: std.Io, request: CompareSnapshotRequest) LoadError!CompareSnapshotResult {
+    pub fn loadCompareSnapshot(allocator: std.mem.Allocator, io: std.Io, request: CompareSnapshotRequest) git_command.Error!CompareSnapshotResult {
         return loadGitCompareSnapshot(allocator, io, request);
     }
 
-    pub fn runOperation(allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) LoadError!OperationResult {
+    pub fn runOperation(allocator: std.mem.Allocator, io: std.Io, request: OperationRequest) git_command.Error!OperationResult {
         return switch (request.kind) {
             .stage_file => |path| runGitAdd(allocator, io, request.repo_root, path),
             .unstage_file => |path| runGitUnstage(allocator, io, request.repo_root, path),
@@ -659,24 +660,16 @@ fn runCapturedCommand(
     argv: []const []const u8,
     stdout_limit: std.Io.Limit,
     stderr_limit: std.Io.Limit,
-) LoadError!process_runner.Result {
+) git_command.Error!process_runner.Result {
     return process_runner.runCaptured(allocator, io, .{
         .argv = argv,
         .cwd = if (repo_root) |root| .{ .path = root } else .inherit,
         .stdout_limit = stdout_limit,
         .stderr_limit = stderr_limit,
-    }) catch |err| return runnerErrorToLoadError(err);
+    }) catch |err| return git_command.fromRunnerError(err);
 }
 
-fn runnerErrorToLoadError(err: process_runner.Error) LoadError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-}
-
-fn loadResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!LoadResult {
+fn loadResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) git_command.Error!LoadResult {
     switch (result.term) {
         .exited => |code| if (code == 0) {
             allocator.free(result.stderr);
@@ -692,7 +685,7 @@ fn loadResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner
     return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
 }
 
-fn statusResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!StatusLoadResult {
+fn statusResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) git_command.Error!StatusLoadResult {
     switch (result.term) {
         .exited => |code| if (code == 0) {
             allocator.free(result.stderr);
@@ -708,7 +701,7 @@ fn statusResultFromGitCommand(allocator: std.mem.Allocator, result: process_runn
     return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
 }
 
-fn repositoryManifestResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result) LoadError!RepositoryManifestLoadResult {
+fn repositoryManifestResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result) git_command.Error!RepositoryManifestLoadResult {
     switch (result.term) {
         .exited => |code| if (code == 0) {
             allocator.free(result.stderr);
@@ -736,7 +729,7 @@ fn repositoryFileStatusResultFromGitCommand(allocator: std.mem.Allocator, result
     return .{ .failed_static = "Repository file status could not be loaded" };
 }
 
-fn operationResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) LoadError!OperationResult {
+fn operationResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) git_command.Error!OperationResult {
     allocator.free(result.stdout);
     switch (result.term) {
         .exited => |code| if (code == 0) {
@@ -756,7 +749,7 @@ fn operationResultFromGitStdinCommand(
     allocator: std.mem.Allocator,
     detailed: process_runner.DetailedResult,
     fallback_label: []const u8,
-) LoadError!OperationResult {
+) git_command.Error!OperationResult {
     return switch (detailed) {
         .ok => |result| operationResultFromGitCommand(allocator, result, fallback_label),
         .failed => |failure_value| {
@@ -792,25 +785,25 @@ fn operationResultFromGitStdinCommand(
                     result.deinit(allocator);
                     return .{ .failed = message };
                 },
-                else => runnerErrorToLoadError(failure.toError()),
+                else => git_command.fromRunnerError(failure.toError()),
             };
         },
     };
 }
 
-fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!LoadResult {
+fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) git_command.Error!LoadResult {
     // Use structured argv and force stable path prefixes so display/editor
     // paths do not depend on user diff.mnemonicPrefix/diff.noprefix config.
     const result = try runCapturedCommand(allocator, io, repo_root, argv, .limited(max_diff_bytes), .limited(256 * 1024));
     return loadResultFromGitCommand(allocator, result, "git diff");
 }
 
-fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, range: []const u8) LoadError!LoadResult {
+fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, range: []const u8) git_command.Error!LoadResult {
     const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", range };
     return loadGitDiff(allocator, io, repo_root, &argv);
 }
 
-fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: FileDiffRequest) LoadError!LoadResult {
+fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: FileDiffRequest) git_command.Error!LoadResult {
     return switch (request.base) {
         .unstaged => {
             const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
@@ -833,7 +826,7 @@ fn statusArgvForOrigin(origin: ReadOrigin) []const []const u8 {
     };
 }
 
-fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) LoadError!StatusLoadResult {
+fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) git_command.Error!StatusLoadResult {
     const argv = statusArgvForOrigin(request.origin);
     const result = try runCapturedCommand(allocator, io, request.repo_root, argv, .limited(max_status_bytes), .limited(256 * 1024));
     return statusResultFromGitCommand(allocator, result, "git status");
@@ -854,13 +847,12 @@ fn repositoryManifestArgv() []const []const u8 {
     return &repository_manifest_argv;
 }
 
-fn loadGitRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) LoadError!RepositoryManifestLoadResult {
-    const result = process_runner.runCaptured(allocator, io, .{
+fn loadGitRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) git_command.Error!RepositoryManifestLoadResult {
+    const result = try git_command.runCaptured(allocator, io, .{ .cwd = request.cwd, .environment = request.environment }, .{
         .argv = repositoryManifestArgv(),
-        .cwd = .{ .dir = cwd },
         .stdout_limit = .limited(max_repository_manifest_bytes),
         .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return runnerErrorToLoadError(err);
+    });
     return repositoryManifestResultFromGitCommand(allocator, result);
 }
 
@@ -877,13 +869,12 @@ fn repositoryFileStatusArgv() []const []const u8 {
     return &repository_file_status_argv;
 }
 
-fn loadGitRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir) LoadError!RepositoryFileStatusLoadResult {
-    const result = process_runner.runCaptured(allocator, io, .{
+fn loadGitRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) git_command.Error!RepositoryFileStatusLoadResult {
+    const result = try git_command.runCaptured(allocator, io, .{ .cwd = request.cwd, .environment = request.environment }, .{
         .argv = repositoryFileStatusArgv(),
-        .cwd = .{ .dir = cwd },
         .stdout_limit = .limited(max_status_bytes),
         .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return runnerErrorToLoadError(err);
+    });
     return repositoryFileStatusResultFromGitCommand(allocator, result);
 }
 
@@ -911,9 +902,9 @@ const TreeBlob = struct {
 
 const RepositoryChangePhaseHook = struct {
     context: *anyopaque,
-    run: *const fn (*anyopaque, std.Io, std.Io.Dir) LoadError!void,
+    run: *const fn (*anyopaque, std.Io, std.Io.Dir) git_command.Error!void,
 
-    fn invoke(self: RepositoryChangePhaseHook, io: std.Io, cwd: std.Io.Dir) LoadError!void {
+    fn invoke(self: RepositoryChangePhaseHook, io: std.Io, cwd: std.Io.Dir) git_command.Error!void {
         return self.run(self.context, io, cwd);
     }
 };
@@ -940,7 +931,7 @@ fn loadGitRepositoryFileChange(
     allocator: std.mem.Allocator,
     io: std.Io,
     request: RepositoryFileChangeRequest,
-) LoadError!RepositoryFileChangeLoadResult {
+) git_command.Error!RepositoryFileChangeLoadResult {
     return loadGitRepositoryFileChangeWithHooks(allocator, io, request, null);
 }
 
@@ -949,8 +940,10 @@ fn loadGitRepositoryFileChangeWithHooks(
     io: std.Io,
     request: RepositoryFileChangeRequest,
     hooks: ?*RepositoryChangeTestHooks,
-) LoadError!RepositoryFileChangeLoadResult {
-    const head_result = try runRepositoryChangeCommand(allocator, io, request.cwd, &.{
+) git_command.Error!RepositoryFileChangeLoadResult {
+    const repository_context = git_command.DirectoryContext{ .cwd = request.cwd, .environment = request.environment };
+
+    const head_result = try runRepositoryChangeCommand(allocator, io, repository_context, &.{
         "git",
         "--no-optional-locks",
         "--literal-pathspecs",
@@ -970,7 +963,7 @@ fn loadGitRepositoryFileChangeWithHooks(
 
     const treeish = std.fmt.allocPrint(allocator, "{s}^{{tree}}", .{head.present}) catch return error.OutOfMemory;
     defer allocator.free(treeish);
-    const tree_result = try runRepositoryChangeCommand(allocator, io, request.cwd, &.{
+    const tree_result = try runRepositoryChangeCommand(allocator, io, repository_context, &.{
         "git",
         "--no-optional-locks",
         "rev-parse",
@@ -982,7 +975,7 @@ fn loadGitRepositoryFileChangeWithHooks(
     const tree_oid = trimSingleLine(tree_result.stdout);
     if (!isObjectId(tree_oid)) return .{ .failed_static = "Repository change basis unavailable" };
 
-    const entry_result = try runRepositoryChangeCommand(allocator, io, request.cwd, &.{
+    const entry_result = try runRepositoryChangeCommand(allocator, io, repository_context, &.{
         "git",
         "--no-optional-locks",
         "--literal-pathspecs",
@@ -998,10 +991,10 @@ fn loadGitRepositoryFileChangeWithHooks(
     const blob = parseTreeBlob(entry_result.stdout, request.path) catch return .{ .failed_static = "Repository change basis unavailable" };
     if (blob == null) return .all_added;
 
-    const attributes_before = try loadSafeRepositoryChangeAttributes(allocator, io, request.cwd, request.path, hooks) orelse
+    const attributes_before = try loadSafeRepositoryChangeAttributes(allocator, io, repository_context, request.path, hooks) orelse
         return .{ .failed_static = "Repository change attributes unavailable" };
 
-    const blob_result = try runRepositoryChangeCommand(allocator, io, request.cwd, &.{
+    const blob_result = try runRepositoryChangeCommand(allocator, io, repository_context, &.{
         "git",
         "--no-optional-locks",
         "cat-file",
@@ -1031,7 +1024,7 @@ fn loadGitRepositoryFileChangeWithHooks(
     if (hooks) |test_hooks| if (test_hooks.fail_write == .current) return error.SpawnFailed;
     try writePrivateComparisonFile(io, temp.dir, "current", current_logical);
 
-    const diff_result = try runRepositoryChangeCommand(allocator, io, temp.dir, &.{
+    const diff_result = try runRepositoryChangeCommand(allocator, io, .{ .cwd = temp.dir, .environment = request.environment }, &.{
         "git",
         "diff",
         "--no-index",
@@ -1049,7 +1042,7 @@ fn loadGitRepositoryFileChangeWithHooks(
     }, &.{}, max_diff_bytes, hooks);
     errdefer diff_result.deinit(allocator);
 
-    const attributes_after = try loadSafeRepositoryChangeAttributes(allocator, io, request.cwd, request.path, hooks) orelse {
+    const attributes_after = try loadSafeRepositoryChangeAttributes(allocator, io, repository_context, request.path, hooks) orelse {
         diff_result.deinit(allocator);
         return .{ .failed_static = "Repository change attributes unavailable" };
     };
@@ -1093,12 +1086,12 @@ fn loadGitRepositoryFileChangeWithHooks(
 fn runRepositoryChangeCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
-    cwd: std.Io.Dir,
+    context: git_command.DirectoryContext,
     argv: []const []const u8,
     stdin: []const u8,
     stdout_limit: usize,
     hooks: ?*RepositoryChangeTestHooks,
-) LoadError!process_runner.Result {
+) git_command.Error!process_runner.Result {
     var effective_stdout_limit = stdout_limit;
     if (hooks) |test_hooks| {
         const command_index = test_hooks.command_index;
@@ -1106,13 +1099,12 @@ fn runRepositoryChangeCommand(
         if (test_hooks.fail_command_at == command_index) return error.SpawnFailed;
         if (test_hooks.limit_command_at == command_index) effective_stdout_limit = @min(effective_stdout_limit, test_hooks.forced_stdout_limit);
     }
-    return process_runner.runWithStdin(allocator, io, .{
+    return git_command.runWithStdin(allocator, io, context, .{
         .argv = argv,
-        .cwd = .{ .dir = cwd },
         .stdin = stdin,
         .stdout_limit = .limited(effective_stdout_limit),
         .stderr_limit = .limited(repository_change_small_output_limit),
-    }) catch |err| return runnerErrorToLoadError(err);
+    });
 }
 
 fn termExited(term: std.process.Child.Term, expected: u8) bool {
@@ -1171,15 +1163,15 @@ fn parseTreeBlob(output: []const u8, expected_path: []const u8) !?TreeBlob {
 fn loadSafeRepositoryChangeAttributes(
     allocator: std.mem.Allocator,
     io: std.Io,
-    cwd: std.Io.Dir,
+    context: git_command.DirectoryContext,
     path: []const u8,
     hooks: ?*RepositoryChangeTestHooks,
-) LoadError!?AttributeState {
+) git_command.Error!?AttributeState {
     const stdin = allocator.alloc(u8, path.len + 1) catch return error.OutOfMemory;
     defer allocator.free(stdin);
     @memcpy(stdin[0..path.len], path);
     stdin[path.len] = 0;
-    const result = try runRepositoryChangeCommand(allocator, io, cwd, &.{
+    const result = try runRepositoryChangeCommand(allocator, io, context, &.{
         "git",
         "--no-optional-locks",
         "--literal-pathspecs",
@@ -1228,7 +1220,7 @@ const ComparisonTemp = struct {
         configured_base: []const u8,
         name_token: ?[]const u8,
         fail_open: bool,
-    ) LoadError!ComparisonTemp {
+    ) git_command.Error!ComparisonTemp {
         const preferred = if (std.fs.path.isAbsolute(configured_base)) configured_base else "/tmp";
         var base_dir = std.Io.Dir.openDirAbsolute(io, preferred, .{}) catch
             std.Io.Dir.openDirAbsolute(io, "/tmp", .{}) catch return error.SpawnFailed;
@@ -1285,15 +1277,18 @@ const ComparisonTemp = struct {
     }
 };
 
-fn writePrivateComparisonFile(io: std.Io, dir: std.Io.Dir, name: []const u8, contents: []const u8) LoadError!void {
+fn writePrivateComparisonFile(io: std.Io, dir: std.Io.Dir, name: []const u8, contents: []const u8) git_command.Error!void {
     var file = dir.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch return error.SpawnFailed;
     defer file.close(io);
     file.writeStreamingAll(io, contents) catch return error.SpawnFailed;
 }
 
 fn repositoryChangeMapForTest(cwd: std.Io.Dir, path: []const u8, source_bytes: []const u8, temp_base_path: []const u8) !repository_change_map.Map {
+    var environment = try testingLocalGitEnvironment(std.testing.allocator);
+    defer environment.deinit();
     const result = try LocalCommandBackend.loadRepositoryFileChange(std.testing.allocator, std.testing.io, .{
         .cwd = cwd,
+        .environment = &environment,
         .path = path,
         .source_bytes = source_bytes,
         .temp_base_path = temp_base_path,
@@ -1305,6 +1300,38 @@ fn repositoryChangeMapForTest(cwd: std.Io.Dir, path: []const u8, source_bytes: [
         .unchanged => repository_change_map.fromPatch(std.testing.allocator, "", testContentLineCount(source_bytes)),
         .failed_static => error.UnexpectedRepositoryChangeFailure,
     };
+}
+
+fn testingLocalGitEnvironment(allocator: std.mem.Allocator) !git_command.LocalGitEnvironment {
+    var parent = try std.testing.environ.createMap(allocator);
+    defer parent.deinit();
+    return git_command.LocalGitEnvironment.initFromParent(allocator, &parent);
+}
+
+fn loadRepositoryFileStatusForTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+) !RepositoryFileStatusLoadResult {
+    var environment = try testingLocalGitEnvironment(allocator);
+    defer environment.deinit();
+    return LocalCommandBackend.loadRepositoryFileStatus(allocator, io, .{
+        .cwd = cwd,
+        .environment = &environment,
+    });
+}
+
+fn loadRepositoryManifestForTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+) !RepositoryManifestLoadResult {
+    var environment = try testingLocalGitEnvironment(allocator);
+    defer environment.deinit();
+    return LocalCommandBackend.loadRepositoryManifest(allocator, io, .{
+        .cwd = cwd,
+        .environment = &environment,
+    });
 }
 
 fn testContentLineCount(bytes: []const u8) usize {
@@ -1407,6 +1434,8 @@ test "repository change backend treats pathspec magic literally and fails closed
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
+    var environment = try testingLocalGitEnvironment(std.testing.allocator);
+    defer environment.deinit();
     try tmp.dir.createDir(io, "work", .default_dir);
     var work = try tmp.dir.openDir(io, "work", .{});
     defer work.close(io);
@@ -1435,6 +1464,7 @@ test "repository change backend treats pathspec magic literally and fails closed
     try work.writeFile(io, .{ .sub_path = ".gitattributes", .data = "a\\*b.zig filter=unsafe\n" });
     const rejected = try LocalCommandBackend.loadRepositoryFileChange(std.testing.allocator, io, .{
         .cwd = work,
+        .environment = &environment,
         .path = "a*b.zig",
         .source_bytes = "changed\n",
     });
@@ -1444,6 +1474,7 @@ test "repository change backend treats pathspec magic literally and fails closed
     try work.writeFile(io, .{ .sub_path = ".gitattributes", .data = "a[*]b.zig working-tree-encoding=UTF-16\n" });
     const encoding_rejected = try LocalCommandBackend.loadRepositoryFileChange(std.testing.allocator, io, .{
         .cwd = work,
+        .environment = &environment,
         .path = "a*b.zig",
         .source_bytes = "changed\n",
     });
@@ -1497,7 +1528,7 @@ test "repository change temporary comparison leaves its private base empty" {
 const ResetHeadHookContext = struct {
     oid: []const u8,
 
-    fn run(ctx_ptr: *anyopaque, io: std.Io, cwd: std.Io.Dir) LoadError!void {
+    fn run(ctx_ptr: *anyopaque, io: std.Io, cwd: std.Io.Dir) git_command.Error!void {
         const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
         runTestGit(io, &.{ "git", "reset", "--hard", ctx.oid }, cwd) catch return error.SpawnFailed;
     }
@@ -1506,7 +1537,7 @@ const ResetHeadHookContext = struct {
 const RemoveIndexHookContext = struct {
     path: []const u8,
 
-    fn run(ctx_ptr: *anyopaque, io: std.Io, cwd: std.Io.Dir) LoadError!void {
+    fn run(ctx_ptr: *anyopaque, io: std.Io, cwd: std.Io.Dir) git_command.Error!void {
         const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
         runTestGit(io, &.{ "git", "rm", "--cached", "--", ctx.path }, cwd) catch return error.SpawnFailed;
     }
@@ -1516,7 +1547,7 @@ const RewriteWorktreeHookContext = struct {
     path: []const u8,
     bytes: []const u8,
 
-    fn run(ctx_ptr: *anyopaque, io: std.Io, cwd: std.Io.Dir) LoadError!void {
+    fn run(ctx_ptr: *anyopaque, io: std.Io, cwd: std.Io.Dir) git_command.Error!void {
         const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
         cwd.writeFile(io, .{ .sub_path = ctx.path, .data = ctx.bytes }) catch return error.SpawnFailed;
     }
@@ -1526,6 +1557,8 @@ test "repository change backend keeps copied object basis across HEAD index and 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
+    var environment = try testingLocalGitEnvironment(std.testing.allocator);
+    defer environment.deinit();
     try tmp.dir.createDir(io, "head-move", .default_dir);
     var head_move = try tmp.dir.openDir(io, "head-move", .{});
     defer head_move.close(io);
@@ -1548,6 +1581,7 @@ test "repository change backend keeps copied object basis across HEAD index and 
     } };
     const pinned = try loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
         .cwd = head_move,
+        .environment = &environment,
         .path = "source",
         .source_bytes = "old\n",
     }, &head_hooks);
@@ -1571,6 +1605,7 @@ test "repository change backend keeps copied object basis across HEAD index and 
     } };
     const index_independent = try loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
         .cwd = index_move,
+        .environment = &environment,
         .path = "source",
         .source_bytes = "same\n",
     }, &index_hooks);
@@ -1585,6 +1620,7 @@ test "repository change backend keeps copied object basis across HEAD index and 
     } };
     const snapshot_independent = try loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
         .cwd = index_move,
+        .environment = &environment,
         .path = "source",
         .source_bytes = "same\n",
     }, &worktree_hooks);
@@ -1629,6 +1665,8 @@ test "repository change success is gated on cleanup and error paths remove priva
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
+    var environment = try testingLocalGitEnvironment(std.testing.allocator);
+    defer environment.deinit();
     try tmp.dir.createDir(io, "work", .default_dir);
     try tmp.dir.createDir(io, "temp-base", .default_dir);
     var work = try tmp.dir.openDir(io, "work", .{});
@@ -1650,6 +1688,7 @@ test "repository change success is gated on cleanup and error paths remove priva
         };
         const result = try loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
             .cwd = work,
+            .environment = &environment,
             .path = "source",
             .source_bytes = fixture.bytes,
             .temp_base_path = temp_base,
@@ -1676,6 +1715,7 @@ test "repository change success is gated on cleanup and error paths remove priva
     var collision_hooks = RepositoryChangeTestHooks{ .temp_name_token = "collision" };
     const collision_result = try loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
         .cwd = work,
+        .environment = &environment,
         .path = "source",
         .source_bytes = "changed\n",
         .temp_base_path = temp_base,
@@ -1687,6 +1727,7 @@ test "repository change success is gated on cleanup and error paths remove priva
     var open_hooks = RepositoryChangeTestHooks{ .fail_temp_open = true, .temp_name_token = "open-failure" };
     try std.testing.expectError(error.SpawnFailed, loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
         .cwd = work,
+        .environment = &environment,
         .path = "source",
         .source_bytes = "changed\n",
         .temp_base_path = temp_base,
@@ -1696,6 +1737,7 @@ test "repository change success is gated on cleanup and error paths remove priva
         var write_hooks = RepositoryChangeTestHooks{ .fail_write = write_failure, .temp_name_token = @tagName(write_failure) };
         try std.testing.expectError(error.SpawnFailed, loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
             .cwd = work,
+            .environment = &environment,
             .path = "source",
             .source_bytes = "changed\n",
             .temp_base_path = temp_base,
@@ -1705,6 +1747,7 @@ test "repository change success is gated on cleanup and error paths remove priva
         var command_hooks = RepositoryChangeTestHooks{ .fail_command_at = command_index, .temp_name_token = if (command_index == 5) "diff-failure" else "post-attr-failure" };
         try std.testing.expectError(error.SpawnFailed, loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
             .cwd = work,
+            .environment = &environment,
             .path = "source",
             .source_bytes = "changed\n",
             .temp_base_path = temp_base,
@@ -1717,6 +1760,7 @@ test "repository change success is gated on cleanup and error paths remove priva
     };
     try std.testing.expectError(error.StreamTooLong, loadGitRepositoryFileChangeWithHooks(std.testing.allocator, io, .{
         .cwd = work,
+        .environment = &environment,
         .path = "source",
         .source_bytes = "changed\n",
         .temp_base_path = temp_base,
@@ -1731,12 +1775,14 @@ test "repository change success is gated on cleanup and error paths remove priva
 const RepositoryChangeAllocationFixture = struct {
     io: std.Io,
     cwd: std.Io.Dir,
+    environment: *const git_command.LocalGitEnvironment,
     temp_base_path: []const u8,
 
     fn exercise(allocator: std.mem.Allocator, fixture: *@This()) !void {
         var hooks = RepositoryChangeTestHooks{ .temp_name_token = "allocation" };
         const result = try loadGitRepositoryFileChangeWithHooks(allocator, fixture.io, .{
             .cwd = fixture.cwd,
+            .environment = fixture.environment,
             .path = "source",
             .source_bytes = "changed\n",
             .temp_base_path = fixture.temp_base_path,
@@ -1760,7 +1806,14 @@ test "repository change backend releases private inputs at every allocation fail
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
     const temp_base = try tmp.dir.realPathFileAlloc(io, "temp-base", std.testing.allocator);
     defer std.testing.allocator.free(temp_base);
-    var fixture = RepositoryChangeAllocationFixture{ .io = io, .cwd = work, .temp_base_path = temp_base };
+    var environment = try testingLocalGitEnvironment(std.testing.allocator);
+    defer environment.deinit();
+    var fixture = RepositoryChangeAllocationFixture{
+        .io = io,
+        .cwd = work,
+        .environment = &environment,
+        .temp_base_path = temp_base,
+    };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, RepositoryChangeAllocationFixture.exercise, .{&fixture});
 
     var base = try tmp.dir.openDir(io, "temp-base", .{ .iterate = true });
@@ -1801,7 +1854,7 @@ test "repository file status reports real intent-to-add as current added path" {
     try work.writeFile(io, .{ .sub_path = "intent.zig", .data = "const value = 1;\n" });
     try runTestGit(io, &.{ "git", "add", "-N", "intent.zig" }, work);
 
-    var result = try LocalCommandBackend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = work });
+    var result = try loadRepositoryFileStatusForTest(std.testing.allocator, io, work);
     const bytes = switch (result) {
         .ok => |owned| blk: {
             result = .{ .failed_static = "consumed" };
@@ -1831,7 +1884,7 @@ test "repository file status descriptor cwd survives path replacement" {
     try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
     try replacement.writeFile(io, .{ .sub_path = "replacement.txt", .data = "new\n" });
 
-    const result = try LocalCommandBackend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = committed });
+    const result = try loadRepositoryFileStatusForTest(std.testing.allocator, io, committed);
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |owned| owned,
@@ -1856,7 +1909,7 @@ test "repository file status with rename detection disabled keeps only current p
     try runTestGit(io, &.{ "git", "config", "status.renames", "false" }, work);
     try work.rename("old.zig", work, "new.zig", io);
 
-    var result = try LocalCommandBackend.loadRepositoryFileStatus(std.testing.allocator, io, .{ .cwd = work });
+    var result = try loadRepositoryFileStatusForTest(std.testing.allocator, io, work);
     const bytes = switch (result) {
         .ok => |owned| blk: {
             result = .{ .failed_static = "consumed" };
@@ -1896,7 +1949,7 @@ test "repository file status classifies a dirty submodule gitlink" {
     defer checked_out_child.close(io);
     try checked_out_child.writeFile(io, .{ .sub_path = "source.zig", .data = "const value = 2;\n" });
 
-    var result = try LocalCommandBackend.loadRepositoryFileStatus(allocator, io, .{ .cwd = work });
+    var result = try loadRepositoryFileStatusForTest(allocator, io, work);
     const bytes = switch (result) {
         .ok => |owned| blk: {
             result = .{ .failed_static = "consumed" };
@@ -1947,7 +2000,7 @@ test "repository manifest backend deduplicates a real three-stage conflict" {
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "main" }, work);
     try runTestGitFailure(io, &.{ "git", "merge", "side" }, work);
 
-    const result = try LocalCommandBackend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
+    const result = try loadRepositoryManifestForTest(std.testing.allocator, io, work);
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -1974,7 +2027,7 @@ test "repository manifest backend accepts gitlink as one path" {
     defer std.testing.allocator.free(cache_info);
     try runTestGit(io, &.{ "git", "update-index", "--add", "--cacheinfo", cache_info }, work);
 
-    const result = try LocalCommandBackend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
+    const result = try loadRepositoryManifestForTest(std.testing.allocator, io, work);
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -1999,7 +2052,7 @@ test "repository manifest backend includes tracked and non-ignored untracked pat
     try work.writeFile(io, .{ .sub_path = "ignored.log", .data = "ignored\n" });
     try work.writeFile(io, .{ .sub_path = "visible.txt", .data = "visible\n" });
 
-    const result = try LocalCommandBackend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = work });
+    const result = try loadRepositoryManifestForTest(std.testing.allocator, io, work);
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -2028,7 +2081,7 @@ test "repository manifest descriptor cwd stays on committed directory after path
     try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
     try replacement.writeFile(io, .{ .sub_path = "replacement.txt", .data = "new\n" });
 
-    const result = try LocalCommandBackend.loadRepositoryManifest(std.testing.allocator, io, .{ .cwd = committed });
+    const result = try loadRepositoryManifestForTest(std.testing.allocator, io, committed);
     defer result.deinit(std.testing.allocator);
     const bytes = switch (result) {
         .ok => |value| value,
@@ -2065,19 +2118,15 @@ test "background status suppresses optional locks without changing foreground ar
     try std.testing.expectEqualStrings("status", statusArgvForOrigin(.background)[2]);
 }
 
-fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) LoadError!BranchStatusLoadResult {
+fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) git_command.Error!BranchStatusLoadResult {
     var builder = git_branch_status.Builder.init(allocator);
     defer builder.deinit();
 
-    const cwd: std.process.Child.Cwd = switch (request.cwd) {
-        .path => |path| .{ .path = path },
-        .dir => |dir| .{ .dir = dir },
-    };
-    var env = try controlledGitEnvironment(allocator, request.parent_env);
-    defer env.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, request.parent_env);
+    defer environment.deinit();
 
     const head_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
-    const head_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &head_argv, .limited(4 * 1024));
+    const head_result = try runControlledBranchCommand(allocator, io, request.cwd, &environment, &head_argv, .limited(4 * 1024));
     defer head_result.deinit(allocator);
 
     switch (head_result.term) {
@@ -2090,7 +2139,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
     }
 
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
-    const oid_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &oid_argv, .limited(4 * 1024));
+    const oid_result = try runControlledBranchCommand(allocator, io, request.cwd, &environment, &oid_argv, .limited(4 * 1024));
     defer oid_result.deinit(allocator);
     switch (oid_result.term) {
         .exited => |code| if (code == 0) {
@@ -2100,7 +2149,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
     }
 
     const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
-    const upstream_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &upstream_argv, .limited(4 * 1024));
+    const upstream_result = try runControlledBranchCommand(allocator, io, request.cwd, &environment, &upstream_argv, .limited(4 * 1024));
     defer upstream_result.deinit(allocator);
     var has_upstream = false;
     switch (upstream_result.term) {
@@ -2116,7 +2165,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
 
     if (has_upstream) {
         const ab_argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}" };
-        const ab_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, &env, &ab_argv, .limited(4 * 1024));
+        const ab_result = try runControlledBranchCommand(allocator, io, request.cwd, &environment, &ab_argv, .limited(4 * 1024));
         defer ab_result.deinit(allocator);
         switch (ab_result.term) {
             .exited => |code| if (code == 0) {
@@ -2132,7 +2181,7 @@ fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: Branch
     return .{ .ok = builder.finish() };
 }
 
-fn loadGitBranchList(allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) LoadError!BranchListLoadResult {
+fn loadGitBranchList(allocator: std.mem.Allocator, io: std.Io, request: BranchListRequest) git_command.Error!BranchListLoadResult {
     return loadGitBranchListWithLimit(allocator, io, request, .limited(max_branch_list_bytes));
 }
 
@@ -2141,29 +2190,35 @@ fn loadGitBranchListWithLimit(
     io: std.Io,
     request: BranchListRequest,
     list_stdout_limit: std.Io.Limit,
-) LoadError!BranchListLoadResult {
+) git_command.Error!BranchListLoadResult {
     const cwd: std.process.Child.Cwd = switch (request.cwd) {
         .path => |path| .{ .path = path },
         .dir => |dir| .{ .dir = dir },
     };
-    var controlled_env: ?std.process.Environ.Map = switch (request.environment) {
+    var controlled_environment: ?git_command.LocalGitEnvironment = switch (request.environment) {
         .inherited => null,
-        .controlled => |parent| try controlledGitEnvironment(allocator, parent),
+        .controlled => |parent| try git_command.LocalGitEnvironment.initFromParent(allocator, parent),
     };
-    defer if (controlled_env) |*env| env.deinit();
-    const env: ?*const std.process.Environ.Map = if (controlled_env) |*value| value else null;
+    defer if (controlled_environment) |*environment| environment.deinit();
 
     const current_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
-    const current_result = try runGitBranchStatusCommandInCwd(allocator, io, cwd, env, &current_argv, .limited(4 * 1024));
+    const current_result = if (controlled_environment) |*environment|
+        try runControlledBranchCommand(allocator, io, request.cwd, environment, &current_argv, .limited(4 * 1024))
+    else
+        try runGitBranchStatusCommandInCwd(allocator, io, cwd, null, &current_argv, .limited(4 * 1024));
     defer current_result.deinit(allocator);
 
     const format = "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(symref)%00";
     const local_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads" };
     const all_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads", "refs/remotes" };
-    const list_result = switch (request.scope) {
-        .local => try runGitBranchStatusCommandInCwd(allocator, io, cwd, env, &local_argv, list_stdout_limit),
-        .local_and_remote => try runGitBranchStatusCommandInCwd(allocator, io, cwd, env, &all_argv, list_stdout_limit),
+    const list_argv = switch (request.scope) {
+        .local => &local_argv,
+        .local_and_remote => &all_argv,
     };
+    const list_result = if (controlled_environment) |*environment|
+        try runControlledBranchCommand(allocator, io, request.cwd, environment, list_argv, list_stdout_limit)
+    else
+        try runGitBranchStatusCommandInCwd(allocator, io, cwd, null, list_argv, list_stdout_limit);
     defer list_result.deinit(allocator);
 
     return branchListResultFromCommandResults(allocator, current_result, list_result);
@@ -2171,9 +2226,9 @@ fn loadGitBranchListWithLimit(
 
 const ComparePhaseHook = struct {
     context: *anyopaque,
-    run: *const fn (*anyopaque, std.Io, std.Io.Dir) LoadError!void,
+    run: *const fn (*anyopaque, std.Io, std.Io.Dir) git_command.Error!void,
 
-    fn invoke(self: ComparePhaseHook, io: std.Io, cwd: std.Io.Dir) LoadError!void {
+    fn invoke(self: ComparePhaseHook, io: std.Io, cwd: std.Io.Dir) git_command.Error!void {
         return self.run(self.context, io, cwd);
     }
 };
@@ -2220,7 +2275,7 @@ fn loadGitCompareSnapshot(
     allocator: std.mem.Allocator,
     io: std.Io,
     request: CompareSnapshotRequest,
-) LoadError!CompareSnapshotResult {
+) git_command.Error!CompareSnapshotResult {
     return loadGitCompareSnapshotWithHooks(allocator, io, request, null);
 }
 
@@ -2229,14 +2284,14 @@ fn loadGitCompareSnapshotWithHooks(
     io: std.Io,
     request: CompareSnapshotRequest,
     hooks: ?*CompareTestHooks,
-) LoadError!CompareSnapshotResult {
-    var env = try controlledGitEnvironment(allocator, request.parent_env);
-    defer env.deinit();
+) git_command.Error!CompareSnapshotResult {
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, request.parent_env);
+    defer environment.deinit();
 
     const resolution = if (request.target) |target|
-        try resolveExplicitCompareTarget(allocator, io, request.cwd, &env, target)
+        try resolveExplicitCompareTarget(allocator, io, request.cwd, &environment, target)
     else
-        try resolveDefaultCompareTarget(allocator, io, request.cwd, &env);
+        try resolveDefaultCompareTarget(allocator, io, request.cwd, &environment);
 
     const resolved = switch (resolution) {
         .resolved => |value| value,
@@ -2254,7 +2309,7 @@ fn loadGitCompareSnapshotWithHooks(
     var base_oid_owned = true;
     defer if (base_oid_owned) allocator.free(base_oid);
 
-    const head_resolution = try resolveCompareHead(allocator, io, request.cwd, &env);
+    const head_resolution = try resolveCompareHead(allocator, io, request.cwd, &environment);
     const resolved_head = switch (head_resolution) {
         .resolved => |value| value,
         .unresolved => {
@@ -2281,7 +2336,7 @@ fn loadGitCompareSnapshotWithHooks(
         allocator,
         io,
         request.cwd,
-        &env,
+        &environment,
         base_oid,
         head_oid,
     );
@@ -2303,7 +2358,7 @@ fn loadGitCompareSnapshotWithHooks(
         allocator,
         io,
         request.cwd,
-        &env,
+        &environment,
         merge_base_oid,
         head_oid,
     )) {
@@ -2318,7 +2373,7 @@ fn loadGitCompareSnapshotWithHooks(
         allocator,
         io,
         request.cwd,
-        &env,
+        &environment,
         merge_base_oid,
         head_oid,
     )) {
@@ -2348,9 +2403,9 @@ fn resolveExplicitCompareTarget(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
+    env: *const git_command.LocalGitEnvironment,
     spec: CompareTargetSpec,
-) LoadError!CompareTargetResolution {
+) git_command.Error!CompareTargetResolution {
     if (branchKind(spec.full_ref) != spec.kind) {
         return .{ .failed_static = "Compare target kind does not match its full ref" };
     }
@@ -2362,8 +2417,8 @@ fn resolveDefaultCompareTarget(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
-) LoadError!CompareTargetResolution {
+    env: *const git_command.LocalGitEnvironment,
+) git_command.Error!CompareTargetResolution {
     const origin_head_argv = [_][]const u8{
         "git",
         "symbolic-ref",
@@ -2424,9 +2479,9 @@ fn resolveOwnedCompareTarget(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
+    env: *const git_command.LocalGitEnvironment,
     target_value: CompareTarget,
-) LoadError!CompareTargetResolution {
+) git_command.Error!CompareTargetResolution {
     var target = target_value;
     var target_owned = true;
     defer if (target_owned) target.deinit(allocator);
@@ -2457,8 +2512,8 @@ fn resolveCompareHead(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
-) LoadError!CompareHeadResolution {
+    env: *const git_command.LocalGitEnvironment,
+) git_command.Error!CompareHeadResolution {
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "--quiet", "HEAD" };
     const oid = switch (try runOptionalCompareText(
         allocator,
@@ -2499,10 +2554,10 @@ fn resolveCompareMergeBase(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
+    env: *const git_command.LocalGitEnvironment,
     base_oid: []const u8,
     head_oid: []const u8,
-) LoadError!CompareMergeBaseResult {
+) git_command.Error!CompareMergeBaseResult {
     const argv = [_][]const u8{ "git", "merge-base", base_oid, head_oid };
     const result = try runCompareCommand(allocator, io, cwd, env, &argv, .limited(4 * 1024));
     defer result.deinit(allocator);
@@ -2521,10 +2576,10 @@ fn loadCompareAheadCount(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
+    env: *const git_command.LocalGitEnvironment,
     merge_base_oid: []const u8,
     head_oid: []const u8,
-) LoadError!CompareTextResult {
+) git_command.Error!CompareTextResult {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base_oid, head_oid });
     defer allocator.free(range);
     const argv = [_][]const u8{ "git", "rev-list", "--count", range };
@@ -2544,10 +2599,10 @@ fn loadCompareDiff(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
+    env: *const git_command.LocalGitEnvironment,
     merge_base_oid: []const u8,
     head_oid: []const u8,
-) LoadError!CompareTextResult {
+) git_command.Error!CompareTextResult {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ merge_base_oid, head_oid });
     defer allocator.free(range);
     const argv = [_][]const u8{
@@ -2575,11 +2630,11 @@ fn runOptionalCompareText(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
+    env: *const git_command.LocalGitEnvironment,
     argv: []const []const u8,
     label: []const u8,
     stdout_limit: std.Io.Limit,
-) LoadError!CompareTextResult {
+) git_command.Error!CompareTextResult {
     const result = try runCompareCommand(allocator, io, cwd, env, argv, stdout_limit);
     defer result.deinit(allocator);
     switch (result.term) {
@@ -2602,12 +2657,12 @@ fn runRequiredCompareText(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
+    env: *const git_command.LocalGitEnvironment,
     argv: []const []const u8,
     label: []const u8,
     stdout_limit: std.Io.Limit,
     trim_output: bool,
-) LoadError!CompareTextResult {
+) git_command.Error!CompareTextResult {
     const result = try runCompareCommand(allocator, io, cwd, env, argv, stdout_limit);
     defer result.deinit(allocator);
     if (termExited(result.term, 0)) {
@@ -2622,24 +2677,22 @@ fn runCompareCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: std.Io.Dir,
-    env: *const std.process.Environ.Map,
+    env: *const git_command.LocalGitEnvironment,
     argv: []const []const u8,
     stdout_limit: std.Io.Limit,
-) LoadError!process_runner.Result {
-    return process_runner.runCaptured(allocator, io, .{
+) git_command.Error!process_runner.Result {
+    return git_command.runCaptured(allocator, io, .{ .cwd = cwd, .environment = env }, .{
         .argv = argv,
-        .cwd = .{ .dir = cwd },
-        .environ_map = env,
         .stdout_limit = stdout_limit,
         .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return runnerErrorToLoadError(err);
+    });
 }
 
 fn compareCommandFailure(
     allocator: std.mem.Allocator,
     label: []const u8,
     result: process_runner.Result,
-) LoadError![]u8 {
+) git_command.Error![]u8 {
     const stderr = trimLineEnd(result.stderr);
     if (stderr.len != 0) return std.fmt.allocPrint(allocator, "{s} failed: {s}", .{ label, stderr });
     return std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ label, result.term });
@@ -2677,7 +2730,7 @@ fn branchListResultFromCommandResults(
     allocator: std.mem.Allocator,
     current_result: process_runner.Result,
     list_result: process_runner.Result,
-) LoadError!BranchListLoadResult {
+) git_command.Error!BranchListLoadResult {
     var current: ?[]u8 = null;
     defer if (current) |owned| allocator.free(owned);
     switch (current_result.term) {
@@ -2883,13 +2936,38 @@ test "branch list success transfers current ownership exactly once" {
     try std.testing.expect(!list.branches[1].current);
 }
 
-fn branchListCommandFailure(allocator: std.mem.Allocator, result: process_runner.Result) LoadError!BranchListLoadResult {
+fn branchListCommandFailure(allocator: std.mem.Allocator, result: process_runner.Result) git_command.Error!BranchListLoadResult {
     if (result.stderr.len > 0) return .{ .failed = allocator.dupe(u8, result.stderr) catch return error.OutOfMemory };
     return .{ .failed = std.fmt.allocPrint(allocator, "git branch list failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
-fn runGitBranchStatusCommand(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) LoadError!process_runner.Result {
+fn runGitBranchStatusCommand(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) git_command.Error!process_runner.Result {
     return runGitBranchStatusCommandInCwd(allocator, io, .{ .path = repo_root }, null, argv, .limited(4 * 1024));
+}
+
+fn runControlledBranchCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: BranchStatusCwd,
+    environment: *const git_command.LocalGitEnvironment,
+    argv: []const []const u8,
+    stdout_limit: std.Io.Limit,
+) git_command.Error!process_runner.Result {
+    return switch (cwd) {
+        .path => |path| runGitBranchStatusCommandInCwd(
+            allocator,
+            io,
+            .{ .path = path },
+            environment.borrow(),
+            argv,
+            stdout_limit,
+        ),
+        .dir => |dir| git_command.runCaptured(allocator, io, .{ .cwd = dir, .environment = environment }, .{
+            .argv = argv,
+            .stdout_limit = stdout_limit,
+            .stderr_limit = .limited(16 * 1024),
+        }),
+    };
 }
 
 fn runGitBranchStatusCommandInCwd(
@@ -2899,44 +2977,14 @@ fn runGitBranchStatusCommandInCwd(
     environ_map: ?*const std.process.Environ.Map,
     argv: []const []const u8,
     stdout_limit: std.Io.Limit,
-) LoadError!process_runner.Result {
+) git_command.Error!process_runner.Result {
     return process_runner.runCaptured(allocator, io, .{
         .argv = argv,
         .cwd = cwd,
         .environ_map = environ_map,
         .stdout_limit = stdout_limit,
         .stderr_limit = .limited(16 * 1024),
-    }) catch |err| return runnerErrorToLoadError(err);
-}
-
-/// Build the complete environment for one descriptor-authorized local Git
-/// snapshot (branch status or Compare).
-///
-/// Git gives `GIT_*` variables precedence over cwd and repository config. That
-/// family includes repository/worktree selectors (`GIT_DIR`, `GIT_WORK_TREE`,
-/// `GIT_COMMON_DIR`, `GIT_INDEX_FILE`), object/ref selectors
-/// (`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-/// `GIT_NAMESPACE`), and config/discovery injection (`GIT_CONFIG_*`,
-/// `GIT_CEILING_DIRECTORIES`). Removing the entire family is intentionally
-/// future-proof: a newly inherited Git knob cannot silently become a second
-/// repository authority for any command in the snapshot.
-fn controlledGitEnvironment(allocator: std.mem.Allocator, parent: ?*const std.process.Environ.Map) LoadError!std.process.Environ.Map {
-    var env = if (parent) |map|
-        map.clone(allocator) catch return error.OutOfMemory
-    else
-        std.process.Environ.Map.init(allocator);
-    errdefer env.deinit();
-
-    var index: usize = 0;
-    while (index < env.keys().len) {
-        const key = env.keys()[index];
-        if (key.len >= "GIT_".len and std.ascii.eqlIgnoreCase(key[0.."GIT_".len], "GIT_")) {
-            _ = env.swapRemove(key);
-        } else {
-            index += 1;
-        }
-    }
-    return env;
+    }) catch |err| return git_command.fromRunnerError(err);
 }
 
 fn freeRunResult(allocator: std.mem.Allocator, result: std.process.RunResult) void {
@@ -2944,7 +2992,7 @@ fn freeRunResult(allocator: std.mem.Allocator, result: std.process.RunResult) vo
     allocator.free(result.stderr);
 }
 
-fn branchStatusCommandFailure(allocator: std.mem.Allocator, label: []const u8, result: process_runner.Result) LoadError!BranchStatusLoadResult {
+fn branchStatusCommandFailure(allocator: std.mem.Allocator, label: []const u8, result: process_runner.Result) git_command.Error!BranchStatusLoadResult {
     if (result.stderr.len > 0) return .{ .failed = try std.fmt.allocPrint(allocator, "{s} failed: {s}", .{ label, trimLineEnd(result.stderr) }) };
     return .{ .failed = try std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ label, result.term }) };
 }
@@ -2958,7 +3006,7 @@ const RevListAheadBehind = struct {
     behind: u32,
 };
 
-fn parseRevListAheadBehind(text: []const u8) LoadError!RevListAheadBehind {
+fn parseRevListAheadBehind(text: []const u8) git_command.Error!RevListAheadBehind {
     var iter = std.mem.tokenizeAny(u8, text, " \t\r\n");
     const ahead_text = iter.next() orelse return error.SpawnFailed;
     const behind_text = iter.next() orelse return error.SpawnFailed;
@@ -2968,37 +3016,37 @@ fn parseRevListAheadBehind(text: []const u8) LoadError!RevListAheadBehind {
     };
 }
 
-fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
+fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) git_command.Error!OperationResult {
     const argv = [_][]const u8{ "git", "add", "--", path };
     const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git add");
 }
 
-fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
+fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) git_command.Error!OperationResult {
     const argv = [_][]const u8{ "git", "restore", "--staged", "--", path };
     const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git restore --staged");
 }
 
-fn runGitAddAll(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!OperationResult {
+fn runGitAddAll(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) git_command.Error!OperationResult {
     const argv = [_][]const u8{ "git", "add", "--all", "--", "." };
     const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git add --all");
 }
 
-fn runGitUnstageAll(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!OperationResult {
+fn runGitUnstageAll(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) git_command.Error!OperationResult {
     const argv = [_][]const u8{ "git", "restore", "--staged", "--", "." };
     const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git restore --staged");
 }
 
-fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) LoadError!OperationResult {
+fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path: []const u8) git_command.Error!OperationResult {
     const argv = [_][]const u8{ "git", "restore", "--", path };
     const result = try runCapturedCommand(allocator, io, repo_root, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git restore");
 }
 
-fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
+fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) git_command.Error!OperationResult {
     const argv = [_][]const u8{ "git", "apply", "--cached", "--whitespace=nowarn", "-" };
     const detailed = try process_runner.runWithStdinDetailed(allocator, io, .{
         .argv = &argv,
@@ -3011,7 +3059,7 @@ fn runGitApplyCached(allocator: std.mem.Allocator, io: std.Io, repo_root: []cons
     return operationResultFromGitStdinCommand(allocator, detailed, "git apply --cached");
 }
 
-fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) LoadError!OperationResult {
+fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, patch: []const u8) git_command.Error!OperationResult {
     const argv = [_][]const u8{ "git", "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" };
     const detailed = try process_runner.runWithStdinDetailed(allocator, io, .{
         .argv = &argv,
@@ -3024,11 +3072,11 @@ fn runGitApplyCachedReverse(allocator: std.mem.Allocator, io: std.Io, repo_root:
     return operationResultFromGitStdinCommand(allocator, detailed, "git apply --cached --reverse");
 }
 
-fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {
+fn runGitCommit(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) git_command.Error!OperationResult {
     return runGitCommitLike(allocator, io, repo_root, request, false);
 }
 
-fn runGitAmend(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) LoadError!OperationResult {
+fn runGitAmend(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest) git_command.Error!OperationResult {
     return runGitCommitLike(allocator, io, repo_root, request, true);
 }
 
@@ -4166,7 +4214,7 @@ fn secureRemoteBranchSnapshotMatches(
     return if (std.mem.eql(u8, actual_oid, oid)) .matches else .mismatch;
 }
 
-fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: SwitchBranchRequest) LoadError!OperationResult {
+fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: SwitchBranchRequest) git_command.Error!OperationResult {
     if (!try verifyRemoteBranchSnapshot(allocator, io, repo_root, request.expected_branch, request.expected_oid)) {
         return .{ .failed_static = "Branch changed before switch; reload and try again" };
     }
@@ -4203,7 +4251,7 @@ fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, repo_root: []con
     return .{ .failed = std.fmt.allocPrint(allocator, "git switch failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
-fn verifyRemoteBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, branch: []const u8, oid: []const u8) LoadError!bool {
+fn verifyRemoteBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, branch: []const u8, oid: []const u8) git_command.Error!bool {
     const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
     const branch_result = try runGitBranchStatusCommand(allocator, io, repo_root, &branch_argv);
     defer branch_result.deinit(allocator);
@@ -4223,7 +4271,7 @@ fn verifyRemoteBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, repo_roo
     return std.mem.eql(u8, trimLineEnd(oid_result.stdout), oid);
 }
 
-fn verifyBranchOid(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, branch: []const u8, oid: []const u8) LoadError!bool {
+fn verifyBranchOid(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, branch: []const u8, oid: []const u8) git_command.Error!bool {
     const ref = std.fmt.allocPrint(allocator, "refs/heads/{s}", .{branch}) catch return error.OutOfMemory;
     defer allocator.free(ref);
     const argv = [_][]const u8{ "git", "rev-parse", "--verify", ref };
@@ -4236,7 +4284,7 @@ fn verifyBranchOid(allocator: std.mem.Allocator, io: std.Io, repo_root: []const 
     return std.mem.eql(u8, trimLineEnd(result.stdout), oid);
 }
 
-fn verifyCleanWorktree(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) LoadError!bool {
+fn verifyCleanWorktree(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8) git_command.Error!bool {
     // Include untracked files to enforce the "clean worktree only" contract.
     // This is stricter than Git's overwrite protection, but avoids a
     // review action starting from a workspace state GitFrame no longer shows.
@@ -4394,7 +4442,7 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest, amend: bool) LoadError!OperationResult {
+fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: CommitRequest, amend: bool) git_command.Error!OperationResult {
     const argv_subject = [_][]const u8{ "git", "commit", "-m", request.subject };
     const argv_with_body = [_][]const u8{ "git", "commit", "-m", request.subject, "-m", request.body orelse "" };
     const amend_argv_subject = [_][]const u8{ "git", "commit", "--amend", "-m", request.subject };
@@ -4407,7 +4455,7 @@ fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, repo_root: []const
     return operationResultFromGitCommand(allocator, result, "git commit");
 }
 
-fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) LoadError!LoadResult {
+fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) git_command.Error!LoadResult {
     const argv = [_][]const u8{
         "git",
         "diff",
@@ -6109,7 +6157,7 @@ const SwapCompareRefsHookContext = struct {
     original_main_oid: []const u8,
     original_feature_oid: []const u8,
 
-    fn run(ctx_ptr: *anyopaque, io: std.Io, cwd: std.Io.Dir) LoadError!void {
+    fn run(ctx_ptr: *anyopaque, io: std.Io, cwd: std.Io.Dir) git_command.Error!void {
         const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
         runTestGit(io, &.{ "git", "update-ref", "refs/heads/main", ctx.original_feature_oid }, cwd) catch
             return error.SpawnFailed;
@@ -6727,39 +6775,6 @@ test "LocalCommandBackend loads branch status with upstream" {
     try std.testing.expectEqualStrings("main", status.upstream.?.remote_branch);
     try std.testing.expectEqual(@as(u32, 0), status.ahead_behind.?.ahead);
     try std.testing.expectEqual(@as(u32, 0), status.ahead_behind.?.behind);
-}
-
-test "controlled Git environment removes inherited repository authority" {
-    var parent = std.process.Environ.Map.init(std.testing.allocator);
-    defer parent.deinit();
-    try parent.put("HOME", "/home/test");
-
-    const git_keys = [_][]const u8{
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_INDEX_FILE",
-        "GIT_NAMESPACE",
-        "GIT_BARE",
-        "GIT_SHALLOW_FILE",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    };
-    for (git_keys) |key| try parent.put(key, "redirect");
-
-    var env = try controlledGitEnvironment(std.testing.allocator, &parent);
-    defer env.deinit();
-
-    try std.testing.expectEqualStrings("/home/test", env.get("HOME").?);
-    for (git_keys) |key| try std.testing.expect(env.get(key) == null);
-    try std.testing.expectEqualStrings("redirect", parent.get("GIT_DIR").?);
 }
 
 test "branch status descriptor cwd survives path replacement" {

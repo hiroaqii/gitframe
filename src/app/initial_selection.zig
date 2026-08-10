@@ -13,6 +13,7 @@ const context_export = @import("../context_export.zig");
 const diff_file = @import("../diff/file.zig");
 const diff_source = @import("../diff/source.zig");
 const git_status = @import("../git/status.zig");
+const git_command = @import("../git/command.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 
@@ -23,6 +24,7 @@ const CliConfig = diff_source.CliConfig;
 pub fn exportContextJson(
     allocator: std.mem.Allocator,
     io: std.Io,
+    parent_environment: ?*const std.process.Environ.Map,
     config: CliConfig,
     writer: *std.Io.Writer,
 ) !void {
@@ -30,7 +32,9 @@ pub fn exportContextJson(
     defer if (discovery) |*result| result.deinit(allocator);
 
     const repo_root = if (diff_source.sourceRequiresRepo(config.source)) blk: {
-        discovery = try repo_discovery.discover(allocator, io);
+        var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment);
+        defer environment.deinit();
+        discovery = try repo_discovery.discover(allocator, io, &environment);
         const discovered_root = try activeRootFromDiscovery(discovery.?);
         break :blk discovered_root orelse return error.MissingRepoRoot;
     } else null;

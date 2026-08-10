@@ -56,6 +56,7 @@ const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
 const EmptyReason = app_load_state.EmptyReason;
 const LoadedDiff = loaded_diff.LoadedDiff;
 const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
+const RepoDiscoveryTask = app_load.RepoDiscoveryTask(app_message.Msg);
 const BranchStatusLoadFinished = app_load.BranchStatusLoadFinished;
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(app_message.Msg);
 const StatusLoadFinished = app_load.StatusLoadFinished;
@@ -2083,9 +2084,14 @@ test "Review revalidation startup retries repository discovery after detached te
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
+    var parent_environment = try std.testing.environ.createMap(allocator);
+    defer parent_environment.deinit();
+    try parent_environment.put("gIt_retry_selector", "redirect");
+    try parent_environment.put("GITFRAME_S1_CANARY", "preserved");
     var app = try mutationFenceRepoTestApp(allocator, roots.a);
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
+    app.env_map = &parent_environment;
 
     const pending = app.actionLifecycle().prepare(.stage_file).pending;
     app.acceptActionLaunch(pending);
@@ -2115,12 +2121,18 @@ test "Review revalidation startup retries repository discovery after detached te
 
     try runReadCoordinationTail(&app, &ctx);
     const retry_count = ctx._pending_tasks_with_len;
+    const retry_task: *RepoDiscoveryTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
 
     try std.testing.expect(fence_closed);
     try std.testing.expect(terminal_returned_normally);
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expectEqual(@as(u8, 1), retry_count);
+    try std.testing.expectEqualStrings(
+        "preserved",
+        retry_task.environment.borrow().get("GITFRAME_S1_CANARY").?,
+    );
+    try std.testing.expect(retry_task.environment.borrow().get("gIt_retry_selector") == null);
 }
 
 test "Review revalidation startup discards inactive and one-shot terminal fallback" {

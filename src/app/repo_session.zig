@@ -9,6 +9,7 @@ const app_message = @import("message.zig");
 const app_state = @import("state.zig");
 const config = @import("../config.zig");
 const diff_source = @import("../diff/source.zig");
+const git_command = @import("../git/command.zig");
 const git_ops = @import("git_ops.zig");
 const load = @import("load.zig");
 const page = @import("page.zig");
@@ -210,6 +211,7 @@ pub const Controller = struct {
     active_page: page.Id,
     source: diff_source.SourceMode,
     home: ?[]const u8,
+    env_map: ?*const std.process.Environ.Map = null,
     action_pending: bool,
     review: review_repository_session.Controller,
     repository: RepositoryInvalidationPort,
@@ -647,12 +649,20 @@ pub const Controller = struct {
             return;
         }
         const task = try ctx.allocator().create(RepoPathDiscoveryTask);
-        errdefer ctx.allocator().destroy(task);
-        const owned_path = try expandUserPath(ctx.allocator(), path, self.home);
-        errdefer ctx.allocator().free(owned_path);
+        const owned_path = expandUserPath(ctx.allocator(), path, self.home) catch |err| {
+            ctx.allocator().destroy(task);
+            return err;
+        };
+        const environment = git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map) catch |err| {
+            ctx.allocator().free(owned_path);
+            ctx.allocator().destroy(task);
+            return err;
+        };
+        const generation = self.state.repo_picker.beginPathDiscovery();
         task.* = .{
             .path = owned_path,
-            .generation = self.state.repo_picker.beginPathDiscovery(),
+            .generation = generation,
+            .environment = environment,
         };
         self.state.pending_repo_path_recent_source = recent_source;
         ctx.task().spawnWith(.{
@@ -660,7 +670,8 @@ pub const Controller = struct {
             .run = RepoPathDiscoveryTask.run,
             .failed = RepoPathDiscoveryTask.failed,
         }) catch |err| {
-            _ = self.state.repo_picker.finishPathDiscovery(task.generation);
+            task.destroy(ctx.allocator());
+            _ = self.state.repo_picker.finishPathDiscovery(generation);
             self.state.pending_repo_path_recent_source = null;
             self.setStatus("could not start repo path discovery task", .{});
             return err;
@@ -916,6 +927,7 @@ const RepoSessionTestPages = struct {
 /// adapter without importing or retaining the root App.
 const RepoSessionTestApp = struct {
     allocator: ?std.mem.Allocator = null,
+    env_map: ?*const std.process.Environ.Map = null,
     repo_session: State = .{},
     status: app_state.StatusMessage = .{},
     active_page: page.Id = .review,
@@ -969,6 +981,7 @@ const RepoSessionTestApp = struct {
             .active_page = self.active_page,
             .source = self.source,
             .home = null,
+            .env_map = self.env_map,
             .action_pending = false,
             .review = .{
                 .page = &self.pages.review,
@@ -1411,7 +1424,12 @@ test "repo picker removes stale recent workspace after no repos remain" {
 
 test "repo picker path input errors do not remove recent history" {
     const allocator = std.testing.allocator;
+    var parent_environment = try std.testing.environ.createMap(allocator);
+    defer parent_environment.deinit();
+    try parent_environment.put("GiT_path_selector", "redirect");
+    try parent_environment.put("GITFRAME_S1_CANARY", "preserved");
     var app: RepoSessionTestApp = .{
+        .env_map = &parent_environment,
         .repo_session = .{
             .repo_picker = .{ .mode = true, .input_mode = .path_input },
             .repo_state = .{
@@ -1428,7 +1446,18 @@ test "repo picker path input errors do not remove recent history" {
 
     try app.repo_session.recent_repos.rememberRepo(allocator, "/kept/repo");
     try app.repoSession().enterPicker(allocator);
-    const generation = app.repo_session.repo_picker.beginPathDiscovery();
+    try app.repoSession().startPathDiscovery(&ctx, "/typed/missing", null);
+    const pending_tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), pending_tasks.len);
+    const task: *RepoPathDiscoveryTask = @ptrCast(@alignCast(pending_tasks[0].ctx));
+    const generation = task.generation;
+    try std.testing.expectEqualStrings(
+        "preserved",
+        task.environment.borrow().get("GITFRAME_S1_CANARY").?,
+    );
+    try std.testing.expect(task.environment.borrow().get("GiT_path_selector") == null);
+    var abandoned = pending_tasks[0].failed(pending_tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
 
     var finished = RepoPathDiscoveryFinished{
         .generation = generation,

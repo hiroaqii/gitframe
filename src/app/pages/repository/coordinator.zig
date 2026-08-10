@@ -9,6 +9,7 @@ const chasen = @import("chasen");
 const app_message = @import("../../message.zig");
 const effect_origin = @import("../../effect_origin.zig");
 const page = @import("../../page.zig");
+const git_command = @import("../../../git/command.zig");
 const repo_session = @import("../../repo_session.zig");
 const repository_page = @import("../repository.zig");
 const repository_tasks = @import("tasks.zig");
@@ -152,12 +153,19 @@ pub const Controller = struct {
         var request_consumed = false;
         defer if (!request_consumed) request.deinit(ctx.allocator());
         const generation = request.generation;
+        var environment = git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map) catch |err| {
+            self.page_state.rejectSpawn(generation);
+            return err;
+        };
+        var environment_consumed = false;
+        defer if (!environment_consumed) environment.deinit();
         const task = ctx.allocator().create(ManifestTask) catch |err| {
             self.page_state.rejectSpawn(generation);
             return err;
         };
-        task.* = .{ .request = request };
+        task.* = .{ .request = request, .environment = environment };
         request_consumed = true;
+        environment_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = ManifestTask.run, .failed = ManifestTask.failed }) catch |err| {
             task.destroy(ctx.allocator());
             self.page_state.rejectSpawn(generation);
@@ -257,12 +265,19 @@ pub const Controller = struct {
         var request_consumed = false;
         defer if (!request_consumed) request.deinit(ctx.allocator());
         const generation = request.generation;
+        var environment = git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map) catch {
+            self.page_state.rejectChangeMapSpawn(generation);
+            return;
+        };
+        var environment_consumed = false;
+        defer if (!environment_consumed) environment.deinit();
         const task = ctx.allocator().create(ChangeMapTask) catch {
             self.page_state.rejectChangeMapSpawn(generation);
             return;
         };
-        task.* = .{ .request = request };
+        task.* = .{ .request = request, .environment = environment };
         request_consumed = true;
+        environment_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = ChangeMapTask.run, .failed = ChangeMapTask.failed }) catch {
             task.destroy(ctx.allocator());
             self.page_state.rejectChangeMapSpawn(generation);
