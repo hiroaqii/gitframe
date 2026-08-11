@@ -18,6 +18,7 @@ const file_tree = @import("../file_tree.zig");
 const git_backend = @import("../git/backend.zig");
 const git_command = @import("../git/command.zig");
 const git_read = @import("../git/read.zig");
+const git_refs = @import("../git/refs.zig");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
@@ -367,7 +368,7 @@ pub const BranchStatusLoadTaskResult = union(enum) {
 
 pub const BranchListLoadTaskResult = union(enum) {
     empty,
-    loaded: git_backend.BranchList,
+    loaded: git_refs.BranchList,
     failed: []u8,
     failed_static: []const u8,
 
@@ -697,15 +698,18 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
         identity: page.RequestIdentity,
         read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []u8,
-        /// Borrowed from process initialization; App and the runtime keep it
-        /// alive until every spawned task has completed.
-        env_map: ?*const std.process.Environ.Map,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         generation: u64,
         background_cycle_id: ?u64 = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runBranchStatusLoad(task.repo_root, task.env_map, allocator, io));
+            return task.finish(allocator, runBranchStatusLoad(
+                .{ .cwd = task.root.dir(), .environment = &task.environment },
+                allocator,
+                io,
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -717,13 +721,19 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
         /// task-owned payload without producing a Msg.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(task.repo_root);
+            task.environment.deinit();
+            task.root.deinit();
             allocator.destroy(task);
         }
 
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchStatusLoadTaskResult) Msg {
-            defer allocator.destroy(task);
+            defer {
+                task.environment.deinit();
+                task.root.deinit();
+                allocator.destroy(task);
+            }
             const finished = BranchStatusLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
@@ -744,11 +754,17 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
         repo_epoch: u64,
         activation_id: u64,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         generation: u64,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runBranchListLoad(task.repo_root, allocator, io));
+            return task.finish(allocator, runBranchListLoad(
+                .{ .cwd = task.root.dir(), .environment = &task.environment },
+                allocator,
+                io,
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -760,13 +776,19 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
         /// task-owned payload without producing a Msg.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(task.repo_root);
+            task.environment.deinit();
+            task.root.deinit();
             allocator.destroy(task);
         }
 
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchListLoadTaskResult) Msg {
-            defer allocator.destroy(task);
+            defer {
+                task.environment.deinit();
+                task.root.deinit();
+                allocator.destroy(task);
+            }
             const finished = BranchListLoadFinished{
                 .origin = task.origin,
                 .repo_epoch = task.repo_epoch,
@@ -1075,15 +1097,11 @@ pub fn runStatusLoadWithOrigin(
 }
 
 pub fn runBranchStatusLoad(
-    repo_root: []const u8,
-    env_map: ?*const std.process.Environ.Map,
+    context: git_command.DirectoryContext,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) BranchStatusLoadTaskResult {
-    const raw_result = git_backend.LocalCommandBackend.loadBranchStatus(allocator, io, .{
-        .cwd = .{ .path = repo_root },
-        .parent_env = env_map,
-    }) catch |err| {
+    const raw_result = git_refs.loadBranchStatus(allocator, io, .{ .context = context }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Branch status load failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Branch status load failed: OutOfMemory" },
@@ -1297,10 +1315,13 @@ fn nextZField(text: []const u8, offset: *usize) ?[]const u8 {
     return text[start..end];
 }
 
-pub fn runBranchListLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) BranchListLoadTaskResult {
-    const raw_result = git_backend.LocalCommandBackend.loadBranchList(allocator, io, .{
-        .cwd = .{ .path = repo_root },
-        .environment = .inherited,
+pub fn runBranchListLoad(
+    context: git_command.DirectoryContext,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) BranchListLoadTaskResult {
+    const raw_result = git_refs.loadBranchList(allocator, io, .{
+        .context = context,
         .scope = .local,
     }) catch |err| {
         return .{
@@ -1322,9 +1343,15 @@ pub fn runCompareBranchListLoad(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) BranchListLoadTaskResult {
-    const raw_result = git_backend.LocalCommandBackend.loadBranchList(allocator, io, .{
-        .cwd = .{ .dir = cwd },
-        .environment = .{ .controlled = env_map },
+    var environment = git_command.LocalGitEnvironment.initFromParent(allocator, env_map) catch |err| {
+        return .{
+            .failed = std.fmt.allocPrint(allocator, "Compare base list failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Compare base list failed: OutOfMemory" },
+        };
+    };
+    defer environment.deinit();
+    const raw_result = git_refs.loadBranchList(allocator, io, .{
+        .context = .{ .cwd = cwd, .environment = &environment },
         .scope = .local_and_remote,
     }) catch |err| {
         return .{
@@ -3654,15 +3681,26 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
     };
     const Task = BranchStatusLoadTask(TestMsg);
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
 
     const task = try allocator.create(Task);
     task.* = .{
         .identity = page.RequestIdentity.review(5, 13),
         .read_epoch = .{ .value = 29 },
         .repo_root = try allocator.dupe(u8, "/repo"),
-        .env_map = null,
+        .root = root,
+        .environment = environment,
         .generation = 47,
     };
+    root = undefined;
+    environment = undefined;
+    const root_observer = task.root;
 
     const msg = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
     var finished = switch (msg) {
@@ -3684,6 +3722,11 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
+    if (root_observer.duplicate()) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.deinit();
+        return error.ExpectedClosedRootCapability;
+    } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 }
 
 test "ReviewProjectionTask failed preserves request identity and read epoch" {

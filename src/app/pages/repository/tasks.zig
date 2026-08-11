@@ -9,9 +9,9 @@ const chasen = @import("chasen");
 const actions = @import("../../actions.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const page = @import("../../page.zig");
-const git_backend = @import("../../../git/backend.zig");
 const git_command = @import("../../../git/command.zig");
 const git_read = @import("../../../git/read.zig");
+const git_refs = @import("../../../git/refs.zig");
 const git_repository_change = @import("../../../git/repository_change.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const process_runner = @import("../../../process/runner.zig");
@@ -386,9 +386,11 @@ fn readRepositoryBranchStatus(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) repository_branch.Result {
-    const raw = git_backend.LocalCommandBackend.loadBranchStatus(allocator, io, .{
-        .cwd = .{ .dir = cwd },
-        .parent_env = env_map,
+    var environment = git_command.LocalGitEnvironment.initFromParent(allocator, env_map) catch
+        return .{ .failed = .load_failed };
+    defer environment.deinit();
+    const raw = git_refs.loadBranchStatus(allocator, io, .{
+        .context = .{ .cwd = cwd, .environment = &environment },
     }) catch return .{ .failed = .load_failed };
     return switch (raw) {
         .ok => |bundle| .{ .loaded = bundle },

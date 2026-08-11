@@ -26,6 +26,7 @@ const diff_source = @import("../../diff/source.zig");
 const git_ops = @import("../git_ops.zig");
 const git_backend = @import("../../git/backend.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
+const git_refs = @import("../../git/refs.zig");
 const git_status = @import("../../git/status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
@@ -367,8 +368,7 @@ fn clearPendingBranchListTasks(
 ) void {
     for (ctx.takePendingTasksWith()) |entry| {
         const task: *BranchListLoadTask = @ptrCast(@alignCast(entry.ctx));
-        allocator.free(task.repo_root);
-        allocator.destroy(task);
+        task.destroy(allocator);
     }
 }
 
@@ -382,7 +382,7 @@ fn branchListForTest(
     allocator: std.mem.Allocator,
     specs: []const BranchListItemSpec,
 ) !app_load.BranchListLoadTaskResult {
-    const items = try allocator.alloc(git_backend.BranchListItem, specs.len);
+    const items = try allocator.alloc(git_refs.BranchListItem, specs.len);
     errdefer allocator.free(items);
     var initialized: usize = 0;
     errdefer for (items[0..initialized]) |item| {
@@ -793,31 +793,55 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
 }
 
 test "requestBranchSwitch opens loading popup and starts identity scoped list task" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "slot", .default_dir);
+    try tmp.dir.createDir(io, "replacement", .default_dir);
+    var accepted = try tmp.dir.openDir(io, "slot", .{});
+    defer accepted.close(io);
+    var replacement = try tmp.dir.openDir(io, "replacement", .{});
+    defer replacement.close(io);
+    try runAppTestGit(allocator, io, &.{ "git", "init", "--initial-branch=main" }, accepted);
+    try accepted.writeFile(io, .{ .sub_path = "A.txt", .data = "accepted\n" });
+    try runAppTestGit(allocator, io, &.{ "git", "add", "A.txt" }, accepted);
+    try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "accepted" }, accepted);
+    try runAppTestGit(allocator, io, &.{ "git", "branch", "accepted-only" }, accepted);
+    try runAppTestGit(allocator, io, &.{ "git", "init", "--initial-branch=replacement" }, replacement);
+    try replacement.writeFile(io, .{ .sub_path = "B.txt", .data = "replacement\n" });
+    try runAppTestGit(allocator, io, &.{ "git", "add", "B.txt" }, replacement);
+    try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "replacement" }, replacement);
+    try runAppTestGit(allocator, io, &.{ "git", "branch", "replacement-only" }, replacement);
+    const slot_path = try tmp.dir.realPathFileAlloc(io, "slot", allocator);
+    defer allocator.free(slot_path);
+    const slot_git_dir = try std.fs.path.join(allocator, &.{ slot_path, ".git" });
+    defer allocator.free(slot_git_dir);
+    var parent_environment = try std.testing.environ.createMap(allocator);
+    defer parent_environment.deinit();
+    try parent_environment.put("GIT_DIR", slot_git_dir);
+
     var app: RemoteHarness = .{
-        .allocator = std.testing.allocator,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
-        },
+        .allocator = allocator,
+        .env_map = &parent_environment,
     };
+    try installActiveRepoForTest(&app, allocator, slot_path);
+    defer app.repo_session.repo_state.deinit(allocator);
     defer app.pages.review.branch_status.deinit();
     defer app.pages.review.git_status.deinit();
-    defer app.clearBranchSwitch(std.testing.allocator);
+    defer app.clearBranchSwitch(allocator);
 
-    var branch_bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+    var branch_bundle = try branchStatusBundleForTest(allocator, .{
         .oid = "abc123",
         .branch = "main",
     });
-    try app.pages.review.branch_status.replace("/repo", &branch_bundle);
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.review.branch_status.replace(slot_path, &branch_bundle);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "");
+    try app.pages.review.git_status.replace(slot_path, &status_bundle);
     syncTestActivation(&app);
 
-    var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    defer clearPendingBranchListTasks(&ctx, std.testing.allocator);
+    var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
+    defer clearPendingBranchListTasks(&ctx, allocator);
 
     try app.requestBranchSwitch(&ctx);
 
@@ -828,31 +852,61 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try std.testing.expectEqual(page.Id.review, task.origin);
     try std.testing.expectEqual(app.repo_session.repo_epoch, task.repo_epoch);
     try std.testing.expectEqual(app.pages.review.activation.next_activation_id, task.activation_id);
-    try std.testing.expectEqualStrings("/repo", task.repo_root);
+    try std.testing.expectEqualStrings(slot_path, task.repo_root);
     try std.testing.expectEqual(app.remote_workflow.branch_switch.generation, task.generation);
+    try std.testing.expect(task.environment.borrow().get("GIT_DIR") == null);
+    const root_observer = task.root;
+
+    const pending = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
+    try tmp.dir.rename("replacement", tmp.dir, "slot", io);
+    const task_message = pending[0].run(pending[0].ctx, allocator, io);
+    var finished = switch (task_message) {
+        .load_finished => |load| switch (load) {
+            .shell => |shell| switch (shell) {
+                .branch_list => |value| value,
+                else => return error.ExpectedBranchListRead,
+            },
+            else => return error.ExpectedBranchListRead,
+        },
+        else => return error.ExpectedBranchListRead,
+    };
+    defer finished.deinit(allocator);
+    const list = switch (finished.result) {
+        .loaded => |value| value,
+        else => return error.ExpectedLoadedBranchList,
+    };
+    try std.testing.expectEqualStrings("main", list.current.?);
+    var saw_accepted = false;
+    var saw_replacement = false;
+    for (list.branches) |branch| {
+        saw_accepted = saw_accepted or std.mem.eql(u8, branch.name, "accepted-only");
+        saw_replacement = saw_replacement or std.mem.eql(u8, branch.name, "replacement-only");
+    }
+    try std.testing.expect(saw_accepted);
+    try std.testing.expect(!saw_replacement);
+    if (root_observer.duplicate()) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.deinit();
+        return error.ExpectedClosedRootCapability;
+    } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 
     // Task admission failure rolls back the newly owned popup snapshot and
     // leaves no pending branch-list correlation behind.
-    var rejected: RemoteHarness = .{
-        .allocator = std.testing.allocator,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
-        },
-    };
+    var rejected: RemoteHarness = .{ .allocator = allocator };
+    try installActiveRepoForTest(&rejected, allocator, slot_path);
+    defer rejected.repo_session.repo_state.deinit(allocator);
     defer rejected.pages.review.branch_status.deinit();
     defer rejected.pages.review.git_status.deinit();
-    defer rejected.clearBranchSwitch(std.testing.allocator);
-    var rejected_branch = try branchStatusBundleForTest(std.testing.allocator, .{
+    defer rejected.clearBranchSwitch(allocator);
+    var rejected_branch = try branchStatusBundleForTest(allocator, .{
         .oid = "abc123",
-        .branch = "main",
+        .branch = "replacement",
     });
-    try rejected.pages.review.branch_status.replace("/repo", &rejected_branch);
-    var rejected_status = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try rejected.pages.review.git_status.replace("/repo", &rejected_status);
+    try rejected.pages.review.branch_status.replace(slot_path, &rejected_branch);
+    var rejected_status = try git_status.StatusBundle.parseOwned(allocator, "");
+    try rejected.pages.review.git_status.replace(slot_path, &rejected_status);
     syncTestActivation(&rejected);
 
     const DummyTask = struct {
@@ -864,7 +918,7 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
             return .quit;
         }
     };
-    var rejected_ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
+    var rejected_ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
     for (0..16) |_| try rejected_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
 
     try std.testing.expectError(error.TaskLimitExceeded, rejected.requestBranchSwitch(&rejected_ctx));

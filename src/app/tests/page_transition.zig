@@ -29,7 +29,7 @@ const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const diff_view_model = @import("../../diff/view_model.zig");
 const file_tree = @import("../../file_tree.zig");
-const git_backend = @import("../../git/backend.zig");
+const git_refs = @import("../../git/refs.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
@@ -1198,7 +1198,7 @@ const BranchListItemSpec = struct {
 };
 
 fn branchListForTest(allocator: std.mem.Allocator, specs: []const BranchListItemSpec) !app_load.BranchListLoadTaskResult {
-    const items = try allocator.alloc(git_backend.BranchListItem, specs.len);
+    const items = try allocator.alloc(git_refs.BranchListItem, specs.len);
     errdefer allocator.free(items);
     var initialized: usize = 0;
     errdefer {

@@ -13,7 +13,7 @@ const page = @import("../page.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
-const git_backend = @import("../../git/backend.zig");
+const git_refs = @import("../../git/refs.zig");
 const review_state = @import("../../review/state.zig");
 
 pub const BasePickerRequest = struct {
@@ -28,7 +28,7 @@ pub const BasePickerState = struct {
     loading: bool = false,
     generation: u64 = 0,
     selected_index: usize = 0,
-    accepted: ?git_backend.BranchList = null,
+    accepted: ?git_refs.BranchList = null,
     failure: ?[]u8 = null,
 
     pub fn begin(self: *BasePickerState, allocator: std.mem.Allocator, identity: page.RequestIdentity) BasePickerRequest {
@@ -862,8 +862,8 @@ test "Compare failed replacement preserves accepted display and attempted intent
     try std.testing.expectEqualStrings("topic", state.base_target.?.display_name);
 }
 
-fn testBranchList(allocator: std.mem.Allocator, name: []const u8) !git_backend.BranchList {
-    const branches = try allocator.alloc(git_backend.BranchListItem, 1);
+fn testBranchList(allocator: std.mem.Allocator, name: []const u8) !git_refs.BranchList {
+    const branches = try allocator.alloc(git_refs.BranchListItem, 1);
     errdefer allocator.free(branches);
     branches[0] = .{
         .full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name}),

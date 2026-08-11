@@ -654,7 +654,7 @@ test "Review mutation read fence drains old production reads without publication
         .result = .{ .loaded = new_branch },
     } } });
     branch_task.repo_root = &.{};
-    allocator.destroy(branch_task);
+    BranchStatusLoadTask.destroy(branch_task, allocator);
     new_branch = undefined;
 
     const source_task: *DiffLoadTask = @ptrCast(@alignCast(queued[2].ctx));
@@ -1062,6 +1062,7 @@ test "Review re-entry starts immediate fingerprint revalidation even when pollin
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put("GIT_DIR", "/must-be-sanitized-before-branch-read");
+    try env.put("ISSUE54_BRANCH_ENV_CANARY", "queue-time-value");
 
     var app: App = .{
         .active_page = .repository,
@@ -1080,6 +1081,7 @@ test "Review re-entry starts immediate fingerprint revalidation even when pollin
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
     try requestPageSwitchForTest(&app, &ctx, .review);
+    try env.put("ISSUE54_BRANCH_ENV_CANARY", "parent-after-queue");
 
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
     const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
@@ -1090,7 +1092,19 @@ test "Review re-entry starts immediate fingerprint revalidation even when pollin
     try std.testing.expectEqual(active.activation_id, status_task.identity.activation_id);
     try std.testing.expectEqual(active.activation_id, branch_task.identity.activation_id);
     try std.testing.expectEqual(active.activation_id, diff_task.identity.activation_id);
-    try std.testing.expect(branch_task.env_map == &env);
+    try std.testing.expect(branch_task.environment.borrow().get("GIT_DIR") == null);
+    try std.testing.expectEqualStrings(
+        "queue-time-value",
+        branch_task.environment.borrow().get("ISSUE54_BRANCH_ENV_CANARY").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/must-be-sanitized-before-branch-read",
+        env.get("GIT_DIR").?,
+    );
+    try std.testing.expectEqualStrings(
+        "parent-after-queue",
+        env.get("ISSUE54_BRANCH_ENV_CANARY").?,
+    );
     try std.testing.expect(diff_task.expected_fingerprint != null);
 }
 test "repo picker capability rejection preserves Review navigation and does not reload" {
@@ -2444,8 +2458,7 @@ pub fn takeCanonicalPublicationReads(
         .branch_cycle_id = branch_task.background_cycle_id,
     };
     StatusLoadTask.destroy(status_task, allocator);
-    allocator.free(branch_task.repo_root);
-    allocator.destroy(branch_task);
+    BranchStatusLoadTask.destroy(branch_task, allocator);
     DiffLoadTask.destroy(source_task, allocator);
     return reads;
 }

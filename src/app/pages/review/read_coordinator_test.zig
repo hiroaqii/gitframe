@@ -43,7 +43,6 @@ const diff_selection = @import("../../../diff/selection.zig");
 const diff_source = @import("../../../diff/source.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
 const file_tree = @import("../../../file_tree.zig");
-const git_backend = @import("../../../git/backend.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const git_status = @import("../../../git/status.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
@@ -868,8 +867,7 @@ fn takeCanonicalPublicationReads(
         .branch_cycle_id = branch_task.background_cycle_id,
     };
     StatusLoadTask.destroy(status_task, allocator);
-    allocator.free(branch_task.repo_root);
-    allocator.destroy(branch_task);
+    BranchStatusLoadTask.destroy(branch_task, allocator);
     DiffLoadTask.destroy(source_task, allocator);
     return reads;
 }
@@ -2002,7 +2000,7 @@ test "Review revalidation startup drains partial auxiliaries before one replacem
             .result = .{ .loaded = changed_branch },
         } } });
         branch_task.repo_root = &.{};
-        allocator.destroy(branch_task);
+        BranchStatusLoadTask.destroy(branch_task, allocator);
         changed_branch = undefined;
     } else {
         for (ctx._pending_tasks_with[saturated_slots..ctx._pending_tasks_with_len]) |entry| {
@@ -7522,7 +7520,7 @@ test "queued Review Git reads retain the accepted root across path replacement" 
     try runReviewTestGit(io, accepted, &.{ "git", "add", "a-staged.txt" });
     try accepted.writeFile(io, .{ .sub_path = "shared-untracked.txt", .data = "A_ONE\nA_TWO\n" });
 
-    try runReviewTestGit(io, replacement, &.{ "git", "init", "--initial-branch=main" });
+    try runReviewTestGit(io, replacement, &.{ "git", "init", "--initial-branch=replacement" });
     try replacement.writeFile(io, .{ .sub_path = "tracked.txt", .data = "base\n" });
     try runReviewTestGit(io, replacement, &.{ "git", "add", "tracked.txt" });
     try runReviewTestGit(io, replacement, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
@@ -7552,9 +7550,10 @@ test "queued Review Git reads retain the accepted root across path replacement" 
     try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
     try tmp.dir.rename("replacement", tmp.dir, "slot", io);
 
+    const branch_task: *BranchStatusLoadTask = @ptrCast(@alignCast(queued[1].ctx));
+    const branch_root_observer = branch_task.root;
     const status_message = queued[0].run(queued[0].ctx, allocator, io);
-    var branch_message = queued[1].failed(queued[1].ctx, .runtime_abandoned, allocator);
-    defer branch_message.deinitUndelivered(allocator);
+    const branch_message = queued[1].run(queued[1].ctx, allocator, io);
     const source_message = queued[2].run(queued[2].ctx, allocator, io);
 
     var status_finished = switch (status_message) {
@@ -7568,6 +7567,17 @@ test "queued Review Git reads retain the accepted root across path replacement" 
         else => return error.ExpectedStatusRead,
     };
     defer status_finished.deinit(allocator);
+    var branch_finished = switch (branch_message) {
+        .load_finished => |load| switch (load) {
+            .review => |review| switch (review) {
+                .branch_status => |finished| finished,
+                else => return error.ExpectedBranchStatusRead,
+            },
+            else => return error.ExpectedBranchStatusRead,
+        },
+        else => return error.ExpectedBranchStatusRead,
+    };
+    defer branch_finished.deinit(allocator);
     var source_finished = switch (source_message) {
         .load_finished => |load| switch (load) {
             .review => |review| switch (review) {
@@ -7617,4 +7627,15 @@ test "queued Review Git reads retain the accepted root across path replacement" 
     }
     try std.testing.expect(saw_a_numstat);
     try std.testing.expect(saw_a_untracked_stats);
+    const branch_bundle = switch (branch_finished.result) {
+        .loaded => |bundle| bundle,
+        else => return error.ExpectedLoadedBranchStatus,
+    };
+    try std.testing.expectEqualStrings("main", branch_bundle.status.branchName().?);
+    try std.testing.expect(!std.mem.eql(u8, "replacement", branch_bundle.status.branchName().?));
+    if (branch_root_observer.duplicate()) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.deinit();
+        return error.ExpectedClosedRootCapability;
+    } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 }

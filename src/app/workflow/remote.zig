@@ -27,6 +27,8 @@ const review_operations = @import("../pages/review/operations.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 const remote_state = @import("remote_state.zig");
 const git_backend = @import("../../git/backend.zig");
+const git_command = @import("../../git/command.zig");
+const git_refs = @import("../../git/refs.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 
 const BranchListLoadFinished = app_load.BranchListLoadFinished;
@@ -470,16 +472,30 @@ pub const Controller = struct {
         self.overlay.openSwitchBranch();
         errdefer self.clearBranchSwitch(ctx.allocator());
 
+        const capability = self.repo.activeCapability() orelse return error.RepositoryReadAuthorityClosed;
+        var root = try capability.duplicate();
+        var root_consumed = false;
+        errdefer if (!root_consumed) root.deinit();
+        var environment = try git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map);
+        var environment_consumed = false;
+        errdefer if (!environment_consumed) environment.deinit();
+        const owned_repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        var repo_root_consumed = false;
+        errdefer if (!repo_root_consumed) ctx.allocator().free(owned_repo_root);
         const task = try ctx.allocator().create(BranchListLoadTask);
         task.* = .{
             .origin = .review,
             .repo_epoch = self.repo.epoch(),
             .activation_id = self.review_origin.activation_id,
-            .repo_root = &.{},
+            .repo_root = owned_repo_root,
+            .root = root,
+            .environment = environment,
             .generation = generation,
         };
+        root_consumed = true;
+        environment_consumed = true;
+        repo_root_consumed = true;
         errdefer task.destroy(ctx.allocator());
-        task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
         try ctx.task().spawnWith(.{ .ctx = task, .run = BranchListLoadTask.run, .failed = BranchListLoadTask.failed });
         return .{ .cancel_local_confirmations = true };
     }
@@ -1232,7 +1248,7 @@ fn remoteFailurePresentationAlloc(
     return allocator.dupe(u8, message);
 }
 
-fn copyBranchSwitchItems(allocator: std.mem.Allocator, source: []const git_backend.BranchListItem) ![]app_state.BranchSwitchItem {
+fn copyBranchSwitchItems(allocator: std.mem.Allocator, source: []const git_refs.BranchListItem) ![]app_state.BranchSwitchItem {
     const items = try allocator.alloc(app_state.BranchSwitchItem, source.len);
     errdefer allocator.free(items);
     var initialized: usize = 0;

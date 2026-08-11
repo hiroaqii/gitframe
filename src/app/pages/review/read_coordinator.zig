@@ -609,6 +609,25 @@ pub const Controller = struct {
         var command_consumed = false;
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const branch_read = &command.branch_status_load;
+        const capability = self.repo.activeCapability() orelse {
+            self.reloadOwner().rejectBranchStatusSpawn(background_cycle_id);
+            self.setStatus("could not prepare branch status authority", .{});
+            return null;
+        };
+        var root = capability.duplicate() catch {
+            self.reloadOwner().rejectBranchStatusSpawn(background_cycle_id);
+            self.setStatus("could not prepare branch status authority", .{});
+            return null;
+        };
+        var root_consumed = false;
+        defer if (!root_consumed) root.deinit();
+        var environment = git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map) catch {
+            self.reloadOwner().rejectBranchStatusSpawn(background_cycle_id);
+            self.setStatus("could not prepare branch status environment", .{});
+            return null;
+        };
+        var environment_consumed = false;
+        defer if (!environment_consumed) environment.deinit();
         const task = ctx.allocator().create(BranchStatusLoadTask) catch {
             self.reloadOwner().rejectBranchStatusSpawn(background_cycle_id);
             self.setStatus("could not allocate branch status load task", .{});
@@ -618,10 +637,13 @@ pub const Controller = struct {
             .identity = branch_read.identity,
             .read_epoch = branch_read.read_epoch,
             .repo_root = branch_read.repo_root,
-            .env_map = self.env_map,
+            .root = root,
+            .environment = environment,
             .generation = branch_read.generation,
             .background_cycle_id = branch_read.background_cycle_id,
         };
+        root_consumed = true;
+        environment_consumed = true;
         command_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = BranchStatusLoadTask.run, .failed = BranchStatusLoadTask.failed }) catch {
             task.destroy(ctx.allocator());

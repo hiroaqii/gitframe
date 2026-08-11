@@ -8,7 +8,7 @@ const page = @import("../../page.zig");
 const repo_session = @import("../../repo_session.zig");
 const diff_basis = @import("../../diff_basis.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
-const git_backend = @import("../../../git/backend.zig");
+const git_refs = @import("../../../git/refs.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
 const compare_page = @import("../compare.zig");
@@ -417,7 +417,7 @@ const BranchListItemSpec = struct {
 };
 
 fn branchListForTest(allocator: std.mem.Allocator, specs: []const BranchListItemSpec) !app_load.BranchListLoadTaskResult {
-    const items = try allocator.alloc(git_backend.BranchListItem, specs.len);
+    const items = try allocator.alloc(git_refs.BranchListItem, specs.len);
     errdefer allocator.free(items);
     var initialized: usize = 0;
     errdefer {
