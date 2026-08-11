@@ -15,8 +15,8 @@ const diff_source = @import("../diff/source.zig");
 const diff_syntax_view = @import("../diff/syntax_view.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
-const git_backend = @import("../git/backend.zig");
 const git_command = @import("../git/command.zig");
+const git_compare = @import("../git/compare.zig");
 const git_read = @import("../git/read.zig");
 const git_refs = @import("../git/refs.zig");
 const git_branch_status = @import("../git/branch_status.zig");
@@ -806,15 +806,15 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
 /// Async owner for one Compare snapshot request.
 ///
 /// `init` is the only constructor: it duplicates descriptor authority and
-/// clones the optional user target before the task can be spawned. The
-/// environment pointer is borrowed from process initialization.
+/// snapshots the controlled Git environment plus the optional user target
+/// before the task can be spawned.
 pub fn CompareLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
         generation: u64,
         root: root_capability.RootCapability,
         target: ?diff_basis.BaseTarget,
-        env_map: ?*const std.process.Environ.Map,
+        environment: git_command.LocalGitEnvironment,
 
         pub fn init(
             identity: page.RequestIdentity,
@@ -826,12 +826,14 @@ pub fn CompareLoadTask(comptime Msg: type) type {
         ) !@This() {
             var owned_root = try root.duplicate();
             errdefer owned_root.deinit();
+            var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map);
+            errdefer environment.deinit();
             return .{
                 .identity = identity,
                 .generation = generation,
                 .root = owned_root,
                 .target = if (target) |value| try value.clone(allocator) else null,
-                .env_map = env_map,
+                .environment = environment,
             };
         }
 
@@ -840,7 +842,7 @@ pub fn CompareLoadTask(comptime Msg: type) type {
             return task.finish(allocator, runCompareLoad(
                 task.root.dir(),
                 task.target,
-                task.env_map,
+                &task.environment,
                 allocator,
                 io,
             ));
@@ -870,6 +872,7 @@ pub fn CompareLoadTask(comptime Msg: type) type {
 
         fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
             if (task.target) |*target| target.deinit(allocator);
+            task.environment.deinit();
             task.root.deinit();
         }
     };
@@ -1367,18 +1370,18 @@ pub fn runCompareBranchListLoad(
     };
 }
 
-/// Run the single structured Compare backend operation and translate its raw
+/// Run the single structured Compare domain operation and translate its raw
 /// owned values into the page-independent, validated diff-basis vocabulary.
 pub fn runCompareLoad(
     cwd: std.Io.Dir,
     target: ?diff_basis.BaseTarget,
-    env_map: ?*const std.process.Environ.Map,
+    environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) CompareLoadTaskResult {
-    var raw = git_backend.LocalCommandBackend.loadCompareSnapshot(allocator, io, .{
+    var raw = git_compare.loadCompareSnapshot(allocator, io, .{
         .cwd = cwd,
-        .parent_env = env_map,
+        .environment = environment,
         .target = if (target) |value| .{
             .full_ref = value.full_ref,
             .display_name = value.display_name,
@@ -1400,7 +1403,7 @@ pub fn runCompareLoad(
 fn translateCompareSnapshot(
     allocator: std.mem.Allocator,
     io: std.Io,
-    snapshot: git_backend.CompareSnapshot,
+    snapshot: git_compare.CompareSnapshot,
 ) CompareLoadTaskResult {
     const base_oid = parseCompareOid(snapshot.base_oid) orelse
         return .{ .failed_static = "Compare load returned an invalid base oid" };
@@ -1457,8 +1460,8 @@ fn translateCompareSnapshot(
 
 fn translateCompareBasisFailure(
     allocator: std.mem.Allocator,
-    kind: git_backend.CompareBasisFailure,
-    attempted: git_backend.CompareTarget,
+    kind: git_compare.CompareBasisFailure,
+    attempted: git_compare.CompareTarget,
 ) CompareLoadTaskResult {
     const full_ref = allocator.dupe(u8, attempted.full_ref) catch
         return .{ .failed_static = "Compare load failed: OutOfMemory" };
@@ -3241,6 +3244,8 @@ test "runCompareLoad returns an atomic validated basis and diff bundle" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3257,7 +3262,7 @@ test "runCompareLoad returns an atomic validated basis and diff bundle" {
         .full_ref = @constCast("refs/heads/main"),
         .display_name = @constCast("main"),
         .kind = .local,
-    }, null, allocator, io);
+    }, &environment, allocator, io);
     defer result.deinit(allocator);
     switch (result) {
         .loaded => |bundle| {
@@ -3274,6 +3279,8 @@ test "runCompareLoad treats empty diff as success and labels detached head" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3283,7 +3290,7 @@ test "runCompareLoad treats empty diff as success and labels detached head" {
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, tmp.dir);
     try runTestGit(io, &.{ "git", "switch", "--detach", "HEAD" }, tmp.dir);
 
-    var result = runCompareLoad(tmp.dir, null, null, allocator, io);
+    var result = runCompareLoad(tmp.dir, null, &environment, allocator, io);
     defer result.deinit(allocator);
     switch (result) {
         .loaded => |bundle| {
@@ -3472,7 +3479,7 @@ test "CompareBranchListLoadTask keeps physical root and controlled environment a
 test "Compare task translation keeps basis failure kinds and attempted target" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
-        backend: git_backend.CompareBasisFailure,
+        backend: git_compare.CompareBasisFailure,
         expected: diff_basis.BasisFailure,
     }{
         .{ .backend = .missing_base_ref, .expected = .missing_base_ref },
@@ -3499,6 +3506,8 @@ test "Compare task translation keeps basis failure kinds and attempted target" {
 test "runCompareLoad separates process failure from basis failure" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = ".git", .data = "invalid gitfile\n" });
@@ -3506,7 +3515,7 @@ test "runCompareLoad separates process failure from basis failure" {
         .full_ref = @constCast("refs/heads/main"),
         .display_name = @constCast("main"),
         .kind = .local,
-    }, null, allocator, io);
+    }, &environment, allocator, io);
     defer result.deinit(allocator);
     try std.testing.expect(result == .failed or result == .failed_static);
 }
@@ -3540,9 +3549,18 @@ test "CompareLoadTask duplicate retains physical root after path replacement" {
     defer allocator.free(root_path);
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
+    var parent_env = std.process.Environ.Map.init(allocator);
+    defer parent_env.deinit();
+    try parent_env.put("UTSUWA_COMPARE_CANARY", "queue-time");
+    try parent_env.put("GIT_DIR", "/definitely/not/the/pinned/repository");
 
     const task = try allocator.create(Task);
-    task.* = try Task.init(page.RequestIdentity.compare(2, 3), 1, root, null, null, allocator);
+    task.* = try Task.init(page.RequestIdentity.compare(2, 3), 1, root, null, &parent_env, allocator);
+    try std.testing.expectEqualStrings("queue-time", task.environment.map.get("UTSUWA_COMPARE_CANARY").?);
+    try std.testing.expect(task.environment.map.get("GIT_DIR") == null);
+    try std.testing.expect(parent_env.get("GIT_DIR") != null);
+    try parent_env.put("UTSUWA_COMPARE_CANARY", "mutated-after-queue");
+    try std.testing.expectEqualStrings("queue-time", task.environment.map.get("UTSUWA_COMPARE_CANARY").?);
     try tmp.dir.rename("repo", tmp.dir, "pinned-repo", io);
     try tmp.dir.createDir(io, "repo", .default_dir);
     var replacement = try tmp.dir.openDir(io, "repo", .{});
