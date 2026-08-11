@@ -820,6 +820,7 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     var parent_environment = try std.testing.environ.createMap(allocator);
     defer parent_environment.deinit();
     try parent_environment.put("GIT_DIR", slot_git_dir);
+    try parent_environment.put("GITFRAME_SWITCH_CANARY", "retained");
 
     var app: RemoteHarness = .{
         .allocator = allocator,
@@ -872,7 +873,8 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
         },
         else => return error.ExpectedBranchListRead,
     };
-    defer finished.deinit(allocator);
+    var finished_owned = true;
+    defer if (finished_owned) finished.deinit(allocator);
     const list = switch (finished.result) {
         .loaded => |value| value,
         else => return error.ExpectedLoadedBranchList,
@@ -891,6 +893,25 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
         unexpected.deinit();
         return error.ExpectedClosedRootCapability;
     } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
+
+    // Apply the accepted list, then abandon a queued switch. The switch task
+    // owns a second duplicate of the same physical A descriptor and a
+    // selector-free environment snapshot even though the display path now
+    // resolves to replacement B.
+    finished_owned = false;
+    try app.finishBranchListLoad(&ctx, finished);
+    try app.confirmBranchSwitch(&ctx);
+    const switch_entries = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), switch_entries.len);
+    const SwitchTask = app_actions.SwitchBranchTask(RemoteHarness.Msg);
+    const switch_task: *SwitchTask = @ptrCast(@alignCast(switch_entries[0].ctx));
+    const switch_root_observer = switch_task.root;
+    try std.testing.expect(switch_task.root.identity.eql(app.repoSessionView().activeIdentity().?));
+    try std.testing.expect(switch_task.environment.borrow().get("GIT_DIR") == null);
+    try std.testing.expectEqualStrings("retained", switch_task.environment.borrow().get("GITFRAME_SWITCH_CANARY").?);
+    var abandoned = switch_entries[0].failed(switch_entries[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+    try expectRootCapabilityClosed(switch_root_observer);
 
     // Task admission failure rolls back the newly owned popup snapshot and
     // leaves no pending branch-list correlation behind.
@@ -1117,6 +1138,30 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
     try std.testing.expectEqualStrings("already on branch: main", app.pages.review.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
+
+    var missing_authority: RemoteHarness = .{
+        .allocator = std.testing.allocator,
+        .remote_workflow = .{ .branch_switch = .{
+            .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
+            .current_branch = try std.testing.allocator.dupe(u8, "main"),
+            .current_oid = try std.testing.allocator.dupe(u8, "abc123"),
+            .generation = 4,
+            .loading = false,
+            .branches = try branchSwitchItemsForTest(std.testing.allocator, &.{
+                .{ .name = "feature", .oid = "def456", .current = false },
+            }),
+        } },
+        .overlay = .{ .kind = .switch_branch },
+    };
+    defer missing_authority.clearBranchSwitch(std.testing.allocator);
+    var missing_ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
+
+    try missing_authority.confirmBranchSwitch(&missing_ctx);
+
+    try std.testing.expectEqualStrings("branch switch unavailable: repository authority changed", missing_authority.pages.review.status.text());
+    try std.testing.expect(missing_authority.remote_workflow.branch_switch.hasState());
+    try std.testing.expectEqual(@as(u8, 0), missing_ctx._pending_tasks_with_len);
+    try std.testing.expect(!missing_authority.actionLifecycleView().hasPending());
 }
 
 test "requestPush clears previous push error details" {

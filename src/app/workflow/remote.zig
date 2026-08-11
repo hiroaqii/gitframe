@@ -527,7 +527,7 @@ pub const Controller = struct {
             .target_branch = &.{},
             .target_oid = &.{},
         };
-        errdefer request.deinit(ctx.allocator());
+        defer request.deinit(ctx.allocator());
         request.repo_root = try ctx.allocator().dupe(u8, branch_switch.repo_root);
         request.expected_branch = try ctx.allocator().dupe(u8, branch_switch.current_branch);
         request.expected_oid = try ctx.allocator().dupe(u8, branch_switch.current_oid);
@@ -535,7 +535,12 @@ pub const Controller = struct {
         request.target_oid = try ctx.allocator().dupe(u8, selected.oid);
         self.setStatus("switching branch: {s} -> {s}", .{ branch_switch.current_branch, selected.name });
         const prepared = self.lifecycle.prepare(.switch_branch);
-        app_git_requests.startSwitchBranch(app_message.Msg, ctx, prepared.pending, &request) catch |err| {
+        const capability = self.repo.activeCapability() orelse {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("branch switch unavailable: repository authority changed", .{});
+            return;
+        };
+        app_git_requests.startSwitchBranch(app_message.Msg, ctx, prepared.pending, &request, capability, self.env_map) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start branch switch task", .{});
             return err;

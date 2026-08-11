@@ -89,6 +89,14 @@ fn localTestGitOutput(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]
     return error.GitCommandFailed;
 }
 
+fn expectLocalRootCapabilityClosed(observer: repo_root_capability.RootCapability) !void {
+    if (observer.duplicate()) |unexpected| {
+        var owned = unexpected;
+        owned.deinit();
+        return error.ExpectedClosedRootCapability;
+    } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
+}
+
 const LocalPages = struct {
     review: review_page.ReviewPageState = .{},
 };
@@ -1819,4 +1827,117 @@ test "queued commit-message assist retains staged diff and external cwd across p
     defer allocator.free(b_contents);
     try std.testing.expectEqualStrings("B_STAGED\n", b_contents);
     try std.testing.expectEqualStrings("Generated from A", app.local_workflow.commit_panel.subject.slice());
+}
+
+test "queued local Git mutation retains the accepted root across path replacement" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "slot", .default_dir);
+    try tmp.dir.createDir(io, "replacement", .default_dir);
+    var accepted = try tmp.dir.openDir(io, "slot", .{});
+    defer accepted.close(io);
+    var replacement = try tmp.dir.openDir(io, "replacement", .{});
+    defer replacement.close(io);
+
+    try runLocalTestGit(io, accepted, &.{ "git", "init", "--initial-branch=main" });
+    try accepted.writeFile(io, .{ .sub_path = "a", .data = "base\n" });
+    try runLocalTestGit(io, accepted, &.{ "git", "add", "a" });
+    try runLocalTestGit(io, accepted, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+    try accepted.writeFile(io, .{ .sub_path = "a", .data = "A_MUTATION\n" });
+
+    try runLocalTestGit(io, replacement, &.{ "git", "init", "--initial-branch=main" });
+    try replacement.writeFile(io, .{ .sub_path = "a", .data = "base\n" });
+    try runLocalTestGit(io, replacement, &.{ "git", "add", "a" });
+    try runLocalTestGit(io, replacement, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+    try replacement.writeFile(io, .{ .sub_path = "a", .data = "B_MUTATION\n" });
+    const b_index_before = try localTestGitOutput(io, replacement, &.{ "git", "diff", "--cached", "--name-only" });
+    defer allocator.free(b_index_before);
+
+    const slot_path = try tmp.dir.realPathFileAlloc(io, "slot", allocator);
+    defer allocator.free(slot_path);
+    const replacement_path = try tmp.dir.realPathFileAlloc(io, "replacement", allocator);
+    defer allocator.free(replacement_path);
+    const replacement_git_dir = try std.fs.path.join(allocator, &.{ replacement_path, ".git" });
+    defer allocator.free(replacement_git_dir);
+    var parent_environment = try std.testing.environ.createMap(allocator);
+    defer parent_environment.deinit();
+    try parent_environment.put("GIT_DIR", replacement_git_dir);
+    try parent_environment.put("gIt_WoRk_TrEe", replacement_path);
+    try parent_environment.put("GITFRAME_LOCAL_CANARY", "retained");
+
+    var app: LocalHarness = .{
+        .allocator = allocator,
+        .env_map = &parent_environment,
+        .config = .{ .source = .unstaged },
+        .pages = .{ .review = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 } },
+        } },
+        .repo_session = .{ .repo_state = .{
+            .discovery = try testSingleRepoDiscovery(allocator, slot_path),
+            .root = try repo_root_capability.RootCapability.openCanonical(slot_path),
+        } },
+    };
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
+    defer app.reviewNavigation().clearActionCursor(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
+    try app.pages.review.git_status.replace(slot_path, &status_bundle);
+    app.pages.review.status_load.markSuccess();
+    app.pages.review.branch_status_load.markSuccess();
+    acceptTestSource(&app);
+
+    // Queue rejection must close the just-created duplicate. The next
+    // duplicate reuses the same lowest free descriptor if teardown did so.
+    var first_probe = try app.repoSessionView().activeCapability().?.duplicate();
+    const reusable_handle = first_probe.handle;
+    first_probe.deinit();
+    var rejected_ctx: chasen.Ctx(LocalHarness.Msg) = .{
+        ._allocator = allocator,
+        ._io = io,
+        ._pending_tasks_with_len = 16,
+    };
+    try std.testing.expectError(error.TaskLimitExceeded, app.localWorkflow().stageSelectedFile(&rejected_ctx));
+    rejected_ctx._pending_tasks_with_len = 0;
+    var second_probe = try app.repoSessionView().activeCapability().?.duplicate();
+    try std.testing.expectEqual(reusable_handle, second_probe.handle);
+    second_probe.deinit();
+
+    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator, ._io = io };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    try app.localWorkflow().stageSelectedFile(&ctx);
+    const queued = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    const Task = app_actions.StageFileTask(LocalHarness.Msg);
+    const task: *Task = @ptrCast(@alignCast(queued[0].ctx));
+    const task_root_observer = task.root;
+    try std.testing.expect(task.root.identity.eql(app.repoSessionView().activeIdentity().?));
+    try std.testing.expect(task.environment.borrow().get("GIT_DIR") == null);
+    try std.testing.expect(task.environment.borrow().get("gIt_WoRk_TrEe") == null);
+    try std.testing.expectEqualStrings("retained", task.environment.borrow().get("GITFRAME_LOCAL_CANARY").?);
+
+    try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
+    try tmp.dir.rename("replacement", tmp.dir, "slot", io);
+    const message = queued[0].run(queued[0].ctx, allocator, io);
+    try expectLocalRootCapabilityClosed(task_root_observer);
+    switch (message) {
+        .action_finished => |finished| switch (finished) {
+            .stage_file => |result| try finishStageFileForTest(&app, &ctx, result),
+            else => return error.ExpectedStageFileTerminal,
+        },
+        else => return error.ExpectedStageFileTerminal,
+    }
+
+    const a_index_after = try localTestGitOutput(io, accepted, &.{ "git", "diff", "--cached", "--name-only" });
+    defer allocator.free(a_index_after);
+    try std.testing.expectEqualStrings("a\n", a_index_after);
+    const b_index_after = try localTestGitOutput(io, replacement, &.{ "git", "diff", "--cached", "--name-only" });
+    defer allocator.free(b_index_after);
+    try std.testing.expectEqualStrings(b_index_before, b_index_after);
+    const b_contents = try replacement.readFileAlloc(io, "a", allocator, .limited(4096));
+    defer allocator.free(b_contents);
+    try std.testing.expectEqualStrings("B_MUTATION\n", b_contents);
 }

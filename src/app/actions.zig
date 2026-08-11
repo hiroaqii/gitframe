@@ -2,6 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const git_backend = @import("../git/backend.zig");
 const git_command = @import("../git/command.zig");
+const git_operations = @import("../git/operations.zig");
 const git_read = @import("../git/read.zig");
 const git_push = @import("../git/push.zig");
 const git_ops = @import("git_ops.zig");
@@ -420,13 +421,15 @@ pub fn StageFileTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         path: []u8,
         label: []u8,
         target_kind: git_ops.TargetKind,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runStageTarget(task.repo_root, task.path, task.target_kind, allocator, io));
+            return task.finish(allocator, runStageTarget(task.directoryContext(), task.path, task.target_kind, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -441,6 +444,8 @@ pub fn StageFileTask(comptime Msg: type) type {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 if (task.label.len > 0) allocator.free(task.label);
+                task.environment.deinit();
+                task.root.deinit();
                 allocator.destroy(task);
             }
             const path = task.label;
@@ -454,6 +459,10 @@ pub fn StageFileTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        fn directoryContext(task: *@This()) git_command.DirectoryContext {
+            return .{ .cwd = task.root.dir(), .environment = &task.environment };
+        }
     };
 }
 
@@ -466,13 +475,15 @@ pub fn UnstageFileTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         path: []u8,
         label: []u8,
         target_kind: git_ops.TargetKind,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runUnstageTarget(task.repo_root, task.path, task.target_kind, allocator, io));
+            return task.finish(allocator, runUnstageTarget(task.directoryContext(), task.path, task.target_kind, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -487,6 +498,8 @@ pub fn UnstageFileTask(comptime Msg: type) type {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 if (task.label.len > 0) allocator.free(task.label);
+                task.environment.deinit();
+                task.root.deinit();
                 allocator.destroy(task);
             }
             const path = task.label;
@@ -500,6 +513,10 @@ pub fn UnstageFileTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        fn directoryContext(task: *@This()) git_command.DirectoryContext {
+            return .{ .cwd = task.root.dir(), .environment = &task.environment };
+        }
     };
 }
 
@@ -511,6 +528,8 @@ pub fn StageHunkTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         path: []u8,
         patch: []u8,
         hunk_index: usize,
@@ -518,7 +537,7 @@ pub fn StageHunkTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runStageHunk(task.repo_root, task.patch, allocator, io));
+            return task.finish(allocator, runStageHunk(task.directoryContext(), task.patch, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -533,6 +552,8 @@ pub fn StageHunkTask(comptime Msg: type) type {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 allocator.free(task.patch);
+                task.environment.deinit();
+                task.root.deinit();
                 allocator.destroy(task);
             }
             const repo_root = task.repo_root;
@@ -548,6 +569,10 @@ pub fn StageHunkTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        fn directoryContext(task: *@This()) git_command.DirectoryContext {
+            return .{ .cwd = task.root.dir(), .environment = &task.environment };
+        }
     };
 }
 
@@ -556,6 +581,8 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         path: []u8,
         patch: []u8,
         hunk_index: usize,
@@ -564,7 +591,7 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runUnstageHunk(task.repo_root, task.patch, allocator, io));
+            return task.finish(allocator, runUnstageHunk(task.directoryContext(), task.patch, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -579,6 +606,8 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
                 allocator.free(task.patch);
+                task.environment.deinit();
+                task.root.deinit();
                 allocator.destroy(task);
             }
             const repo_root = task.repo_root;
@@ -595,6 +624,10 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        fn directoryContext(task: *@This()) git_command.DirectoryContext {
+            return .{ .cwd = task.root.dir(), .environment = &task.environment };
+        }
     };
 }
 
@@ -606,11 +639,13 @@ pub fn DiscardFileTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         path: []u8,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runDiscardFile(task.repo_root, task.path, allocator, io));
+            return task.finish(allocator, runDiscardFile(task.directoryContext(), task.path, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -624,6 +659,8 @@ pub fn DiscardFileTask(comptime Msg: type) type {
             defer {
                 allocator.free(task.repo_root);
                 if (task.path.len > 0) allocator.free(task.path);
+                task.environment.deinit();
+                task.root.deinit();
                 allocator.destroy(task);
             }
             const repo_root = task.repo_root;
@@ -637,6 +674,10 @@ pub fn DiscardFileTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        fn directoryContext(task: *@This()) git_command.DirectoryContext {
+            return .{ .cwd = task.root.dir(), .environment = &task.environment };
+        }
     };
 }
 
@@ -648,12 +689,14 @@ pub fn CommitTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         subject: []u8,
         body: ?[]u8,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runCommit(task.repo_root, task.subject, task.body, allocator, io));
+            return task.finish(allocator, runCommit(task.directoryContext(), task.subject, task.body, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -668,6 +711,8 @@ pub fn CommitTask(comptime Msg: type) type {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 allocator.free(task.subject);
                 if (task.body) |body| allocator.free(body);
+                task.environment.deinit();
+                task.root.deinit();
                 allocator.destroy(task);
             }
             const repo_root = task.repo_root;
@@ -677,6 +722,10 @@ pub fn CommitTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .result = result,
             } });
+        }
+
+        fn directoryContext(task: *@This()) git_command.DirectoryContext {
+            return .{ .cwd = task.root.dir(), .environment = &task.environment };
         }
     };
 }
@@ -743,12 +792,14 @@ pub fn AmendTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         subject: []u8,
         body: ?[]u8,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runAmend(task.repo_root, task.subject, task.body, allocator, io));
+            return task.finish(allocator, runAmend(task.directoryContext(), task.subject, task.body, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -763,6 +814,8 @@ pub fn AmendTask(comptime Msg: type) type {
                 if (task.repo_root.len > 0) allocator.free(task.repo_root);
                 allocator.free(task.subject);
                 if (task.body) |body| allocator.free(body);
+                task.environment.deinit();
+                task.root.deinit();
                 allocator.destroy(task);
             }
             const repo_root = task.repo_root;
@@ -772,6 +825,10 @@ pub fn AmendTask(comptime Msg: type) type {
                 .repo_root = repo_root,
                 .result = result,
             } });
+        }
+
+        fn directoryContext(task: *@This()) git_command.DirectoryContext {
+            return .{ .cwd = task.root.dir(), .environment = &task.environment };
         }
     };
 }
@@ -1001,6 +1058,8 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         expected_branch: []u8,
         expected_oid: []u8,
         target_branch: []u8,
@@ -1008,7 +1067,7 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runSwitchBranch(task.repo_root, task.expected_branch, task.expected_oid, task.target_branch, task.target_oid, allocator, io));
+            return task.finish(allocator, runSwitchBranch(task.directoryContext(), task.expected_branch, task.expected_oid, task.target_branch, task.target_oid, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -1025,6 +1084,8 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
                 allocator.free(task.expected_oid);
                 if (task.target_branch.len > 0) allocator.free(task.target_branch);
                 allocator.free(task.target_oid);
+                task.environment.deinit();
+                task.root.deinit();
                 allocator.destroy(task);
             }
             const repo_root = task.repo_root;
@@ -1041,6 +1102,10 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
                 .result = result,
             } });
         }
+
+        fn directoryContext(task: *@This()) git_command.DirectoryContext {
+            return .{ .cwd = task.root.dir(), .environment = &task.environment };
+        }
     };
 }
 
@@ -1051,64 +1116,64 @@ pub fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
     };
 }
 
-pub fn runStageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runStageFile(context: git_command.DirectoryContext, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Stage", .{
-        .repo_root = repo_root,
+        .context = context,
         .kind = .{ .stage_file = path },
     }, allocator, io);
 }
 
-pub fn runStageTarget(repo_root: []const u8, path: []const u8, target_kind: git_ops.TargetKind, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runStageTarget(context: git_command.DirectoryContext, path: []const u8, target_kind: git_ops.TargetKind, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return switch (target_kind) {
         .repository => runOperationMapped("Stage", .{
-            .repo_root = repo_root,
+            .context = context,
             .kind = .stage_all,
         }, allocator, io),
-        .file, .directory => runStageFile(repo_root, path, allocator, io),
+        .file, .directory => runStageFile(context, path, allocator, io),
     };
 }
 
-pub fn runUnstageFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runUnstageFile(context: git_command.DirectoryContext, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Unstage", .{
-        .repo_root = repo_root,
+        .context = context,
         .kind = .{ .unstage_file = path },
     }, allocator, io);
 }
 
-pub fn runUnstageTarget(repo_root: []const u8, path: []const u8, target_kind: git_ops.TargetKind, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runUnstageTarget(context: git_command.DirectoryContext, path: []const u8, target_kind: git_ops.TargetKind, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return switch (target_kind) {
         .repository => runOperationMapped("Unstage", .{
-            .repo_root = repo_root,
+            .context = context,
             .kind = .unstage_all,
         }, allocator, io),
-        .file, .directory => runUnstageFile(repo_root, path, allocator, io),
+        .file, .directory => runUnstageFile(context, path, allocator, io),
     };
 }
 
-pub fn runStageHunk(repo_root: []const u8, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runStageHunk(context: git_command.DirectoryContext, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Stage hunk", .{
-        .repo_root = repo_root,
+        .context = context,
         .kind = .{ .stage_patch = .{ .patch = patch } },
     }, allocator, io);
 }
 
-pub fn runUnstageHunk(repo_root: []const u8, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runUnstageHunk(context: git_command.DirectoryContext, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Unstage hunk", .{
-        .repo_root = repo_root,
+        .context = context,
         .kind = .{ .unstage_patch = .{ .patch = patch } },
     }, allocator, io);
 }
 
-pub fn runDiscardFile(repo_root: []const u8, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runDiscardFile(context: git_command.DirectoryContext, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Discard", .{
-        .repo_root = repo_root,
+        .context = context,
         .kind = .{ .discard_file = path },
     }, allocator, io);
 }
 
-pub fn runCommit(repo_root: []const u8, subject: []const u8, body: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runCommit(context: git_command.DirectoryContext, subject: []const u8, body: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Commit", .{
-        .repo_root = repo_root,
+        .context = context,
         .kind = .{ .commit = .{ .subject = subject, .body = body } },
     }, allocator, io);
 }
@@ -1338,9 +1403,9 @@ fn allocFailure(allocator: std.mem.Allocator, comptime fmt: []const u8, args: an
     return .{ .failed = message };
 }
 
-pub fn runAmend(repo_root: []const u8, subject: []const u8, body: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runAmend(context: git_command.DirectoryContext, subject: []const u8, body: ?[]const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Amend", .{
-        .repo_root = repo_root,
+        .context = context,
         .kind = .{ .amend = .{ .subject = subject, .body = body } },
     }, allocator, io);
 }
@@ -1430,9 +1495,9 @@ fn remoteTaskSpawnFailure(warnings: git_backend.RemoteWarningSet) git_backend.Re
     };
 }
 
-pub fn runSwitchBranch(repo_root: []const u8, expected_branch: []const u8, expected_oid: []const u8, target_branch: []const u8, target_oid: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runSwitchBranch(context: git_command.DirectoryContext, expected_branch: []const u8, expected_oid: []const u8, target_branch: []const u8, target_oid: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Branch switch", .{
-        .repo_root = repo_root,
+        .context = context,
         .kind = .{ .switch_branch = .{
             .expected_branch = expected_branch,
             .expected_oid = expected_oid,
@@ -1442,8 +1507,8 @@ pub fn runSwitchBranch(repo_root: []const u8, expected_branch: []const u8, expec
     }, allocator, io);
 }
 
-fn runOperationMapped(comptime prefix: []const u8, request: git_backend.OperationRequest, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    const raw_result = git_backend.LocalCommandBackend.runOperation(allocator, io, request) catch |err| {
+fn runOperationMapped(comptime prefix: []const u8, request: git_operations.OperationRequest, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+    const raw_result = git_operations.runOperation(allocator, io, request) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, prefix ++ " failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = prefix ++ " failed: OutOfMemory" },
@@ -1541,12 +1606,24 @@ const FileTaskTestMsg = union(enum) {
 
 fn makeStageFileTaskForTest(allocator: std.mem.Allocator, pending: PendingAction) !*StageFileTask(FileTaskTestMsg) {
     const Task = StageFileTask(FileTaskTestMsg);
+    var root = try root_capability.RootCapability.openCanonical("/");
+    errdefer root.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    errdefer environment.deinit();
+    const repo_root = try allocator.dupe(u8, "/__gitframe_missing_repo__");
+    errdefer allocator.free(repo_root);
+    const path = try allocator.dupe(u8, "src/main.zig");
+    errdefer allocator.free(path);
+    const label = try allocator.dupe(u8, "src/main.zig");
+    errdefer allocator.free(label);
     const task = try allocator.create(Task);
     task.* = .{
         .pending = pending,
-        .repo_root = try allocator.dupe(u8, "/__gitframe_missing_repo__"),
-        .path = try allocator.dupe(u8, "src/main.zig"),
-        .label = try allocator.dupe(u8, "src/main.zig"),
+        .repo_root = repo_root,
+        .root = root,
+        .environment = environment,
+        .path = path,
+        .label = label,
         .target_kind = .file,
     };
     return task;
@@ -1554,15 +1631,35 @@ fn makeStageFileTaskForTest(allocator: std.mem.Allocator, pending: PendingAction
 
 fn makeUnstageFileTaskForTest(allocator: std.mem.Allocator, pending: PendingAction) !*UnstageFileTask(FileTaskTestMsg) {
     const Task = UnstageFileTask(FileTaskTestMsg);
+    var root = try root_capability.RootCapability.openCanonical("/");
+    errdefer root.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    errdefer environment.deinit();
+    const repo_root = try allocator.dupe(u8, "/__gitframe_missing_repo__");
+    errdefer allocator.free(repo_root);
+    const path = try allocator.dupe(u8, "src/main.zig");
+    errdefer allocator.free(path);
+    const label = try allocator.dupe(u8, "src/main.zig");
+    errdefer allocator.free(label);
     const task = try allocator.create(Task);
     task.* = .{
         .pending = pending,
-        .repo_root = try allocator.dupe(u8, "/__gitframe_missing_repo__"),
-        .path = try allocator.dupe(u8, "src/main.zig"),
-        .label = try allocator.dupe(u8, "src/main.zig"),
+        .repo_root = repo_root,
+        .root = root,
+        .environment = environment,
+        .path = path,
+        .label = label,
         .target_kind = .file,
     };
     return task;
+}
+
+fn expectRootCapabilityClosedForTest(observer: root_capability.RootCapability) !void {
+    if (observer.duplicate()) |unexpected| {
+        var owned = unexpected;
+        owned.deinit();
+        return error.ExpectedClosedRootCapability;
+    } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 }
 
 fn expectStageFileFinished(msg: FileTaskTestMsg) StageFileFinished {
@@ -1587,6 +1684,7 @@ test "StageFileTask run frees borrowed command path and moves label" {
     const allocator = std.testing.allocator;
     const Task = StageFileTask(FileTaskTestMsg);
     const task = try makeStageFileTaskForTest(allocator, .{ .generation = 11, .kind = .stage_file });
+    const root_observer = task.root;
 
     var finished = expectStageFileFinished(Task.run(task, allocator, std.testing.io));
     defer finished.deinit(allocator);
@@ -1596,30 +1694,34 @@ test "StageFileTask run frees borrowed command path and moves label" {
     try std.testing.expectEqualStrings("/__gitframe_missing_repo__", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
     try std.testing.expectEqual(FileActionTaskResult.failed, std.meta.activeTag(finished.result));
+    try expectRootCapabilityClosedForTest(root_observer);
 }
 
 test "StageFileTask failed frees borrowed command path and moves label" {
     const allocator = std.testing.allocator;
     const Task = StageFileTask(FileTaskTestMsg);
     const task = try makeStageFileTaskForTest(allocator, .{ .generation = 12, .kind = .stage_file });
+    const root_observer = task.root;
 
-    var finished = expectStageFileFinished(Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator));
+    var finished = expectStageFileFinished(Task.failed(task, .runtime_abandoned, allocator));
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 12), finished.pending.generation);
     try std.testing.expectEqual(ActionKind.stage_file, finished.pending.kind);
     try std.testing.expectEqualStrings("/__gitframe_missing_repo__", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
-    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
+    try std.testing.expectEqualStrings("runtime shutting down", switch (finished.result) {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
+    try expectRootCapabilityClosedForTest(root_observer);
 }
 
 test "UnstageFileTask run frees borrowed command path and moves label" {
     const allocator = std.testing.allocator;
     const Task = UnstageFileTask(FileTaskTestMsg);
     const task = try makeUnstageFileTaskForTest(allocator, .{ .generation = 13, .kind = .unstage_file });
+    const root_observer = task.root;
 
     var finished = expectUnstageFileFinished(Task.run(task, allocator, std.testing.io));
     defer finished.deinit(allocator);
@@ -1629,12 +1731,14 @@ test "UnstageFileTask run frees borrowed command path and moves label" {
     try std.testing.expectEqualStrings("/__gitframe_missing_repo__", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
     try std.testing.expectEqual(FileActionTaskResult.failed, std.meta.activeTag(finished.result));
+    try expectRootCapabilityClosedForTest(root_observer);
 }
 
 test "UnstageFileTask failed frees borrowed command path and moves label" {
     const allocator = std.testing.allocator;
     const Task = UnstageFileTask(FileTaskTestMsg);
     const task = try makeUnstageFileTaskForTest(allocator, .{ .generation = 14, .kind = .unstage_file });
+    const root_observer = task.root;
 
     var finished = expectUnstageFileFinished(Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator));
     defer finished.deinit(allocator);
@@ -1647,6 +1751,7 @@ test "UnstageFileTask failed frees borrowed command path and moves label" {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
+    try expectRootCapabilityClosedForTest(root_observer);
 }
 
 test "StageHunkTask failed preserves identity and transfers moved fields" {
@@ -1662,6 +1767,11 @@ test "StageHunkTask failed preserves identity and transfers moved fields" {
     };
     const Task = StageHunkTask(TestMsg);
     const allocator = std.testing.allocator;
+    var root = try root_capability.RootCapability.openCanonical("/");
+    var authority_consumed = false;
+    errdefer if (!authority_consumed) root.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    errdefer if (!authority_consumed) environment.deinit();
     const mark_key: git_ops.SessionHunkMarkKey = .{
         .content = .{
             .repo_epoch = 2,
@@ -1677,11 +1787,15 @@ test "StageHunkTask failed preserves identity and transfers moved fields" {
     task.* = .{
         .pending = .{ .generation = 7, .kind = .stage_hunk },
         .repo_root = try allocator.dupe(u8, "/repo"),
+        .root = root,
+        .environment = environment,
         .path = try allocator.dupe(u8, "src/main.zig"),
         .patch = try allocator.dupe(u8, "patch"),
         .hunk_index = 3,
         .session_mark_mutation = .{ .add = mark_key },
     };
+    authority_consumed = true;
+    const root_observer = task.root;
 
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
     var finished = switch (msg) {
@@ -1702,23 +1816,39 @@ test "StageHunkTask failed preserves identity and transfers moved fields" {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
+    try expectRootCapabilityClosedForTest(root_observer);
 }
 
 test "runOperationMapped preserves action failure prefixes" {
-    var result = runStageFile("/__gitframe_missing_repo__", "src/main.zig", std.testing.allocator, std.testing.io);
-    defer result.deinit(std.testing.allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
+    defer environment.deinit();
+    const context: git_command.DirectoryContext = .{
+        .cwd = tmp.dir,
+        .environment = &environment,
+    };
+
+    var stage_allocator_state = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const stage_allocator = stage_allocator_state.allocator();
+    var result = runStageFile(context, "src/main.zig", stage_allocator, std.testing.io);
+    defer result.deinit(stage_allocator);
 
     const message = switch (result) {
         .failed => |text| text,
+        .failed_static => |text| text,
         else => return error.UnexpectedResult,
     };
     try std.testing.expect(std.mem.startsWith(u8, message, "Stage failed: "));
 
-    var commit_result = runCommit("/__gitframe_missing_repo__", "subject", null, std.testing.allocator, std.testing.io);
-    defer commit_result.deinit(std.testing.allocator);
+    var commit_allocator_state = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const commit_allocator = commit_allocator_state.allocator();
+    var commit_result = runCommit(context, "subject", null, commit_allocator, std.testing.io);
+    defer commit_result.deinit(commit_allocator);
 
     const commit_message = switch (commit_result) {
         .failed => |text| text,
+        .failed_static => |text| text,
         else => return error.UnexpectedResult,
     };
     try std.testing.expect(std.mem.startsWith(u8, commit_message, "Commit failed: "));

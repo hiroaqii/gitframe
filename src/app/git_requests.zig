@@ -20,18 +20,25 @@ const git_command = @import("../git/command.zig");
 const process_runner = @import("../process/runner.zig");
 const root_capability = @import("../repo/root_capability.zig");
 
-pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.StageTarget) !void {
+pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.StageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     requireKind(pending, .stage_file);
+
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    var authority_consumed = false;
+    defer if (!authority_consumed) authority.deinit();
 
     const Task = actions.StageFileTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = &.{},
+        .root = authority.root,
+        .environment = authority.environment,
         .path = &.{},
         .label = &.{},
         .target_kind = target.kind,
     };
+    authority_consumed = true;
     errdefer destroyFileTask(Task, ctx.allocator(), task);
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
@@ -41,18 +48,25 @@ pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: action
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
-pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.UnstageTarget) !void {
+pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.UnstageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     requireKind(pending, .unstage_file);
+
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    var authority_consumed = false;
+    defer if (!authority_consumed) authority.deinit();
 
     const Task = actions.UnstageFileTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = &.{},
+        .root = authority.root,
+        .environment = authority.environment,
         .path = &.{},
         .label = &.{},
         .target_kind = target.kind,
     };
+    authority_consumed = true;
     errdefer destroyFileTask(Task, ctx.allocator(), task);
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
@@ -62,20 +76,27 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
-pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: *git_ops.HunkStageTarget) !void {
+pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: *git_ops.HunkStageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     defer consumeHunkTarget(ctx.allocator(), target);
     requireKind(pending, .stage_hunk);
+
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    var authority_consumed = false;
+    defer if (!authority_consumed) authority.deinit();
 
     const Task = actions.StageHunkTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = &.{},
+        .root = authority.root,
+        .environment = authority.environment,
         .path = &.{},
         .patch = &.{},
         .hunk_index = target.hunk_index,
         .session_mark_mutation = target.session_mark_mutation,
     };
+    authority_consumed = true;
     errdefer destroyHunkTask(Task, ctx.allocator(), task);
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
@@ -86,21 +107,28 @@ pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: action
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
-pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: *git_ops.HunkUnstageTarget) !void {
+pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: *git_ops.HunkUnstageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     defer consumeHunkTarget(ctx.allocator(), target);
     requireKind(pending, .unstage_hunk);
+
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    var authority_consumed = false;
+    defer if (!authority_consumed) authority.deinit();
 
     const Task = actions.UnstageHunkTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = &.{},
+        .root = authority.root,
+        .environment = authority.environment,
         .path = &.{},
         .patch = &.{},
         .hunk_index = target.hunk_index,
         .session_mark_mutation = target.session_mark_mutation,
         .reload_after_success = target.reload_after_success,
     };
+    authority_consumed = true;
     errdefer destroyHunkTask(Task, ctx.allocator(), task);
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
@@ -111,16 +139,23 @@ pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
-pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, repo_root: []const u8, path: []const u8) !void {
+pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, repo_root: []const u8, path: []const u8, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     requireKind(pending, .discard_file);
+
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    var authority_consumed = false;
+    defer if (!authority_consumed) authority.deinit();
 
     const Task = actions.DiscardFileTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = &.{},
+        .root = authority.root,
+        .environment = authority.environment,
         .path = &.{},
     };
+    authority_consumed = true;
     errdefer destroyFileTask(Task, ctx.allocator(), task);
 
     task.repo_root = try ctx.allocator().dupe(u8, repo_root);
@@ -142,18 +177,25 @@ pub const CommitRequest = struct {
     }
 };
 
-pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, request: *CommitRequest) !void {
+pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, request: *CommitRequest, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     defer request.deinit(ctx.allocator());
     requireKind(pending, .commit);
+
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    var authority_consumed = false;
+    defer if (!authority_consumed) authority.deinit();
 
     const Task = actions.CommitTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = request.repo_root,
+        .root = authority.root,
+        .environment = authority.environment,
         .subject = request.subject,
         .body = request.body,
     };
+    authority_consumed = true;
     request.* = .{ .repo_root = &.{}, .subject = &.{}, .body = null };
     errdefer destroyCommitTask(Task, ctx.allocator(), task);
 
@@ -214,18 +256,25 @@ pub fn startCommitMessageAssist(
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
-pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, confirmation: *app_state.AmendConfirmation) !void {
+pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, confirmation: *app_state.AmendConfirmation, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     defer consumeAmendConfirmation(ctx.allocator(), confirmation);
     requireKind(pending, .amend);
+
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    var authority_consumed = false;
+    defer if (!authority_consumed) authority.deinit();
 
     const Task = actions.AmendTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = confirmation.repo_root,
+        .root = authority.root,
+        .environment = authority.environment,
         .subject = confirmation.subject,
         .body = confirmation.body,
     };
+    authority_consumed = true;
     confirmation.* = .{ .repo_root = &.{}, .subject = &.{}, .body = null };
     errdefer destroyCommitTask(Task, ctx.allocator(), task);
 
@@ -405,20 +454,29 @@ pub fn startSwitchBranch(
     ctx: *chasen.Ctx(Msg),
     pending: actions.PendingAction,
     request: *SwitchBranchRequest,
+    root: *const root_capability.RootCapability,
+    parent_environment: ?*const std.process.Environ.Map,
 ) !void {
     defer consumeSwitchBranchRequest(ctx.allocator(), request);
     requireKind(pending, .switch_branch);
+
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    var authority_consumed = false;
+    defer if (!authority_consumed) authority.deinit();
 
     const Task = actions.SwitchBranchTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
         .pending = pending,
         .repo_root = request.repo_root,
+        .root = authority.root,
+        .environment = authority.environment,
         .expected_branch = request.expected_branch,
         .expected_oid = request.expected_oid,
         .target_branch = request.target_branch,
         .target_oid = request.target_oid,
     };
+    authority_consumed = true;
     request.* = .{
         .repo_root = &.{},
         .expected_branch = &.{},
@@ -431,10 +489,36 @@ pub fn startSwitchBranch(
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
+const LocalTaskAuthority = struct {
+    root: root_capability.RootCapability,
+    environment: git_command.LocalGitEnvironment,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        root: *const root_capability.RootCapability,
+        parent_environment: ?*const std.process.Environ.Map,
+    ) !LocalTaskAuthority {
+        var owned_root = try root.duplicate();
+        errdefer owned_root.deinit();
+        return .{
+            .root = owned_root,
+            .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment),
+        };
+    }
+
+    fn deinit(self: *LocalTaskAuthority) void {
+        self.environment.deinit();
+        self.root.deinit();
+        self.* = undefined;
+    }
+};
+
 fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.path.len > 0) allocator.free(task.path);
     if (@hasField(Task, "label") and task.label.len > 0) allocator.free(task.label);
+    task.environment.deinit();
+    task.root.deinit();
     allocator.destroy(task);
 }
 
@@ -548,6 +632,8 @@ fn destroySwitchBranchTask(comptime Task: type, allocator: std.mem.Allocator, ta
     if (task.expected_oid.len > 0) allocator.free(task.expected_oid);
     if (task.target_branch.len > 0) allocator.free(task.target_branch);
     if (task.target_oid.len > 0) allocator.free(task.target_oid);
+    task.environment.deinit();
+    task.root.deinit();
     allocator.destroy(task);
 }
 
@@ -555,6 +641,8 @@ fn destroyHunkTask(comptime Task: type, allocator: std.mem.Allocator, task: *Tas
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.path.len > 0) allocator.free(task.path);
     if (task.patch.len > 0) allocator.free(task.patch);
+    task.environment.deinit();
+    task.root.deinit();
     allocator.destroy(task);
 }
 
@@ -562,6 +650,8 @@ fn destroyCommitTask(comptime Task: type, allocator: std.mem.Allocator, task: *T
     if (task.repo_root.len > 0) allocator.free(task.repo_root);
     if (task.subject.len > 0) allocator.free(task.subject);
     if (task.body) |body| allocator.free(body);
+    task.environment.deinit();
+    task.root.deinit();
     allocator.destroy(task);
 }
 

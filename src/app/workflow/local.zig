@@ -145,12 +145,17 @@ pub const Controller = struct {
         defer if (cursor_owned) cursor.deinit(ctx.allocator());
 
         const prepared = self.lifecycle.prepare(.stage_file);
+        const capability = self.repo.activeCapability() orelse {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("stage unavailable: repository authority changed", .{});
+            return;
+        };
         app_git_requests.startStageFile(app_message.Msg, ctx, prepared.pending, .{
             .repo_root = owned.repo_root,
             .path = owned.path,
             .kind = owned.kind,
             .label = owned.label,
-        }) catch |err| {
+        }, capability, self.env_map) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start stage task", .{});
             return err;
@@ -278,9 +283,15 @@ pub const Controller = struct {
             .session_mark_mutation = owned.session_mark_mutation,
             .reload_after_success = owned.reload_after_success,
         };
+        defer task_target.deinit(ctx.allocator());
         owned.patch = &.{};
         const prepared = self.lifecycle.prepare(.stage_hunk);
-        app_git_requests.startStageHunk(app_message.Msg, ctx, prepared.pending, &task_target) catch |err| {
+        const capability = self.repo.activeCapability() orelse {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("hunk stage unavailable: repository authority changed", .{});
+            return;
+        };
+        app_git_requests.startStageHunk(app_message.Msg, ctx, prepared.pending, &task_target, capability, self.env_map) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start hunk stage task", .{});
             return err;
@@ -394,9 +405,15 @@ pub const Controller = struct {
             .session_mark_mutation = owned.session_mark_mutation,
             .reload_after_success = owned.reload_after_success,
         };
+        defer task_target.deinit(ctx.allocator());
         owned.patch = &.{};
         const prepared = self.lifecycle.prepare(.unstage_hunk);
-        app_git_requests.startUnstageHunk(app_message.Msg, ctx, prepared.pending, &task_target) catch |err| {
+        const capability = self.repo.activeCapability() orelse {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("hunk unstage unavailable: repository authority changed", .{});
+            return;
+        };
+        app_git_requests.startUnstageHunk(app_message.Msg, ctx, prepared.pending, &task_target, capability, self.env_map) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start hunk unstage task", .{});
             return err;
@@ -466,12 +483,17 @@ pub const Controller = struct {
         defer if (cursor_owned) cursor.deinit(ctx.allocator());
 
         const prepared = self.lifecycle.prepare(.unstage_file);
+        const capability = self.repo.activeCapability() orelse {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("unstage unavailable: repository authority changed", .{});
+            return;
+        };
         app_git_requests.startUnstageFile(app_message.Msg, ctx, prepared.pending, .{
             .repo_root = owned.repo_root,
             .path = owned.path,
             .kind = owned.kind,
             .label = owned.label,
-        }) catch |err| {
+        }, capability, self.env_map) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start unstage task", .{});
             return err;
@@ -558,12 +580,19 @@ pub const Controller = struct {
         defer if (cursor_owned) cursor.deinit(ctx.allocator());
 
         const prepared = self.lifecycle.prepare(.discard_file);
+        const capability = self.repo.activeCapability() orelse {
+            self.lifecycle.rejectSpawn(prepared);
+            self.setStatus("discard unavailable: repository authority changed", .{});
+            return;
+        };
         app_git_requests.startDiscardFile(
             app_message.Msg,
             ctx,
             prepared.pending,
             confirmation.repo_root,
             confirmation.path,
+            capability,
+            self.env_map,
         ) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.setStatus("could not start discard task", .{});
@@ -847,10 +876,17 @@ pub const Controller = struct {
             .subject = parts.subject,
             .body = parts.body,
         };
+        defer request.deinit(ctx.allocator());
         parts = .{ .subject = &.{}, .body = null };
 
         const prepared = self.lifecycle.prepare(.commit);
-        app_git_requests.startCommit(app_message.Msg, ctx, prepared.pending, &request) catch |err| {
+        const capability = self.repo.activeCapability() orelse {
+            self.lifecycle.rejectSpawn(prepared);
+            panel.commit_error = .commit_failed;
+            self.setStatus("commit unavailable: repository authority changed", .{});
+            return;
+        };
+        app_git_requests.startCommit(app_message.Msg, ctx, prepared.pending, &request, capability, self.env_map) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             panel.commit_error = .commit_failed;
             self.setStatus("could not start commit task", .{});
@@ -891,7 +927,15 @@ pub const Controller = struct {
         self.state.amend_confirmation = null;
 
         const prepared = self.lifecycle.prepare(.amend);
-        app_git_requests.startAmend(app_message.Msg, ctx, prepared.pending, &confirmation) catch |err| {
+        const capability = self.repo.activeCapability() orelse {
+            self.lifecycle.rejectSpawn(prepared);
+            if (self.overlay.isAmendCommit()) self.overlay.close();
+            self.state.commit_panel.commit_error = .amend_failed;
+            self.setStatus("amend unavailable: repository authority changed", .{});
+            confirmation.deinit(ctx.allocator());
+            return;
+        };
+        app_git_requests.startAmend(app_message.Msg, ctx, prepared.pending, &confirmation, capability, self.env_map) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             if (self.overlay.isAmendCommit()) self.overlay.close();
             self.state.commit_panel.commit_error = .amend_failed;

@@ -97,6 +97,7 @@ test {
     _ = @import("git/branch_status.zig");
     _ = @import("git/command.zig");
     _ = @import("git/compare.zig");
+    _ = @import("git/operations.zig");
     _ = @import("git/read.zig");
     _ = @import("git/refs.zig");
     _ = @import("git/status.zig");
