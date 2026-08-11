@@ -635,6 +635,8 @@ test "Review mutation read fence drains old production reads without publication
         .result = .{ .loaded = new_status },
     } } });
     status_task.repo_root = &.{};
+    status_task.environment.deinit();
+    status_task.root.deinit();
     allocator.destroy(status_task);
     new_status = undefined;
 
@@ -666,8 +668,7 @@ test "Review mutation read fence drains old production reads without publication
             app_test_support.diff_unstaged_projection,
         ) },
     } } });
-    diff_source.freeLoadRequest(allocator, source_task.request);
-    allocator.destroy(source_task);
+    DiffLoadTask.destroy(source_task, allocator);
 
     const pending = beginAcceptedTestAction(&app, .push);
     const action_terminal = App.Msg.actionFinished(.{ .push = .{
@@ -1055,27 +1056,28 @@ test "Review re-entry queues one revalidation behind an older read and leaving c
     try std.testing.expect(app.pages.review.activation.revalidation_requested == null);
 }
 test "Review re-entry starts immediate fingerprint revalidation even when polling is disabled" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put("GIT_DIR", "/must-be-sanitized-before-branch-read");
 
     var app: App = .{
         .active_page = .repository,
-        .allocator = std.testing.allocator,
+        .allocator = allocator,
         .env_map = &env,
         .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
         .pages = .{ .review = .{ .load = .{ .state = .{ .empty = .no_changes } } } },
     };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
     app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("retained"));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer ctx.runtimeClearPendingEffectCopies();
-    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
     try requestPageSwitchForTest(&app, &ctx, .review);
 
@@ -1848,8 +1850,7 @@ test "Review canonical publication retains the prior body for a stage hunk succe
     const hunk_identity = hunk_status_task.identity;
     const hunk_read_epoch = hunk_status_task.read_epoch;
     const hunk_generation = hunk_status_task.generation;
-    allocator.free(hunk_status_task.repo_root);
-    allocator.destroy(hunk_status_task);
+    StatusLoadTask.destroy(hunk_status_task, allocator);
     var hunk_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
     try app.update(App.Msg.loadFinished(.{ .review = .{ .status = .{
         .identity = hunk_identity,
@@ -2442,12 +2443,10 @@ pub fn takeCanonicalPublicationReads(
         .branch_generation = branch_task.generation,
         .branch_cycle_id = branch_task.background_cycle_id,
     };
-    allocator.free(status_task.repo_root);
-    allocator.destroy(status_task);
+    StatusLoadTask.destroy(status_task, allocator);
     allocator.free(branch_task.repo_root);
     allocator.destroy(branch_task);
-    diff_source.freeLoadRequest(allocator, source_task.request);
-    allocator.destroy(source_task);
+    DiffLoadTask.destroy(source_task, allocator);
     return reads;
 }
 
@@ -2578,7 +2577,8 @@ fn takeCanonicalPublicationProjectionRequest(
     const task: *ReviewProjectionTask = @ptrCast(@alignCast(entries[0].ctx));
     const request = task.request;
     task.request = undefined;
-    if (task.root) |*root| root.deinit();
+    task.environment.deinit();
+    task.root.deinit();
     allocator.destroy(task);
     return request;
 }

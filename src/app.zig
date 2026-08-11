@@ -310,6 +310,7 @@ pub const App = struct {
             .operations = self.reviewOperationController(),
             .repo = self.repoSessionView(),
             .current_review_root = self.currentReviewActionRoot(),
+            .env_map = self.env_map,
             .user_config = &self.user_config,
             .status = &self.pages.review.status,
             .overlay = &self.overlay,

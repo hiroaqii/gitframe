@@ -41,75 +41,7 @@ pub const OwnedRemoteEnvironment = struct {
     }
 };
 
-pub const max_diff_bytes = 16 * 1024 * 1024;
-pub const max_status_bytes = 8 * 1024 * 1024;
-pub const max_repository_manifest_bytes = 16 * 1024 * 1024;
 pub const max_branch_list_bytes = 4 * 1024 * 1024;
-
-pub const LoadResult = union(enum) {
-    /// Allocated raw diff text. Caller owns and must call `deinit`.
-    ok: []u8,
-    /// Allocated error message from the backend. Caller owns and must call `deinit`.
-    failed: []u8,
-    /// Non-owned fallback error message, used when allocation itself fails.
-    failed_static: []const u8,
-
-    pub fn deinit(self: LoadResult, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .ok => |bytes| allocator.free(bytes),
-            .failed => |message| allocator.free(message),
-            .failed_static => {},
-        }
-    }
-};
-
-pub const StatusLoadResult = union(enum) {
-    /// Allocated raw porcelain status text. Caller owns and must call `deinit`.
-    ok: []u8,
-    /// Allocated error message from the backend. Caller owns and must call `deinit`.
-    failed: []u8,
-    /// Non-owned fallback error message, used when allocation itself fails.
-    failed_static: []const u8,
-
-    pub fn deinit(self: StatusLoadResult, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .ok => |bytes| allocator.free(bytes),
-            .failed => |message| allocator.free(message),
-            .failed_static => {},
-        }
-    }
-};
-
-pub const RepositoryManifestLoadResult = union(enum) {
-    /// Owned raw NUL-delimited `git ls-files` output.
-    ok: []u8,
-    failed: []u8,
-    failed_static: []const u8,
-
-    pub fn deinit(self: RepositoryManifestLoadResult, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .ok => |bytes| allocator.free(bytes),
-            .failed => |message| allocator.free(message),
-            .failed_static => {},
-        }
-    }
-};
-
-/// Optional Repository-tree status snapshot. This is deliberately separate
-/// from Review's string-root status API: Repository tasks remain committed to
-/// the already-open root descriptor for both manifest and status reads.
-pub const RepositoryFileStatusLoadResult = union(enum) {
-    /// Owned porcelain-v1 `-z` bytes.
-    ok: []u8,
-    failed_static: []const u8,
-
-    pub fn deinit(self: RepositoryFileStatusLoadResult, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .ok => |bytes| allocator.free(bytes),
-            .failed_static => {},
-        }
-    }
-};
 
 /// Bounded raw-object comparison for one Repository source gutter.
 pub const RepositoryFileChangeLoadResult = union(enum) {
@@ -302,65 +234,6 @@ pub const PushUpstreamFinalizeRequest = struct {
     remote: []const u8,
     remote_branch: []const u8,
     oid: []const u8,
-};
-
-/// Git-command diff kinds only.
-///
-/// Raw input such as stdin or patch files belongs to diff/source.zig, not to
-/// this backend boundary. Keeping this union git-only prevents future status /
-/// stage / commit operations from inheriting raw-input concerns.
-pub const GitDiffKind = union(enum) {
-    unstaged,
-    cached,
-    file: FileDiffRequest,
-    range: []const u8,
-    no_index: PathPair,
-};
-
-pub const FileDiffBase = enum {
-    unstaged,
-    cached,
-};
-
-pub const FileDiffRequest = struct {
-    base: FileDiffBase,
-    path: []const u8,
-};
-
-pub const PathPair = struct {
-    left: []const u8,
-    right: []const u8,
-};
-
-/// Request for a diff produced by running Git in a concrete repository.
-pub const GitDiffRequest = struct {
-    repo_root: ?[]const u8,
-    kind: GitDiffKind,
-};
-
-/// Request for a read-only `git status` snapshot in a concrete repository.
-pub const ReadOrigin = enum {
-    foreground,
-    background,
-};
-
-pub const GitStatusRequest = struct {
-    repo_root: []const u8,
-    origin: ReadOrigin = .foreground,
-};
-
-pub const RepositoryManifestRequest = struct {
-    /// Borrowed descriptor cwd. The caller keeps it alive through command wait.
-    cwd: std.Io.Dir,
-    /// Borrowed controlled environment owned by the synchronous caller/task.
-    environment: *const git_command.LocalGitEnvironment,
-};
-
-pub const RepositoryFileStatusRequest = struct {
-    /// Borrowed descriptor cwd. The caller keeps it alive through command wait.
-    cwd: std.Io.Dir,
-    /// Borrowed controlled environment shared with the manifest read.
-    environment: *const git_command.LocalGitEnvironment,
 };
 
 pub const RepositoryFileChangeRequest = struct {
@@ -565,31 +438,6 @@ pub const OperationRequest = struct {
 };
 
 pub const LocalCommandBackend = struct {
-    const git_diff_unstaged = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
-    const git_diff_cached = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
-
-    pub fn loadDiff(allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) git_command.Error!LoadResult {
-        return switch (request.kind) {
-            .unstaged => loadGitDiff(allocator, io, repoRoot(request), &git_diff_unstaged),
-            .cached => loadGitDiff(allocator, io, repoRoot(request), &git_diff_cached),
-            .file => |file| loadGitFileDiff(allocator, io, repoRoot(request), file),
-            .range => |range| loadGitDiffRange(allocator, io, repoRoot(request), range),
-            .no_index => |paths| loadNoIndexDiff(allocator, io, paths),
-        };
-    }
-
-    pub fn loadStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) git_command.Error!StatusLoadResult {
-        return loadGitStatus(allocator, io, request);
-    }
-
-    pub fn loadRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) git_command.Error!RepositoryManifestLoadResult {
-        return loadGitRepositoryManifest(allocator, io, request);
-    }
-
-    pub fn loadRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) git_command.Error!RepositoryFileStatusLoadResult {
-        return loadGitRepositoryFileStatus(allocator, io, request);
-    }
-
     pub fn loadRepositoryFileChange(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileChangeRequest) git_command.Error!RepositoryFileChangeLoadResult {
         return loadGitRepositoryFileChange(allocator, io, request);
     }
@@ -649,10 +497,6 @@ pub const LocalCommandBackend = struct {
     }
 };
 
-fn repoRoot(request: GitDiffRequest) []const u8 {
-    return request.repo_root.?;
-}
-
 fn runCapturedCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -667,66 +511,6 @@ fn runCapturedCommand(
         .stdout_limit = stdout_limit,
         .stderr_limit = stderr_limit,
     }) catch |err| return git_command.fromRunnerError(err);
-}
-
-fn loadResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) git_command.Error!LoadResult {
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .{ .ok = result.stdout };
-        },
-        else => {},
-    }
-
-    allocator.free(result.stdout);
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
-}
-
-fn statusResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) git_command.Error!StatusLoadResult {
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .{ .ok = result.stdout };
-        },
-        else => {},
-    }
-
-    allocator.free(result.stdout);
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "{s} failed: {any}", .{ fallback_label, result.term }) catch return error.OutOfMemory };
-}
-
-fn repositoryManifestResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result) git_command.Error!RepositoryManifestLoadResult {
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .{ .ok = result.stdout };
-        },
-        else => {},
-    }
-    allocator.free(result.stdout);
-    allocator.free(result.stderr);
-    return .{ .failed_static = "Repository manifest could not be loaded" };
-}
-
-fn repositoryFileStatusResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result) RepositoryFileStatusLoadResult {
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .{ .ok = result.stdout };
-        },
-        else => {},
-    }
-    allocator.free(result.stdout);
-    allocator.free(result.stderr);
-    // Status is an optional tree decoration. Raw Git diagnostics (including
-    // repository paths) never cross this backend boundary into page status.
-    return .{ .failed_static = "Repository file status could not be loaded" };
 }
 
 fn operationResultFromGitCommand(allocator: std.mem.Allocator, result: process_runner.Result, fallback_label: []const u8) git_command.Error!OperationResult {
@@ -789,93 +573,6 @@ fn operationResultFromGitStdinCommand(
             };
         },
     };
-}
-
-fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) git_command.Error!LoadResult {
-    // Use structured argv and force stable path prefixes so display/editor
-    // paths do not depend on user diff.mnemonicPrefix/diff.noprefix config.
-    const result = try runCapturedCommand(allocator, io, repo_root, argv, .limited(max_diff_bytes), .limited(256 * 1024));
-    return loadResultFromGitCommand(allocator, result, "git diff");
-}
-
-fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, range: []const u8) git_command.Error!LoadResult {
-    const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", range };
-    return loadGitDiff(allocator, io, repo_root, &argv);
-}
-
-fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, request: FileDiffRequest) git_command.Error!LoadResult {
-    return switch (request.base) {
-        .unstaged => {
-            const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
-            return loadGitDiff(allocator, io, repo_root, &argv);
-        },
-        .cached => {
-            const argv = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
-            return loadGitDiff(allocator, io, repo_root, &argv);
-        },
-    };
-}
-
-const foreground_status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
-const background_status_argv = [_][]const u8{ "git", "--no-optional-locks", "status", "--porcelain=v1", "-z", "-uall" };
-
-fn statusArgvForOrigin(origin: ReadOrigin) []const []const u8 {
-    return switch (origin) {
-        .foreground => &foreground_status_argv,
-        .background => &background_status_argv,
-    };
-}
-
-fn loadGitStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) git_command.Error!StatusLoadResult {
-    const argv = statusArgvForOrigin(request.origin);
-    const result = try runCapturedCommand(allocator, io, request.repo_root, argv, .limited(max_status_bytes), .limited(256 * 1024));
-    return statusResultFromGitCommand(allocator, result, "git status");
-}
-
-const repository_manifest_argv = [_][]const u8{
-    "git",
-    "--no-optional-locks",
-    "ls-files",
-    "-z",
-    "--cached",
-    "--others",
-    "--exclude-standard",
-    "--deduplicate",
-};
-
-fn repositoryManifestArgv() []const []const u8 {
-    return &repository_manifest_argv;
-}
-
-fn loadGitRepositoryManifest(allocator: std.mem.Allocator, io: std.Io, request: RepositoryManifestRequest) git_command.Error!RepositoryManifestLoadResult {
-    const result = try git_command.runCaptured(allocator, io, .{ .cwd = request.cwd, .environment = request.environment }, .{
-        .argv = repositoryManifestArgv(),
-        .stdout_limit = .limited(max_repository_manifest_bytes),
-        .stderr_limit = .limited(256 * 1024),
-    });
-    return repositoryManifestResultFromGitCommand(allocator, result);
-}
-
-const repository_file_status_argv = [_][]const u8{
-    "git",
-    "--no-optional-locks",
-    "status",
-    "--porcelain=v1",
-    "-z",
-    "-uall",
-};
-
-fn repositoryFileStatusArgv() []const []const u8 {
-    return &repository_file_status_argv;
-}
-
-fn loadGitRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, request: RepositoryFileStatusRequest) git_command.Error!RepositoryFileStatusLoadResult {
-    const result = try git_command.runCaptured(allocator, io, .{ .cwd = request.cwd, .environment = request.environment }, .{
-        .argv = repositoryFileStatusArgv(),
-        .stdout_limit = .limited(max_status_bytes),
-        .stderr_limit = .limited(256 * 1024),
-    });
-    return repositoryFileStatusResultFromGitCommand(allocator, result);
 }
 
 const repository_change_small_output_limit = 256 * 1024;
@@ -1000,7 +697,7 @@ fn loadGitRepositoryFileChangeWithHooks(
         "cat-file",
         "blob",
         blob.?.oid,
-    }, &.{}, max_diff_bytes, hooks);
+    }, &.{}, 16 * 1024 * 1024, hooks);
     defer blob_result.deinit(allocator);
     if (!termExited(blob_result.term, 0)) return .{ .failed_static = "Repository change basis unavailable" };
     if (hooks) |test_hooks| if (test_hooks.after_blob_loaded) |hook| try hook.invoke(io, request.cwd);
@@ -1039,7 +736,7 @@ fn loadGitRepositoryFileChangeWithHooks(
         "--",
         "head",
         "current",
-    }, &.{}, max_diff_bytes, hooks);
+    }, &.{}, 16 * 1024 * 1024, hooks);
     errdefer diff_result.deinit(allocator);
 
     const attributes_after = try loadSafeRepositoryChangeAttributes(allocator, io, repository_context, request.path, hooks) orelse {
@@ -1306,32 +1003,6 @@ fn testingLocalGitEnvironment(allocator: std.mem.Allocator) !git_command.LocalGi
     var parent = try std.testing.environ.createMap(allocator);
     defer parent.deinit();
     return git_command.LocalGitEnvironment.initFromParent(allocator, &parent);
-}
-
-fn loadRepositoryFileStatusForTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cwd: std.Io.Dir,
-) !RepositoryFileStatusLoadResult {
-    var environment = try testingLocalGitEnvironment(allocator);
-    defer environment.deinit();
-    return LocalCommandBackend.loadRepositoryFileStatus(allocator, io, .{
-        .cwd = cwd,
-        .environment = &environment,
-    });
-}
-
-fn loadRepositoryManifestForTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cwd: std.Io.Dir,
-) !RepositoryManifestLoadResult {
-    var environment = try testingLocalGitEnvironment(allocator);
-    defer environment.deinit();
-    return LocalCommandBackend.loadRepositoryManifest(allocator, io, .{
-        .cwd = cwd,
-        .environment = &environment,
-    });
 }
 
 fn testContentLineCount(bytes: []const u8) usize {
@@ -1820,302 +1491,6 @@ test "repository change backend releases private inputs at every allocation fail
     defer base.close(io);
     var iterator = base.iterate();
     try std.testing.expect(try iterator.next(io) == null);
-}
-
-test "repository manifest argv is read-only NUL-delimited and deduplicated" {
-    const argv = repositoryManifestArgv();
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
-    try std.testing.expectEqualStrings("ls-files", argv[2]);
-    try std.testing.expectEqualStrings("-z", argv[3]);
-    try std.testing.expectEqualStrings("--deduplicate", argv[7]);
-}
-
-test "repository file status argv is descriptor-safe porcelain v1" {
-    const argv = repositoryFileStatusArgv();
-    try std.testing.expectEqualSlices([]const u8, &repository_file_status_argv, argv);
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
-    try std.testing.expectEqualStrings("status", argv[2]);
-    try std.testing.expectEqualStrings("--porcelain=v1", argv[3]);
-    try std.testing.expectEqualStrings("-z", argv[4]);
-    try std.testing.expectEqualStrings("-uall", argv[5]);
-}
-
-test "repository file status reports real intent-to-add as current added path" {
-    const repository_change_index = @import("../repository/change_index.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try work.writeFile(io, .{ .sub_path = "intent.zig", .data = "const value = 1;\n" });
-    try runTestGit(io, &.{ "git", "add", "-N", "intent.zig" }, work);
-
-    var result = try loadRepositoryFileStatusForTest(std.testing.allocator, io, work);
-    const bytes = switch (result) {
-        .ok => |owned| blk: {
-            result = .{ .failed_static = "consumed" };
-            break :blk owned;
-        },
-        .failed_static => return error.UnexpectedRepositoryFileStatusFailure,
-    };
-    var index = try repository_change_index.parseOwned(std.testing.allocator, bytes);
-    defer index.deinit(std.testing.allocator);
-    try std.testing.expectEqual(repository_change_index.Kind.added, index.kindForPath("intent.zig").?);
-}
-
-test "repository file status descriptor cwd survives path replacement" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var committed = try tmp.dir.openDir(io, "work", .{});
-    defer committed.close(io);
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, committed);
-    try committed.writeFile(io, .{ .sub_path = "committed.txt", .data = "old\n" });
-
-    try tmp.dir.rename("work", tmp.dir, "old-work", io);
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var replacement = try tmp.dir.openDir(io, "work", .{});
-    defer replacement.close(io);
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
-    try replacement.writeFile(io, .{ .sub_path = "replacement.txt", .data = "new\n" });
-
-    const result = try loadRepositoryFileStatusForTest(std.testing.allocator, io, committed);
-    defer result.deinit(std.testing.allocator);
-    const bytes = switch (result) {
-        .ok => |owned| owned,
-        .failed_static => return error.UnexpectedRepositoryFileStatusFailure,
-    };
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "committed.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "replacement.txt") == null);
-}
-
-test "repository file status with rename detection disabled keeps only current path" {
-    const repository_change_index = @import("../repository/change_index.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try work.writeFile(io, .{ .sub_path = "old.zig", .data = "const value = 1;\n" });
-    try runTestGit(io, &.{ "git", "add", "old.zig" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
-    try runTestGit(io, &.{ "git", "config", "status.renames", "false" }, work);
-    try work.rename("old.zig", work, "new.zig", io);
-
-    var result = try loadRepositoryFileStatusForTest(std.testing.allocator, io, work);
-    const bytes = switch (result) {
-        .ok => |owned| blk: {
-            result = .{ .failed_static = "consumed" };
-            break :blk owned;
-        },
-        .failed_static => return error.UnexpectedRepositoryFileStatusFailure,
-    };
-    var index = try repository_change_index.parseOwned(std.testing.allocator, bytes);
-    defer index.deinit(std.testing.allocator);
-    try std.testing.expect(index.kindForPath("old.zig") == null);
-    try std.testing.expectEqual(repository_change_index.Kind.added, index.kindForPath("new.zig").?);
-}
-
-test "repository file status classifies a dirty submodule gitlink" {
-    const repository_change_index = @import("../repository/change_index.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    try tmp.dir.createDir(io, "child", .default_dir);
-    var child = try tmp.dir.openDir(io, "child", .{});
-    defer child.close(io);
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, child);
-    try child.writeFile(io, .{ .sub_path = "source.zig", .data = "const value = 1;\n" });
-    try runTestGit(io, &.{ "git", "add", "source.zig" }, child);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, child);
-    const child_path = try tmp.dir.realPathFileAlloc(io, "child", allocator);
-    defer allocator.free(child_path);
-
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try runTestGit(io, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", child_path, "vendor/sub" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "submodule" }, work);
-    var checked_out_child = try work.openDir(io, "vendor/sub", .{});
-    defer checked_out_child.close(io);
-    try checked_out_child.writeFile(io, .{ .sub_path = "source.zig", .data = "const value = 2;\n" });
-
-    var result = try loadRepositoryFileStatusForTest(allocator, io, work);
-    const bytes = switch (result) {
-        .ok => |owned| blk: {
-            result = .{ .failed_static = "consumed" };
-            break :blk owned;
-        },
-        .failed_static => return error.UnexpectedRepositoryFileStatusFailure,
-    };
-    var index = try repository_change_index.parseOwned(allocator, bytes);
-    defer index.deinit(allocator);
-    try std.testing.expectEqual(repository_change_index.Kind.modified, index.kindForPath("vendor/sub").?);
-}
-
-test "repository file status failure does not expose diagnostics" {
-    const secret = "/private/worktree/token-123";
-    const raw = process_runner.Result{
-        .term = .{ .exited = 128 },
-        .stdout = try std.testing.allocator.alloc(u8, 0),
-        .stderr = try std.fmt.allocPrint(std.testing.allocator, "fatal at {s}\n", .{secret}),
-    };
-    const result = repositoryFileStatusResultFromGitCommand(std.testing.allocator, raw);
-    defer result.deinit(std.testing.allocator);
-    switch (result) {
-        .failed_static => |message| {
-            try std.testing.expectEqualStrings("Repository file status could not be loaded", message);
-            try std.testing.expect(std.mem.indexOf(u8, message, secret) == null);
-        },
-        .ok => return error.ExpectedRepositoryFileStatusFailure,
-    }
-}
-
-test "repository manifest backend deduplicates a real three-stage conflict" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try work.writeFile(io, .{ .sub_path = "conflict.txt", .data = "base\n" });
-    try runTestGit(io, &.{ "git", "add", "conflict.txt" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
-    try runTestGit(io, &.{ "git", "checkout", "-b", "side" }, work);
-    try work.writeFile(io, .{ .sub_path = "conflict.txt", .data = "side\n" });
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "side" }, work);
-    try runTestGit(io, &.{ "git", "checkout", "main" }, work);
-    try work.writeFile(io, .{ .sub_path = "conflict.txt", .data = "main\n" });
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "main" }, work);
-    try runTestGitFailure(io, &.{ "git", "merge", "side" }, work);
-
-    const result = try loadRepositoryManifestForTest(std.testing.allocator, io, work);
-    defer result.deinit(std.testing.allocator);
-    const bytes = switch (result) {
-        .ok => |value| value,
-        else => return error.UnexpectedRepositoryManifestFailure,
-    };
-    try std.testing.expectEqualStrings("conflict.txt\x00", bytes);
-}
-
-test "repository manifest backend accepts gitlink as one path" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try work.writeFile(io, .{ .sub_path = "README.md", .data = "base\n" });
-    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
-    const oid_output = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
-    defer std.testing.allocator.free(oid_output);
-    const cache_info = try std.fmt.allocPrint(std.testing.allocator, "160000,{s},vendor/sub", .{trimLineEnd(oid_output)});
-    defer std.testing.allocator.free(cache_info);
-    try runTestGit(io, &.{ "git", "update-index", "--add", "--cacheinfo", cache_info }, work);
-
-    const result = try loadRepositoryManifestForTest(std.testing.allocator, io, work);
-    defer result.deinit(std.testing.allocator);
-    const bytes = switch (result) {
-        .ok => |value| value,
-        else => return error.UnexpectedRepositoryManifestFailure,
-    };
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "vendor/sub\x00") != null);
-}
-
-test "repository manifest backend includes tracked and non-ignored untracked paths" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var work = try tmp.dir.openDir(io, "work", .{});
-    defer work.close(io);
-
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
-    try work.writeFile(io, .{ .sub_path = "tracked.log", .data = "tracked\n" });
-    try runTestGit(io, &.{ "git", "add", "tracked.log" }, work);
-    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, work);
-    try work.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
-    try work.writeFile(io, .{ .sub_path = "ignored.log", .data = "ignored\n" });
-    try work.writeFile(io, .{ .sub_path = "visible.txt", .data = "visible\n" });
-
-    const result = try loadRepositoryManifestForTest(std.testing.allocator, io, work);
-    defer result.deinit(std.testing.allocator);
-    const bytes = switch (result) {
-        .ok => |value| value,
-        else => return error.UnexpectedRepositoryManifestFailure,
-    };
-    try std.testing.expect(containsNulPath(bytes, "tracked.log"));
-    try std.testing.expect(containsNulPath(bytes, ".gitignore"));
-    try std.testing.expect(containsNulPath(bytes, "visible.txt"));
-    try std.testing.expect(!containsNulPath(bytes, "ignored.log"));
-}
-
-test "repository manifest descriptor cwd stays on committed directory after path replacement" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var committed = try tmp.dir.openDir(io, "work", .{});
-    defer committed.close(io);
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, committed);
-    try committed.writeFile(io, .{ .sub_path = "committed.txt", .data = "old\n" });
-
-    try tmp.dir.rename("work", tmp.dir, "old-work", io);
-    try tmp.dir.createDir(io, "work", .default_dir);
-    var replacement = try tmp.dir.openDir(io, "work", .{});
-    defer replacement.close(io);
-    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, replacement);
-    try replacement.writeFile(io, .{ .sub_path = "replacement.txt", .data = "new\n" });
-
-    const result = try loadRepositoryManifestForTest(std.testing.allocator, io, committed);
-    defer result.deinit(std.testing.allocator);
-    const bytes = switch (result) {
-        .ok => |value| value,
-        else => return error.UnexpectedRepositoryManifestFailure,
-    };
-    try std.testing.expect(containsNulPath(bytes, "committed.txt"));
-    try std.testing.expect(!containsNulPath(bytes, "replacement.txt"));
-}
-
-test "repository manifest unsupported option is a typed failure" {
-    const secret = "/private/worktree/token-123";
-    const result = process_runner.Result{
-        .term = .{ .exited = 129 },
-        .stdout = try std.testing.allocator.alloc(u8, 0),
-        .stderr = try std.fmt.allocPrint(std.testing.allocator, "error at {s}: unknown option `deduplicate`\n", .{secret}),
-    };
-    const mapped = try repositoryManifestResultFromGitCommand(std.testing.allocator, result);
-    defer mapped.deinit(std.testing.allocator);
-    switch (mapped) {
-        .failed_static => |message| {
-            try std.testing.expectEqualStrings("Repository manifest could not be loaded", message);
-            try std.testing.expect(std.mem.indexOf(u8, message, secret) == null);
-            try std.testing.expect(std.mem.indexOf(u8, message, "deduplicate") == null);
-        },
-        else => return error.ExpectedRepositoryManifestFailure,
-    }
-}
-
-test "background status suppresses optional locks without changing foreground argv" {
-    try std.testing.expectEqualSlices([]const u8, &foreground_status_argv, statusArgvForOrigin(.foreground));
-    try std.testing.expectEqualSlices([]const u8, &background_status_argv, statusArgvForOrigin(.background));
-    try std.testing.expectEqualStrings("status", statusArgvForOrigin(.foreground)[1]);
-    try std.testing.expectEqualStrings("--no-optional-locks", statusArgvForOrigin(.background)[1]);
-    try std.testing.expectEqualStrings("status", statusArgvForOrigin(.background)[2]);
 }
 
 fn loadGitBranchStatus(allocator: std.mem.Allocator, io: std.Io, request: BranchStatusRequest) git_command.Error!BranchStatusLoadResult {
@@ -2621,7 +1996,7 @@ fn loadCompareDiff(
         env,
         &argv,
         "git diff compare",
-        .limited(max_diff_bytes),
+        .limited(16 * 1024 * 1024),
         false,
     );
 }
@@ -4453,53 +3828,6 @@ fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, repo_root: []const
 
     const result = try runCapturedCommand(allocator, io, repo_root, argv, .limited(256 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git commit");
-}
-
-fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, paths: PathPair) git_command.Error!LoadResult {
-    const argv = [_][]const u8{
-        "git",
-        "diff",
-        "--no-index",
-        "--no-color",
-        "--no-ext-diff",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        "--",
-        paths.left,
-        paths.right,
-    };
-
-    // `git diff --no-index` returns 1 for "differences found", which is the
-    // normal case for an external diff viewer. Only accept that widened success
-    // when stdout actually contains a diff; path errors also return 1 but only
-    // explain the failure on stderr.
-    const result = std.process.run(allocator, io, .{
-        .argv = &argv,
-        .stdout_limit = .limited(max_diff_bytes),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.StreamTooLong,
-        else => error.SpawnFailed,
-    };
-
-    if (isNoIndexSuccess(result.term, result.stdout.len)) {
-        allocator.free(result.stderr);
-        return .{ .ok = result.stdout };
-    }
-
-    allocator.free(result.stdout);
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-
-    return .{ .failed = std.fmt.allocPrint(allocator, "git diff --no-index failed: {any}", .{result.term}) catch return error.OutOfMemory };
-}
-
-fn isNoIndexSuccess(term: std.process.Child.Term, stdout_len: usize) bool {
-    return switch (term) {
-        .exited => |code| code == 0 or (code == 1 and stdout_len > 0),
-        else => false,
-    };
 }
 
 test "OperationRequest represents supported operation inputs" {
@@ -6904,16 +6232,6 @@ fn runTestGitFailure(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !voi
     return error.ExpectedGitCommandFailure;
 }
 
-fn containsNulPath(bytes: []const u8, expected: []const u8) bool {
-    var start: usize = 0;
-    while (start < bytes.len) {
-        const end = std.mem.indexOfScalarPos(u8, bytes, start, 0) orelse return false;
-        if (std.mem.eql(u8, bytes[start..end], expected)) return true;
-        start = end + 1;
-    }
-    return false;
-}
-
 const BranchSwitchFixture = struct {
     repo_root: []u8,
     main_oid: []u8,
@@ -7027,22 +6345,4 @@ fn gitOutputAlloc(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
     }
     freeRunResult(std.testing.allocator, result);
     return error.GitCommandFailed;
-}
-
-test "GitDiffRequest cannot represent raw input sources" {
-    const request = GitDiffRequest{
-        .repo_root = "/repo",
-        .kind = .unstaged,
-    };
-
-    try std.testing.expectEqualStrings("/repo", request.repo_root.?);
-    try std.testing.expect(request.kind == .unstaged);
-}
-
-test "no-index diff treats exit one as success only with diff output" {
-    try std.testing.expect(isNoIndexSuccess(.{ .exited = 0 }, 0));
-    try std.testing.expect(isNoIndexSuccess(.{ .exited = 1 }, 1));
-    try std.testing.expect(!isNoIndexSuccess(.{ .exited = 1 }, 0));
-    try std.testing.expect(!isNoIndexSuccess(.{ .exited = 2 }, 1));
-    try std.testing.expect(!isNoIndexSuccess(.{ .unknown = 9 }, 1));
 }

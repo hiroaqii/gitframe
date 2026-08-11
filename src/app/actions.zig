@@ -1,6 +1,8 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const git_backend = @import("../git/backend.zig");
+const git_command = @import("../git/command.zig");
+const git_read = @import("../git/read.zig");
 const git_push = @import("../git/push.zig");
 const git_ops = @import("git_ops.zig");
 const external_action = @import("../external/action.zig");
@@ -690,12 +692,23 @@ pub fn CommitMessageAssistTask(comptime Msg: type) type {
         repo_root: []u8,
         action_id: []u8,
         argv: [][]u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         launch_revision: u64,
         mode: CommitMessageAssistMode,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runCommitMessageAssist(task.repo_root, task.action_id, task.argv, task.mode, allocator, io));
+            return task.finish(allocator, runCommitMessageAssist(
+                task.repo_root,
+                task.action_id,
+                task.argv,
+                task.root,
+                &task.environment,
+                task.mode,
+                allocator,
+                io,
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -1109,6 +1122,8 @@ pub fn destroyCommitMessageAssistTask(comptime Task: type, allocator: std.mem.Al
     if (task.action_id.len > 0) allocator.free(task.action_id);
     for (task.argv) |arg| allocator.free(arg);
     allocator.free(task.argv);
+    task.environment.deinit();
+    task.root.deinit();
     task.mode.deinit(allocator);
     allocator.destroy(task);
 }
@@ -1117,10 +1132,19 @@ const staged_diff_json_limit = 256 * 1024;
 // Capture a larger diff before truncating the JSON payload. This lets normal
 // large diffs produce a truncated prompt while still bounding accidental huge
 // stdout from Git before it enters JSON construction.
-const staged_diff_capture_limit = 4 * 1024 * 1024;
 
-pub fn runCommitMessageAssist(repo_root: []const u8, action_id: []const u8, argv: []const []const u8, mode: CommitMessageAssistMode, allocator: std.mem.Allocator, io: std.Io) CommitMessageActionResult {
-    const staged_diff = collectStagedDiff(allocator, repo_root, io) catch |err|
+pub fn runCommitMessageAssist(
+    repo_root: []const u8,
+    action_id: []const u8,
+    argv: []const []const u8,
+    root: root_capability.RootCapability,
+    environment: *const git_command.LocalGitEnvironment,
+    mode: CommitMessageAssistMode,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) CommitMessageActionResult {
+    const context = git_command.DirectoryContext{ .cwd = root.dir(), .environment = environment };
+    const staged_diff = collectStagedDiff(allocator, context, io) catch |err|
         return stagedDiffFailure(allocator, err);
     var owned_staged_diff = staged_diff;
     defer owned_staged_diff.deinit(allocator);
@@ -1135,7 +1159,7 @@ pub fn runCommitMessageAssist(repo_root: []const u8, action_id: []const u8, argv
         .id = .custom,
         .argv = argv,
         .stdin_json = stdin_json,
-        .cwd = repo_root,
+        .cwd = .{ .dir = root.dir() },
     }) catch |err| return allocFailure(allocator, "external action failed: {s}", .{@errorName(err)});
     var owned_action_result = action_result;
     defer owned_action_result.deinit(allocator);
@@ -1167,27 +1191,20 @@ const StagedDiffPayload = struct {
     }
 };
 
-fn collectStagedDiff(allocator: std.mem.Allocator, repo_root: []const u8, io: std.Io) !StagedDiffPayload {
-    const diff_argv = [_][]const u8{ "git", "diff", "--cached", "--no-ext-diff", "--no-color" };
-    const diff_result = process_runner.runCaptured(allocator, io, .{
-        .argv = &diff_argv,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(staged_diff_capture_limit),
-        .stderr_limit = .limited(64 * 1024),
-    }) catch |err| return err;
-    defer diff_result.deinit(allocator);
+fn collectStagedDiff(allocator: std.mem.Allocator, context: git_command.DirectoryContext, io: std.Io) !StagedDiffPayload {
+    const raw = try git_read.loadStagedDiff(allocator, io, .{ .context = context });
+    defer raw.deinit(allocator);
+    const bytes = switch (raw) {
+        .ok => |value| value,
+        .failed_static => return error.StagedDiffFailed,
+    };
 
-    switch (diff_result.term) {
-        .exited => |code| if (code != 0) return error.StagedDiffFailed,
-        else => return error.StagedDiffFailed,
-    }
-
-    if (validateStagedDiffForJson(diff_result.stdout)) |failure| {
+    if (validateStagedDiffForJson(bytes)) |failure| {
         if (std.mem.eql(u8, failure, "no staged changes")) return error.NoStagedChanges;
         return error.InvalidStagedDiff;
     }
 
-    const truncate = truncateDiff(diff_result.stdout, staged_diff_json_limit);
+    const truncate = truncateDiff(bytes, staged_diff_json_limit);
     return .{
         .diff = try allocator.dupe(u8, truncate.bytes),
         .truncated = truncate.truncated,

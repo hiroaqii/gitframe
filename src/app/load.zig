@@ -17,11 +17,11 @@ const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
 const git_backend = @import("../git/backend.zig");
 const git_command = @import("../git/command.zig");
+const git_read = @import("../git/read.zig");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const path_key_mod = @import("../path_key.zig");
-const process_runner = @import("../process/runner.zig");
 const projection_component = @import("projection_component.zig");
 const review_projection = @import("review_projection.zig");
 const review_read_epoch = @import("review_read_epoch.zig");
@@ -36,8 +36,6 @@ const syntax_provider = @import("../syntax/provider_runtime.zig");
 const LoadRequest = diff_source.LoadRequest;
 const LoadedDiff = loaded_diff.LoadedDiff;
 
-const status_line_stats_stdout_limit = 2 * 1024 * 1024;
-const status_line_stats_stderr_limit = 256 * 1024;
 const untracked_line_stats_per_file_bytes = 1024 * 1024;
 const untracked_stats_max_files = 256;
 const untracked_stats_total_bytes = 4 * 1024 * 1024;
@@ -45,6 +43,60 @@ const generated_oversized_message = std.fmt.comptimePrint(
     "File exceeds the {d} MiB preview limit.",
     .{selected_document.max_text_mib},
 );
+
+/// Task-owned authority for the three source families. Display `repo_root`
+/// bytes remain in `LoadRequest` for result/context data only.
+pub const LoadAuthority = union(enum) {
+    repository: struct {
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
+    },
+    non_repository: git_command.LocalGitEnvironment,
+    none,
+
+    pub fn initRepository(
+        allocator: std.mem.Allocator,
+        root: root_capability.RootCapability,
+        parent_environment: ?*const std.process.Environ.Map,
+    ) !LoadAuthority {
+        var owned_root = try root.duplicate();
+        errdefer owned_root.deinit();
+        return .{ .repository = .{
+            .root = owned_root,
+            .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment),
+        } };
+    }
+
+    pub fn initNonRepository(
+        allocator: std.mem.Allocator,
+        parent_environment: ?*const std.process.Environ.Map,
+    ) !LoadAuthority {
+        return .{ .non_repository = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment) };
+    }
+
+    pub fn deinit(self: *LoadAuthority) void {
+        switch (self.*) {
+            .repository => |*repository| {
+                repository.environment.deinit();
+                repository.root.deinit();
+            },
+            .non_repository => |*environment| environment.deinit(),
+            .none => {},
+        }
+        self.* = .none;
+    }
+
+    fn borrowed(self: *const LoadAuthority) diff_source.LoadContext {
+        return switch (self.*) {
+            .repository => |*repository| .{ .repository = .{
+                .cwd = repository.root.dir(),
+                .environment = &repository.environment,
+            } },
+            .non_repository => |*environment| .{ .non_repository = environment },
+            .none => .none,
+        };
+    }
+};
 
 /// Result payload sent from the asynchronous diff load task back to App.
 pub const DiffLoadFinished = struct {
@@ -534,13 +586,20 @@ pub fn DiffLoadTask(comptime Msg: type) type {
         identity: page.RequestIdentity,
         read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         request: LoadRequest,
+        authority: LoadAuthority,
         generation: u64,
         expected_fingerprint: ?content_fingerprint.Fingerprint = null,
         background_cycle_id: ?u64 = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runLoadExpected(task.request, task.expected_fingerprint, allocator, io));
+            return task.finish(allocator, runLoadExpectedWithContext(
+                task.request,
+                task.authority.borrowed(),
+                task.expected_fingerprint,
+                allocator,
+                io,
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -552,6 +611,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
         /// task-owned payload without producing a Msg.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
+            task.authority.deinit();
             allocator.destroy(task);
         }
 
@@ -560,6 +620,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: DiffLoadTaskResult) Msg {
             defer {
                 diff_source.freeLoadRequest(allocator, task.request);
+                task.authority.deinit();
                 allocator.destroy(task);
             }
             return Msg.loadFinished(.{ .review = .{ .source = DiffLoadFinished{
@@ -578,13 +639,21 @@ pub fn StatusLoadTask(comptime Msg: type) type {
         identity: page.RequestIdentity,
         read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
         repo_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
         generation: u64,
-        origin: git_backend.ReadOrigin = .foreground,
+        origin: git_read.ReadOrigin = .foreground,
         background_cycle_id: ?u64 = null,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runStatusLoadWithOrigin(task.repo_root, task.origin, allocator, io));
+            return task.finish(allocator, runStatusLoadWithOrigin(
+                task.repo_root,
+                .{ .cwd = task.root.dir(), .environment = &task.environment },
+                task.origin,
+                allocator,
+                io,
+            ));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -596,13 +665,19 @@ pub fn StatusLoadTask(comptime Msg: type) type {
         /// task-owned payload without producing a Msg.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(task.repo_root);
+            task.environment.deinit();
+            task.root.deinit();
             allocator.destroy(task);
         }
 
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: StatusLoadTaskResult) Msg {
-            defer allocator.destroy(task);
+            defer {
+                task.environment.deinit();
+                task.root.deinit();
+                allocator.destroy(task);
+            }
             const finished = StatusLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
@@ -836,11 +911,12 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
 pub fn ReviewProjectionTask(comptime Msg: type) type {
     return struct {
         request: review_projection.Request,
-        root: ?root_capability.RootCapability = null,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runReviewProjectionLoad(task.request, task.root, allocator, io));
+            return task.finish(allocator, runReviewProjectionLoad(task.request, task.root, &task.environment, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -852,7 +928,8 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
         /// task-owned payload without producing a Msg.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
-            if (task.root) |*root| root.deinit();
+            task.environment.deinit();
+            task.root.deinit();
             allocator.destroy(task);
         }
 
@@ -860,7 +937,8 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
         /// moves, and destroy live only here.
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: review_projection.TaskResult) Msg {
             defer allocator.destroy(task);
-            defer if (task.root) |*root| root.deinit();
+            defer task.environment.deinit();
+            defer task.root.deinit();
             const request = task.request;
             task.request = undefined;
             return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
@@ -944,17 +1022,33 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
     };
 }
 
-pub fn runStatusLoad(repo_root: []const u8, allocator: std.mem.Allocator, io: std.Io) StatusLoadTaskResult {
-    return runStatusLoadWithOrigin(repo_root, .foreground, allocator, io);
-}
-
-pub fn runStatusLoadWithOrigin(
+pub fn runStatusLoad(
     repo_root: []const u8,
-    origin: git_backend.ReadOrigin,
+    parent_environment: ?*const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) StatusLoadTaskResult {
-    const raw_result = git_backend.LocalCommandBackend.loadStatus(allocator, io, .{ .repo_root = repo_root, .origin = origin }) catch |err| {
+    var root = root_capability.RootCapability.openCanonical(repo_root) catch |err| return .{
+        .failed = std.fmt.allocPrint(allocator, "Status load failed: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Status load failed: OutOfMemory" },
+    };
+    defer root.deinit();
+    var environment = git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment) catch |err| return .{
+        .failed = std.fmt.allocPrint(allocator, "Status load failed: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Status load failed: OutOfMemory" },
+    };
+    defer environment.deinit();
+    return runStatusLoadWithOrigin(repo_root, .{ .cwd = root.dir(), .environment = &environment }, .foreground, allocator, io);
+}
+
+pub fn runStatusLoadWithOrigin(
+    _: []const u8,
+    context: git_command.DirectoryContext,
+    origin: git_read.ReadOrigin,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) StatusLoadTaskResult {
+    const raw_result = git_read.loadStatus(allocator, io, .{ .context = context, .origin = origin }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Status load failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Status load failed: OutOfMemory" },
@@ -972,7 +1066,7 @@ pub fn runStatusLoadWithOrigin(
                 return .{ .failed = std.fmt.allocPrint(allocator, "Status parse failed: {s}", .{@errorName(err)}) catch
                     return .{ .failed_static = "Status parse failed: OutOfMemory" } };
             };
-            populateStatusLineStats(allocator, io, repo_root, &bundle) catch {};
+            populateStatusLineStats(allocator, io, context, &bundle) catch {};
             return .{ .loaded = bundle };
         },
         .failed => |message| return .{ .failed = message },
@@ -1005,13 +1099,18 @@ pub fn runBranchStatusLoad(
 
 const StatusStatsMap = std.StringHashMapUnmanaged(file_tree.Stats);
 
-fn populateStatusLineStats(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, bundle: *git_status.StatusBundle) !void {
+fn populateStatusLineStats(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    bundle: *git_status.StatusBundle,
+) !void {
     var stats_map: StatusStatsMap = .empty;
     defer deinitStatusStatsMap(allocator, &stats_map);
 
-    try collectTrackedStatusLineStats(allocator, io, repo_root, bundle.document, &stats_map, .staged);
-    try collectTrackedStatusLineStats(allocator, io, repo_root, bundle.document, &stats_map, .unstaged);
-    try collectUntrackedStatusLineStats(allocator, io, repo_root, bundle.document, &stats_map);
+    try collectTrackedStatusLineStats(allocator, io, context, bundle.document, &stats_map, .staged);
+    try collectTrackedStatusLineStats(allocator, io, context, bundle.document, &stats_map, .unstaged);
+    try collectUntrackedStatusLineStats(allocator, io, context.cwd, bundle.document, &stats_map);
 
     const line_stats = try statusStatsMapToList(allocator, stats_map);
     defer {
@@ -1036,7 +1135,7 @@ const TrackedStatsSide = enum {
 fn collectTrackedStatusLineStats(
     allocator: std.mem.Allocator,
     io: std.Io,
-    repo_root: []const u8,
+    context: git_command.DirectoryContext,
     document: git_status.StatusDocument,
     stats_map: *StatusStatsMap,
     side: TrackedStatsSide,
@@ -1056,28 +1155,15 @@ fn collectTrackedStatusLineStats(
     }
     if (paths.items.len == 0) return;
 
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, "git");
-    try argv.append(allocator, "diff");
-    if (side == .staged) try argv.append(allocator, "--cached");
-    try argv.append(allocator, "--no-renames");
-    try argv.append(allocator, "--numstat");
-    try argv.append(allocator, "-z");
-    try argv.append(allocator, "--");
-    for (paths.items) |path| try argv.append(allocator, path);
-
-    const result = process_runner.runCaptured(allocator, io, .{
-        .argv = argv.items,
-        .cwd = .{ .path = repo_root },
-        .stdout_limit = .limited(status_line_stats_stdout_limit),
-        .stderr_limit = .limited(status_line_stats_stderr_limit),
+    const result = git_read.loadTrackedNumstat(allocator, io, .{
+        .context = context,
+        .paths = paths.items,
+        .staged = side == .staged,
     }) catch return;
     defer result.deinit(allocator);
-
-    switch (result.term) {
-        .exited => |code| if (code == 0) try parseNumstatZIntoMap(allocator, result.stdout, stats_map),
-        else => {},
+    switch (result) {
+        .ok => |bytes| try parseNumstatZIntoMap(allocator, bytes, stats_map),
+        .unavailable => {},
     }
 }
 
@@ -1113,11 +1199,11 @@ fn parseNumstatField(field: []const u8) ?NumstatField {
 fn collectUntrackedStatusLineStats(
     allocator: std.mem.Allocator,
     io: std.Io,
-    repo_root: []const u8,
+    root: std.Io.Dir,
     document: git_status.StatusDocument,
     stats_map: *StatusStatsMap,
 ) !void {
-    return collectUntrackedStatusLineStatsWithBudget(allocator, io, repo_root, document, stats_map, .{
+    return collectUntrackedStatusLineStatsWithBudget(allocator, io, root, document, stats_map, .{
         .per_file_bytes = untracked_line_stats_per_file_bytes,
         .max_files = untracked_stats_max_files,
         .total_bytes = untracked_stats_total_bytes,
@@ -1133,7 +1219,7 @@ const UntrackedStatsBudget = struct {
 fn collectUntrackedStatusLineStatsWithBudget(
     allocator: std.mem.Allocator,
     io: std.Io,
-    repo_root: []const u8,
+    root: std.Io.Dir,
     document: git_status.StatusDocument,
     stats_map: *StatusStatsMap,
     budget: UntrackedStatsBudget,
@@ -1147,7 +1233,7 @@ fn collectUntrackedStatusLineStatsWithBudget(
         const key = entry.canonicalPathKey() orelse continue;
         inspected_files += 1;
 
-        const content = readRepoFileLimited(allocator, io, repo_root, key, budget.per_file_bytes) catch continue;
+        const content = readRepoFileLimited(allocator, io, root, key, budget.per_file_bytes) catch continue;
         defer allocator.free(content);
 
         if (inspected_bytes + content.len > budget.total_bytes) return;
@@ -1397,17 +1483,58 @@ pub fn parseCompareAheadCount(text: []const u8) ?usize {
     return std.fmt.parseInt(usize, text, 10) catch null;
 }
 
-pub fn runLoad(request: LoadRequest, allocator: std.mem.Allocator, io: std.Io) DiffLoadTaskResult {
-    return runLoadExpected(request, null, allocator, io);
+pub fn runLoad(
+    request: LoadRequest,
+    parent_environment: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) DiffLoadTaskResult {
+    return runLoadExpected(request, null, parent_environment, allocator, io);
 }
 
 pub fn runLoadExpected(
     request: LoadRequest,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
+    parent_environment: ?*const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) DiffLoadTaskResult {
-    const raw_result = diff_source.load(allocator, io, request) catch |err| {
+    var authority = initSynchronousLoadAuthority(request, parent_environment, allocator) catch |err| return .{
+        .failed = std.fmt.allocPrint(allocator, "Diff load failed: {s}", .{@errorName(err)}) catch
+            return .{ .failed_static = "Diff load failed: OutOfMemory" },
+    };
+    defer authority.deinit();
+    return runLoadExpectedWithContext(request, authority.borrowed(), expected_fingerprint, allocator, io);
+}
+
+fn initSynchronousLoadAuthority(
+    request: LoadRequest,
+    parent_environment: ?*const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+) !LoadAuthority {
+    return switch (request.source) {
+        .unstaged, .cached, .range => blk: {
+            const repo_root = request.repo_root orelse return error.MissingRepoRoot;
+            var root = try root_capability.RootCapability.openCanonical(repo_root);
+            errdefer root.deinit();
+            break :blk .{ .repository = .{
+                .root = root,
+                .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment),
+            } };
+        },
+        .no_index => LoadAuthority.initNonRepository(allocator, parent_environment),
+        .stdin, .pager, .patch_file => .none,
+    };
+}
+
+fn runLoadExpectedWithContext(
+    request: LoadRequest,
+    context: diff_source.LoadContext,
+    expected_fingerprint: ?content_fingerprint.Fingerprint,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) DiffLoadTaskResult {
+    const raw_result = diff_source.load(allocator, io, request, context) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Diff load failed: {s}", .{@errorName(err)}) catch
                 return .{ .failed_static = "Diff load failed: OutOfMemory" },
@@ -1435,19 +1562,26 @@ pub fn runLoadExpected(
 
 pub fn runReviewProjectionLoad(
     request: review_projection.Request,
-    root: ?root_capability.RootCapability,
+    root: root_capability.RootCapability,
+    environment: ?*const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) review_projection.TaskResult {
     return switch (request.kind) {
-        .cached_diff => loadCachedFileDiff(request, allocator, io),
+        .cached_diff => loadCachedFileDiff(request, root, environment orelse return .{ .failed_static = "Repository authority unavailable" }, allocator, io),
         .generated_added_file => loadGeneratedAddedFile(request, root, allocator, io),
-        .combined_hunks => loadCombinedHunks(request, allocator, io),
+        .combined_hunks => loadCombinedHunks(request, root, environment orelse return .{ .failed_static = "Repository authority unavailable" }, allocator, io),
     };
 }
 
-fn loadCachedFileDiff(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
-    var component = loadFileProjectionComponent(request, allocator, io, .cached) catch |err| {
+fn loadCachedFileDiff(
+    request: review_projection.Request,
+    root: root_capability.RootCapability,
+    environment: *const git_command.LocalGitEnvironment,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) review_projection.TaskResult {
+    var component = loadFileProjectionComponent(request, root, environment, allocator, io, .cached) catch |err| {
         return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cached diff load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Cached diff load failed: OutOfMemory" } };
     } orelse {
@@ -1518,23 +1652,27 @@ fn buildCachedFileEagerResult(
 
 fn loadFileProjectionComponent(
     request: review_projection.Request,
+    root: root_capability.RootCapability,
+    environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
-    base: git_backend.FileDiffBase,
+    base: git_read.FileDiffBase,
 ) !?projection_component.ParsedComponent {
-    const bytes = try loadFileDiffBytes(request, allocator, io, base) orelse return null;
+    const bytes = try loadFileDiffBytes(request, root, environment, allocator, io, base) orelse return null;
     defer allocator.free(bytes);
     return try projection_component.ParsedComponent.parse(allocator, bytes);
 }
 
 fn loadFileDiffBytes(
     request: review_projection.Request,
+    root: root_capability.RootCapability,
+    environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
-    base: git_backend.FileDiffBase,
+    base: git_read.FileDiffBase,
 ) !?[]u8 {
-    const raw_result = try git_backend.LocalCommandBackend.loadDiff(allocator, io, .{
-        .repo_root = request.repo_root,
+    const raw_result = try git_read.loadDiff(allocator, io, .{
+        .context = .{ .cwd = root.dir(), .environment = environment },
         .kind = .{ .file = .{ .base = base, .path = request.path_key } },
     });
 
@@ -1554,15 +1692,21 @@ fn loadFileDiffBytes(
     }
 }
 
-fn loadCombinedHunks(request: review_projection.Request, allocator: std.mem.Allocator, io: std.Io) review_projection.TaskResult {
-    var cached_component = loadFileProjectionComponent(request, allocator, io, .cached) catch |err| {
+fn loadCombinedHunks(
+    request: review_projection.Request,
+    root: root_capability.RootCapability,
+    environment: *const git_command.LocalGitEnvironment,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) review_projection.TaskResult {
+    var cached_component = loadFileProjectionComponent(request, root, environment, allocator, io, .cached) catch |err| {
         return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Staged hunk projection load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Projection load failed: OutOfMemory" } };
     } orelse return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged hunks for this file.", .{}) catch
         return .{ .failed_static = "Projection allocation failed" } } };
     defer cached_component.deinit();
 
-    var unstaged_component = loadFileProjectionComponent(request, allocator, io, .unstaged) catch |err| {
+    var unstaged_component = loadFileProjectionComponent(request, root, environment, allocator, io, .unstaged) catch |err| {
         return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Unstaged hunk projection load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Projection load failed: OutOfMemory" } };
     } orelse return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No unstaged hunks for this file.", .{}) catch
@@ -1932,14 +2076,14 @@ fn generatedStatusBody(allocator: std.mem.Allocator, path: []const u8, message: 
         return .{ .failed_static = "Projection allocation failed" } } };
 }
 
-/// Residual stats-only helper for best-effort untracked line counts. Review
-/// preview bytes must use `repository/document.zig` instead: this legacy walk
-/// validates components but cannot make its stat/open pairs race-free.
-fn readRepoFileLimited(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, path_key: []const u8, limit: usize) ![]u8 {
+/// Best-effort untracked line-count read rooted at the task-owned repository
+/// descriptor. Review preview bytes use `repository/document.zig` instead.
+fn readRepoFileLimited(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, path_key: []const u8, limit: usize) ![]u8 {
     try validateRepoRelativePath(path_key);
 
-    var current_dir = try std.Io.Dir.openDirAbsolute(io, repo_root, .{});
-    defer current_dir.close(io);
+    var current_dir = root;
+    var current_dir_owned = false;
+    defer if (current_dir_owned) current_dir.close(io);
 
     var components = std.mem.splitScalar(u8, path_key, '/');
     var component = components.next() orelse return error.InvalidPath;
@@ -1953,8 +2097,9 @@ fn readRepoFileLimited(allocator: std.mem.Allocator, io: std.Io, repo_root: []co
 
         if (stat.kind != .directory) return error.InvalidPath;
         const child_dir = try current_dir.openDir(io, component, .{});
-        current_dir.close(io);
+        if (current_dir_owned) current_dir.close(io);
         current_dir = child_dir;
+        current_dir_owned = true;
         component = next.?;
     }
 }
@@ -2680,6 +2825,7 @@ test "expected raw fingerprint returns unchanged before diff parsing" {
     var result = runLoadExpected(
         .{ .source = .{ .patch_file = path } },
         expected,
+        null,
         std.testing.allocator,
         std.testing.io,
     );
@@ -2702,15 +2848,12 @@ test "stats-only repository read rejects stable symlink components" {
     try tmp.dir.writeFile(io, .{ .sub_path = "dir/inside.txt", .data = "nested" });
     try tmp.dir.symLink(io, "dir", "linked-dir", .{ .is_directory = true });
 
-    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(repo_root);
-
-    const content = try readRepoFileLimited(std.testing.allocator, io, repo_root, "inside.txt", untracked_line_stats_per_file_bytes);
+    const content = try readRepoFileLimited(std.testing.allocator, io, tmp.dir, "inside.txt", untracked_line_stats_per_file_bytes);
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("inside", content);
 
-    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, repo_root, "linked.txt", untracked_line_stats_per_file_bytes));
-    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, repo_root, "linked-dir/inside.txt", untracked_line_stats_per_file_bytes));
+    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, tmp.dir, "linked.txt", untracked_line_stats_per_file_bytes));
+    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, tmp.dir, "linked-dir/inside.txt", untracked_line_stats_per_file_bytes));
 }
 
 test "generated projection uses pinned safe source snapshot" {
@@ -2738,7 +2881,7 @@ test "generated projection uses pinned safe source snapshot" {
     );
     defer request.deinit(allocator);
 
-    var result = runReviewProjectionLoad(request, root, allocator, io);
+    var result = runReviewProjectionLoad(request, root, null, allocator, io);
     defer result.deinit(allocator);
     switch (result) {
         .ready => |ready| switch (ready) {
@@ -2783,14 +2926,14 @@ test "text limit contract generated projection shared loader" {
     );
     defer request.deinit(allocator);
 
-    var unsafe = runReviewProjectionLoad(request, first_root, allocator, io);
+    var unsafe = runReviewProjectionLoad(request, first_root, null, allocator, io);
     defer unsafe.deinit(allocator);
     try std.testing.expect(switch (unsafe) {
         .ready => |ready| ready == .status_body,
         else => false,
     });
 
-    var wrong_root = runReviewProjectionLoad(request, second_root, allocator, io);
+    var wrong_root = runReviewProjectionLoad(request, second_root, null, allocator, io);
     defer wrong_root.deinit(allocator);
     try std.testing.expect(switch (wrong_root) {
         .failed_static => |message| std.mem.eql(u8, message, "Repository root changed"),
@@ -2814,7 +2957,7 @@ test "text limit contract generated projection shared loader" {
         first_root.identity,
     );
     defer boundary_request.deinit(allocator);
-    var boundary = runReviewProjectionLoad(boundary_request, first_root, allocator, io);
+    var boundary = runReviewProjectionLoad(boundary_request, first_root, null, allocator, io);
     defer boundary.deinit(allocator);
     switch (boundary) {
         .ready => |ready| switch (ready) {
@@ -2844,7 +2987,7 @@ test "text limit contract generated projection shared loader" {
         first_root.identity,
     );
     defer oversized_request.deinit(allocator);
-    var oversized = runReviewProjectionLoad(oversized_request, first_root, allocator, io);
+    var oversized = runReviewProjectionLoad(oversized_request, first_root, null, allocator, io);
     defer oversized.deinit(allocator);
     switch (oversized) {
         .ready => |ready| switch (ready) {
@@ -2903,9 +3046,6 @@ test "collectUntrackedStatusLineStats skips binary and oversized files" {
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'x');
     try tmp.dir.writeFile(io, .{ .sub_path = "oversized.txt", .data = oversized });
-    const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(repo_root);
-
     const entries = [_]git_status.StatusEntry{
         .{ .path = "one.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
         .{ .path = "two.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked },
@@ -2916,7 +3056,7 @@ test "collectUntrackedStatusLineStats skips binary and oversized files" {
     var stats_map: StatusStatsMap = .empty;
     defer deinitStatusStatsMap(std.testing.allocator, &stats_map);
 
-    try collectUntrackedStatusLineStats(std.testing.allocator, io, repo_root, document, &stats_map);
+    try collectUntrackedStatusLineStats(std.testing.allocator, io, tmp.dir, document, &stats_map);
 
     try std.testing.expectEqual(@as(usize, 2), stats_map.count());
     try std.testing.expectEqual(@as(usize, 1), stats_map.get("one.txt").?.added);
@@ -2943,7 +3083,7 @@ test "collectUntrackedStatusLineStats consumes max-files budget for failed reads
     var stats_map: StatusStatsMap = .empty;
     defer deinitStatusStatsMap(std.testing.allocator, &stats_map);
 
-    try collectUntrackedStatusLineStatsWithBudget(std.testing.allocator, io, repo_root, document, &stats_map, .{
+    try collectUntrackedStatusLineStatsWithBudget(std.testing.allocator, io, tmp.dir, document, &stats_map, .{
         .per_file_bytes = untracked_line_stats_per_file_bytes,
         .max_files = 2,
         .total_bytes = untracked_stats_total_bytes,
@@ -2962,7 +3102,7 @@ test "runStatusLoad preserves clean repository snapshot" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    var result = runStatusLoad(repo_root, std.testing.allocator, io);
+    var result = runStatusLoad(repo_root, null, std.testing.allocator, io);
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
@@ -2985,7 +3125,7 @@ test "runStatusLoad attaches line stats for staged and untracked added files" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    var result = runStatusLoad(repo_root, std.testing.allocator, io);
+    var result = runStatusLoad(repo_root, null, std.testing.allocator, io);
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
@@ -3016,7 +3156,7 @@ test "runStatusLoad keys staged rename stats by current path" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    var result = runStatusLoad(repo_root, std.testing.allocator, io);
+    var result = runStatusLoad(repo_root, null, std.testing.allocator, io);
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
@@ -3406,11 +3546,18 @@ test "StatusLoadTask failed preserves read epoch generation and moves repo root"
     const Task = StatusLoadTask(TestMsg);
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root_path);
+
     const task = try allocator.create(Task);
     task.* = .{
         .identity = page.RequestIdentity.review(7, 11),
         .read_epoch = .{ .value = 19 },
         .repo_root = try allocator.dupe(u8, "/repo"),
+        .root = try root_capability.RootCapability.openCanonical(root_path),
+        .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null),
         .generation = 42,
     };
 
@@ -3448,6 +3595,20 @@ test "DiffLoadTask failed frees request and preserves read epoch generation" {
     const Task = DiffLoadTask(TestMsg);
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root_path);
+    var authority: LoadAuthority = blk: {
+        var owned_root = try root_capability.RootCapability.openCanonical(root_path);
+        errdefer owned_root.deinit();
+        break :blk .{ .repository = .{
+            .root = owned_root,
+            .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null),
+        } };
+    };
+    errdefer authority.deinit();
+
     const task = try allocator.create(Task);
     task.* = .{
         .identity = page.RequestIdentity.review(3, 5),
@@ -3456,8 +3617,10 @@ test "DiffLoadTask failed frees request and preserves read epoch generation" {
             .source = .{ .range = try allocator.dupe(u8, "HEAD~1..HEAD") },
             .repo_root = try allocator.dupe(u8, "/repo"),
         },
+        .authority = authority,
         .generation = 9,
     };
+    authority = .none;
 
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
     var finished = switch (msg) {
@@ -3534,19 +3697,27 @@ test "ReviewProjectionTask failed preserves request identity and read epoch" {
     };
     const Task = ReviewProjectionTask(TestMsg);
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root_path);
 
     const task = try allocator.create(Task);
-    task.* = .{ .request = .{
-        .identity = page.RequestIdentity.review(0, 1),
-        .id = 11,
-        .read_epoch = .{ .value = 53 },
-        .repo_root = try allocator.dupe(u8, "/repo"),
-        .path_key = try allocator.dupe(u8, "src/main.zig"),
-        .kind = .cached_diff,
-        .source_kind = .unstaged,
-        .source_session_revision = 2,
-        .status_snapshot_revision = 3,
-    } };
+    task.* = .{
+        .request = .{
+            .identity = page.RequestIdentity.review(0, 1),
+            .id = 11,
+            .read_epoch = .{ .value = 53 },
+            .repo_root = try allocator.dupe(u8, "/repo"),
+            .path_key = try allocator.dupe(u8, "src/main.zig"),
+            .kind = .cached_diff,
+            .source_kind = .unstaged,
+            .source_session_revision = 2,
+            .status_snapshot_revision = 3,
+        },
+        .root = try root_capability.RootCapability.openCanonical(root_path),
+        .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null),
+    };
 
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
     var finished = switch (msg) {

@@ -11,6 +11,7 @@ const content_fingerprint = @import("../../../content_fingerprint.zig");
 const page = @import("../../page.zig");
 const git_backend = @import("../../../git/backend.zig");
 const git_command = @import("../../../git/command.zig");
+const git_read = @import("../../../git/read.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const process_runner = @import("../../../process/runner.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
@@ -665,14 +666,13 @@ pub fn runManifestLoad(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) TaskResult {
-    const raw_manifest = git_backend.LocalCommandBackend.loadRepositoryManifest(allocator, io, .{
-        .cwd = cwd,
-        .environment = environment,
+    const context = git_command.DirectoryContext{ .cwd = cwd, .environment = environment };
+    const raw_manifest = git_read.loadRepositoryManifest(allocator, io, .{
+        .context = context,
     }) catch
         return .{ .failed_static = "Repository manifest could not be loaded" };
-    const raw_status = git_backend.LocalCommandBackend.loadRepositoryFileStatus(allocator, io, .{
-        .cwd = cwd,
-        .environment = environment,
+    const raw_status = git_read.loadRepositoryFileStatus(allocator, io, .{
+        .context = context,
     }) catch null;
     return buildManifestTaskResult(allocator, raw_manifest, raw_status, expected_fingerprint, expected_status_fingerprint);
 }
@@ -684,8 +684,8 @@ pub fn runManifestLoad(
 /// the path projection belongs to the new tree generation.
 fn buildManifestTaskResult(
     allocator: std.mem.Allocator,
-    raw_manifest: git_backend.RepositoryManifestLoadResult,
-    raw_status: ?git_backend.RepositoryFileStatusLoadResult,
+    raw_manifest: git_read.RepositoryManifestLoadResult,
+    raw_status: ?git_read.RepositoryFileStatusLoadResult,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
     expected_status_fingerprint: ?content_fingerprint.Fingerprint,
 ) TaskResult {
@@ -819,11 +819,11 @@ pub const ChangeMapRequest = struct {
     }
 };
 
-fn manifestResultForTest(bytes: []const u8) !git_backend.RepositoryManifestLoadResult {
+fn manifestResultForTest(bytes: []const u8) !git_read.RepositoryManifestLoadResult {
     return .{ .ok = try std.testing.allocator.dupe(u8, bytes) };
 }
 
-fn statusResultForTest(bytes: []const u8) !git_backend.RepositoryFileStatusLoadResult {
+fn statusResultForTest(bytes: []const u8) !git_read.RepositoryFileStatusLoadResult {
     return .{ .ok = try std.testing.allocator.dupe(u8, bytes) };
 }
 
@@ -859,7 +859,7 @@ test "repository manifest task result matrix keeps manifest and status identitie
     var status_unavailable = buildManifestTaskResult(
         allocator,
         try manifestResultForTest(old_manifest),
-        git_backend.RepositoryFileStatusLoadResult{ .failed_static = "optional failure" },
+        git_read.RepositoryFileStatusLoadResult{ .failed_static = "optional failure" },
         old_manifest_fingerprint,
         old_status_fingerprint,
     );
@@ -905,7 +905,7 @@ test "repository manifest task result matrix keeps manifest and status identitie
 
     var manifest_failed = buildManifestTaskResult(
         allocator,
-        git_backend.RepositoryManifestLoadResult{ .failed = try allocator.dupe(u8, "private diagnostic") },
+        git_read.RepositoryManifestLoadResult{ .failed = try allocator.dupe(u8, "private diagnostic") },
         try statusResultForTest(new_status),
         old_manifest_fingerprint,
         old_status_fingerprint,

@@ -95,6 +95,7 @@ test {
     _ = @import("git/backend.zig");
     _ = @import("git/branch_status.zig");
     _ = @import("git/command.zig");
+    _ = @import("git/read.zig");
     _ = @import("git/status.zig");
     _ = @import("keymap");
     _ = @import("loaded_diff.zig");

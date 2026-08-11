@@ -651,8 +651,7 @@ test "focus loss terminates selection without a deferred result" {
     const task: *DiffLoadTask = @ptrCast(@alignCast(entries[0].ctx));
     const cycle_id = task.background_cycle_id.?;
     const generation = task.generation;
-    diff_source.freeLoadRequest(std.testing.allocator, task.request);
-    std.testing.allocator.destroy(task);
+    DiffLoadTask.destroy(task, std.testing.allocator);
     _ = app.pages.review.load.clearPendingIfCurrent(.{ .diff_load = generation });
     reviewReload(&app).clearPendingReloadIfGeneration(std.testing.allocator, generation);
     app.pages.review.auto_reload.finishMember(cycle_id, .source);

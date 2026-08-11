@@ -5,6 +5,7 @@
 //! App dispatcher.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const chasen = @import("chasen");
 
 const app_actions = @import("../actions.zig");
@@ -51,6 +52,43 @@ const SessionHunkMarkMutation = git_ops.SessionHunkMarkMutation;
 const TargetKind = git_ops.TargetKind;
 const ToggleStageOperation = git_ops.ToggleStageOperation;
 
+fn runLocalTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !void {
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer {
+        std.testing.allocator.free(result.stdout);
+        std.testing.allocator.free(result.stderr);
+    }
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.GitCommandFailed;
+}
+
+fn localTestGitOutput(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            std.testing.allocator.free(result.stderr);
+            return result.stdout;
+        },
+        else => {},
+    }
+    std.testing.allocator.free(result.stdout);
+    std.testing.allocator.free(result.stderr);
+    return error.GitCommandFailed;
+}
+
 const LocalPages = struct {
     review: review_page.ReviewPageState = .{},
 };
@@ -78,6 +116,7 @@ const LocalHarness = struct {
     action_runtime: action_lifecycle.ActionRuntime = .{},
     local_workflow: workflow_local.LocalState = .{},
     overlay: app_state.OverlayState = .{},
+    env_map: ?*std.process.Environ.Map = null,
 
     fn repoSessionView(self: *const LocalHarness) repo_session.View {
         return self.repo_session.view();
@@ -165,6 +204,7 @@ const LocalHarness = struct {
             .operations = self.reviewOperationController(),
             .repo = self.repoSessionView(),
             .current_review_root = self.currentReviewActionRoot(),
+            .env_map = self.env_map,
             .user_config = &self.user_config,
             .status = &self.pages.review.status,
             .overlay = &self.overlay,
@@ -447,8 +487,7 @@ fn clearPendingStatusTasks(
 ) void {
     for (ctx.takePendingTasksWith()) |entry| {
         const task: *StatusLoadTask = @ptrCast(@alignCast(entry.ctx));
-        allocator.free(task.repo_root);
-        allocator.destroy(task);
+        StatusLoadTask.destroy(task, allocator);
     }
 }
 
@@ -1359,6 +1398,8 @@ test "hunk action results mutate session staged marks" {
 
 test "hunk action none effect reloads status without adding a session mark" {
     const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: LocalHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -1366,13 +1407,11 @@ test "hunk action none effect reloads status without adding a session mark" {
         .allocator = allocator,
         .config = .{ .source = .unstaged },
         .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
     activateTestReview(&app);
     defer app.pages.review.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
@@ -1381,7 +1420,7 @@ test "hunk action none effect reloads status without adding a session mark" {
     const stage_pending = beginAcceptedTestAction(&app, .stage_hunk);
     try finishStageHunkForTest(&app, &ctx, .{
         .pending = stage_pending,
-        .repo_root = try allocator.dupe(u8, "/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
         .session_mark_mutation = .none,
@@ -1394,6 +1433,8 @@ test "hunk action none effect reloads status without adding a session mark" {
 
 test "hunk action none effect reloads status without removing a session mark" {
     const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: LocalHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -1401,37 +1442,37 @@ test "hunk action none effect reloads status without removing a session mark" {
         .allocator = allocator,
         .config = .{ .source = .unstaged },
         .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
     activateTestReview(&app);
     defer app.pages.review.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
 
     const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
-    try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
+    try app.pages.review.staged_hunks.addExact(allocator, roots.a, "a", mark_key);
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_hunk);
     try finishUnstageHunkForTest(&app, &ctx, .{
         .pending = unstage_pending,
-        .repo_root = try allocator.dupe(u8, "/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
         .session_mark_mutation = .none,
         .result = .ok,
     });
 
-    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact(roots.a, "a", mark_key));
     try std.testing.expectEqual(@as(usize, 1), app.pages.review.staged_hunks.items.items.len);
     try std.testing.expect(app.pages.review.status_load.isPending());
 }
 
 test "cached source hunk unstage reload decision travels with task result" {
     const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: LocalHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -1439,24 +1480,22 @@ test "cached source hunk unstage reload decision travels with task result" {
         .allocator = allocator,
         .config = .{ .source = .unstaged },
         .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
     activateTestReview(&app);
     defer app.pages.review.deinit(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
     const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
-    try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
+    try app.pages.review.staged_hunks.addExact(allocator, roots.a, "a", mark_key);
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_hunk);
     try finishUnstageHunkForTest(&app, &ctx, .{
         .pending = unstage_pending,
-        .repo_root = try allocator.dupe(u8, "/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
         .hunk_index = 1,
         .session_mark_mutation = .none,
@@ -1464,7 +1503,7 @@ test "cached source hunk unstage reload decision travels with task result" {
         .result = .ok,
     });
 
-    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
+    try std.testing.expect(app.pages.review.staged_hunks.containsExact(roots.a, "a", mark_key));
     switch (app.pages.review.load.pending orelse return error.ExpectedReloadAfterCachedHunkUnstage) {
         .diff_load => {},
         .repo_discovery => return error.ExpectedReloadAfterCachedHunkUnstage,
@@ -1667,4 +1706,117 @@ test "fresh status-only targets fail closed without accepted source" {
     try std.testing.expectEqual(git_ops.StageTargetResult.stale_source, app.reviewOperations().stageTarget());
     try std.testing.expectEqual(git_ops.UnstageTargetResult.stale_source, app.reviewOperations().unstageTarget());
     try std.testing.expectEqual(git_ops.DiscardTargetResult.stale_source, app.reviewOperations().discardTarget());
+}
+
+test "queued commit-message assist retains staged diff and external cwd across path replacement" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "slot", .default_dir);
+    try tmp.dir.createDir(io, "replacement", .default_dir);
+    var accepted = try tmp.dir.openDir(io, "slot", .{});
+    defer accepted.close(io);
+    var replacement = try tmp.dir.openDir(io, "replacement", .{});
+    defer replacement.close(io);
+
+    try runLocalTestGit(io, accepted, &.{ "git", "init", "--initial-branch=main" });
+    try accepted.writeFile(io, .{ .sub_path = "base.txt", .data = "base\n" });
+    try runLocalTestGit(io, accepted, &.{ "git", "add", "base.txt" });
+    try runLocalTestGit(io, accepted, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+    try accepted.writeFile(io, .{ .sub_path = "a-staged.txt", .data = "A_STAGED\n" });
+    try runLocalTestGit(io, accepted, &.{ "git", "add", "a-staged.txt" });
+
+    try runLocalTestGit(io, replacement, &.{ "git", "init", "--initial-branch=main" });
+    try replacement.writeFile(io, .{ .sub_path = "base.txt", .data = "base\n" });
+    try runLocalTestGit(io, replacement, &.{ "git", "add", "base.txt" });
+    try runLocalTestGit(io, replacement, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+    try replacement.writeFile(io, .{ .sub_path = "b-staged.txt", .data = "B_STAGED\n" });
+    try runLocalTestGit(io, replacement, &.{ "git", "add", "b-staged.txt" });
+    const b_index_before = try localTestGitOutput(io, replacement, &.{ "git", "diff", "--cached", "--name-only" });
+    defer allocator.free(b_index_before);
+
+    const slot_path = try tmp.dir.realPathFileAlloc(io, "slot", allocator);
+    defer allocator.free(slot_path);
+    const slot_git_dir = try std.fs.path.join(allocator, &.{ slot_path, ".git" });
+    defer allocator.free(slot_git_dir);
+    var parent_environment = try std.testing.environ.createMap(allocator);
+    defer parent_environment.deinit();
+    try parent_environment.put("GIT_DIR", slot_git_dir);
+    try parent_environment.put("GIT_WORK_TREE", slot_path);
+
+    var app: LocalHarness = .{
+        .allocator = allocator,
+        .env_map = &parent_environment,
+        .repo_session = .{ .repo_state = .{
+            .discovery = try testSingleRepoDiscovery(allocator, slot_path),
+            .root = try repo_root_capability.RootCapability.openCanonical(slot_path),
+        } },
+        .local_workflow = workflow_local.LocalState.init(allocator),
+    };
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
+    defer app.local_workflow.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "A  a-staged.txt\x00");
+    try app.pages.review.git_status.replace(slot_path, &status_bundle);
+    app.pages.review.status_load.markSuccess();
+    app.pages.review.branch_status_load.markSuccess();
+    acceptTestSource(&app);
+    app.local_workflow.commit_panel.open(.commit);
+
+    var action: config_mod.ExternalActionConfig = .{};
+    action.id = "commit-message";
+    action.argv[0] = "sh";
+    action.argv[1] = "-c";
+    action.argv[2] = "pwd > child-cwd; printf '%s' \"$1\" > display-root; cat > stdin.json; printf marker > cwd-marker; printf 'Generated from A\\n'";
+    action.argv[3] = "helper";
+    action.argv[4] = "{repo_root}";
+    action.argv_len = 5;
+    action.stdin = .staged_diff;
+    app.user_config.actions.items[0] = action;
+    app.user_config.actions.len = 1;
+
+    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator, ._io = io };
+    try app.localWorkflow().assistCommitMessage(&ctx);
+    const queued = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+
+    try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
+    try tmp.dir.rename("replacement", tmp.dir, "slot", io);
+    const physical_a_path = try tmp.dir.realPathFileAlloc(io, "physical-a", allocator);
+    defer allocator.free(physical_a_path);
+
+    const message = queued[0].run(queued[0].ctx, allocator, io);
+    switch (message) {
+        .action_finished => |finished| switch (finished) {
+            .assist_commit_message => |result| app.localWorkflow().finishCommitMessageAssist(allocator, result),
+            else => return error.ExpectedCommitMessageAssist,
+        },
+        else => return error.ExpectedCommitMessageAssist,
+    }
+
+    const captured_json = try tmp.dir.readFileAlloc(io, "physical-a/stdin.json", allocator, .limited(1024 * 1024));
+    defer allocator.free(captured_json);
+    try std.testing.expect(std.mem.indexOf(u8, captured_json, "A_STAGED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured_json, "B_STAGED") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured_json, slot_path) != null);
+    const display_root = try tmp.dir.readFileAlloc(io, "physical-a/display-root", allocator, .limited(4096));
+    defer allocator.free(display_root);
+    try std.testing.expectEqualStrings(slot_path, display_root);
+    const child_cwd = try tmp.dir.readFileAlloc(io, "physical-a/child-cwd", allocator, .limited(4096));
+    defer allocator.free(child_cwd);
+    try std.testing.expectEqualStrings(physical_a_path, std.mem.trim(u8, child_cwd, "\r\n"));
+    try tmp.dir.access(io, "physical-a/cwd-marker", .{});
+
+    inline for (.{ "stdin.json", "display-root", "child-cwd", "cwd-marker" }) |name| {
+        try std.testing.expectError(error.FileNotFound, replacement.access(io, name, .{}));
+    }
+    const b_index_after = try localTestGitOutput(io, replacement, &.{ "git", "diff", "--cached", "--name-only" });
+    defer allocator.free(b_index_after);
+    try std.testing.expectEqualStrings(b_index_before, b_index_after);
+    const b_contents = try replacement.readFileAlloc(io, "b-staged.txt", allocator, .limited(4096));
+    defer allocator.free(b_contents);
+    try std.testing.expectEqualStrings("B_STAGED\n", b_contents);
+    try std.testing.expectEqualStrings("Generated from A", app.local_workflow.commit_panel.subject.slice());
 }

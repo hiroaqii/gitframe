@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const process_runner = @import("../process/runner.zig");
 
 pub const stdout_limit = 1024 * 1024;
@@ -37,13 +38,78 @@ pub const ExternalActionResult = union(enum) {
     }
 };
 
+pub const ExternalActionCwd = union(enum) {
+    inherit,
+    path: []const u8,
+    dir: std.Io.Dir,
+};
+
+pub const ExternalActionCloneError = std.mem.Allocator.Error || error{
+    ExternalActionCwdUnsupported,
+    ExternalActionInvalidCwd,
+    ExternalActionProcessFdQuotaExceeded,
+    ExternalActionSystemFdQuotaExceeded,
+    ExternalActionDuplicateCwdFailed,
+};
+
+const CwdOperations = struct {
+    context: ?*anyopaque = null,
+    duplicate: *const fn (?*anyopaque, std.posix.fd_t) ExternalActionCloneError!std.posix.fd_t = duplicateCwd,
+    close: *const fn (?*anyopaque, std.posix.fd_t) void = closeCwd,
+};
+
+const OwnedExternalActionDir = struct {
+    dir: std.Io.Dir,
+    close_context: ?*anyopaque,
+    close_fn: *const fn (?*anyopaque, std.posix.fd_t) void,
+
+    fn deinit(self: *OwnedExternalActionDir) void {
+        self.close_fn(self.close_context, self.dir.handle);
+        self.* = undefined;
+    }
+};
+
+pub const OwnedExternalActionCwd = union(enum) {
+    inherit,
+    path: []u8,
+    dir: OwnedExternalActionDir,
+
+    fn deinit(self: *OwnedExternalActionCwd, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .inherit => {},
+            .path => |path| allocator.free(path),
+            .dir => |*dir| dir.deinit(),
+        }
+        self.* = .inherit;
+    }
+
+    fn borrowed(self: *const OwnedExternalActionCwd) ExternalActionCwd {
+        return switch (self.*) {
+            .inherit => .inherit,
+            .path => |path| .{ .path = path },
+            .dir => |dir| .{ .dir = dir.dir },
+        };
+    }
+};
+
 pub const ExternalActionRequest = struct {
     id: ExternalActionId,
     argv: []const []const u8,
     stdin_json: []const u8,
-    cwd: ?[]const u8 = null,
+    cwd: ExternalActionCwd = .inherit,
 
-    pub fn clone(self: ExternalActionRequest, allocator: std.mem.Allocator) std.mem.Allocator.Error!OwnedExternalActionRequest {
+    pub fn clone(self: ExternalActionRequest, allocator: std.mem.Allocator) ExternalActionCloneError!OwnedExternalActionRequest {
+        return self.cloneWithCwdOperations(allocator, .{});
+    }
+
+    fn cloneWithCwdOperations(
+        self: ExternalActionRequest,
+        allocator: std.mem.Allocator,
+        operations: CwdOperations,
+    ) ExternalActionCloneError!OwnedExternalActionRequest {
+        var cwd = try cloneCwd(allocator, self.cwd, operations);
+        errdefer cwd.deinit(allocator);
+
         var argv = try allocator.alloc([]u8, self.argv.len);
         errdefer allocator.free(argv);
 
@@ -59,7 +125,6 @@ pub const ExternalActionRequest = struct {
 
         const stdin_json = try allocator.dupe(u8, self.stdin_json);
         errdefer allocator.free(stdin_json);
-        const cwd = if (self.cwd) |cwd| try allocator.dupe(u8, cwd) else null;
         return .{
             .id = self.id,
             .argv = argv,
@@ -73,18 +138,18 @@ pub const OwnedExternalActionRequest = struct {
     id: ExternalActionId,
     argv: [][]u8,
     stdin_json: []u8,
-    cwd: ?[]u8 = null,
+    cwd: OwnedExternalActionCwd = .inherit,
 
     pub fn deinit(self: *OwnedExternalActionRequest, allocator: std.mem.Allocator) void {
         for (self.argv) |arg| allocator.free(arg);
         allocator.free(self.argv);
         allocator.free(self.stdin_json);
-        if (self.cwd) |cwd| allocator.free(cwd);
+        self.cwd.deinit(allocator);
         self.* = .{
             .id = .custom,
             .argv = &.{},
             .stdin_json = &.{},
-            .cwd = null,
+            .cwd = .inherit,
         };
     }
 
@@ -93,7 +158,7 @@ pub const OwnedExternalActionRequest = struct {
             .id = self.id,
             .argv = self.argv,
             .stdin_json = self.stdin_json,
-            .cwd = self.cwd,
+            .cwd = self.cwd.borrowed(),
         };
     }
 };
@@ -102,7 +167,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: ExternalActionRequ
     const detailed = try process_runner.runWithStdinDetailed(allocator, io, .{
         .argv = request.argv,
         .stdin = request.stdin_json,
-        .cwd = if (request.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .cwd = switch (request.cwd) {
+            .inherit => .inherit,
+            .path => |path| .{ .path = path },
+            .dir => |dir| .{ .dir = dir },
+        },
         .stdout_limit = .limited(stdout_limit),
         .stderr_limit = .limited(stderr_limit),
     });
@@ -123,6 +192,47 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: ExternalActionRequ
         .exited => |code| if (code == 0) .{ .ok = output } else .{ .failed = output },
         else => .{ .failed = output },
     };
+}
+
+fn cloneCwd(
+    allocator: std.mem.Allocator,
+    cwd: ExternalActionCwd,
+    operations: CwdOperations,
+) ExternalActionCloneError!OwnedExternalActionCwd {
+    return switch (cwd) {
+        .inherit => .inherit,
+        .path => |path| .{ .path = try allocator.dupe(u8, path) },
+        .dir => |dir| .{ .dir = .{
+            .dir = .{ .handle = try operations.duplicate(operations.context, dir.handle) },
+            .close_context = operations.context,
+            .close_fn = operations.close,
+        } },
+    };
+}
+
+fn duplicateCwd(_: ?*anyopaque, handle: std.posix.fd_t) ExternalActionCloneError!std.posix.fd_t {
+    return switch (builtin.os.tag) {
+        .linux, .macos => duplicateCwdSupported(handle),
+        else => error.ExternalActionCwdUnsupported,
+    };
+}
+
+fn duplicateCwdSupported(handle: std.posix.fd_t) ExternalActionCloneError!std.posix.fd_t {
+    while (true) {
+        const rc = std.posix.system.fcntl(handle, std.posix.F.DUPFD_CLOEXEC, @as(usize, 0));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .BADF => return error.ExternalActionInvalidCwd,
+            .MFILE => return error.ExternalActionProcessFdQuotaExceeded,
+            .NFILE => return error.ExternalActionSystemFdQuotaExceeded,
+            else => return error.ExternalActionDuplicateCwdFailed,
+        }
+    }
+}
+
+fn closeCwd(_: ?*anyopaque, handle: std.posix.fd_t) void {
+    _ = std.posix.system.close(handle);
 }
 
 fn resultForRunFailure(allocator: std.mem.Allocator, failure_value: process_runner.Failure) std.mem.Allocator.Error!ExternalActionResult {
@@ -167,6 +277,85 @@ test "ExternalActionRequest clone owns argv and stdin" {
 
     try std.testing.expect(@intFromPtr(owned.argv[0].ptr) != @intFromPtr(raw_argv[0].ptr));
     try std.testing.expect(@intFromPtr(owned.stdin_json.ptr) != @intFromPtr(request.stdin_json.ptr));
+}
+
+test "ExternalActionRequest clone owns descriptor cwd" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const TrackingOperations = struct {
+        duplicate_count: usize = 0,
+        close_count: usize = 0,
+        last_duplicate: ?std.posix.fd_t = null,
+
+        fn duplicate(context: ?*anyopaque, handle: std.posix.fd_t) ExternalActionCloneError!std.posix.fd_t {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            const duplicated = try duplicateCwd(null, handle);
+            self.duplicate_count += 1;
+            self.last_duplicate = duplicated;
+            return duplicated;
+        }
+
+        fn close(context: ?*anyopaque, handle: std.posix.fd_t) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.close_count += 1;
+            closeCwd(null, handle);
+        }
+
+        fn operations(self: *@This()) CwdOperations {
+            return .{
+                .context = self,
+                .duplicate = duplicate,
+                .close = close,
+            };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "physical", .default_dir);
+    const physical_path = try tmp.dir.realPathFileAlloc(io, "physical", allocator);
+    defer allocator.free(physical_path);
+
+    var caller_dir = try std.Io.Dir.openDirAbsolute(io, physical_path, .{});
+    const argv = [_][]const u8{ "sh", "-c", "printf descriptor > descriptor-marker" };
+    const request: ExternalActionRequest = .{
+        .id = .custom,
+        .argv = &argv,
+        .stdin_json = "{}",
+        .cwd = .{ .dir = caller_dir },
+    };
+
+    var completed_tracking: TrackingOperations = .{};
+    var owned = try request.cloneWithCwdOperations(allocator, completed_tracking.operations());
+    try std.testing.expectEqual(@as(usize, 1), completed_tracking.duplicate_count);
+    caller_dir.close(io);
+
+    var result = try run(allocator, io, owned.borrowed());
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .ok);
+    try tmp.dir.access(io, "physical/descriptor-marker", .{});
+
+    owned.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), completed_tracking.close_count);
+
+    var partial_tracking: TrackingOperations = .{};
+    var partial_caller = try std.Io.Dir.openDirAbsolute(io, physical_path, .{});
+    defer partial_caller.close(io);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        (ExternalActionRequest{
+            .id = .custom,
+            .argv = &argv,
+            .stdin_json = "{}",
+            .cwd = .{ .dir = partial_caller },
+        }).cloneWithCwdOperations(failing.allocator(), partial_tracking.operations()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), partial_tracking.duplicate_count);
+    try std.testing.expectEqual(@as(usize, 1), partial_tracking.close_count);
+    try std.testing.expect(partial_tracking.last_duplicate != null);
 }
 
 test "ExternalAction run maps zero exit to ok" {

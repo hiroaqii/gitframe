@@ -932,17 +932,17 @@ test "copyCommitMessage reports empty draft and closed panel" {
 
 test "finishSwitchBranch success clears repo-local review state and reloads matching repo" {
     const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
     var app: App = .{
         .allocator = allocator,
         .terminal_size = .{ .width = 100, .height = 12 },
         .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
     _ = activateReview(&app);
     defer app.pages.review.reviewed_store.deinit(allocator);
     defer app.pages.review.staged_hunks.deinit(allocator);
@@ -951,7 +951,7 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
     defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
 
     try app.pages.review.reviewed_store.set(allocator, app.repo_session.view().activeRoot(), app_test_support.files_two[0], true);
-    try app.pages.review.staged_hunks.addExact(allocator, "/repo", "a", testSessionHunkMarkKey(1, 0));
+    try app.pages.review.staged_hunks.addExact(allocator, roots.a, "a", testSessionHunkMarkKey(1, 0));
     try installTestActionCursor(&app, allocator, .file, "a", 99);
     setDiffSearchQuery(&app, "needle");
 
@@ -961,7 +961,7 @@ test "finishSwitchBranch success clears repo-local review state and reloads matc
 
     try app.update(.{ .action_finished = .{ .switch_branch = .{
         .pending = pending,
-        .repo_root = try allocator.dupe(u8, "/repo"),
+        .repo_root = try allocator.dupe(u8, roots.a),
         .old_branch = try allocator.dupe(u8, "main"),
         .new_branch = try allocator.dupe(u8, "feature"),
         .result = .ok,

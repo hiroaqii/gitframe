@@ -78,6 +78,7 @@ pub const Controller = struct {
     operations: review_operations.Controller,
     repo: repo_session.View,
     current_review_root: ?[]const u8,
+    env_map: ?*const std.process.Environ.Map,
     user_config: *const config_mod.Config,
     status: *app_state.StatusMessage,
     overlay: *app_state.OverlayState,
@@ -706,6 +707,18 @@ pub const Controller = struct {
             panel.commit_error = .status_unavailable;
             return;
         };
+        const capability = self.repo.activeCapability() orelse {
+            panel.commit_error = .status_unavailable;
+            return;
+        };
+        const identity = self.repo.activeIdentity() orelse {
+            panel.commit_error = .status_unavailable;
+            return;
+        };
+        if (!capability.identity.eql(identity)) {
+            panel.commit_error = .status_unavailable;
+            return;
+        }
 
         const draft_empty = panel.draftIsEmpty();
         const action = if (draft_empty)
@@ -735,7 +748,14 @@ pub const Controller = struct {
         };
 
         const prepared = self.lifecycle.prepare(.assist_commit_message);
-        app_git_requests.startCommitMessageAssist(app_message.Msg, ctx, prepared.pending, &request) catch |err| {
+        app_git_requests.startCommitMessageAssist(
+            app_message.Msg,
+            ctx,
+            prepared.pending,
+            &request,
+            capability,
+            self.env_map,
+        ) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             panel.commit_error = .assist_failed;
             self.setStatus("could not start commit message action", .{});

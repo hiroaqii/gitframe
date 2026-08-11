@@ -32,7 +32,7 @@ const diff_parser = @import("../../../diff/parser.zig");
 const diff_presentation_identity = @import("../../../diff/presentation_identity.zig");
 const diff_source = @import("../../../diff/source.zig");
 const file_tree = @import("../../../file_tree.zig");
-const git_backend = @import("../../../git/backend.zig");
+const git_read = @import("../../../git/read.zig");
 const git_status = @import("../../../git/status.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
@@ -266,7 +266,7 @@ pub const OwnedStatusRead = struct {
     read_epoch: ReviewRepositoryReadEpoch,
     repo_root: []u8,
     generation: u64,
-    origin: git_backend.ReadOrigin,
+    origin: git_read.ReadOrigin,
     background_cycle_id: ?u64,
 
     fn deinit(self: *OwnedStatusRead, allocator: std.mem.Allocator) void {
@@ -1632,7 +1632,7 @@ pub const Controller = struct {
         self: Controller,
         allocator: std.mem.Allocator,
         repo_root: []const u8,
-        origin: git_backend.ReadOrigin,
+        origin: git_read.ReadOrigin,
         background_cycle_id: ?u64,
     ) !ReviewUpdate {
         try self.requireRepositoryReadStart();
@@ -2399,7 +2399,7 @@ pub const Controller = struct {
         // no completion will arrive to reconcile that candidate.
         errdefer self.clearCompletedSelectionForProjection(allocator, selection_scope);
 
-        const request_root_identity = if (target.kind == .generated_added_file) self.root_identity else null;
+        const request_root_identity = self.root_identity;
         const force_eager_retry = self.page.review_projection.shouldForceEagerRetry(live_expected_presentation);
         const expected_presentation = if (force_eager_retry) null else live_expected_presentation;
         var pair = try self.buildProjectionRequestPair(

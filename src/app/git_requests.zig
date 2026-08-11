@@ -16,6 +16,7 @@ const git_ops = @import("git_ops.zig");
 const remote_request = @import("remote_request.zig");
 const app_state = @import("state.zig");
 const git_backend = @import("../git/backend.zig");
+const git_command = @import("../git/command.zig");
 const process_runner = @import("../process/runner.zig");
 const root_capability = @import("../repo/root_capability.zig");
 
@@ -176,10 +177,23 @@ pub const CommitMessageAssistRequest = struct {
     }
 };
 
-pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, request: *CommitMessageAssistRequest) !void {
+pub fn startCommitMessageAssist(
+    comptime Msg: type,
+    ctx: *chasen.Ctx(Msg),
+    pending: actions.PendingAction,
+    request: *CommitMessageAssistRequest,
+    root: *const root_capability.RootCapability,
+    parent_environment: ?*const std.process.Environ.Map,
+) !void {
     defer request.deinit(ctx.allocator());
     requireKind(pending, .assist_commit_message);
 
+    var owned_root = try root.duplicate();
+    var root_consumed = false;
+    defer if (!root_consumed) owned_root.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), parent_environment);
+    var environment_consumed = false;
+    defer if (!environment_consumed) environment.deinit();
     const Task = actions.CommitMessageAssistTask(Msg);
     const task = try ctx.allocator().create(Task);
     task.* = .{
@@ -187,10 +201,14 @@ pub fn startCommitMessageAssist(comptime Msg: type, ctx: *chasen.Ctx(Msg), pendi
         .repo_root = request.repo_root,
         .action_id = request.action_id,
         .argv = request.argv,
+        .root = owned_root,
+        .environment = environment,
         .launch_revision = request.launch_revision,
         .mode = request.mode,
     };
     request.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{}, .launch_revision = 0, .mode = .generate };
+    root_consumed = true;
+    environment_consumed = true;
     errdefer actions.destroyCommitMessageAssistTask(Task, ctx.allocator(), task);
 
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });

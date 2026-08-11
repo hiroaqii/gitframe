@@ -1,6 +1,6 @@
 const std = @import("std");
-const git_backend = @import("../git/backend.zig");
 const git_command = @import("../git/command.zig");
+const git_read = @import("../git/read.zig");
 
 /// User-selected source for the raw unified diff text.
 ///
@@ -154,7 +154,15 @@ pub const LoadError = git_command.Error || error{
     MissingRepoRoot,
 };
 
-pub const LoadResult = git_backend.LoadResult;
+pub const LoadResult = git_read.LoadResult;
+
+/// Borrowed execution context for one synchronous source load. Async owners
+/// keep the corresponding descriptor/environment alive in their task.
+pub const LoadContext = union(enum) {
+    repository: git_command.DirectoryContext,
+    non_repository: *const git_command.LocalGitEnvironment,
+    none,
+};
 
 pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
     var config: CliConfig = .{};
@@ -275,41 +283,47 @@ pub fn freeLoadRequest(allocator: std.mem.Allocator, request: LoadRequest) void 
 /// Raw sources are read locally here. Git-command sources are converted to a
 /// git_backend request so the backend boundary never needs to model stdin or
 /// patch-file input.
-pub fn load(allocator: std.mem.Allocator, io: std.Io, request: LoadRequest) LoadError!LoadResult {
+pub fn load(allocator: std.mem.Allocator, io: std.Io, request: LoadRequest, context: LoadContext) LoadError!LoadResult {
     return switch (request.source) {
         .patch_file => |path| .{ .ok = readPatchFile(allocator, io, path) catch |err| return mapReadError(err) },
         .stdin => .{ .ok = readStdin(allocator, io) catch |err| return mapReadError(err) },
         .pager => |bytes| .{ .ok = allocator.dupe(u8, bytes) catch |err| return mapReadError(err) },
-        .unstaged, .cached, .range, .no_index => if (sourceUsesGitCommand(request.source)) {
-            return git_backend.LocalCommandBackend.loadDiff(allocator, io, try gitDiffRequest(request));
-        } else unreachable,
+        .unstaged, .cached, .range => git_read.loadDiff(allocator, io, try gitDiffRequest(request, context)),
+        .no_index => |paths| git_read.loadNoIndexDiff(allocator, io, .{
+            .environment = switch (context) {
+                .non_repository => |environment| environment,
+                else => return error.MissingRepoRoot,
+            },
+            .left = paths.left,
+            .right = paths.right,
+        }),
     };
 }
 
-fn gitDiffRequest(request: LoadRequest) LoadError!git_backend.GitDiffRequest {
+fn gitDiffRequest(request: LoadRequest, context: LoadContext) LoadError!git_read.GitDiffRequest {
     return .{
-        .repo_root = switch (request.source) {
-            .no_index => null,
-            else => request.repo_root orelse return error.MissingRepoRoot,
+        .context = switch (context) {
+            .repository => |repository| repository,
+            else => return error.MissingRepoRoot,
         },
         .kind = switch (request.source) {
             .unstaged => .unstaged,
             .cached => .cached,
             .range => |range| .{ .range = range },
-            .no_index => |paths| .{ .no_index = .{ .left = paths.left, .right = paths.right } },
+            .no_index => unreachable,
             .stdin, .pager, .patch_file => unreachable,
         },
     };
 }
 
 fn readPatchFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(git_backend.max_diff_bytes));
+    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(git_read.max_diff_bytes));
 }
 
 fn readStdin(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var buffer: [4096]u8 = undefined;
     var reader = std.Io.File.stdin().readerStreaming(io, &buffer);
-    return try reader.interface.allocRemaining(allocator, .limited(git_backend.max_diff_bytes));
+    return try reader.interface.allocRemaining(allocator, .limited(git_read.max_diff_bytes));
 }
 
 pub fn preparePagerSource(allocator: std.mem.Allocator, io: std.Io) LoadError!?SourceMode {
@@ -670,7 +684,7 @@ test "load requires repo root before routing git sources to backend" {
     try std.testing.expectError(error.MissingRepoRoot, load(std.testing.allocator, std.testing.io, .{
         .source = .unstaged,
         .repo_root = null,
-    }));
+    }, .none));
 }
 
 test "stripAnsiAlloc removes common CSI color sequences" {

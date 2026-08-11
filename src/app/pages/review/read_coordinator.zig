@@ -22,8 +22,8 @@ const review_navigation = @import("navigation.zig");
 const review_reload = @import("reload.zig");
 const review_repository_session = @import("repository_session.zig");
 const diff_source = @import("../../../diff/source.zig");
-const git_backend = @import("../../../git/backend.zig");
 const git_command = @import("../../../git/command.zig");
+const git_read = @import("../../../git/read.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
@@ -441,6 +441,15 @@ pub const Controller = struct {
         if (action_cursor_generation) |action_generation| {
             _ = self.page_state.action_cursor.startMember(action_generation, .source, generation);
         }
+        var authority = self.loadAuthorityForSource(ctx.allocator(), source_read.request.source) catch |err| {
+            _ = self.reloadOwner().rejectSourceSpawn(ctx.allocator(), generation);
+            if (action_cursor_generation) |action_generation| {
+                _ = self.page_state.action_cursor.rejectMemberSpawn(action_generation, .source, generation);
+            }
+            return err;
+        };
+        var authority_consumed = false;
+        defer if (!authority_consumed) authority.deinit();
         const task = ctx.allocator().create(DiffLoadTask) catch |err| {
             _ = self.reloadOwner().rejectSourceSpawn(ctx.allocator(), generation);
             if (action_cursor_generation) |action_generation| {
@@ -452,10 +461,12 @@ pub const Controller = struct {
             .identity = source_read.identity,
             .read_epoch = source_read.read_epoch,
             .request = source_read.request,
+            .authority = authority,
             .generation = source_read.generation,
             .expected_fingerprint = source_read.expected_fingerprint,
             .background_cycle_id = source_read.background_cycle_id,
         };
+        authority_consumed = true;
         command_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = DiffLoadTask.run, .failed = DiffLoadTask.failed }) catch |err| {
             task.destroy(ctx.allocator());
@@ -476,7 +487,7 @@ pub const Controller = struct {
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
         repo_root: []const u8,
-        origin: git_backend.ReadOrigin,
+        origin: git_read.ReadOrigin,
         background_cycle_id: ?u64,
         action_cursor_generation: ?u64,
     ) !app_auto_reload.AuxiliaryTerminal {
@@ -502,6 +513,28 @@ pub const Controller = struct {
         if (action_cursor_generation) |generation| {
             _ = self.page_state.action_cursor.startMember(generation, .status, status_read.generation);
         }
+        const capability = self.repo.activeCapability() orelse {
+            self.reloadOwner().rejectStatusSpawn(background_cycle_id);
+            return error.RepositoryReadAuthorityClosed;
+        };
+        var root = capability.duplicate() catch |err| {
+            self.reloadOwner().rejectStatusSpawn(background_cycle_id);
+            if (action_cursor_generation) |generation| {
+                _ = self.page_state.action_cursor.rejectMemberSpawn(generation, .status, status_read.generation);
+            }
+            return err;
+        };
+        var root_consumed = false;
+        defer if (!root_consumed) root.deinit();
+        var environment = git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map) catch |err| {
+            self.reloadOwner().rejectStatusSpawn(background_cycle_id);
+            if (action_cursor_generation) |generation| {
+                _ = self.page_state.action_cursor.rejectMemberSpawn(generation, .status, status_read.generation);
+            }
+            return err;
+        };
+        var environment_consumed = false;
+        defer if (!environment_consumed) environment.deinit();
         const task = ctx.allocator().create(StatusLoadTask) catch |err| {
             self.reloadOwner().rejectStatusSpawn(background_cycle_id);
             if (action_cursor_generation) |generation| {
@@ -514,10 +547,14 @@ pub const Controller = struct {
             .identity = status_read.identity,
             .read_epoch = status_read.read_epoch,
             .repo_root = status_read.repo_root,
+            .root = root,
+            .environment = environment,
             .generation = status_read.generation,
             .origin = status_read.origin,
             .background_cycle_id = status_read.background_cycle_id,
         };
+        root_consumed = true;
+        environment_consumed = true;
         command_consumed = true;
         ctx.task().spawnWith(.{ .ctx = task, .run = StatusLoadTask.run, .failed = StatusLoadTask.failed }) catch |err| {
             task.destroy(ctx.allocator());
@@ -533,6 +570,21 @@ pub const Controller = struct {
             .generation = status_read.generation,
             .read_epoch = status_read.read_epoch,
             .background_cycle_id = status_read.background_cycle_id,
+        };
+    }
+
+    fn loadAuthorityForSource(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        source: diff_source.SourceMode,
+    ) !app_load.LoadAuthority {
+        return switch (source) {
+            .unstaged, .cached, .range => blk: {
+                const capability = self.repo.activeCapability() orelse return error.RepositoryReadAuthorityClosed;
+                break :blk try app_load.LoadAuthority.initRepository(allocator, capability.*, self.env_map);
+            },
+            .no_index => app_load.LoadAuthority.initNonRepository(allocator, self.env_map),
+            .stdin, .pager, .patch_file => .none,
         };
     }
 
@@ -641,28 +693,33 @@ pub const Controller = struct {
                 .repo_discovery, .source_load, .status_load, .branch_status_load => unreachable,
                 .review_projection => |*request| {
                     const request_id = request.id;
-                    var root: ?repo_root_capability.RootCapability = null;
-                    if (request.kind == .generated_added_file) {
-                        const capability = self.repo.activeCapability() orelse {
-                            self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
-                            return;
-                        };
-                        if (!request.matchesRootIdentity(capability.identity)) {
-                            self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
-                            return;
-                        }
-                        root = capability.duplicate() catch |err| {
-                            self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
-                            return err;
-                        };
+                    const capability = self.repo.activeCapability() orelse {
+                        self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
+                        return;
+                    };
+                    if (!request.matchesRootIdentity(capability.identity)) {
+                        self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
+                        return;
                     }
-                    errdefer if (root) |*owned| owned.deinit();
+                    var root = capability.duplicate() catch |err| {
+                        self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
+                        return err;
+                    };
+                    var root_consumed = false;
+                    defer if (!root_consumed) root.deinit();
+                    var environment = git_command.LocalGitEnvironment.initFromParent(allocator, self.env_map) catch |err| {
+                        self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
+                        return err;
+                    };
+                    var environment_consumed = false;
+                    defer if (!environment_consumed) environment.deinit();
                     const task = allocator.create(ReviewProjectionTask) catch |err| {
                         self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
                         return err;
                     };
-                    task.* = .{ .request = request.*, .root = root };
-                    root = null;
+                    task.* = .{ .request = request.*, .root = root, .environment = environment };
+                    root_consumed = true;
+                    environment_consumed = true;
                     request.* = undefined;
                     command_consumed = true;
                     ctx.task().spawnWith(.{ .ctx = task, .run = ReviewProjectionTask.run, .failed = ReviewProjectionTask.failed }) catch |err| {
@@ -1125,7 +1182,7 @@ pub const testing = if (builtin.is_test) struct {
         controller: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
         repo_root: []const u8,
-        origin: git_backend.ReadOrigin,
+        origin: git_read.ReadOrigin,
         background_cycle_id: ?u64,
         action_cursor_generation: ?u64,
     ) !app_auto_reload.AuxiliaryTerminal {

@@ -42,7 +42,7 @@ pub fn exportContextJson(
     var load_result = app_load.runLoad(.{
         .source = config.source,
         .repo_root = repo_root,
-    }, allocator, io);
+    }, parent_environment, allocator, io);
     defer load_result.deinit(allocator);
 
     var status_result: ?app_load.StatusLoadTaskResult = null;
@@ -51,7 +51,7 @@ pub fn exportContextJson(
     const selection = switch (load_result) {
         .unchanged => unreachable,
         .empty => blk: {
-            status_result = initialStatusLoadResultIfNeeded(config.source, repo_root, allocator, io);
+            status_result = initialStatusLoadResultIfNeeded(config.source, repo_root, parent_environment, allocator, io);
             break :blk initialContext(
                 config.source,
                 repo_root,
@@ -64,7 +64,7 @@ pub fn exportContextJson(
             if (loaded_selection != null) {
                 break :blk contextForSelection(config.source, repo_root, loaded_selection);
             }
-            status_result = initialStatusLoadResultIfNeeded(config.source, repo_root, allocator, io);
+            status_result = initialStatusLoadResultIfNeeded(config.source, repo_root, parent_environment, allocator, io);
             break :blk initialContext(
                 config.source,
                 repo_root,
@@ -133,12 +133,13 @@ fn activeRootFromDiscovery(result: repo_discovery.DiscoveryResult) !?[]const u8 
 fn initialStatusLoadResultIfNeeded(
     source: SourceMode,
     repo_root: ?[]const u8,
+    parent_environment: ?*const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) ?app_load.StatusLoadTaskResult {
     if (!diff_source.sourceRequiresRepo(source)) return null;
     const root = repo_root orelse return null;
-    return app_load.runStatusLoad(root, allocator, io);
+    return app_load.runStatusLoad(root, parent_environment, allocator, io);
 }
 
 fn optionalStatusResultPtr(
