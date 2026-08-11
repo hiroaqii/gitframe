@@ -12,6 +12,7 @@ const page = @import("../../page.zig");
 const git_backend = @import("../../../git/backend.zig");
 const git_command = @import("../../../git/command.zig");
 const git_read = @import("../../../git/read.zig");
+const git_repository_change = @import("../../../git/repository_change.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const process_runner = @import("../../../process/runner.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
@@ -641,7 +642,7 @@ fn loadChangeMap(
     source: *const source_document.Document,
     temp_base_path: []const u8,
 ) ChangeMapResult {
-    const loaded = git_backend.LocalCommandBackend.loadRepositoryFileChange(allocator, io, .{
+    const loaded = git_repository_change.loadRepositoryFileChange(allocator, io, .{
         .cwd = cwd,
         .environment = environment,
         .path = path,

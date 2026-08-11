@@ -29,6 +29,7 @@ test {
     // Zig's --test-filter is active.
     // Modules with dedicated test artifacts are discovered by those roots instead.
     _ = @import("app/test_support.zig");
+    _ = @import("git/repository_change.zig");
     _ = @import("app/actions.zig");
     _ = @import("app/auto_reload.zig");
     _ = @import("app/branch_chrome.zig");
