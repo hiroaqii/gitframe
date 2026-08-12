@@ -877,7 +877,7 @@ fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette 
     return theme.Palette.fromConfig(FakeConfig{ .role = role, .color = color });
 }
 
-test "review pane title stays stable while rule and search keep focus treatment" {
+test "review pane title and white rule stay stable while search keeps focus treatment" {
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 4, 5, 6 } };
@@ -901,7 +901,7 @@ test "review pane title stays stable while rule and search keep focus treatment"
     try std.testing.expect(!inactive_diff_title.dim);
     try std.testing.expect(active_rule.fg.eql(.default));
     try std.testing.expect(active_rule.dim);
-    try std.testing.expect(inactive_rule.fg.eql(palette.color(.muted)));
+    try std.testing.expect(inactive_rule.fg.eql(.default));
     try std.testing.expect(inactive_rule.dim);
     try std.testing.expect(active_search.fg.eql(palette.color(.prompt)));
     try std.testing.expect(active_search.bold);
@@ -1139,6 +1139,7 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     try view(testContext(&page, palette, 80, 9), &full.surface);
     const separator_col = review_layout.sidebarWidth(80, page.viewer.sidebar_width);
     const separator = full.surface.readCell(separator_col, selected_row) orelse return error.ExpectedSidebarSeparator;
+    try std.testing.expect(separator.style.fg.eql(.default));
     try std.testing.expect(separator.style.dim);
     try std.testing.expect(!separator.style.reverse);
     try std.testing.expect(!separator.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1214,6 +1215,8 @@ test "review markerless root renderer keeps hierarchy stats and selection stylin
     try ts.expectCellText(0, 0, " ");
     try ts.expectCellText(1, 0, "g");
     try std.testing.expect(!ts.surface.readCell(1, 0).?.style.reverse);
+    try std.testing.expect(ts.surface.readCell(1, 0).?.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(ts.surface.readCell(1, 0).?.style.bold);
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(ts.surface.readCell(1, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(ts.surface.readCell(39, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1223,6 +1226,8 @@ test "review markerless root renderer keeps hierarchy stats and selection stylin
     try std.testing.expect(ts.surface.readCell(32, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try ts.expectCellText(2, 1, "▾");
     try ts.expectCellText(4, 1, "s");
+    try std.testing.expect(ts.surface.readCell(4, 1).?.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(ts.surface.readCell(4, 1).?.style.bold);
     try std.testing.expect(ts.surface.readCell(39, 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     ts.surface.clearAll();
@@ -1231,6 +1236,7 @@ test "review markerless root renderer keeps hierarchy stats and selection stylin
     const retained_root = ts.surface.readCell(1, 0) orelse return error.ExpectedRetainedRoot;
     const retained_trailing = ts.surface.readCell(39, 0) orelse return error.ExpectedRetainedRootTrailingCell;
     try std.testing.expect(retained_root.style.bold);
+    try std.testing.expect(retained_root.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(!retained_root.style.dim);
     try std.testing.expect(!retained_root.style.reverse);
     try std.testing.expect(!retained_root.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1408,7 +1414,7 @@ test "diff renderer owns header search marker gutter and input presentation" {
     page.viewer.focus = .sidebar;
     ts.surface.clear(.{ .col = 0, .row = 0, .width = 90, .height = 10 });
     try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
-    try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.gray));
+    try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.default));
     try std.testing.expect(!ts.surface.readCell(1, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(!ts.surface.readCell(89, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
