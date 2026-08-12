@@ -1539,11 +1539,11 @@ pub const RepositoryPageState = struct {
             .cancel_mouse_owner => self.cancelMouseOwner(),
             .mouse_source_wheel_up => if (source) |document| {
                 self.viewer.focus = .source;
-                repository_navigation.moveSource(&self.viewer, document, -1, source_geometry.?);
+                repository_navigation.wheelSource(&self.viewer, document, -1, source_geometry.?);
             },
             .mouse_source_wheel_down => if (source) |document| {
                 self.viewer.focus = .source;
-                repository_navigation.moveSource(&self.viewer, document, 1, source_geometry.?);
+                repository_navigation.wheelSource(&self.viewer, document, 1, source_geometry.?);
             },
             .focus_tree => if (!self.viewer.tree_hidden) {
                 self.viewer.focus = .tree;
@@ -4525,6 +4525,84 @@ test "repository page owns source focus navigation search and mouse geometry" {
     state.clampForBodySize(size);
     try std.testing.expectEqual(@as(usize, 3), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);
+}
+
+test "repository source comfort page routes wheel page search boundaries and mouse authority" {
+    const allocator = std.testing.allocator;
+    const content =
+        "row 00\n" ++
+        "row 01\n" ++
+        "row 02\n" ++
+        "row 03\n" ++
+        "row 04\n" ++
+        "row 05\n" ++
+        "row 06\n" ++
+        "row 07\n" ++
+        "row 08\n" ++
+        "row 09\n" ++
+        "row 10\n" ++
+        "row 11\n" ++
+        "needle target\n" ++
+        "row 13\n" ++
+        "row 14\n" ++
+        "row 15\n" ++
+        "row 16\n" ++
+        "row 17\n" ++
+        "row 18\n" ++
+        "row 19\n";
+    var state = try selectionStateForTest("main.zig\x00", content);
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    const geometry = state.sourceGeometry(size, state.currentSource().?);
+    try std.testing.expectEqual(@as(u16, 4), geometry.visible_source_rows);
+
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 5;
+    state.viewer.source_vertical_scroll = 5;
+    _ = state.applyNavigation(allocator, .mouse_source_wheel_down, size);
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
+
+    _ = state.applyNavigation(allocator, .wheel_down, size);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
+
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 5;
+    state.viewer.source_vertical_scroll = 5;
+    _ = state.applyNavigation(allocator, .page_down, size);
+    try std.testing.expectEqual(@as(usize, 9), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_vertical_scroll);
+
+    _ = state.applyNavigation(allocator, .enter_source_search, size);
+    for ("needle") |byte| _ = state.applyNavigation(allocator, .{ .source_search_insert = byte }, size);
+    _ = state.applyNavigation(allocator, .submit_source_search, size);
+    try std.testing.expectEqual(@as(usize, 12), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 10), state.viewer.source_vertical_scroll);
+
+    _ = state.applyNavigation(allocator, .source_first, size);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    _ = state.applyNavigation(allocator, .source_last, size);
+    try std.testing.expectEqual(@as(usize, 19), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 16), state.viewer.source_vertical_scroll);
+
+    state.viewer.source_cursor = 8;
+    state.viewer.source_vertical_scroll = 5;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
+        .col = geometry.text_col,
+        .row = geometry.body_first_row,
+    } }, size);
+    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{
+        .col = geometry.text_col,
+        .row = geometry.body_first_row + 3,
+    } }, size);
+    try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
 }
 
 test "repository selection live gesture fixes mode and resumes after leaving the pane" {
