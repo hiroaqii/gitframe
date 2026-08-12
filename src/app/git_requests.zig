@@ -15,7 +15,7 @@ const actions = @import("actions.zig");
 const git_ops = @import("git_ops.zig");
 const remote_request = @import("remote_request.zig");
 const app_state = @import("state.zig");
-const git_backend = @import("../git/backend.zig");
+const git_remote = @import("../git/remote.zig");
 const git_command = @import("../git/command.zig");
 const process_runner = @import("../process/runner.zig");
 const root_capability = @import("../repo/root_capability.zig");
@@ -286,7 +286,7 @@ pub fn startPush(
     ctx: *chasen.Ctx(Msg),
     pending: actions.PendingAction,
     root: *?root_capability.RootCapability,
-    environment: *?git_backend.OwnedRemoteEnvironment,
+    environment: *?git_remote.OwnedRemoteEnvironment,
     cancellation: process_runner.CancellationView,
     confirmation: *app_state.PushConfirmation,
 ) !void {
@@ -337,7 +337,7 @@ pub fn startPull(
     ctx: *chasen.Ctx(Msg),
     pending: actions.PendingAction,
     root: *?root_capability.RootCapability,
-    environment: *?git_backend.OwnedRemoteEnvironment,
+    environment: *?git_remote.OwnedRemoteEnvironment,
     cancellation: process_runner.CancellationView,
     confirmation: *app_state.PullConfirmation,
 ) !void {
@@ -400,7 +400,7 @@ pub fn startFetch(
     ctx: *chasen.Ctx(Msg),
     pending: actions.PendingAction,
     root: *?root_capability.RootCapability,
-    environment: *?git_backend.OwnedRemoteEnvironment,
+    environment: *?git_remote.OwnedRemoteEnvironment,
     cancellation: process_runner.CancellationView,
     request: *FetchRequest,
 ) !void {

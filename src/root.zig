@@ -93,7 +93,7 @@ test {
     _ = @import("diff/syntax_view.zig");
     _ = @import("editor.zig");
     _ = @import("external/action.zig");
-    _ = @import("git/backend.zig");
+    _ = @import("git/remote.zig");
     _ = @import("git/branch_status.zig");
     _ = @import("git/command.zig");
     _ = @import("git/compare.zig");

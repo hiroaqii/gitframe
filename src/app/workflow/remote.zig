@@ -26,7 +26,7 @@ const review_action_fence = @import("../pages/review/action_fence.zig");
 const review_operations = @import("../pages/review/operations.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 const remote_state = @import("remote_state.zig");
-const git_backend = @import("../../git/backend.zig");
+const git_remote = @import("../../git/remote.zig");
 const git_command = @import("../../git/command.zig");
 const git_refs = @import("../../git/refs.zig");
 const root_capability = @import("../../repo/root_capability.zig");
@@ -207,7 +207,7 @@ pub const Controller = struct {
             return err;
         };
         defer if (root) |*owned| owned.deinit();
-        var environment: ?git_backend.OwnedRemoteEnvironment = git_backend.buildRemoteEnvironment(
+        var environment: ?git_remote.OwnedRemoteEnvironment = git_remote.buildRemoteEnvironment(
             ctx.allocator(),
             self.env_map,
             .background,
@@ -319,7 +319,7 @@ pub const Controller = struct {
             return err;
         };
         defer if (root) |*owned| owned.deinit();
-        var environment: ?git_backend.OwnedRemoteEnvironment = git_backend.buildRemoteEnvironment(
+        var environment: ?git_remote.OwnedRemoteEnvironment = git_remote.buildRemoteEnvironment(
             ctx.allocator(),
             self.env_map,
             .background,
@@ -398,7 +398,7 @@ pub const Controller = struct {
             return err;
         };
         defer if (root) |*owned_root| owned_root.deinit();
-        var environment: ?git_backend.OwnedRemoteEnvironment = git_backend.buildRemoteEnvironment(
+        var environment: ?git_remote.OwnedRemoteEnvironment = git_remote.buildRemoteEnvironment(
             ctx.allocator(),
             self.env_map,
             .background,
@@ -798,7 +798,7 @@ pub const Controller = struct {
                 return outcome;
             }
 
-            var environment: ?git_backend.OwnedRemoteEnvironment = git_backend.buildRemoteEnvironment(
+            var environment: ?git_remote.OwnedRemoteEnvironment = git_remote.buildRemoteEnvironment(
                 allocator,
                 self.env_map,
                 .local_finalizer,
@@ -931,7 +931,7 @@ pub const Controller = struct {
             return self.rejectVoid("push retry unavailable: repository authority could not be retained");
         };
         defer if (root) |*owned| owned.deinit();
-        var environment: ?git_backend.OwnedRemoteEnvironment = try git_backend.buildRemoteEnvironment(
+        var environment: ?git_remote.OwnedRemoteEnvironment = try git_remote.buildRemoteEnvironment(
             ctx.allocator(),
             self.env_map,
             .inspection,
@@ -953,7 +953,7 @@ pub const Controller = struct {
         origin: effect_origin.PageOrigin,
         owned_root: root_capability.RootCapability,
         owned_target: app_state.PushRetryTarget,
-        inspection_warnings: git_backend.RemoteWarningSet,
+        inspection_warnings: git_remote.RemoteWarningSet,
     ) !void {
         var root: ?root_capability.RootCapability = owned_root;
         defer if (root) |*owned| owned.deinit();
@@ -964,53 +964,42 @@ pub const Controller = struct {
             self.setForegroundStatus(inspection_warnings, "another git action is running", .{});
             return;
         }
-        const refspec = std.fmt.allocPrint(ctx.allocator(), "{s}:refs/heads/{s}", .{ target.oid, target.remote_branch }) catch {
+        var prepared_push = git_remote.prepareForegroundPush(
+            ctx.allocator(),
+            self.env_map,
+            .{
+                .mode = target.mode,
+                .branch = target.branch,
+                .remote = target.remote,
+                .remote_branch = target.remote_branch,
+                .oid = target.oid,
+            },
+            inspection_warnings,
+        ) catch {
             self.restorePushRetryTarget(ctx.allocator(), target.take());
             self.setForegroundStatus(inspection_warnings, "interactive push could not be queued", .{});
             return;
         };
-        defer ctx.allocator().free(refspec);
-        const argv = [_][]const u8{
-            "git",
-            "-c",
-            "credential.trace=false",
-            "-c",
-            "credential.traceSecrets=false",
-            "-c",
-            "credential.traceMsAuth=false",
-            "-c",
-            "credential.debug=false",
-            "push",
-            "--",
-            target.remote,
-            refspec,
-        };
-        var environment = git_backend.buildRemoteEnvironment(ctx.allocator(), self.env_map, .foreground) catch {
-            self.restorePushRetryTarget(ctx.allocator(), target.take());
-            self.setForegroundStatus(inspection_warnings, "interactive push could not be queued", .{});
-            return;
-        };
-        defer environment.deinit();
-        environment.warnings.merge(inspection_warnings);
+        defer prepared_push.deinit(ctx.allocator());
         const prepared = self.lifecycle.prepare(.push);
         const request_id = ctx.terminal().runForegroundCommand(.{
-            .argv = &argv,
+            .argv = &prepared_push.argv,
             .cwd = .{ .dir = root.?.dir() },
-            .environment = .{ .replace = &environment.map },
+            .environment = .{ .replace = &prepared_push.environment.map },
             .finished = app_message.Msg.pushForegroundFinished,
         }) catch |err| {
             self.lifecycle.rejectSpawn(prepared);
             self.restorePushRetryTarget(ctx.allocator(), target.take());
             switch (err) {
-                error.ForegroundCommandLimitExceeded => self.setForegroundStatus(environment.warnings, "interactive push already queued", .{}),
-                error.ForegroundCommandEmptyArgv => self.setForegroundStatus(environment.warnings, "interactive push command is empty", .{}),
-                error.ForegroundCommandCwdUnsupported => self.setForegroundStatus(environment.warnings, "interactive push unavailable on this platform", .{}),
-                error.ForegroundCommandInvalidCwd => self.setForegroundStatus(environment.warnings, "interactive push repository authority is invalid", .{}),
+                error.ForegroundCommandLimitExceeded => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push already queued", .{}),
+                error.ForegroundCommandEmptyArgv => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push command is empty", .{}),
+                error.ForegroundCommandCwdUnsupported => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push unavailable on this platform", .{}),
+                error.ForegroundCommandInvalidCwd => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push repository authority is invalid", .{}),
                 error.ForegroundCommandProcessFdQuotaExceeded,
                 error.ForegroundCommandSystemFdQuotaExceeded,
                 error.ForegroundCommandDuplicateCwdFailed,
-                => self.setForegroundStatus(environment.warnings, "interactive push could not retain repository authority", .{}),
-                error.OutOfMemory => self.setForegroundStatus(environment.warnings, "interactive push could not be queued", .{}),
+                => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push could not retain repository authority", .{}),
+                error.OutOfMemory => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push could not be queued", .{}),
             }
             return;
         };
@@ -1022,7 +1011,7 @@ pub const Controller = struct {
             .origin = origin,
             .root = root.?,
             .target = target.take(),
-            .warnings = environment.warnings,
+            .warnings = prepared_push.environment.warnings,
         } };
         root = null;
         const foreground = &self.state.push_retry.state.foreground;
@@ -1057,7 +1046,7 @@ pub const Controller = struct {
         repo_root: []const u8,
         identity: remote_request.RemoteRequestIdentity,
         origin_page: effect_origin.PageOrigin,
-        warnings: git_backend.RemoteWarningSet,
+        warnings: git_remote.RemoteWarningSet,
     ) Outcome {
         const terminal = self.acceptTerminal(allocator, pending, repo_root) orelse return .{};
         const quit_after_terminal = self.takeDeferredQuit();
@@ -1154,7 +1143,7 @@ pub const Controller = struct {
 
     fn setRemoteStatus(
         self: Controller,
-        warnings: git_backend.RemoteWarningSet,
+        warnings: git_remote.RemoteWarningSet,
         comptime fmt: []const u8,
         args: anytype,
     ) void {
@@ -1169,9 +1158,9 @@ pub const Controller = struct {
 
     fn setRemoteFailureStatus(
         self: Controller,
-        warnings: git_backend.RemoteWarningSet,
+        warnings: git_remote.RemoteWarningSet,
         kind: RemotePresentationKind,
-        failure: git_backend.RemoteFailure,
+        failure: git_remote.RemoteFailure,
     ) void {
         if (!remoteOutcomeUnknown(failure)) {
             self.setRemoteStatus(warnings, "{s} failed: {s}", .{ @tagName(kind), remoteFailureMessage(kind, failure) });
@@ -1186,7 +1175,7 @@ pub const Controller = struct {
 
     fn setForegroundStatus(
         self: Controller,
-        warnings: git_backend.RemoteWarningSet,
+        warnings: git_remote.RemoteWarningSet,
         comptime fmt: []const u8,
         args: anytype,
     ) void {
@@ -1207,13 +1196,13 @@ fn isBackgroundRemoteKind(kind: app_actions.ActionKind) bool {
     };
 }
 
-fn remoteOutcomeUnknown(failure: git_backend.RemoteFailure) bool {
+fn remoteOutcomeUnknown(failure: git_remote.RemoteFailure) bool {
     return failure == .canceled_outcome_unknown or failure == .timed_out_outcome_unknown;
 }
 
 const RemotePresentationKind = enum { push, pull, fetch };
 
-fn remoteFailureMessage(kind: RemotePresentationKind, failure: git_backend.RemoteFailure) []const u8 {
+fn remoteFailureMessage(kind: RemotePresentationKind, failure: git_remote.RemoteFailure) []const u8 {
     return switch (failure) {
         .authentication_required => if (kind == .push)
             "authentication is required; press i to continue in the native terminal"
@@ -1231,7 +1220,7 @@ fn remoteFailureMessage(kind: RemotePresentationKind, failure: git_backend.Remot
     };
 }
 
-fn remoteWarningMessage(warnings: git_backend.RemoteWarningSet) ?[]const u8 {
+fn remoteWarningMessage(warnings: git_remote.RemoteWarningSet) ?[]const u8 {
     if (warnings.git_plaintext_store) return "warning: credential.helper may store credentials in plaintext";
     if (warnings.gcm_plaintext_store) return "warning: Git Credential Manager plaintext storage is configured";
     if (warnings.potential_plaintext_store) return "warning: scoped credential helpers may store credentials in plaintext";
@@ -1243,8 +1232,8 @@ fn remoteWarningMessage(warnings: git_backend.RemoteWarningSet) ?[]const u8 {
 fn remoteFailurePresentationAlloc(
     allocator: std.mem.Allocator,
     kind: RemotePresentationKind,
-    failure: git_backend.RemoteFailure,
-    warnings: git_backend.RemoteWarningSet,
+    failure: git_remote.RemoteFailure,
+    warnings: git_remote.RemoteWarningSet,
 ) ![]u8 {
     const message = remoteFailureMessage(kind, failure);
     if (remoteWarningMessage(warnings)) |warning| {

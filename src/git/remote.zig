@@ -142,6 +142,26 @@ pub const PushRequest = struct {
     oid: []const u8,
 };
 
+/// Owned foreground command inputs prepared by the remote domain.
+///
+/// `argv` points only at static strings and the two owned buffers below. The
+/// caller may pass it, `environment.map`, and its retained root descriptor to
+/// Chasen while this value is alive; Chasen copies all three inputs before its
+/// queue call returns.
+pub const PreparedForegroundPush = struct {
+    argv: [13][]const u8,
+    remote: []u8,
+    refspec: []u8,
+    environment: OwnedRemoteEnvironment,
+
+    pub fn deinit(self: *PreparedForegroundPush, allocator: std.mem.Allocator) void {
+        self.environment.deinit();
+        allocator.free(self.refspec);
+        allocator.free(self.remote);
+        self.* = undefined;
+    }
+};
+
 pub const PullRequest = struct {
     branch: []const u8,
     remote: []const u8,
@@ -156,61 +176,38 @@ pub const FetchRequest = struct {
     remote: []const u8,
 };
 
-pub const LocalCommandBackend = struct {
-    /// Runs the credentialless background remote path. This is the sole backend
-    /// entry point that executes background push, pull, or fetch: it accepts a
-    /// retained root descriptor and returns no child-owned diagnostic bytes.
-    pub fn runRemoteOperation(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        request: RemoteOperationRequest,
-    ) RemoteOperationResult {
-        return runSecureRemoteOperation(allocator, io, request);
-    }
+/// Runs the credentialless background remote path. This is the sole remote
+/// entry point that executes background push, pull, or fetch: it accepts a
+/// retained root descriptor and returns no child-owned diagnostic bytes.
+pub fn runOperation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: RemoteOperationRequest,
+) RemoteOperationResult {
+    return runSecureRemoteOperation(allocator, io, request);
+}
 
-    pub fn inspectForegroundPush(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        request: ForegroundPushInspectionRequest,
-    ) ForegroundPushInspectionResult {
-        return runForegroundPushInspection(allocator, io, request);
-    }
+pub fn inspectForegroundPush(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: ForegroundPushInspectionRequest,
+) ForegroundPushInspectionResult {
+    return runForegroundPushInspection(allocator, io, request);
+}
 
-    pub fn finalizePushUpstream(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        request: PushUpstreamFinalizeRequest,
-    ) PushUpstreamFinalizeOutcome {
-        return runPushUpstreamFinalizer(allocator, io, request);
-    }
-};
+pub fn finalizePushUpstream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: PushUpstreamFinalizeRequest,
+) PushUpstreamFinalizeOutcome {
+    return runPushUpstreamFinalizer(allocator, io, request);
+}
 
 fn termExited(term: std.process.Child.Term, expected: u8) bool {
     return switch (term) {
         .exited => |code| code == expected,
         else => false,
     };
-}
-
-fn runGitBranchStatusCommand(allocator: std.mem.Allocator, io: std.Io, repo_root: []const u8, argv: []const []const u8) git_command.Error!process_runner.Result {
-    return runGitBranchStatusCommandInCwd(allocator, io, .{ .path = repo_root }, null, argv, .limited(4 * 1024));
-}
-
-fn runGitBranchStatusCommandInCwd(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cwd: std.process.Child.Cwd,
-    environ_map: ?*const std.process.Environ.Map,
-    argv: []const []const u8,
-    stdout_limit: std.Io.Limit,
-) git_command.Error!process_runner.Result {
-    return process_runner.runCaptured(allocator, io, .{
-        .argv = argv,
-        .cwd = cwd,
-        .environ_map = environ_map,
-        .stdout_limit = stdout_limit,
-        .stderr_limit = .limited(16 * 1024),
-    }) catch |err| return git_command.fromRunnerError(err);
 }
 
 fn freeRunResult(allocator: std.mem.Allocator, result: std.process.RunResult) void {
@@ -1478,6 +1475,51 @@ pub fn buildRemoteEnvironment(
     return owned;
 }
 
+/// Own the fixed argv/refspec and reviewed foreground environment for one
+/// already-inspected push. This function prepares data only; App code retains
+/// repository authority and owns Chasen effect admission and lifecycle.
+pub fn prepareForegroundPush(
+    allocator: std.mem.Allocator,
+    parent: ?*const std.process.Environ.Map,
+    push: PushRequest,
+    inspection_warnings: RemoteWarningSet,
+) std.mem.Allocator.Error!PreparedForegroundPush {
+    const remote = try allocator.dupe(u8, push.remote);
+    errdefer allocator.free(remote);
+
+    const refspec = try std.fmt.allocPrint(
+        allocator,
+        "{s}:refs/heads/{s}",
+        .{ push.oid, push.remote_branch },
+    );
+    errdefer allocator.free(refspec);
+
+    var environment = try buildRemoteEnvironment(allocator, parent, .foreground);
+    errdefer environment.deinit();
+    environment.warnings.merge(inspection_warnings);
+
+    return .{
+        .argv = .{
+            "git",
+            "-c",
+            "credential.trace=false",
+            "-c",
+            "credential.traceSecrets=false",
+            "-c",
+            "credential.traceMsAuth=false",
+            "-c",
+            "credential.debug=false",
+            "push",
+            "--",
+            remote,
+            refspec,
+        },
+        .remote = remote,
+        .refspec = refspec,
+        .environment = environment,
+    };
+}
+
 fn copyRemoteEnvironmentKey(
     destination: *std.process.Environ.Map,
     source: *const std.process.Environ.Map,
@@ -1857,7 +1899,7 @@ test "remote URL audit rejects every fetch URL pushurl and effective push URL be
     defer allocator.free(fetch_root_path);
     var fetch_root = try root_capability.RootCapability.openCanonical(fetch_root_path);
     defer fetch_root.deinit();
-    const fetch_result = LocalCommandBackend.runRemoteOperation(allocator, io, .{
+    const fetch_result = runOperation(allocator, io, .{
         .root = &fetch_root,
         .environment = &environment,
         .control = .{},
@@ -1877,7 +1919,7 @@ test "remote URL audit rejects every fetch URL pushurl and effective push URL be
     defer allocator.free(pushurl_root_path);
     var pushurl_root = try root_capability.RootCapability.openCanonical(pushurl_root_path);
     defer pushurl_root.deinit();
-    const pushurl_result = LocalCommandBackend.runRemoteOperation(allocator, io, .{
+    const pushurl_result = runOperation(allocator, io, .{
         .root = &pushurl_root,
         .environment = &environment,
         .control = .{},
@@ -1902,7 +1944,7 @@ test "remote URL audit rejects every fetch URL pushurl and effective push URL be
     defer allocator.free(effective_root_path);
     var effective_root = try root_capability.RootCapability.openCanonical(effective_root_path);
     defer effective_root.deinit();
-    const effective_result = LocalCommandBackend.runRemoteOperation(allocator, io, .{
+    const effective_result = runOperation(allocator, io, .{
         .root = &effective_root,
         .environment = &environment,
         .control = .{},
@@ -1953,7 +1995,7 @@ test "sensitive diagnostic from a production remote helper cannot cross the type
     var root = try root_capability.RootCapability.openCanonical(work_root_path);
     defer root.deinit();
 
-    const result = LocalCommandBackend.runRemoteOperation(allocator, io, .{
+    const result = runOperation(allocator, io, .{
         .root = &root,
         .environment = &environment,
         .control = .{},
@@ -2160,7 +2202,7 @@ test "credential helper plaintext warning survives descriptor-bound remote authe
     var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .background);
     defer environment.deinit();
 
-    const result = LocalCommandBackend.runRemoteOperation(std.testing.allocator, io, .{
+    const result = runOperation(std.testing.allocator, io, .{
         .root = &root,
         .environment = &environment,
         .control = .{},
@@ -2249,7 +2291,7 @@ test "remote authentication descriptor cwd survives repository path replacement"
     try parent.put("PATH", "/usr/bin:/bin");
     var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .background);
     defer environment.deinit();
-    const result = LocalCommandBackend.runRemoteOperation(std.testing.allocator, io, .{
+    const result = runOperation(std.testing.allocator, io, .{
         .root = &root,
         .environment = &environment,
         .control = .{},
@@ -2279,7 +2321,7 @@ test "remote URL userinfo is rejected before background authentication network a
     var environment = try buildRemoteEnvironment(std.testing.allocator, &parent, .background);
     defer environment.deinit();
 
-    const result = LocalCommandBackend.runRemoteOperation(std.testing.allocator, io, .{
+    const result = runOperation(std.testing.allocator, io, .{
         .root = &root,
         .environment = &environment,
         .control = .{},
@@ -2324,11 +2366,24 @@ fn exerciseForegroundRemoteEnvironmentAllocationFailure(
     allocator: std.mem.Allocator,
     parent: *const std.process.Environ.Map,
 ) !void {
-    var owned = try buildRemoteEnvironment(allocator, parent, .foreground);
-    defer owned.deinit();
-    try std.testing.expectEqualStrings("1", owned.map.get("GCM_INTERACTIVE").?);
-    try std.testing.expect(owned.warnings.proxy_credentials_omitted);
-    try std.testing.expect(owned.map.get("HTTPS_PROXY") == null);
+    var prepared = try prepareForegroundPush(
+        allocator,
+        parent,
+        .{
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = "0123456789abcdef",
+        },
+        .{ .git_plaintext_store = true },
+    );
+    defer prepared.deinit(allocator);
+    try std.testing.expectEqualStrings("1", prepared.environment.map.get("GCM_INTERACTIVE").?);
+    try std.testing.expect(prepared.environment.warnings.git_plaintext_store);
+    try std.testing.expect(prepared.environment.warnings.proxy_credentials_omitted);
+    try std.testing.expect(prepared.environment.map.get("HTTPS_PROXY") == null);
+    try std.testing.expectEqualStrings("origin", prepared.argv[11]);
+    try std.testing.expectEqualStrings("0123456789abcdef:refs/heads/main", prepared.argv[12]);
 }
 
 test "foreground remote environment releases partial construction on allocation failure" {
@@ -2348,7 +2403,7 @@ test "foreground remote environment releases partial construction on allocation 
     );
 }
 
-test "LocalCommandBackend foreground push inspection rejects stale oid before admission" {
+test "remote foreground push inspection rejects stale oid before admission" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2374,7 +2429,7 @@ test "LocalCommandBackend foreground push inspection rejects stale oid before ad
     defer environment.deinit();
     var root = try root_capability.RootCapability.openCanonical(repo_root);
     defer root.deinit();
-    const result = LocalCommandBackend.inspectForegroundPush(std.testing.allocator, io, .{
+    const result = inspectForegroundPush(std.testing.allocator, io, .{
         .root = &root,
         .environment = &environment,
         .control = .{},
@@ -2388,7 +2443,7 @@ test "LocalCommandBackend foreground push inspection rejects stale oid before ad
     try std.testing.expectEqual(ForegroundPushInspectionOutcome.oid_changed, result.outcome);
 }
 
-test "LocalCommandBackend foreground push inspection rejects a missing remote" {
+test "remote foreground push inspection rejects a missing remote" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2415,7 +2470,7 @@ test "LocalCommandBackend foreground push inspection rejects a missing remote" {
     defer environment.deinit();
     var root = try root_capability.RootCapability.openCanonical(repo_root);
     defer root.deinit();
-    const result = LocalCommandBackend.inspectForegroundPush(std.testing.allocator, io, .{
+    const result = inspectForegroundPush(std.testing.allocator, io, .{
         .root = &root,
         .environment = &environment,
         .control = .{},
@@ -2429,7 +2484,7 @@ test "LocalCommandBackend foreground push inspection rejects a missing remote" {
     try std.testing.expectEqual(ForegroundPushInspectionOutcome{ .failed = .failed }, result.outcome);
 }
 
-test "LocalCommandBackend foreground push inspection accepts a local bare remote" {
+test "remote foreground push inspection accepts a local bare remote" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2461,7 +2516,7 @@ test "LocalCommandBackend foreground push inspection accepts a local bare remote
     defer environment.deinit();
     var root = try root_capability.RootCapability.openCanonical(repo_root);
     defer root.deinit();
-    const result = LocalCommandBackend.inspectForegroundPush(std.testing.allocator, io, .{
+    const result = inspectForegroundPush(std.testing.allocator, io, .{
         .root = &root,
         .environment = &environment,
         .control = .{},
@@ -2484,7 +2539,7 @@ test "LocalCommandBackend foreground push inspection accepts a local bare remote
     try std.testing.expect(config_result.term == .exited and config_result.term.exited != 0);
 }
 
-test "LocalCommandBackend upstream finalization configures local tracking after fixed oid push" {
+test "remote upstream finalization configures local tracking after fixed oid push" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2530,11 +2585,11 @@ test "LocalCommandBackend upstream finalization configures local tracking after 
         .remote_branch = "feature/topic",
         .oid = trimLineEnd(oid),
     };
-    const result = LocalCommandBackend.finalizePushUpstream(std.testing.allocator, io, request);
+    const result = finalizePushUpstream(std.testing.allocator, io, request);
     try std.testing.expectEqual(PushUpstreamFinalizeOutcome.configured, result);
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.already_configured,
-        LocalCommandBackend.finalizePushUpstream(std.testing.allocator, io, request),
+        finalizePushUpstream(std.testing.allocator, io, request),
     );
 
     const remote_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "refs/remotes/origin/feature/topic" });
@@ -2550,7 +2605,7 @@ test "LocalCommandBackend upstream finalization configures local tracking after 
     try std.testing.expectEqualStrings("refs/heads/feature/topic", trimLineEnd(upstream_merge));
 }
 
-test "LocalCommandBackend upstream finalization has conflict-safe typed terminals" {
+test "remote upstream finalization has conflict-safe typed terminals" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2591,21 +2646,21 @@ test "LocalCommandBackend upstream finalization has conflict-safe typed terminal
     try runTestGit(io, &.{ "git", "switch", "-c", "other" }, work);
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.branch_changed,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     try runTestGit(io, &.{ "git", "switch", "main" }, work);
 
     request.oid = "0000000000000000000000000000000000000000";
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.oid_changed,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     request.oid = oid;
 
     try runTestGit(io, &.{ "git", "switch", "--detach" }, work);
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.context_changed,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     try runTestGit(io, &.{ "git", "switch", "main" }, work);
 
@@ -2613,14 +2668,14 @@ test "LocalCommandBackend upstream finalization has conflict-safe typed terminal
     try runTestGit(io, &.{ "git", "config", "--local", "--add", "branch.main.remote", "origin" }, work);
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.config_verification_failed,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     try runTestGit(io, &.{ "git", "config", "--local", "--unset-all", "branch.main.remote" }, work);
 
     try runTestGit(io, &.{ "git", "config", "--local", "branch.main.remote", "other" }, work);
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.upstream_conflict,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     try runTestGit(io, &.{ "git", "config", "--local", "--unset-all", "branch.main.remote" }, work);
 
@@ -2628,7 +2683,7 @@ test "LocalCommandBackend upstream finalization has conflict-safe typed terminal
     lock.close(io);
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.config_write_failed,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     try work.deleteFile(io, ".git/config.lock");
 
@@ -2639,7 +2694,7 @@ test "LocalCommandBackend upstream finalization has conflict-safe typed terminal
     } };
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.tracking_unknown,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     request.control = .{};
 
@@ -2648,7 +2703,7 @@ test "LocalCommandBackend upstream finalization has conflict-safe typed terminal
     request.remote = ".";
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.configured,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     const configured_remote = try gitOutputAlloc(io, work, &.{ "git", "config", "--get", "branch.main.remote" });
     defer allocator.free(configured_remote);
@@ -2658,12 +2713,12 @@ test "LocalCommandBackend upstream finalization has conflict-safe typed terminal
     try std.testing.expectEqualStrings("true", trimLineEnd(configured_rebase));
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.already_configured,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     try runTestGit(io, &.{ "git", "config", "--local", "branch.main.rebase", "false" }, work);
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.upstream_conflict,
-        LocalCommandBackend.finalizePushUpstream(allocator, io, request),
+        finalizePushUpstream(allocator, io, request),
     );
     const conflicting_rebase = try gitOutputAlloc(io, work, &.{ "git", "config", "--bool", "--get", "branch.main.rebase" });
     defer allocator.free(conflicting_rebase);
@@ -2778,7 +2833,7 @@ fn exerciseUpstreamFinalizerFault(
     };
     var fault_future = try io.concurrent(injectUpstreamFinalizerFault, .{ io, work, fault });
     defer _ = fault_future.cancel(io) catch {};
-    const outcome = LocalCommandBackend.finalizePushUpstream(allocator, io, request);
+    const outcome = finalizePushUpstream(allocator, io, request);
     try fault_future.await(io);
     try std.testing.expectEqual(expected, outcome);
 
@@ -2806,7 +2861,7 @@ fn exerciseUpstreamFinalizerFault(
     }
 }
 
-test "LocalCommandBackend upstream finalization reports later write and postcondition faults" {
+test "remote upstream finalization reports later write and postcondition faults" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

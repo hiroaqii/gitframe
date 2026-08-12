@@ -13,7 +13,7 @@ const actions = @import("actions.zig");
 const effect_origin = @import("effect_origin.zig");
 const app_state = @import("state.zig");
 const remote_request = @import("remote_request.zig");
-const git_backend = @import("../git/backend.zig");
+const git_remote = @import("../git/remote.zig");
 const root_capability = @import("../repo/root_capability.zig");
 
 const inspection_timeout = std.Io.Duration.fromSeconds(10);
@@ -63,7 +63,7 @@ pub const Foreground = struct {
     origin: effect_origin.PageOrigin,
     root: root_capability.RootCapability,
     target: app_state.PushRetryTarget,
-    warnings: git_backend.RemoteWarningSet,
+    warnings: git_remote.RemoteWarningSet,
 
     pub fn deinit(self: *Foreground, allocator: std.mem.Allocator) void {
         self.root.deinit();
@@ -158,7 +158,7 @@ pub const Outcome = union(enum) {
     ready,
     branch_changed,
     oid_changed,
-    failed: git_backend.RemoteFailure,
+    failed: git_remote.RemoteFailure,
 };
 
 pub const Finished = struct {
@@ -167,7 +167,7 @@ pub const Finished = struct {
     target_identity: TargetIdentity,
     root: ?root_capability.RootCapability,
     target: app_state.PushRetryTarget,
-    warnings: git_backend.RemoteWarningSet,
+    warnings: git_remote.RemoteWarningSet,
     outcome: Outcome,
 
     pub fn takeRoot(self: *Finished) root_capability.RootCapability {
@@ -188,7 +188,7 @@ pub fn startInspection(
     ctx: *chasen.Ctx(Msg),
     metadata: Inspecting,
     root: *?root_capability.RootCapability,
-    environment: *?git_backend.OwnedRemoteEnvironment,
+    environment: *?git_remote.OwnedRemoteEnvironment,
     target: *app_state.PushRetryTarget,
 ) !void {
     const TaskType = InspectionTask(Msg);
@@ -214,14 +214,14 @@ pub fn InspectionTask(comptime Msg: type) type {
     return struct {
         metadata: Inspecting,
         root: root_capability.RootCapability,
-        environment: git_backend.OwnedRemoteEnvironment,
+        environment: git_remote.OwnedRemoteEnvironment,
         target: app_state.PushRetryTarget,
 
         const Self = @This();
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *Self = @ptrCast(@alignCast(ctx_ptr));
-            const result = git_backend.LocalCommandBackend.inspectForegroundPush(allocator, io, .{
+            const result = git_remote.inspectForegroundPush(allocator, io, .{
                 .root = &task.root,
                 .environment = &task.environment,
                 .control = .{ .deadline = std.Io.Clock.Timestamp.fromNow(io, .{
@@ -258,7 +258,7 @@ pub fn InspectionTask(comptime Msg: type) type {
 
         const TaskResult = struct {
             outcome: Outcome,
-            warnings: git_backend.RemoteWarningSet,
+            warnings: git_remote.RemoteWarningSet,
         };
 
         fn finish(task: *Self, allocator: std.mem.Allocator, result: TaskResult) Finished {
@@ -281,8 +281,8 @@ pub fn InspectionTask(comptime Msg: type) type {
 
 pub const FinalizeFinished = struct {
     identity: remote_request.RemoteRequestIdentity,
-    outcome: git_backend.PushUpstreamFinalizeOutcome,
-    warnings: git_backend.RemoteWarningSet,
+    outcome: git_remote.PushUpstreamFinalizeOutcome,
+    warnings: git_remote.RemoteWarningSet,
 };
 
 pub fn startFinalization(
@@ -290,9 +290,9 @@ pub fn startFinalization(
     ctx: *chasen.Ctx(Msg),
     metadata: Finalizing,
     root: *?root_capability.RootCapability,
-    environment: *?git_backend.OwnedRemoteEnvironment,
+    environment: *?git_remote.OwnedRemoteEnvironment,
     target: *app_state.PushRetryTarget,
-    warnings: git_backend.RemoteWarningSet,
+    warnings: git_remote.RemoteWarningSet,
 ) !void {
     const TaskType = FinalizeTask(Msg);
     const task = try ctx.allocator().create(TaskType);
@@ -318,15 +318,15 @@ pub fn FinalizeTask(comptime Msg: type) type {
     return struct {
         metadata: Finalizing,
         root: root_capability.RootCapability,
-        environment: git_backend.OwnedRemoteEnvironment,
+        environment: git_remote.OwnedRemoteEnvironment,
         target: app_state.PushRetryTarget,
-        warnings: git_backend.RemoteWarningSet,
+        warnings: git_remote.RemoteWarningSet,
 
         const Self = @This();
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *Self = @ptrCast(@alignCast(ctx_ptr));
-            const outcome = git_backend.LocalCommandBackend.finalizePushUpstream(allocator, io, .{
+            const outcome = git_remote.finalizePushUpstream(allocator, io, .{
                 .root = &task.root,
                 .environment = &task.environment,
                 .control = .{ .deadline = std.Io.Clock.Timestamp.fromNow(io, .{
@@ -347,7 +347,7 @@ pub fn FinalizeTask(comptime Msg: type) type {
             return Msg.pushUpstreamFinalizeFinished(task.finish(allocator, .config_write_failed));
         }
 
-        fn finish(task: *Self, allocator: std.mem.Allocator, outcome: git_backend.PushUpstreamFinalizeOutcome) FinalizeFinished {
+        fn finish(task: *Self, allocator: std.mem.Allocator, outcome: git_remote.PushUpstreamFinalizeOutcome) FinalizeFinished {
             defer {
                 task.root.deinit();
                 task.environment.deinit();
