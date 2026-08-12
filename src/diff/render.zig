@@ -686,6 +686,7 @@ fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLin
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), whole_line, styles));
 
     if (line_numbers) {
+        fillRowRegion(surface, row, .{ .col = 0, .width = layout.prefix_col }, selectedStyle(presentation.compose(lineNumberStyle(line.kind, styles), styles), whole_line, styles));
         _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.old_line != null, styles), whole_line, styles));
         _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.new_line != null, styles), whole_line, styles));
     }
@@ -851,6 +852,7 @@ fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     const layout = lineLayout(line_numbers, .side_by_side);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), selected, styles));
     if (line_numbers) {
+        fillRowRegion(surface, row, .{ .col = 0, .width = layout.prefix_col }, selectedStyle(presentation.compose(lineNumberStyle(line.kind, styles), styles), selected, styles));
         _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.old_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.old_line != null, styles), selected, styles));
     }
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
@@ -864,6 +866,7 @@ fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     const layout = lineLayout(line_numbers, .side_by_side);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), selected, styles));
     if (line_numbers) {
+        fillRowRegion(surface, row, .{ .col = 0, .width = layout.prefix_col }, selectedStyle(presentation.compose(lineNumberStyle(line.kind, styles), styles), selected, styles));
         _ = try surface.copyTextAt(0, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.new_line != null, styles), selected, styles));
     }
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
@@ -1138,8 +1141,8 @@ const RenderStyles = struct {
             .added_marker = .{ .bold = true, .fg = palette.color(.diff_added), .bg = palette.color(.diff_added_bg) },
             .removed_marker = .{ .bold = true, .fg = palette.color(.diff_removed), .bg = palette.color(.diff_removed_bg) },
             .context_marker = .{ .bg = palette.color(.diff_context_bg) },
-            .added_line_number = .{ .fg = palette.color(.diff_line_number), .bg = palette.color(.diff_added_bg) },
-            .removed_line_number = .{ .fg = palette.color(.diff_line_number), .bg = palette.color(.diff_removed_bg) },
+            .added_line_number = .{ .fg = palette.color(.foreground), .bg = palette.color(.diff_added_line_number_bg) },
+            .removed_line_number = .{ .fg = palette.color(.foreground), .bg = palette.color(.diff_removed_line_number_bg) },
             .context = .{ .bg = palette.color(.diff_context_bg) },
             .metadata = palette.style(.diff_metadata),
             .line_number = palette.style(.diff_line_number),
@@ -1290,8 +1293,11 @@ test "full-row diff background fills unified rows without leaking into chrome" {
     const added_row: u16 = 6;
     const removed_bg = palette.color(.diff_removed_bg);
     const added_bg = palette.color(.diff_added_bg);
-    try expectBgRange(&ts.surface, removed_row, cursor_gutter_width, 40, removed_bg);
-    try expectBgRange(&ts.surface, added_row, cursor_gutter_width, 40, added_bg);
+    const number_region_end = cursor_gutter_width + lineLayout(true, .unified).prefix_col;
+    try expectBgRange(&ts.surface, removed_row, cursor_gutter_width, number_region_end, palette.color(.diff_removed_line_number_bg));
+    try expectBgRange(&ts.surface, added_row, cursor_gutter_width, number_region_end, palette.color(.diff_added_line_number_bg));
+    try expectBgRange(&ts.surface, removed_row, number_region_end, 40, removed_bg);
+    try expectBgRange(&ts.surface, added_row, number_region_end, 40, added_bg);
     try std.testing.expect(!ts.surface.readCell(1, removed_row).?.style.bg.eql(removed_bg));
     try std.testing.expect(!ts.surface.readCell(39, 3).?.style.bg.eql(removed_bg));
     try std.testing.expect(!ts.surface.readCell(39, 3).?.style.bg.eql(added_bg));
@@ -1303,7 +1309,7 @@ test "full-row diff background fills unified rows without leaking into chrome" {
     const text_col = cursor_gutter_width + lineTextStart(true, .unified);
     try ts.expectCellText(text_col, removed_row, "c");
     try std.testing.expect(ts.surface.readCell(text_col, removed_row).?.style.fg.eql(palette.color(.accent)));
-    try std.testing.expect(ts.surface.readCell(cursor_gutter_width + 1, removed_row).?.style.fg.eql(palette.color(.diff_line_number)));
+    try std.testing.expect(ts.surface.readCell(cursor_gutter_width + 1, removed_row).?.style.fg.eql(palette.color(.foreground)));
     try ts.expectCellText(cursor_gutter_width + lineLayout(true, .unified).prefix_col, removed_row, " ");
     try ts.expectCellText(cursor_gutter_width + lineLayout(true, .unified).prefix_col, added_row, "+");
     try std.testing.expect(ts.surface.readCell(1, removed_row).?.style.fg.eql(palette.color(.staged)));
@@ -1534,12 +1540,15 @@ test "renderFile composes diff state as body background and marker foreground" {
 
     try renderFile(&ts.surface, file, .{ .requested_mode = .unified, .palette = palette });
 
-    try expectBodyGutterLeadInBg(&ts.surface, 4, lineTextStart(true, .unified), palette.color(.diff_removed_bg));
-    try expectBodyGutterLeadInBg(&ts.surface, 5, lineTextStart(true, .unified), palette.color(.diff_added_bg));
+    const number_region_end = cursor_gutter_width + lineLayout(true, .unified).prefix_col;
+    try expectBgRange(&ts.surface, 4, cursor_gutter_width, number_region_end, palette.color(.diff_removed_line_number_bg));
+    try expectBgRange(&ts.surface, 5, cursor_gutter_width, number_region_end, palette.color(.diff_added_line_number_bg));
+    try expectBgRange(&ts.surface, 4, number_region_end, cursor_gutter_width + lineTextStart(true, .unified), palette.color(.diff_removed_bg));
+    try expectBgRange(&ts.surface, 5, number_region_end, cursor_gutter_width + lineTextStart(true, .unified), palette.color(.diff_added_bg));
 
     const removed_old_line_number = ts.surface.readCell(3, 4).?;
-    try std.testing.expect(removed_old_line_number.style.fg.eql(palette.color(.diff_line_number)));
-    try std.testing.expect(removed_old_line_number.style.bg.eql(palette.color(.diff_removed_bg)));
+    try std.testing.expect(removed_old_line_number.style.fg.eql(palette.color(.foreground)));
+    try std.testing.expect(removed_old_line_number.style.bg.eql(palette.color(.diff_removed_line_number_bg)));
 
     const removed_prefix = ts.surface.readCell(12, 4).?;
     try std.testing.expect(removed_prefix.style.fg.eql(palette.color(.diff_removed)));
@@ -1550,7 +1559,8 @@ test "renderFile composes diff state as body background and marker foreground" {
     try std.testing.expect(removed_body.style.bg.eql(palette.color(.diff_removed_bg)));
 
     const added_line_number = ts.surface.readCell(7, 5).?;
-    try std.testing.expect(added_line_number.style.bg.eql(palette.color(.diff_added_bg)));
+    try std.testing.expect(added_line_number.style.fg.eql(palette.color(.foreground)));
+    try std.testing.expect(added_line_number.style.bg.eql(palette.color(.diff_added_line_number_bg)));
 
     const added_prefix = ts.surface.readCell(12, 5).?;
     try std.testing.expect(added_prefix.style.fg.eql(palette.color(.diff_added)));
@@ -2058,8 +2068,11 @@ test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
     const geometry = sideBySideGeometry(bodyWidth(100));
     const old_start = cursor_gutter_width + geometry.old.col;
     const new_start = cursor_gutter_width + geometry.new.col;
-    try expectBgRange(&ts.surface, 4, old_start, old_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_removed_bg));
-    try expectBgRange(&ts.surface, 4, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
+    const number_width = lineLayout(true, .side_by_side).prefix_col;
+    try expectBgRange(&ts.surface, 4, old_start, old_start + number_width, theme.Palette.default().color(.diff_removed_line_number_bg));
+    try expectBgRange(&ts.surface, 4, new_start, new_start + number_width, theme.Palette.default().color(.diff_added_line_number_bg));
+    try expectBgRange(&ts.surface, 4, old_start + number_width, old_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_removed_bg));
+    try expectBgRange(&ts.surface, 4, new_start + number_width, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
     try ts.expectCellText(7, 4, " ");
     try ts.expectCellText(57, 4, " ");
     try ts.expectCellText(9, 4, "o");
@@ -2212,7 +2225,7 @@ test "renderFile highlights only the selected side-by-side pane side" {
     try std.testing.expect(old_body.style.bg.eql(palette.color(.diff_cursor)));
     try std.testing.expect(!new_line_number.style.bg.eql(palette.color(.diff_cursor)));
     try std.testing.expect(!new_body.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(new_line_number.style.bg.eql(palette.color(.diff_added_bg)));
+    try std.testing.expect(new_line_number.style.bg.eql(palette.color(.diff_added_line_number_bg)));
     try std.testing.expect(new_body.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
@@ -2776,7 +2789,9 @@ test "full-row diff background fills generated content on new side" {
 
     const geometry = sideBySideGeometry(bodyWidth(90));
     const new_start = cursor_gutter_width + geometry.new.col;
-    try expectBgRange(&ts.surface, 3, new_start, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
+    const number_width = lineLayout(true, .side_by_side).prefix_col;
+    try expectBgRange(&ts.surface, 3, new_start, new_start + number_width, theme.Palette.default().color(.diff_added_line_number_bg));
+    try expectBgRange(&ts.surface, 3, new_start + number_width, new_start + lineTextStart(true, .side_by_side), theme.Palette.default().color(.diff_added_bg));
     try std.testing.expect(!ts.surface.readCell(cursor_gutter_width + geometry.separator_col - 1, 3).?.style.bg.eql(theme.Palette.default().color(.diff_added_bg)));
     try std.testing.expect(ts.surface.readCell(89, 3).?.style.bg.eql(theme.Palette.default().color(.diff_added_bg)));
     try ts.expectCellText(0, 0, "s");

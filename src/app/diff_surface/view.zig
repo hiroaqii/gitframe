@@ -800,11 +800,8 @@ pub fn paneSearchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
         palette.style(.prompt);
 }
 
-pub fn paneHeaderRuleStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        .{ .dim = true }
-    else
-        .{ .fg = palette.color(.muted), .dim = true };
+pub fn paneHeaderRuleStyle(_: bool, _: theme.Palette) chasen.TextStyle {
+    return .{ .dim = true };
 }
 
 /// Draw a bounded file-search projection in the diff-pane position.
@@ -1071,7 +1068,7 @@ fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row)
 
 pub fn sidebarRowStyle(row: sidebar_view_model.Row, palette: theme.Palette) chasen.TextStyle {
     var style: chasen.TextStyle = if (row.kind == .directory or row.kind == .repo_root)
-        .{ .bold = true }
+        palette.boldStyle(.accent)
     else switch (row.stage_presence) {
         .staged_only => .{ .fg = palette.color(.staged) },
         .mixed => .{ .fg = palette.color(.prompt) },

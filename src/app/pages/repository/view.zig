@@ -89,12 +89,19 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             std.fmt.bufPrint(header_buffer[0..], "{s}  ({s}: toggle)", .{ mode_header, binding }) catch mode_header
         else
             mode_header;
-        // Copy frame-local text and let the surface clip its right edge without
-        // adding a marker; the current mode therefore remains the leading fact.
-        if (size.height > 2) _ = left.copyTextAt(1, 2, tree_header, context.palette.boldStyle(.accent)) catch {};
+        // Keep the current mode as the leading fact, while rendering the
+        // shortcut hint as subdued chrome instead of another accent target.
+        if (size.height > 2) {
+            _ = left.copyTextAt(1, 2, mode_header, context.palette.boldStyle(.accent)) catch {};
+            if (tree_header.len > mode_header.len) {
+                var shortcut_style = context.palette.style(.muted);
+                shortcut_style.dim = true;
+                const shortcut_col: u16 = @intCast(1 + chasen.text.displayWidth(mode_header));
+                _ = left.copyTextAt(shortcut_col, 2, tree_header[mode_header.len..], shortcut_style) catch {};
+            }
+        }
         if (layout.tree_width < size.width) {
-            var separator_style = context.palette.style(.muted);
-            separator_style.dim = true;
+            const separator_style: chasen.TextStyle = .{ .dim = true };
             var separator_row: u16 = 0;
             while (separator_row < size.height) : (separator_row += 1) _ = surface.borrowTextAt(layout.tree_width, separator_row, "│", separator_style);
         }
@@ -579,7 +586,7 @@ pub fn drawSource(
         const base_style = sourceRowStyle(palette.style(.foreground), source_active, current, palette);
 
         const change = if (changes) |map| map.row(line_index) else .none;
-        const gutter: []const u8 = if (change == .none) " " else "│";
+        const gutter: []const u8 = if (change == .none) " " else "▌";
         const gutter_role: theme.Role = switch (change) {
             .none => .foreground,
             .added => .diff_added,
@@ -816,13 +823,8 @@ fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, pale
     return true;
 }
 
-fn sourceHeaderRuleStyle(source_active: bool, palette: theme.Palette) chasen.TextStyle {
-    // Match Review's pane rule exactly: the active rule uses terminal-default
-    // foreground rather than the configurable semantic accent role.
-    return if (source_active)
-        .{ .dim = true }
-    else
-        .{ .fg = palette.color(.muted), .dim = true };
+fn sourceHeaderRuleStyle(_: bool, _: theme.Palette) chasen.TextStyle {
+    return .{ .dim = true };
 }
 
 /// Current-row presentation is active-source chrome. It contributes only a
@@ -873,8 +875,8 @@ test "repository source gutter renders added and modified rows without moving te
     defer test_surface.deinit();
 
     try drawSource(&test_surface.surface, &document, null, &map, .{ .focus = .source, .source_cursor = 1 }, .{}, null, palette);
-    try test_surface.expectCellText(0, 2, "│");
-    try test_surface.expectCellText(0, 3, "│");
+    try test_surface.expectCellText(0, 2, "▌");
+    try test_surface.expectCellText(0, 3, "▌");
     try test_surface.expectCellText(0, 4, " ");
     try test_surface.expectCellText(3, 2, "a");
     try test_surface.expectCellText(3, 3, "m");
@@ -1078,7 +1080,7 @@ test "repository source header renderer follows adaptive omission regions" {
     try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "2000-") == null);
 }
 
-test "repository source normal header rule follows source focus" {
+test "repository source normal header rule stays white across source focus" {
     const RulePalette = struct {
         pub fn get(_: @This(), role: theme.Role) ?theme.ColorValue {
             return switch (role) {
@@ -1110,7 +1112,7 @@ test "repository source normal header rule follows source focus" {
         try std.testing.expect(!active_rule.style.fg.eql(palette.color(.accent)));
         try std.testing.expect(active_rule.style.dim);
         try std.testing.expectEqualStrings("─", inactive_rule.char.grapheme);
-        try std.testing.expect(inactive_rule.style.fg.eql(palette.color(.muted)));
+        try std.testing.expect(inactive_rule.style.fg.eql(.default));
         try std.testing.expect(inactive_rule.style.dim);
     }
 }
@@ -1974,7 +1976,7 @@ test "repository tree cursor background follows active focus and preserves seman
     try std.testing.expect(!active_selected_trailing.style.reverse);
     try std.testing.expect(active_selected_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(!active_selected_trailing.style.dim);
-    try std.testing.expect(active_separator.style.fg.eql(palette.color(.muted)));
+    try std.testing.expect(active_separator.style.fg.eql(.default));
     try std.testing.expect(active_separator.style.dim);
     try std.testing.expect(!active_separator.style.reverse);
     try std.testing.expect(!active_separator.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -2050,7 +2052,7 @@ test "repository tree cursor background follows active focus and preserves seman
     try std.testing.expect(!inactive_selected_trailing.style.dim);
     try std.testing.expect(!inactive_selected_trailing.style.reverse);
     try std.testing.expect(!inactive_selected_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(inactive_separator.style.fg.eql(palette.color(.muted)));
+    try std.testing.expect(inactive_separator.style.fg.eql(.default));
     try std.testing.expect(inactive_separator.style.dim);
     try std.testing.expect(!inactive_separator.style.reverse);
     try std.testing.expect(!inactive_separator.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -2621,6 +2623,15 @@ test "repository filter discoverability header follows effective keymap and clip
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]  (F: toggle") != null);
         try test_surface.expectCellText(27, 2, "e");
+        const mode_cell = test_surface.surface.readCell(1, 2) orelse return error.ExpectedFilterModeCell;
+        const shortcut_cell = test_surface.surface.readCell(19, 2) orelse return error.ExpectedFilterShortcutCell;
+        const palette: theme.Palette = .default();
+        try std.testing.expect(mode_cell.style.fg.eql(palette.color(.accent)));
+        try std.testing.expect(mode_cell.style.bold);
+        try std.testing.expect(!mode_cell.style.dim);
+        try std.testing.expect(shortcut_cell.style.fg.eql(palette.color(.muted)));
+        try std.testing.expect(!shortcut_cell.style.bold);
+        try std.testing.expect(shortcut_cell.style.dim);
     }
 
     var config: keymap.Config = .{};

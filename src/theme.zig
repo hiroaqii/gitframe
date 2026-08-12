@@ -21,6 +21,8 @@ pub const Role = enum {
     diff_removed,
     diff_added_bg,
     diff_removed_bg,
+    diff_added_line_number_bg,
+    diff_removed_line_number_bg,
     diff_context_bg,
     diff_metadata,
     diff_line_number,
@@ -122,6 +124,8 @@ pub const Palette = struct {
         palette.set(.diff_removed, palette.color(.danger));
         palette.set(.diff_added_bg, .{ .rgb = .{ 18, 54, 35 } });
         palette.set(.diff_removed_bg, .{ .rgb = .{ 66, 28, 32 } });
+        palette.set(.diff_added_line_number_bg, .{ .rgb = .{ 24, 74, 48 } });
+        palette.set(.diff_removed_line_number_bg, .{ .rgb = .{ 90, 37, 43 } });
         palette.set(.diff_context_bg, .default);
         palette.set(.diff_metadata, palette.color(.muted));
         palette.set(.diff_line_number, palette.color(.muted));
@@ -186,6 +190,8 @@ fn isDerivedRole(role: Role) bool {
         .diff_removed,
         .diff_added_bg,
         .diff_removed_bg,
+        .diff_added_line_number_bg,
+        .diff_removed_line_number_bg,
         .diff_context_bg,
         .diff_metadata,
         .diff_line_number,
