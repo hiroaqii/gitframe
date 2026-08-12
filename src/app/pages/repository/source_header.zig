@@ -54,6 +54,12 @@ pub const GitState = enum {
     }
 };
 
+pub const CommitFact = union(enum) {
+    committed: i64,
+    uncommitted,
+    unavailable,
+};
+
 /// Page-neutral facts which describe one source-header presentation basis.
 /// `raw_path` remains the borrowed byte-exact identity; its escaped width is a
 /// presentation fact only and must never be used to open or compare a path.
@@ -62,20 +68,20 @@ pub const Presentation = struct {
     displayed_path_width: usize,
     line_position: ?LinePosition,
     git_state: GitState,
-    modified_at: ?std.Io.Timestamp,
+    commit_fact: CommitFact,
 
     pub fn init(
         raw_path: []const u8,
         line_position: ?LinePosition,
         git_state: GitState,
-        modified_at: ?std.Io.Timestamp,
+        commit_fact: CommitFact,
     ) Presentation {
         return .{
             .raw_path = raw_path,
             .displayed_path_width = manifest.escapedDisplayWidth(raw_path),
             .line_position = line_position,
             .git_state = git_state,
-            .modified_at = modified_at,
+            .commit_fact = commit_fact,
         };
     }
 };
@@ -107,16 +113,14 @@ pub const UtcMinute = struct {
     }
 };
 
-const maximum_utc_second: u64 = 253_402_300_799; // 9999-12-31 23:59:59Z
+const maximum_utc_second: i64 = 253_402_300_799; // 9999-12-31 23:59:59Z
 
-/// Formats a raw filesystem timestamp without consulting local timezone or a
-/// clock. Negative values and years outside the fixed four-digit contract are
-/// omitted rather than normalized into a fabricated presentation.
-pub fn formatUtcMinute(timestamp: std.Io.Timestamp) ?UtcMinute {
-    if (timestamp.nanoseconds < 0) return null;
-    const seconds_i96 = @divTrunc(timestamp.nanoseconds, std.time.ns_per_s);
-    const seconds = std.math.cast(u64, seconds_i96) orelse return null;
-    if (seconds > maximum_utc_second) return null;
+/// Formats an accepted committer Unix timestamp without consulting local
+/// timezone or a clock. Invalid values remain the unavailable presentation.
+pub fn formatUtcMinute(timestamp_seconds: i64) ?UtcMinute {
+    if (timestamp_seconds < 0) return null;
+    const seconds = std.math.cast(u64, timestamp_seconds) orelse return null;
+    if (timestamp_seconds > maximum_utc_second) return null;
 
     const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = seconds };
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
@@ -134,6 +138,45 @@ pub fn formatUtcMinute(timestamp: std.Io.Timestamp) ?UtcMinute {
     return result;
 }
 
+pub const CommitLabel = struct {
+    bytes: [24]u8 = undefined,
+    len: u8,
+    width: u8,
+
+    pub fn text(self: *const CommitLabel) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub fn formatCommitFact(fact: CommitFact) CommitLabel {
+    var result: CommitLabel = .{ .len = 0, .width = 0 };
+    switch (fact) {
+        .committed => |seconds| if (formatUtcMinute(seconds)) |minute| {
+            const label = std.fmt.bufPrint(&result.bytes, "commit {s}", .{minute.text()}) catch unreachable;
+            result.len = @intCast(label.len);
+            result.width = @intCast(label.len);
+        } else {
+            const label = "commit —";
+            @memcpy(result.bytes[0..label.len], label);
+            result.len = label.len;
+            result.width = 8;
+        },
+        .uncommitted => {
+            const label = "uncommitted";
+            @memcpy(result.bytes[0..label.len], label);
+            result.len = label.len;
+            result.width = label.len;
+        },
+        .unavailable => {
+            const label = "commit —";
+            @memcpy(result.bytes[0..label.len], label);
+            result.len = label.len;
+            result.width = 8;
+        },
+    }
+    return result;
+}
+
 pub const LineField = struct {
     region: Region,
     label: LineLabel,
@@ -144,9 +187,9 @@ pub const GitField = struct {
     state: GitState,
 };
 
-pub const MtimeField = struct {
+pub const CommitField = struct {
     region: Region,
-    value: UtcMinute,
+    value: CommitLabel,
 };
 
 pub const Layout = struct {
@@ -154,11 +197,11 @@ pub const Layout = struct {
     path_target: ?Region = null,
     line: ?LineField = null,
     git: ?GitField = null,
-    mtime: ?MtimeField = null,
+    commit: ?CommitField = null,
 };
 
 /// Computes the complete row-0 geometry and already-formatted metadata fields.
-/// Optional fields are removed in mtime, Git, line order until at least eight
+/// Optional fields are removed in line, commit, Git order until at least eight
 /// path cells plus a two-cell group boundary fit. The path target covers only
 /// cells the bounded escaped-path renderer can actually emit.
 pub fn layout(width: u16, presentation: Presentation) Layout {
@@ -174,34 +217,31 @@ pub fn layout(width: u16, presentation: Presentation) Layout {
         formatLinePosition(position)
     else
         null;
-    const mtime_value: ?UtcMinute = if (presentation.modified_at) |timestamp|
-        formatUtcMinute(timestamp)
-    else
-        null;
+    const commit_label = formatCommitFact(presentation.commit_fact);
 
     var include_line = line_label != null;
     var include_git = true;
-    var include_mtime = mtime_value != null;
+    var include_commit = true;
     while (true) {
         const metadata_width = metadataGroupWidth(
             if (include_line) line_label.?.len else null,
             if (include_git) presentation.git_state.label().len else null,
-            if (include_mtime) mtime_value.?.bytes.len else null,
+            if (include_commit) commit_label.width else null,
         );
         const required = @as(usize, minimum_path_width) +
             (if (metadata_width > 0) @as(usize, path_metadata_gap) else 0) +
             metadata_width;
         if (required <= content_width) break;
-        if (include_mtime) {
-            include_mtime = false;
+        if (include_line) {
+            include_line = false;
+            continue;
+        }
+        if (include_commit) {
+            include_commit = false;
             continue;
         }
         if (include_git) {
             include_git = false;
-            continue;
-        }
-        if (include_line) {
-            include_line = false;
             continue;
         }
         break;
@@ -210,7 +250,7 @@ pub fn layout(width: u16, presentation: Presentation) Layout {
     const metadata_width = metadataGroupWidth(
         if (include_line) line_label.?.len else null,
         if (include_git) presentation.git_state.label().len else null,
-        if (include_mtime) mtime_value.?.bytes.len else null,
+        if (include_commit) commit_label.width else null,
     );
     const metadata_col = content_end - metadata_width;
     const path_end = if (metadata_width > 0)
@@ -243,7 +283,7 @@ pub fn layout(width: u16, presentation: Presentation) Layout {
             .label = label,
         };
         field_col += label.len;
-        if (include_git or include_mtime) field_col += field_gap;
+        if (include_git or include_commit) field_col += field_gap;
     }
     if (include_git) {
         const label = presentation.git_state.label();
@@ -252,24 +292,23 @@ pub fn layout(width: u16, presentation: Presentation) Layout {
             .state = presentation.git_state,
         };
         field_col += label.len;
-        if (include_mtime) field_col += field_gap;
+        if (include_commit) field_col += field_gap;
     }
-    if (include_mtime) {
-        const value = mtime_value.?;
-        result.mtime = .{
-            .region = .{ .col = @intCast(field_col), .width = @intCast(value.bytes.len) },
-            .value = value,
+    if (include_commit) {
+        result.commit = .{
+            .region = .{ .col = @intCast(field_col), .width = commit_label.width },
+            .value = commit_label,
         };
-        field_col += value.bytes.len;
+        field_col += commit_label.width;
     }
     std.debug.assert(field_col == content_end);
     return result;
 }
 
-fn metadataGroupWidth(line: ?usize, git: ?usize, mtime: ?usize) usize {
+fn metadataGroupWidth(line: ?usize, git: ?usize, commit: ?usize) usize {
     var width: usize = 0;
     var count: usize = 0;
-    for ([_]?usize{ line, git, mtime }) |field| if (field) |field_width| {
+    for ([_]?usize{ line, git, commit }) |field| if (field) |field_width| {
         if (count > 0) width += field_gap;
         width += field_width;
         count += 1;
@@ -300,25 +339,30 @@ test "repository source header Git labels remain typed aggregate facts" {
 }
 
 test "repository source header UTC minute formatting is deterministic and bounded" {
-    const epoch = formatUtcMinute(.zero).?;
+    const epoch = formatUtcMinute(0).?;
     try std.testing.expectEqualStrings("1970-01-01 00:00Z", epoch.text());
 
-    const before_minute = formatUtcMinute(.{ .nanoseconds = 59 * std.time.ns_per_s + 999_999_999 }).?;
+    const before_minute = formatUtcMinute(59).?;
     try std.testing.expectEqualStrings("1970-01-01 00:00Z", before_minute.text());
-    const next_minute = formatUtcMinute(.{ .nanoseconds = 60 * std.time.ns_per_s }).?;
+    const next_minute = formatUtcMinute(60).?;
     try std.testing.expectEqualStrings("1970-01-01 00:01Z", next_minute.text());
 
-    const leap = formatUtcMinute(.{ .nanoseconds = 951_827_640 * std.time.ns_per_s }).?;
+    const leap = formatUtcMinute(951_827_640).?;
     try std.testing.expectEqualStrings("2000-02-29 12:34Z", leap.text());
-    const upper = formatUtcMinute(.{
-        .nanoseconds = @as(i96, maximum_utc_second) * std.time.ns_per_s,
-    }).?;
+    const upper = formatUtcMinute(maximum_utc_second).?;
     try std.testing.expectEqualStrings("9999-12-31 23:59Z", upper.text());
 
-    try std.testing.expect(formatUtcMinute(.{ .nanoseconds = -1 }) == null);
-    try std.testing.expect(formatUtcMinute(.{
-        .nanoseconds = (@as(i96, maximum_utc_second) + 1) * std.time.ns_per_s,
-    }) == null);
+    try std.testing.expect(formatUtcMinute(-1) == null);
+    try std.testing.expect(formatUtcMinute(maximum_utc_second + 1) == null);
+
+    const committed = formatCommitFact(.{ .committed = 951_827_640 });
+    try std.testing.expectEqualStrings("commit 2000-02-29 12:34Z", committed.text());
+    try std.testing.expectEqual(@as(u8, 24), committed.width);
+    const uncommitted = formatCommitFact(.uncommitted);
+    try std.testing.expectEqualStrings("uncommitted", uncommitted.text());
+    const unavailable = formatCommitFact(.unavailable);
+    try std.testing.expectEqualStrings("commit —", unavailable.text());
+    try std.testing.expectEqual(@as(u8, 8), unavailable.width);
 }
 
 test "repository source header presentation measures escaped raw path" {
@@ -326,7 +370,7 @@ test "repository source header presentation measures escaped raw path" {
         "日本語\\\xff",
         null,
         .unavailable,
-        null,
+        .unavailable,
     );
     try std.testing.expectEqual(
         manifest.escapedDisplayWidth(presentation.raw_path),
@@ -340,37 +384,37 @@ test "repository source header layout removes metadata in approved priority orde
         "src/main.zig",
         .{ .current = 42, .total = 8713 },
         .modified,
-        .{ .nanoseconds = 951_827_640 * std.time.ns_per_s },
+        .{ .committed = 951_827_640 },
     );
 
     const wide = layout(80, presentation);
     try std.testing.expect(wide.line != null);
     try std.testing.expect(wide.git != null);
-    try std.testing.expect(wide.mtime != null);
+    try std.testing.expect(wide.commit != null);
     try std.testing.expectEqual(@as(u16, 1), wide.path_area.col);
     try std.testing.expect(wide.path_area.width >= minimum_path_width);
     try std.testing.expectEqual(@as(u16, 12), wide.path_target.?.width);
-    try std.testing.expectEqual(@as(u16, 79), wide.mtime.?.region.col + wide.mtime.?.region.width);
+    try std.testing.expectEqual(@as(u16, 79), wide.commit.?.region.col + wide.commit.?.region.width);
 
-    const without_mtime = layout(50, presentation);
-    try std.testing.expect(without_mtime.line != null);
-    try std.testing.expect(without_mtime.git != null);
-    try std.testing.expect(without_mtime.mtime == null);
+    const without_line = layout(50, presentation);
+    try std.testing.expect(without_line.line == null);
+    try std.testing.expect(without_line.git != null);
+    try std.testing.expect(without_line.commit != null);
 
-    const line_only = layout(29, presentation);
-    try std.testing.expect(line_only.line != null);
-    try std.testing.expect(line_only.git == null);
-    try std.testing.expect(line_only.mtime == null);
+    const git_only = layout(34, presentation);
+    try std.testing.expect(git_only.line == null);
+    try std.testing.expect(git_only.git != null);
+    try std.testing.expect(git_only.commit == null);
 
     const path_only = layout(19, presentation);
     try std.testing.expect(path_only.line == null);
     try std.testing.expect(path_only.git == null);
-    try std.testing.expect(path_only.mtime == null);
+    try std.testing.expect(path_only.commit == null);
     try std.testing.expectEqual(@as(u16, 17), path_only.path_area.width);
 }
 
 test "repository source header layout preserves path target and tiny bounds" {
-    const short = Presentation.init("a", null, .clean, null);
+    const short = Presentation.init("a", null, .clean, .unavailable);
     const wide = layout(40, short);
     try std.testing.expect(wide.git != null);
     try std.testing.expectEqual(@as(u16, 1), wide.path_target.?.width);
@@ -383,25 +427,26 @@ test "repository source header layout preserves path target and tiny bounds" {
     try std.testing.expectEqual(Region{ .col = 1, .width = 1 }, width_two.path_area);
     try std.testing.expectEqual(Region{ .col = 1, .width = 1 }, width_two.path_target.?);
 
-    const wide_first = Presentation.init("👩‍🚀x", null, .clean, null);
+    const wide_first = Presentation.init("👩‍🚀x", null, .clean, .unavailable);
     const width_three = layout(3, wide_first);
     try std.testing.expectEqual(@as(u16, 1), width_three.path_area.width);
     try std.testing.expect(width_three.path_target == null);
 
-    const empty = Presentation.init("", null, .clean, null);
+    const empty = Presentation.init("", null, .clean, .unavailable);
     try std.testing.expect(layout(40, empty).path_target == null);
 }
 
-test "repository source header layout omits unrepresentable mtime without dropping Git" {
+test "repository source header renders invalid timestamp as whole unavailable fact" {
     const presentation = Presentation.init(
         "src/main.zig",
         null,
         .unavailable,
-        .{ .nanoseconds = -1 },
+        .{ .committed = -1 },
     );
     const result = layout(80, presentation);
     try std.testing.expect(result.line == null);
     try std.testing.expect(result.git != null);
     try std.testing.expectEqual(GitState.unavailable, result.git.?.state);
-    try std.testing.expect(result.mtime == null);
+    try std.testing.expect(result.commit != null);
+    try std.testing.expectEqualStrings("commit —", result.commit.?.value.text());
 }

@@ -36,6 +36,7 @@ const diff_source = @import("../../diff/source.zig");
 const diff_view_model = @import("../../diff/view_model.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_refs = @import("../../git/refs.zig");
+const git_read = @import("../../git/read.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
 const git_status = @import("../../git/status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
@@ -133,6 +134,40 @@ test "system events keep previous ephemeral status" {
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 40 } }, undefined);
 
     try std.testing.expectEqualStrings("staged: src/app.zig", app.status.text());
+}
+
+test "Repository path history known unavailable and stale completions preserve primary diagnostics" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator, .active_page = .repository };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_session.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    for (0..2) |case| {
+        app.status.set("root diagnostic", .{});
+        app.pages.repository.status.set("Repository diagnostic", .{});
+        const outcome: git_read.RepositoryPathHistoryOutcome = if (case == 0)
+            .{ .known = .{
+                .head = .{ .oid = try allocator.dupe(u8, "0123456789abcdef0123456789abcdef01234567") },
+                .fact = .uncommitted,
+            } }
+        else
+            .unavailable;
+        try app.update(.{ .repository = .{ .path_history_finished = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 99, .activation_id = 88 },
+            .root_identity = .{ .device = 7, .inode = 6 },
+            .manifest_revision = 5,
+            .generation = 4,
+            .path = try allocator.dupe(u8, "stale.zig"),
+            .outcome = outcome,
+        } } }, &ctx);
+        try std.testing.expectEqualStrings("root diagnostic", app.status.text());
+        try std.testing.expectEqualStrings("Repository diagnostic", app.pages.repository.status.text());
+    }
+
+    try app.update(.{ .repository = .move_down }, &ctx);
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("", app.pages.repository.status.text());
 }
 
 test "git action spinner ticks keep previous ephemeral status" {

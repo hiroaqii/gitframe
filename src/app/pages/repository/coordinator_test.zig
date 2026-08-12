@@ -15,6 +15,7 @@ const repo_root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 
 const RepositoryBranchTask = repository_tasks.BranchTask(app_message.Msg);
+const RepositoryPathHistoryTask = repository_tasks.PathHistoryTask(app_message.Msg);
 const RepositoryDocumentTask = repository_tasks.DocumentTask(app_message.Msg);
 const RepositorySyntaxTask = repository_tasks.SyntaxTask(app_message.Msg);
 const RepositoryChangeMapTask = repository_tasks.ChangeMapTask(app_message.Msg);
@@ -110,6 +111,49 @@ test "Repository branch App route runs owned task and preserves primary status" 
     try std.testing.expectEqualStrings("main", app.pages.repository.branch.snapshot.status.branchName().?);
     try std.testing.expect(app.pages.repository.branch.freshness == .fresh);
     try std.testing.expect(app.pages.repository.branch.pending == null);
+    try std.testing.expectEqualStrings("Selected source range", app.pages.repository.status.text());
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+}
+
+test "Repository path history App route runs one task and preserves primary status" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try initializeRepositoryBranchAppRepoForTest(allocator, io, tmp.dir);
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+
+    var app: TestApp = .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .repo_session = .{ .repo_epoch = 3 },
+    };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+    app.pages.repository.branch.needs_revalidation = false;
+    app.pages.repository.selected_path = "tracked.txt";
+    app.pages.repository.manifest_revision = 7;
+    app.pages.repository.path_history.invalidate(allocator, true);
+    app.pages.repository.status.set("Selected source range", .{});
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
+
+    try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+    const queued = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    const task: *RepositoryPathHistoryTask = @ptrCast(@alignCast(queued[0].ctx));
+    try std.testing.expectEqualStrings("tracked.txt", task.request.path);
+    try std.testing.expectEqual(@as(u64, 7), task.request.manifest_revision);
+    try std.testing.expect(task.request.root.identity.eql(app.repo_session.view().activeIdentity().?));
+
+    const message = queued[0].run(queued[0].ctx, allocator, io);
+    try app.update(message, &ctx);
+
+    const presentation = app.pages.repository.sourceHeaderPresentation().?;
+    try std.testing.expect(presentation.commit_fact == .committed);
+    try std.testing.expect(app.pages.repository.path_history.terminal == .known);
     try std.testing.expectEqualStrings("Selected source range", app.pages.repository.status.text());
     try std.testing.expect(!ctx.redrawWasSuppressed());
     try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);

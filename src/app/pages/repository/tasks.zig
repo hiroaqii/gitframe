@@ -25,6 +25,7 @@ const repository_tree = @import("../../../repository/tree.zig");
 const source_syntax = @import("../../../syntax/source.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 const repository_branch = @import("branch.zig");
+const repository_path_history = @import("path_history.zig");
 
 pub const Bundle = struct {
     document: manifest.Document,
@@ -326,6 +327,82 @@ pub fn BranchTask(comptime AppMsg: type) type {
             return .{ .repository = .{ .branch_finished = finished } };
         }
     };
+}
+
+/// Repository current-path history task. Request/root/environment ownership is
+/// closed by one epilogue, while the raw path and typed backend outcome move
+/// together into the completion message.
+pub fn PathHistoryTask(comptime AppMsg: type) type {
+    return struct {
+        request: repository_path_history.Request,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const outcome = runRepositoryPathHistoryChecked(
+                task.request.root_path,
+                task.request.root,
+                task.request.path,
+                &task.environment,
+                allocator,
+                io,
+            );
+            return task.finish(allocator, outcome);
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .unavailable);
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.deinitOwned(allocator);
+        }
+
+        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            task.environment.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(
+            task: *@This(),
+            allocator: std.mem.Allocator,
+            outcome: git_read.RepositoryPathHistoryOutcome,
+        ) AppMsg {
+            defer task.deinitOwned(allocator);
+            const finished = repository_path_history.Finished{
+                .identity = task.request.identity,
+                .root_identity = task.request.root_identity,
+                .manifest_revision = task.request.manifest_revision,
+                .generation = task.request.generation,
+                .path = task.request.path,
+                .outcome = outcome,
+            };
+            task.request.path = &.{};
+            return .{ .repository = .{ .path_history_finished = finished } };
+        }
+    };
+}
+
+fn runRepositoryPathHistoryChecked(
+    root_path: []const u8,
+    root: root_capability.RootCapability,
+    path: []const u8,
+    environment: *const git_command.LocalGitEnvironment,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) git_read.RepositoryPathHistoryOutcome {
+    if (!root_capability.pathMatches(root_path, root.identity)) return .unavailable;
+    var outcome = git_read.loadRepositoryPathHistory(allocator, io, .{
+        .context = .{ .cwd = root.dir(), .environment = environment },
+        .path = path,
+    }) catch return .unavailable;
+    if (!root_capability.pathMatches(root_path, root.identity)) {
+        outcome.deinit(allocator);
+        return .unavailable;
+    }
+    return outcome;
 }
 
 const RepositoryBranchReadFn = *const fn (
@@ -967,6 +1044,7 @@ fn testingLocalGitEnvironment(allocator: std.mem.Allocator) !git_command.LocalGi
 const TaskTestRepositoryMsg = union(enum) {
     manifest_finished: ManifestFinished,
     branch_finished: repository_branch.Finished,
+    path_history_finished: repository_path_history.Finished,
     document_finished: DocumentFinished,
     syntax_finished: SyntaxFinished,
     change_map_finished: ChangeMapFinished,
@@ -975,6 +1053,7 @@ const TaskTestRepositoryMsg = union(enum) {
         switch (self.*) {
             .manifest_finished => |*finished| finished.deinit(allocator),
             .branch_finished => |*finished| finished.deinit(),
+            .path_history_finished => |*finished| finished.deinit(allocator),
             .document_finished => |*finished| finished.deinit(allocator),
             .syntax_finished => |*finished| finished.deinit(allocator),
             .change_map_finished => |*finished| finished.deinit(allocator),
@@ -1081,6 +1160,103 @@ test "Repository branch task failure callback preserves typed runtime ownership"
         },
         else => return error.ExpectedBranchCompletion,
     }
+}
+
+test "Repository path history task reads descriptor-owned current path and transfers completion" {
+    const allocator = std.testing.allocator;
+    var root = try TaskTestRoot.init();
+    defer root.deinit();
+    try initializeBranchTaskRepository(&root);
+    var environment = try testingLocalGitEnvironment(allocator);
+
+    const History = PathHistoryTask(TaskTestMsg);
+    const task = try allocator.create(History);
+    task.* = .{
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 3, .activation_id = 4 },
+            .root_identity = root.capability.identity,
+            .manifest_revision = 7,
+            .generation = 8,
+            .root_path = try allocator.dupe(u8, root.path),
+            .path = try allocator.dupe(u8, "tracked.txt"),
+            .root = try root.capability.duplicate(),
+        },
+        .environment = environment,
+    };
+    environment = undefined;
+    var message = History.run(task, allocator, std.testing.io);
+    defer message.repository.deinitUndelivered(allocator);
+    switch (message.repository) {
+        .path_history_finished => |finished| {
+            try std.testing.expect(root.capability.identity.eql(finished.root_identity));
+            try std.testing.expectEqual(@as(u64, 7), finished.manifest_revision);
+            try std.testing.expectEqualStrings("tracked.txt", finished.path);
+            try std.testing.expect(finished.outcome == .known);
+            try std.testing.expect(finished.outcome.known.fact == .committed);
+        },
+        else => return error.ExpectedPathHistoryCompletion,
+    }
+}
+
+test "Repository path history task runtime failure closes as owned unavailable completion" {
+    const allocator = std.testing.allocator;
+    var root = try TaskTestRoot.init();
+    defer root.deinit();
+    var environment = try testingLocalGitEnvironment(allocator);
+
+    const History = PathHistoryTask(TaskTestMsg);
+    const task = try allocator.create(History);
+    task.* = .{
+        .request = .{
+            .identity = .{ .origin = .repository, .repo_epoch = 1, .activation_id = 2 },
+            .root_identity = root.capability.identity,
+            .manifest_revision = 3,
+            .generation = 4,
+            .root_path = try allocator.dupe(u8, root.path),
+            .path = try allocator.dupe(u8, "missing.txt"),
+            .root = try root.capability.duplicate(),
+        },
+        .environment = environment,
+    };
+    environment = undefined;
+    var message = History.failed(task, .runtime_abandoned, allocator);
+    defer message.repository.deinitUndelivered(allocator);
+    switch (message.repository) {
+        .path_history_finished => |finished| try std.testing.expect(finished.outcome == .unavailable),
+        else => return error.ExpectedPathHistoryCompletion,
+    }
+}
+
+test "Repository path history command and root failures stay in auxiliary unavailable terminal" {
+    const allocator = std.testing.allocator;
+    var root = try TaskTestRoot.init();
+    defer root.deinit();
+    try initializeBranchTaskRepository(&root);
+
+    try root.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".git/HEAD", .data = "corrupt\n" });
+    var normal = try testingLocalGitEnvironment(allocator);
+    defer normal.deinit();
+    var command_failure = runRepositoryPathHistoryChecked(
+        root.path,
+        root.capability,
+        "tracked.txt",
+        &normal,
+        allocator,
+        std.testing.io,
+    );
+    defer command_failure.deinit(allocator);
+    try std.testing.expect(command_failure == .unavailable);
+
+    var root_failure = runRepositoryPathHistoryChecked(
+        "/not/the/descriptor/path",
+        root.capability,
+        "tracked.txt",
+        &normal,
+        allocator,
+        std.testing.io,
+    );
+    defer root_failure.deinit(allocator);
+    try std.testing.expect(root_failure == .unavailable);
 }
 
 test "repository tasks derive completion root identity from their descriptor" {

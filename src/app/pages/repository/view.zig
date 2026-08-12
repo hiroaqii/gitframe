@@ -524,7 +524,7 @@ pub fn drawSourceHeader(
             sourceHeaderGitStyle(field.state, palette),
         ) catch {};
     }
-    if (header_layout.mtime) |*field| {
+    if (header_layout.commit) |*field| {
         draw.copyClippedTextAt(
             surface,
             field.region.col,
@@ -914,7 +914,7 @@ test "repository source geometry handles narrow line-number transitions" {
 }
 
 fn sourceHeaderPresentationForTest(path: []const u8) source_header.Presentation {
-    return .init(path, null, .unavailable, null);
+    return .init(path, null, .unavailable, .unavailable);
 }
 
 test "repository source header renders path above a full fixed separator" {
@@ -953,12 +953,12 @@ test "repository source header renders typed metadata focus-stably" {
         "src/app/pages/repository.zig",
         .{ .current = 42, .total = 8713 },
         .modified,
-        .{ .nanoseconds = 951_827_640 * std.time.ns_per_s },
+        .{ .committed = 951_827_640 },
     );
     const expected_layout = source_header.layout(96, presentation);
     try std.testing.expect(expected_layout.line != null);
     try std.testing.expect(expected_layout.git != null);
-    try std.testing.expect(expected_layout.mtime != null);
+    try std.testing.expect(expected_layout.commit != null);
 
     var active: chasen.testing.TestSurface = undefined;
     try active.init(96, source_geometry.source_body_first_row);
@@ -975,13 +975,13 @@ test "repository source header renders typed metadata focus-stably" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/app/pages/repository.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 42/8713") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29 12:34Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit 2000-02-29 12:34Z") != null);
 
     const points = [_]struct { col: u16, role: theme.Role, bold: bool }{
         .{ .col = expected_layout.path_target.?.col, .role = .accent, .bold = true },
         .{ .col = expected_layout.line.?.region.col, .role = .muted, .bold = false },
         .{ .col = expected_layout.git.?.region.col, .role = .diff_modified, .bold = false },
-        .{ .col = expected_layout.mtime.?.region.col, .role = .muted, .bold = false },
+        .{ .col = expected_layout.commit.?.region.col, .role = .muted, .bold = false },
     };
     for (points) |point| {
         const active_cell = active.surface.readCell(point.col, source_geometry.source_path_row) orelse
@@ -1003,7 +1003,7 @@ test "repository source header highlights only the exact path target" {
         "src/main.zig",
         .{ .current = 2, .total = 20 },
         .modified,
-        .{ .nanoseconds = 951_827_640 * std.time.ns_per_s },
+        .{ .committed = 951_827_640 },
     );
     const expected = source_header.layout(72, presentation);
     const target = expected.path_target orelse return error.ExpectedPathTarget;
@@ -1036,7 +1036,7 @@ test "repository source header preserves semantic Git styles" {
         .{ .state = .unavailable, .role = .warning },
     };
     for (cases) |case| {
-        const presentation = source_header.Presentation.init("main.zig", null, case.state, null);
+        const presentation = source_header.Presentation.init("main.zig", null, case.state, .unavailable);
         const expected_layout = source_header.layout(40, presentation);
         var test_surface: chasen.testing.TestSurface = undefined;
         try test_surface.init(40, 1);
@@ -1054,7 +1054,7 @@ test "repository source header renderer follows adaptive omission regions" {
         "src/main.zig",
         .{ .current = 42, .total = 8713 },
         .modified,
-        .{ .nanoseconds = 951_827_640 * std.time.ns_per_s },
+        .{ .committed = 951_827_640 },
     );
 
     var medium: chasen.testing.TestSurface = undefined;
@@ -1063,9 +1063,9 @@ test "repository source header renderer follows adaptive omission regions" {
     try drawSourceHeader(&medium.surface, presentation, .{}, false, false, .default());
     const medium_snapshot = try medium.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(medium_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "Ln 42/8713") != null);
+    try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "Ln 42/8713") == null);
     try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "modified") != null);
-    try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "2000-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "commit 2000-") != null);
 
     var narrow: chasen.testing.TestSurface = undefined;
     try narrow.init(29, 1);
@@ -1073,8 +1073,8 @@ test "repository source header renderer follows adaptive omission regions" {
     try drawSourceHeader(&narrow.surface, presentation, .{}, false, false, .default());
     const narrow_snapshot = try narrow.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(narrow_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "Ln 42/8713") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "modified") == null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "Ln 42/8713") == null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "modified") != null);
     try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "2000-") == null);
 }
 
@@ -2467,7 +2467,7 @@ test "repository root renders without disclosure and activation preserves opened
     try std.testing.expect(std.mem.indexOf(u8, after_root_snapshot, "Loading selected file") != null);
 }
 
-test "repository source header page view renders and withdraws exact document facts" {
+test "repository source header page view keeps filesystem metadata outside commit history" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
     defer state.deinit(allocator);
@@ -2489,7 +2489,8 @@ test "repository source header page view renders and withdraws exact document fa
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "main.zig") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 2/2") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29 12:34Z") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29 12:34Z") == null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit —") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "second") != null);
     }
 
@@ -2527,6 +2528,7 @@ test "repository source header page view renders and withdraws exact document fa
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 2/2") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29") == null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit —") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "second") != null);
     }

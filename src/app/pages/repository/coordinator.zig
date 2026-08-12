@@ -2,7 +2,7 @@
 //!
 //! This short-lived controller owns no retained state. It translates page
 //! updates into typed shell effects and closes every allocation/spawn terminal
-//! for the five Repository read members without access to the root App.
+//! for the six Repository read members without access to the root App.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -16,6 +16,7 @@ const repository_tasks = @import("tasks.zig");
 
 const ManifestTask = repository_tasks.ManifestTask(app_message.Msg);
 const BranchTask = repository_tasks.BranchTask(app_message.Msg);
+const PathHistoryTask = repository_tasks.PathHistoryTask(app_message.Msg);
 const DocumentTask = repository_tasks.DocumentTask(app_message.Msg);
 const SyntaxTask = repository_tasks.SyntaxTask(app_message.Msg);
 const ChangeMapTask = repository_tasks.ChangeMapTask(app_message.Msg);
@@ -74,12 +75,18 @@ pub const Controller = struct {
             .branch_finished => |finished| {
                 var owned = finished;
                 defer owned.deinit();
-                const outcome = self.page_state.applyBranchFinished(&owned);
+                const outcome = self.page_state.applyBranchFinished(ctx.allocator(), &owned);
                 const quiet = self.active_page != .repository or switch (outcome) {
                     .changed, .failed => false,
                     .discarded, .unchanged => true,
                 };
                 return .{ .redraw = if (quiet) .skip else .default };
+            },
+            .path_history_finished => |finished| {
+                var owned = finished;
+                defer owned.deinit(ctx.allocator());
+                const outcome = self.page_state.applyPathHistoryFinished(ctx.allocator(), &owned);
+                return .{ .redraw = if (self.active_page != .repository or outcome == .discarded) .skip else .default };
             },
             .document_finished => |finished| {
                 var owned = finished;
@@ -130,6 +137,7 @@ pub const Controller = struct {
     pub fn startPending(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         try self.maybeStartManifest(ctx);
         self.maybeStartBranch(ctx);
+        self.maybeStartPathHistory(ctx);
         try self.maybeStartDocument(ctx);
         try self.maybeStartSyntax(ctx);
         self.maybeStartChangeMap(ctx);
@@ -226,6 +234,43 @@ pub const Controller = struct {
         ctx.task().spawnWith(.{ .ctx = task, .run = BranchTask.run, .failed = BranchTask.failed }) catch {
             task.destroy(ctx.allocator());
             self.page_state.rejectBranchSpawn(generation);
+        };
+    }
+
+    fn maybeStartPathHistory(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) void {
+        if (self.active_page != .repository or !self.page_state.wantsPathHistoryRequest()) return;
+        const repo_root = self.repo.activeRoot() orelse {
+            self.page_state.markPathHistoryRequestPreparationFailed();
+            return;
+        };
+        const capability = self.repo.activeCapability() orelse {
+            self.page_state.markPathHistoryRequestPreparationFailed();
+            return;
+        };
+
+        var request = self.page_state.preparePathHistoryRequest(ctx.allocator(), repo_root, capability) catch {
+            self.page_state.markPathHistoryRequestPreparationFailed();
+            return;
+        };
+        var request_consumed = false;
+        defer if (!request_consumed) request.deinit(ctx.allocator());
+        const generation = request.generation;
+        var environment = git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map) catch {
+            self.page_state.rejectPathHistorySpawn(generation);
+            return;
+        };
+        var environment_consumed = false;
+        defer if (!environment_consumed) environment.deinit();
+        const task = ctx.allocator().create(PathHistoryTask) catch {
+            self.page_state.rejectPathHistorySpawn(generation);
+            return;
+        };
+        task.* = .{ .request = request, .environment = environment };
+        request_consumed = true;
+        environment_consumed = true;
+        ctx.task().spawnWith(.{ .ctx = task, .run = PathHistoryTask.run, .failed = PathHistoryTask.failed }) catch {
+            task.destroy(ctx.allocator());
+            self.page_state.rejectPathHistorySpawn(generation);
         };
     }
 

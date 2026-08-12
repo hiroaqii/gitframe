@@ -146,6 +146,349 @@ pub const StagedDiffResult = union(enum) {
     }
 };
 
+pub const HeadBasis = union(enum) {
+    oid: []u8,
+    unborn,
+
+    pub fn deinit(self: *HeadBasis, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .oid => |oid| allocator.free(oid),
+            .unborn => {},
+        }
+        self.* = .unborn;
+    }
+
+    pub fn eql(left: HeadBasis, right: HeadBasis) bool {
+        if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+        return switch (left) {
+            .oid => |oid| std.mem.eql(u8, oid, right.oid),
+            .unborn => true,
+        };
+    }
+};
+
+pub const RepositoryPathHistoryFact = union(enum) {
+    committed: i64,
+    uncommitted,
+};
+
+pub const RepositoryPathHistoryKnown = struct {
+    /// A positive fact is intentionally impossible to represent without the
+    /// exact HEAD observation against which it was classified.
+    head: HeadBasis,
+    fact: RepositoryPathHistoryFact,
+
+    pub fn deinit(self: *RepositoryPathHistoryKnown, allocator: std.mem.Allocator) void {
+        self.head.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const RepositoryPathHistoryOutcome = union(enum) {
+    known: RepositoryPathHistoryKnown,
+    unavailable,
+
+    pub fn deinit(self: *RepositoryPathHistoryOutcome, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .known => |*known| known.deinit(allocator),
+            .unavailable => {},
+        }
+        self.* = .unavailable;
+    }
+};
+
+pub const RepositoryPathHistoryRequest = struct {
+    context: git_command.DirectoryContext,
+    /// Byte-exact repository-relative path. It is passed only as one argv item
+    /// after `--`; this API performs no display conversion or rename following.
+    path: []const u8,
+};
+
+const path_history_stdout_limit = 16 * 1024;
+const path_history_stderr_limit = 64 * 1024;
+const maximum_utc_second: i64 = 253_402_300_799;
+
+/// Classifies the exact current path before consulting history, then proves
+/// that HEAD did not move across the complete query. Mechanical failures are
+/// returned to the caller, which owns the page-local unavailable terminal;
+/// ambiguous Git state is represented directly as `.unavailable`.
+pub fn loadRepositoryPathHistory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: RepositoryPathHistoryRequest,
+) git_command.Error!RepositoryPathHistoryOutcome {
+    return loadRepositoryPathHistoryWithHook(allocator, io, request, null);
+}
+
+const BeforeHeadRecheckHook = struct {
+    context: *anyopaque,
+    run: *const fn (*anyopaque) void,
+};
+
+fn loadRepositoryPathHistoryWithHook(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: RepositoryPathHistoryRequest,
+    before_head_recheck: ?BeforeHeadRecheckHook,
+) git_command.Error!RepositoryPathHistoryOutcome {
+    var before = (try readHeadBasis(allocator, io, request.context)) orelse return .unavailable;
+    var before_moved = false;
+    defer if (!before_moved) before.deinit(allocator);
+
+    const in_head = switch (before) {
+        .oid => |oid| (try pathInHeadTree(allocator, io, request.context, oid, request.path)) orelse
+            return .unavailable,
+        .unborn => false,
+    };
+    const in_index = (try exactPathPresence(
+        allocator,
+        io,
+        request.context,
+        &.{ "git", "--no-optional-locks", "--literal-pathspecs", "ls-files", "-z", "--cached", "--", request.path },
+        request.path,
+    )) orelse return .unavailable;
+    const untracked = (try exactPathPresence(
+        allocator,
+        io,
+        request.context,
+        &.{ "git", "--no-optional-locks", "--literal-pathspecs", "ls-files", "-z", "--others", "--exclude-standard", "--", request.path },
+        request.path,
+    )) orelse return .unavailable;
+    if (in_index and untracked) return .unavailable;
+
+    const fact: RepositoryPathHistoryFact = switch (classifyCurrentPath(in_head, in_index, untracked)) {
+        .uncommitted => .uncommitted,
+        .history => .{ .committed = (try lastCommitTimestamp(
+            allocator,
+            io,
+            request.context,
+            before.oid,
+            request.path,
+        )) orelse return .unavailable },
+        .unavailable => return .unavailable,
+    };
+
+    if (before_head_recheck) |hook| hook.run(hook.context);
+    var after = (try readHeadBasis(allocator, io, request.context)) orelse return .unavailable;
+    defer after.deinit(allocator);
+    if (!before.eql(after)) return .unavailable;
+
+    before_moved = true;
+    return .{ .known = .{ .head = before, .fact = fact } };
+}
+
+fn readHeadBasis(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+) git_command.Error!?HeadBasis {
+    const oid_result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-optional-locks", "rev-parse", "--verify", "HEAD" },
+    );
+    defer oid_result.deinit(allocator);
+    if (exitedWith(oid_result.term, 0)) {
+        const oid = exactLine(oid_result.stdout) orelse return null;
+        if (!validObjectId(oid)) return null;
+        return .{ .oid = allocator.dupe(u8, oid) catch return error.OutOfMemory };
+    }
+
+    const symbolic_result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-optional-locks", "symbolic-ref", "-q", "HEAD" },
+    );
+    defer symbolic_result.deinit(allocator);
+    if (!exitedWith(symbolic_result.term, 0)) return null;
+    const reference = exactLine(symbolic_result.stdout) orelse return null;
+    if (!std.mem.startsWith(u8, reference, "refs/") or reference.len <= "refs/".len) return null;
+
+    const ref_result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-optional-locks", "show-ref", "--verify", "--quiet", reference },
+    );
+    defer ref_result.deinit(allocator);
+    if (!exitedWith(ref_result.term, 1) or ref_result.stdout.len != 0) return null;
+    return .unborn;
+}
+
+fn pathInHeadTree(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    oid: []const u8,
+    path: []const u8,
+) git_command.Error!?bool {
+    const result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-optional-locks", "--literal-pathspecs", "ls-tree", "-z", oid, "--", path },
+    );
+    defer result.deinit(allocator);
+    if (!exitedWith(result.term, 0) or result.stderr.len != 0) return null;
+    if (result.stdout.len == 0) return false;
+    if (result.stdout[result.stdout.len - 1] != 0 or
+        std.mem.indexOfScalar(u8, result.stdout[0 .. result.stdout.len - 1], 0) != null)
+    {
+        return null;
+    }
+    const record = result.stdout[0 .. result.stdout.len - 1];
+    const tab = std.mem.indexOfScalar(u8, record, '\t') orelse return null;
+    if (tab == 0 or !std.mem.eql(u8, record[tab + 1 ..], path)) return null;
+    var fields = std.mem.tokenizeScalar(u8, record[0..tab], ' ');
+    const mode = fields.next() orelse return null;
+    const kind = fields.next() orelse return null;
+    const object_id = fields.next() orelse return null;
+    if (fields.next() != null or mode.len != 6 or
+        !(std.mem.eql(u8, kind, "blob") or std.mem.eql(u8, kind, "commit")) or
+        !validObjectId(object_id)) return null;
+    for (mode) |byte| if (byte < '0' or byte > '7') return null;
+    return true;
+}
+
+fn exactPathPresence(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    argv: []const []const u8,
+    path: []const u8,
+) git_command.Error!?bool {
+    const result = try runPathHistoryCommand(allocator, io, context, argv);
+    defer result.deinit(allocator);
+    if (!exitedWith(result.term, 0) or result.stderr.len != 0) return null;
+    if (result.stdout.len == 0) return false;
+    if (result.stdout.len != path.len + 1 or result.stdout[result.stdout.len - 1] != 0) return null;
+    return std.mem.eql(u8, result.stdout[0..path.len], path);
+}
+
+fn lastCommitTimestamp(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    head_oid: []const u8,
+    path: []const u8,
+) git_command.Error!?i64 {
+    const result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-pager", "--no-optional-locks", "--literal-pathspecs", "log", "--no-color", "--no-follow", "-1", "--format=%H%x00%ct", head_oid, "--", path },
+    );
+    defer result.deinit(allocator);
+    if (!exitedWith(result.term, 0) or result.stderr.len != 0) return null;
+    const line = exactLine(result.stdout) orelse return null;
+    const parsed = parseHistoryRecord(line) orelse return null;
+
+    const shallow_result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-optional-locks", "rev-parse", "--is-shallow-repository" },
+    );
+    defer shallow_result.deinit(allocator);
+    if (!exitedWith(shallow_result.term, 0) or shallow_result.stderr.len != 0) return null;
+    const shallow = exactLine(shallow_result.stdout) orelse return null;
+    if (std.mem.eql(u8, shallow, "true")) {
+        if (!(try commitHasLocallyVisibleParent(allocator, io, context, parsed.oid))) return null;
+    } else if (!std.mem.eql(u8, shallow, "false")) {
+        return null;
+    }
+    return parsed.timestamp;
+}
+
+const CurrentPathClass = enum { history, uncommitted, unavailable };
+
+fn classifyCurrentPath(in_head: bool, in_index: bool, untracked: bool) CurrentPathClass {
+    if (in_index and untracked) return .unavailable;
+    if (!in_head and (in_index or untracked)) return .uncommitted;
+    if (in_head and !in_index and untracked) return .uncommitted;
+    if (in_head and in_index) return .history;
+    return .unavailable;
+}
+
+const ParsedHistoryRecord = struct { oid: []const u8, timestamp: i64 };
+
+fn parseHistoryRecord(line: []const u8) ?ParsedHistoryRecord {
+    const separator = std.mem.indexOfScalar(u8, line, 0) orelse return null;
+    if (std.mem.indexOfScalarPos(u8, line, separator + 1, 0) != null) return null;
+    const oid = line[0..separator];
+    if (!validObjectId(oid)) return null;
+    const timestamp = std.fmt.parseInt(i64, line[separator + 1 ..], 10) catch return null;
+    if (timestamp < 0 or timestamp > maximum_utc_second) return null;
+    return .{ .oid = oid, .timestamp = timestamp };
+}
+
+fn commitHasLocallyVisibleParent(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    commit_oid: []const u8,
+) git_command.Error!bool {
+    const result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-optional-locks", "rev-list", "--parents", "-n", "1", commit_oid },
+    );
+    defer result.deinit(allocator);
+    if (!exitedWith(result.term, 0) or result.stderr.len != 0) return false;
+    const line = exactLine(result.stdout) orelse return false;
+    var words = std.mem.tokenizeScalar(u8, line, ' ');
+    const commit = words.next() orelse return false;
+    if (!std.mem.eql(u8, commit, commit_oid)) return false;
+    const parent = words.next() orelse return false;
+    if (!validObjectId(parent)) return false;
+
+    const parent_result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-optional-locks", "cat-file", "-e", parent },
+    );
+    defer parent_result.deinit(allocator);
+    return exitedWith(parent_result.term, 0) and
+        parent_result.stdout.len == 0 and parent_result.stderr.len == 0;
+}
+
+fn runPathHistoryCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    argv: []const []const u8,
+) git_command.Error!process_runner.Result {
+    return git_command.runCaptured(allocator, io, context, .{
+        .argv = argv,
+        .stdout_limit = .limited(path_history_stdout_limit),
+        .stderr_limit = .limited(path_history_stderr_limit),
+    });
+}
+
+fn exitedWith(term: std.process.Child.Term, expected: u8) bool {
+    return switch (term) {
+        .exited => |code| code == expected,
+        else => false,
+    };
+}
+
+fn exactLine(bytes: []const u8) ?[]const u8 {
+    if (bytes.len < 2 or bytes[bytes.len - 1] != '\n') return null;
+    const line = bytes[0 .. bytes.len - 1];
+    if (std.mem.indexOfScalar(u8, line, '\n') != null or std.mem.indexOfScalar(u8, line, '\r') != null) return null;
+    return line;
+}
+
+fn validObjectId(oid: []const u8) bool {
+    if (oid.len != 40 and oid.len != 64) return false;
+    for (oid) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}
+
 const git_diff_unstaged = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
 const git_diff_cached = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
 const foreground_status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
@@ -796,4 +1139,252 @@ test "no-index diff treats exit one as success only with diff output" {
     try std.testing.expect(!isNoIndexSuccess(.{ .exited = 1 }, 0));
     try std.testing.expect(!isNoIndexSuccess(.{ .exited = 2 }, 1));
     try std.testing.expect(!isNoIndexSuccess(.{ .unknown = 9 }, 1));
+}
+
+fn runTestGitWithDates(
+    io: std.Io,
+    cwd: std.Io.Dir,
+    message: []const u8,
+    author_date: []const u8,
+    committer_date: []const u8,
+) !void {
+    var environment = try std.testing.environ.createMap(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("GIT_AUTHOR_DATE", author_date);
+    try environment.put("GIT_COMMITTER_DATE", committer_date);
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{
+            "git",
+            "-c",
+            "user.name=Path History Test",
+            "-c",
+            "user.email=path-history@example.invalid",
+            "commit",
+            "-m",
+            message,
+        },
+        .cwd = .{ .dir = cwd },
+        .environ_map = &environment,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer {
+        std.testing.allocator.free(result.stdout);
+        std.testing.allocator.free(result.stderr);
+    }
+    if (!exitedWith(result.term, 0)) return error.GitCommandFailed;
+}
+
+fn loadPathHistoryForTest(cwd: std.Io.Dir, path: []const u8) !RepositoryPathHistoryOutcome {
+    var environment = try testingLocalGitEnvironment(std.testing.allocator);
+    defer environment.deinit();
+    return loadRepositoryPathHistory(std.testing.allocator, std.testing.io, .{
+        .context = .{ .cwd = cwd, .environment = &environment },
+        .path = path,
+    });
+}
+
+fn expectCommittedPath(cwd: std.Io.Dir, path: []const u8, expected: i64) !void {
+    var outcome = try loadPathHistoryForTest(cwd, path);
+    defer outcome.deinit(std.testing.allocator);
+    switch (outcome) {
+        .known => |known| {
+            try std.testing.expect(known.head == .oid);
+            switch (known.fact) {
+                .committed => |timestamp| try std.testing.expectEqual(expected, timestamp),
+                .uncommitted => return error.ExpectedCommittedPath,
+            }
+        },
+        .unavailable => return error.ExpectedCommittedPath,
+    }
+}
+
+fn expectUncommittedPath(cwd: std.Io.Dir, path: []const u8, expected_head: std.meta.Tag(HeadBasis)) !void {
+    var outcome = try loadPathHistoryForTest(cwd, path);
+    defer outcome.deinit(std.testing.allocator);
+    switch (outcome) {
+        .known => |known| {
+            try std.testing.expectEqual(expected_head, std.meta.activeTag(known.head));
+            try std.testing.expect(known.fact == .uncommitted);
+        },
+        .unavailable => return error.ExpectedUncommittedPath,
+    }
+}
+
+fn expectUnavailablePath(cwd: std.Io.Dir, path: []const u8) !void {
+    var outcome = try loadPathHistoryForTest(cwd, path);
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(outcome == .unavailable);
+}
+
+test "repository path history classification prioritizes current exact path state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+
+    const magic_path = ":(glob)literal[1].txt";
+    const invalid_path = "invalid-\xff.txt";
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "tracked base\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "history.txt", .data = "old history\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "cached.txt", .data = "cached base\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "rename-old.txt", .data = "rename base\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pending-old.txt", .data = "pending rename\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "-leading.txt", .data = "leading\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = magic_path, .data = "magic\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = invalid_path, .data = "invalid\n" });
+    try runTestGit(io, &.{ "git", "--literal-pathspecs", "add", "--", "tracked.txt", "history.txt", "cached.txt", "rename-old.txt", "pending-old.txt", "-leading.txt", magic_path, invalid_path }, tmp.dir);
+    try runTestGitWithDates(io, tmp.dir, "base", "@946684800 +0000", "@951827640 +0000");
+
+    try runTestGit(io, &.{ "git", "rm", "--", "history.txt" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "mv", "--", "rename-old.txt", "rename-new.txt" }, tmp.dir);
+    try runTestGitWithDates(io, tmp.dir, "delete and rename", "@951827650 +0000", "@951827700 +0000");
+    try runTestGit(io, &.{ "git", "mv", "--", "pending-old.txt", "pending-new.txt" }, tmp.dir);
+
+    // A filesystem/content change does not alter the Git-history fact.
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "tracked modified later\n" });
+    try expectCommittedPath(tmp.dir, "tracked.txt", 951_827_640);
+    try expectCommittedPath(tmp.dir, "rename-new.txt", 951_827_700);
+    try expectCommittedPath(tmp.dir, "-leading.txt", 951_827_640);
+    try expectCommittedPath(tmp.dir, magic_path, 951_827_640);
+    try expectCommittedPath(tmp.dir, invalid_path, 951_827_640);
+
+    // Every case below has old or potential history, but current state wins.
+    try tmp.dir.writeFile(io, .{ .sub_path = "history.txt", .data = "recreated\n" });
+    try runTestGit(io, &.{ "git", "rm", "--cached", "--", "cached.txt" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "untracked.txt", .data = "new\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "intent.txt", .data = "intent\n" });
+    try runTestGit(io, &.{ "git", "add", "-N", "--", "intent.txt" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "index-only.txt", .data = "index\n" });
+    try runTestGit(io, &.{ "git", "add", "--", "index-only.txt" }, tmp.dir);
+    try tmp.dir.deleteFile(io, "index-only.txt");
+
+    try expectUncommittedPath(tmp.dir, "history.txt", .oid);
+    try expectUncommittedPath(tmp.dir, "cached.txt", .oid);
+    try expectUncommittedPath(tmp.dir, "untracked.txt", .oid);
+    try expectUncommittedPath(tmp.dir, "intent.txt", .oid);
+    try expectUncommittedPath(tmp.dir, "index-only.txt", .oid);
+    try expectUncommittedPath(tmp.dir, "pending-new.txt", .oid);
+}
+
+test "repository path history handles unborn ignored and corrupt HEAD without fabricated facts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "new.txt", .data = "new\n" });
+    try expectUncommittedPath(tmp.dir, "new.txt", .unborn);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "ignored.txt\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ignored.txt", .data = "ignored\n" });
+    try expectUnavailablePath(tmp.dir, "ignored.txt");
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "not a valid HEAD\n" });
+    try expectUnavailablePath(tmp.dir, "new.txt");
+}
+
+test "repository path history parsers reject ambiguous state and malformed timestamps" {
+    try std.testing.expectEqual(CurrentPathClass.history, classifyCurrentPath(true, true, false));
+    try std.testing.expectEqual(CurrentPathClass.uncommitted, classifyCurrentPath(false, true, false));
+    try std.testing.expectEqual(CurrentPathClass.uncommitted, classifyCurrentPath(false, false, true));
+    try std.testing.expectEqual(CurrentPathClass.uncommitted, classifyCurrentPath(true, false, true));
+    try std.testing.expectEqual(CurrentPathClass.unavailable, classifyCurrentPath(true, false, false));
+    try std.testing.expectEqual(CurrentPathClass.unavailable, classifyCurrentPath(false, false, false));
+    try std.testing.expectEqual(CurrentPathClass.unavailable, classifyCurrentPath(true, true, true));
+
+    const oid = "0123456789abcdef0123456789abcdef01234567";
+    try std.testing.expectEqual(@as(i64, 42), parseHistoryRecord(oid ++ "\x0042").?.timestamp);
+    try std.testing.expect(parseHistoryRecord(oid ++ "\x00-1") == null);
+    try std.testing.expect(parseHistoryRecord(oid ++ "\x00253402300800") == null);
+    try std.testing.expect(parseHistoryRecord(oid ++ "\x009223372036854775808") == null);
+    try std.testing.expect(parseHistoryRecord(oid ++ "\x0042\x00extra") == null);
+    try std.testing.expect(parseHistoryRecord("bad\x0042") == null);
+
+    const fields = @typeInfo(RepositoryPathHistoryKnown).@"struct".fields;
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expect(fields[0].type == HeadBasis);
+}
+
+test "repository path history accepts recent shallow commit and rejects shallow boundary" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "source", .default_dir);
+    var source = try tmp.dir.openDir(io, "source", .{});
+    defer source.close(io);
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, source);
+    try source.writeFile(io, .{ .sub_path = "tracked.txt", .data = "one\n" });
+    try runTestGit(io, &.{ "git", "add", "tracked.txt" }, source);
+    try runTestGitWithDates(io, source, "root", "@951827500 +0000", "@951827500 +0000");
+    try source.writeFile(io, .{ .sub_path = "other.txt", .data = "two\n" });
+    try runTestGit(io, &.{ "git", "add", "other.txt" }, source);
+    try runTestGitWithDates(io, source, "parent", "@951827600 +0000", "@951827600 +0000");
+    try source.writeFile(io, .{ .sub_path = "tracked.txt", .data = "three\n" });
+    try runTestGit(io, &.{ "git", "add", "tracked.txt" }, source);
+    try runTestGitWithDates(io, source, "latest", "@951827700 +0000", "@951827700 +0000");
+
+    const source_path = try tmp.dir.realPathFileAlloc(io, "source", allocator);
+    defer allocator.free(source_path);
+    const source_url = try std.fmt.allocPrint(allocator, "file://{s}", .{source_path});
+    defer allocator.free(source_url);
+    try runTestGit(io, &.{ "git", "clone", "--depth=2", source_url, "recent" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "clone", "--depth=1", source_url, "boundary" }, tmp.dir);
+    var recent = try tmp.dir.openDir(io, "recent", .{});
+    defer recent.close(io);
+    var boundary = try tmp.dir.openDir(io, "boundary", .{});
+    defer boundary.close(io);
+
+    try expectCommittedPath(recent, "tracked.txt", 951_827_700);
+    try expectUnavailablePath(boundary, "tracked.txt");
+}
+
+const HeadMoveTestHook = struct {
+    cwd: std.Io.Dir,
+    target_oid: []const u8,
+    failed: bool = false,
+
+    fn run(raw: *anyopaque) void {
+        const self: *HeadMoveTestHook = @ptrCast(@alignCast(raw));
+        runTestGit(std.testing.io, &.{ "git", "update-ref", "HEAD", self.target_oid }, self.cwd) catch {
+            self.failed = true;
+        };
+    }
+};
+
+test "repository path history rejects HEAD movement across the query" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "base\n" });
+    try runTestGit(io, &.{ "git", "add", "tracked.txt" }, tmp.dir);
+    try runTestGitWithDates(io, tmp.dir, "base", "@951827600 +0000", "@951827600 +0000");
+    const old_output = try gitOutputAlloc(io, tmp.dir, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(old_output);
+    const old_oid = trimLineEnd(old_output);
+    try tmp.dir.writeFile(io, .{ .sub_path = "successor.txt", .data = "successor\n" });
+    try runTestGit(io, &.{ "git", "add", "successor.txt" }, tmp.dir);
+    try runTestGitWithDates(io, tmp.dir, "successor", "@951827700 +0000", "@951827700 +0000");
+    const new_output = try gitOutputAlloc(io, tmp.dir, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(new_output);
+    const new_oid = trimLineEnd(new_output);
+    try runTestGit(io, &.{ "git", "reset", "--hard", old_oid }, tmp.dir);
+
+    var environment = try testingLocalGitEnvironment(allocator);
+    defer environment.deinit();
+    var hook = HeadMoveTestHook{ .cwd = tmp.dir, .target_oid = new_oid };
+    var outcome = try loadRepositoryPathHistoryWithHook(
+        allocator,
+        io,
+        .{
+            .context = .{ .cwd = tmp.dir, .environment = &environment },
+            .path = "tracked.txt",
+        },
+        .{ .context = &hook, .run = HeadMoveTestHook.run },
+    );
+    defer outcome.deinit(allocator);
+    try std.testing.expect(!hook.failed);
+    try std.testing.expect(outcome == .unavailable);
 }

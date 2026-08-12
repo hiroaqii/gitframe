@@ -12,6 +12,7 @@ const page = @import("../page.zig");
 const page_link = @import("../page_link.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
 const git_command = @import("../../git/command.zig");
+const git_read = @import("../../git/read.zig");
 const process_runner = @import("../../process/runner.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const selected_document = @import("../../repository/document.zig");
@@ -23,6 +24,7 @@ const repository_tree = @import("../../repository/tree.zig");
 const source_syntax = @import("../../syntax/source.zig");
 const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
 const repository_branch = @import("repository/branch.zig");
+const repository_path_history = @import("repository/path_history.zig");
 const repository_tasks = @import("repository/tasks.zig");
 const repository_input = @import("repository/input.zig");
 const repository_file_search_focus = @import("repository/file_search_focus.zig");
@@ -103,6 +105,7 @@ pub const ChangeDecoration = union(enum) {
 pub const Msg = union(enum) {
     manifest_finished: repository_tasks.ManifestFinished,
     branch_finished: repository_branch.Finished,
+    path_history_finished: repository_path_history.Finished,
     document_finished: repository_tasks.DocumentFinished,
     syntax_finished: repository_tasks.SyntaxFinished,
     change_map_finished: repository_tasks.ChangeMapFinished,
@@ -160,6 +163,7 @@ pub const Msg = union(enum) {
         switch (self.*) {
             .manifest_finished => |*finished| finished.deinit(allocator),
             .branch_finished => |*finished| finished.deinit(),
+            .path_history_finished => |*finished| finished.deinit(allocator),
             .document_finished => |*finished| finished.deinit(allocator),
             .syntax_finished => |*finished| finished.deinit(allocator),
             .change_map_finished => |*finished| finished.deinit(allocator),
@@ -215,6 +219,9 @@ pub const RepositoryPageState = struct {
     /// Independent read-only branch owner. It shares neither Review's
     /// freshness nor Repository's primary manifest/status diagnostic slot.
     branch: repository_branch.State = .{},
+    /// Independent current-selection Git-history owner. It never borrows the
+    /// document snapshot or writes Repository's primary diagnostic.
+    path_history: repository_path_history.State = .{},
     generation: u64 = 0,
     pending_generation: ?u64 = null,
     manifest_revision: u64 = 0,
@@ -301,6 +308,7 @@ pub const RepositoryPageState = struct {
 
     pub fn deinit(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
         self.branch.deinit();
+        self.path_history.deinit(allocator);
         self.clearFileSearchDocumentAuthority();
         self.incoming.deinit(allocator);
         self.cancelMouseOwner();
@@ -321,6 +329,7 @@ pub const RepositoryPageState = struct {
         if (self.repo_epoch != repo_epoch) self.repo_epoch = repo_epoch;
         self.root_identity = identity;
         self.branch.activate(self.repo_epoch, identity);
+        self.path_history.retire(identity != null and self.selected_path != null);
         self.pending_generation = null;
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -349,6 +358,7 @@ pub const RepositoryPageState = struct {
         self.file_search_source_focus.clear();
         self.cancelMouseOwner();
         self.active = false;
+        self.path_history.retire(false);
         if (self.bundle != null) self.freshness = .validating;
     }
 
@@ -401,6 +411,10 @@ pub const RepositoryPageState = struct {
         self.repo_epoch = repo_epoch;
         self.root_identity = identity;
         self.branch.repositoryChanged(self.active, identity);
+        if (allocator) |owner|
+            self.path_history.invalidate(owner, false)
+        else
+            self.path_history.retire(false);
         self.status.clear();
         self.load_state = if (identity != null) .idle else .no_repository;
         self.freshness = if (identity != null) .validating else .unavailable;
@@ -514,6 +528,7 @@ pub const RepositoryPageState = struct {
 
         if (!optionalPathEql(self.selected_path, exact_path)) {
             self.clearFileSearchDocumentAuthority();
+            self.path_history.invalidate(allocator, true);
         }
         self.selected_path = exact_path;
         self.viewer.tree_cursor = visible_index;
@@ -675,6 +690,7 @@ pub const RepositoryPageState = struct {
         // fallible request preparation has succeeded below.
         self.file_search_source_focus.clear();
         self.invalidateDisplayedDocumentAuthority();
+        self.path_history.retire(false);
         const owned_root = try allocator.dupe(u8, repo_root);
         errdefer allocator.free(owned_root);
         var root = try capability.duplicate();
@@ -734,9 +750,10 @@ pub const RepositoryPageState = struct {
 
     pub fn applyBranchFinished(
         self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
         finished: *repository_branch.Finished,
     ) repository_branch.ApplyOutcome {
-        return self.branch.applyFinished(
+        const outcome = self.branch.applyFinished(
             .{
                 .origin = .repository,
                 .repo_epoch = self.repo_epoch,
@@ -744,6 +761,87 @@ pub const RepositoryPageState = struct {
             },
             self.root_identity,
             self.active,
+            finished,
+        );
+        switch (outcome) {
+            .changed, .unchanged => if (self.freshBranchBasis()) |basis| {
+                if (self.path_history.reconcileFreshBranchBasis(
+                    allocator,
+                    basis,
+                    self.active and self.selected_path != null,
+                )) return .changed;
+            },
+            .discarded, .failed => {},
+        }
+        return outcome;
+    }
+
+    fn requestIdentity(self: *const RepositoryPageState) page.RequestIdentity {
+        return .{
+            .origin = .repository,
+            .repo_epoch = self.repo_epoch,
+            .activation_id = self.activation_id,
+        };
+    }
+
+    fn freshBranchBasis(self: *const RepositoryPageState) ?repository_path_history.FreshHeadBasis {
+        switch (self.branch.freshness) {
+            .fresh => {},
+            .unavailable, .validating, .failed => return null,
+        }
+        const root = self.root_identity orelse return null;
+        if (!self.branch.snapshot.matches(.{ .repo_epoch = self.repo_epoch, .root_identity = root })) return null;
+        const status = self.branch.snapshot.status;
+        if (status.oid) |oid| return .{ .oid = oid };
+        return switch (status.head) {
+            .branch => .unborn,
+            .detached, .unknown => null,
+        };
+    }
+
+    pub fn wantsPathHistoryRequest(self: *const RepositoryPageState) bool {
+        return self.path_history.wantsRequest(self.active, self.root_identity, self.selected_path) and
+            self.pending_generation == null;
+    }
+
+    pub fn preparePathHistoryRequest(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        capability: *const root_capability.RootCapability,
+    ) !repository_path_history.Request {
+        const path = self.selected_path orelse return error.NoSelectedPath;
+        return self.path_history.prepareRequest(
+            allocator,
+            self.requestIdentity(),
+            self.manifest_revision,
+            repo_root,
+            path,
+            capability,
+        );
+    }
+
+    pub fn markPathHistoryRequestPreparationFailed(self: *RepositoryPageState) void {
+        self.path_history.markPreparationFailed();
+    }
+
+    pub fn rejectPathHistorySpawn(self: *RepositoryPageState, generation: u64) void {
+        self.path_history.rejectSpawn(generation);
+    }
+
+    pub fn applyPathHistoryFinished(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        finished: *repository_path_history.Finished,
+    ) repository_path_history.ApplyOutcome {
+        return self.path_history.applyFinished(
+            allocator,
+            self.requestIdentity(),
+            self.root_identity,
+            self.manifest_revision,
+            self.selected_path,
+            self.active,
+            self.freshBranchBasis(),
             finished,
         );
     }
@@ -903,6 +1001,7 @@ pub const RepositoryPageState = struct {
 
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
         self.cancelMouseOwner();
+        self.path_history.retire(false);
         self.branch.requestReload(
             self.active,
             self.repo_epoch,
@@ -1039,6 +1138,7 @@ pub const RepositoryPageState = struct {
                     self.bundle != null and !self.bundle.?.status_available;
                 self.freshness = if (self.active) .fresh else .validating;
                 self.requireDocumentRevalidation();
+                self.path_history.invalidate(allocator, self.selected_path != null);
                 self.status.clear();
                 return self.applyIncomingManifestResolution(
                     allocator,
@@ -1080,10 +1180,11 @@ pub const RepositoryPageState = struct {
                 // but Changed projection may move or clear selection when a file
                 // leaves the status set. Preserve the source only when its raw
                 // path identity survived that projection.
-                if (selection_changed)
-                    self.invalidateSelectedDocument(allocator)
-                else
-                    self.requireDocumentRevalidation();
+                if (selection_changed) {
+                    self.invalidateSelectedDocument(allocator);
+                    self.path_history.invalidate(allocator, self.selected_path != null);
+                } else self.requireDocumentRevalidation();
+                if (!selection_changed) self.path_history.invalidate(allocator, self.selected_path != null);
                 self.freshness = if (self.active) .fresh else .validating;
                 self.status.clear();
                 const status_availability_changed = self.file_visibility == .changed and
@@ -1109,6 +1210,7 @@ pub const RepositoryPageState = struct {
                 self.needs_syntax_request = false;
                 self.needs_change_map_request = false;
                 self.needs_document_revalidation = self.selected_path != null;
+                self.path_history.invalidate(allocator, self.selected_path != null);
                 if (self.displayed_document) |*document| document.deinit(allocator);
                 self.displayed_document = null;
                 self.freshness = if (self.active) .fresh else .validating;
@@ -1622,10 +1724,11 @@ pub const RepositoryPageState = struct {
                 };
                 self.refreshFileSearch();
             },
-            .manifest_finished, .branch_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
+            .manifest_finished, .branch_finished, .path_history_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
         }
         if (!optionalPathEql(previous, self.selected_path)) {
             self.invalidateSelectedDocument(allocator);
+            self.path_history.invalidate(allocator, self.selected_path != null);
             result.selected_path_changed = true;
         }
         if (file_search_submitted) self.commitFileSearchSourceFocus();
@@ -2342,6 +2445,7 @@ fn navigationDismissesIncoming(msg: Msg) bool {
         .cancel_file_search,
         .manifest_finished,
         .branch_finished,
+        .path_history_finished,
         .document_finished,
         .syntax_finished,
         .change_map_finished,
@@ -2357,8 +2461,8 @@ fn optionalPathEql(left: ?[]const u8, right: ?[]const u8) bool {
 
 /// Projects only facts proved for the currently selected Repository path.
 /// The path and current manifest Git fact remain useful while a document is
-/// loading or retained; line and mtime require the exact accepted document
-/// authority so header chrome never upgrades last-good bytes to fresh state.
+/// loading or retained. Line position requires the accepted document;
+/// commit history is an independent page-owned authority.
 fn projectSourceHeaderPresentation(
     state: *const RepositoryPageState,
     selected_path: []const u8,
@@ -2374,15 +2478,24 @@ fn projectSourceHeaderPresentation(
         }
     else
         null;
-    const modified_at: ?std.Io.Timestamp = if (accepted) |displayed|
-        if (displayed.metadata) |metadata| metadata.modified_at else null
+    const history_fact = state.path_history.fact(
+        state.requestIdentity(),
+        state.root_identity,
+        state.manifest_revision,
+        selected_path,
+    );
+    const commit_fact: repository_source_header.CommitFact = if (history_fact) |fact|
+        switch (fact) {
+            .committed => |seconds| .{ .committed = seconds },
+            .uncommitted => .uncommitted,
+        }
     else
-        null;
+        .unavailable;
     return .init(
         selected_path,
         line_position,
         sourceHeaderGitState(state, selected_path),
-        modified_at,
+        commit_fact,
     );
 }
 
@@ -3193,7 +3306,7 @@ test "repository source header projects exact accepted source facts" {
         presentation.line_position.?,
     );
     try std.testing.expectEqual(repository_source_header.GitState.modified, presentation.git_state);
-    try std.testing.expectEqual(modified_at.nanoseconds, presentation.modified_at.?.nanoseconds);
+    try std.testing.expect(presentation.commit_fact == .unavailable);
     try std.testing.expectEqualStrings("main.zig", presentation.raw_path);
 }
 
@@ -3212,7 +3325,7 @@ test "repository source header projects empty accepted source as zero of zero" {
     try std.testing.expectEqual(repository_source_header.GitState.clean, presentation.git_state);
 }
 
-test "repository source header keeps inert mtime and omits its line" {
+test "repository source header does not project inert filesystem mtime as Git history" {
     const allocator = std.testing.allocator;
     var state: RepositoryPageState = .{
         .bundle = try bundleForTest("binary.dat\x00"),
@@ -3234,10 +3347,10 @@ test "repository source header keeps inert mtime and omits its line" {
     const presentation = state.sourceHeaderPresentation().?;
     try std.testing.expect(presentation.line_position == null);
     try std.testing.expectEqual(repository_source_header.GitState.added, presentation.git_state);
-    try std.testing.expectEqual(modified_at.nanoseconds, presentation.modified_at.?.nanoseconds);
+    try std.testing.expect(presentation.commit_fact == .unavailable);
 }
 
-test "repository source header retained document cannot claim line or mtime" {
+test "repository source header retained document cannot claim line or commit history" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "first\nsecond\n");
     defer state.deinit(allocator);
@@ -3247,14 +3360,14 @@ test "repository source header retained document cannot claim line or mtime" {
 
     var presentation = state.sourceHeaderPresentation().?;
     try std.testing.expect(presentation.line_position == null);
-    try std.testing.expect(presentation.modified_at == null);
+    try std.testing.expect(presentation.commit_fact == .unavailable);
     try std.testing.expectEqual(repository_source_header.GitState.added, presentation.git_state);
 
     state.displayed_document.?.authority = .accepted;
     state.displayed_document.?.manifest_revision +%= 1;
     presentation = state.sourceHeaderPresentation().?;
     try std.testing.expect(presentation.line_position == null);
-    try std.testing.expect(presentation.modified_at == null);
+    try std.testing.expect(presentation.commit_fact == .unavailable);
     try std.testing.expectEqual(repository_source_header.GitState.added, presentation.git_state);
 }
 
@@ -3277,7 +3390,7 @@ test "repository source header status requires an exact usable manifest node" {
     presentation = projectSourceHeaderPresentation(&state, "missing.zig");
     try std.testing.expectEqual(repository_source_header.GitState.unavailable, presentation.git_state);
     try std.testing.expect(presentation.line_position == null);
-    try std.testing.expect(presentation.modified_at == null);
+    try std.testing.expect(presentation.commit_fact == .unavailable);
 }
 
 test "repository source header copies a loading byte-exact path and excludes chrome" {
@@ -3974,8 +4087,164 @@ test "Repository branch terminal does not mutate the primary page status" {
     };
     defer finished.deinit();
 
-    try std.testing.expectEqual(repository_branch.ApplyOutcome.failed, state.applyBranchFinished(&finished));
+    try std.testing.expectEqual(repository_branch.ApplyOutcome.failed, state.applyBranchFinished(std.testing.allocator, &finished));
     try std.testing.expectEqualStrings("Selected source copied", state.status.text());
+}
+
+test "Repository path history projects accepted fact independently from document state" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state: RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 3,
+        .root_identity = root.capability.identity,
+        .bundle = try bundleForTest("main.zig\x00"),
+        .load_state = .loaded,
+        .manifest_revision = 7,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    state.path_history.invalidate(allocator, true);
+    var request = try state.preparePathHistoryRequest(allocator, root.path, &root.capability);
+    defer request.deinit(allocator);
+    var finished = repository_path_history.Finished{
+        .identity = request.identity,
+        .root_identity = request.root_identity,
+        .manifest_revision = request.manifest_revision,
+        .generation = request.generation,
+        .path = request.path,
+        .outcome = .{ .known = .{
+            .head = .{ .oid = try allocator.dupe(u8, "0123456789abcdef0123456789abcdef01234567") },
+            .fact = .{ .committed = 951_827_640 },
+        } },
+    };
+    request.path = &.{};
+    defer finished.deinit(allocator);
+
+    try std.testing.expectEqual(
+        repository_path_history.ApplyOutcome.known,
+        state.applyPathHistoryFinished(allocator, &finished),
+    );
+    const presentation = state.sourceHeaderPresentation().?;
+    try std.testing.expectEqual(@as(i64, 951_827_640), presentation.commit_fact.committed);
+    try std.testing.expect(presentation.line_position == null);
+}
+
+test "Repository path history rejects present and unborn basis mismatches in both completion orders" {
+    const allocator = std.testing.allocator;
+    const Basis = enum { present, unborn };
+    const present_oid = "0123456789abcdef0123456789abcdef01234567";
+    const cases = [_]struct {
+        history: Basis,
+        branch: Basis,
+        branch_first: bool,
+    }{
+        .{ .history = .present, .branch = .unborn, .branch_first = true },
+        .{ .history = .present, .branch = .unborn, .branch_first = false },
+        .{ .history = .unborn, .branch = .present, .branch_first = true },
+        .{ .history = .unborn, .branch = .present, .branch_first = false },
+    };
+
+    for (cases) |case| {
+        var root = try TestRoot.init();
+        defer root.deinit();
+        var state: RepositoryPageState = .{
+            .active = true,
+            .activation_id = 2,
+            .repo_epoch = 3,
+            .root_identity = root.capability.identity,
+            .bundle = try bundleForTest("main.zig\x00"),
+            .load_state = .loaded,
+            .manifest_revision = 7,
+        };
+        defer state.deinit(allocator);
+        state.selected_path = state.bundle.?.tree.firstFilePath();
+
+        var branch_request = try state.prepareBranchRequest(allocator, root.path, &root.capability);
+        defer branch_request.deinit(allocator);
+        state.path_history.invalidate(allocator, true);
+        var history_request = try state.preparePathHistoryRequest(allocator, root.path, &root.capability);
+        defer history_request.deinit(allocator);
+
+        var branch_builder = git_branch_status.Builder.init(allocator);
+        errdefer branch_builder.deinit();
+        try branch_builder.setBranchHead("main");
+        if (case.branch == .present) try branch_builder.setOid(present_oid);
+        var branch_finished = repository_branch.Finished{
+            .identity = branch_request.identity,
+            .root_identity = branch_request.root.identity,
+            .generation = branch_request.generation,
+            .result = .{ .loaded = branch_builder.finish() },
+        };
+        defer branch_finished.deinit();
+
+        const history_outcome: git_read.RepositoryPathHistoryOutcome = switch (case.history) {
+            .present => .{ .known = .{
+                .head = .{ .oid = try allocator.dupe(u8, present_oid) },
+                .fact = .{ .committed = 42 },
+            } },
+            .unborn => .{ .known = .{ .head = .unborn, .fact = .uncommitted } },
+        };
+        var history_finished = repository_path_history.Finished{
+            .identity = history_request.identity,
+            .root_identity = history_request.root_identity,
+            .manifest_revision = history_request.manifest_revision,
+            .generation = history_request.generation,
+            .path = history_request.path,
+            .outcome = history_outcome,
+        };
+        history_request.path = &.{};
+        defer history_finished.deinit(allocator);
+
+        if (case.branch_first) {
+            _ = state.applyBranchFinished(allocator, &branch_finished);
+            try std.testing.expectEqual(
+                repository_path_history.ApplyOutcome.unavailable,
+                state.applyPathHistoryFinished(allocator, &history_finished),
+            );
+            try std.testing.expect(!state.path_history.needs_revalidation);
+        } else {
+            try std.testing.expectEqual(
+                repository_path_history.ApplyOutcome.known,
+                state.applyPathHistoryFinished(allocator, &history_finished),
+            );
+            _ = state.applyBranchFinished(allocator, &branch_finished);
+            try std.testing.expect(state.path_history.needs_revalidation);
+        }
+
+        try std.testing.expect(state.path_history.accepted == null);
+        try std.testing.expect(state.path_history.terminal == .unavailable);
+        try std.testing.expect(state.sourceHeaderPresentation().?.commit_fact == .unavailable);
+    }
+}
+
+test "Repository path history schedules only selection reload and reactivation edges" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("a.zig\x00b.zig\x00", "one\ntwo\n");
+    defer state.deinit(allocator);
+    state.path_history.needs_revalidation = false;
+    state.viewer.focus = .source;
+
+    const generation = state.path_history.generation;
+    const cursor_update = state.applyNavigation(allocator, .move_down, .{ .width = 80, .height = 12 });
+    try std.testing.expect(!cursor_update.selected_path_changed);
+    try std.testing.expectEqual(generation, state.path_history.generation);
+    try std.testing.expect(!state.path_history.needs_revalidation);
+
+    state.viewer.focus = .tree;
+    const selection_update = state.applyNavigation(allocator, .move_down, .{ .width = 80, .height = 12 });
+    try std.testing.expect(selection_update.selected_path_changed);
+    try std.testing.expectEqualStrings("b.zig", state.selected_path.?);
+    try std.testing.expect(state.path_history.needs_revalidation);
+
+    state.requestReload(true);
+    try std.testing.expect(!state.path_history.needs_revalidation);
+    try std.testing.expect(state.path_history.terminal == .unavailable);
+    state.deactivate();
+    state.activate(state.repo_epoch, state.root_identity);
+    try std.testing.expect(state.path_history.needs_revalidation);
 }
 
 test "repository syntax task is plain-first and accepts only matching source identity" {
