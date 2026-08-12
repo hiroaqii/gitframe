@@ -69,6 +69,38 @@ const startCanonicalPublicationWatch = canonical.startCanonicalPublicationWatch;
 const finishCanonicalPublicationStatus = canonical.finishCanonicalPublicationStatus;
 const finishCanonicalPublicationBranch = canonical.finishCanonicalPublicationBranch;
 
+const FakeRealClock = struct {
+    seconds: i64,
+    resolution_ns: i96 = 1,
+    available: bool = true,
+    samples: usize = 0,
+    vtable: std.Io.VTable,
+
+    fn init(seconds: i64) FakeRealClock {
+        return .{ .seconds = seconds, .vtable = std.testing.io.vtable.* };
+    }
+
+    fn io(self: *FakeRealClock) std.Io {
+        self.vtable.now = now;
+        self.vtable.clockResolution = resolution;
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+        std.debug.assert(clock == .real);
+        const self: *FakeRealClock = @ptrCast(@alignCast(userdata.?));
+        self.samples += 1;
+        return .{ .nanoseconds = @as(i96, self.seconds) * std.time.ns_per_s };
+    }
+
+    fn resolution(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Clock.ResolutionError!std.Io.Duration {
+        std.debug.assert(clock == .real);
+        const self: *FakeRealClock = @ptrCast(@alignCast(userdata.?));
+        if (!self.available) return error.ClockUnavailable;
+        return .{ .nanoseconds = self.resolution_ns };
+    }
+};
+
 const cached_projection_b_diff =
     \\diff --git a/b b/b
     \\index 1..2 100644
@@ -145,6 +177,76 @@ test "grouped result messages keep previous ephemeral status" {
     try std.testing.expect(app_message.keepsEphemeralStatus(.{ .load_finished = undefined }));
     try std.testing.expect(app_message.keepsEphemeralStatus(.{ .action_finished = undefined }));
     try std.testing.expect(app_message.keepsEphemeralStatus(.git_action_spinner_tick));
+}
+
+test "Compare base picker samples one real-clock snapshot at every non-skipped redraw tail" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator, .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    _ = app.pages.compare.beginBasePicker(allocator).?;
+    var clock = FakeRealClock.init(1_700_000_059);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = clock.io() };
+
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_059), app.pages.compare.base_picker.render_now_unix);
+    try std.testing.expectEqual(@as(usize, 1), clock.samples);
+
+    // An unrelated Compare source completion crosses the 59s -> 1m boundary
+    // through the same common tail instead of a picker-specific handler.
+    clock.seconds += 1;
+    const refresh = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        allocator,
+        refresh.identity,
+        refresh.generation,
+        'a',
+        'b',
+    ) } } }, &ctx);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_060), app.pages.compare.base_picker.render_now_unix);
+    try std.testing.expectEqual(@as(usize, 2), clock.samples);
+
+    // A stale list terminal resolves to skip and therefore does not sample.
+    clock.seconds += 1;
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
+        .identity = refresh.identity,
+        .generation = app.pages.compare.base_picker.generation + 1,
+        .result = .empty,
+    } } } }, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(@as(?i64, 1_700_000_060), app.pages.compare.base_picker.render_now_unix);
+    try std.testing.expectEqual(@as(usize, 2), clock.samples);
+
+    // Hidden and idle picker states do not consult the wall clock.
+    app.active_page = .review;
+    try app.update(.{ .terminal_resized = .{ .width = 100, .height = 24 } }, &ctx);
+    try std.testing.expectEqual(@as(usize, 2), clock.samples);
+    app.active_page = .compare;
+    app.pages.compare.closeBasePicker(allocator);
+    try app.update(.{ .terminal_resized = .{ .width = 90, .height = 20 } }, &ctx);
+    try std.testing.expectEqual(@as(usize, 2), clock.samples);
+}
+
+test "Compare base picker fails closed for unavailable and zero-resolution real clocks" {
+    const allocator = std.testing.allocator;
+    var app: App = .{ .allocator = allocator, .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    _ = app.pages.compare.beginBasePicker(allocator).?;
+    var clock = FakeRealClock.init(1_700_000_000);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = clock.io() };
+
+    clock.available = false;
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try std.testing.expect(app.pages.compare.base_picker.render_now_unix == null);
+    try std.testing.expectEqual(@as(usize, 0), clock.samples);
+
+    clock.available = true;
+    clock.resolution_ns = 0;
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx);
+    try std.testing.expect(app.pages.compare.base_picker.render_now_unix == null);
+    try std.testing.expectEqual(@as(usize, 0), clock.samples);
 }
 
 test "modal transitions clear previous ephemeral status" {

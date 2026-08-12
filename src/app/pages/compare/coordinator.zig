@@ -104,6 +104,14 @@ pub const Controller = struct {
             },
             .open_base_picker => try self.startBasePicker(ctx),
             .close_base_picker => self.page_state.closeBasePicker(ctx.allocator()),
+            .base_picker_enter_query => self.page_state.base_picker.enterQuery(),
+            .base_picker_leave_query => self.page_state.base_picker.leaveQuery(),
+            .base_picker_clear_query => self.page_state.base_picker.clearQuery(ctx.allocator()) catch
+                self.page_state.status.set("Could not clear Compare base search", .{}),
+            .base_picker_insert => |codepoint| self.page_state.base_picker.insertQuery(ctx.allocator(), codepoint) catch
+                self.page_state.status.set("Could not update Compare base search", .{}),
+            .base_picker_backspace => self.page_state.base_picker.backspaceQuery(ctx.allocator()) catch
+                self.page_state.status.set("Could not update Compare base search", .{}),
             .base_picker_previous => self.page_state.base_picker.moveSelection(-1),
             .base_picker_next => self.page_state.base_picker.moveSelection(1),
             .choose_base => if (try self.page_state.chooseBasePickerTarget(ctx.allocator())) try self.refresh(ctx),
@@ -225,14 +233,18 @@ pub const Controller = struct {
         return self.finishLoad(ctx, deferred.finished);
     }
 
+    pub fn prepareModalRedraw(self: Controller, io: std.Io) void {
+        self.page_state.base_picker.prepareModalRedraw(io);
+    }
+
     fn startBasePicker(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         const request = self.page_state.beginBasePicker(ctx.allocator()) orelse return;
         const capability = self.repo.activeCapability() orelse {
-            self.page_state.base_picker.markFailure(ctx.allocator(), "Compare base picker requires a repository");
+            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Compare base picker requires a repository");
             return;
         };
         const task = ctx.allocator().create(BranchListTask) catch |err| {
-            self.page_state.base_picker.markFailure(ctx.allocator(), "Could not allocate Compare base list task");
+            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not allocate Compare base list task");
             return err;
         };
         task.* = BranchListTask.init(
@@ -242,12 +254,12 @@ pub const Controller = struct {
             self.env_map,
         ) catch |err| {
             ctx.allocator().destroy(task);
-            self.page_state.base_picker.markFailure(ctx.allocator(), "Could not prepare Compare base list task");
+            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not prepare Compare base list task");
             return err;
         };
         ctx.task().spawnWith(.{ .ctx = task, .run = BranchListTask.run, .failed = BranchListTask.failed }) catch |err| {
             task.destroy(ctx.allocator());
-            self.page_state.base_picker.markFailure(ctx.allocator(), "Could not start Compare base list task");
+            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not start Compare base list task");
             return err;
         };
     }

@@ -1356,6 +1356,7 @@ pub fn runCompareBranchListLoad(
     const raw_result = git_refs.loadBranchList(allocator, io, .{
         .context = .{ .cwd = cwd, .environment = &environment },
         .scope = .local_and_remote,
+        .include_tip_committer_unix = true,
     }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Compare base list failed: {s}", .{@errorName(err)}) catch
@@ -3471,7 +3472,10 @@ test "CompareBranchListLoadTask keeps physical root and controlled environment a
     };
     var found_pinned = false;
     for (list.branches) |branch| {
-        if (std.mem.eql(u8, branch.full_ref, "refs/heads/pinned")) found_pinned = true;
+        if (std.mem.eql(u8, branch.full_ref, "refs/heads/pinned")) {
+            found_pinned = true;
+            try std.testing.expect(branch.tip_committer_unix != null);
+        }
     }
     try std.testing.expect(found_pinned);
 }

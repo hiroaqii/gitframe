@@ -104,6 +104,10 @@ pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
 
 fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
+    // Compare base search v1 is key-event-only. The modal owns this event even
+    // if an underlying diff/file search flag is retained, so pasted bytes can
+    // never leak through to that hidden input.
+    if (context.active_page == .compare and context.compare.base_picker_open) return null;
     if (context.active_page == .review and (context.review.search_mode or context.review.file_search_mode)) {
         const review_msg = review_input.pasteToMsg(context.review, text) orelse return null;
         return translateReviewMsg(review_msg);
@@ -452,6 +456,15 @@ test "eventToMsg rejects invalid paste and ignores non-input modes" {
     try std.testing.expect(eventToMsg(.{ .help_mode = true }, .{ .paste = "ignored" }) == null);
     try std.testing.expect(eventToMsg(.{ .discard_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
     try std.testing.expect(eventToMsg(.{ .amend_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
+    try std.testing.expect(eventToMsg(.{
+        .active_page = .compare,
+        .compare = .{
+            .base_picker_open = true,
+            .base_picker_query_mode = true,
+            .search_mode = true,
+            .file_search_mode = true,
+        },
+    }, .{ .paste = "must-not-leak" }) == null);
 }
 
 test "shell nests Review void and payload messages under one route" {

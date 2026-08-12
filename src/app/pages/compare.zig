@@ -4,7 +4,9 @@
 //! plus independent navigation, picker, refresh, and deferred-apply state.
 
 const std = @import("std");
+const ui = @import("chasen_ui");
 const app_state = @import("../state.zig");
+const app_prompt = @import("../prompt.zig");
 const diff_basis = @import("../diff_basis.zig");
 const diff_surface = @import("../diff_surface.zig");
 const app_load = @import("../load.zig");
@@ -15,6 +17,7 @@ const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_refs = @import("../../git/refs.zig");
 const review_state = @import("../../review/state.zig");
+const commit_time = @import("compare/commit_time.zig");
 
 pub const BasePickerRequest = struct {
     identity: page.RequestIdentity,
@@ -24,19 +27,45 @@ pub const BasePickerRequest = struct {
 /// Page-owned modal list. Pending task ownership remains independent: closing
 /// advances the generation, while the eventual stale Finished owns cleanup.
 pub const BasePickerState = struct {
+    pub const InputMode = enum { command, query };
+
+    pub const Failure = union(enum) {
+        owned: []u8,
+        static: []const u8,
+
+        pub fn text(self: Failure) []const u8 {
+            return switch (self) {
+                .owned => |message| message,
+                .static => |message| message,
+            };
+        }
+
+        pub fn deinit(self: Failure, allocator: std.mem.Allocator) void {
+            switch (self) {
+                .owned => |message| allocator.free(message),
+                .static => {},
+            }
+        }
+    };
+
     open: bool = false,
     loading: bool = false,
     generation: u64 = 0,
-    selected_index: usize = 0,
     accepted: ?git_refs.BranchList = null,
-    failure: ?[]u8 = null,
+    filter: ui.ListFilter = .{},
+    query: app_prompt.TextInput = .{},
+    input_mode: InputMode = .command,
+    render_now_unix: ?i64 = null,
+    failure: ?Failure = null,
 
     pub fn begin(self: *BasePickerState, allocator: std.mem.Allocator, identity: page.RequestIdentity) BasePickerRequest {
         self.clearAccepted(allocator);
         self.clearFailure(allocator);
         self.open = true;
         self.loading = true;
-        self.selected_index = 0;
+        self.query = .{};
+        self.input_mode = .command;
+        self.render_now_unix = null;
         self.advanceGeneration();
         return .{ .identity = identity, .generation = self.generation };
     }
@@ -46,30 +75,91 @@ pub const BasePickerState = struct {
         self.clearFailure(allocator);
         self.open = false;
         self.loading = false;
-        self.selected_index = 0;
+        self.query = .{};
+        self.input_mode = .command;
+        self.render_now_unix = null;
         self.advanceGeneration();
     }
 
     pub fn moveSelection(self: *BasePickerState, delta: isize) void {
-        const list = self.accepted orelse return;
-        if (list.branches.len == 0) return;
+        const len = self.filter.source_indexes.len;
+        if (len == 0) return;
         if (delta < 0) {
-            self.selected_index = if (self.selected_index == 0) list.branches.len - 1 else self.selected_index - 1;
+            if (self.filter.list.focusedIndex() == 0) {
+                self.filter.list.focus.index = len - 1;
+            } else {
+                self.filter.update(.move_prev);
+            }
         } else if (delta > 0) {
-            self.selected_index = (self.selected_index + 1) % list.branches.len;
+            if (self.filter.list.focusedIndex() + 1 == len) {
+                self.filter.list.focus.index = 0;
+            } else {
+                self.filter.update(.move_next);
+            }
         }
     }
 
-    pub fn markFailure(self: *BasePickerState, allocator: std.mem.Allocator, message: []const u8) void {
+    pub fn markStaticFailure(self: *BasePickerState, allocator: std.mem.Allocator, comptime message: []const u8) void {
         self.loading = false;
+        self.clearAccepted(allocator);
         self.clearFailure(allocator);
-        self.failure = allocator.dupe(u8, message) catch null;
+        self.query = .{};
+        self.input_mode = .command;
+        self.failure = .{ .static = message };
+    }
+
+    pub fn failureText(self: *const BasePickerState) ?[]const u8 {
+        return if (self.failure) |failure| failure.text() else null;
+    }
+
+    pub fn visibleCount(self: *const BasePickerState) usize {
+        return self.filter.source_indexes.len;
+    }
+
+    pub fn selectedSourceIndex(self: *const BasePickerState) ?usize {
+        if (self.filter.source_indexes.len == 0) return null;
+        return self.filter.sourceIndex(self.filter.list.focusedIndex());
+    }
+
+    pub fn selectedItem(self: *const BasePickerState) ?*const git_refs.BranchListItem {
+        const list = if (self.accepted) |*value| value else return null;
+        const source_index = self.selectedSourceIndex() orelse return null;
+        if (source_index >= list.branches.len) return null;
+        return &list.branches[source_index];
+    }
+
+    pub fn enterQuery(self: *BasePickerState) void {
+        if (self.accepted == null) return;
+        self.input_mode = .query;
+    }
+
+    pub fn leaveQuery(self: *BasePickerState) void {
+        self.input_mode = .command;
+    }
+
+    pub fn insertQuery(self: *BasePickerState, allocator: std.mem.Allocator, codepoint: u21) !void {
+        var next = self.query;
+        try next.insert(codepoint);
+        try self.publishQuery(allocator, next);
+    }
+
+    pub fn backspaceQuery(self: *BasePickerState, allocator: std.mem.Allocator) !void {
+        var next = self.query;
+        next.backspace();
+        try self.publishQuery(allocator, next);
+    }
+
+    pub fn clearQuery(self: *BasePickerState, allocator: std.mem.Allocator) !void {
+        try self.publishQuery(allocator, .{});
+        self.input_mode = .command;
+    }
+
+    pub fn prepareModalRedraw(self: *BasePickerState, io: std.Io) void {
+        self.render_now_unix = commit_time.sampleUnixSeconds(io);
     }
 
     pub fn selectedTarget(self: *const BasePickerState, allocator: std.mem.Allocator) !?diff_basis.BaseTarget {
-        const list = self.accepted orelse return null;
-        if (self.selected_index >= list.branches.len) return null;
-        const item = list.branches[self.selected_index];
+        const item = (self.selectedItem() orelse return null).*;
         const full_ref = try allocator.dupe(u8, item.full_ref);
         errdefer allocator.free(full_ref);
         return .{
@@ -94,18 +184,39 @@ pub const BasePickerState = struct {
         self.loading = false;
         self.clearFailure(allocator);
         switch (finished.result) {
-            .loaded => |list| {
+            .loaded => |*list| {
+                commit_time.sortBranches(list.branches);
+                var next_filter: ui.ListFilter = .{};
+                defer next_filter.deinit(allocator);
+                self.prepareFilter(allocator, list, &next_filter, "") catch {
+                    self.clearAccepted(allocator);
+                    self.query = .{};
+                    self.input_mode = .command;
+                    self.failure = .{ .static = "Could not prepare branch filter" };
+                    return true;
+                };
+
                 self.clearAccepted(allocator);
-                self.accepted = list;
+                self.accepted = list.*;
                 finished.result = .empty;
-                const len = self.accepted.?.branches.len;
-                if (len == 0) self.selected_index = 0 else self.selected_index = @min(self.selected_index, len - 1);
+                self.filter = next_filter;
+                next_filter = .{};
+                self.query = .{};
+                self.input_mode = .command;
             },
             .failed => |message| {
-                self.failure = message;
+                self.clearAccepted(allocator);
+                self.query = .{};
+                self.input_mode = .command;
+                self.failure = .{ .owned = message };
                 finished.result = .empty;
             },
-            .failed_static => |message| self.failure = allocator.dupe(u8, message) catch null,
+            .failed_static => |message| {
+                self.clearAccepted(allocator);
+                self.query = .{};
+                self.input_mode = .command;
+                self.failure = .{ .static = message };
+            },
             .empty => {},
         }
         return true;
@@ -118,13 +229,40 @@ pub const BasePickerState = struct {
     }
 
     fn clearAccepted(self: *BasePickerState, allocator: std.mem.Allocator) void {
+        self.filter.deinit(allocator);
+        self.filter = .{};
         if (self.accepted) |*list| list.deinit(allocator);
         self.accepted = null;
     }
 
     fn clearFailure(self: *BasePickerState, allocator: std.mem.Allocator) void {
-        if (self.failure) |message| allocator.free(message);
+        if (self.failure) |failure| failure.deinit(allocator);
         self.failure = null;
+    }
+
+    fn publishQuery(self: *BasePickerState, allocator: std.mem.Allocator, next_query: app_prompt.TextInput) !void {
+        const list = if (self.accepted) |*value| value else return;
+        var next_filter: ui.ListFilter = .{};
+        errdefer next_filter.deinit(allocator);
+        try self.prepareFilter(allocator, list, &next_filter, next_query.slice());
+
+        self.filter.deinit(allocator);
+        self.filter = next_filter;
+        self.query = next_query;
+    }
+
+    fn prepareFilter(
+        self: *const BasePickerState,
+        allocator: std.mem.Allocator,
+        list: *const git_refs.BranchList,
+        destination: *ui.ListFilter,
+        query_text: []const u8,
+    ) !void {
+        _ = self;
+        const labels = try allocator.alloc([]const u8, list.branches.len);
+        defer allocator.free(labels);
+        for (list.branches, labels) |branch, *label| label.* = branch.full_ref;
+        try destination.apply(allocator, labels, query_text);
     }
 
     fn advanceGeneration(self: *BasePickerState) void {
@@ -875,6 +1013,42 @@ fn testBranchList(allocator: std.mem.Allocator, name: []const u8) !git_refs.Bran
     return .{ .branches = branches };
 }
 
+const TestBranch = struct {
+    full_ref: []const u8,
+    name: []const u8,
+    kind: git_refs.BranchKind = .local,
+    timestamp: ?i64,
+};
+
+fn testBranchListFrom(allocator: std.mem.Allocator, specs: []const TestBranch) !git_refs.BranchList {
+    const branches = try allocator.alloc(git_refs.BranchListItem, specs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (branches[0..initialized]) |item| {
+            allocator.free(item.full_ref);
+            allocator.free(item.name);
+            allocator.free(item.oid);
+        }
+        allocator.free(branches);
+    }
+    for (specs, branches) |spec, *branch| {
+        const full_ref = try allocator.dupe(u8, spec.full_ref);
+        errdefer allocator.free(full_ref);
+        const name = try allocator.dupe(u8, spec.name);
+        errdefer allocator.free(name);
+        const oid = try allocator.dupe(u8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        branch.* = .{
+            .full_ref = full_ref,
+            .name = name,
+            .kind = spec.kind,
+            .oid = oid,
+            .tip_committer_unix = spec.timestamp,
+        };
+        initialized += 1;
+    }
+    return .{ .branches = branches };
+}
+
 test "Compare base picker replacement close and selection have one owner" {
     const allocator = std.testing.allocator;
     var state: ComparePageState = .{};
@@ -928,4 +1102,144 @@ test "Compare base picker replacement close and selection have one owner" {
     try std.testing.expect(!state.base_picker.open);
     try std.testing.expect(state.base_picker.accepted == null);
     try std.testing.expectEqualStrings("refs/heads/topic", state.base_target.?.full_ref);
+}
+
+test "Compare base picker owns recency order filter projection and full-ref activation" {
+    const allocator = std.testing.allocator;
+    var state: ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(17);
+    const request = state.beginBasePicker(allocator).?;
+    var finished: app_load.CompareBranchListFinished = .{
+        .identity = request.identity,
+        .generation = request.generation,
+        .result = .{ .loaded = try testBranchListFrom(allocator, &.{
+            .{ .full_ref = "refs/heads/auth-old", .name = "auth-old", .timestamp = 100 },
+            .{ .full_ref = "refs/remotes/origin/auth-new", .name = "origin/auth-new", .kind = .remote_tracking, .timestamp = 300 },
+            .{ .full_ref = "refs/remotes/origin/z-tie", .name = "origin/z-tie", .kind = .remote_tracking, .timestamp = 200 },
+            .{ .full_ref = "refs/heads/a-tie", .name = "a-tie", .timestamp = 200 },
+            .{ .full_ref = "refs/heads/unknown", .name = "unknown", .timestamp = null },
+        }) },
+    };
+    defer finished.deinit(allocator);
+
+    try std.testing.expect(state.base_picker.acceptFinished(allocator, 17, &state.activation, &finished));
+    try std.testing.expect(finished.result == .empty);
+    const branches = state.base_picker.accepted.?.branches;
+    try std.testing.expectEqualStrings("refs/remotes/origin/auth-new", branches[0].full_ref);
+    try std.testing.expectEqualStrings("refs/heads/a-tie", branches[1].full_ref);
+    try std.testing.expectEqualStrings("refs/remotes/origin/z-tie", branches[2].full_ref);
+    try std.testing.expectEqualStrings("refs/heads/auth-old", branches[3].full_ref);
+    try std.testing.expectEqualStrings("refs/heads/unknown", branches[4].full_ref);
+
+    state.base_picker.enterQuery();
+    for ("auth") |byte| try state.base_picker.insertQuery(allocator, byte);
+    try std.testing.expectEqual(@as(usize, 2), state.base_picker.visibleCount());
+    try std.testing.expectEqualStrings("refs/remotes/origin/auth-new", state.base_picker.selectedItem().?.full_ref);
+    try state.base_picker.backspaceQuery(allocator);
+    try std.testing.expectEqualStrings("aut", state.base_picker.query.slice());
+    try std.testing.expectEqual(@as(usize, 2), state.base_picker.visibleCount());
+    try state.base_picker.insertQuery(allocator, 'h');
+    state.base_picker.moveSelection(1);
+    const selected = try state.base_picker.selectedTarget(allocator) orelse return error.ExpectedBaseTarget;
+    defer {
+        var owned = selected;
+        owned.deinit(allocator);
+    }
+    try std.testing.expectEqualStrings("refs/heads/auth-old", selected.full_ref);
+
+    try state.base_picker.clearQuery(allocator);
+    state.base_picker.enterQuery();
+    for ("refs/remotes") |byte| try state.base_picker.insertQuery(allocator, byte);
+    try std.testing.expectEqual(@as(usize, 2), state.base_picker.visibleCount());
+    try std.testing.expectEqualStrings("refs/remotes/origin/auth-new", state.base_picker.selectedItem().?.full_ref);
+    try state.base_picker.clearQuery(allocator);
+    state.base_picker.enterQuery();
+    for ("no-such-branch") |byte| try state.base_picker.insertQuery(allocator, byte);
+    try std.testing.expectEqual(@as(usize, 0), state.base_picker.visibleCount());
+    try std.testing.expect((try state.base_picker.selectedTarget(allocator)) == null);
+}
+
+test "Compare base picker publication allocation failure is terminal without partial ownership" {
+    const allocator = std.testing.allocator;
+    var state: ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(19);
+    const request = state.beginBasePicker(allocator).?;
+    var finished: app_load.CompareBranchListFinished = .{
+        .identity = request.identity,
+        .generation = request.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "topic") },
+    };
+    defer finished.deinit(allocator);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+
+    try std.testing.expect(state.base_picker.acceptFinished(failing.allocator(), 19, &state.activation, &finished));
+    try std.testing.expect(!state.base_picker.loading);
+    try std.testing.expect(state.base_picker.open);
+    try std.testing.expect(state.base_picker.accepted == null);
+    try std.testing.expectEqual(@as(usize, 0), state.base_picker.visibleCount());
+    try std.testing.expectEqualStrings("Could not prepare branch filter", state.base_picker.failureText().?);
+    try std.testing.expect(finished.result == .loaded);
+
+    state.closeBasePicker(allocator);
+    const retry = state.beginBasePicker(allocator).?;
+    var retry_finished: app_load.CompareBranchListFinished = .{
+        .identity = retry.identity,
+        .generation = retry.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "retry") },
+    };
+    defer retry_finished.deinit(allocator);
+    try std.testing.expect(state.base_picker.acceptFinished(allocator, 19, &state.activation, &retry_finished));
+    try std.testing.expectEqualStrings("refs/heads/retry", state.base_picker.selectedItem().?.full_ref);
+
+    const replacement = state.beginBasePicker(allocator).?;
+    var replacement_finished: app_load.CompareBranchListFinished = .{
+        .identity = replacement.identity,
+        .generation = replacement.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "replacement") },
+    };
+    defer replacement_finished.deinit(allocator);
+    var replacement_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expect(state.base_picker.acceptFinished(
+        replacement_failing.allocator(),
+        19,
+        &state.activation,
+        &replacement_finished,
+    ));
+    try std.testing.expect(state.base_picker.accepted == null);
+    try std.testing.expectEqualStrings("Could not prepare branch filter", state.base_picker.failureText().?);
+    try std.testing.expect(replacement_finished.result == .loaded);
+}
+
+test "Compare base picker live query allocation failure preserves old projection byte-for-byte" {
+    const allocator = std.testing.allocator;
+    var state: ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(23);
+    const request = state.beginBasePicker(allocator).?;
+    var finished: app_load.CompareBranchListFinished = .{
+        .identity = request.identity,
+        .generation = request.generation,
+        .result = .{ .loaded = try testBranchListFrom(allocator, &.{
+            .{ .full_ref = "refs/heads/alpha", .name = "alpha", .timestamp = 20 },
+            .{ .full_ref = "refs/heads/beta", .name = "beta", .timestamp = 10 },
+        }) },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expect(state.base_picker.acceptFinished(allocator, 23, &state.activation, &finished));
+    state.base_picker.moveSelection(1);
+
+    const old_indexes = state.base_picker.filter.source_indexes.ptr;
+    const old_labels = state.base_picker.filter.labels.ptr;
+    const old_selected = state.base_picker.filter.list.focusedIndex();
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, state.base_picker.insertQuery(failing.allocator(), 'a'));
+
+    try std.testing.expectEqual(@as(usize, 0), state.base_picker.query.len);
+    try std.testing.expectEqual(old_indexes, state.base_picker.filter.source_indexes.ptr);
+    try std.testing.expectEqual(old_labels, state.base_picker.filter.labels.ptr);
+    try std.testing.expectEqual(old_selected, state.base_picker.filter.list.focusedIndex());
+    try std.testing.expectEqual(@as(usize, 2), state.base_picker.visibleCount());
+    try std.testing.expectEqualStrings("refs/heads/beta", state.base_picker.selectedItem().?.full_ref);
 }

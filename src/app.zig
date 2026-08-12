@@ -613,6 +613,12 @@ pub const App = struct {
             try self.reviewRead().maybeStartQueuedRevalidation(ctx);
         }
         self.actionLifecycle().reconcileSpinner(ctx);
+        if (!self.redraw_plan.resolvesToSkip() and
+            self.active_page == .compare and
+            self.pages.compare.base_picker.open)
+        {
+            self.compareCoordinator().prepareModalRedraw(ctx.io());
+        }
     }
 
     fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
@@ -933,6 +939,8 @@ pub const App = struct {
                     .focus = self.pages.compare.viewer.focus,
                     .sidebar_hidden = self.pages.compare.viewer.sidebar_hidden,
                     .base_picker_open = self.pages.compare.base_picker.open,
+                    .base_picker_query_mode = self.pages.compare.base_picker.input_mode == .query,
+                    .base_picker_query_len = self.pages.compare.base_picker.query.len,
                     .keymap = self.keymap,
                 },
                 .selection_owner = &self.pages.compare.selection_owner,

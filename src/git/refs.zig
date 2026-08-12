@@ -39,6 +39,10 @@ pub const BranchListItem = struct {
     kind: BranchKind,
     oid: []u8,
     current: bool = false,
+    /// Committer timestamp of the commit at this ref's tip. This is populated
+    /// only for callers that explicitly request it; malformed Git output is an
+    /// item-local unknown rather than a whole-list failure.
+    tip_committer_unix: ?i64 = null,
 };
 
 pub const BranchList = struct {
@@ -88,6 +92,7 @@ pub const BranchListRequest = struct {
     /// One borrowed descriptor/environment pair for the complete snapshot.
     context: git_command.DirectoryContext,
     scope: BranchListScope,
+    include_tip_committer_unix: bool = false,
 };
 
 pub fn loadBranchStatus(
@@ -171,17 +176,25 @@ fn loadBranchListWithLimit(
     const current_result = try runBranchCommand(allocator, io, request.context, &current_argv, .limited(4 * 1024));
     defer current_result.deinit(allocator);
 
-    const format = "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(symref)%00";
+    // Keep one fixed record schema for both callers. The typed request only
+    // decides whether the timestamp fact is parsed/stored; it never changes
+    // ordering or adds another subprocess for the normal branch picker.
+    const format = "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(symref)%00%(committerdate:unix)%00";
     const local_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads" };
     const all_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads", "refs/remotes" };
-    const list_argv = switch (request.scope) {
+    const list_argv: []const []const u8 = switch (request.scope) {
         .local => &local_argv,
         .local_and_remote => &all_argv,
     };
     const list_result = try runBranchCommand(allocator, io, request.context, list_argv, list_stdout_limit);
     defer list_result.deinit(allocator);
 
-    return branchListResultFromCommandResults(allocator, current_result, list_result);
+    return branchListResultFromCommandResultsWithTipTime(
+        allocator,
+        current_result,
+        list_result,
+        request.include_tip_committer_unix,
+    );
 }
 
 fn runBranchCommand(
@@ -202,6 +215,15 @@ fn branchListResultFromCommandResults(
     allocator: std.mem.Allocator,
     current_result: process_runner.Result,
     list_result: process_runner.Result,
+) git_command.Error!BranchListLoadResult {
+    return branchListResultFromCommandResultsWithTipTime(allocator, current_result, list_result, false);
+}
+
+fn branchListResultFromCommandResultsWithTipTime(
+    allocator: std.mem.Allocator,
+    current_result: process_runner.Result,
+    list_result: process_runner.Result,
+    include_tip_committer_unix: bool,
 ) git_command.Error!BranchListLoadResult {
     var current: ?[]u8 = null;
     defer if (current) |owned| allocator.free(owned);
@@ -243,6 +265,13 @@ fn branchListResultFromCommandResults(
         const symref_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
         const symref = list_result.stdout[index..symref_end];
         index = symref_end + 1;
+        const timestamp_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const timestamp = list_result.stdout[index..timestamp_end];
+        index = timestamp_end + 1;
+        const tip_committer_unix: ?i64 = if (include_tip_committer_unix)
+            std.fmt.parseInt(i64, timestamp, 10) catch null
+        else
+            null;
         if (full_ref.len == 0 or name.len == 0 or oid.len == 0) continue;
 
         const kind = branchKind(full_ref) orelse continue;
@@ -264,6 +293,7 @@ fn branchListResultFromCommandResults(
             .kind = kind,
             .oid = owned_oid,
             .current = kind == .local and current != null and std.mem.eql(u8, current.?, name),
+            .tip_committer_unix = tip_committer_unix,
         }) catch {
             allocator.free(owned_full_ref);
             allocator.free(owned_name);
@@ -386,7 +416,7 @@ test "branch list diagnostic allocation failure releases current" {
 
 test "branch list success transfers current ownership exactly once" {
     var current_stdout = "main\n".*;
-    var list_stdout = "refs/heads/main\x00main\x00abc\x00\x00\nrefs/heads/feature/topic\x00feature/topic\x00def\x00\x00".*;
+    var list_stdout = "refs/heads/main\x00main\x00abc\x00\x001700000001\x00\nrefs/heads/feature/topic\x00feature/topic\x00def\x00\x001700000002\x00".*;
     var empty: [0]u8 = .{};
     const result = try branchListResultFromCommandResults(
         std.testing.allocator,
@@ -407,6 +437,35 @@ test "branch list success transfers current ownership exactly once" {
     try std.testing.expect(list.branches[0].current);
     try std.testing.expectEqualStrings("feature/topic", list.branches[1].name);
     try std.testing.expect(!list.branches[1].current);
+    try std.testing.expect(list.branches[0].tip_committer_unix == null);
+    try std.testing.expect(list.branches[1].tip_committer_unix == null);
+}
+
+test "branch list typed tip time parses per item without reordering or whole-list failure" {
+    var current_stdout = "main\n".*;
+    var list_stdout = ("refs/heads/zeta\x00zeta\x00abc\x00\x001700000001\x00\n" ++
+        "refs/heads/alpha\x00alpha\x00def\x00\x00not-a-time\x00\n" ++
+        "refs/remotes/origin/topic\x00origin/topic\x00123\x00\x001700000003\x00").*;
+    var empty: [0]u8 = .{};
+    const result = try branchListResultFromCommandResultsWithTipTime(
+        std.testing.allocator,
+        .{ .term = .{ .exited = 0 }, .stdout = &current_stdout, .stderr = &empty },
+        .{ .term = .{ .exited = 0 }, .stdout = &list_stdout, .stderr = &empty },
+        true,
+    );
+    defer result.deinit(std.testing.allocator);
+
+    const list = switch (result) {
+        .ok => |value| value,
+        .failed, .failed_static => return error.ExpectedBranchList,
+    };
+    try std.testing.expectEqual(@as(usize, 3), list.branches.len);
+    try std.testing.expectEqualStrings("refs/heads/zeta", list.branches[0].full_ref);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_001), list.branches[0].tip_committer_unix);
+    try std.testing.expectEqualStrings("refs/heads/alpha", list.branches[1].full_ref);
+    try std.testing.expect(list.branches[1].tip_committer_unix == null);
+    try std.testing.expectEqualStrings("refs/remotes/origin/topic", list.branches[2].full_ref);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_003), list.branches[2].tip_committer_unix);
 }
 
 test "refs loads local branch list without record separator newlines" {
@@ -465,6 +524,7 @@ test "refs loads distinct local and remote refs and excludes every remote HEAD s
     const result = try loadBranchList(std.testing.allocator, io, .{
         .context = .{ .cwd = work, .environment = &environment },
         .scope = .local_and_remote,
+        .include_tip_committer_unix = true,
     });
     defer result.deinit(std.testing.allocator);
 
@@ -488,6 +548,9 @@ test "refs loads distinct local and remote refs and excludes every remote HEAD s
     try std.testing.expectEqual(BranchKind.remote_tracking, remote_only.kind);
     try std.testing.expectEqualStrings(fixture.main_oid, local_collision.oid);
     try std.testing.expectEqualStrings(fixture.main_oid, remote_collision.oid);
+    try std.testing.expect(local_collision.tip_committer_unix != null);
+    try std.testing.expect(remote_collision.tip_committer_unix != null);
+    try std.testing.expect(remote_only.tip_committer_unix != null);
     try std.testing.expect(current.current);
     try std.testing.expect(!remote_collision.current);
     try std.testing.expect(branchByFullRef(list.branches, "refs/remotes/origin/HEAD") == null);

@@ -10,6 +10,11 @@ pub const Msg = union(enum) {
     shared: diff_surface.message.Msg,
     open_base_picker,
     close_base_picker,
+    base_picker_enter_query,
+    base_picker_leave_query,
+    base_picker_clear_query,
+    base_picker_insert: u21,
+    base_picker_backspace,
     base_picker_previous,
     base_picker_next,
     choose_base,
@@ -25,6 +30,8 @@ pub const Context = struct {
     focus: diff_surface.Focus = .sidebar,
     sidebar_hidden: bool = false,
     base_picker_open: bool = false,
+    base_picker_query_mode: bool = false,
+    base_picker_query_len: usize = 0,
     keymap: keymap.Effective = .{},
 
     fn shared(self: Context) diff_surface.input.Context {
@@ -38,10 +45,25 @@ pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (context.base_picker_open) {
-        if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return .close_base_picker;
+        if (key.matches(chasen.Key.escape, .{})) {
+            return if (context.base_picker_query_mode or context.base_picker_query_len > 0)
+                .base_picker_clear_query
+            else
+                .close_base_picker;
+        }
         if (key.matches(chasen.Key.enter, .{})) return .choose_base;
-        if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return .base_picker_previous;
-        if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return .base_picker_next;
+        if (key.matches(chasen.Key.up, .{})) return .base_picker_previous;
+        if (key.matches(chasen.Key.down, .{})) return .base_picker_next;
+        if (context.base_picker_query_mode) {
+            if (key.matches(chasen.Key.tab, .{})) return .base_picker_leave_query;
+            if (key.matches(chasen.Key.backspace, .{})) return .base_picker_backspace;
+            if (key_input.textInputCodepoint(key)) |codepoint| return .{ .base_picker_insert = codepoint };
+            return null;
+        }
+        if (key.codepoint == '/') return .base_picker_enter_query;
+        if (key.codepoint == 'q') return .close_base_picker;
+        if (key.codepoint == 'k') return .base_picker_previous;
+        if (key.codepoint == 'j') return .base_picker_next;
         return null;
     }
     if (context.search_mode or context.file_search_mode) {
@@ -138,4 +160,22 @@ test "base picker owns its modal grammar" {
     try std.testing.expectEqual(Msg.base_picker_previous, keyToMsg(context, .{ .codepoint = 'k' }).?);
     try std.testing.expectEqual(Msg.choose_base, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(Msg.close_base_picker, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(Msg.base_picker_enter_query, keyToMsg(context, .{ .codepoint = '/' }).?);
+}
+
+test "base picker query accepts printable command letters and uses two-step escape" {
+    const query: Context = .{
+        .base_picker_open = true,
+        .base_picker_query_mode = true,
+        .base_picker_query_len = 2,
+    };
+    try std.testing.expectEqual(Msg{ .base_picker_insert = '/' }, keyToMsg(query, .{ .codepoint = '/' }).?);
+    try std.testing.expectEqual(Msg{ .base_picker_insert = 'j' }, keyToMsg(query, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(Msg{ .base_picker_insert = 'k' }, keyToMsg(query, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(Msg.base_picker_backspace, keyToMsg(query, .{ .codepoint = chasen.Key.backspace }).?);
+    try std.testing.expectEqual(Msg.base_picker_leave_query, keyToMsg(query, .{ .codepoint = chasen.Key.tab }).?);
+    try std.testing.expectEqual(Msg.base_picker_clear_query, keyToMsg(query, .{ .codepoint = chasen.Key.escape }).?);
+
+    const retained_query: Context = .{ .base_picker_open = true, .base_picker_query_len = 2 };
+    try std.testing.expectEqual(Msg.base_picker_clear_query, keyToMsg(retained_query, .{ .codepoint = chasen.Key.escape }).?);
 }

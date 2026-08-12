@@ -87,7 +87,7 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     _ = activateReview(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
     try app.update(.{ .switch_page = .compare }, &ctx);
@@ -133,6 +133,17 @@ test "Compare entry resolves default and picker selection queues its full ref" {
             .oid = "1111111111111111111111111111111111111111",
         }}),
     } } } }, &ctx);
+    const enter_query = app.handleEvent(.{ .key_press = .{ .codepoint = '/' } }) orelse
+        return error.ExpectedCompareBaseQuery;
+    try std.testing.expectEqual(App.Msg{ .compare = .base_picker_enter_query }, enter_query);
+    try app.update(enter_query, &ctx);
+    for ("topic") |byte| {
+        const insert = app.handleEvent(.{ .key_press = .{ .codepoint = byte } }) orelse
+            return error.ExpectedCompareBaseQueryInsert;
+        try app.update(insert, &ctx);
+    }
+    try std.testing.expectEqualStrings("topic", app.pages.compare.base_picker.query.slice());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try app.update(.{ .compare = .choose_base }, &ctx);
     try std.testing.expect(!app.pages.compare.base_picker.open);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
