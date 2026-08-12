@@ -933,7 +933,7 @@ test "repository source header renders path above a full fixed separator" {
         const cell = test_surface.surface.readCell(@intCast(col), source_geometry.source_search_or_rule_row) orelse
             return error.ExpectedSourceHeaderRuleCell;
         try std.testing.expectEqualStrings("─", cell.char.grapheme);
-        try std.testing.expect(cell.style.fg.eql(palette.color(.muted)));
+        try std.testing.expect(cell.style.fg.eql(.default));
         try std.testing.expect(cell.style.dim);
     }
 }
@@ -2443,7 +2443,7 @@ test "repository root renders without disclosure and activation preserves opened
     const source_rule = test_surface.surface.readCell(layout.tree_width + 1, source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceHeaderRuleCell;
     try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
-    try std.testing.expect(source_rule.style.fg.eql(theme.Palette.default().color(.muted)));
+    try std.testing.expect(source_rule.style.fg.eql(.default));
     try std.testing.expect(source_rule.style.dim);
 
     const directory = state.bundle.?.tree.nodeIndexForPath("src", .all) orelse return error.ExpectedDirectory;
@@ -2590,7 +2590,7 @@ test "repository page anchors inert checkpoint below source header rule" {
     const source_rule = test_surface.surface.readCell(layout.tree_width + 1, source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceHeaderRuleCell;
     try std.testing.expectEqualStrings("─", source_rule.char.grapheme);
-    try std.testing.expect(source_rule.style.fg.eql(theme.Palette.default().color(.muted)));
+    try std.testing.expect(source_rule.style.fg.eql(.default));
     try std.testing.expect(source_rule.style.dim);
 
     state.viewer.tree_hidden = true;

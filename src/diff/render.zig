@@ -1678,7 +1678,7 @@ test "renderFile colors staged current hunk header without dimming body" {
     try std.testing.expect(!header_cell.style.dim);
     try std.testing.expect(header_cell.style.bg.eql(.default));
     const gutter_cell = ts.surface.readCell(3, 4).?;
-    try std.testing.expect(gutter_cell.style.bg.eql(theme.Palette.default().color(.diff_removed_bg)));
+    try std.testing.expect(gutter_cell.style.bg.eql(theme.Palette.default().color(.diff_removed_line_number_bg)));
     try std.testing.expect(!gutter_cell.style.dim);
     try std.testing.expect(!ts.surface.readCell(5, 4).?.style.dim);
     try std.testing.expect(!ts.surface.readCell(12, 4).?.style.dim);
