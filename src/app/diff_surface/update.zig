@@ -131,8 +131,7 @@ pub const Controller = struct {
                 self.navigation.controller.resetDiffHorizontalScroll();
                 self.navigation.updateSearchMatchOffset();
                 self.navigation.controller.scrollSearchMatchIntoView();
-                self.navigation.applyDiffCursorScrolloff();
-                self.navigation.clampDiffNavigation();
+                self.navigation.keepDiffCursorVisible();
             },
             .toggle_line_numbers => {
                 self.navigation.controller.surface.viewer.view_options.toggleLineNumbers();

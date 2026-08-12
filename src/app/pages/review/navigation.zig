@@ -1642,14 +1642,9 @@ pub const Controller = struct {
         self.sharedBodyController(&adapter).initializeDiffCursorForSelectedFile();
     }
 
-    pub fn applyDiffCursorScrolloff(self: Controller) void {
+    pub fn placeDiffCursorInComfortBand(self: Controller) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).applyDiffCursorScrolloff();
-    }
-
-    pub fn syncDiffCursorAfterViewportScroll(self: Controller, direction: VerticalDirection, old_scroll: usize, old_cursor_offset: ?usize) void {
-        var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).syncDiffCursorAfterViewportScroll(direction, old_scroll, old_cursor_offset);
+        self.sharedBodyController(&adapter).placeDiffCursorInComfortBand();
     }
 
     pub fn toggleSidebarVisibility(self: Controller) void {
@@ -2480,7 +2475,7 @@ test "Review navigation keeps selected hunk visible across mode changes" {
         },
     }, .{ .width = 100, .height = 9 });
 
-    harness.controller().applyDiffCursorScrolloff();
+    harness.controller().placeDiffCursorInComfortBand();
     try std.testing.expect(harness.pages.review.viewer.diff_scroll > 0);
 
     harness.pages.review.viewer.display_mode = .side_by_side;
@@ -2503,6 +2498,10 @@ test "Review navigation initializes cursor at first rendered body row" {
     metadata.controller().initializeDiffCursorForSelectedFile();
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, metadata.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 0), metadata.view().visibleDiffCursorOffset());
+    const metadata_cursor = metadata.pages.review.viewer.diff_cursor;
+    metadata.controller().scrollDiff(.down);
+    try std.testing.expectEqual(@as(usize, 0), metadata.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(metadata_cursor, metadata.pages.review.viewer.diff_cursor);
 
     var binary = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffBinaryOnly()),
@@ -2510,6 +2509,107 @@ test "Review navigation initializes cursor at first rendered body row" {
     binary.controller().initializeDiffCursorForSelectedFile();
     try std.testing.expectEqual(diff_view_model.BodyCoordinate.binary_marker, binary.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 0), binary.view().visibleDiffCursorOffset());
+    const binary_cursor = binary.pages.review.viewer.diff_cursor;
+    binary.controller().scrollDiff(.down);
+    try std.testing.expectEqual(@as(usize, 0), binary.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(binary_cursor, binary.pages.review.viewer.diff_cursor);
+}
+
+test "diff cursor comfort applies keyboard page hunk and search placement" {
+    var harness = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+        },
+    }, .{ .width = 140, .height = 15 });
+    const visible_rows = harness.view().diffVisibleRows();
+    const margin = @min(@as(usize, 8), visible_rows / 3);
+    const band_last = visible_rows - 1 -| margin;
+
+    harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(band_last - 1) orelse
+        return error.ExpectedCoordinate;
+    harness.controller().moveDiffCursorRows(.down);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(?usize, band_last), harness.view().selectedDiffCursorOffset());
+
+    harness.controller().moveDiffCursorRows(.down);
+    try std.testing.expectEqual(@as(usize, 1), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(?usize, band_last + 1), harness.view().selectedDiffCursorOffset());
+
+    harness.pages.review.viewer.diff_scroll = 0;
+    harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
+        return error.ExpectedCoordinate;
+    harness.controller().moveDiffCursorPage(.down);
+    const page_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
+    try std.testing.expectEqual(@as(usize, visible_rows), page_offset);
+    const line_count = harness.view().displayedDiffLineCount();
+    try std.testing.expectEqual(
+        @min(page_offset -| (visible_rows / 2), line_count -| visible_rows),
+        harness.pages.review.viewer.diff_scroll,
+    );
+
+    harness.pages.review.viewer.diff_scroll = 0;
+    harness.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
+    harness.controller().selectHunkDelta(1);
+    const hunk_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
+    const hunk_row = hunk_offset - harness.pages.review.viewer.diff_scroll;
+    try std.testing.expect(hunk_row >= margin and hunk_row <= band_last);
+
+    harness.pages.review.viewer.diff_scroll = 0;
+    setDiffSearchQuery(&harness, "new");
+    harness.controller().submitSearch();
+    const search_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
+    const search_row = search_offset - harness.pages.review.viewer.diff_scroll;
+    try std.testing.expect(search_row >= margin and search_row <= band_last);
+
+    harness.terminal_size.height = 8;
+    harness.pages.review.viewer.diff_scroll = 1;
+    harness.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const zero_height_cursor = harness.pages.review.viewer.diff_cursor;
+    harness.controller().scrollDiff(.down);
+    try std.testing.expectEqual(@as(usize, 2), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(zero_height_cursor, harness.pages.review.viewer.diff_cursor);
+}
+
+test "reload search fallback resyncs match without interactive cursor placement" {
+    var harness = TestHarness.init(.{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .display_mode = .unified,
+            .sidebar_hidden = true,
+            .diff_cursor = .{ .hunk_header = 0 },
+        },
+    }, .{ .width = 140, .height = 15 });
+    setDiffSearchQuery(&harness, "late old");
+
+    var path_key = [_]u8{'a'};
+    var sidebar_path = [_]u8{'a'};
+    const invalid_coordinate: diff_view_model.BodyCoordinate = .{ .hunk_line = .{
+        .hunk_index = 99,
+        .line_index = 0,
+    } };
+    var anchor: diff_surface.ReloadAnchor = .{
+        .path_key = path_key[0..],
+        .sidebar_identity = .{ .file = sidebar_path[0..] },
+        .selected_target_tag = .diff_file,
+        .visible_sidebar_row = 0,
+        .diff_cursor = harness.pages.review.viewer.diff_cursor,
+        .diff_cursor_offset = 0,
+        .diff_scroll = 0,
+        .diff_horizontal_scroll = 0,
+        .sidebar_horizontal_scroll = 0,
+        .search_coordinate = invalid_coordinate,
+    };
+
+    const cursor_before = harness.pages.review.viewer.diff_cursor;
+    harness.controller().restoreSearchFromReloadAnchor(&anchor);
+
+    try std.testing.expectEqual(cursor_before, harness.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
+    const match = harness.pages.review.search.match orelse return error.ExpectedSearchMatch;
+    try std.testing.expect(!std.meta.eql(invalid_coordinate, match.coordinate));
+    try std.testing.expect(harness.pages.review.search.match_offset != null);
 }
 
 test "Review mouse selection ignores the opposite side and resumes on its locked side" {
@@ -3395,6 +3495,10 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
     }, status.view().resolvedTarget());
     try expectResolverRenderContains(&status, "No staged diff.");
     try std.testing.expectEqual(@as(usize, 0), status.view().visibleBodyTextMaxHorizontalScroll());
+    const status_cursor = status.pages.review.viewer.diff_cursor;
+    status.controller().scrollDiff(.down);
+    try std.testing.expectEqual(@as(usize, 0), status.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(status_cursor, status.pages.review.viewer.diff_cursor);
 
     const invalid_patch =
         "diff --git a/a b/a\n" ++
@@ -3515,18 +3619,18 @@ test "search resync without pane width change keeps horizontal scroll" {
     try std.testing.expectEqual(@as(usize, 16), app.pages.review.viewer.diff_horizontal_scroll);
 }
 
-test "mouse diff scroll keeps cursor in the viewport" {
+test "diff wheel scroll brings an invisible cursor into the moved viewport" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
                 .sidebar_hidden = true,
-                .diff_scroll = 12,
+                .diff_scroll = 2,
                 .diff_cursor = .{ .hunk_header = 0 },
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 9 },
+        .terminal_size = .{ .width = 140, .height = 15 },
     };
 
     try std.testing.expect(app.visibleDiffCursorOffset() == null);
@@ -3536,29 +3640,32 @@ test "mouse diff scroll keeps cursor in the viewport" {
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
 
-test "diff scroll keeps visible cursor screen position stable" {
+test "diff wheel comfort keeps band cursor screen position stable" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
                 .sidebar_hidden = true,
-                .diff_scroll = 3,
+                .diff_scroll = 1,
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 10 },
+        .terminal_size = .{ .width = 140, .height = 15 },
     };
     const old_scroll = app.pages.review.viewer.diff_scroll;
-    const old_offset = old_scroll + 1;
+    const visible_rows = app.reviewNavigationView().diffVisibleRows();
+    const margin = @min(@as(usize, 8), visible_rows / 3);
+    const old_offset = old_scroll + margin;
     app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
 
     app.reviewNavigation().scrollDiff(.down);
 
     const new_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
+    try std.testing.expectEqual(old_scroll + 1, app.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.pages.review.viewer.diff_scroll);
 }
 
-test "diff scroll syncs invisible cursor to scrolloff margin" {
+test "diff wheel comfort recenters edge cursor only after viewport movement" {
     var app: TestHarness = .{
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -3567,21 +3674,33 @@ test "diff scroll syncs invisible cursor to scrolloff margin" {
                 .sidebar_hidden = true,
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 9 },
+        .terminal_size = .{ .width = 140, .height = 15 },
     };
     const line_count = app.reviewNavigationView().selectedFileLineIndex(app.reviewNavigationView().effectiveDisplayMode()).lineCount();
     const visible_rows = app.reviewNavigationView().diffVisibleRows();
-    const margin = @min(@as(usize, 8), visible_rows / 3);
 
     app.pages.review.viewer.diff_scroll = 0;
     app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
+    const cursor_at_bof = app.pages.review.viewer.diff_cursor;
     app.reviewNavigation().scrollDiff(.up);
-    try std.testing.expectEqual(app.pages.review.viewer.diff_scroll + margin, app.reviewNavigationView().selectedDiffCursorOffset().?);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(cursor_at_bof, app.pages.review.viewer.diff_cursor);
+
+    app.reviewNavigation().scrollDiff(.down);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(
+        @min(app.pages.review.viewer.diff_scroll + visible_rows / 2, line_count - 1),
+        app.reviewNavigationView().selectedDiffCursorOffset().?,
+    );
 
     app.pages.review.viewer.diff_scroll = line_count - visible_rows;
     app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
-    app.reviewNavigation().scrollDiff(.down);
-    try std.testing.expectEqual(app.pages.review.viewer.diff_scroll + visible_rows - 1 -| margin, app.reviewNavigationView().selectedDiffCursorOffset().?);
+    app.reviewNavigation().scrollDiff(.up);
+    try std.testing.expectEqual(line_count - visible_rows - 1, app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(
+        app.pages.review.viewer.diff_scroll + visible_rows / 2,
+        app.reviewNavigationView().selectedDiffCursorOffset().?,
+    );
 }
 
 test "diff row movement continues from wheel-synced visible cursor" {
@@ -3593,13 +3712,13 @@ test "diff row movement continues from wheel-synced visible cursor" {
                 .sidebar_hidden = true,
             },
         } },
-        .terminal_size = .{ .width = 140, .height = 9 },
+        .terminal_size = .{ .width = 140, .height = 15 },
     };
     const line_count = app.reviewNavigationView().selectedFileLineIndex(app.reviewNavigationView().effectiveDisplayMode()).lineCount();
     app.pages.review.viewer.diff_scroll = 0;
     app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
 
-    app.reviewNavigation().scrollDiff(.up);
+    app.reviewNavigation().scrollDiff(.down);
     const synced_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
     app.reviewNavigation().moveDiffCursorRows(.down);
 
@@ -5160,7 +5279,7 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
             .status_load = .{ .generation = 3 },
             .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
         } },
-        .terminal_size = .{ .width = 100, .height = 40 },
+        .terminal_size = .{ .width = 100, .height = 11 },
         .source = .unstaged,
         .repo_root = "/repo",
     };
@@ -5183,7 +5302,11 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
     );
     app.pages.review.review_projection.displayed = .{ .ready = .{
         .request = request,
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n") },
+        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(
+            std.testing.allocator,
+            "src/new.zig",
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
+        ) },
     } };
 
     try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
@@ -5192,6 +5315,12 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
     try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
     app.reviewNavigation().selectHunkDelta(1);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
+
+    app.pages.review.viewer.diff_scroll = 0;
+    app.pages.review.viewer.diff_cursor = .{ .metadata = 0 };
+    app.reviewNavigation().scrollDiff(.down);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 2 }, app.pages.review.viewer.diff_cursor);
 }
 
 test "generated preview blocks diff search" {

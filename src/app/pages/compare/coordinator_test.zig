@@ -7,6 +7,8 @@ const app_message = @import("../../message.zig");
 const page = @import("../../page.zig");
 const repo_session = @import("../../repo_session.zig");
 const diff_basis = @import("../../diff_basis.zig");
+const diff_surface = @import("../../diff_surface.zig");
+const app_test_support = @import("../../test_support.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
 const git_refs = @import("../../../git/refs.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
@@ -23,6 +25,7 @@ const TestApp = struct {
     active_page: page.Id = .compare,
     repo_session: repo_session.State = .{},
     pages: struct { compare: compare_page.ComparePageState = .{} } = .{},
+    layout: diff_surface.Layout = .{ .width = 100, .height = 30 },
 
     const Msg = app_message.Msg;
 
@@ -30,7 +33,7 @@ const TestApp = struct {
         return .{
             .page_state = &self.pages.compare,
             .repo = self.repo_session.view(),
-            .layout = .{ .width = 100, .height = 30 },
+            .layout = self.layout,
             .env_map = null,
         };
     }
@@ -53,6 +56,43 @@ const TestApp = struct {
         }
     }
 };
+
+test "diff wheel comfort routes through Compare and recenters an edge cursor" {
+    const allocator = std.testing.allocator;
+    var app: TestApp = .{
+        .pages = .{ .compare = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .unified,
+                .sidebar_hidden = true,
+                .focus = .sidebar,
+                .diff_scroll = 2,
+            },
+        } },
+        .layout = .{ .width = 140, .height = 9 },
+    };
+    defer app.pages.compare.deinit(allocator);
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+
+    const old_scroll = app.pages.compare.viewer.diff_scroll;
+    const navigation = app.controller().navigation();
+    var update_adapter = navigation.updateAdapter();
+    const body = update_adapter.bodyController();
+    const visible_rows = body.view().view.diffVisibleRows();
+    app.pages.compare.viewer.diff_cursor = body.view().selectedCoordinateAtOffset(old_scroll) orelse
+        return error.ExpectedCoordinate;
+
+    try app.update(.{ .compare = .{ .shared = .mouse_diff_wheel_down } }, &ctx);
+
+    var result_adapter = app.controller().navigation().updateAdapter();
+    const result_body = result_adapter.bodyController();
+    try std.testing.expectEqual(diff_surface.Focus.diff, app.pages.compare.viewer.focus);
+    try std.testing.expectEqual(old_scroll + 1, app.pages.compare.viewer.diff_scroll);
+    try std.testing.expectEqual(
+        app.pages.compare.viewer.diff_scroll + visible_rows / 2,
+        result_body.view().selectedDiffCursorOffset().?,
+    );
+}
 
 test "Compare reload retries user intent and preserves accepted display on failure" {
     const allocator = std.testing.allocator;

@@ -8,6 +8,7 @@ const std = @import("std");
 const layout = @import("layout.zig");
 const diff_surface = @import("../diff_surface.zig");
 const app_direction = @import("../direction.zig");
+const cursor_viewport = @import("../cursor_viewport.zig");
 const file_search = diff_surface.file_search;
 const context = @import("../../context.zig");
 const diff_file = @import("../../diff/file.zig");
@@ -1023,7 +1024,9 @@ pub const BodyController = struct {
             if (self.controller.surface.search.match != null) return;
         }
 
-        self.refreshSearchForSelectedFile();
+        _ = self.refreshSearchMatchForSelectedFile();
+        self.clampDiffNavigation();
+        self.keepDiffCursorVisible();
     }
 
     pub fn toggleSidebarVisibility(self: BodyController) void {
@@ -1231,14 +1234,25 @@ pub const BodyController = struct {
     }
 
     pub fn scrollDiff(self: BodyController, direction: VerticalDirection) void {
-        const old_scroll = self.controller.surface.viewer.diff_scroll;
+        const bounds = self.diffCursorBounds();
+        const old_scroll = bounds.clampScroll(self.controller.surface.viewer.diff_scroll);
         const old_cursor_offset = self.view().selectedDiffCursorOffset();
-        switch (direction) {
-            .up => self.controller.surface.viewer.diff_scroll -|= 1,
-            .down => self.controller.surface.viewer.diff_scroll += 1,
-        }
-        self.clampDiffNavigation();
-        self.syncDiffCursorAfterViewportScroll(direction, old_scroll, old_cursor_offset);
+        const requested_scroll = switch (direction) {
+            .up => old_scroll -| 1,
+            .down => old_scroll +| 1,
+        };
+        const new_scroll = bounds.clampScroll(requested_scroll);
+        self.controller.surface.viewer.diff_scroll = new_scroll;
+        if (old_scroll == new_scroll or bounds.visible_rows == 0) return;
+
+        const target = cursor_viewport.retargetCursorAfterViewportScroll(
+            bounds,
+            old_scroll,
+            new_scroll,
+            old_cursor_offset,
+        ) orelse return;
+        self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(target) orelse
+            self.controller.surface.viewer.diff_cursor;
     }
 
     pub fn scrollDiffHorizontal(self: BodyController, direction: HorizontalDirection) void {
@@ -1260,23 +1274,23 @@ pub const BodyController = struct {
     pub fn moveDiffCursorRows(self: BodyController, direction: VerticalDirection) void {
         const current = self.view().selectedDiffCursorOffset() orelse {
             self.initializeDiffCursorForSelectedFile();
-            self.applyDiffCursorScrolloff();
+            self.placeDiffCursorInComfortBand();
             return;
         };
         const line_count = self.view().displayedDiffLineCount();
         if (line_count == 0) return;
         const target = switch (direction) {
             .up => current -| 1,
-            .down => @min(current + 1, line_count - 1),
+            .down => @min(current +| 1, line_count - 1),
         };
         self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(target) orelse self.controller.surface.viewer.diff_cursor;
-        self.applyDiffCursorScrolloff();
+        self.placeDiffCursorInComfortBand();
     }
 
     pub fn moveDiffCursorPage(self: BodyController, direction: VerticalDirection) void {
         const current = self.view().selectedDiffCursorOffset() orelse {
             self.initializeDiffCursorForSelectedFile();
-            self.applyDiffCursorScrolloff();
+            self.centerDiffCursor();
             return;
         };
         const line_count = self.view().displayedDiffLineCount();
@@ -1284,10 +1298,10 @@ pub const BodyController = struct {
         const step = @max(self.controller.view().diffVisibleRows(), 1);
         const target = switch (direction) {
             .up => current -| step,
-            .down => @min(current + step, line_count - 1),
+            .down => @min(current +| step, line_count - 1),
         };
         self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(target) orelse self.controller.surface.viewer.diff_cursor;
-        self.applyDiffCursorScrolloff();
+        self.centerDiffCursor();
     }
 
     pub fn selectHunkDelta(self: BodyController, delta: i2) void {
@@ -1307,7 +1321,7 @@ pub const BodyController = struct {
             break :blk 0;
         };
         self.controller.surface.viewer.diff_cursor = .{ .hunk_header = target };
-        self.applyDiffCursorScrolloff();
+        self.placeDiffCursorInComfortBand();
     }
 
     pub fn toggleSelectedHunkFold(self: BodyController) void {
@@ -1336,8 +1350,7 @@ pub const BodyController = struct {
             }
         }
         self.updateSearchMatchOffset();
-        self.applyDiffCursorScrolloff();
-        self.clampDiffNavigation();
+        self.keepDiffCursorVisible();
     }
 
     pub fn clampDiffNavigation(self: BodyController) void {
@@ -1347,29 +1360,16 @@ pub const BodyController = struct {
             self.controller.surface.viewer.diff_horizontal_scroll = 0;
             return;
         }
-        if (self.controller.view().selectedFile() == null) {
-            const line_count = self.view().selectedProjectionLineCount();
-            const visible_rows = self.controller.view().diffVisibleRows();
-            const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-            if (self.controller.surface.viewer.diff_scroll > max_scroll) self.controller.surface.viewer.diff_scroll = max_scroll;
-            return;
-        }
-
-        if (self.view().selectedDiffCursorOffset() == null) {
+        const bounds = self.diffCursorBounds();
+        if (bounds.content_rows > 0 and self.view().selectedDiffCursorOffset() == null) {
             self.initializeDiffCursorForSelectedFile();
         }
-
-        const mode = self.controller.view().effectiveDisplayMode();
-        const line_count = self.view().selectedFileLineIndex(mode).lineCount();
-        const visible_rows = self.controller.view().diffVisibleRows();
-        const max_scroll = if (line_count > visible_rows) line_count - visible_rows else 0;
-        if (self.controller.surface.viewer.diff_scroll > max_scroll) self.controller.surface.viewer.diff_scroll = max_scroll;
+        self.controller.surface.viewer.diff_scroll = bounds.clampScroll(self.controller.surface.viewer.diff_scroll);
     }
 
     pub fn clampDiffNavigationKeepingHunkVisible(self: BodyController) void {
         self.clampDiffNavigation();
-        self.applyDiffCursorScrolloff();
-        self.clampDiffNavigation();
+        self.keepDiffCursorVisible();
     }
 
     pub fn resetDiffPosition(self: BodyController) void {
@@ -1411,21 +1411,25 @@ pub const BodyController = struct {
         self.setSearchMatch(next);
         self.controller.surface.viewer.diff_cursor = next.coordinate;
         self.controller.resetDiffHorizontalScroll();
-        self.applyDiffCursorScrolloff();
-        self.clampDiffNavigation();
+        self.placeDiffCursorInComfortBand();
     }
 
     pub fn refreshSearchForSelectedFile(self: BodyController) void {
+        const next = self.refreshSearchMatchForSelectedFile() orelse return;
+        self.controller.surface.viewer.diff_cursor = next.coordinate;
+        self.placeDiffCursorInComfortBand();
+    }
+
+    fn refreshSearchMatchForSelectedFile(self: BodyController) ?diff_search.Match {
         self.controller.clearSearchMatch();
-        if (self.controller.surface.search.query.len == 0) return;
-        if (self.view().unsupportedSearchMessage() != null) return;
+        if (self.controller.surface.search.query.len == 0) return null;
+        if (self.view().unsupportedSearchMessage() != null) return null;
         const mode = self.controller.view().effectiveDisplayMode();
-        const target = self.view().displayedSearchTarget(mode) orelse return;
-        const next = diff_search.findMatch(target.file, mode, self.controller.surface.search.query.slice(), null, .forward) orelse return;
+        const target = self.view().displayedSearchTarget(mode) orelse return null;
+        const next = diff_search.findMatch(target.file, mode, self.controller.surface.search.query.slice(), null, .forward) orelse return null;
         self.unfoldSearchMatchIfNeeded(next);
         self.setSearchMatch(next);
-        self.controller.surface.viewer.diff_cursor = next.coordinate;
-        self.applyDiffCursorScrolloff();
+        return next;
     }
 
     pub fn setSearchMatch(self: BodyController, match: diff_search.Match) void {
@@ -1476,13 +1480,11 @@ pub const BodyController = struct {
 
     pub fn keepDiffCursorVisible(self: BodyController) void {
         const offset = self.view().selectedDiffCursorOffset() orelse return;
-        const visible_rows = self.controller.view().diffVisibleRows();
-        if (offset < self.controller.surface.viewer.diff_scroll) {
-            self.controller.surface.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.controller.surface.viewer.diff_scroll + visible_rows) {
-            self.controller.surface.viewer.diff_scroll = offset + 1 - visible_rows;
-        }
-        self.clampDiffNavigation();
+        self.controller.surface.viewer.diff_scroll = cursor_viewport.keepCursorVisible(
+            self.diffCursorBounds(),
+            self.controller.surface.viewer.diff_scroll,
+            offset,
+        );
     }
 
     pub fn clampSelection(self: BodyController, file_count: usize) void {
@@ -1560,59 +1562,35 @@ pub const BodyController = struct {
         self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(0) orelse .{ .metadata = 0 };
     }
 
-    pub fn applyDiffCursorScrolloff(self: BodyController) void {
+    fn diffCursorBounds(self: BodyController) cursor_viewport.Bounds {
+        return .{
+            .content_rows = self.view().displayedDiffLineCount(),
+            .visible_rows = self.controller.view().diffVisibleRows(),
+        };
+    }
+
+    pub fn placeDiffCursorInComfortBand(self: BodyController) void {
         const cursor_offset = self.view().selectedDiffCursorOffset() orelse {
             self.clampDiffNavigation();
             return;
         };
-        const visible_rows = self.controller.view().diffVisibleRows();
-        if (visible_rows == 0) {
-            self.clampDiffNavigation();
-            return;
-        }
-        const margin = @min(@as(usize, 8), visible_rows / 3);
-        if (cursor_offset < self.controller.surface.viewer.diff_scroll + margin) {
-            self.controller.surface.viewer.diff_scroll = cursor_offset -| margin;
-        } else {
-            const lower_edge = self.controller.surface.viewer.diff_scroll + visible_rows -| margin;
-            if (cursor_offset >= lower_edge) {
-                self.controller.surface.viewer.diff_scroll = cursor_offset + margin + 1 - visible_rows;
-            }
-        }
-        self.clampDiffNavigation();
+        self.controller.surface.viewer.diff_scroll = cursor_viewport.placeCursorInComfortBand(
+            self.diffCursorBounds(),
+            self.controller.surface.viewer.diff_scroll,
+            cursor_offset,
+        );
     }
 
-    pub fn syncDiffCursorAfterViewportScroll(
-        self: BodyController,
-        direction: VerticalDirection,
-        old_scroll: usize,
-        old_cursor_offset: ?usize,
-    ) void {
-        const line_count = self.view().selectedFileLineIndex(self.controller.view().effectiveDisplayMode()).lineCount();
-        if (line_count == 0) return;
-        const visible_rows = self.controller.view().diffVisibleRows();
-        if (visible_rows == 0) return;
-
-        // Mouse-wheel scrolling is viewport-first, but hunk actions still use
-        // the diff cursor. Keep the cursor near the user's visible scroll
-        // position without letting normal scrolloff pull the viewport back.
-        const margin = @min(@as(usize, 8), visible_rows / 3);
-        const target = if (old_cursor_offset) |offset| blk: {
-            if (offset >= old_scroll and offset < old_scroll + visible_rows) {
-                break :blk self.controller.surface.viewer.diff_scroll + (offset - old_scroll);
-            }
-            break :blk switch (direction) {
-                .up => self.controller.surface.viewer.diff_scroll + margin,
-                .down => self.controller.surface.viewer.diff_scroll + visible_rows - 1 -| margin,
-            };
-        } else blk: {
-            break :blk switch (direction) {
-                .up => self.controller.surface.viewer.diff_scroll + margin,
-                .down => self.controller.surface.viewer.diff_scroll + visible_rows - 1 -| margin,
-            };
+    pub fn centerDiffCursor(self: BodyController) void {
+        const cursor_offset = self.view().selectedDiffCursorOffset() orelse {
+            self.clampDiffNavigation();
+            return;
         };
-
-        self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(@min(target, line_count - 1)) orelse self.controller.surface.viewer.diff_cursor;
+        self.controller.surface.viewer.diff_scroll = cursor_viewport.centerCursor(
+            self.diffCursorBounds(),
+            self.controller.surface.viewer.diff_scroll,
+            cursor_offset,
+        );
     }
 };
 
