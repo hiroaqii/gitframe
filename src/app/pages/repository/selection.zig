@@ -10,9 +10,10 @@ const std = @import("std");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const source = @import("../../../repository/source.zig");
-const text_projection = @import("../../../text/projection.zig");
+const text_projection = @import("chasen_ui").text_projection;
 
 const Fingerprint = content_fingerprint.Fingerprint;
+const repository_tab_width: usize = 4;
 
 pub const Mode = enum {
     character,
@@ -248,8 +249,8 @@ pub fn pointFromLine(line_index: usize) Point {
 pub fn pointFromToken(line_index: usize, token: text_projection.Token) Point {
     return .{
         .line_index = line_index,
-        .leading_byte = token.leading,
-        .trailing_byte = token.trailing,
+        .leading_byte = token.byte_start,
+        .trailing_byte = token.byte_end,
     };
 }
 
@@ -333,9 +334,9 @@ fn selectedBytesForLine(line: []const u8, mode: Mode, range: Range, line_index: 
     if (mode == .line) return line;
     const start = if (line_index == range.start.line_index) range.start.leading_byte else 0;
     const end = if (line_index == range.end.line_index) range.end.trailing_byte else line.len;
-    if (start > end or !text_projection.validateBoundary(line, start) or
-        !text_projection.validateBoundary(line, end))
-    {
+    const projection = text_projection.Projection.init(line, .{ .tab_width = repository_tab_width }) catch
+        return error.InvalidSelection;
+    if (start > end or !projection.isBoundary(start) or !projection.isBoundary(end)) {
         return error.InvalidSelection;
     }
     return line[start..end];
@@ -347,9 +348,10 @@ fn selectedBytesForLine(line: []const u8, mode: Mode, range: Range, line_index: 
 /// be deferred to whichever endpoint the current assembler happens to slice.
 fn validCharacterPoint(document: *const source.Document, point: Point) bool {
     const line = document.lineBody(point.line_index) orelse return false;
+    const projection = text_projection.Projection.init(line, .{ .tab_width = repository_tab_width }) catch return false;
     return point.leading_byte <= point.trailing_byte and
-        text_projection.validateBoundary(line, point.leading_byte) and
-        text_projection.validateBoundary(line, point.trailing_byte);
+        projection.isBoundary(point.leading_byte) and
+        projection.isBoundary(point.trailing_byte);
 }
 
 fn pointEql(left: Point, right: Point) bool {
@@ -461,7 +463,8 @@ test "repository selection point total order keeps first tokens dragged to their
         var document = try testDocument(case.line);
         defer document.deinit(std.testing.allocator);
         const token = testToken("first-token.zig", case.line);
-        const first = switch (text_projection.hitAtDisplayCell(case.line, 0).?) {
+        const projection = try text_projection.Projection.init(case.line, .{ .tab_width = repository_tab_width });
+        const first = switch (projection.hitCell(0)) {
             .token => |value| value,
             .boundary => return error.ExpectedToken,
         };
@@ -549,20 +552,21 @@ test "repository selection character assembler preserves atomic TAB combining em
     defer document.deinit(std.testing.allocator);
     const token = testToken("unicode.zig", line);
     var display_cell: usize = 0;
+    const projection = try text_projection.Projection.init(line, .{ .tab_width = repository_tab_width });
     const expected = [_][]const u8{ "\t", "e\u{301}", "👩‍💻", "界" };
     for (expected) |wanted| {
-        const hit = switch (text_projection.hitAtDisplayCell(line, display_cell).?) {
+        const hit = switch (projection.hitCell(display_cell)) {
             .token => |value| value,
             .boundary => return error.ExpectedToken,
         };
         var completed = try buildCompletedSelection(
             std.testing.allocator,
             &document,
-            testSelection(token, .character, pointFromToken(0, hit), pointFromBoundary(0, hit.trailing)),
+            testSelection(token, .character, pointFromToken(0, hit), pointFromBoundary(0, hit.byte_end)),
         );
         defer completed.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings(wanted, completed.text);
-        display_cell = hit.display_end;
+        display_cell = hit.cell_end;
     }
 }
 

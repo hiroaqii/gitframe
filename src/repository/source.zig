@@ -7,9 +7,11 @@
 //! separate coordinate systems.
 
 const std = @import("std");
+const text_projection = @import("chasen_ui").text_projection;
 const content_fingerprint = @import("../content_fingerprint.zig");
 const selected_document = @import("document.zig");
-const text_projection = @import("../text/projection.zig");
+
+const repository_tab_width: usize = 4;
 
 pub const Match = struct {
     line: usize,
@@ -47,7 +49,11 @@ pub const Document = struct {
             .max_display_width = 0,
         };
         for (0..document.rowCount()) |line_index| {
-            document.max_display_width = @max(document.max_display_width, try text_projection.displayWidth(document.lineBody(line_index).?));
+            const projection = try text_projection.Projection.init(
+                document.lineBody(line_index).?,
+                .{ .tab_width = repository_tab_width },
+            );
+            document.max_display_width = @max(document.max_display_width, projection.displayWidth());
         }
         return document;
     }
@@ -160,12 +166,14 @@ pub const Document = struct {
 
     pub fn displayColumnForByte(self: *const Document, line_index: usize, byte_offset: usize) ?usize {
         const line = self.lineBody(line_index) orelse return null;
-        return text_projection.leadingDisplayColumnForByte(line, byte_offset);
+        const projection = text_projection.Projection.init(line, .{ .tab_width = repository_tab_width }) catch return null;
+        return projection.leadingCellForByte(byte_offset);
     }
 
     pub fn lineDisplayWidth(self: *const Document, line_index: usize) ?usize {
         const line = self.lineBody(line_index) orelse return null;
-        return text_projection.displayWidth(line) catch null;
+        const projection = text_projection.Projection.init(line, .{ .tab_width = repository_tab_width }) catch return null;
+        return projection.displayWidth();
     }
 
     pub fn maxDisplayWidth(self: *const Document) usize {
@@ -241,19 +249,30 @@ test "repository source search wraps both directions within one line" {
 }
 
 test "repository source render window expands tabs and preserves graphemes" {
+    const projection = try text_projection.Projection.init("a\tb界e\u{301}", .{ .tab_width = repository_tab_width });
+    var visible = projection.visibleSegments(0, 12);
+    try std.testing.expectEqualStrings("a", visible.next().?.materialization.source);
+    try std.testing.expectEqual(@as(usize, 3), visible.next().?.materialization.spaces);
+    try std.testing.expectEqualStrings("b", visible.next().?.materialization.source);
+    try std.testing.expectEqualStrings("界", visible.next().?.materialization.source);
+    try std.testing.expectEqualStrings("e\u{301}", visible.next().?.materialization.source);
+    try std.testing.expect(visible.next() == null);
+
+    const clipped_projection = try text_projection.Projection.init("界x", .{ .tab_width = repository_tab_width });
+    var clipped = clipped_projection.visibleSegments(1, 2);
+    const clipped_wide = clipped.next().?;
+    try std.testing.expectEqual(text_projection.CellRange{ .start = 0, .end = 1 }, clipped_wide.viewport_cells);
+    try std.testing.expectEqual(@as(usize, 1), clipped_wide.materialization.spaces);
+    try std.testing.expectEqualStrings("x", clipped.next().?.materialization.source);
+    try std.testing.expect(clipped.next() == null);
+
+    const preceded_projection = try text_projection.Projection.init("a界x", .{ .tab_width = repository_tab_width });
+    var preceded = preceded_projection.visibleSegments(2, 2);
+    try std.testing.expectEqual(@as(usize, 1), preceded.next().?.materialization.spaces);
+    try std.testing.expectEqualStrings("x", preceded.next().?.materialization.source);
+    try std.testing.expect(preceded.next() == null);
+
     const allocator = std.testing.allocator;
-    const rendered = try text_projection.renderWindowAlloc(allocator, "a\tb界e\u{301}", 0, 12);
-    defer allocator.free(rendered);
-    try std.testing.expectEqualStrings("a   b界e\u{301}", rendered);
-
-    const clipped = try text_projection.renderWindowAlloc(allocator, "界x", 1, 2);
-    defer allocator.free(clipped);
-    try std.testing.expectEqualStrings(" x", clipped);
-
-    const preceded = try text_projection.renderWindowAlloc(allocator, "a界x", 2, 2);
-    defer allocator.free(preceded);
-    try std.testing.expectEqualStrings(" x", preceded);
-
     const combining_bytes = try allocator.dupe(u8, "e\u{301}x");
     var combining = try Document.initOwned(allocator, combining_bytes, content_fingerprint.Fingerprint.init(combining_bytes));
     defer combining.deinit(allocator);
@@ -261,26 +280,29 @@ test "repository source render window expands tabs and preserves graphemes" {
 }
 
 test "repository source match window expands graphemes and preserves display columns" {
-    const allocator = std.testing.allocator;
-    const after_tab = (try text_projection.renderEnclosingRangeWindowAlloc(allocator, "a\tneedle", 2, 8, 0, 20)).?;
-    defer allocator.free(after_tab.text);
-    try std.testing.expectEqual(@as(usize, 4), after_tab.column);
-    try std.testing.expectEqualStrings("needle", after_tab.text);
+    const after_tab = try text_projection.Projection.init("a\tneedle", .{ .tab_width = repository_tab_width });
+    try std.testing.expectEqual(
+        text_projection.CellRange{ .start = 4, .end = 10 },
+        after_tab.enclosingCellsForBytes(.{ .start = 2, .end = 8 }).?,
+    );
 
-    const combining = (try text_projection.renderEnclosingRangeWindowAlloc(allocator, "e\u{301}x", 1, 3, 0, 10)).?;
-    defer allocator.free(combining.text);
-    try std.testing.expectEqual(@as(usize, 0), combining.column);
-    try std.testing.expectEqualStrings("e\u{301}", combining.text);
+    const combining = try text_projection.Projection.init("e\u{301}x", .{ .tab_width = repository_tab_width });
+    try std.testing.expectEqual(
+        text_projection.CellRange{ .start = 0, .end = 1 },
+        combining.enclosingCellsForBytes(.{ .start = 1, .end = 3 }).?,
+    );
 
-    const clipped_wide = (try text_projection.renderEnclosingRangeWindowAlloc(allocator, "a界x", 1, 4, 2, 2)).?;
-    defer allocator.free(clipped_wide.text);
-    try std.testing.expectEqual(@as(usize, 0), clipped_wide.column);
-    try std.testing.expectEqualStrings(" ", clipped_wide.text);
-
-    const after_wide = (try text_projection.renderEnclosingRangeWindowAlloc(allocator, "a界x", 4, 5, 2, 2)).?;
-    defer allocator.free(after_wide.text);
-    try std.testing.expectEqual(@as(usize, 1), after_wide.column);
-    try std.testing.expectEqualStrings("x", after_wide.text);
+    const wide = try text_projection.Projection.init("a界x", .{ .tab_width = repository_tab_width });
+    try std.testing.expectEqual(
+        text_projection.CellRange{ .start = 1, .end = 3 },
+        wide.enclosingCellsForBytes(.{ .start = 1, .end = 4 }).?,
+    );
+    var clipped_wide = wide.visibleSegments(2, 2);
+    try std.testing.expectEqual(@as(usize, 1), clipped_wide.next().?.materialization.spaces);
+    const after_wide = clipped_wide.next().?;
+    try std.testing.expectEqual(text_projection.CellRange{ .start = 1, .end = 2 }, after_wide.viewport_cells);
+    try std.testing.expectEqualStrings("x", after_wide.materialization.source);
+    try std.testing.expect(clipped_wide.next() == null);
 }
 
 test "text limit contract repository source dense and long lines" {

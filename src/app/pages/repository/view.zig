@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
+const text_projection = @import("chasen_ui").text_projection;
 const draw = @import("draw");
 const keymap = @import("keymap");
 const theme = @import("theme");
@@ -19,7 +20,6 @@ const selection = @import("selection.zig");
 const source_header = @import("source_header.zig");
 const source_geometry = @import("source_geometry.zig");
 const source = @import("../../../repository/source.zig");
-const text_projection = @import("../../../text/projection.zig");
 const repository_change_map = @import("../../../repository/change_map.zig");
 const repository_change_index = @import("../../../repository/change_index.zig");
 const source_syntax = @import("../../../syntax/source.zig");
@@ -30,6 +30,7 @@ const repository_tree = @import("../../../repository/tree.zig");
 const selected_document = @import("../../../repository/document.zig");
 
 const RepositoryPageState = repository_page.RepositoryPageState;
+const repository_tab_width: usize = 4;
 const oversized_display_message = std.fmt.comptimePrint(
     "File exceeds the {d} MiB display limit",
     .{selected_document.max_text_mib},
@@ -580,6 +581,8 @@ pub fn drawSource(
     var body_row: usize = 0;
     while (body_row < rows and viewer.source_vertical_scroll + body_row < document.rowCount()) : (body_row += 1) {
         const line_index = viewer.source_vertical_scroll + body_row;
+        const line = document.lineBody(line_index).?;
+        const projection = try text_projection.Projection.init(line, .{ .tab_width = repository_tab_width });
         const row = geometry.body_first_row + @as(u16, @intCast(body_row));
         const current = line_index == viewer.source_cursor;
         if (source_active and current) fillSourceCursorRow(surface, row, palette.color(.pane_cursor_bg));
@@ -604,17 +607,15 @@ pub fn drawSource(
             draw.copyClippedTextAt(surface, number_col, row, number, sourceRowStyle(palette.style(number_role), source_active, current, palette)) catch {};
         }
         if (geometry.text_width == 0) {
-            applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
+            applySelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
             continue;
         }
-        const line = document.lineBody(line_index).?;
-        const visible = try text_projection.renderWindowAlloc(surface.frameAllocator(), line, viewer.source_horizontal_scroll, geometry.text_width);
-        draw.copyClippedTextAt(surface, geometry.text_col, row, visible, base_style) catch {};
+        drawProjectedLine(surface, geometry.text_col, row, projection, viewer.source_horizontal_scroll, geometry.text_width, base_style);
         if (syntax) |spans| applySyntaxLineStyles(
             surface,
             geometry.text_col,
             row,
-            line,
+            projection,
             viewer.source_horizontal_scroll,
             geometry.text_width,
             spans.lineSpans(line_index),
@@ -623,19 +624,66 @@ pub fn drawSource(
             null,
         );
         if (search.match) |match| if (match.line == line_index) {
-            if (try text_projection.renderEnclosingRangeWindowAlloc(
-                surface.frameAllocator(),
-                line,
-                match.start,
-                match.end,
+            applyByteRangeStyle(
+                surface,
+                geometry.text_col,
+                row,
+                projection,
                 viewer.source_horizontal_scroll,
                 geometry.text_width,
-            )) |range| {
-                const match_col: u16 = @intCast(@as(usize, geometry.text_col) + range.column);
-                draw.copyClippedTextAt(surface, match_col, row, range.text, sourceRowStyle(palette.boldStyle(.warning), source_active, current, palette)) catch {};
-            }
+                .{ .start = match.start, .end = match.end },
+                sourceRowStyle(palette.boldStyle(.warning), source_active, current, palette),
+            );
         };
-        applySelectionLineStyles(surface, geometry, row, document, line_index, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
+        applySelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
+    }
+}
+
+fn drawProjectedLine(
+    surface: *chasen.Surface,
+    text_col: u16,
+    row: u16,
+    projection: text_projection.Projection,
+    horizontal_scroll: usize,
+    width: usize,
+    style: chasen.TextStyle,
+) void {
+    var visible = projection.visibleSegments(horizontal_scroll, width);
+    while (visible.next()) |segment| drawVisibleSegment(surface, text_col, row, segment, style);
+}
+
+fn drawVisibleSegment(
+    surface: *chasen.Surface,
+    text_col: u16,
+    row: u16,
+    segment: text_projection.VisibleSegment,
+    style: chasen.TextStyle,
+) void {
+    const segment_col: u16 = @intCast(@as(usize, text_col) + segment.viewport_cells.start);
+    switch (segment.materialization) {
+        .source => |bytes| _ = surface.borrowTextAt(segment_col, row, bytes, style),
+        .spaces => |count| for (0..count) |offset| {
+            _ = surface.borrowTextAt(@intCast(@as(usize, segment_col) + offset), row, " ", style);
+        },
+    }
+}
+
+fn applyByteRangeStyle(
+    surface: *chasen.Surface,
+    text_col: u16,
+    row: u16,
+    projection: text_projection.Projection,
+    horizontal_scroll: usize,
+    width: usize,
+    range: text_projection.ByteRange,
+    style: chasen.TextStyle,
+) void {
+    if (range.start >= range.end) return;
+    var visible = projection.visibleSegments(horizontal_scroll, width);
+    while (visible.next()) |segment| {
+        if (segment.token.byte_start >= range.end) break;
+        if (segment.token.byte_end <= range.start) continue;
+        restyleVisibleSegment(surface, text_col, row, segment, style, null);
     }
 }
 
@@ -645,6 +693,7 @@ fn applySelectionLineStyles(
     row: u16,
     document: *const source.Document,
     line_index: usize,
+    projection: text_projection.Projection,
     horizontal_scroll: usize,
     live_selection: ?selection.DragSelection,
     background: chasen.Color,
@@ -659,33 +708,30 @@ fn applySelectionLineStyles(
         return;
     }
 
-    const line = document.lineBody(line_index) orelse return;
     const byte_start = if (line_index == range.start.line_index) range.start.leading_byte else 0;
-    const byte_end = if (line_index == range.end.line_index) range.end.trailing_byte else line.len;
+    const byte_end = if (line_index == range.end.line_index) range.end.trailing_byte else projection.line.len;
     if (byte_start >= byte_end or geometry.text_width == 0) return;
-    const viewport_end = std.math.add(usize, horizontal_scroll, geometry.text_width) catch std.math.maxInt(usize);
-    var logical_col: usize = 0;
-    var graphemes = chasen.text.graphemeIterator(line);
-    while (graphemes.next()) |grapheme| {
-        if (logical_col >= viewport_end or grapheme.start >= byte_end) break;
-        const bytes = grapheme.bytes(line);
-        const cells = if (bytes.len == 1 and bytes[0] == '\t')
-            text_projection.tab_width - (logical_col % text_projection.tab_width)
-        else
-            chasen.text.displayWidth(bytes);
-        const segment_end = logical_col + cells;
-        defer logical_col = segment_end;
-        if (grapheme.start + grapheme.len <= byte_start or segment_end <= horizontal_scroll) continue;
-        const visible_start = @max(logical_col, horizontal_scroll);
-        const visible_end = @min(segment_end, viewport_end);
-        if (visible_start >= visible_end) continue;
-        const relative_start = visible_start - horizontal_scroll;
-        const visible_cells = visible_end - visible_start;
-        if (bytes.len == 1 and bytes[0] == '\t' or logical_col < horizontal_scroll) {
-            for (0..visible_cells) |offset| setCellBackground(surface, @intCast(@as(usize, geometry.text_col) + relative_start + offset), row, background);
-        } else if (segment_end <= viewport_end) {
-            setCellBackground(surface, @intCast(@as(usize, geometry.text_col) + relative_start), row, background);
-        }
+    var visible = projection.visibleSegments(horizontal_scroll, geometry.text_width);
+    while (visible.next()) |segment| {
+        if (segment.token.byte_start >= byte_end) break;
+        if (segment.token.byte_end <= byte_start) continue;
+        setVisibleSegmentBackground(surface, geometry.text_col, row, segment, background);
+    }
+}
+
+fn setVisibleSegmentBackground(
+    surface: *chasen.Surface,
+    text_col: u16,
+    row: u16,
+    segment: text_projection.VisibleSegment,
+    background: chasen.Color,
+) void {
+    const segment_col: u16 = @intCast(@as(usize, text_col) + segment.viewport_cells.start);
+    switch (segment.materialization) {
+        .source => setCellBackground(surface, segment_col, row, background),
+        .spaces => |count| for (0..count) |offset| {
+            setCellBackground(surface, @intCast(@as(usize, segment_col) + offset), row, background);
+        },
     }
 }
 
@@ -696,20 +742,20 @@ fn setCellBackground(surface: *chasen.Surface, col: u16, row: u16, background: c
 }
 
 const SyntaxProjectionStats = struct {
-    graphemes_visited: usize = 0,
+    segments_visited: usize = 0,
     spans_advanced: usize = 0,
     cells_restyled: usize = 0,
 };
 
 /// Restyles the already rendered visible source cells with one monotonic pass
-/// over both graphemes and ordered spans. Reusing the plain projection keeps
+/// over canonical visible segments and ordered spans. Reusing the admitted projection keeps
 /// TAB/wide clipping in one implementation and avoids allocating/redrawing a
 /// text slice per span, which became quadratic for capture-dense lines.
 fn applySyntaxLineStyles(
     surface: *chasen.Surface,
     text_col: u16,
     row: u16,
-    line: []const u8,
+    projection: text_projection.Projection,
     horizontal_scroll: usize,
     width: usize,
     line_spans: syntax_token.LineSpans,
@@ -718,46 +764,37 @@ fn applySyntaxLineStyles(
     stats: ?*SyntaxProjectionStats,
 ) void {
     if (width == 0 or line_spans.spans.len == 0) return;
-    const viewport_end = std.math.add(usize, horizontal_scroll, width) catch std.math.maxInt(usize);
-    var logical_col: usize = 0;
     var span_index: usize = 0;
-    var graphemes = chasen.text.graphemeIterator(line);
-    while (graphemes.next()) |grapheme| {
-        if (stats) |value| value.graphemes_visited += 1;
-        if (logical_col >= viewport_end) break;
-        const grapheme_end = grapheme.start + grapheme.len;
-        while (span_index < line_spans.spans.len and line_spans.spans[span_index].end <= grapheme.start) {
+    var visible = projection.visibleSegments(horizontal_scroll, width);
+    while (visible.next()) |segment| {
+        if (stats) |value| value.segments_visited += 1;
+        while (span_index < line_spans.spans.len and line_spans.spans[span_index].end <= segment.token.byte_start) {
             span_index += 1;
             if (stats) |value| value.spans_advanced += 1;
         }
-
-        const bytes = grapheme.bytes(line);
-        const cells = if (bytes.len == 1 and bytes[0] == '\t')
-            text_projection.tab_width - (logical_col % text_projection.tab_width)
-        else
-            chasen.text.displayWidth(bytes);
-        const segment_end = logical_col + cells;
-        defer logical_col = segment_end;
         if (span_index >= line_spans.spans.len) continue;
         const span = line_spans.spans[span_index];
-        if (span.start > grapheme.start or grapheme_end > span.end) continue;
+        if (span.start > segment.token.byte_start or segment.token.byte_end > span.end) continue;
         if (!syntax_style.changesForeground(span.role)) continue;
-        if (segment_end <= horizontal_scroll) continue;
-
-        const visible_start = @max(logical_col, horizontal_scroll);
-        const visible_end = @min(segment_end, viewport_end);
-        if (visible_start >= visible_end) continue;
         const style = syntax_style.apply(base_style, span.role, palette);
-        const relative_start = visible_start - horizontal_scroll;
-        const visible_cells = visible_end - visible_start;
-        const materialized_as_spaces = bytes.len == 1 and bytes[0] == '\t' or logical_col < horizontal_scroll;
-        if (materialized_as_spaces) {
-            for (0..visible_cells) |offset| restyleCell(surface, @intCast(@as(usize, text_col) + relative_start + offset), row, style, stats);
-        } else if (segment_end <= viewport_end) {
-            // A fully visible grapheme is stored in its leading cell; rewriting
-            // a backend continuation cell could corrupt wide-character layout.
-            restyleCell(surface, @intCast(@as(usize, text_col) + relative_start), row, style, stats);
-        }
+        restyleVisibleSegment(surface, text_col, row, segment, style, stats);
+    }
+}
+
+fn restyleVisibleSegment(
+    surface: *chasen.Surface,
+    text_col: u16,
+    row: u16,
+    segment: text_projection.VisibleSegment,
+    style: chasen.TextStyle,
+    stats: ?*SyntaxProjectionStats,
+) void {
+    const segment_col: u16 = @intCast(@as(usize, text_col) + segment.viewport_cells.start);
+    switch (segment.materialization) {
+        .source => restyleCell(surface, segment_col, row, style, stats),
+        .spaces => |count| for (0..count) |offset| {
+            restyleCell(surface, @intCast(@as(usize, segment_col) + offset), row, style, stats);
+        },
     }
 }
 
@@ -1551,14 +1588,14 @@ test "repository source syntax projection visits dense line and spans only once"
     try test_surface.init(80, 1);
     defer test_surface.deinit();
     const horizontal_scroll = count - 80;
-    const visible = try text_projection.renderWindowAlloc(test_surface.surface.frameAllocator(), line, horizontal_scroll, 80);
-    draw.copyClippedTextAt(&test_surface.surface, 0, 0, visible, .{}) catch {};
+    const projection = try text_projection.Projection.init(line, .{ .tab_width = repository_tab_width });
+    drawProjectedLine(&test_surface.surface, 0, 0, projection, horizontal_scroll, 80, .{});
     var stats: SyntaxProjectionStats = .{};
     applySyntaxLineStyles(
         &test_surface.surface,
         0,
         0,
-        line,
+        projection,
         horizontal_scroll,
         80,
         .{ .spans = spans },
@@ -1567,7 +1604,7 @@ test "repository source syntax projection visits dense line and spans only once"
         &stats,
     );
 
-    try std.testing.expect(stats.graphemes_visited <= count);
+    try std.testing.expectEqual(@as(usize, 80), stats.segments_visited);
     try std.testing.expect(stats.spans_advanced <= count);
     try std.testing.expectEqual(@as(usize, 80), stats.cells_restyled);
     try std.testing.expectEqual(theme.Palette.default().color(.accent), test_surface.surface.readCell(79, 0).?.style.fg);
@@ -1585,18 +1622,17 @@ test "repository source syntax projection preserves tab and clipped-wide cells" 
     var tab_surface: chasen.testing.TestSurface = undefined;
     try tab_surface.init(3, 1);
     defer tab_surface.deinit();
-    const tab_visible = try text_projection.renderWindowAlloc(tab_surface.surface.frameAllocator(), line, 1, 3);
-    draw.copyClippedTextAt(&tab_surface.surface, 0, 0, tab_visible, .{}) catch {};
-    applySyntaxLineStyles(&tab_surface.surface, 0, 0, line, 1, 3, .{ .spans = &spans }, .{}, palette, null);
+    const projection = try text_projection.Projection.init(line, .{ .tab_width = repository_tab_width });
+    drawProjectedLine(&tab_surface.surface, 0, 0, projection, 1, 3, .{});
+    applySyntaxLineStyles(&tab_surface.surface, 0, 0, projection, 1, 3, .{ .spans = &spans }, .{}, palette, null);
     try std.testing.expectEqual(palette.color(.accent), tab_surface.surface.readCell(0, 0).?.style.fg);
     try std.testing.expectEqual(palette.color(.accent), tab_surface.surface.readCell(2, 0).?.style.fg);
 
     var wide_surface: chasen.testing.TestSurface = undefined;
     try wide_surface.init(2, 1);
     defer wide_surface.deinit();
-    const wide_visible = try text_projection.renderWindowAlloc(wide_surface.surface.frameAllocator(), line, 5, 2);
-    draw.copyClippedTextAt(&wide_surface.surface, 0, 0, wide_visible, .{}) catch {};
-    applySyntaxLineStyles(&wide_surface.surface, 0, 0, line, 5, 2, .{ .spans = &spans }, .{}, palette, null);
+    drawProjectedLine(&wide_surface.surface, 0, 0, projection, 5, 2, .{});
+    applySyntaxLineStyles(&wide_surface.surface, 0, 0, projection, 5, 2, .{ .spans = &spans }, .{}, palette, null);
     try std.testing.expectEqualStrings(" ", wide_surface.surface.readCell(0, 0).?.char.grapheme);
     try std.testing.expectEqual(palette.color(.success), wide_surface.surface.readCell(0, 0).?.style.fg);
     try std.testing.expectEqualStrings("x", wide_surface.surface.readCell(1, 0).?.char.grapheme);

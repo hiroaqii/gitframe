@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(
         usize,
         "expected_package_root_test_count",
-        if (!provider_enabled and test_filters.len == 0) 1800 else 0,
+        if (!provider_enabled and test_filters.len == 0) 1796 else 0,
     );
 
     const mod = mod: {
@@ -321,6 +321,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
                     .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+                    .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
                 },
             }),
         });
@@ -338,6 +339,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
                     .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+                    .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
                 },
             }),
         });

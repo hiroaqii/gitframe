@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
+const text_projection = @import("chasen_ui").text_projection;
 const keymap = @import("keymap");
 const app_state = @import("../state.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
@@ -36,7 +37,8 @@ const repository_selection = @import("repository/selection.zig");
 const repository_source_header = @import("repository/source_header.zig");
 const repository_source_geometry = @import("repository/source_geometry.zig");
 const repository_tree_projection = @import("repository/tree_projection.zig");
-const text_projection = @import("../../text/projection.zig");
+
+const repository_tab_width: usize = 4;
 
 pub const LoadState = enum { idle, no_repository, loading, loaded, empty, failed };
 
@@ -2256,12 +2258,14 @@ pub const RepositoryPageState = struct {
     fn pointAtTextCell(
         document: *const source_document.Document,
         line_index: usize,
-        logical_cell: usize,
+        horizontal_scroll: usize,
+        viewport_cell: usize,
     ) ?repository_selection.Point {
         const line = document.lineBody(line_index) orelse return null;
-        return switch (text_projection.hitAtDisplayCell(line, logical_cell) orelse return null) {
+        const projection = text_projection.Projection.init(line, .{ .tab_width = repository_tab_width }) catch return null;
+        return switch (projection.hitViewportCell(horizontal_scroll, viewport_cell)) {
             .token => |token| repository_selection.pointFromToken(line_index, token),
-            .boundary => |boundary| repository_selection.pointFromBoundary(line_index, boundary.offset),
+            .boundary => |boundary| repository_selection.pointFromBoundary(line_index, boundary.byte_offset),
         };
     }
 
@@ -2282,7 +2286,8 @@ pub const RepositoryPageState = struct {
             .character => pointAtTextCell(
                 document,
                 line_index,
-                self.viewer.source_horizontal_scroll + @as(usize, point.col - geometry.text_col),
+                self.viewer.source_horizontal_scroll,
+                @as(usize, point.col - geometry.text_col),
             ) orelse return,
         };
         self.viewer.focus = .source;
@@ -2321,7 +2326,8 @@ pub const RepositoryPageState = struct {
                 .text => pointAtTextCell(
                     document,
                     line_index,
-                    self.viewer.source_horizontal_scroll + @as(usize, local.col - geometry.text_col),
+                    self.viewer.source_horizontal_scroll,
+                    @as(usize, local.col - geometry.text_col),
                 ) orelse return,
             },
         };
@@ -4969,6 +4975,39 @@ test "repository selection hit testing applies scroll once and follows line numb
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
     try std.testing.expectEqual(repository_selection.Mode.character, state.selection_owner.activeSource().?.mode);
     try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.anchor.leading_byte);
+
+    var atomic = try selectionStateForTest("unicode.zig\x00", "a\t界e\u{301}👩‍💻z\n");
+    defer atomic.deinit(allocator);
+    const atomic_document = atomic.currentSource().?;
+    const atomic_geometry = atomic.sourceGeometry(size, atomic_document);
+    atomic.viewer.source_horizontal_scroll = 2;
+    const occupied = [_]struct {
+        viewport_cell: usize,
+        byte_start: usize,
+        byte_end: usize,
+    }{
+        .{ .viewport_cell = 0, .byte_start = 1, .byte_end = 2 },
+        .{ .viewport_cell = 1, .byte_start = 1, .byte_end = 2 },
+        .{ .viewport_cell = 2, .byte_start = 2, .byte_end = 5 },
+        .{ .viewport_cell = 3, .byte_start = 2, .byte_end = 5 },
+        .{ .viewport_cell = 4, .byte_start = 5, .byte_end = 8 },
+        .{ .viewport_cell = 5, .byte_start = 8, .byte_end = 19 },
+        .{ .viewport_cell = 6, .byte_start = 8, .byte_end = 19 },
+    };
+    for (occupied) |case| {
+        _ = atomic.applyNavigation(allocator, .{ .mouse_source_press = .{
+            .col = atomic_geometry.text_col + @as(u16, @intCast(case.viewport_cell)),
+            .row = atomic_geometry.body_first_row,
+        } }, size);
+        const anchor = atomic.selection_owner.activeSource().?.anchor;
+        try std.testing.expectEqual(case.byte_start, anchor.leading_byte);
+        try std.testing.expectEqual(case.byte_end, anchor.trailing_byte);
+        atomic.cancelMouseOwner();
+    }
+
+    const saturated = RepositoryPageState.pointAtTextCell(atomic_document, 0, std.math.maxInt(usize), 1).?;
+    try std.testing.expectEqual(@as(usize, "a\t界e\u{301}👩‍💻z".len), saturated.leading_byte);
+    try std.testing.expectEqual(saturated.leading_byte, saturated.trailing_byte);
 }
 
 test "repository selection synthetic empty row rejects every gesture stage" {
