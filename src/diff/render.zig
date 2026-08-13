@@ -95,6 +95,289 @@ pub const SideBySideGeometry = struct {
     }
 };
 
+/// Generic presentation-only row insertion consumed synchronously by the
+/// renderer. The Review-owned selection-action module is the semantic owner;
+/// this value is deliberately model-agnostic.
+pub const VirtualRowProjection = struct {
+    source_rows: usize,
+    after_source_row: usize,
+    virtual_rows: usize,
+
+    pub fn sourceToPresentation(self: VirtualRowProjection, source_row: usize) ?usize {
+        if (source_row >= self.source_rows) return null;
+        return source_row +| if (source_row > self.after_source_row) self.virtual_rows else 0;
+    }
+
+    pub fn sourceAtOrAfter(self: VirtualRowProjection, presentation_row: usize) usize {
+        const insertion = self.after_source_row + 1;
+        if (presentation_row < insertion) return @min(presentation_row, self.source_rows);
+        if (presentation_row < insertion +| self.virtual_rows) return @min(insertion, self.source_rows);
+        return @min(presentation_row - self.virtual_rows, self.source_rows);
+    }
+
+    pub fn actionPresentationRow(self: VirtualRowProjection, action_row: usize) ?usize {
+        if (action_row >= self.virtual_rows) return null;
+        return self.after_source_row +| 1 +| action_row;
+    }
+};
+
+pub const SelectionActionBlock = struct {
+    projection: VirtualRowProjection,
+    side: diff_selection.Side,
+    line_count: usize,
+};
+
+pub const SelectionActionTarget = enum {
+    copy,
+    clear,
+};
+
+pub const SelectionActionLayout = struct {
+    region: SideBySideRegion,
+    copy: ?SideBySideRegion,
+    clear: ?SideBySideRegion,
+
+    pub fn targetAt(self: SelectionActionLayout, col: u16, action_row: usize) ?SelectionActionTarget {
+        if (action_row != 1) return null;
+        if (self.copy) |region| if (region.contains(col)) return .copy;
+        if (self.clear) |region| if (region.contains(col)) return .clear;
+        return null;
+    }
+};
+
+pub fn selectionActionLayout(width: u16, requested_mode: DisplayMode, side: diff_selection.Side) SelectionActionLayout {
+    const mode = effectiveMode(width, requested_mode);
+    const region = if (mode == .side_by_side) switch (side) {
+        .old => sideBySideGeometry(width).old,
+        .new => sideBySideGeometry(width).new,
+    } else SideBySideRegion{ .col = 0, .width = width };
+
+    const copy_width: u16 = 8;
+    const clear_width: u16 = 11;
+    const copy_col = region.col;
+    const clear_col = copy_col +| copy_width +| 1;
+    const end = region.col +| region.width;
+    return .{
+        .region = region,
+        .copy = if (copy_col +| copy_width <= end) .{ .col = copy_col, .width = copy_width } else null,
+        .clear = if (clear_col +| clear_width <= end) .{ .col = clear_col, .width = clear_width } else null,
+    };
+}
+
+pub fn selectionActionSourceScroll(projection: VirtualRowProjection, presentation_scroll: usize) usize {
+    return projection.sourceAtOrAfter(presentation_scroll);
+}
+
+/// Composes a presentation-only action block over a source window rendered at
+/// `source_scroll`. Source cells move bottom-up into their projected screen
+/// rows, so no model row or terminal cell becomes coordinate authority.
+pub fn composeSelectionAction(
+    surface: *chasen.Surface,
+    block: SelectionActionBlock,
+    presentation_scroll: usize,
+    source_scroll: usize,
+    requested_mode: DisplayMode,
+    pane_active: bool,
+    palette: theme.Palette,
+) !void {
+    const visible_rows = visibleBodyRows(surface.size().height);
+    if (visible_rows == 0 or surface.size().width <= cursor_gutter_width) return;
+
+    var reverse = visible_rows;
+    while (reverse > 0) {
+        reverse -= 1;
+        const presentation_row = presentation_scroll +| reverse;
+        const source_row = presentationSourceRow(block.projection, presentation_row) orelse continue;
+        if (source_row < source_scroll) continue;
+        const source_screen = source_row - source_scroll;
+        if (source_screen >= visible_rows or source_screen == reverse) continue;
+        copySurfaceRow(
+            surface,
+            @intCast(@as(usize, body_start_row) + source_screen),
+            @intCast(@as(usize, body_start_row) + reverse),
+        );
+    }
+
+    const content_width = bodyWidth(surface.size().width);
+    const mode = effectiveMode(content_width, requested_mode);
+    var body_surface = surface.child(.{
+        .col = cursor_gutter_width,
+        .row = 0,
+        .width = content_width,
+        .height = surface.size().height,
+    });
+    const action_layout = selectionActionLayout(content_width, mode, block.side);
+    const action_style: chasen.TextStyle = .{
+        .fg = palette.color(.foreground),
+        .bg = palette.color(.pane_cursor_bg),
+        .dim = !pane_active,
+    };
+
+    for (0..visible_rows) |screen_row| {
+        const presentation_row = presentation_scroll +| screen_row;
+        const row: u16 = @intCast(@as(usize, body_start_row) + screen_row);
+        const action_index = presentationActionRow(block.projection, presentation_row);
+        if (action_index == null) {
+            if (presentationSourceRow(block.projection, presentation_row) == null) {
+                clearSurfaceRow(surface, row);
+            }
+            continue;
+        }
+
+        clearSurfaceRow(surface, row);
+        fillRowRegion(&body_surface, row, action_layout.region, action_style);
+        var action_surface = body_surface.child(.{
+            .col = action_layout.region.col,
+            .row = row,
+            .width = action_layout.region.width,
+            .height = 1,
+        });
+        const text = switch (action_index.?) {
+            0 => try std.fmt.allocPrint(surface.frameAllocator(), "{d} lines selected", .{block.line_count}),
+            1 => "[y Copy] [Esc Clear]",
+            else => unreachable,
+        };
+        try draw.copyClippedTextAt(&action_surface, 0, 0, text, action_style);
+        if (mode == .side_by_side) {
+            const geometry = sideBySideGeometry(content_width);
+            _ = body_surface.borrowTextAt(geometry.separator_col, row, "│", .{
+                .fg = palette.color(.foreground),
+                .dim = true,
+            });
+        }
+    }
+}
+
+fn presentationSourceRow(projection: VirtualRowProjection, presentation_row: usize) ?usize {
+    const insertion = projection.after_source_row + 1;
+    if (presentation_row < insertion) return if (presentation_row < projection.source_rows) presentation_row else null;
+    if (presentation_row < insertion +| projection.virtual_rows) return null;
+    const source_row = presentation_row - projection.virtual_rows;
+    return if (source_row < projection.source_rows) source_row else null;
+}
+
+fn presentationActionRow(projection: VirtualRowProjection, presentation_row: usize) ?usize {
+    const insertion = projection.after_source_row + 1;
+    if (presentation_row < insertion or presentation_row >= insertion +| projection.virtual_rows) return null;
+    return presentation_row - insertion;
+}
+
+fn copySurfaceRow(surface: *chasen.Surface, source_row: u16, destination_row: u16) void {
+    for (0..surface.size().width) |col| {
+        const cell = surface.readCell(@intCast(col), source_row) orelse continue;
+        surface.writeCell(@intCast(col), destination_row, cell);
+    }
+}
+
+fn clearSurfaceRow(surface: *chasen.Surface, row: u16) void {
+    fillRowRegion(surface, row, .{ .col = 0, .width = surface.size().width }, .{});
+}
+
+test "selection action compositor inserts two virtual rows without source rows" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 9);
+    defer ts.deinit();
+    inline for (0..4) |index| {
+        const label = try std.fmt.allocPrint(ts.surface.frameAllocator(), "source{d}", .{index});
+        _ = try ts.surface.copyTextAt(0, body_start_row + index, label, .{});
+    }
+
+    const projection: VirtualRowProjection = .{ .source_rows = 4, .after_source_row = 1, .virtual_rows = 2 };
+    try composeSelectionAction(&ts.surface, .{
+        .projection = projection,
+        .side = .new,
+        .line_count = 3,
+    }, 0, selectionActionSourceScroll(projection, 0), .unified, true, .default());
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "source0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "source1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "3 lines selected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "[y Copy] [Esc Clear]") != null);
+    // Issue #69 owns these two rows verbatim.  In particular, the action
+    // surface has no decorative border or prefix: the first body cell is the
+    // count on row one and the opening button bracket on row two.
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "╭") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "╰") == null);
+    const summary_row: u16 = body_start_row + 2;
+    const controls_row: u16 = body_start_row + 3;
+    for ("3 lines selected", 0..) |byte, col| {
+        const cell = [_]u8{byte};
+        try ts.expectCellText(cursor_gutter_width + @as(u16, @intCast(col)), summary_row, &cell);
+    }
+    for ("[y Copy] [Esc Clear]", 0..) |byte, col| {
+        const cell = [_]u8{byte};
+        try ts.expectCellText(cursor_gutter_width + @as(u16, @intCast(col)), controls_row, &cell);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "source2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "source3") != null);
+}
+
+test "side by side selection action stays on selected side and preserves separator chrome" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 6);
+    defer ts.deinit();
+    const palette = theme.Palette.default();
+    const projection: VirtualRowProjection = .{ .source_rows = 2, .after_source_row = 0, .virtual_rows = 2 };
+    try composeSelectionAction(&ts.surface, .{
+        .projection = projection,
+        .side = .old,
+        .line_count = 4,
+    }, 0, 0, .side_by_side, true, palette);
+
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const action_row: u16 = body_start_row + 1;
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "4 lines selected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "╭") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "╰") == null);
+    for ("4 lines selected", 0..) |byte, col| {
+        const cell = [_]u8{byte};
+        try ts.expectCellText(cursor_gutter_width + @as(u16, @intCast(col)), action_row, &cell);
+    }
+    try ts.expectCellText(cursor_gutter_width + geometry.separator_col, action_row, "│");
+    try std.testing.expect(ts.surface.readCell(cursor_gutter_width, action_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!ts.surface.readCell(cursor_gutter_width + geometry.new.col, action_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    const separator_style = ts.surface.readCell(cursor_gutter_width + geometry.separator_col, action_row).?.style;
+    try std.testing.expect(separator_style.dim);
+    try std.testing.expect(separator_style.fg.eql(palette.color(.foreground)));
+}
+
+test "selection action layout exposes only rendered Copy and Clear targets" {
+    const unified = selectionActionLayout(80, .unified, .new);
+    try std.testing.expectEqual(SelectionActionTarget.copy, unified.targetAt(0, 1).?);
+    try std.testing.expectEqual(SelectionActionTarget.copy, unified.targetAt(7, 1).?);
+    try std.testing.expectEqual(SelectionActionTarget.clear, unified.targetAt(9, 1).?);
+    try std.testing.expectEqual(SelectionActionTarget.clear, unified.targetAt(19, 1).?);
+    try std.testing.expect(unified.targetAt(8, 1) == null);
+    try std.testing.expect(unified.targetAt(20, 1) == null);
+    try std.testing.expect(unified.targetAt(0, 0) == null);
+
+    const narrow = selectionActionLayout(10, .unified, .new);
+    try std.testing.expect(narrow.copy != null);
+    try std.testing.expect(narrow.clear == null);
+    try std.testing.expectEqual(SelectionActionTarget.copy, narrow.targetAt(7, 1).?);
+    try std.testing.expect(narrow.targetAt(9, 1) == null);
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(12, 6);
+    defer ts.deinit();
+    const projection: VirtualRowProjection = .{ .source_rows = 1, .after_source_row = 0, .virtual_rows = 2 };
+    try composeSelectionAction(&ts.surface, .{
+        .projection = projection,
+        .side = .new,
+        .line_count = 1,
+    }, 0, 0, .unified, true, .default());
+    const controls_row: u16 = body_start_row + 2;
+    for ("[y Copy] ", 0..) |byte, col| {
+        const cell = [_]u8{byte};
+        try ts.expectCellText(cursor_gutter_width + @as(u16, @intCast(col)), controls_row, &cell);
+    }
+    try ts.expectCellText(cursor_gutter_width + 9, controls_row, "…");
+}
+
 pub const FileStats = diff_file.Stats;
 
 pub const HeaderRegion = struct {
@@ -430,7 +713,7 @@ fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, stats: HeaderStats
     if (layout.mode) |region| try draw.copyClippedTextAt(surface, region.col, 0, mode_label, headerMetadataStyle(styles));
 
     if (header_selected) {
-        if (layout.path_target) |region| applyHeaderRegionStyle(surface, region, styles.selection);
+        if (layout.path_target) |region| applyHeaderRegionStyle(surface, region, styles.header_selection);
     }
 }
 
@@ -1121,6 +1404,7 @@ const RenderStyles = struct {
     line_number: chasen.TextStyle,
     warning: chasen.TextStyle,
     selection: chasen.TextStyle,
+    header_selection: chasen.TextStyle,
 
     fn fromPalette(palette: theme.Palette) RenderStyles {
         return .{
@@ -1147,7 +1431,8 @@ const RenderStyles = struct {
             .metadata = palette.style(.diff_metadata),
             .line_number = palette.style(.diff_line_number),
             .warning = palette.style(.warning),
-            .selection = .{ .bg = palette.color(.diff_cursor) },
+            .selection = .{ .bg = palette.color(.diff_selection_bg) },
+            .header_selection = .{ .bg = palette.color(.diff_cursor) },
         };
     }
 };
@@ -1464,7 +1749,7 @@ test "full-row diff background preserves cursor and selection precedence" {
     const row: u16 = body_start_row + 1;
     const text_col = cursor_gutter_width + lineTextStart(true, .unified);
     const pane_bg = palette.color(.pane_cursor_bg);
-    const selection_bg = palette.color(.diff_cursor);
+    const selection_bg = palette.color(.diff_selection_bg);
     try std.testing.expect(character.surface.readCell(0, row).?.style.bg.eql(pane_bg));
     try std.testing.expect(character.surface.readCell(text_col, row).?.style.bg.eql(pane_bg));
     try std.testing.expect(character.surface.readCell(text_col + 1, row).?.style.bg.eql(selection_bg));
@@ -2221,10 +2506,10 @@ test "renderFile highlights only the selected side-by-side pane side" {
     const new_line_number = ts.surface.readCell(cursor_gutter_width + geometry.new.col, 4).?;
     const new_body = ts.surface.readCell(cursor_gutter_width + geometry.new.col + lineTextStart(true, .side_by_side), 4).?;
 
-    try std.testing.expect(old_line_number.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(old_body.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(!new_line_number.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(!new_body.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(old_line_number.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(old_body.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(!new_line_number.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(!new_body.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(new_line_number.style.bg.eql(palette.color(.diff_added_line_number_bg)));
     try std.testing.expect(new_body.style.bg.eql(palette.color(.diff_added_bg)));
 }
@@ -2283,8 +2568,8 @@ test "review diff cursor character selection preserves syntax without stage dim"
     try std.testing.expect(ts.surface.readCell(10, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(12, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(first.style.bg.eql(pane_bg));
-    try std.testing.expect(selected_b.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(selected_c.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(selected_b.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(selected_c.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(last.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(selected_b.style.fg.eql(palette.color(.accent)));
@@ -2338,7 +2623,7 @@ test "review diff cursor side-by-side character selection stays inside the locke
     try std.testing.expect(ts.surface.readCell(1, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(cursor_gutter_width + geometry.old.col, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(old_text, 4).?.style.bg.eql(pane_bg));
-    try std.testing.expect(ts.surface.readCell(old_text + 1, 4).?.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(ts.surface.readCell(old_text + 1, 4).?.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(ts.surface.readCell(old_text + 2, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(separator, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(new_text + 1, 4).?.style.bg.eql(pane_bg));
@@ -2389,7 +2674,7 @@ test "review diff cursor TAB selection and syntax use the same multi-cell projec
     const text_col = cursor_gutter_width + lineTextStart(true, .unified);
     const pane_bg = palette.color(.pane_cursor_bg);
     try std.testing.expect(ts.surface.readCell(text_col, 4).?.style.bg.eql(pane_bg));
-    try expectBgRange(&ts.surface, 4, text_col + 1, text_col + 4, palette.color(.diff_cursor));
+    try expectBgRange(&ts.surface, 4, text_col + 1, text_col + 4, palette.color(.diff_selection_bg));
     const b = ts.surface.readCell(text_col + 4, 4).?;
     try std.testing.expect(b.style.bg.eql(pane_bg));
     try std.testing.expect(b.style.fg.eql(palette.color(.accent)));
@@ -2437,7 +2722,7 @@ test "review diff cursor keeps wide combining and emoji graphemes atomic under c
 
     const text_col = cursor_gutter_width + lineTextStart(true, .unified);
     const pane_bg = palette.color(.pane_cursor_bg);
-    const selection_bg = palette.color(.diff_cursor);
+    const selection_bg = palette.color(.diff_selection_bg);
     try std.testing.expect(ts.surface.readCell(text_col, 4).?.style.bg.eql(pane_bg));
     // Vaxis stores a wide grapheme as one styled Cell with width 2, rather
     // than exposing its second occupied terminal column as another token.
@@ -3396,7 +3681,7 @@ test "review diff cursor composes unified selection inside pane chrome" {
 
     const row: u16 = body_start_row + 1;
     const pane_bg = palette.color(.pane_cursor_bg);
-    const selection_bg = palette.color(.diff_cursor);
+    const selection_bg = palette.color(.diff_selection_bg);
     try std.testing.expect(ts.surface.readCell(0, row).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(1, row).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(2, row).?.style.bg.eql(selection_bg));
@@ -3452,7 +3737,7 @@ test "review diff cursor keeps side-by-side separator outside selected side" {
 
     const row: u16 = body_start_row + 1;
     const pane_bg = palette.color(.pane_cursor_bg);
-    const selection_bg = palette.color(.diff_cursor);
+    const selection_bg = palette.color(.diff_selection_bg);
     const old_start = cursor_gutter_width + geometry.old.col;
     const separator = cursor_gutter_width + geometry.separator_col;
     const new_start = cursor_gutter_width + geometry.new.col;

@@ -30,6 +30,7 @@ pub const layout = @import("diff_surface/layout.zig");
 pub const message = @import("diff_surface/message.zig");
 pub const navigation = @import("diff_surface/navigation.zig");
 pub const selection = @import("diff_surface/selection.zig");
+pub const selection_action = @import("diff_surface/selection_action.zig");
 pub const update = @import("diff_surface/update.zig");
 pub const view = @import("diff_surface/view.zig");
 
@@ -43,6 +44,14 @@ pub const Focus = enum {
             .diff => .sidebar,
         };
     }
+};
+
+/// Page-owned completion behavior for an otherwise shared mouse-selection
+/// transaction. Compare keeps its immediate-copy contract; Review retains the
+/// installed candidate for its explicit action surface.
+pub const SelectionCompletionPolicy = enum {
+    copy_on_release,
+    retain_with_actions,
 };
 
 pub const ViewOptions = struct {
@@ -93,6 +102,7 @@ pub const ReloadAnchor = struct {
     diff_cursor: diff_view_model.BodyCoordinate,
     diff_cursor_offset: ?usize,
     diff_scroll: usize,
+    selection_viewport: ?selection_action.SelectionViewportAnchor = null,
     diff_horizontal_scroll: usize,
     sidebar_horizontal_scroll: usize,
     search_coordinate: ?diff_view_model.BodyCoordinate,
@@ -193,6 +203,8 @@ pub const ReadSurface = struct {
     pending_initial_first_visible_selection: *const bool,
     reload_anchor: ?*const ReloadAnchor,
     live_drag_deferred_source: bool,
+    selection_completion_policy: SelectionCompletionPolicy,
+    selection_layout_revision: u64,
     source: diff_source.SourceMode,
     layout: Layout,
 };
@@ -225,6 +237,8 @@ pub const DiffSurface = struct {
     pending_initial_first_visible_selection: *bool,
     reload_anchor: ?*const ReloadAnchor,
     live_drag_deferred_source: bool,
+    selection_completion_policy: SelectionCompletionPolicy,
+    selection_layout_revision: u64,
     source: diff_source.SourceMode,
     layout: Layout,
 
@@ -249,6 +263,8 @@ pub const DiffSurface = struct {
             .pending_initial_first_visible_selection = self.pending_initial_first_visible_selection,
             .reload_anchor = self.reload_anchor,
             .live_drag_deferred_source = self.live_drag_deferred_source,
+            .selection_completion_policy = self.selection_completion_policy,
+            .selection_layout_revision = self.selection_layout_revision,
             .source = self.source,
             .layout = self.layout,
         };
@@ -263,6 +279,7 @@ test {
     _ = layout;
     _ = navigation;
     _ = selection;
+    _ = selection_action;
     _ = update;
     _ = view;
 

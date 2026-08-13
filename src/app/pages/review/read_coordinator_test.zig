@@ -2994,6 +2994,7 @@ test "Review canonical publication exact acceptance retains navigation search an
     var app = try canonicalPublicationPrimaryTestApp(allocator, roots.a);
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
+    app.terminal_size.height = 12;
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator };
 
     app.reviewNavigation().enterSearchMode();
@@ -3002,8 +3003,6 @@ test "Review canonical publication exact acceptance retains navigation search an
     const search_before = app.pages.review.search.match orelse return error.ExpectedSearchMatch;
     const search_offset_before = app.pages.review.search.match_offset;
     app.pages.review.viewer.diff_horizontal_scroll = 2;
-    const cursor_before = app.pages.review.viewer.diff_cursor;
-    const scroll_before = app.pages.review.viewer.diff_scroll;
     const horizontal_before = app.pages.review.viewer.diff_horizontal_scroll;
     const sidebar_horizontal_before = app.pages.review.viewer.sidebar_horizontal_scroll;
 
@@ -3023,6 +3022,21 @@ test "Review canonical publication exact acceptance retains navigation search an
         displayed,
         selection,
     );
+    const action_block = app.reviewNavigationView().selectionActionRenderBlock() orelse
+        return error.ExpectedSelectionActionBlock;
+    const summary_row = action_block.projection.actionPresentationRow(0) orelse
+        return error.ExpectedSelectionActionSummary;
+    app.pages.review.viewer.diff_scroll = summary_row;
+    const selection_viewport_before = app.reviewNavigationView().captureSelectionViewportAnchor() orelse
+        return error.ExpectedSelectionViewportAnchor;
+    try std.testing.expectEqual(summary_row, selection_viewport_before.raw_presentation_scroll);
+    try std.testing.expectEqual(@as(isize, 2), selection_viewport_before.signed_screen_delta);
+    switch (selection_viewport_before.semantic_source) {
+        .parsed => |coordinate| app.pages.review.viewer.diff_cursor = coordinate,
+        .none, .generated_row => return error.ExpectedParsedSelectionViewportSource,
+    }
+    const cursor_before = app.pages.review.viewer.diff_cursor;
+    const scroll_before = app.pages.review.viewer.diff_scroll;
     const token_before = app.pages.review.completed_selection.?.token;
     const clipboard_before = try app.pages.review.completed_selection.?.clipboardText(allocator);
     defer allocator.free(clipboard_before);
@@ -3066,6 +3080,13 @@ test "Review canonical publication exact acceptance retains navigation search an
     try std.testing.expectEqual(search_offset_before, app.pages.review.search.match_offset);
     const completed = app.pages.review.completed_selection orelse
         return error.ExpectedRetainedCompletedSelection;
+    const selection_viewport_after = app.reviewNavigationView().captureSelectionViewportAnchor() orelse
+        return error.ExpectedRetainedSelectionViewportAnchor;
+    try std.testing.expect(selection_viewport_before.basis.eql(selection_viewport_after.basis));
+    try std.testing.expectEqual(
+        selection_viewport_before.raw_presentation_scroll,
+        app.pages.review.viewer.diff_scroll,
+    );
     const token_after = app.reviewNavigationView().currentContentToken() orelse
         return error.ExpectedReviewContentToken;
     try std.testing.expect(!token_after.eql(token_before));
@@ -3115,6 +3136,10 @@ test "Review canonical publication exact acceptance retains navigation search an
         return error.ExpectedFreshUnstagedActionSource;
     try std.testing.expectEqualStrings("a", diff_file.canonicalPathKey(cached_source).?);
     try std.testing.expectEqualStrings("a", diff_file.canonicalPathKey(unstaged_source).?);
+    // The focused viewport proof above intentionally uses a four-row diff
+    // body. Restore the fixture's normal geometry before the existing action
+    // capability assertions, which require both hunks to be visible.
+    app.terminal_size.height = 40;
     try expectFreshCanonicalActionCapabilities(&app, allocator, roots.a);
 }
 
@@ -3474,6 +3499,7 @@ test "Review canonical publication projection failure publishes failure body ato
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
+    app.terminal_size.height = 12;
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator };
 
     const source_revision_before = app.pages.review.source_session_revision;
@@ -3481,6 +3507,20 @@ test "Review canonical publication projection failure publishes failure body ato
     const prior = app.reviewNavigationView().activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
+    _ = try installCanonicalPublicationLineageOwners(&app, allocator, roots.a);
+    const action_block = app.reviewNavigationView().selectionActionRenderBlock() orelse
+        return error.ExpectedSelectionActionBlock;
+    const controls_row = action_block.projection.actionPresentationRow(1) orelse
+        return error.ExpectedSelectionActionControls;
+    app.pages.review.viewer.diff_scroll = controls_row;
+    const selection_viewport_before = app.reviewNavigationView().captureSelectionViewportAnchor() orelse
+        return error.ExpectedSelectionViewportAnchor;
+    try std.testing.expectEqual(controls_row, selection_viewport_before.raw_presentation_scroll);
+    try std.testing.expectEqual(@as(isize, 1), selection_viewport_before.signed_screen_delta);
+    switch (selection_viewport_before.semantic_source) {
+        .parsed => |coordinate| app.pages.review.viewer.diff_cursor = coordinate,
+        .none, .generated_row => return error.ExpectedParsedSelectionViewportSource,
+    }
 
     const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
     const cycle_id = reads.source_cycle_id orelse return error.ExpectedBackgroundCycle;
@@ -3525,6 +3565,12 @@ test "Review canonical publication projection failure publishes failure body ato
     }
     try std.testing.expect(app.pages.review.pending_reload == null);
     try std.testing.expect(app.pages.review.review_projection.pending == null);
+    try std.testing.expect(app.pages.review.completed_selection == null);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        app.reviewNavigationView().restoredSelectionViewportScroll(selection_viewport_before),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
     try std.testing.expect(!review_read.testing.readBusy(app.reviewRead()));
 }
 

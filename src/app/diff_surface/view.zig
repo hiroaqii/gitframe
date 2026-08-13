@@ -473,12 +473,12 @@ pub fn viewDiffPane(
             const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), state.viewer.display_mode);
             try diff_render.renderFile(&diff_content, file, .{
                 .requested_mode = state.viewer.display_mode,
-                .scroll = state.viewer.diff_scroll,
+                .scroll = body.renderDiffScroll(),
                 .horizontal_scroll = state.viewer.diff_horizontal_scroll,
                 .pane_active = active,
                 .line_numbers = state.viewer.view_options.line_numbers,
                 .highlighted_hunk = body.selectedHunkIndex(),
-                .cursor_offset = body.visibleDiffCursorOffset(),
+                .cursor_offset = body.renderDiffCursorOffset(),
                 .hunk_stages = try body.hunkStagePresentation(surface.frameAllocator(), file_index),
                 .line_index = loaded.cachedRenderedLineIndex(file_index, mode),
                 .folded_hunks = loaded.foldedHunksForFile(file_index),
@@ -489,8 +489,19 @@ pub fn viewDiffPane(
             });
         },
     }
+    if (body.selectionActionRenderBlock()) |block| {
+        try diff_render.composeSelectionAction(
+            &diff_content,
+            block,
+            state.viewer.diff_scroll,
+            body.renderDiffScroll(),
+            state.viewer.display_mode,
+            active,
+            palette,
+        );
+    }
     drawDiffHeaderDetailRow(surface, state, active, palette);
-    drawSearchMatchMarker(surface, state, palette);
+    drawSearchMatchMarkerAt(surface, state, palette, if (state.search.match_offset) |offset| body.sourceToPresentationOffset(offset) else null);
 }
 
 /// Shared projected-body presentation for inert/status content. Page adapters
@@ -555,12 +566,12 @@ fn projectedBodyRenderArgs(surface: *chasen.Surface, body: diff_surface.navigati
     return .{
         .surface = surface,
         .requested_mode = state.viewer.display_mode,
-        .scroll = state.viewer.diff_scroll,
+        .scroll = body.renderDiffScroll(),
         .horizontal_scroll = state.viewer.diff_horizontal_scroll,
         .pane_active = active,
         .line_numbers = state.viewer.view_options.line_numbers,
         .highlighted_hunk = body.selectedHunkIndex(),
-        .cursor_offset = body.visibleDiffCursorOffset(),
+        .cursor_offset = body.renderDiffCursorOffset(),
         .palette = palette,
         .selection = body.diffSelectionView(),
         .header_selection = body.diffHeaderSelectionActive(),
@@ -695,6 +706,8 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
         .pending_initial_first_visible_selection = &pending_initial_selection,
         .reload_anchor = null,
         .live_drag_deferred_source = false,
+        .selection_completion_policy = .copy_on_release,
+        .selection_layout_revision = 1,
         .source = .unstaged,
         .layout = .{ .width = 80, .height = 10 },
     };
@@ -769,7 +782,11 @@ pub fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme
 }
 
 pub fn drawSearchMatchMarker(surface: *chasen.Surface, state: diff_surface.ReadSurface, palette: theme.Palette) void {
-    const match_offset = state.search.match_offset orelse return;
+    drawSearchMatchMarkerAt(surface, state, palette, state.search.match_offset);
+}
+
+fn drawSearchMatchMarkerAt(surface: *chasen.Surface, state: diff_surface.ReadSurface, palette: theme.Palette, match_offset_opt: ?usize) void {
+    const match_offset = match_offset_opt orelse return;
     if (match_offset < state.viewer.diff_scroll) return;
 
     const visible_offset = match_offset - state.viewer.diff_scroll;

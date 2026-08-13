@@ -422,6 +422,7 @@ pub const App = struct {
                 // Mouse coordinates are relative to the old geometry. End the
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
+                const review_selection_anchor = self.reviewNavigation().captureSelectionViewportAnchor();
                 self.reviewNavigation().clearDiffSelection();
                 self.pages.compare.selection_owner = .none;
                 self.pages.repository.cancelMouseOwner();
@@ -435,6 +436,7 @@ pub const App = struct {
                 self.terminal_size = size;
                 self.reviewNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.reviewNavigationView().effectiveDisplayMode()) self.reviewNavigation().clearDiffSelection();
+                if (review_selection_anchor) |anchor| self.reviewNavigation().restoreSelectionViewportAnchor(anchor);
                 self.reviewNavigation().clampSidebarHorizontalScroll();
                 self.reviewNavigation().clampDiffNavigationKeepingHunkVisible();
                 self.reviewNavigation().updateSearchMatchOffset();
@@ -923,6 +925,7 @@ pub const App = struct {
                     .focus = self.pages.review.viewer.focus,
                     .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
                     .review_mode = self.config.review_mode,
+                    .retained_selection_action_available = review_navigation_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,
                 },
                 .selection_owner = &self.pages.review.selection_owner,

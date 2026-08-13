@@ -946,6 +946,7 @@ test "loadConfig accepts theme color overrides" {
         \\diff_modified = "index:12"
         \\pane_cursor_bg = "#292a2b"
         \\pane_active_line_number = "#ffdaaa"
+        \\diff_selection_bg = "#304052"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -962,6 +963,7 @@ test "loadConfig accepts theme color overrides" {
     try std.testing.expect(loaded.value.theme.get(.diff_modified).?.toChasen().eql(.{ .index = 12 }));
     try std.testing.expect(loaded.value.theme.get(.pane_cursor_bg).?.toChasen().eql(.{ .rgb = .{ 41, 42, 43 } }));
     try std.testing.expect(loaded.value.theme.get(.pane_active_line_number).?.toChasen().eql(.{ .rgb = .{ 255, 218, 170 } }));
+    try std.testing.expect(loaded.value.theme.get(.diff_selection_bg).?.toChasen().eql(.{ .rgb = .{ 48, 64, 82 } }));
 }
 
 test "parse config rejects removed repository cursor theme key" {

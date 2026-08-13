@@ -123,14 +123,16 @@ pub const Controller = struct {
             .mouse_diff_release => result.effect = try self.releaseDiffMouse(allocator orelse return error.MissingAllocator),
             .toggle_display_mode => {
                 self.navigation.controller.clearDiffSelection();
+                const selection_anchor = self.navigation.captureSelectionViewportAnchor();
                 const old_mode = self.navigation.controller.view().effectiveDisplayMode();
-                const old_scroll = self.navigation.controller.surface.viewer.diff_scroll;
+                const old_scroll = self.navigation.view().renderDiffScroll();
                 self.navigation.controller.surface.viewer.display_mode = self.navigation.controller.surface.viewer.display_mode.toggled();
                 const new_mode = self.navigation.controller.view().effectiveDisplayMode();
                 self.navigation.controller.surface.viewer.diff_scroll = self.navigation.view().remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
+                if (selection_anchor) |anchor| self.navigation.restoreSelectionViewportAnchor(anchor);
                 self.navigation.controller.resetDiffHorizontalScroll();
                 self.navigation.updateSearchMatchOffset();
-                self.navigation.controller.scrollSearchMatchIntoView();
+                self.navigation.scrollSearchMatchIntoView();
                 self.navigation.keepDiffCursorVisible();
             },
             .toggle_line_numbers => {
@@ -211,9 +213,14 @@ pub const Controller = struct {
                 }
 
                 var candidate = self.buildCompletedSelection(allocator, drag) catch {
-                    if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
-                    self.navigation.controller.surface.completed_selection.* = null;
+                    if (self.navigation.controller.surface.selection_completion_policy == .copy_on_release) {
+                        if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
+                        self.navigation.controller.surface.completed_selection.* = null;
+                        self.navigation.controller.clearDiffSelection();
+                        break :blk null;
+                    }
                     self.navigation.controller.clearDiffSelection();
+                    self.navigation.controller.setStatus("Could not retain selected text", .{});
                     break :blk null;
                 };
                 if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
@@ -221,6 +228,10 @@ pub const Controller = struct {
                 candidate = undefined;
                 self.navigation.controller.clearDiffSelection();
 
+                if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions) {
+                    self.navigation.controller.revealCompletedSelectionAction(self.navigation.resolver);
+                    break :blk null;
+                }
                 const clipboard = self.navigation.controller.surface.completed_selection.*.?.clipboardText(allocator) catch break :blk null;
                 break :blk .{ .copy_diff_selection = clipboard };
             },

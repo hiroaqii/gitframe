@@ -28,6 +28,7 @@ pub const Role = enum {
     diff_line_number,
     diff_hunk,
     diff_cursor,
+    diff_selection_bg,
 };
 
 pub const role_count = @typeInfo(Role).@"enum".fields.len;
@@ -131,6 +132,7 @@ pub const Palette = struct {
         palette.set(.diff_line_number, palette.color(.muted));
         palette.set(.diff_hunk, palette.color(.accent));
         palette.set(.diff_cursor, palette.color(.warning));
+        palette.set(.diff_selection_bg, .{ .rgb = .{ 48, 64, 82 } });
         return palette;
     }
 
@@ -272,6 +274,7 @@ test "roleFromKey maps known theme keys" {
     try std.testing.expectEqual(Role.diff_added, roleFromKey("diff_added").?);
     try std.testing.expectEqual(Role.diff_modified, roleFromKey("diff_modified").?);
     try std.testing.expectEqual(Role.diff_added_bg, roleFromKey("diff_added_bg").?);
+    try std.testing.expectEqual(Role.diff_selection_bg, roleFromKey("diff_selection_bg").?);
     try std.testing.expectEqual(Role.pane_cursor_bg, roleFromKey("pane_cursor_bg").?);
     try std.testing.expectEqual(Role.pane_active_line_number, roleFromKey("pane_active_line_number").?);
     try std.testing.expect(roleFromKey("repository_active_line_number") == null);
@@ -287,6 +290,10 @@ test "Palette.default keeps active pane line number independent from accent" {
 
 test "Palette.default preserves neutral pane cursor background" {
     try std.testing.expect(Palette.default().color(.pane_cursor_bg).eql(.{ .rgb = .{ 45, 48, 58 } }));
+}
+
+test "Palette.default uses the retained selection visual reference color" {
+    try std.testing.expect(Palette.default().color(.diff_selection_bg).eql(.{ .rgb = .{ 48, 64, 82 } }));
 }
 
 test "Palette.fromConfig derives diff roles from base role overrides" {

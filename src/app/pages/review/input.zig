@@ -21,6 +21,7 @@ pub const Context = struct {
     focus: review_page.Focus = .sidebar,
     sidebar_hidden: bool = false,
     review_mode: bool = false,
+    retained_selection_action_available: bool = false,
     keymap: keymap.Effective = .{},
 
     fn shared(self: Context) diff_surface_input.Context {
@@ -44,6 +45,8 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
 
 fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return .toggle_focus;
+    if (context.retained_selection_action_available and key.matches(chasen.Key.escape, .{})) return .clear_completed_selection;
+    if (context.retained_selection_action_available and key.matches('y', .{})) return .copy_completed_selection;
     if (key.matches(chasen.Key.escape, .{}) and context.search_query_len > 0) return .clear_search;
     if (context.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return .toggle_directory;
     if (context.focus == .diff and key.matches(chasen.Key.enter, .{})) return .toggle_hunk_fold;
@@ -132,6 +135,14 @@ test "normal mapping is focus and review-mode aware" {
     try std.testing.expectEqual(Msg.scroll_diff_down, keyToMsg(.{ .focus = .diff }, chasen.Key{ .codepoint = 'j' }).?);
     try std.testing.expect(keyToMsg(.{}, chasen.Key{ .codepoint = 'q' }) == null);
     try std.testing.expectEqual(Msg.finish_review_canceled, keyToMsg(.{ .review_mode = true }, chasen.Key{ .codepoint = 'q' }).?);
+}
+
+test "retained selection actions override line copy and empty escape fallback" {
+    const context: Context = .{ .retained_selection_action_available = true };
+    try std.testing.expectEqual(Msg.copy_completed_selection, keyToMsg(context, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(Msg.clear_completed_selection, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(Msg.copy_current_line, keyToMsg(.{}, .{ .codepoint = 'y' }).?);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.escape }) == null);
 }
 
 test "shell-owned configured commands are not duplicated by Review" {

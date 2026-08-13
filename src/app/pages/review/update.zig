@@ -7,12 +7,15 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const diff_surface = @import("../../diff_surface.zig");
 const diff_surface_update = @import("../../diff_surface/update.zig");
+const diff_surface_navigation = @import("../../diff_surface/navigation.zig");
 const message = @import("message.zig");
 const navigation = @import("navigation.zig");
 const context = @import("../../../context.zig");
 const review_page = @import("../review.zig");
 const diff_selection = @import("../../../diff/selection.zig");
+const diff_render = @import("../../../diff/render.zig");
 const file_tree = if (builtin.is_test) @import("../../../file_tree.zig") else struct {};
 const review_session = @import("../../../review/session.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
@@ -71,11 +74,49 @@ pub const Controller = struct {
     /// the optional form keeps pure page transitions independent of Chasen Ctx.
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !ReviewUpdate {
         var result: ReviewUpdate = .{};
+        switch (msg) {
+            .copy_completed_selection => {
+                self.applyCompletedSelectionAction(allocator orelse return error.MissingAllocator, .copy, &result);
+                return result;
+            },
+            .clear_completed_selection => {
+                self.applyCompletedSelectionAction(allocator orelse return error.MissingAllocator, .clear, &result);
+                return result;
+            },
+            .mouse_diff_press => |point| if (self.navigation.view().selectionActionHit(point)) |hit| {
+                self.navigation.page.viewer.focus = .diff;
+                if (hit.target) |target| self.applyCompletedSelectionAction(
+                    allocator orelse return error.MissingAllocator,
+                    switch (target) {
+                        .copy => .copy,
+                        .clear => .clear,
+                    },
+                    &result,
+                );
+                return result;
+            },
+            else => {},
+        }
         var adapter = self.navigation.updateAdapter();
         if (msg.shared()) |shared_msg| {
+            const viewport_anchor = self.navigation.captureSelectionViewportAnchor();
+            const selected_target_before = self.navigation.page.viewer.selected_target;
+            const requested_mode_before = self.navigation.page.viewer.display_mode;
+            const source_rows_before = self.navigation.view().displayedDiffLineCount();
+            const layout_revision_before = self.navigation.page.selection_layout_revision;
             var shared_update = try adapter.shared().apply(allocator, shared_msg);
             defer shared_update.deinit(allocator);
             if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
+
+            if (!std.meta.eql(selected_target_before, self.navigation.page.viewer.selected_target) or
+                requested_mode_before != self.navigation.page.viewer.display_mode or
+                source_rows_before != self.navigation.view().displayedDiffLineCount())
+            {
+                if (self.navigation.page.selection_layout_revision == layout_revision_before) {
+                    self.navigation.page.advanceSelectionLayoutRevision();
+                    if (viewport_anchor) |anchor| self.navigation.restoreSelectionViewportAnchor(anchor);
+                }
+            }
 
             // This boundary sees semantic Review input after it has either
             // changed the sidebar/file intent or proved to be a no-op. Internal
@@ -109,6 +150,31 @@ pub const Controller = struct {
         }
         return result;
     }
+
+    const CompletedSelectionAction = enum { copy, clear };
+
+    fn applyCompletedSelectionAction(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        action: CompletedSelectionAction,
+        result: *ReviewUpdate,
+    ) void {
+        if (!self.navigation.view().retainedSelectionActionAvailable()) {
+            self.navigation.setStatus("Retained selection is no longer available", .{});
+            return;
+        }
+        switch (action) {
+            .copy => {
+                const completed = self.navigation.page.completed_selection orelse return;
+                const text = completed.clipboardText(allocator) catch {
+                    self.navigation.setStatus("Could not prepare selected text for copying", .{});
+                    return;
+                };
+                result.command = .{ .copy_diff_selection = text };
+            },
+            .clear => self.navigation.clearCompletedSelectionWithViewport(allocator),
+        }
+    }
 };
 
 fn commandFromEffect(effect: diff_surface_update.Effect) Command {
@@ -136,6 +202,45 @@ test "review update owns state transition and shell intent" {
     var shell_update = try controller.apply(std.testing.allocator, .request_push);
     defer shell_update.deinit(std.testing.allocator);
     try std.testing.expectEqual(Command.request_push, shell_update.command.?);
+}
+
+test "Review advances selection layout revision only for mapping mode and fold changes" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var loaded = test_support.loadedDiffTwo();
+    loaded.collapsed_hunks = try arena.allocator().alloc(bool, loaded.document.totalHunks());
+    @memset(loaded.collapsed_hunks, false);
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadStateWithArena(arena, loaded),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = "/repo",
+        .source = .unstaged,
+        .layout = .{ .width = 120, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    const initial = page.selection_layout_revision;
+    var focus = try controller.apply(null, .toggle_focus);
+    focus.deinit(null);
+    try std.testing.expectEqual(initial, page.selection_layout_revision);
+
+    var mode = try controller.apply(null, .toggle_display_mode);
+    mode.deinit(null);
+    try std.testing.expectEqual(initial + 1, page.selection_layout_revision);
+
+    var file = try controller.apply(null, .select_next_file);
+    file.deinit(null);
+    try std.testing.expectEqual(initial + 2, page.selection_layout_revision);
+
+    page.viewer.selected_target = .{ .diff_file = 0 };
+    page.viewer.diff_cursor = .{ .hunk_header = 0 };
+    var fold = try controller.apply(null, .toggle_hunk_fold);
+    fold.deinit(null);
+    try std.testing.expectEqual(initial + 3, page.selection_layout_revision);
 }
 
 fn installUpdateTestActionCursor(
@@ -479,7 +584,7 @@ test "review file search missing allocator preserves the published query generat
     try std.testing.expect(page.file_search.basis.?.eql(a_basis));
 }
 
-test "review mouse release returns one owned copy command" {
+test "review mouse release retains candidate until explicit copy or clear" {
     var page: @import("../review.zig").ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
     };
@@ -502,14 +607,27 @@ test "review mouse release returns one owned copy command" {
     var update = try controller.apply(std.testing.allocator, .{ .mouse_diff_release = null });
     defer update.deinit(std.testing.allocator);
     try std.testing.expectEqual(diff_selection.Owner.none, page.selection_owner);
+    try std.testing.expect(update.command == null);
+    try std.testing.expect(page.completed_selection != null);
 
-    var command = update.takeCommand() orelse return error.ExpectedCopyCommand;
+    var copied = try controller.apply(std.testing.allocator, .copy_completed_selection);
+    defer copied.deinit(std.testing.allocator);
+    var command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer command.deinit(std.testing.allocator);
     switch (command) {
         .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
         else => return error.ExpectedCopyCommand,
     }
     try std.testing.expect(page.completed_selection != null);
+
+    const navigation_token = page.completed_selection.?.token;
+    for ([_]message.Msg{ .focus_diff, .scroll_diff_down, .toggle_display_mode }) |navigation_msg| {
+        var navigation_update = try controller.apply(null, navigation_msg);
+        navigation_update.deinit(null);
+        try std.testing.expect(page.completed_selection != null);
+        try std.testing.expect(page.completed_selection.?.token.eql(navigation_token));
+        try std.testing.expect(controller.navigation.view().retainedSelectionActionAvailable());
+    }
 
     const retained_token = page.completed_selection.?.token;
     page.selection_owner = .{ .diff = .{
@@ -525,6 +643,80 @@ test "review mouse release returns one owned copy command" {
     try std.testing.expect(page.selection_owner == .none);
     try std.testing.expect(page.completed_selection != null);
     try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
+
+    var cleared = try controller.apply(std.testing.allocator, .clear_completed_selection);
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(cleared.command == null);
+    try std.testing.expect(page.completed_selection == null);
+}
+
+test "review action rows route mouse Copy and Clear while inert cells consume the press" {
+    const allocator = std.testing.allocator;
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{ .sidebar_hidden = true },
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 3 },
+        .moved = true,
+    } };
+    var release = try controller.apply(allocator, .{ .mouse_diff_release = null });
+    release.deinit(allocator);
+
+    const block = controller.navigation.view().selectionActionRenderBlock().?;
+    const raw = controller.navigation.view().rawDiffPaneGeometry().?;
+    const content_width = diff_surface_navigation.contentWidth(raw.width);
+    const gutter = raw.width - content_width;
+    const body_width = diff_render.bodyWidth(content_width);
+    const action_layout = diff_render.selectionActionLayout(
+        body_width,
+        page.viewer.display_mode,
+        block.side,
+    );
+    const controls = block.projection.actionPresentationRow(1).? - page.viewer.diff_scroll;
+    const summary = block.projection.actionPresentationRow(0).? - page.viewer.diff_scroll;
+    const copy_point = diff_surface.MousePoint{
+        .col = raw.col + gutter + diff_render.cursor_gutter_width + action_layout.copy.?.col,
+        .row = @intCast(@as(usize, diff_render.body_start_row) + controls),
+    };
+
+    var inert = try controller.apply(allocator, .{ .mouse_diff_press = .{
+        .col = copy_point.col,
+        .row = @intCast(@as(usize, diff_render.body_start_row) + summary),
+    } });
+    inert.deinit(allocator);
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(page.selection_owner == .none);
+
+    var copied = try controller.apply(allocator, .{ .mouse_diff_press = copy_point });
+    defer copied.deinit(allocator);
+    var copy_command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
+    defer copy_command.deinit(allocator);
+    switch (copy_command) {
+        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
+        else => return error.ExpectedCopyCommand,
+    }
+    try std.testing.expect(page.completed_selection != null);
+
+    const clear_point = diff_surface.MousePoint{
+        .col = raw.col + gutter + diff_render.cursor_gutter_width + action_layout.clear.?.col,
+        .row = copy_point.row,
+    };
+    var cleared = try controller.apply(allocator, .{ .mouse_diff_press = clear_point });
+    cleared.deinit(allocator);
+    try std.testing.expect(page.completed_selection == null);
 }
 
 test "review header release returns an independent owned path command" {
@@ -591,7 +783,7 @@ test "review header release allocation failure retains active selection" {
     try std.testing.expect(retained.moved);
 }
 
-test "failed moved release clears prior candidate without emitting clipboard work" {
+test "failed moved release preserves prior candidate without emitting clipboard work" {
     const allocator = std.testing.allocator;
     var page: @import("../review.zig").ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
@@ -615,6 +807,7 @@ test "failed moved release clears prior candidate without emitting clipboard wor
     var accepted = try controller.apply(allocator, .{ .mouse_diff_release = null });
     defer accepted.deinit(allocator);
     try std.testing.expect(page.completed_selection != null);
+    const retained_token = page.completed_selection.?.token;
 
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "different" } },
@@ -626,41 +819,39 @@ test "failed moved release clears prior candidate without emitting clipboard wor
     var rejected = try controller.apply(allocator, .{ .mouse_diff_release = null });
     defer rejected.deinit(allocator);
     try std.testing.expect(rejected.command == null);
-    try std.testing.expect(page.completed_selection == null);
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(page.selection_owner == .none);
 }
 
 test "clipboard allocation failure retains the accepted candidate" {
-    const backing = std.testing.allocator;
-    var observed_clipboard_failure = false;
-    var fail_index: usize = 0;
-    while (fail_index < 16 and !observed_clipboard_failure) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
-        var page: @import("../review.zig").ReviewPageState = .{
-            .load = test_support.loadState(test_support.loadedDiffOne()),
-        };
-        defer page.deinit(failing.allocator());
-        page.selection_owner = .{ .diff = .{
-            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .new,
-            .anchor = .{ .hunk_index = 0, .line_index = 0 },
-            .focus = .{ .hunk_index = 0, .line_index = 1 },
-            .moved = true,
-        } };
-        const controller: Controller = .{ .navigation = .{
-            .page = &page,
-            .repo_root = null,
-            .source = .unstaged,
-            .layout = .{ .width = 80, .height = 20 },
-            .diagnostics = .{ .target = &page.status },
-        } };
+    const allocator = std.testing.allocator;
+    var page: @import("../review.zig").ReviewPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+    };
+    defer page.deinit(allocator);
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+    var accepted = try controller.apply(allocator, .{ .mouse_diff_release = null });
+    accepted.deinit(allocator);
+    const retained_token = page.completed_selection.?.token;
 
-        var update = try controller.apply(failing.allocator(), .{ .mouse_diff_release = null });
-        defer update.deinit(failing.allocator());
-        if (page.completed_selection != null and update.command == null) {
-            observed_clipboard_failure = true;
-            try std.testing.expect(page.selection_owner == .none);
-        }
-    }
-    try std.testing.expect(observed_clipboard_failure);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var copy = try controller.apply(failing.allocator(), .copy_completed_selection);
+    defer copy.deinit(failing.allocator());
+    try std.testing.expect(copy.command == null);
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
 }

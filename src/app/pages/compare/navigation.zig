@@ -1,6 +1,7 @@
 //! Compare adapter for the page-independent diff-surface navigation contract.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compare_page = @import("../compare.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const context = @import("../../../context.zig");
@@ -13,6 +14,7 @@ const diff_source = @import("../../../diff/source.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
 const file_tree = @import("../../../file_tree.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
+const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
 const source: diff_source.SourceMode = .{ .range = "compare" };
 
@@ -288,4 +290,50 @@ test "Compare navigation separates read-only View from mutable Controller author
     try std.testing.expect(!@hasDecl(Controller, "bodyController"));
     try std.testing.expect(!@hasDecl(Controller, "resolver"));
     try std.testing.expect(@hasDecl(Controller, "updateAdapter"));
+}
+
+test "Compare selection release still emits immediate clipboard bytes" {
+    const allocator = std.testing.allocator;
+    var page: compare_page.ComparePageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+    };
+    defer page.deinit(allocator);
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 3 },
+        .moved = true,
+    } };
+    const controller: Controller = .{
+        .page = &page,
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = 80, .height = 20 },
+    };
+    var adapter = controller.updateAdapter();
+    var update = try adapter.shared().apply(allocator, .{ .mouse_diff_release = null });
+    defer update.deinit(allocator);
+    var effect = update.takeEffect() orelse return error.ExpectedSelectionEffect;
+    defer effect.deinit(allocator);
+    switch (effect) {
+        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
+        .copy_diff_header_path => return error.ExpectedSelectionEffect,
+    }
+    try std.testing.expect(page.selection_owner == .none);
+
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "stale" } },
+        .side = .new,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+    var rejected = try adapter.shared().apply(allocator, .{ .mouse_diff_release = null });
+    defer rejected.deinit(allocator);
+    try std.testing.expect(rejected.effect == null);
+    try std.testing.expect(page.completed_selection == null);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expectEqualStrings("", page.status.text());
 }

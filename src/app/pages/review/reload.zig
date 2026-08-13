@@ -21,6 +21,7 @@ const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 const review_page = @import("../review.zig");
 const ReviewRepositoryReadEpoch = review_page.repository_read_authority.ReviewRepositoryReadEpoch;
 const review_selection = @import("../../diff_surface/selection.zig");
+const selection_action = @import("../../diff_surface/selection_action.zig");
 const session_hunk_mark = @import("session_hunk_mark.zig");
 const review_operations = if (builtin.is_test) @import("operations.zig") else struct {};
 const file_search = @import("../../diff_surface/file_search.zig");
@@ -355,6 +356,7 @@ pub const View = struct {
             .diff_cursor = self.page.viewer.diff_cursor,
             .diff_cursor_offset = self.navigation.selectedDiffCursorOffset(),
             .diff_scroll = self.page.viewer.diff_scroll,
+            .selection_viewport = self.navigation.captureSelectionViewportAnchor(),
             .diff_horizontal_scroll = self.page.viewer.diff_horizontal_scroll,
             .sidebar_horizontal_scroll = self.page.viewer.sidebar_horizontal_scroll,
             .search_coordinate = if (self.page.search.match) |match| match.coordinate else null,
@@ -529,8 +531,10 @@ pub const Controller = struct {
     }
 
     fn clearCompletedSelection(self: Controller, allocator: std.mem.Allocator) void {
+        const viewport_anchor = self.navigation.captureSelectionViewportAnchor();
         if (self.page.completed_selection) |*selection| selection.deinit(allocator);
         self.page.completed_selection = null;
+        if (viewport_anchor) |anchor| self.navigation.restoreSelectionViewportAnchor(anchor);
     }
 
     /// Projection replacement never invalidates another path. Global owner
@@ -1960,6 +1964,7 @@ pub const Controller = struct {
             self.page.accepted_sidebar_revision = file_search.nextAcceptedSidebarRevision(
                 self.page.accepted_sidebar_revision,
             );
+            self.page.advanceSelectionLayoutRevision();
         }
         self.page.review_projection.clearPending(allocator);
         self.page.review_projection.clearSyntaxPending(allocator);
@@ -2229,6 +2234,7 @@ pub const Controller = struct {
                 if (has_navigation_authority) {
                     self.applyPresentationLineageTransfer(allocator, boundary.transfer);
                     self.page.review_projection.finishCombinedToOrdinaryPrimary(allocator);
+                    if (boundary.owner == .self_owned) self.page.advanceSelectionLayoutRevision();
                     switch (boundary.owner) {
                         .self_owned => self.reconcileInstalledProjectionNavigation(
                             allocator,
@@ -2251,6 +2257,11 @@ pub const Controller = struct {
                 self.page.activation.queueRevalidation();
                 return .{};
             }
+            const changes_selected_body_mapping = self.page.review_projection.hasDisplayed();
+            const selection_viewport = if (changes_selected_body_mapping)
+                self.navigation.captureSelectionViewportAnchor()
+            else
+                null;
             if (outgoing_lineage) |lineage| self.clearPresentationLineage(allocator, lineage);
             self.reconcileCompletedSelectionForNoProjectionTarget(allocator);
             if (self.page.pending_display_navigation_restore != null) self.clearDisplayRestore(allocator);
@@ -2266,6 +2277,10 @@ pub const Controller = struct {
             } else {
                 self.page.review_projection.clearDisplayed(allocator);
                 self.page.review_projection.clearCache(allocator);
+            }
+            if (changes_selected_body_mapping) {
+                self.page.advanceSelectionLayoutRevision();
+                if (selection_viewport) |anchor| self.navigation.restoreSelectionViewportAnchor(anchor);
             }
             return .{};
         };
@@ -2320,15 +2335,19 @@ pub const Controller = struct {
                     target.repo_root,
                     target.path_key,
                 );
-                if (self.retainCombinedPresentationTokenIfExact(
-                    target.repo_root,
-                    target.path_key,
-                    &hit.value,
-                )) |transfer| {
-                    self.applyPresentationLineageTransfer(allocator, transfer);
-                } else if (outgoing_lineage) |lineage| {
-                    self.clearPresentationLineage(allocator, lineage);
-                }
+                const exact_presentation_transfer = blk: {
+                    if (self.retainCombinedPresentationTokenIfExact(
+                        target.repo_root,
+                        target.path_key,
+                        &hit.value,
+                    )) |transfer| {
+                        self.applyPresentationLineageTransfer(allocator, transfer);
+                        break :blk true;
+                    }
+                    if (outgoing_lineage) |lineage| self.clearPresentationLineage(allocator, lineage);
+                    break :blk false;
+                };
+                if (!exact_presentation_transfer) self.page.advanceSelectionLayoutRevision();
                 self.reconcileCompletedSelectionForReady(allocator, .{
                     .repo_root = target.repo_root,
                     .path_key = target.path_key,
@@ -2605,6 +2624,26 @@ pub const Controller = struct {
         } else {
             self.navigation.refreshSearchForSelectedFile();
         }
+    }
+
+    /// A failure terminal replaces the outgoing diff with a one-row status
+    /// body. Restore only the retained-selection viewport component against
+    /// that installed basis, then clamp even when no such anchor exists so a
+    /// stale source or virtual-row ordinal cannot survive the owner change.
+    fn reconcileInstalledProjectionFailureViewport(
+        self: Controller,
+        local_navigation: ?*const review_page.ReloadAnchor,
+    ) void {
+        const navigation_anchor = if (self.page.pending_display_navigation_restore) |*restore|
+            restore.authoritative()
+        else
+            local_navigation;
+        if (navigation_anchor) |anchor| {
+            if (anchor.selection_viewport) |viewport| {
+                self.navigation.restoreSelectionViewportAnchor(viewport);
+            }
+        }
+        self.navigation.clampDiffNavigation();
     }
 
     /// Exact reuse leaves the rendered coordinate system unchanged. Preserve
@@ -3308,6 +3347,14 @@ pub const Controller = struct {
         };
         defer if (static_failure) |*body| body.deinit(allocator);
 
+        // Failure terminals do not need the owned reload/navigation snapshot,
+        // but they still retire the action projection. Capture its scalar
+        // semantic viewport while the outgoing display is alive so the
+        // failure body cannot inherit a virtual-row ordinal.
+        const terminal_selection_viewport = switch (result.result) {
+            .failed, .failed_static => self.navigation.captureSelectionViewportAnchor(),
+            .ready, .reuse_candidate, .staged_only_reuse_candidate => null,
+        };
         var final_anchor = if (result.result == .ready)
             try self.view().captureAnchor(allocator)
         else
@@ -3375,6 +3422,7 @@ pub const Controller = struct {
                 self.page.accepted_sidebar_revision,
             );
             self.page.review_projection.clearCache(allocator);
+            if (!reused) self.page.advanceSelectionLayoutRevision();
         }
 
         var retiring_status: ?git_status.GitStatusState = null;
@@ -3451,6 +3499,9 @@ pub const Controller = struct {
             if (final_anchor) |*anchor| {
                 self.restoreDisplayedNavigation(anchor);
             } else {
+                if (terminal_selection_viewport) |anchor| {
+                    self.navigation.restoreSelectionViewportAnchor(anchor);
+                }
                 self.clearDisplayRestore(allocator);
             }
         }
@@ -3631,6 +3682,7 @@ pub const Controller = struct {
             current.path_key,
         );
 
+        var exact_presentation_transfer = false;
         switch (result.result) {
             .ready => |*ready| {
                 if (self.retainCombinedPresentationTokenIfExact(
@@ -3639,6 +3691,7 @@ pub const Controller = struct {
                     ready,
                 )) |transfer| {
                     self.applyPresentationLineageTransfer(allocator, transfer);
+                    exact_presentation_transfer = true;
                 } else if (outgoing_lineage) |lineage| {
                     self.clearPresentationLineage(allocator, lineage);
                 }
@@ -3656,6 +3709,7 @@ pub const Controller = struct {
                 });
             },
         }
+        if (!exact_presentation_transfer) self.page.advanceSelectionLayoutRevision();
 
         switch (result.result) {
             .ready => {
@@ -3673,6 +3727,7 @@ pub const Controller = struct {
                     .repo_root = current.repo_root,
                     .source_kind = current.source_kind,
                 } });
+                self.reconcileInstalledProjectionFailureViewport(if (local_navigation) |*anchor| anchor else null);
                 self.clearDisplayRestore(allocator);
                 return .{ .result_transferred = true };
             },
@@ -3707,6 +3762,7 @@ pub const Controller = struct {
                 var body = try review_projection.statusBodyAlloc(allocator, result.request.path_key, "{s}", .{message});
                 errdefer body.deinit(allocator);
                 self.page.review_projection.displayed = .{ .failed = .{ .request = request, .body = body } };
+                self.reconcileInstalledProjectionFailureViewport(if (local_navigation) |*anchor| anchor else null);
                 self.clearDisplayRestore(allocator);
                 return .{};
             },
@@ -3994,7 +4050,10 @@ pub const Controller = struct {
             }
         }
         if (self.navigation.view().selectedDiffCursorOffset() == null) self.navigation.initializeDiffCursorForSelectedFile();
-        self.page.viewer.diff_scroll = anchor.diff_scroll;
+        self.page.viewer.diff_scroll = if (anchor.selection_viewport) |viewport|
+            self.navigation.view().restoredSelectionViewportScroll(viewport)
+        else
+            anchor.diff_scroll;
         self.page.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
         self.page.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
         self.navigation.clampDiffNavigation();
@@ -4016,6 +4075,7 @@ pub const Controller = struct {
             std.debug.assert(self.page.completed_selection == null);
         }
         self.page.source_session_revision +%= 1;
+        self.page.advanceSelectionLayoutRevision();
     }
 
     /// Projection cache validity relies on StatusDocument.eql comparing both
@@ -4603,6 +4663,99 @@ const TestProjectionTerminal = enum {
     exact_candidate,
 };
 
+const TestSelectionViewportTop = enum {
+    action_before,
+    summary,
+    controls,
+    action_after,
+};
+
+/// Places a real Review viewport at each boundary around the retained action
+/// projection.  These assertions intentionally inspect the captured scalar
+/// anchor, rather than merely duplicating the pure projection tests: every
+/// caller below then drives that anchor through an actual projection owner
+/// terminal.
+fn captureTestSelectionViewportTop(
+    controller: Controller,
+    top: TestSelectionViewportTop,
+) !selection_action.SelectionViewportAnchor {
+    const block = controller.navigation.view().selectionActionRenderBlock() orelse
+        return error.ExpectedSelectionActionBlock;
+    const summary = block.projection.actionPresentationRow(0) orelse
+        return error.ExpectedSelectionActionSummary;
+    const controls = block.projection.actionPresentationRow(1) orelse
+        return error.ExpectedSelectionActionControls;
+    const raw_scroll = switch (top) {
+        .action_before => summary -| 1,
+        .summary => summary,
+        .controls => controls,
+        .action_after => controls +| 1,
+    };
+    if (raw_scroll >= block.projection.source_rows +| block.projection.virtual_rows) {
+        return error.ExpectedSourceAfterSelectionAction;
+    }
+    controller.page.viewer.diff_scroll = raw_scroll;
+    const anchor = controller.navigation.captureSelectionViewportAnchor() orelse
+        return error.ExpectedSelectionViewportAnchor;
+    try std.testing.expectEqual(raw_scroll, anchor.raw_presentation_scroll);
+    try std.testing.expectEqual(
+        switch (top) {
+            .action_before => block.projection.after_source_row,
+            .summary, .controls, .action_after => block.projection.after_source_row + 1,
+        },
+        anchor.source_offset_fallback,
+    );
+    try std.testing.expectEqual(
+        switch (top) {
+            .action_before, .action_after => @as(isize, 0),
+            .summary => @as(isize, 2),
+            .controls => @as(isize, 1),
+        },
+        anchor.signed_screen_delta,
+    );
+    // Downstream cursor reconciliation is part of the integration contract.
+    // Keep it on the semantic source represented by the viewport top so it
+    // validates (rather than legitimately supersedes) the viewport restore.
+    switch (anchor.semantic_source) {
+        .parsed => |coordinate| controller.page.viewer.diff_cursor = coordinate,
+        .generated_row => |row| controller.page.viewer.diff_cursor = .{ .metadata = row },
+        .none => return error.ExpectedSelectionViewportSemanticSource,
+    }
+    return anchor;
+}
+
+fn expectParsedTestSelectionViewport(anchor: selection_action.SelectionViewportAnchor) !void {
+    switch (anchor.semantic_source) {
+        .parsed => {},
+        .none, .generated_row => return error.ExpectedParsedSelectionViewportSource,
+    }
+}
+
+fn expectGeneratedTestSelectionViewport(anchor: selection_action.SelectionViewportAnchor) !void {
+    switch (anchor.semantic_source) {
+        .generated_row => {},
+        .none, .parsed => return error.ExpectedGeneratedSelectionViewportSource,
+    }
+}
+
+fn expectTestSelectionViewportRestored(
+    controller: Controller,
+    anchor: selection_action.SelectionViewportAnchor,
+) !void {
+    const expected = controller.navigation.view().restoredSelectionViewportScroll(anchor);
+    try std.testing.expectEqual(expected, controller.page.viewer.diff_scroll);
+}
+
+fn expectTestSelectionViewportRawReuse(
+    controller: Controller,
+    anchor: selection_action.SelectionViewportAnchor,
+) !void {
+    const current = controller.navigation.captureSelectionViewportAnchor() orelse
+        return error.ExpectedRetainedSelectionViewportAnchor;
+    try std.testing.expect(anchor.basis.eql(current.basis));
+    try std.testing.expectEqual(anchor.raw_presentation_scroll, controller.page.viewer.diff_scroll);
+}
+
 fn testMultiFileProjectionSelectionScope(
     allocator: std.mem.Allocator,
     owner: TestProjectionSelectionOwner,
@@ -4617,7 +4770,8 @@ fn testMultiFileProjectionSelectionScope(
     try page.git_status.replace("/repo", &status_bundle);
     page.status_load.markSuccess();
     var status_message = @import("../../state.zig").StatusMessage{};
-    const controller = testController(&page, &status_message, .unstaged);
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.navigation.layout.height = 7;
 
     const selection_file_index: usize = switch (owner) {
         .other_path => 0,
@@ -4634,6 +4788,23 @@ fn testMultiFileProjectionSelectionScope(
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
     controller.navigation.setSelectedDiffFile(1);
+
+    var viewport_anchor: ?selection_action.SelectionViewportAnchor = null;
+    if (owner == .target_path and terminal != .cache_hit) {
+        viewport_anchor = try captureTestSelectionViewportTop(controller, switch (terminal) {
+            .normal_ready => .action_before,
+            .failed => .controls,
+            .failed_static => .action_after,
+            .spawn_rejected => .summary,
+            .exact_candidate => .summary,
+            .cache_hit => unreachable,
+        });
+        try expectParsedTestSelectionViewport(viewport_anchor.?);
+        if (terminal == .failed or terminal == .failed_static) {
+            try std.testing.expect(viewport_anchor.?.basis.source_rows > controller.navigation.view().diffVisibleRows());
+            try std.testing.expect(viewport_anchor.?.raw_presentation_scroll > 0);
+        }
+    }
 
     switch (terminal) {
         .cache_hit => {
@@ -4666,6 +4837,10 @@ fn testMultiFileProjectionSelectionScope(
                 page.status_snapshot_revision,
             );
             try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+            if (owner == .target_path) {
+                viewport_anchor = try captureTestSelectionViewportTop(controller, .summary);
+                try expectParsedTestSelectionViewport(viewport_anchor.?);
+            }
             var update = try controller.prepareProjection(allocator);
             defer update.deinit(allocator);
             try std.testing.expect(update.command == null);
@@ -4752,8 +4927,15 @@ fn testMultiFileProjectionSelectionScope(
         const clipboard = try completed.clipboardText(allocator);
         defer allocator.free(clipboard);
         try std.testing.expectEqualStrings(original_clipboard, clipboard);
+        if (viewport_anchor) |anchor| try expectTestSelectionViewportRawReuse(controller, anchor);
     } else {
         try std.testing.expect(page.completed_selection == null);
+        if (viewport_anchor) |anchor| try expectTestSelectionViewportRestored(controller, anchor);
+        if (terminal == .failed or terminal == .failed_static) {
+            try std.testing.expect(controller.navigation.view().displayedReviewBody() == .status);
+            try std.testing.expectEqual(@as(usize, 1), controller.navigation.view().displayedDiffLineCount());
+            try std.testing.expectEqual(@as(usize, 0), page.viewer.diff_scroll);
+        }
     }
 }
 
@@ -7640,7 +7822,7 @@ test "mutation read promotion gate drains deferred projection without publicatio
     try std.testing.expect(!page.review_projection.hasDisplayed());
 }
 
-test "combined content token survives exact index partition and rejects changed presentation" {
+test "selection viewport reload exact transfer preserves candidate and changed content invalidates" {
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
@@ -7651,7 +7833,8 @@ test "combined content token survives exact index partition and rejects changed 
     try page.git_status.replace("/repo", &status_bundle);
     page.status_load.markSuccess();
     var status_message = @import("../../state.zig").StatusMessage{};
-    const controller = testController(&page, &status_message, .unstaged);
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.navigation.layout.height = 7;
 
     page.review_projection.installReady(.{
         .request = try review_projection.testing.cloneRequest(
@@ -7683,6 +7866,9 @@ test "combined content token survives exact index partition and rejects changed 
     try addTestSessionHunkMarks(&page, allocator, "/repo", "other.zig", original_content, &.{0});
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
+    const original_layout_revision = page.selection_layout_revision;
+    const exact_viewport = try captureTestSelectionViewportTop(controller, .summary);
+    try expectParsedTestSelectionViewport(exact_viewport);
 
     var repartitioned = try testCombinedBundle(
         allocator,
@@ -7697,6 +7883,7 @@ test "combined content token survives exact index partition and rejects changed 
     try std.testing.expect(page.completed_selection != null);
     try applyTestCombinedBundle(controller, allocator, 2, 1, repartitioned);
     repartitioned = undefined;
+    try std.testing.expectEqual(original_layout_revision, page.selection_layout_revision);
 
     const accepted = &page.review_projection.displayed.ready.value.combined_hunks;
     try std.testing.expect(accepted.presentation.content_token.eql(original_token));
@@ -7709,6 +7896,7 @@ test "combined content token survives exact index partition and rejects changed 
     const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(accepted_clipboard);
     try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
+    try expectTestSelectionViewportRawReuse(controller, exact_viewport);
 
     var changed = try testCombinedBundle(
         allocator,
@@ -7718,11 +7906,15 @@ test "combined content token survives exact index partition and rejects changed 
         test_combined_changed_unstaged,
     );
     try std.testing.expect(!changed.presentation.fingerprint.eql(accepted.presentation.fingerprint));
+    const changed_viewport = try captureTestSelectionViewportTop(controller, .controls);
+    try expectParsedTestSelectionViewport(changed_viewport);
     controller.advanceStatusSnapshotRevision(allocator);
     try std.testing.expect(page.completed_selection != null);
     try applyTestCombinedBundle(controller, allocator, 3, 2, changed);
     changed = undefined;
     try std.testing.expect(page.completed_selection == null);
+    try expectTestSelectionViewportRestored(controller, changed_viewport);
+    try std.testing.expect(page.selection_layout_revision != original_layout_revision);
     try std.testing.expect(page.review_projection.displayed.ready.value.combined_hunks.presentation.content_token.eql(.init(3)));
     try std.testing.expect(!page.staged_hunks.containsExact("/repo", "a", .{
         .content = original_content,
@@ -10031,9 +10223,12 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
         try page.git_status.replace("/repo", &status_bundle);
         page.status_load.markSuccess();
         var status_message = @import("../../state.zig").StatusMessage{};
-        const controller = testController(&page, &status_message, .unstaged);
+        var controller = testController(&page, &status_message, .unstaged);
+        controller.navigation.layout.height = 7;
 
         try installTestCombinedCandidate(controller, backing, 1, 74 + fail_index, 0);
+        const viewport_anchor = try captureTestSelectionViewportTop(controller, .summary);
+        try expectParsedTestSelectionViewport(viewport_anchor);
         const retained_before = &page.review_projection.displayed.ready.value.combined_hunks;
         const presentation_text_ptr = retained_before.presentation.cached_bundle.loaded.text.ptr;
         const authority_text_ptr = retained_before.authority.cached_component.text.ptr;
@@ -10100,6 +10295,7 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
         try std.testing.expect(retained_after.authority.cached_component.text.ptr == authority_text_ptr);
         try std.testing.expectEqual(@as(u64, 0), retained_after.authority.status_snapshot_revision);
         try std.testing.expect(page.completed_selection != null);
+        try expectTestSelectionViewportRawReuse(controller, viewport_anchor);
 
         var replacement_update = try controller.prepareProjection(backing);
         defer replacement_update.deinit(backing);
@@ -10128,16 +10324,26 @@ test "combined candidate closes when replacement request allocation fails" {
         try page.git_status.replace("/repo", &status_bundle);
         page.status_load.markSuccess();
         var status_message = @import("../../state.zig").StatusMessage{};
-        const controller = testController(&page, &status_message, .unstaged);
+        var controller = testController(&page, &status_message, .unstaged);
+        controller.navigation.layout.height = 7;
 
         try installTestCombinedCandidate(controller, backing, 1, 1, 0);
         controller.advanceStatusSnapshotRevision(backing);
         try std.testing.expect(page.completed_selection != null);
+        const viewport_anchor = try captureTestSelectionViewportTop(controller, switch (fail_index) {
+            0 => .action_before,
+            1 => .summary,
+            2 => .controls,
+            3 => .action_after,
+            else => unreachable,
+        });
+        try expectParsedTestSelectionViewport(viewport_anchor);
 
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         try std.testing.expectError(error.OutOfMemory, controller.prepareProjection(failing.allocator()));
         try std.testing.expect(page.review_projection.pending == null);
         try std.testing.expect(page.completed_selection == null);
+        try expectTestSelectionViewportRestored(controller, viewport_anchor);
     }
 }
 
@@ -10152,10 +10358,13 @@ test "combined candidate spawn rejection closes only the matching replacement" {
     try page.git_status.replace("/repo", &status_bundle);
     page.status_load.markSuccess();
     var status_message = @import("../../state.zig").StatusMessage{};
-    const controller = testController(&page, &status_message, .unstaged);
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.navigation.layout.height = 7;
 
     try installTestCombinedCandidate(controller, allocator, 1, 1, 0);
     controller.advanceStatusSnapshotRevision(allocator);
+    const viewport_anchor = try captureTestSelectionViewportTop(controller, .controls);
+    try expectParsedTestSelectionViewport(viewport_anchor);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     const request_id = switch (update.command orelse return error.ExpectedProjectionCommand) {
@@ -10168,10 +10377,12 @@ test "combined candidate spawn rejection closes only the matching replacement" {
     controller.rejectProjectionSpawn(allocator, request_id +% 1);
     try std.testing.expect(page.review_projection.pending != null);
     try std.testing.expect(page.completed_selection != null);
+    try expectTestSelectionViewportRawReuse(controller, viewport_anchor);
 
     controller.rejectProjectionSpawn(allocator, request_id);
     try std.testing.expect(page.review_projection.pending == null);
     try std.testing.expect(page.completed_selection == null);
+    try expectTestSelectionViewportRestored(controller, viewport_anchor);
 }
 
 test "projection candidate survives exact rebuild and clears on changed content basis" {
@@ -10184,11 +10395,14 @@ test "projection candidate survives exact rebuild and clears on changed content 
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
     try page.git_status.replace("/repo", &status_bundle);
     var status_message = @import("../../state.zig").StatusMessage{};
-    const controller = testController(&page, &status_message, .unstaged);
+    var controller = testController(&page, &status_message, .unstaged);
+    controller.navigation.layout.height = 6;
 
     page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
     const displayed = &page.review_projection.displayed.ready.value.generated_added_file;
     page.completed_selection = try testGeneratedCandidate(controller, allocator, displayed);
+    const exact_viewport = try captureTestSelectionViewportTop(controller, .summary);
+    try expectGeneratedTestSelectionViewport(exact_viewport);
 
     page.review_projection.pending = try review_projection.testing.cloneRequest(
         allocator,
@@ -10221,6 +10435,13 @@ test "projection candidate survives exact rebuild and clears on changed content 
     try std.testing.expect(exact_apply.result_transferred);
     exact_owned = false;
     try std.testing.expect(page.completed_selection != null);
+    const exact_viewport_after = controller.navigation.captureSelectionViewportAnchor() orelse
+        return error.ExpectedRetainedSelectionViewportAnchor;
+    try std.testing.expect(!exact_viewport.basis.eql(exact_viewport_after.basis));
+    try expectTestSelectionViewportRestored(controller, exact_viewport);
+
+    const changed_viewport = try captureTestSelectionViewportTop(controller, .controls);
+    try expectGeneratedTestSelectionViewport(changed_viewport);
 
     page.review_projection.pending = try review_projection.testing.cloneRequest(
         allocator,
@@ -10253,6 +10474,8 @@ test "projection candidate survives exact rebuild and clears on changed content 
     try std.testing.expect(changed_apply.result_transferred);
     changed_owned = false;
     try std.testing.expect(page.completed_selection == null);
+    try expectTestSelectionViewportRestored(controller, changed_viewport);
+    try std.testing.expectEqual(@as(usize, 0), page.viewer.diff_scroll);
 }
 
 test "deferred source terminals consume blocked and accepted ownership" {

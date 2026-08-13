@@ -229,6 +229,8 @@ pub const ReviewPageState = struct {
     reviewed_store: review_state.Store = .{},
     selection_owner: diff_selection.Owner = .none,
     completed_selection: ?review_selection.CompletedSelection = null,
+    /// Non-zero semantic generation of the selected body's source-row map.
+    selection_layout_revision: u64 = 1,
 
     pub fn init(
         self: *ReviewPageState,
@@ -237,6 +239,11 @@ pub const ReviewPageState = struct {
         source: diff_source.SourceMode,
     ) void {
         self.auto_reload = .init(cli, user, source);
+    }
+
+    pub fn advanceSelectionLayoutRevision(self: *ReviewPageState) void {
+        self.selection_layout_revision +%= 1;
+        if (self.selection_layout_revision == 0) self.selection_layout_revision = 1;
     }
 
     /// Only an ordinary source completion deferred behind a live drag borrows
@@ -313,6 +320,8 @@ pub const ReviewPageState = struct {
             else
                 null,
             .live_drag_deferred_source = self.deferredSourceBlocksPageTransition(),
+            .selection_completion_policy = .retain_with_actions,
+            .selection_layout_revision = self.selection_layout_revision,
             .source = source,
             .layout = layout,
         };
@@ -346,6 +355,8 @@ pub const ReviewPageState = struct {
             else
                 null,
             .live_drag_deferred_source = self.deferredSourceBlocksPageTransition(),
+            .selection_completion_policy = .retain_with_actions,
+            .selection_layout_revision = self.selection_layout_revision,
             .source = source,
             .layout = layout,
         };
@@ -456,6 +467,14 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     try std.testing.expect(resolved.reload_anchor != null);
     try std.testing.expectEqualStrings("src/main.zig", resolved.reload_anchor.?.path_key);
     try std.testing.expect(resolved.live_drag_deferred_source);
+}
+
+test "selection layout revision is non-zero and skips zero on wrap" {
+    var state: ReviewPageState = .{ .selection_layout_revision = std.math.maxInt(u64) };
+    state.advanceSelectionLayoutRevision();
+    try std.testing.expectEqual(@as(u64, 1), state.selection_layout_revision);
+    state.advanceSelectionLayoutRevision();
+    try std.testing.expectEqual(@as(u64, 2), state.selection_layout_revision);
 }
 
 test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {

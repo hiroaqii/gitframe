@@ -81,6 +81,8 @@ pub const Msg = union(enum) {
     toggle_line_numbers,
     copy_current_line,
     copy_current_hunk,
+    copy_completed_selection,
+    clear_completed_selection,
     finish_review_approved,
     finish_review_needs_changes,
     finish_review_canceled,

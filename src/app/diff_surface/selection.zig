@@ -97,6 +97,7 @@ pub const Parsed = struct {
     selected_path: []u8,
     side: diff_selection.Side,
     mode: diff_selection.Mode,
+    range: diff_selection.Range,
     fragments: diff_selection.OwnedFragments,
 
     fn deinit(self: *Parsed, allocator: std.mem.Allocator) void {
@@ -125,6 +126,7 @@ pub const Generated = struct {
     path: []u8,
     side: diff_selection.Side = .new,
     mode: diff_selection.Mode,
+    range: diff_selection.Range,
     fragment: GeneratedFragment,
 
     fn deinit(self: *Generated, allocator: std.mem.Allocator) void {
@@ -208,6 +210,7 @@ pub fn buildParsed(
             .selected_path = selected_owned,
             .side = selection.side,
             .mode = selection.mode,
+            .range = selection.range(),
             .fragments = fragments,
         } },
     };
@@ -251,6 +254,7 @@ pub fn buildGenerated(
         .value = .{ .generated_untracked = .{
             .path = owned_path,
             .mode = selection.mode,
+            .range = range,
             .fragment = .{
                 .source_start = @intCast(range.start.line_index + 1),
                 .source_end = @intCast(range.end.line_index + 1),
@@ -369,6 +373,49 @@ test "generated candidate is not represented as a parser hunk" {
     defer allocator.free(clipboard);
     try std.testing.expectEqualStrings("DEFG\nHIJKL", clipboard);
     try std.testing.expect(completed.value == .generated_untracked);
+    const generated = completed.value.generated_untracked;
+    try std.testing.expectEqual(diff_selection.Side.new, generated.side);
+    try std.testing.expectEqual(diff_selection.Mode.character, generated.mode);
+    try std.testing.expectEqual(@as(usize, 2), generated.fragment.line_count);
+    try std.testing.expectEqualDeep(diff_selection.Range{
+        .start = .{ .hunk_index = 0, .line_index = 0, .leading = 3, .trailing = 4 },
+        .end = .{ .hunk_index = 0, .line_index = 1, .leading = 4, .trailing = 5 },
+    }, generated.range);
+}
+
+test "parsed candidate retains exact cross-hunk range and character bytes" {
+    const allocator = std.testing.allocator;
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{
+            .{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{.{ .kind = .context, .text = "abc", .old_line = 1, .new_line = 1 }} },
+            .{ .old_start = 20, .old_count = 1, .new_start = 20, .new_count = 1, .section = "", .lines = &.{.{ .kind = .context, .text = "xyz", .old_line = 20, .new_line = 20 }} },
+        },
+    };
+    const drag: diff_selection.DragSelection = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .mode = .character,
+        .anchor = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
+        .focus = .{ .hunk_index = 1, .line_index = 0, .leading = 1, .trailing = 2 },
+        .moved = true,
+    };
+    var completed = try buildParsed(allocator, .{
+        .repo_epoch = 1,
+        .root_identity = null,
+        .source = SourceBasis.init(.unstaged),
+        .source_session_revision = 1,
+        .display = .{ .loaded = Fingerprint.init("multi-hunk") },
+    }, file, drag);
+    defer completed.deinit(allocator);
+    const clipboard = try completed.clipboardText(allocator);
+    defer allocator.free(clipboard);
+    try std.testing.expectEqualStrings("bc\nxy", clipboard);
+    try std.testing.expectEqualDeep(drag.range(), completed.value.parsed_diff.range);
+    try std.testing.expectEqual(@as(usize, 2), completed.value.parsed_diff.fragments.line_count);
 }
 
 test "parsed candidate owns byte-exact rename paths for the selected side" {

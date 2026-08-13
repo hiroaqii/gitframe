@@ -643,6 +643,8 @@ pub const ComparePageState = struct {
             .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
             .reload_anchor = if (self.refresh_anchor) |*anchor| anchor else null,
             .live_drag_deferred_source = self.deferred_load_apply != null,
+            .selection_completion_policy = .copy_on_release,
+            .selection_layout_revision = 1,
             .source = source,
             .layout = layout,
         };
@@ -672,6 +674,8 @@ pub const ComparePageState = struct {
             .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
             .reload_anchor = if (self.refresh_anchor) |*anchor| anchor else null,
             .live_drag_deferred_source = self.deferred_load_apply != null,
+            .selection_completion_policy = .copy_on_release,
+            .selection_layout_revision = 1,
             .source = source,
             .layout = layout,
         };

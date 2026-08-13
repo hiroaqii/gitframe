@@ -441,6 +441,44 @@ pub const View = struct {
         return self.sharedBodyView(&adapter).diffSelectionView();
     }
 
+    pub fn selectionActionRenderBlock(self: View) ?diff_render.SelectionActionBlock {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).selectionActionRenderBlock();
+    }
+
+    pub fn renderDiffScroll(self: View) usize {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).renderDiffScroll();
+    }
+
+    pub fn renderDiffCursorOffset(self: View) ?usize {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).renderDiffCursorOffset();
+    }
+
+    pub fn retainedSelectionActionAvailable(self: View) bool {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).retainedSelectionActionAvailable();
+    }
+
+    pub fn captureSelectionViewportAnchor(self: View) ?diff_surface.selection_action.SelectionViewportAnchor {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).captureSelectionViewportAnchor();
+    }
+
+    pub fn restoredSelectionViewportScroll(
+        self: View,
+        anchor: diff_surface.selection_action.SelectionViewportAnchor,
+    ) usize {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).restoreSelectionViewportAnchor(anchor);
+    }
+
+    pub fn selectionActionHit(self: View, point: diff_surface.MousePoint) ?diff_surface.navigation.SelectionActionHit {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).selectionActionHit(point);
+    }
+
     pub fn diffHeaderSelectionActive(self: View) bool {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyView(&adapter).diffHeaderSelectionActive();
@@ -1028,8 +1066,15 @@ pub const View = struct {
     }
 
     fn displayedDiffLineCountDirect(self: View) usize {
-        if (self.generatedBodyDirect()) |body| return body.source.rowCount();
-        return self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount();
+        return switch (self.displayedReviewBody()) {
+            .generated => |body| body.source.rowCount(),
+            // These bodies render their own single presentation row and must
+            // never inherit the selected underlying diff's row count as their
+            // scroll basis.
+            .inert_invalid_utf8, .status, .pending => 1,
+            .none => 0,
+            .primary, .cached, .combined, .retained_staged_only => self.selectedFileLineIndex(self.effectiveDisplayMode()).lineCount(),
+        };
     }
 
     pub fn selectedFileCachedLineIndex(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
@@ -1216,7 +1261,7 @@ pub const Controller = struct {
         };
     }
 
-    fn setStatus(self: Controller, comptime fmt: []const u8, args: anytype) void {
+    pub fn setStatus(self: Controller, comptime fmt: []const u8, args: anytype) void {
         self.sharedController().setStatus(fmt, args);
     }
 
@@ -1240,6 +1285,19 @@ pub const Controller = struct {
 
     pub fn clearDiffSelection(self: Controller) void {
         self.sharedController().clearDiffSelection();
+    }
+
+    pub fn clearCompletedSelectionWithViewport(self: Controller, allocator: std.mem.Allocator) void {
+        var adapter = self.bodyResolverAdapter();
+        self.sharedController().clearCompletedSelectionWithViewport(adapter.interface(), allocator);
+    }
+
+    pub fn captureSelectionViewportAnchor(self: Controller) ?diff_surface.selection_action.SelectionViewportAnchor {
+        return self.view().captureSelectionViewportAnchor();
+    }
+
+    pub fn restoreSelectionViewportAnchor(self: Controller, anchor: diff_surface.selection_action.SelectionViewportAnchor) void {
+        self.page.viewer.diff_scroll = self.view().restoredSelectionViewportScroll(anchor);
     }
 
     pub fn selectFileDelta(self: Controller, delta: i2) void {
@@ -1327,8 +1385,22 @@ pub const Controller = struct {
             self.setStatus("hunk fold is unavailable for projected view", .{});
             return;
         }
+        const hunk_index = self.view().selectedHunkIndex();
+        const before_folded = if (hunk_index) |index| blk: {
+            const folded = self.view().selectedFoldedHunks();
+            break :blk if (index < folded.len) folded[index] else null;
+        } else null;
+        const viewport_anchor = self.captureSelectionViewportAnchor();
         var adapter = self.bodyResolverAdapter();
         self.sharedBodyController(&adapter).toggleSelectedHunkFold();
+        const changed = if (hunk_index) |index| blk: {
+            const folded = self.view().selectedFoldedHunks();
+            break :blk index < folded.len and before_folded != null and folded[index] != before_folded.?;
+        } else false;
+        if (changed) {
+            self.page.advanceSelectionLayoutRevision();
+            if (viewport_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
+        }
     }
 
     pub fn clampDiffNavigation(self: Controller) void {
@@ -1476,7 +1548,8 @@ pub const Controller = struct {
     }
 
     pub fn scrollSearchMatchIntoView(self: Controller) void {
-        self.sharedController().scrollSearchMatchIntoView();
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).scrollSearchMatchIntoView();
     }
 
     pub fn prepareActionCursor(
@@ -3484,6 +3557,7 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
     });
     defer status.pages.review.deinit(allocator);
     try std.testing.expect(status.view().displayedReviewBody() == .status);
+    try std.testing.expectEqual(@as(usize, 1), status.view().displayedDiffLineCount());
     try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
         .kind = .projected,
         .line_count = 1,

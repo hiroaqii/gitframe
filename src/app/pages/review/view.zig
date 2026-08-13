@@ -278,7 +278,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .hunk_stages = .all_staged,
                 .syntax = .initDirect(&bundle.loaded.syntax_spans, 0),
             }, projectedBodyRenderArgs(app, &content, active));
-            drawPaneHeaderRule(surface, active, app.theme);
+            try finishProjectedBody(app, surface, &content, active);
             return;
         },
         .combined => |bundle| {
@@ -289,7 +289,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.hunkStageStates()),
                 .syntax = bundle.syntaxView(),
             }, projectedBodyRenderArgs(app, &content, active));
-            drawPaneHeaderRule(surface, active, app.theme);
+            try finishProjectedBody(app, surface, &content, active);
             return;
         },
         .retained_staged_only => |bundle| {
@@ -300,12 +300,12 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .hunk_stages = .all_staged,
                 .syntax = bundle.syntaxView(),
             }, projectedBodyRenderArgs(app, &content, active));
-            drawPaneHeaderRule(surface, active, app.theme);
+            try finishProjectedBody(app, surface, &content, active);
             return;
         },
         .generated => |bundle| {
             try review_body_render.renderGenerated(bundle, projectedBodyRenderArgs(app, &content, active));
-            drawPaneHeaderRule(surface, active, app.theme);
+            try finishProjectedBody(app, surface, &content, active);
             return;
         },
         .inert_invalid_utf8 => |inert| {
@@ -333,16 +333,31 @@ fn projectedBodyRenderArgs(app: Context, surface: *chasen.Surface, active: bool)
     return .{
         .surface = surface,
         .requested_mode = app.page.viewer.display_mode,
-        .scroll = app.page.viewer.diff_scroll,
+        .scroll = app.navigation.renderDiffScroll(),
         .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
         .pane_active = active,
         .line_numbers = app.page.viewer.view_options.line_numbers,
         .highlighted_hunk = app.selectedHunkIndex(),
-        .cursor_offset = app.visibleDiffCursorOffset(),
+        .cursor_offset = app.navigation.renderDiffCursorOffset(),
         .palette = app.theme,
         .selection = app.diffSelectionView(),
         .header_selection = app.diffHeaderSelectionActive(),
     };
+}
+
+fn finishProjectedBody(app: Context, pane: *chasen.Surface, content: *chasen.Surface, active: bool) !void {
+    if (app.navigation.selectionActionRenderBlock()) |block| {
+        try diff_render.composeSelectionAction(
+            content,
+            block,
+            app.page.viewer.diff_scroll,
+            app.navigation.renderDiffScroll(),
+            app.page.viewer.display_mode,
+            active,
+            app.theme,
+        );
+    }
+    drawPaneHeaderRule(pane, active, app.theme);
 }
 
 const drawPaneHeaderRule = diff_surface_view.drawPaneHeaderRule;
