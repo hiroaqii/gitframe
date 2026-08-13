@@ -424,13 +424,14 @@ pub const App = struct {
                 // the common post-update boundary below.
                 const review_selection_anchor = self.reviewNavigation().captureSelectionViewportAnchor();
                 self.reviewNavigation().clearDiffSelection();
+                const previous_compare_view = self.compareCoordinator().navigationView();
+                var previous_compare_adapter = previous_compare_view.resolver();
+                const previous_compare_body = previous_compare_view.bodyView(&previous_compare_adapter);
+                const compare_selection_anchor = previous_compare_body.captureSelectionViewportAnchor();
                 self.pages.compare.selection_owner = .none;
                 self.pages.repository.cancelMouseOwner();
                 const previous_width = self.reviewNavigationView().diffPaneWidth();
                 const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
-                const previous_compare_view = self.compareCoordinator().navigationView();
-                var previous_compare_adapter = previous_compare_view.resolver();
-                const previous_compare_body = previous_compare_view.bodyView(&previous_compare_adapter);
                 const previous_compare_width = previous_compare_body.view.diffPaneWidth();
                 const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
                 self.terminal_size = size;
@@ -448,7 +449,9 @@ pub const App = struct {
                 compare_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_compare_width);
                 if (previous_compare_mode != compare_body.controller.view().effectiveDisplayMode()) {
                     compare_body.controller.clearDiffSelection();
+                    self.pages.compare.advanceSelectionLayoutRevision();
                 }
+                if (compare_selection_anchor) |anchor| compare_body.restoreSelectionViewportAnchor(anchor);
                 compare_body.controller.clampSidebarHorizontalScroll();
                 compare_body.clampDiffNavigationKeepingHunkVisible();
                 compare_body.updateSearchMatchOffset();
@@ -914,6 +917,8 @@ pub const App = struct {
             .root_identity = repo.activeIdentity(),
             .layout = .{ .width = body_size.width, .height = body_size.height },
         };
+        var compare_body_adapter = compare_navigation_view.resolver();
+        const compare_body_view = compare_navigation_view.bodyView(&compare_body_adapter);
         const review_navigation_view = self.reviewNavigationView();
         return .{
             .active_page = self.active_page,
@@ -944,10 +949,11 @@ pub const App = struct {
                     .base_picker_open = self.pages.compare.base_picker.open,
                     .base_picker_query_mode = self.pages.compare.base_picker.input_mode == .query,
                     .base_picker_query_len = self.pages.compare.base_picker.query.len,
+                    .retained_selection_action_available = compare_body_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,
                 },
                 .selection_owner = &self.pages.compare.selection_owner,
-                .loaded = compare_navigation_view.view().activeLoadedDiffConst(),
+                .loaded = compare_body_view.view.activeLoadedDiffConst(),
                 .selected_node = self.pages.compare.viewer.selected_node,
                 .sidebar_hidden = self.pages.compare.viewer.sidebar_hidden,
                 .sidebar_width = self.pages.compare.viewer.sidebar_width,

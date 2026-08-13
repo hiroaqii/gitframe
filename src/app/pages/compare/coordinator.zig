@@ -8,9 +8,12 @@ const std = @import("std");
 const chasen = @import("chasen");
 const app_load = @import("../../load.zig");
 const app_message = @import("../../message.zig");
+const diff_basis = @import("../../diff_basis.zig");
 const effect_origin = @import("../../effect_origin.zig");
+const page = @import("../../page.zig");
 const repo_session = @import("../../repo_session.zig");
 const diff_surface = @import("../../diff_surface.zig");
+const diff_selection = @import("../../../diff/selection.zig");
 const compare_page = @import("../compare.zig");
 const compare_input = @import("input.zig");
 const compare_navigation = @import("navigation.zig");
@@ -89,6 +92,7 @@ pub const Controller = struct {
                 var update_adapter = navigation_controller.updateAdapter();
                 var page_update = try update_adapter.shared().apply(ctx.allocator(), shared_msg);
                 defer page_update.deinit(ctx.allocator());
+                update_adapter.applyRetentionTransition(ctx.allocator(), page_update.retention_transition);
                 const effect = page_update.takeEffect() orelse return .{};
                 return switch (effect) {
                     .copy_diff_selection => |text| .{ .clipboard = self.ownedClipboard("diff selection", text) },
@@ -170,10 +174,19 @@ pub const Controller = struct {
             return .default;
         }
 
+        if (self.page_state.acceptsFinished(self.repo.epoch(), finished)) {
+            if (self.page_state.refresh_anchor) |*anchor| {
+                const navigation_view = self.navigationView();
+                var resolver = navigation_view.resolver();
+                anchor.selection_viewport = navigation_view.bodyView(&resolver).captureSelectionViewportAnchor();
+            }
+        }
+
         const outcome = self.page_state.applyLoadFinished(
             ctx.allocator(),
             self.repo.epoch(),
             self.repo.activeRoot(),
+            self.repo.activeIdentity(),
             &finished,
         ) catch |err| {
             self.page_state.failRefresh(ctx.allocator(), .{
@@ -323,3 +336,283 @@ pub const Controller = struct {
         };
     }
 };
+
+const semantic_viewport_test_diff =
+    "diff --git a/src/compare.zig b/src/compare.zig\n" ++
+    "--- a/src/compare.zig\n" ++
+    "+++ b/src/compare.zig\n" ++
+    "@@ -1,8 +1,8 @@\n" ++
+    " context one\n" ++
+    "-old two\n" ++
+    "+new two\n" ++
+    " context three\n" ++
+    " context four\n" ++
+    " context five\n" ++
+    " context six\n" ++
+    " context seven\n" ++
+    " context eight\n";
+
+fn semanticViewportTestOid(byte: u8) diff_basis.Oid {
+    var oid: diff_basis.Oid = .{ .len = 40 };
+    @memset(oid.bytes[0..40], byte);
+    return oid;
+}
+
+fn semanticViewportLoadedFinished(
+    allocator: std.mem.Allocator,
+    identity: page.RequestIdentity,
+    generation: u64,
+    base_byte: u8,
+    head_byte: u8,
+) !app_load.CompareLoadFinished {
+    const full_ref = try allocator.dupe(u8, "refs/heads/main");
+    errdefer allocator.free(full_ref);
+    const display_name = try allocator.dupe(u8, "main");
+    errdefer allocator.free(display_name);
+    const head_display = try allocator.dupe(u8, "topic");
+    errdefer allocator.free(head_display);
+    return .{
+        .identity = identity,
+        .generation = generation,
+        .result = .{ .loaded = .{
+            .basis = .{
+                .base = .{
+                    .full_ref = full_ref,
+                    .display_name = display_name,
+                    .kind = .local,
+                    .oid = semanticViewportTestOid(base_byte),
+                },
+                .head_display = head_display,
+                .merge_base_oid = semanticViewportTestOid(base_byte),
+                .head_oid = semanticViewportTestOid(head_byte),
+                .ahead_count = 1,
+            },
+            .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, semantic_viewport_test_diff) },
+        } },
+    };
+}
+
+test "Compare changed reload restores semantic viewport after removing retained actions" {
+    const allocator = std.testing.allocator;
+    var repo: repo_session.State = .{};
+    defer repo.deinit(allocator);
+    var compare: compare_page.ComparePageState = .{};
+    defer compare.deinit(allocator);
+    _ = compare.activate(repo.repo_epoch);
+    const controller: Controller = .{
+        .page_state = &compare,
+        .repo = repo.view(),
+        .layout = .{ .width = 80, .height = 9 },
+        .env_map = null,
+    };
+    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+
+    const initial = compare.beginRefresh().?;
+    try std.testing.expectEqual(
+        Redraw.default,
+        try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
+            allocator,
+            initial.identity,
+            initial.generation,
+            'a',
+            'b',
+        )),
+    );
+    compare.viewer.selected_target = .{ .diff_file = 0 };
+    compare.viewer.selected_node = 0;
+    compare.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 5 } };
+    compare.selection_owner = .{ .diff = diff_selection.DragSelection{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 5 },
+        .moved = true,
+    } };
+    const outgoing_view = controller.navigationView();
+    compare.replaceRefreshAnchor(allocator, try outgoing_view.captureAnchor(allocator));
+    const replacement = compare.beginRefresh().?;
+    try std.testing.expectEqual(
+        Redraw.default,
+        try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
+            allocator,
+            replacement.identity,
+            replacement.generation,
+            'c',
+            'd',
+        )),
+    );
+    try std.testing.expect(compare.deferred_load_apply != null);
+    try std.testing.expect(compare.completed_selection == null);
+
+    var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
+    defer release.deinit(allocator);
+    try std.testing.expect(compare.completed_selection != null);
+    try std.testing.expect(compare.pinned_selection_basis != null);
+
+    var outgoing_resolver = outgoing_view.resolver();
+    const outgoing_body = outgoing_view.bodyView(&outgoing_resolver);
+    const projection = outgoing_body.selectionActionProjection() orelse return error.ExpectedSelectionActionProjection;
+    compare.viewer.diff_scroll = projection.insertionOffset();
+    const outgoing_anchor = outgoing_body.captureSelectionViewportAnchor() orelse return error.ExpectedSelectionViewport;
+    try std.testing.expectEqual(
+        Redraw.default,
+        try controller.applyDeferred(&ctx),
+    );
+    try std.testing.expect(compare.deferred_load_apply == null);
+    try std.testing.expect(compare.completed_selection == null);
+    try std.testing.expect(compare.pinned_selection_basis == null);
+
+    const incoming_view = controller.navigationView();
+    var incoming_resolver = incoming_view.resolver();
+    const incoming_body = incoming_view.bodyView(&incoming_resolver);
+    const expected_scroll = incoming_body.restoreSelectionViewportAnchor(outgoing_anchor);
+    try std.testing.expect(expected_scroll != outgoing_anchor.raw_presentation_scroll);
+    try std.testing.expectEqual(expected_scroll, compare.viewer.diff_scroll);
+}
+
+test "Compare deferred exact and stale completions reconcile only after release" {
+    const allocator = std.testing.allocator;
+
+    {
+        var repo: repo_session.State = .{};
+        defer repo.deinit(allocator);
+        var compare: compare_page.ComparePageState = .{};
+        defer compare.deinit(allocator);
+        _ = compare.activate(repo.repo_epoch);
+        const controller: Controller = .{
+            .page_state = &compare,
+            .repo = repo.view(),
+            .layout = .{ .width = 80, .height = 9 },
+            .env_map = null,
+        };
+        var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+
+        const initial = compare.beginRefresh().?;
+        try std.testing.expectEqual(
+            Redraw.default,
+            try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
+                allocator,
+                initial.identity,
+                initial.generation,
+                'a',
+                'b',
+            )),
+        );
+        compare.viewer.selected_target = .{ .diff_file = 0 };
+        compare.viewer.selected_node = 0;
+        compare.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 5 } };
+        compare.selection_owner = .{ .diff = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
+            .side = .new,
+            .mode = .line,
+            .anchor = .{ .hunk_index = 0, .line_index = 0 },
+            .focus = .{ .hunk_index = 0, .line_index = 5 },
+            .moved = true,
+        } };
+        compare.replaceRefreshAnchor(allocator, try controller.navigationView().captureAnchor(allocator));
+        const exact = compare.beginRefresh().?;
+        try std.testing.expectEqual(
+            Redraw.default,
+            try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
+                allocator,
+                exact.identity,
+                exact.generation,
+                'a',
+                'b',
+            )),
+        );
+        try std.testing.expect(compare.deferred_load_apply != null);
+
+        var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
+        defer release.deinit(allocator);
+        const retained_ptr = compare.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
+        const retained_token = compare.completed_selection.?.token;
+        const retained_pin = compare.pinned_selection_basis.?;
+        try std.testing.expectEqual(
+            Redraw.default,
+            try controller.applyDeferred(&ctx),
+        );
+        try std.testing.expect(compare.deferred_load_apply == null);
+        try std.testing.expectEqual(
+            retained_ptr,
+            compare.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr,
+        );
+        try std.testing.expect(compare.completed_selection.?.token.source_session_revision > retained_token.source_session_revision);
+        try std.testing.expectEqual(
+            compare.source_session_revision,
+            compare.completed_selection.?.token.source_session_revision,
+        );
+        try std.testing.expect(compare.pinned_selection_basis.?.eql(retained_pin));
+        try std.testing.expect(compare.retainedSelectionAdmitted());
+    }
+
+    {
+        var repo: repo_session.State = .{};
+        defer repo.deinit(allocator);
+        var compare: compare_page.ComparePageState = .{};
+        defer compare.deinit(allocator);
+        _ = compare.activate(repo.repo_epoch);
+        const controller: Controller = .{
+            .page_state = &compare,
+            .repo = repo.view(),
+            .layout = .{ .width = 80, .height = 9 },
+            .env_map = null,
+        };
+        var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+
+        const initial = compare.beginRefresh().?;
+        try std.testing.expectEqual(
+            Redraw.default,
+            try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
+                allocator,
+                initial.identity,
+                initial.generation,
+                'a',
+                'b',
+            )),
+        );
+        compare.viewer.selected_target = .{ .diff_file = 0 };
+        compare.viewer.selected_node = 0;
+        compare.selection_owner = .{ .diff = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
+            .side = .new,
+            .mode = .line,
+            .anchor = .{ .hunk_index = 0, .line_index = 0 },
+            .focus = .{ .hunk_index = 0, .line_index = 5 },
+            .moved = true,
+        } };
+        compare.replaceRefreshAnchor(allocator, try controller.navigationView().captureAnchor(allocator));
+        const old = compare.beginRefresh().?;
+        try std.testing.expectEqual(
+            Redraw.default,
+            try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
+                allocator,
+                old.identity,
+                old.generation,
+                'c',
+                'd',
+            )),
+        );
+        try std.testing.expect(compare.deferred_load_apply != null);
+        _ = compare.beginRefresh().?;
+
+        var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
+        defer release.deinit(allocator);
+        const retained_ptr = compare.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
+        const retained_token = compare.completed_selection.?.token;
+        const retained_pin = compare.pinned_selection_basis.?;
+        const retained_revision = compare.source_session_revision;
+        try std.testing.expectEqual(Redraw.skip, try controller.applyDeferred(&ctx));
+        try std.testing.expect(compare.deferred_load_apply == null);
+        try std.testing.expectEqual(
+            retained_ptr,
+            compare.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr,
+        );
+        try std.testing.expect(compare.completed_selection.?.token.eql(retained_token));
+        try std.testing.expect(compare.pinned_selection_basis.?.eql(retained_pin));
+        try std.testing.expectEqual(retained_revision, compare.source_session_revision);
+        try std.testing.expect(compare.refresh_anchor != null);
+        try std.testing.expect(compare.retainedSelectionAdmitted());
+    }
+}

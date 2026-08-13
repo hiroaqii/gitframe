@@ -296,6 +296,7 @@ pub const BodyView = struct {
 
     pub fn retainedSelectionPresentation(self: BodyView) ?selection_action.Presentation {
         if (self.view.surface.selection_completion_policy != .retain_with_actions) return null;
+        if (!self.view.surface.retained_selection_action_admitted) return null;
         const completed = self.view.surface.completed_selection.* orelse return null;
         const token = self.currentContentToken() orelse return null;
         if (!completed.token.eql(token)) return null;
@@ -702,7 +703,7 @@ pub const BodyView = struct {
     pub fn selectionViewportBasis(self: BodyView) selection_action.ProjectionBasis {
         const projection = self.selectionActionProjection();
         return .{
-            .layout_revision = self.view.surface.selection_layout_revision,
+            .layout_revision = self.view.surface.selection_layout_revision.*,
             .effective_mode = self.view.effectiveDisplayMode(),
             .source_rows = self.sourceDiffLineCount(),
             .action_insertion_offset = if (projection) |value| value.insertionOffset() else null,
@@ -1252,7 +1253,10 @@ pub const BodyController = struct {
             self.initializeDiffCursorForSelectedFile();
         }
 
-        self.controller.surface.viewer.diff_scroll = anchor.diff_scroll;
+        self.controller.surface.viewer.diff_scroll = if (anchor.selection_viewport) |selection_anchor|
+            self.view().restoreSelectionViewportAnchor(selection_anchor)
+        else
+            anchor.diff_scroll;
         self.clampDiffNavigation();
         self.keepDiffCursorVisible();
         self.restoreSearchFromReloadAnchor(anchor);

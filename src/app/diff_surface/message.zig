@@ -34,6 +34,8 @@ pub const Msg = union(enum) {
     mouse_diff_press: diff_surface.MousePoint,
     mouse_diff_drag: ?diff_surface.MousePoint,
     mouse_diff_release: ?diff_surface.MousePoint,
+    copy_completed_selection,
+    clear_completed_selection,
     toggle_focus,
     page_diff_up,
     page_diff_down,

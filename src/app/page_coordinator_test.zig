@@ -195,6 +195,64 @@ test "Compare mouse selection and base picker block App page transitions" {
     try std.testing.expectEqualStrings("finish Compare search before switching pages", app.status.text());
 }
 
+test "Compare retained selection survives page transitions and clears on repository replacement" {
+    const allocator = std.testing.allocator;
+    var app: TestApp = .{ .allocator = allocator, .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    app.pages.compare.completed_selection = .{
+        .token = .{
+            .repo_epoch = app.repo_session.repo_epoch,
+            .root_identity = null,
+            .source = diff_surface.selection.SourceBasis.init(.{ .range = "compare" }),
+            .source_session_revision = 1,
+            .display = .{ .loaded = content_fingerprint.Fingerprint.init("diff") },
+        },
+        .value = .{ .generated_untracked = .{
+            .path = try allocator.dupe(u8, "src/main.zig"),
+            .mode = .line,
+            .range = .{
+                .start = .{ .hunk_index = 0, .line_index = 0 },
+                .end = .{ .hunk_index = 0, .line_index = 0 },
+            },
+            .fragment = .{
+                .source_start = 0,
+                .source_end = 1,
+                .text = try allocator.dupe(u8, "selected compare"),
+                .line_count = 1,
+            },
+        } },
+    };
+    app.pages.compare.pinned_selection_basis = .{
+        .base_oid = .{},
+        .head_oid = .{},
+        .diff_base_oid = .{},
+    };
+    const retained_token = app.pages.compare.completed_selection.?.token;
+    const retained_pin = app.pages.compare.pinned_selection_basis.?;
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+
+    try requestPageSwitchForTest(&app, &ctx, .config);
+    try std.testing.expectEqual(page.Id.config, app.active_page);
+    try std.testing.expect(app.pages.compare.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(retained_pin));
+
+    try requestPageSwitchForTest(&app, &ctx, .compare);
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try std.testing.expect(app.pages.compare.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(retained_pin));
+
+    // Repository commitment invalidates the complete Compare owner before
+    // page coordination reactivates it. The coordinator must not perform a
+    // second candidate-only clear that could preserve a virtual-row ordinal.
+    app.pages.compare.viewer.diff_scroll = 9;
+    app.pages.compare.deinit(allocator);
+    try std.testing.expectEqual(page_coordinator.Intent.compare_refresh, app.controller().acceptedRepositoryChange());
+    try std.testing.expect(app.pages.compare.completed_selection == null);
+    try std.testing.expect(app.pages.compare.pinned_selection_basis == null);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.compare.viewer.diff_scroll);
+}
+
 test "review repository transition commit selects exact retained Review path" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();

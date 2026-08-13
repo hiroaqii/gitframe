@@ -687,6 +687,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     var completed: ?diff_surface.selection.CompletedSelection = null;
     var source_revision: u64 = 0;
     var pending_initial_selection = false;
+    var selection_layout_revision: u64 = 1;
     const state: diff_surface.ReadSurface = .{
         .activation = &activation,
         .status = &status,
@@ -707,7 +708,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
         .reload_anchor = null,
         .live_drag_deferred_source = false,
         .selection_completion_policy = .copy_on_release,
-        .selection_layout_revision = 1,
+        .selection_layout_revision = &selection_layout_revision,
         .source = .unstaged,
         .layout = .{ .width = 80, .height = 10 },
     };

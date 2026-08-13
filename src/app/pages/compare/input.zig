@@ -32,10 +32,15 @@ pub const Context = struct {
     base_picker_open: bool = false,
     base_picker_query_mode: bool = false,
     base_picker_query_len: usize = 0,
+    retained_selection_action_available: bool = false,
     keymap: keymap.Effective = .{},
 
     fn shared(self: Context) diff_surface.input.Context {
-        return .{ .search_mode = self.search_mode, .file_search_mode = self.file_search_mode };
+        return .{
+            .search_mode = self.search_mode,
+            .file_search_mode = self.file_search_mode,
+            .retained_selection_action_available = self.retained_selection_action_available,
+        };
     }
 };
 
@@ -66,9 +71,8 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
         if (key.codepoint == 'j') return .base_picker_next;
         return null;
     }
-    if (context.search_mode or context.file_search_mode) {
-        return .{ .shared = diff_surface.input.keyToMsg(context.shared(), key) orelse return null };
-    }
+    if (diff_surface.input.keyToMsg(context.shared(), key)) |msg| return .{ .shared = msg };
+    if (context.search_mode or context.file_search_mode) return null;
     return normalKeyToMsg(context, key);
 }
 
@@ -152,6 +156,19 @@ test "Compare exposes display actions but no write actions" {
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'P' }) == null);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'U' }) == null);
     try std.testing.expectEqual(Msg.branch_switch_unavailable, keyToMsg(.{}, .{ .codepoint = 'b' }).?);
+}
+
+test "Compare routes admitted retained actions through shared input" {
+    const retained: Context = .{ .retained_selection_action_available = true };
+    try std.testing.expectEqual(
+        Msg{ .shared = .copy_completed_selection },
+        keyToMsg(retained, .{ .codepoint = 'y' }).?,
+    );
+    try std.testing.expectEqual(
+        Msg{ .shared = .clear_completed_selection },
+        keyToMsg(retained, .{ .codepoint = chasen.Key.escape }).?,
+    );
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.escape }) == null);
 }
 
 test "base picker owns its modal grammar" {

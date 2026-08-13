@@ -25,6 +25,7 @@ pub const Effect = union(enum) {
 /// epilogues. The effect remains owned here until a page adapter takes it.
 pub const Update = struct {
     effect: ?Effect = null,
+    retention_transition: RetentionTransition = .none,
     explicit_sidebar_selection_changed: bool = false,
     display_navigation_changed: bool = false,
 
@@ -38,6 +39,12 @@ pub const Update = struct {
         self.effect = null;
         return effect;
     }
+};
+
+pub const RetentionTransition = enum {
+    none,
+    installed,
+    cleared,
 };
 
 pub const Hook = struct {
@@ -60,6 +67,11 @@ pub const Controller = struct {
         const before = if (tracks_navigation) self.navigation.view().view.displayNavigationSnapshot() else undefined;
         const tracks_sidebar_selection = tracksExplicitSidebarSelection(msg);
         const sidebar_before = if (tracks_sidebar_selection) sidebarSelectionSnapshot(self.navigation) else undefined;
+        const viewport_anchor = self.navigation.captureSelectionViewportAnchor();
+        const selected_target_before = self.navigation.controller.surface.viewer.selected_target;
+        const requested_mode_before = self.navigation.controller.surface.viewer.display_mode;
+        const source_rows_before = self.navigation.view().sourceDiffLineCount();
+        const layout_revision_before = self.navigation.controller.surface.selection_layout_revision.*;
 
         var result: Update = .{};
         switch (msg) {
@@ -118,9 +130,37 @@ pub const Controller = struct {
                 self.navigation.controller.surface.viewer.focus = .diff;
                 self.navigation.scrollDiffHorizontal(.right);
             },
-            .mouse_diff_press => |point| self.navigation.pressDiffMouse(point),
+            .mouse_diff_press => |point| {
+                if (self.navigation.view().selectionActionHit(point)) |hit| {
+                    self.navigation.controller.surface.viewer.focus = .diff;
+                    if (hit.target) |target| self.applyCompletedSelectionAction(
+                        allocator orelse return error.MissingAllocator,
+                        switch (target) {
+                            .copy => .copy,
+                            .clear => .clear,
+                        },
+                        &result,
+                    );
+                } else {
+                    self.navigation.pressDiffMouse(point);
+                }
+            },
             .mouse_diff_drag => |point| self.navigation.dragDiffMouse(point),
-            .mouse_diff_release => result.effect = try self.releaseDiffMouse(allocator orelse return error.MissingAllocator),
+            .mouse_diff_release => {
+                const release = try self.releaseDiffMouse(allocator orelse return error.MissingAllocator);
+                result.effect = release.effect;
+                result.retention_transition = release.retention_transition;
+            },
+            .copy_completed_selection => self.applyCompletedSelectionAction(
+                allocator orelse return error.MissingAllocator,
+                .copy,
+                &result,
+            ),
+            .clear_completed_selection => self.applyCompletedSelectionAction(
+                allocator orelse return error.MissingAllocator,
+                .clear,
+                &result,
+            ),
             .toggle_display_mode => {
                 self.navigation.controller.clearDiffSelection();
                 const selection_anchor = self.navigation.captureSelectionViewportAnchor();
@@ -193,6 +233,16 @@ pub const Controller = struct {
             .cycle_changed_file_filter => try self.navigation.cycleChangedFileFilter(allocator orelse return error.MissingAllocator),
         }
 
+        if (!std.meta.eql(selected_target_before, self.navigation.controller.surface.viewer.selected_target) or
+            requested_mode_before != self.navigation.controller.surface.viewer.display_mode or
+            source_rows_before != self.navigation.view().sourceDiffLineCount())
+        {
+            if (self.navigation.controller.surface.selection_layout_revision.* == layout_revision_before) {
+                advanceLayoutRevision(self.navigation.controller.surface.selection_layout_revision);
+                if (viewport_anchor) |anchor| self.navigation.restoreSelectionViewportAnchor(anchor);
+            }
+        }
+
         if (tracks_sidebar_selection) {
             result.explicit_sidebar_selection_changed = !std.meta.eql(sidebar_before, sidebarSelectionSnapshot(self.navigation));
         }
@@ -202,14 +252,27 @@ pub const Controller = struct {
         return result;
     }
 
-    fn releaseDiffMouse(self: Controller, allocator: std.mem.Allocator) !?Effect {
+    const Release = struct {
+        effect: ?Effect = null,
+        retention_transition: RetentionTransition = .none,
+    };
+
+    fn releaseDiffMouse(self: Controller, allocator: std.mem.Allocator) !Release {
         const owner = self.navigation.controller.surface.selection_owner.*;
         return switch (owner) {
-            .none => null,
+            .none => .{},
             .diff => |drag| blk: {
                 if (!drag.moved) {
                     self.navigation.controller.clearDiffSelection();
-                    break :blk null;
+                    break :blk .{};
+                }
+
+                if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions and
+                    !self.navigation.controller.surface.retained_selection_install_available)
+                {
+                    self.navigation.controller.clearDiffSelection();
+                    self.navigation.controller.setStatus("Could not retain selected text", .{});
+                    break :blk .{};
                 }
 
                 var candidate = self.buildCompletedSelection(allocator, drag) catch {
@@ -217,11 +280,11 @@ pub const Controller = struct {
                         if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
                         self.navigation.controller.surface.completed_selection.* = null;
                         self.navigation.controller.clearDiffSelection();
-                        break :blk null;
+                        break :blk .{};
                     }
                     self.navigation.controller.clearDiffSelection();
                     self.navigation.controller.setStatus("Could not retain selected text", .{});
-                    break :blk null;
+                    break :blk .{};
                 };
                 if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
                 self.navigation.controller.surface.completed_selection.* = candidate;
@@ -229,18 +292,45 @@ pub const Controller = struct {
                 self.navigation.controller.clearDiffSelection();
 
                 if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions) {
-                    self.navigation.controller.revealCompletedSelectionAction(self.navigation.resolver);
-                    break :blk null;
+                    break :blk .{ .retention_transition = .installed };
                 }
-                const clipboard = self.navigation.controller.surface.completed_selection.*.?.clipboardText(allocator) catch break :blk null;
-                break :blk .{ .copy_diff_selection = clipboard };
+                const clipboard = self.navigation.controller.surface.completed_selection.*.?.clipboardText(allocator) catch break :blk .{};
+                break :blk .{ .effect = .{ .copy_diff_selection = clipboard } };
             },
             .diff_header => |header| blk: {
                 const effect: Effect = .{ .copy_diff_header_path = try cloneHeaderSelection(allocator, header) };
                 self.navigation.controller.clearDiffSelection();
-                break :blk effect;
+                break :blk .{ .effect = effect };
             },
         };
+    }
+
+    const CompletedSelectionAction = enum { copy, clear };
+
+    fn applyCompletedSelectionAction(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        action: CompletedSelectionAction,
+        result: *Update,
+    ) void {
+        if (!self.navigation.view().retainedSelectionActionAvailable()) {
+            self.navigation.controller.setStatus("Retained selection is no longer available", .{});
+            return;
+        }
+        switch (action) {
+            .copy => {
+                const completed = self.navigation.controller.surface.completed_selection.* orelse return;
+                const text = completed.clipboardText(allocator) catch {
+                    self.navigation.controller.setStatus("Could not prepare selected text for copying", .{});
+                    return;
+                };
+                result.effect = .{ .copy_diff_selection = text };
+            },
+            .clear => {
+                self.navigation.controller.clearCompletedSelectionWithViewport(self.navigation.resolver, allocator);
+                result.retention_transition = .cleared;
+            },
+        }
     }
 
     fn buildCompletedSelection(self: Controller, allocator: std.mem.Allocator, drag: diff_selection.DragSelection) !selection.CompletedSelection {
@@ -258,6 +348,11 @@ pub const Controller = struct {
         };
     }
 };
+
+fn advanceLayoutRevision(revision: *u64) void {
+    revision.* +%= 1;
+    if (revision.* == 0) revision.* = 1;
+}
 
 const SidebarSelectionSnapshot = struct {
     selected_target: ?context.SelectedTarget,

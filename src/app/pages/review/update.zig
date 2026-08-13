@@ -74,49 +74,15 @@ pub const Controller = struct {
     /// the optional form keeps pure page transitions independent of Chasen Ctx.
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !ReviewUpdate {
         var result: ReviewUpdate = .{};
-        switch (msg) {
-            .copy_completed_selection => {
-                self.applyCompletedSelectionAction(allocator orelse return error.MissingAllocator, .copy, &result);
-                return result;
-            },
-            .clear_completed_selection => {
-                self.applyCompletedSelectionAction(allocator orelse return error.MissingAllocator, .clear, &result);
-                return result;
-            },
-            .mouse_diff_press => |point| if (self.navigation.view().selectionActionHit(point)) |hit| {
-                self.navigation.page.viewer.focus = .diff;
-                if (hit.target) |target| self.applyCompletedSelectionAction(
-                    allocator orelse return error.MissingAllocator,
-                    switch (target) {
-                        .copy => .copy,
-                        .clear => .clear,
-                    },
-                    &result,
-                );
-                return result;
-            },
-            else => {},
-        }
         var adapter = self.navigation.updateAdapter();
         if (msg.shared()) |shared_msg| {
-            const viewport_anchor = self.navigation.captureSelectionViewportAnchor();
-            const selected_target_before = self.navigation.page.viewer.selected_target;
-            const requested_mode_before = self.navigation.page.viewer.display_mode;
-            const source_rows_before = self.navigation.view().displayedDiffLineCount();
-            const layout_revision_before = self.navigation.page.selection_layout_revision;
             var shared_update = try adapter.shared().apply(allocator, shared_msg);
             defer shared_update.deinit(allocator);
-            if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
-
-            if (!std.meta.eql(selected_target_before, self.navigation.page.viewer.selected_target) or
-                requested_mode_before != self.navigation.page.viewer.display_mode or
-                source_rows_before != self.navigation.view().displayedDiffLineCount())
-            {
-                if (self.navigation.page.selection_layout_revision == layout_revision_before) {
-                    self.navigation.page.advanceSelectionLayoutRevision();
-                    if (viewport_anchor) |anchor| self.navigation.restoreSelectionViewportAnchor(anchor);
-                }
+            switch (shared_update.retention_transition) {
+                .none, .cleared => {},
+                .installed => self.navigation.revealCompletedSelectionAction(),
             }
+            if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
 
             // This boundary sees semantic Review input after it has either
             // changed the sidebar/file intent or proved to be a no-op. Internal
@@ -149,31 +115,6 @@ pub const Controller = struct {
             }
         }
         return result;
-    }
-
-    const CompletedSelectionAction = enum { copy, clear };
-
-    fn applyCompletedSelectionAction(
-        self: Controller,
-        allocator: std.mem.Allocator,
-        action: CompletedSelectionAction,
-        result: *ReviewUpdate,
-    ) void {
-        if (!self.navigation.view().retainedSelectionActionAvailable()) {
-            self.navigation.setStatus("Retained selection is no longer available", .{});
-            return;
-        }
-        switch (action) {
-            .copy => {
-                const completed = self.navigation.page.completed_selection orelse return;
-                const text = completed.clipboardText(allocator) catch {
-                    self.navigation.setStatus("Could not prepare selected text for copying", .{});
-                    return;
-                };
-                result.command = .{ .copy_diff_selection = text };
-            },
-            .clear => self.navigation.clearCompletedSelectionWithViewport(allocator),
-        }
     }
 };
 

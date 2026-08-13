@@ -1292,6 +1292,11 @@ pub const Controller = struct {
         self.sharedController().clearCompletedSelectionWithViewport(adapter.interface(), allocator);
     }
 
+    pub fn revealCompletedSelectionAction(self: Controller) void {
+        var adapter = self.bodyResolverAdapter();
+        self.sharedController().revealCompletedSelectionAction(adapter.interface());
+    }
+
     pub fn captureSelectionViewportAnchor(self: Controller) ?diff_surface.selection_action.SelectionViewportAnchor {
         return self.view().captureSelectionViewportAnchor();
     }

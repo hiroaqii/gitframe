@@ -16,7 +16,7 @@ const file_tree = @import("../../../file_tree.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
-const source: diff_source.SourceMode = .{ .range = "compare" };
+const source: diff_source.SourceMode = compare_page.selection_source;
 
 /// Read-only Compare adapter. Rendering and content inspection must construct
 /// this value directly from a const page borrow; mutation authority belongs to
@@ -67,6 +67,7 @@ pub const View = struct {
             .diff_cursor = self.page.viewer.diff_cursor,
             .diff_cursor_offset = body.selectedDiffCursorOffset(),
             .diff_scroll = self.page.viewer.diff_scroll,
+            .selection_viewport = body.captureSelectionViewportAnchor(),
             .diff_horizontal_scroll = self.page.viewer.diff_horizontal_scroll,
             .sidebar_horizontal_scroll = self.page.viewer.sidebar_horizontal_scroll,
             .search_coordinate = if (self.page.search.match) |match| match.coordinate else null,
@@ -117,6 +118,25 @@ pub const Controller = struct {
 
         pub fn shared(self: *UpdateAdapter) diff_surface.update.Controller {
             return .{ .navigation = self.bodyController() };
+        }
+
+        pub fn applyRetentionTransition(
+            self: *UpdateAdapter,
+            allocator: std.mem.Allocator,
+            transition: diff_surface.update.RetentionTransition,
+        ) void {
+            switch (transition) {
+                .none => {},
+                .installed => {
+                    if (!self.navigation.page.installPinnedSelectionBasis()) {
+                        self.navigation.page.clearRetainedSelection(allocator);
+                        return;
+                    }
+                    var body = self.bodyController();
+                    body.controller.revealCompletedSelectionAction(body.resolver);
+                },
+                .cleared => self.navigation.page.pinned_selection_basis = null,
+            }
         }
     };
 
@@ -292,10 +312,22 @@ test "Compare navigation separates read-only View from mutable Controller author
     try std.testing.expect(@hasDecl(Controller, "updateAdapter"));
 }
 
-test "Compare selection release still emits immediate clipboard bytes" {
+test "Compare selection release installs pinned retained actions" {
     const allocator = std.testing.allocator;
     var page: compare_page.ComparePageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
+        .basis = .{
+            .base = .{
+                .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+                .display_name = try allocator.dupe(u8, "main"),
+                .kind = .local,
+                .oid = .{},
+            },
+            .head_display = try allocator.dupe(u8, "topic"),
+            .merge_base_oid = .{},
+            .head_oid = .{},
+            .ahead_count = 1,
+        },
     };
     defer page.deinit(allocator);
     page.selection_owner = .{ .diff = .{
@@ -315,13 +347,64 @@ test "Compare selection release still emits immediate clipboard bytes" {
     var adapter = controller.updateAdapter();
     var update = try adapter.shared().apply(allocator, .{ .mouse_diff_release = null });
     defer update.deinit(allocator);
-    var effect = update.takeEffect() orelse return error.ExpectedSelectionEffect;
+    try std.testing.expect(update.effect == null);
+    try std.testing.expectEqual(diff_surface.update.RetentionTransition.installed, update.retention_transition);
+    adapter.applyRetentionTransition(allocator, update.retention_transition);
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(page.pinned_selection_basis != null);
+    try std.testing.expect(page.retainedSelectionAdmitted());
+    try std.testing.expect(page.selection_owner == .none);
+
+    var copied = try adapter.shared().apply(allocator, .copy_completed_selection);
+    defer copied.deinit(allocator);
+    var effect = copied.takeEffect() orelse return error.ExpectedSelectionEffect;
     defer effect.deinit(allocator);
     switch (effect) {
         .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
         .copy_diff_header_path => return error.ExpectedSelectionEffect,
     }
-    try std.testing.expect(page.selection_owner == .none);
+    var cleared = try adapter.shared().apply(allocator, .clear_completed_selection);
+    defer cleared.deinit(allocator);
+    adapter.applyRetentionTransition(allocator, cleared.retention_transition);
+    try std.testing.expectEqual(diff_surface.update.RetentionTransition.cleared, cleared.retention_transition);
+    try std.testing.expect(page.completed_selection == null);
+    try std.testing.expect(page.pinned_selection_basis == null);
+
+    const release_cases = [_]struct {
+        mode: diff_render.DisplayMode,
+        side: diff_selection.Side,
+        expected: []const u8,
+    }{
+        .{ .mode = .unified, .side = .old, .expected = "one\ntwo\nold\n" },
+        .{ .mode = .side_by_side, .side = .old, .expected = "one\ntwo\nold\n" },
+        .{ .mode = .side_by_side, .side = .new, .expected = "one\ntwo\nnew\n" },
+    };
+    for (release_cases) |case| {
+        page.viewer.display_mode = case.mode;
+        page.selection_owner = .{ .diff = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .side = case.side,
+            .anchor = .{ .hunk_index = 0, .line_index = 0 },
+            .focus = .{ .hunk_index = 0, .line_index = 3 },
+            .moved = true,
+        } };
+        var released = try adapter.shared().apply(allocator, .{ .mouse_diff_release = null });
+        defer released.deinit(allocator);
+        try std.testing.expect(released.effect == null);
+        adapter.applyRetentionTransition(allocator, released.retention_transition);
+        try std.testing.expectEqual(case.side, page.completed_selection.?.value.parsed_diff.side);
+        var copied_case = try adapter.shared().apply(allocator, .copy_completed_selection);
+        defer copied_case.deinit(allocator);
+        var copied_effect = copied_case.takeEffect() orelse return error.ExpectedSelectionEffect;
+        defer copied_effect.deinit(allocator);
+        switch (copied_effect) {
+            .copy_diff_selection => |text| try std.testing.expectEqualStrings(case.expected, text),
+            .copy_diff_header_path => return error.ExpectedSelectionEffect,
+        }
+        var cleared_case = try adapter.shared().apply(allocator, .clear_completed_selection);
+        defer cleared_case.deinit(allocator);
+        adapter.applyRetentionTransition(allocator, cleared_case.retention_transition);
+    }
 
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "stale" } },
@@ -335,5 +418,130 @@ test "Compare selection release still emits immediate clipboard bytes" {
     try std.testing.expect(rejected.effect == null);
     try std.testing.expect(page.completed_selection == null);
     try std.testing.expect(page.selection_owner == .none);
-    try std.testing.expectEqualStrings("", page.status.text());
+    try std.testing.expectEqualStrings("Could not retain selected text", page.status.text());
+}
+
+test "Compare retained candidate and pin replace transactionally and survive rejected installs" {
+    const allocator = std.testing.allocator;
+    var page: compare_page.ComparePageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .basis = .{
+            .base = .{
+                .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+                .display_name = try allocator.dupe(u8, "main"),
+                .kind = .local,
+                .oid = .{},
+            },
+            .head_display = try allocator.dupe(u8, "topic"),
+            .merge_base_oid = .{},
+            .head_oid = .{},
+            .ahead_count = 1,
+        },
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{
+        .page = &page,
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = 80, .height = 20 },
+    };
+    var adapter = controller.updateAdapter();
+
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    } };
+    var initial = try adapter.shared().apply(allocator, .{ .mouse_diff_release = null });
+    defer initial.deinit(allocator);
+    adapter.applyRetentionTransition(allocator, initial.retention_transition);
+    const initial_token = page.completed_selection.?.token;
+    const initial_pin = page.pinned_selection_basis.?;
+    const initial_fragment_ptr = page.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
+    const initial_text = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(initial_text);
+    try std.testing.expectEqualStrings("one\ntwo\n", initial_text);
+
+    // A newly accepted basis must replace both halves of the retained owner.
+    // The candidate is built before the prior allocation is retired, so the
+    // new fragment cannot alias the old allocation.
+    page.basis.?.head_oid.len = 1;
+    page.basis.?.head_oid.bytes[0] = 'c';
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 3 },
+        .focus = .{ .hunk_index = 0, .line_index = 4 },
+        .moved = true,
+    } };
+    var replacement = try adapter.shared().apply(allocator, .{ .mouse_diff_release = null });
+    defer replacement.deinit(allocator);
+    try std.testing.expectEqual(diff_surface.update.RetentionTransition.installed, replacement.retention_transition);
+    adapter.applyRetentionTransition(allocator, replacement.retention_transition);
+    const replacement_token = page.completed_selection.?.token;
+    const replacement_pin = page.pinned_selection_basis.?;
+    const replacement_fragment_ptr = page.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
+    const replacement_text = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(replacement_text);
+    try std.testing.expectEqualStrings("new\nfour\n", replacement_text);
+    try std.testing.expect(replacement_fragment_ptr != initial_fragment_ptr);
+    try std.testing.expect(replacement_token.eql(initial_token));
+    try std.testing.expect(!replacement_pin.eql(initial_pin));
+    try std.testing.expect(replacement_pin.eql(compare_page.PinnedSelectionBasis.init(page.basis.?)));
+
+    // Candidate construction failure must leave the prior candidate and pin
+    // byte-for-byte authoritative while ending only the live drag.
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .old,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 3 },
+        .moved = true,
+    } };
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var allocation_failure = try adapter.shared().apply(failing.allocator(), .{ .mouse_diff_release = null });
+    defer allocation_failure.deinit(failing.allocator());
+    try std.testing.expect(allocation_failure.effect == null);
+    try std.testing.expectEqual(diff_surface.update.RetentionTransition.none, allocation_failure.retention_transition);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expect(page.completed_selection.?.token.eql(replacement_token));
+    try std.testing.expect(page.pinned_selection_basis.?.eql(replacement_pin));
+    const after_allocation_failure = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(after_allocation_failure);
+    try std.testing.expectEqualStrings(replacement_text, after_allocation_failure);
+    try std.testing.expectEqualStrings("Could not retain selected text", page.status.text());
+
+    // The shared pre-admission gate also rejects an impossible selectable
+    // state without publishing a candidate ahead of its missing basis pin.
+    const detached_basis = page.basis.?;
+    page.basis = null;
+    defer if (page.basis == null) {
+        page.basis = detached_basis;
+    };
+    page.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 3 },
+        .moved = true,
+    } };
+    var pin_rejection = try adapter.shared().apply(allocator, .{ .mouse_diff_release = null });
+    defer pin_rejection.deinit(allocator);
+    try std.testing.expect(pin_rejection.effect == null);
+    try std.testing.expectEqual(diff_surface.update.RetentionTransition.none, pin_rejection.retention_transition);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expect(page.completed_selection.?.token.eql(replacement_token));
+    try std.testing.expect(page.pinned_selection_basis.?.eql(replacement_pin));
+    const after_pin_rejection = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(after_pin_rejection);
+    try std.testing.expectEqualStrings(replacement_text, after_pin_rejection);
+    try std.testing.expectEqualStrings("Could not retain selected text", page.status.text());
+    page.basis = detached_basis;
 }

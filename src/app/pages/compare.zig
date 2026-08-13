@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const ui = @import("chasen_ui");
+const content_fingerprint = @import("../../content_fingerprint.zig");
 const app_state = @import("../state.zig");
 const app_prompt = @import("../prompt.zig");
 const diff_basis = @import("../diff_basis.zig");
@@ -17,7 +18,15 @@ const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_refs = @import("../../git/refs.zig");
 const review_state = @import("../../review/state.zig");
+const root_capability = @import("../../repo/root_capability.zig");
 const commit_time = @import("compare/commit_time.zig");
+
+pub const selection_source: diff_source.SourceMode = .{ .range = "compare" };
+
+fn optionalRootIdentityEql(left: ?root_capability.Identity, right: ?root_capability.Identity) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return left.?.eql(right.?);
+}
 
 pub const BasePickerRequest = struct {
     identity: page.RequestIdentity,
@@ -305,6 +314,29 @@ pub const BasisFailureState = struct {
     }
 };
 
+/// Immutable Compare authority captured when a completed selection is
+/// installed. Copy/Clear admission requires all three object ids to remain
+/// equal to the currently accepted Compare snapshot.
+pub const PinnedSelectionBasis = struct {
+    base_oid: diff_basis.Oid,
+    head_oid: diff_basis.Oid,
+    diff_base_oid: diff_basis.Oid,
+
+    pub fn init(basis: diff_basis.BranchDiffBasis) PinnedSelectionBasis {
+        return .{
+            .base_oid = basis.base.oid,
+            .head_oid = basis.head_oid,
+            .diff_base_oid = basis.merge_base_oid,
+        };
+    }
+
+    pub fn eql(self: PinnedSelectionBasis, other: PinnedSelectionBasis) bool {
+        return self.base_oid.eql(&other.base_oid) and
+            self.head_oid.eql(&other.head_oid) and
+            self.diff_base_oid.eql(&other.diff_base_oid);
+    }
+};
+
 pub const ComparePageState = struct {
     // Independently owned fields exposed through DiffSurface.
     activation: diff_surface.authority.Lifecycle = .init(.compare),
@@ -323,6 +355,8 @@ pub const ComparePageState = struct {
     completed_selection: ?diff_surface.selection.CompletedSelection = null,
     source_session_revision: u64 = 0,
     pending_initial_first_visible_selection: bool = false,
+    selection_layout_revision: u64 = 1,
+    pinned_selection_basis: ?PinnedSelectionBasis = null,
 
     // Compare-owned basis and refresh state.
     basis: ?diff_basis.BranchDiffBasis = null,
@@ -340,6 +374,38 @@ pub const ComparePageState = struct {
 
     pub fn deactivate(self: *ComparePageState) void {
         self.activation.deactivate();
+    }
+
+    pub fn advanceSelectionLayoutRevision(self: *ComparePageState) void {
+        self.selection_layout_revision +%= 1;
+        if (self.selection_layout_revision == 0) self.selection_layout_revision = 1;
+    }
+
+    pub fn retainedSelectionInstallAvailable(self: *const ComparePageState) bool {
+        return self.currentPinnedBasis() != null and self.load.state == .loaded;
+    }
+
+    pub fn retainedSelectionAdmitted(self: *const ComparePageState) bool {
+        const pinned = self.pinned_selection_basis orelse return false;
+        const current = self.currentPinnedBasis() orelse return false;
+        return pinned.eql(current);
+    }
+
+    pub fn installPinnedSelectionBasis(self: *ComparePageState) bool {
+        const current = self.currentPinnedBasis() orelse return false;
+        self.pinned_selection_basis = current;
+        return true;
+    }
+
+    pub fn clearRetainedSelection(self: *ComparePageState, allocator: std.mem.Allocator) void {
+        if (self.completed_selection) |*selection| selection.deinit(allocator);
+        self.completed_selection = null;
+        self.pinned_selection_basis = null;
+        self.selection_owner = .none;
+    }
+
+    fn currentPinnedBasis(self: *const ComparePageState) ?PinnedSelectionBasis {
+        return .init(self.basis orelse return null);
     }
 
     pub fn beginRefresh(self: *ComparePageState) ?RefreshRequest {
@@ -385,13 +451,14 @@ pub const ComparePageState = struct {
         allocator: std.mem.Allocator,
         repo_epoch: u64,
         repo_root: ?[]const u8,
+        root_identity: ?root_capability.Identity,
         finished: *app_load.CompareLoadFinished,
     ) !LoadAcceptance {
         if (!self.acceptsLoadFinished(repo_epoch, finished.*)) return .stale;
 
         return switch (finished.result) {
             .loaded => |*bundle| result: {
-                try self.commitLoaded(allocator, repo_root, bundle);
+                try self.commitLoaded(allocator, repo_epoch, repo_root, root_identity, bundle);
                 finished.result = .empty;
                 _ = self.activation.finishMember(finished.identity, .source, .fresh);
                 break :result .loaded;
@@ -467,7 +534,9 @@ pub const ComparePageState = struct {
     }
 
     pub fn markNoRepository(self: *ComparePageState, allocator: std.mem.Allocator) void {
+        self.clearRetainedSelection(allocator);
         self.load.replaceEmpty(allocator, .no_repository);
+        self.resetAcceptedDisplayNavigation();
         self.clearBasisFailure(allocator);
         self.clearLoadFailure(allocator);
         if (self.activation.currentIdentity()) |identity| {
@@ -503,12 +572,21 @@ pub const ComparePageState = struct {
     fn commitLoaded(
         self: *ComparePageState,
         allocator: std.mem.Allocator,
+        repo_epoch: u64,
         repo_root: ?[]const u8,
+        root_identity: ?root_capability.Identity,
         bundle: *app_load.CompareLoadedBundle,
     ) !void {
+        const transfer_selection = self.retainedSelectionTransfers(
+            repo_epoch,
+            root_identity,
+            &bundle.basis,
+            &bundle.diff,
+        );
         const pair_changed = if (self.basis) |current|
-            !std.mem.eql(u8, current.merge_base_oid.slice(), bundle.basis.merge_base_oid.slice()) or
-                !std.mem.eql(u8, current.head_oid.slice(), bundle.basis.head_oid.slice())
+            !current.base.oid.eql(&bundle.basis.base.oid) or
+                !current.merge_base_oid.eql(&bundle.basis.merge_base_oid) or
+                !current.head_oid.eql(&bundle.basis.head_oid)
         else
             true;
 
@@ -562,8 +640,7 @@ pub const ComparePageState = struct {
         errdefer if (prepared_session) |*session| session.deinit(null);
 
         self.file_search.deinit(allocator);
-        if (self.completed_selection) |*selection| selection.deinit(allocator);
-        self.completed_selection = null;
+        if (!transfer_selection) self.clearRetainedSelection(allocator);
         self.selection_owner = .none;
         if (pair_changed) {
             self.reviewed_store.deinit(allocator);
@@ -579,14 +656,73 @@ pub const ComparePageState = struct {
             prepared_session = null;
         } else {
             self.load.state = .{ .empty = .no_changes };
+            self.resetAcceptedDisplayNavigation();
         }
         if (default_target) |target| {
             self.base_target = target;
             default_target = null;
         }
         self.source_session_revision +%= 1;
+        if (transfer_selection) {
+            const loaded = switch (self.load.state) {
+                .loaded => |*session| &session.loaded,
+                else => unreachable,
+            };
+            self.completed_selection.?.token = .{
+                .repo_epoch = repo_epoch,
+                .root_identity = root_identity,
+                .source = diff_surface.selection.SourceBasis.init(selection_source),
+                .source_session_revision = self.source_session_revision,
+                .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
+            };
+            self.pinned_selection_basis = PinnedSelectionBasis.init(self.basis.?);
+        }
         self.clearBasisFailure(allocator);
         self.clearLoadFailure(allocator);
+    }
+
+    /// Once an accepted terminal has no selectable body, no presentation-row
+    /// ordinal may survive as future source navigation. This mirrors Review's
+    /// destructive display reset without importing shared geometry here.
+    fn resetAcceptedDisplayNavigation(self: *ComparePageState) void {
+        self.viewer.diff_scroll = 0;
+        self.viewer.diff_horizontal_scroll = 0;
+        self.viewer.sidebar_horizontal_scroll = 0;
+        self.viewer.diff_cursor = .{ .metadata = 0 };
+        self.search.match = null;
+        self.search.match_offset = null;
+    }
+
+    fn retainedSelectionTransfers(
+        self: *const ComparePageState,
+        repo_epoch: u64,
+        root_identity: ?root_capability.Identity,
+        incoming_basis: *const diff_basis.BranchDiffBasis,
+        incoming_diff: *const app_load.CompareDiffBundle,
+    ) bool {
+        const completed = self.completed_selection orelse return false;
+        const pinned = self.pinned_selection_basis orelse return false;
+        const current_basis = self.basis orelse return false;
+        if (!pinned.eql(PinnedSelectionBasis.init(current_basis)) or
+            !pinned.eql(PinnedSelectionBasis.init(incoming_basis.*))) return false;
+        if (completed.token.repo_epoch != repo_epoch or
+            !optionalRootIdentityEql(completed.token.root_identity, root_identity) or
+            !completed.token.source.eql(diff_surface.selection.SourceBasis.init(selection_source)) or
+            completed.token.source_session_revision != self.source_session_revision) return false;
+        const current_loaded = switch (self.load.state) {
+            .loaded => |session| &session.loaded,
+            else => return false,
+        };
+        const incoming_loaded = switch (incoming_diff.*) {
+            .loaded => |bundle| &bundle.loaded,
+            .empty => return false,
+        };
+        const outgoing_fingerprint = content_fingerprint.Fingerprint.init(current_loaded.text);
+        const incoming_fingerprint = content_fingerprint.Fingerprint.init(incoming_loaded.text);
+        return switch (completed.token.display) {
+            .loaded => |fingerprint| fingerprint.eql(outgoing_fingerprint) and fingerprint.eql(incoming_fingerprint),
+            else => false,
+        };
     }
 
     fn replaceLoadFailure(self: *ComparePageState, allocator: std.mem.Allocator, message: []const u8) !void {
@@ -641,10 +777,12 @@ pub const ComparePageState = struct {
             .completed_selection = &self.completed_selection,
             .source_session_revision = &self.source_session_revision,
             .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
+            .selection_layout_revision = &self.selection_layout_revision,
             .reload_anchor = if (self.refresh_anchor) |*anchor| anchor else null,
             .live_drag_deferred_source = self.deferred_load_apply != null,
-            .selection_completion_policy = .copy_on_release,
-            .selection_layout_revision = 1,
+            .selection_completion_policy = .retain_with_actions,
+            .retained_selection_install_available = self.retainedSelectionInstallAvailable(),
+            .retained_selection_action_admitted = self.retainedSelectionAdmitted(),
             .source = source,
             .layout = layout,
         };
@@ -672,10 +810,12 @@ pub const ComparePageState = struct {
             .completed_selection = &self.completed_selection,
             .source_session_revision = &self.source_session_revision,
             .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
+            .selection_layout_revision = &self.selection_layout_revision,
             .reload_anchor = if (self.refresh_anchor) |*anchor| anchor else null,
             .live_drag_deferred_source = self.deferred_load_apply != null,
-            .selection_completion_policy = .copy_on_release,
-            .selection_layout_revision = 1,
+            .selection_completion_policy = .retain_with_actions,
+            .retained_selection_install_available = self.retainedSelectionInstallAvailable(),
+            .retained_selection_action_admitted = self.retainedSelectionAdmitted(),
             .source = source,
             .layout = layout,
         };
@@ -782,7 +922,7 @@ test "Compare rejects a completion with stale repository epoch" {
     var finished = try failedFinished(allocator, page.RequestIdentity.compare(8, activation_id), request.generation, "old repo");
     defer finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, &finished));
+    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, null, &finished));
 }
 
 test "Compare rejects a completion with stale activation" {
@@ -797,7 +937,7 @@ test "Compare rejects a completion with stale activation" {
     var finished = try failedFinished(allocator, page.RequestIdentity.compare(9, old_activation), current.generation, "old activation");
     defer finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, &finished));
+    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, null, &finished));
 }
 
 test "Compare rejects a completion with stale generation" {
@@ -809,7 +949,7 @@ test "Compare rejects a completion with stale generation" {
     var finished = try failedFinished(allocator, request.identity, request.generation + 1, "old generation");
     defer finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, &finished));
+    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 9, null, null, &finished));
 }
 
 test "Compare replacement makes the older pending completion stale" {
@@ -824,8 +964,8 @@ test "Compare replacement makes the older pending completion stale" {
     var current_finished = try failedFinished(allocator, replacement.identity, replacement.generation, "current");
     defer current_finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 4, null, &old_finished));
-    try std.testing.expectEqual(LoadAcceptance.failed, try state.applyLoadFinished(allocator, 4, null, &current_finished));
+    try std.testing.expectEqual(LoadAcceptance.stale, try state.applyLoadFinished(allocator, 4, null, null, &old_finished));
+    try std.testing.expectEqual(LoadAcceptance.failed, try state.applyLoadFinished(allocator, 4, null, null, &current_finished));
 }
 
 test "Compare moves attempted failure, replaces it, and clears it on success" {
@@ -837,20 +977,20 @@ test "Compare moves attempted failure, replaces it, and clears it on success" {
     const first = state.beginRefresh().?;
     var first_finished = try basisFailedFinished(allocator, first.identity, first.generation, "missing-a");
     defer first_finished.deinit(allocator);
-    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 6, null, &first_finished));
+    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 6, null, null, &first_finished));
     try std.testing.expect(first_finished.result == .empty);
     try std.testing.expectEqualStrings("missing-a", state.basis_failure.?.attempted.display_name);
 
     const second = state.beginRefresh().?;
     var second_finished = try basisFailedFinished(allocator, second.identity, second.generation, "missing-b");
     defer second_finished.deinit(allocator);
-    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 6, null, &second_finished));
+    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 6, null, null, &second_finished));
     try std.testing.expectEqualStrings("missing-b", state.basis_failure.?.attempted.display_name);
 
     const third = state.beginRefresh().?;
     var success = try loadedFinished(allocator, third.identity, third.generation);
     defer success.deinit(allocator);
-    try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 6, null, &success));
+    try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 6, null, null, &success));
     try std.testing.expect(state.basis_failure == null);
     try std.testing.expect(success.result == .empty);
     try std.testing.expect(state.basis != null);
@@ -873,6 +1013,14 @@ const compare_test_diff =
     "@@ -1 +1 @@\n" ++
     "-old\n" ++
     "+new\n";
+
+const compare_test_diff_changed =
+    "diff --git a/src/old.zig b/src/old.zig\n" ++
+    "--- a/src/old.zig\n" ++
+    "+++ b/src/old.zig\n" ++
+    "@@ -1 +1 @@\n" ++
+    "-old\n" ++
+    "+newer\n";
 
 fn testOid(byte: u8) diff_basis.Oid {
     var result: diff_basis.Oid = .{ .len = 40 };
@@ -915,6 +1063,34 @@ fn loadedDiffFinished(
     };
 }
 
+fn installTestRetainedSelection(
+    state: *ComparePageState,
+    allocator: std.mem.Allocator,
+    repo_epoch: u64,
+    root_identity: ?root_capability.Identity,
+) !void {
+    const loaded = switch (state.load.state) {
+        .loaded => |*session| &session.loaded,
+        else => return error.ExpectedLoadedCompare,
+    };
+    const drag: diff_selection.DragSelection = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/old.zig" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 1 },
+        .focus = .{ .hunk_index = 0, .line_index = 1 },
+        .moved = true,
+    };
+    state.completed_selection = try diff_surface.selection.buildParsed(allocator, .{
+        .repo_epoch = repo_epoch,
+        .root_identity = root_identity,
+        .source = diff_surface.selection.SourceBasis.init(selection_source),
+        .source_session_revision = state.source_session_revision,
+        .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
+    }, loaded.document.files[0], drag);
+    state.pinned_selection_basis = PinnedSelectionBasis.init(state.basis.?);
+}
+
 test "Compare loaded acceptance atomically installs matching basis and diff" {
     const allocator = std.testing.allocator;
     var state: ComparePageState = .{};
@@ -924,7 +1100,7 @@ test "Compare loaded acceptance atomically installs matching basis and diff" {
     var finished = try loadedDiffFinished(allocator, request.identity, request.generation, 'a', 'b', compare_test_diff);
     defer finished.deinit(allocator);
 
-    try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 5, "/work/gitframe", &finished));
+    try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 5, "/work/gitframe", null, &finished));
     try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
     try std.testing.expectEqualStrings("refs/heads/main", state.base_target.?.full_ref);
     const loaded = switch (state.load.state) {
@@ -936,6 +1112,126 @@ test "Compare loaded acceptance atomically installs matching basis and diff" {
     try std.testing.expectEqual(file_tree.Node.Kind.repo_root, loaded.tree.nodes[0].kind);
     try std.testing.expectEqualStrings("gitframe", loaded.tree.nodes[0].name);
     try std.testing.expect(finished.result == .empty);
+}
+
+test "Compare reload transfers retained selection only across the exact repository basis and diff" {
+    const allocator = std.testing.allocator;
+    const root_identity: root_capability.Identity = .{ .device = 3, .inode = 7 };
+    const cases = [_]struct {
+        name: []const u8,
+        base: u8 = 'a',
+        diff_base: u8 = 'a',
+        head: u8 = 'b',
+        root: root_capability.Identity = root_identity,
+        diff: []const u8 = compare_test_diff,
+        empty: bool = false,
+        transfers: bool,
+    }{
+        .{ .name = "exact", .transfers = true },
+        .{ .name = "base", .base = 'c', .transfers = false },
+        .{ .name = "diff-base", .diff_base = 'd', .transfers = false },
+        .{ .name = "head", .head = 'e', .transfers = false },
+        .{ .name = "root", .root = .{ .device = 3, .inode = 8 }, .transfers = false },
+        .{ .name = "content", .diff = compare_test_diff_changed, .transfers = false },
+        .{ .name = "empty", .empty = true, .transfers = false },
+    };
+
+    for (cases) |case| {
+        var state: ComparePageState = .{};
+        defer state.deinit(allocator);
+        _ = state.activate(11);
+        const first = state.beginRefresh().?;
+        var first_finished = try loadedDiffFinished(allocator, first.identity, first.generation, 'a', 'b', compare_test_diff);
+        defer first_finished.deinit(allocator);
+        _ = try state.applyLoadFinished(allocator, 11, "/repo", root_identity, &first_finished);
+        try installTestRetainedSelection(&state, allocator, 11, root_identity);
+        const old_revision = state.source_session_revision;
+
+        const second = state.beginRefresh().?;
+        var second_finished = if (case.empty)
+            try loadedFinished(allocator, second.identity, second.generation)
+        else
+            try loadedDiffFinished(allocator, second.identity, second.generation, case.base, case.head, case.diff);
+        defer second_finished.deinit(allocator);
+        if (case.empty) {
+            state.viewer.diff_scroll = 17;
+            state.viewer.diff_horizontal_scroll = 6;
+            state.viewer.sidebar_horizontal_scroll = 3;
+            state.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } };
+        }
+        second_finished.result.loaded.basis.base.oid = testOid(case.base);
+        second_finished.result.loaded.basis.merge_base_oid = testOid(case.diff_base);
+        second_finished.result.loaded.basis.head_oid = testOid(case.head);
+        try std.testing.expectEqual(
+            LoadAcceptance.loaded,
+            try state.applyLoadFinished(allocator, 11, "/repo", case.root, &second_finished),
+        );
+        try std.testing.expectEqual(case.transfers, state.completed_selection != null);
+        try std.testing.expectEqual(case.transfers, state.pinned_selection_basis != null);
+        if (case.transfers) {
+            try std.testing.expect(state.retainedSelectionAdmitted());
+            try std.testing.expect(state.completed_selection.?.token.source_session_revision != old_revision);
+            try std.testing.expect(optionalRootIdentityEql(state.completed_selection.?.token.root_identity, case.root));
+        }
+        if (case.empty) {
+            try std.testing.expectEqual(@as(usize, 0), state.viewer.diff_scroll);
+            try std.testing.expectEqual(@as(usize, 0), state.viewer.diff_horizontal_scroll);
+            try std.testing.expectEqual(@as(usize, 0), state.viewer.sidebar_horizontal_scroll);
+            switch (state.viewer.diff_cursor) {
+                .metadata => |offset| try std.testing.expectEqual(@as(usize, 0), offset),
+                else => return error.ExpectedResetDiffCursor,
+            }
+        }
+        _ = case.name;
+    }
+}
+
+test "Compare failed and stale refreshes preserve the accepted retained selection" {
+    const allocator = std.testing.allocator;
+    const root_identity: root_capability.Identity = .{ .device = 5, .inode = 9 };
+    var state: ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(13);
+    const initial = state.beginRefresh().?;
+    var initial_finished = try loadedDiffFinished(allocator, initial.identity, initial.generation, 'a', 'b', compare_test_diff);
+    defer initial_finished.deinit(allocator);
+    _ = try state.applyLoadFinished(allocator, 13, "/repo", root_identity, &initial_finished);
+    try installTestRetainedSelection(&state, allocator, 13, root_identity);
+    const retained_token = state.completed_selection.?.token;
+    const retained_pin = state.pinned_selection_basis.?;
+    const retained_revision = state.source_session_revision;
+
+    const failed_request = state.beginRefresh().?;
+    var failure = try basisFailedFinished(allocator, failed_request.identity, failed_request.generation, "missing");
+    defer failure.deinit(allocator);
+    try std.testing.expectEqual(
+        LoadAcceptance.basis_failed,
+        try state.applyLoadFinished(allocator, 13, "/repo", root_identity, &failure),
+    );
+    try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
+
+    const stale_request = state.beginRefresh().?;
+    _ = state.beginRefresh().?;
+    var stale = try loadedDiffFinished(allocator, stale_request.identity, stale_request.generation, 'c', 'd', compare_test_diff_changed);
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(
+        LoadAcceptance.stale,
+        try state.applyLoadFinished(allocator, 13, "/repo", root_identity, &stale),
+    );
+    try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expectEqual(retained_revision, state.source_session_revision);
+
+    state.viewer.diff_scroll = 13;
+    state.viewer.diff_horizontal_scroll = 5;
+    state.viewer.sidebar_horizontal_scroll = 2;
+    state.markNoRepository(allocator);
+    try std.testing.expect(state.completed_selection == null);
+    try std.testing.expect(state.pinned_selection_basis == null);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.sidebar_horizontal_scroll);
 }
 
 test "Compare viewed store retains only for the same accepted oid pair" {
@@ -953,7 +1249,7 @@ test "Compare viewed store retains only for the same accepted oid pair" {
         const first = state.beginRefresh().?;
         var first_finished = try loadedDiffFinished(allocator, first.identity, first.generation, 'a', 'b', compare_test_diff);
         defer first_finished.deinit(allocator);
-        _ = try state.applyLoadFinished(allocator, 7, "/repo", &first_finished);
+        _ = try state.applyLoadFinished(allocator, 7, "/repo", null, &first_finished);
         const first_loaded = switch (state.load.state) {
             .loaded => |*session| &session.loaded,
             else => return error.ExpectedLoadedCompare,
@@ -964,7 +1260,7 @@ test "Compare viewed store retains only for the same accepted oid pair" {
         const second = state.beginRefresh().?;
         var second_finished = try loadedDiffFinished(allocator, second.identity, second.generation, case.base, case.head, compare_test_diff);
         defer second_finished.deinit(allocator);
-        _ = try state.applyLoadFinished(allocator, 7, "/repo", &second_finished);
+        _ = try state.applyLoadFinished(allocator, 7, "/repo", null, &second_finished);
         const second_loaded = switch (state.load.state) {
             .loaded => |*session| &session.loaded,
             else => return error.ExpectedLoadedCompare,
@@ -985,7 +1281,7 @@ test "Compare failed replacement preserves accepted display and attempted intent
     const initial = state.beginRefresh().?;
     var initial_finished = try loadedDiffFinished(allocator, initial.identity, initial.generation, 'a', 'b', compare_test_diff);
     defer initial_finished.deinit(allocator);
-    _ = try state.applyLoadFinished(allocator, 9, "/repo", &initial_finished);
+    _ = try state.applyLoadFinished(allocator, 9, "/repo", null, &initial_finished);
 
     if (state.base_target) |*target| target.deinit(allocator);
     state.base_target = .{
@@ -996,7 +1292,7 @@ test "Compare failed replacement preserves accepted display and attempted intent
     const retry = state.beginRefresh().?;
     var failure = try basisFailedFinished(allocator, retry.identity, retry.generation, "topic");
     defer failure.deinit(allocator);
-    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 9, "/repo", &failure));
+    try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 9, "/repo", null, &failure));
 
     try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
     try std.testing.expect(state.load.state == .loaded);
@@ -1106,6 +1402,94 @@ test "Compare base picker replacement close and selection have one owner" {
     try std.testing.expect(!state.base_picker.open);
     try std.testing.expect(state.base_picker.accepted == null);
     try std.testing.expectEqualStrings("refs/heads/topic", state.base_target.?.full_ref);
+}
+
+test "Compare picker and failed chosen-basis refresh retain the accepted selection authority" {
+    const allocator = std.testing.allocator;
+    var state: ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(23);
+    const initial = state.beginRefresh().?;
+    var initial_finished = try loadedDiffFinished(
+        allocator,
+        initial.identity,
+        initial.generation,
+        'a',
+        'b',
+        compare_test_diff,
+    );
+    defer initial_finished.deinit(allocator);
+    try std.testing.expectEqual(
+        LoadAcceptance.loaded,
+        try state.applyLoadFinished(allocator, 23, "/repo", null, &initial_finished),
+    );
+    try installTestRetainedSelection(&state, allocator, 23, null);
+    const retained_token = state.completed_selection.?.token;
+    const retained_pin = state.pinned_selection_basis.?;
+    const retained_revision = state.source_session_revision;
+
+    const opened = state.beginBasePicker(allocator).?;
+    try std.testing.expect(state.base_picker.open);
+    try std.testing.expect(state.base_picker.loading);
+    try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
+    var opened_finished: app_load.CompareBranchListFinished = .{
+        .identity = opened.identity,
+        .generation = opened.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "topic") },
+    };
+    defer opened_finished.deinit(allocator);
+    try std.testing.expect(state.base_picker.acceptFinished(
+        allocator,
+        23,
+        &state.activation,
+        &opened_finished,
+    ));
+    state.base_picker.enterQuery();
+    for ("top") |byte| try state.base_picker.insertQuery(allocator, byte);
+    try std.testing.expectEqual(@as(usize, 1), state.base_picker.visibleCount());
+    try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expect(state.retainedSelectionAdmitted());
+
+    state.closeBasePicker(allocator);
+    try std.testing.expect(!state.base_picker.open);
+    try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
+
+    const chosen = state.beginBasePicker(allocator).?;
+    var chosen_finished: app_load.CompareBranchListFinished = .{
+        .identity = chosen.identity,
+        .generation = chosen.generation,
+        .result = .{ .loaded = try testBranchList(allocator, "topic") },
+    };
+    defer chosen_finished.deinit(allocator);
+    try std.testing.expect(state.base_picker.acceptFinished(
+        allocator,
+        23,
+        &state.activation,
+        &chosen_finished,
+    ));
+    try std.testing.expect(try state.chooseBasePickerTarget(allocator));
+    try std.testing.expectEqualStrings("refs/heads/topic", state.base_target.?.full_ref);
+    try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
+
+    const pending = state.beginRefresh().?;
+    try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expectEqual(retained_revision, state.source_session_revision);
+    var failure = try failedFinished(allocator, pending.identity, pending.generation, "chosen basis failed");
+    defer failure.deinit(allocator);
+    try std.testing.expectEqual(
+        LoadAcceptance.failed,
+        try state.applyLoadFinished(allocator, 23, "/repo", null, &failure),
+    );
+    try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expect(state.retainedSelectionAdmitted());
+    try std.testing.expectEqual(retained_revision, state.source_session_revision);
+    try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
 }
 
 test "Compare base picker owns recency order filter projection and full-ref activation" {

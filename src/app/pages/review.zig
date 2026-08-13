@@ -315,13 +315,13 @@ pub const ReviewPageState = struct {
             .completed_selection = &self.completed_selection,
             .source_session_revision = &self.source_session_revision,
             .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
+            .selection_layout_revision = &self.selection_layout_revision,
             .reload_anchor = if (self.pending_reload) |*pending|
                 (if (pending.anchor) |*anchor| anchor else null)
             else
                 null,
             .live_drag_deferred_source = self.deferredSourceBlocksPageTransition(),
             .selection_completion_policy = .retain_with_actions,
-            .selection_layout_revision = self.selection_layout_revision,
             .source = source,
             .layout = layout,
         };
@@ -350,13 +350,13 @@ pub const ReviewPageState = struct {
             .completed_selection = &self.completed_selection,
             .source_session_revision = &self.source_session_revision,
             .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
+            .selection_layout_revision = &self.selection_layout_revision,
             .reload_anchor = if (self.pending_reload) |*pending|
                 (if (pending.anchor) |*anchor| anchor else null)
             else
                 null,
             .live_drag_deferred_source = self.deferredSourceBlocksPageTransition(),
             .selection_completion_policy = .retain_with_actions,
-            .selection_layout_revision = self.selection_layout_revision,
             .source = source,
             .layout = layout,
         };

@@ -7,9 +7,13 @@ const app_mod = @import("../../app.zig");
 const app_commit_panel = @import("../commit_panel.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const app_test_support = @import("../test_support.zig");
+const compare_navigation = @import("../pages/compare/navigation.zig");
 const review_navigation = @import("../pages/review/navigation.zig");
 const review_reload = @import("../pages/review/reload.zig");
 const review_authority = @import("../diff_surface/authority.zig");
+const content_fingerprint = @import("../../content_fingerprint.zig");
+const diff_render = @import("../../diff/render.zig");
+const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
 const git_status = @import("../../git/status.zig");
@@ -72,6 +76,66 @@ fn reviewReload(app: *App) review_reload.Controller {
         .repo_epoch = repo.epoch(),
         .root_identity = repo.activeIdentity(),
     };
+}
+
+fn retainedCompareAppForViewTest(
+    allocator: std.mem.Allocator,
+    terminal_size: chasen.Size,
+    mode: diff_render.DisplayMode,
+    side: diff_selection.Side,
+) !App {
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .compare,
+        .terminal_size = terminal_size,
+        .theme = paletteWithOverride(.pane_cursor_bg, .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } }),
+        .pages = .{ .compare = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .sidebar_hidden = true, .display_mode = mode },
+            .basis = .{
+                .base = .{
+                    .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+                    .display_name = try allocator.dupe(u8, "main"),
+                    .kind = .local,
+                    .oid = .{},
+                },
+                .head_display = try allocator.dupe(u8, "topic"),
+                .merge_base_oid = .{},
+                .head_oid = .{},
+                .ahead_count = 1,
+            },
+        } },
+    };
+    errdefer app.pages.compare.deinit(allocator);
+    const drag: diff_selection.DragSelection = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = side,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 3 },
+        .moved = true,
+    };
+    app.pages.compare.completed_selection = try @import("../diff_surface/selection.zig").buildParsed(allocator, .{
+        .repo_epoch = 0,
+        .root_identity = null,
+        .source = @import("../diff_surface/selection.zig").SourceBasis.init(.{ .range = "compare" }),
+        .source_session_revision = app.pages.compare.source_session_revision,
+        .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
+    }, app_test_support.loadedDiffOne().document.files[0], drag);
+    try std.testing.expect(app.pages.compare.installPinnedSelectionBasis());
+
+    const body_size = app_shell_layout.compute(terminal_size, .{ .page_bar_visible = true }).bodySize();
+    const controller: compare_navigation.Controller = .{
+        .page = &app.pages.compare,
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = body_size.width, .height = body_size.height },
+    };
+    var adapter = controller.updateAdapter();
+    var body = adapter.bodyController();
+    body.controller.revealCompletedSelectionAction(body.resolver);
+    return app;
 }
 
 fn syncTestActivation(app: *App) void {
@@ -150,6 +214,48 @@ test "load empty state shows actionable no changes message" {
 
     try app_test_support.expectSnapshotContains(&ts, "No changes");
     try app_test_support.expectSnapshotContains(&ts, "Press r to reload or q to quit.");
+}
+
+test "Compare retained actions render at gate sizes for unified and both side-by-side sides" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        size: chasen.Size,
+        mode: diff_render.DisplayMode,
+        side: diff_selection.Side,
+    }{
+        .{ .size = .{ .width = 80, .height = 12 }, .mode = .unified, .side = .old },
+        .{ .size = .{ .width = 80, .height = 12 }, .mode = .unified, .side = .new },
+        .{ .size = .{ .width = 120, .height = 32 }, .mode = .side_by_side, .side = .old },
+        .{ .size = .{ .width = 120, .height = 32 }, .mode = .side_by_side, .side = .new },
+    };
+    for (cases) |case| {
+        var app = try retainedCompareAppForViewTest(allocator, case.size, case.mode, case.side);
+        defer app.pages.compare.deinit(allocator);
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(case.size.width, case.size.height);
+        defer surface.deinit();
+        try app.view(&surface.surface);
+        const snapshot = try surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "3 lines selected") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "[y Copy] [Esc Clear]") != null);
+
+        var themed_action = false;
+        var row: u16 = 0;
+        while (row < case.size.height and !themed_action) : (row += 1) {
+            var col: u16 = 0;
+            while (col < case.size.width) : (col += 1) {
+                const cell = surface.surface.readCell(col, row) orelse continue;
+                if (std.mem.eql(u8, cell.char.grapheme, "[") and
+                    cell.style.bg.eql(app.theme.color(.pane_cursor_bg)))
+                {
+                    themed_action = true;
+                    break;
+                }
+            }
+        }
+        try std.testing.expect(themed_action);
+    }
 }
 
 test "clean empty state shows branch status chrome" {

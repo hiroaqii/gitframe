@@ -28,6 +28,7 @@ pub const Context = struct {
         return .{
             .search_mode = self.search_mode,
             .file_search_mode = self.file_search_mode,
+            .retained_selection_action_available = self.retained_selection_action_available,
         };
     }
 };
@@ -37,16 +38,13 @@ pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
 }
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
-    if (context.search_mode or context.file_search_mode) {
-        return review_message.fromShared(diff_surface_input.keyToMsg(context.shared(), key) orelse return null);
-    }
+    if (diff_surface_input.keyToMsg(context.shared(), key)) |msg| return review_message.fromShared(msg);
+    if (context.search_mode or context.file_search_mode) return null;
     return normalKeyToMsg(context, key);
 }
 
 fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return .toggle_focus;
-    if (context.retained_selection_action_available and key.matches(chasen.Key.escape, .{})) return .clear_completed_selection;
-    if (context.retained_selection_action_available and key.matches('y', .{})) return .copy_completed_selection;
     if (key.matches(chasen.Key.escape, .{}) and context.search_query_len > 0) return .clear_search;
     if (context.focus == .sidebar and key.matches(chasen.Key.enter, .{})) return .toggle_directory;
     if (context.focus == .diff and key.matches(chasen.Key.enter, .{})) return .toggle_hunk_fold;

@@ -5,6 +5,8 @@ const chasen = @import("chasen");
 
 const app_message = @import("message.zig");
 const app_state = @import("state.zig");
+const content_fingerprint = @import("../content_fingerprint.zig");
+const diff_surface = @import("diff_surface.zig");
 const effect_origin = @import("effect_origin.zig");
 const page = @import("page.zig");
 const compare_page = @import("pages/compare.zig");
@@ -103,6 +105,94 @@ test "clipboard copy result status uses best-effort wording" {
     app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 3 }, .outcome = .{ .write_failed = "BrokenPipe" } });
     try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.pages.review.status.text());
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
+}
+
+test "Compare clipboard terminals and queue failure preserve retained selection authority" {
+    const allocator = std.testing.allocator;
+    var app: ShellHarness = .{ .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    defer app.shell_state.clipboard_copies.deinit(allocator);
+    _ = app.pages.compare.activate(0);
+    app.pages.compare.completed_selection = .{
+        .token = .{
+            .repo_epoch = 0,
+            .root_identity = null,
+            .source = diff_surface.selection.SourceBasis.init(.{ .range = "compare" }),
+            .source_session_revision = 1,
+            .display = .{ .loaded = content_fingerprint.Fingerprint.init("diff") },
+        },
+        .value = .{ .generated_untracked = .{
+            .path = try allocator.dupe(u8, "src/main.zig"),
+            .mode = .line,
+            .range = .{
+                .start = .{ .hunk_index = 0, .line_index = 0 },
+                .end = .{ .hunk_index = 0, .line_index = 0 },
+            },
+            .fragment = .{
+                .source_start = 0,
+                .source_end = 1,
+                .text = try allocator.dupe(u8, "selected compare"),
+                .line_count = 1,
+            },
+        } },
+    };
+    app.pages.compare.pinned_selection_basis = .{
+        .base_oid = .{},
+        .head_oid = .{},
+        .diff_base_oid = .{},
+    };
+    const retained_token = app.pages.compare.completed_selection.?.token;
+    const retained_pin = app.pages.compare.pinned_selection_basis.?;
+    const origin: effect_origin.Origin = .{ .page = app.shellEffects().compareOrigin() };
+
+    const outcomes = [_]app_message.ClipboardCopyOutcome{
+        .sent,
+        .unsupported_runtime,
+        .{ .write_failed = "BrokenPipe" },
+    };
+    for (outcomes, 20..) |outcome, request_id| {
+        try app.shell_state.clipboard_copies.put(allocator, request_id, .{
+            .origin = origin,
+            .label = "diff selection",
+        });
+        app.shellEffects().finishClipboard(.{
+            .request_id = .{ .id = request_id },
+            .outcome = outcome,
+        });
+        try std.testing.expect(app.pages.compare.completed_selection.?.token.eql(retained_token));
+        try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(retained_pin));
+    }
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var failing_ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = failing.allocator() };
+    app.shellEffects().queueClipboard(&failing_ctx, .{
+        .origin = origin,
+        .label = "diff selection",
+        .text = "selected compare",
+    });
+    try std.testing.expectEqualStrings("could not prepare clipboard copy", app.pages.compare.status.text());
+    try std.testing.expect(app.pages.compare.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(retained_pin));
+
+    var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    for (0..4) |_| {
+        _ = try ctx.terminal().copyToClipboard(.{
+            .text = "occupied",
+            .finished = ShellHarness.Msg.clipboardFinished,
+        });
+    }
+    const clipboard_text = try app.pages.compare.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(clipboard_text);
+    app.shellEffects().queueClipboard(&ctx, .{
+        .origin = origin,
+        .label = "diff selection",
+        .text = clipboard_text,
+    });
+    try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
+    try std.testing.expectEqualStrings("clipboard copy already queued", app.pages.compare.status.text());
+    try std.testing.expect(app.pages.compare.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(retained_pin));
 }
 
 test "inactive Review clipboard completion retains diagnostic without redraw" {

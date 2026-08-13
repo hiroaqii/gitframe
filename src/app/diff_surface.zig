@@ -47,8 +47,7 @@ pub const Focus = enum {
 };
 
 /// Page-owned completion behavior for an otherwise shared mouse-selection
-/// transaction. Compare keeps its immediate-copy contract; Review retains the
-/// installed candidate for its explicit action surface.
+/// transaction.
 pub const SelectionCompletionPolicy = enum {
     copy_on_release,
     retain_with_actions,
@@ -182,7 +181,7 @@ pub const RawDiffPaneGeometry = struct { col: u16, width: u16 };
 pub const SearchTarget = body_resolver.SearchTarget;
 
 /// Const-qualified projection of the shared surface for rendering and other
-/// read-only consumers. It mirrors `DiffSurface` exactly, but the 16 shared
+/// read-only consumers. It mirrors `DiffSurface` exactly, but its shared
 /// state pointers cannot be used to acquire write authority.
 pub const ReadSurface = struct {
     activation: *const authority.Lifecycle,
@@ -201,10 +200,12 @@ pub const ReadSurface = struct {
     completed_selection: *const ?selection.CompletedSelection,
     source_session_revision: *const u64,
     pending_initial_first_visible_selection: *const bool,
+    selection_layout_revision: *const u64,
     reload_anchor: ?*const ReloadAnchor,
     live_drag_deferred_source: bool,
     selection_completion_policy: SelectionCompletionPolicy,
-    selection_layout_revision: u64,
+    retained_selection_install_available: bool = true,
+    retained_selection_action_admitted: bool = true,
     source: diff_source.SourceMode,
     layout: Layout,
 };
@@ -235,10 +236,12 @@ pub const DiffSurface = struct {
     completed_selection: *?selection.CompletedSelection,
     source_session_revision: *u64,
     pending_initial_first_visible_selection: *bool,
+    selection_layout_revision: *u64,
     reload_anchor: ?*const ReloadAnchor,
     live_drag_deferred_source: bool,
     selection_completion_policy: SelectionCompletionPolicy,
-    selection_layout_revision: u64,
+    retained_selection_install_available: bool = true,
+    retained_selection_action_admitted: bool = true,
     source: diff_source.SourceMode,
     layout: Layout,
 
@@ -261,10 +264,12 @@ pub const DiffSurface = struct {
             .completed_selection = self.completed_selection,
             .source_session_revision = self.source_session_revision,
             .pending_initial_first_visible_selection = self.pending_initial_first_visible_selection,
+            .selection_layout_revision = self.selection_layout_revision,
             .reload_anchor = self.reload_anchor,
             .live_drag_deferred_source = self.live_drag_deferred_source,
             .selection_completion_policy = self.selection_completion_policy,
-            .selection_layout_revision = self.selection_layout_revision,
+            .retained_selection_install_available = self.retained_selection_install_available,
+            .retained_selection_action_admitted = self.retained_selection_action_admitted,
             .source = self.source,
             .layout = self.layout,
         };
@@ -286,9 +291,9 @@ test {
     const mutable_fields = std.meta.fields(DiffSurface);
     const read_fields = std.meta.fields(ReadSurface);
     try std.testing.expectEqual(mutable_fields.len, read_fields.len);
-    inline for (mutable_fields, read_fields, 0..) |mutable_field, read_field, index| {
+    inline for (mutable_fields, read_fields) |mutable_field, read_field| {
         try std.testing.expectEqualStrings(mutable_field.name, read_field.name);
-        if (index < 16) {
+        if (@typeInfo(mutable_field.type) == .pointer) {
             const mutable_pointer = @typeInfo(mutable_field.type).pointer;
             const read_pointer = @typeInfo(read_field.type).pointer;
             try std.testing.expect(!mutable_pointer.is_const);

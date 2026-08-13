@@ -20,6 +20,10 @@ pub const Oid = struct {
     pub fn short(self: *const Oid) []const u8 {
         return self.slice()[0..@min(@as(usize, self.len), 7)];
     }
+
+    pub fn eql(self: *const Oid, other: *const Oid) bool {
+        return std.mem.eql(u8, self.slice(), other.slice());
+    }
 };
 
 pub const BaseKind = git_ref.BranchKind;

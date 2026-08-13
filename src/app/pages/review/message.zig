@@ -117,6 +117,8 @@ pub const Msg = union(enum) {
             .mouse_diff_press,
             .mouse_diff_drag,
             .mouse_diff_release,
+            .copy_completed_selection,
+            .clear_completed_selection,
             .toggle_focus,
             .page_diff_up,
             .page_diff_down,
