@@ -21,13 +21,14 @@ const diff_view_model = @import("../../diff/view_model.zig");
 const file_tree = @import("../../file_tree.zig");
 const loaded_diff = @import("../../loaded_diff.zig");
 const sidebar_view_model = @import("../../sidebar/view_model.zig");
-const text_projection = @import("../../text/projection.zig");
+const text_projection = @import("chasen_ui").text_projection;
 const selection_action = @import("selection_action.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
 const HorizontalDirection = app_direction.Horizontal;
 const SizeDirection = app_direction.Size;
 const VerticalDirection = app_direction.Vertical;
+const review_tab_width: usize = 4;
 
 pub const ParsedSelectionTarget = diff_surface.body_resolver.ParsedSelectionTarget;
 
@@ -504,7 +505,7 @@ pub const BodyView = struct {
             const point_value = if (hit.region.leading_boundary)
                 diff_selection.pointFromBoundary(hit.hunk_index, hit.line_index, 0)
             else
-                pointForTextCell(hit.hunk_index, hit.line_index, hit.line.text, model_mode, hit.region.text_cell +| self.view.surface.viewer.diff_horizontal_scroll) orelse return null;
+                pointForTextCell(hit.hunk_index, hit.line_index, hit.line.text, model_mode, self.view.surface.viewer.diff_horizontal_scroll, hit.region.text_cell) orelse return null;
             return .{
                 .identity = target.identity,
                 .side = hit.region.side,
@@ -524,7 +525,7 @@ pub const BodyView = struct {
             .point = if (region.leading_boundary)
                 diff_selection.pointFromBoundary(0, offset, 0)
             else
-                pointForTextCell(0, offset, line, model_mode, region.text_cell +| self.view.surface.viewer.diff_horizontal_scroll) orelse return null,
+                pointForTextCell(0, offset, line, model_mode, self.view.surface.viewer.diff_horizontal_scroll, region.text_cell) orelse return null,
         };
     }
 
@@ -2037,11 +2038,12 @@ pub fn selectionRegionForGenerated(body_col: u16, body_width: u16, display_mode:
     };
 }
 
-pub fn pointForTextCell(hunk_index: usize, line_index: usize, text: []const u8, mode: diff_selection.Mode, cell: usize) ?diff_selection.Point {
+pub fn pointForTextCell(hunk_index: usize, line_index: usize, text: []const u8, mode: diff_selection.Mode, horizontal_scroll: usize, viewport_cell: usize) ?diff_selection.Point {
     if (mode == .line) return diff_selection.pointFromLine(hunk_index, line_index);
-    return switch (text_projection.hitAtDisplayCell(text, cell) orelse return null) {
+    const projection = text_projection.Projection.init(text, .{ .tab_width = review_tab_width }) catch return null;
+    return switch (projection.hitViewportCell(horizontal_scroll, viewport_cell)) {
         .token => |token| diff_selection.pointFromToken(hunk_index, line_index, token),
-        .boundary => |boundary| diff_selection.pointFromBoundary(hunk_index, line_index, boundary.offset),
+        .boundary => |boundary| diff_selection.pointFromBoundary(hunk_index, line_index, boundary.byte_offset),
     };
 }
 
@@ -2091,7 +2093,8 @@ pub fn visibleTextWidth(total_width: u16, text_col: u16) u16 {
 }
 
 pub fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
-    const width = text_projection.displayWidth(text) catch return 0;
+    const projection = text_projection.Projection.init(text, .{ .tab_width = review_tab_width }) catch return 0;
+    const width = projection.displayWidth();
     if (width <= visible_width) return 0;
     return width - visible_width;
 }

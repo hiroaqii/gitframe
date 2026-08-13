@@ -14,9 +14,11 @@ const repository_source = @import("../repository/source.zig");
 const syntax_style = @import("../syntax/style.zig");
 const syntax_token = @import("../syntax/token.zig");
 const theme = @import("theme");
-const text_projection = @import("../text/projection.zig");
+const text_projection = @import("chasen_ui").text_projection;
 
 pub const DisplayMode = diff_view_model.DisplayMode;
+
+const review_tab_width: usize = 4;
 
 pub const HunkStageState = enum {
     unstaged,
@@ -573,6 +575,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow() orelse continue;
         const presentation = RowPresentation.forBodyOffset(options, body_offset);
+        const projections = try admitBodyRow(body_row);
         presentation.prefill(surface, row, styles);
         drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
         switch (body_row) {
@@ -588,7 +591,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                     if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, guideGlyph(guide_index, hunk_index, body_offset), options.hunk_stages.stateForHunk(hunk_index), presentation, styles);
                 }
                 const syntax_ctx = unifiedSyntaxContext(options, rows, line);
-                try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, presentation, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
+                try drawUnifiedLine(&body_surface, row, line, projections.unified, options.horizontal_scroll, options.line_numbers, presentation, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
             },
             .side_by_side => |side_row| {
                 if (current_hunk_highlighted) {
@@ -597,8 +600,8 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                 const geometry = sideBySideGeometry(body_surface.size().width);
                 const indexed_row = rows.currentSideBySideRow();
                 switch (side_row) {
-                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
-                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                    .single => |line| try drawSideBySideSingle(&body_surface, row, line, projections.side_by_side, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                    .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, projections.side_by_side, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
                 }
             },
         }
@@ -629,23 +632,24 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, sour
         if (cursor.done()) return;
         const body_offset = cursor.bodyOffset();
         const row = cursor.nextRow() orelse continue;
-        const presentation = RowPresentation.forBodyOffset(options, body_offset);
-        presentation.prefill(surface, row, styles);
-        drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
         const line: diff_parser.DiffLine = .{
             .kind = .added,
             .text = source.lineBody(index).?,
             .new_line = @intCast(index + 1),
         };
+        const projection = try text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width });
+        const presentation = RowPresentation.forBodyOffset(options, body_offset);
+        presentation.prefill(surface, row, styles);
+        drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
         const line_spans = options.source_syntax_spans.lineSpans(index);
         if (mode == .side_by_side) {
             const geometry = sideBySideGeometry(body_surface.size().width);
-            try drawSideBySidePair(&body_surface, row, null, line, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, .{
+            try drawSideBySidePair(&body_surface, row, null, line, .{ .new = projection }, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, .{
                 .new = line_spans,
                 .new_hunk_side_has_visible_syntax = options.source_has_visible_syntax,
             }, generatedSideBySideSelection(options, index, line));
         } else {
-            try drawUnifiedLine(&body_surface, row, line, options.horizontal_scroll, options.line_numbers, presentation, styles, line_spans, options.source_has_visible_syntax, generatedUnifiedSelection(options, index, line));
+            try drawUnifiedLine(&body_surface, row, line, projection, options.horizontal_scroll, options.line_numbers, presentation, styles, line_spans, options.source_has_visible_syntax, generatedUnifiedSelection(options, index, line));
         }
     }
 }
@@ -958,7 +962,51 @@ const BodyCursor = struct {
     }
 };
 
-fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+const SideBySideProjections = struct {
+    old: ?text_projection.Projection = null,
+    new: ?text_projection.Projection = null,
+};
+
+const BodyRowProjections = union(enum) {
+    none,
+    unified: text_projection.Projection,
+    side_by_side: SideBySideProjections,
+};
+
+fn admitBodyRow(row: diff_view_model.BodyRow) text_projection.Error!BodyRowProjections {
+    return switch (row) {
+        .metadata, .binary_marker, .hunk_header => .none,
+        .unified_line => |line| .{ .unified = try text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width }) },
+        .side_by_side => |side_row| .{ .side_by_side = try admitSideBySideRow(side_row) },
+    };
+}
+
+fn admitSideBySideRow(row: diff_view_model.SideBySideRow) text_projection.Error!SideBySideProjections {
+    return switch (row) {
+        .single => |line| switch (line.kind) {
+            .removed => .{ .old = try text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width }) },
+            .added => .{ .new = try text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width }) },
+            .context => context: {
+                const projection = try text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width });
+                break :context .{ .old = projection, .new = projection };
+            },
+            .metadata => .{},
+        },
+        .paired => |pair| paired: {
+            const old: ?text_projection.Projection = if (pair.removed) |line|
+                try text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width })
+            else
+                null;
+            const new: ?text_projection.Projection = if (pair.added) |line|
+                try text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width })
+            else
+                null;
+            break :paired .{ .old = old, .new = new };
+        },
+    };
+}
+
+fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, projection: text_projection.Projection, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     prefillIntrinsicDiffBackground(surface, row, .{ .col = 0, .width = surface.size().width }, line.kind, presentation, styles);
     const whole_line = selection != null and selection.?.mode == .line;
     if (whole_line) fillRowRegion(surface, row, .{ .col = 0, .width = surface.size().width }, styles.selection);
@@ -974,8 +1022,8 @@ fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLin
         _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.new_line != null, styles), whole_line, styles));
     }
     _ = surface.borrowTextAt(layout.prefix_col, row, prefix, marker_style);
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, text_style, syntax_spans, styles);
-    if (selection) |selected| if (selected.mode == .character) applyCharacterSelection(surface, layout.text_col, row, line.text, horizontal_scroll, selected, styles.selection.bg);
+    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, horizontal_scroll, text_style, syntax_spans, styles);
+    if (selection) |selected| if (selected.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, horizontal_scroll, selected, styles.selection.bg);
 }
 
 const SideBySideSyntaxSpans = struct {
@@ -1008,18 +1056,18 @@ fn generatedSideBySideSelection(options: RenderOptions, line_index: usize, line:
     return .{ .new = range };
 }
 
-fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, projections: SideBySideProjections, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
     if (removed) |line| prefillIntrinsicDiffBackground(surface, row, geometry.old, line.kind, presentation, styles);
     if (added) |line| prefillIntrinsicDiffBackground(surface, row, geometry.new, line.kind, presentation, styles);
     drawSideBySideSelection(surface, row, geometry, selection, styles);
     var columns = sideBySideRowColumns(surface, row, geometry);
     const selected = selection orelse SideBySideSelection{};
-    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, projections.old.?, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, projections.new.?, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
     drawSideBySideGutter(surface, row, geometry, presentation, styles);
 }
 
-fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, projections: SideBySideProjections, geometry: SideBySideGeometry, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
     switch (line.kind) {
         .removed => prefillIntrinsicDiffBackground(surface, row, geometry.old, line.kind, presentation, styles),
         .added => prefillIntrinsicDiffBackground(surface, row, geometry.new, line.kind, presentation, styles),
@@ -1030,16 +1078,16 @@ fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.Di
     const selected = selection orelse SideBySideSelection{};
     switch (line.kind) {
         .removed => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            try drawSideBySideOld(&columns.old, 0, line, projections.old.?, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .added => {
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            try drawSideBySideNew(&columns.new, 0, line, projections.new.?, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .context => {
-            try drawSideBySideOld(&columns.old, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-            try drawSideBySideNew(&columns.new, 0, line, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            try drawSideBySideOld(&columns.old, 0, line, projections.old.?, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            try drawSideBySideNew(&columns.new, 0, line, projections.new.?, horizontal_scroll, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .metadata => {
@@ -1130,7 +1178,7 @@ fn sideBySideSelectionForPair(options: RenderOptions, file: diff_parser.FileDiff
     return selected;
 }
 
-fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, projection: text_projection.Projection, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const selected = selection != null and selection.?.mode == .line;
     const layout = lineLayout(line_numbers, .side_by_side);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), selected, styles));
@@ -1140,11 +1188,11 @@ fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     }
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
     _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, styles), styles), selected, styles));
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
-    if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, line.text, horizontal_scroll, range, styles.selection.bg);
+    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
+    if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, horizontal_scroll, range, styles.selection.bg);
 }
 
-fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
+fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, projection: text_projection.Projection, horizontal_scroll: usize, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const selected = selection != null and selection.?.mode == .line;
     const layout = lineLayout(line_numbers, .side_by_side);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), selected, styles));
@@ -1154,8 +1202,8 @@ fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     }
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
     _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, styles), styles), selected, styles));
-    try copyStyledScrolledTextAt(surface, layout.text_col, row, line.text, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
-    if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, line.text, horizontal_scroll, range, styles.selection.bg);
+    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
+    if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, horizontal_scroll, range, styles.selection.bg);
 }
 
 fn selectedStyle(style: chasen.TextStyle, selected: bool, styles: RenderStyles) chasen.TextStyle {
@@ -1195,43 +1243,42 @@ fn drawGutterLeadInBackground(surface: *chasen.Surface, row: u16, layout: LineLa
     }
 }
 
-fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, horizontal_scroll: usize, base_style: chasen.TextStyle, spans: syntax_token.LineSpans, styles: RenderStyles) !void {
+fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, projection: text_projection.Projection, horizontal_scroll: usize, base_style: chasen.TextStyle, spans: syntax_token.LineSpans, styles: RenderStyles) void {
     if (col >= surface.size().width) return;
     const width = surface.size().width - col;
-    const visible = try text_projection.renderWindowAlloc(surface.frameAllocator(), text, horizontal_scroll, width);
-    try copyPlainClippedTextAt(surface, col, row, visible, base_style);
+    var visible = projection.visibleSegments(horizontal_scroll, width);
+    while (visible.next()) |segment| drawVisibleSegment(surface, col, row, segment, base_style);
     if (spans.spans.len == 0) return;
 
-    const viewport_end = std.math.add(usize, horizontal_scroll, width) catch std.math.maxInt(usize);
-    var logical_col: usize = 0;
     var span_index: usize = 0;
-    var graphemes = chasen.text.graphemeIterator(text);
-    while (graphemes.next()) |grapheme| {
-        if (logical_col >= viewport_end) break;
-        const grapheme_end = grapheme.start + grapheme.len;
-        while (span_index < spans.spans.len and spans.spans[span_index].end <= grapheme.start) span_index += 1;
-        const bytes = grapheme.bytes(text);
-        const cells = if (bytes.len == 1 and bytes[0] == '\t')
-            text_projection.tab_width - (logical_col % text_projection.tab_width)
-        else
-            chasen.text.displayWidth(bytes);
-        const segment_end = logical_col + cells;
-        defer logical_col = segment_end;
+    visible = projection.visibleSegments(horizontal_scroll, width);
+    while (visible.next()) |segment| {
+        while (span_index < spans.spans.len and spans.spans[span_index].end <= segment.token.byte_start) span_index += 1;
         if (span_index >= spans.spans.len) continue;
         const span = spans.spans[span_index];
-        if (span.start > grapheme.start or grapheme_end > span.end) continue;
-        if (segment_end <= horizontal_scroll) continue;
-        const visible_start = @max(logical_col, horizontal_scroll);
-        const visible_end = @min(segment_end, viewport_end);
-        if (visible_start >= visible_end) continue;
+        if (span.start > segment.token.byte_start or segment.token.byte_end > span.end) continue;
         const style = syntaxStyle(base_style, span.role, styles);
-        const relative_start = visible_start - horizontal_scroll;
-        const visible_cells = visible_end - visible_start;
-        if (bytes.len == 1 and bytes[0] == '\t' or logical_col < horizontal_scroll) {
-            for (0..visible_cells) |offset| restyleCell(surface, @intCast(@as(usize, col) + relative_start + offset), row, style);
-        } else if (segment_end <= viewport_end) {
-            restyleCell(surface, @intCast(@as(usize, col) + relative_start), row, style);
-        }
+        restyleVisibleSegment(surface, col, row, segment, style);
+    }
+}
+
+fn drawVisibleSegment(surface: *chasen.Surface, col: u16, row: u16, segment: text_projection.VisibleSegment, style: chasen.TextStyle) void {
+    const segment_col: u16 = @intCast(@as(usize, col) + segment.viewport_cells.start);
+    switch (segment.materialization) {
+        .source => |bytes| _ = surface.borrowTextAt(segment_col, row, bytes, style),
+        .spaces => |count| for (0..count) |offset| {
+            _ = surface.borrowTextAt(@intCast(@as(usize, segment_col) + offset), row, " ", style);
+        },
+    }
+}
+
+fn restyleVisibleSegment(surface: *chasen.Surface, col: u16, row: u16, segment: text_projection.VisibleSegment, style: chasen.TextStyle) void {
+    const segment_col: u16 = @intCast(@as(usize, col) + segment.viewport_cells.start);
+    switch (segment.materialization) {
+        .source => restyleCell(surface, segment_col, row, style),
+        .spaces => |count| for (0..count) |offset| {
+            restyleCell(surface, @intCast(@as(usize, segment_col) + offset), row, style);
+        },
     }
 }
 
@@ -1245,36 +1292,23 @@ fn applyCharacterSelection(
     surface: *chasen.Surface,
     text_col: u16,
     row: u16,
-    text: []const u8,
+    projection: text_projection.Projection,
     horizontal_scroll: usize,
     range: diff_selection.LineVisualRange,
     background: chasen.Color,
 ) void {
     if (text_col >= surface.size().width or range.byte_start >= range.byte_end) return;
     const width = surface.size().width - text_col;
-    const viewport_end = std.math.add(usize, horizontal_scroll, width) catch std.math.maxInt(usize);
-    var logical_col: usize = 0;
-    var graphemes = chasen.text.graphemeIterator(text);
-    while (graphemes.next()) |grapheme| {
-        if (logical_col >= viewport_end or grapheme.start >= range.byte_end) break;
-        const bytes = grapheme.bytes(text);
-        const cells = if (bytes.len == 1 and bytes[0] == '\t')
-            text_projection.tab_width - (logical_col % text_projection.tab_width)
-        else
-            chasen.text.displayWidth(bytes);
-        const segment_end = logical_col + cells;
-        defer logical_col = segment_end;
-        const grapheme_end = grapheme.start + grapheme.len;
-        if (grapheme_end <= range.byte_start or segment_end <= horizontal_scroll) continue;
-        const visible_start = @max(logical_col, horizontal_scroll);
-        const visible_end = @min(segment_end, viewport_end);
-        if (visible_start >= visible_end) continue;
-        const relative_start = visible_start - horizontal_scroll;
-        const visible_cells = visible_end - visible_start;
-        if (bytes.len == 1 and bytes[0] == '\t' or logical_col < horizontal_scroll) {
-            for (0..visible_cells) |offset| setCellBackground(surface, @intCast(@as(usize, text_col) + relative_start + offset), row, background);
-        } else if (segment_end <= viewport_end) {
-            setCellBackground(surface, @intCast(@as(usize, text_col) + relative_start), row, background);
+    var visible = projection.visibleSegments(horizontal_scroll, width);
+    while (visible.next()) |segment| {
+        if (segment.token.byte_start >= range.byte_end) break;
+        if (segment.token.byte_end <= range.byte_start) continue;
+        const segment_col: u16 = @intCast(@as(usize, text_col) + segment.viewport_cells.start);
+        switch (segment.materialization) {
+            .source => setCellBackground(surface, segment_col, row, background),
+            .spaces => |count| for (0..count) |offset| {
+                setCellBackground(surface, @intCast(@as(usize, segment_col) + offset), row, background);
+            },
         }
     }
 }
@@ -1287,17 +1321,6 @@ fn setCellBackground(surface: *chasen.Surface, col: u16, row: u16, background: c
 
 fn syntaxStyle(base: chasen.TextStyle, role: syntax_token.TokenRole, styles: RenderStyles) chasen.TextStyle {
     return syntax_style.apply(base, role, styles.palette);
-}
-
-// Scrollable diff body text should not draw an artificial ellipsis; users can
-// move horizontally to inspect the clipped suffix.
-fn copyPlainClippedTextAt(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, style: chasen.TextStyle) !void {
-    const size = surface.size();
-    if (col >= size.width) return;
-    const max_width = size.width - col;
-    const clipped = chasen.text.clipToWidth(text, max_width);
-    if (clipped.len == 0) return;
-    _ = try surface.copyTextAt(col, row, clipped, style);
 }
 
 fn lineNumberText(surface: *chasen.Surface, line: ?u32) ![]const u8 {
@@ -1532,6 +1555,88 @@ fn expectBgRange(surface: *chasen.Surface, row: u16, start_col: u16, end_col: u1
 
 fn expectBodyGutterLeadInBg(surface: *chasen.Surface, row: u16, text_col: u16, bg: chasen.Color) !void {
     try expectBgRange(surface, row, cursor_gutter_width, cursor_gutter_width + text_col, bg);
+}
+
+const admissionSentinelStyle: chasen.TextStyle = .{
+    .bold = true,
+    .italic = true,
+    .fg = .{ .index = 201 },
+    .bg = .{ .index = 202 },
+};
+
+fn fillAdmissionSentinelRow(surface: *chasen.Surface, row: u16) void {
+    for (0..surface.size().width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), row, "x", admissionSentinelStyle);
+    }
+}
+
+fn expectAdmissionSentinelRow(surface: *chasen.Surface, row: u16) !void {
+    const expected: chasen.Cell = .{
+        .char = .{ .grapheme = "x", .width = 1 },
+        .style = admissionSentinelStyle,
+    };
+    for (0..surface.size().width) |col| {
+        const actual = surface.readCell(@intCast(col), row) orelse return error.MissingAdmissionSentinelCell;
+        try std.testing.expect(actual.eql(expected));
+    }
+}
+
+test "review diff cursor projection admission leaves invalid body rows untouched" {
+    const invalid_utf8 = [_]u8{0xff};
+    const unified_file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "invalid unified",
+            .lines = &.{.{ .kind = .context, .text = &invalid_utf8, .old_line = 1, .new_line = 1 }},
+        }},
+    };
+    const paired_file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .old_path = "a/a",
+        .new_path = "b/a",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "invalid pair",
+            .lines = &.{
+                .{ .kind = .removed, .text = "valid old", .old_line = 1 },
+                .{ .kind = .added, .text = &invalid_utf8, .new_line = 1 },
+            },
+        }},
+    };
+    const invalid_row = body_start_row + 1;
+
+    var unified: chasen.testing.TestSurface = undefined;
+    try unified.init(80, 6);
+    defer unified.deinit();
+    fillAdmissionSentinelRow(&unified.surface, invalid_row);
+    try std.testing.expectError(error.InvalidUtf8, renderFile(&unified.surface, unified_file, .{
+        .requested_mode = .unified,
+        .cursor_offset = 1,
+        .highlighted_hunk = 0,
+    }));
+    try expectAdmissionSentinelRow(&unified.surface, invalid_row);
+
+    var paired: chasen.testing.TestSurface = undefined;
+    try paired.init(80, 6);
+    defer paired.deinit();
+    fillAdmissionSentinelRow(&paired.surface, invalid_row);
+    try std.testing.expectError(error.InvalidUtf8, renderFile(&paired.surface, paired_file, .{
+        .requested_mode = .side_by_side,
+        .cursor_offset = 1,
+        .highlighted_hunk = 0,
+    }));
+    try expectAdmissionSentinelRow(&paired.surface, invalid_row);
 }
 
 test "full-row diff background fills unified rows without leaking into chrome" {

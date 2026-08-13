@@ -1,7 +1,9 @@
 const std = @import("std");
 const diff_file = @import("file.zig");
 const diff_parser = @import("parser.zig");
-const text_projection = @import("../text/projection.zig");
+const text_projection = @import("chasen_ui").text_projection;
+
+const review_tab_width: usize = 4;
 
 pub const Side = enum {
     old,
@@ -247,8 +249,8 @@ pub fn pointFromToken(hunk_index: usize, line_index: usize, token: text_projecti
     return .{
         .hunk_index = hunk_index,
         .line_index = line_index,
-        .leading = token.leading,
-        .trailing = token.trailing,
+        .leading = token.byte_start,
+        .trailing = token.byte_end,
     };
 }
 
@@ -344,9 +346,9 @@ pub fn buildFragments(allocator: std.mem.Allocator, file: diff_parser.FileDiff, 
             const line = hunk.lines[line_index];
             if (!lineVisibleOnSide(line, selection.side)) continue;
             const range = selectedBytesForLine(line.text, selection.mode, selected_range, hunk_index, line_index) orelse continue;
-            if (range.start > range.end or range.end > line.text.len or
-                !text_projection.validateBoundary(line.text, range.start) or
-                !text_projection.validateBoundary(line.text, range.end)) return error.InvalidSelection;
+            if (range.start > range.end or range.end > line.text.len) return error.InvalidSelection;
+            const projection = text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width }) catch return error.InvalidSelection;
+            if (!projection.isBoundary(range.start) or !projection.isBoundary(range.end)) return error.InvalidSelection;
             if (range.start == range.end and selected_range.start.hunk_index == selected_range.end.hunk_index and
                 selected_range.start.line_index == selected_range.end.line_index) continue;
             if (fragment_line_count > 0) out.writer.writeByte('\n') catch return error.OutOfMemory;
@@ -519,10 +521,10 @@ test "character selection from the first token to its leading boundary keeps the
             .side = .new,
             .mode = .character,
             .anchor = pointFromToken(0, 0, .{
-                .leading = 0,
-                .trailing = case.token_end,
-                .display_start = 0,
-                .display_end = 1,
+                .byte_start = 0,
+                .byte_end = case.token_end,
+                .cell_start = 0,
+                .cell_end = 1,
             }),
             .focus = pointFromBoundary(0, 0, 0),
             .moved = true,

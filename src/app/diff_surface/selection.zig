@@ -15,9 +15,10 @@ const diff_source = @import("../../diff/source.zig");
 const path_key = @import("../../path_key.zig");
 const repository_source = @import("../../repository/source.zig");
 const root_capability = @import("../../repo/root_capability.zig");
-const text_projection = @import("../../text/projection.zig");
+const text_projection = @import("chasen_ui").text_projection;
 
 const Fingerprint = content_fingerprint.Fingerprint;
+const review_tab_width: usize = 4;
 
 pub const SourceBasis = struct {
     kind: std.meta.Tag(diff_source.SourceMode),
@@ -238,7 +239,9 @@ pub fn buildGenerated(
         if (selection.mode == .character) {
             if (line_index == range.start.line_index) start = range.start.leading;
             if (line_index == range.end.line_index) end = range.end.trailing;
-            if (!text_projection.validateBoundary(line, start) or !text_projection.validateBoundary(line, end) or start > end) return error.InvalidSelection;
+            if (start > end) return error.InvalidSelection;
+            const projection = text_projection.Projection.init(line, .{ .tab_width = review_tab_width }) catch return error.InvalidSelection;
+            if (!projection.isBoundary(start) or !projection.isBoundary(end)) return error.InvalidSelection;
         }
         if (start == end and range.start.line_index == range.end.line_index) continue;
         if (line_count > 0) out.writer.writeByte('\n') catch return error.OutOfMemory;

@@ -1960,8 +1960,8 @@ fn selectionRegionForGenerated(body_col: u16, body_width: u16, display_mode: dif
     return diff_surface.navigation.selectionRegionForGenerated(body_col, body_width, display_mode, line_numbers, locked);
 }
 
-fn pointForTextCell(hunk_index: usize, line_index: usize, text: []const u8, mode: diff_selection.Mode, cell: usize) ?diff_selection.Point {
-    return diff_surface.navigation.pointForTextCell(hunk_index, line_index, text, mode, cell);
+fn pointForTextCell(hunk_index: usize, line_index: usize, text: []const u8, mode: diff_selection.Mode, horizontal_scroll: usize, viewport_cell: usize) ?diff_selection.Point {
+    return diff_surface.navigation.pointForTextCell(hunk_index, line_index, text, mode, horizontal_scroll, viewport_cell);
 }
 
 fn contentWidth(width: u16) u16 {
@@ -2724,6 +2724,44 @@ test "Review mouse selection ignores the opposite side and resumes on its locked
     try std.testing.expectEqual(diff_selection.Side.old, resumed.side);
     try std.testing.expectEqual(@as(usize, 2), resumed.focus.line_index);
     try std.testing.expect(resumed.moved);
+}
+
+test "Review mouse selection projects scrolled TAB wide combining and emoji cells atomically" {
+    const text = "a\t界e\u{301}👩‍💻z";
+    const scroll: usize = 2;
+    const cases = [_]struct {
+        viewport_cell: usize,
+        leading: usize,
+        trailing: usize,
+    }{
+        .{ .viewport_cell = 0, .leading = 1, .trailing = 2 },
+        .{ .viewport_cell = 1, .leading = 1, .trailing = 2 },
+        .{ .viewport_cell = 2, .leading = 2, .trailing = 5 },
+        .{ .viewport_cell = 3, .leading = 2, .trailing = 5 },
+        .{ .viewport_cell = 4, .leading = 5, .trailing = 8 },
+        .{ .viewport_cell = 5, .leading = 8, .trailing = 19 },
+        .{ .viewport_cell = 6, .leading = 8, .trailing = 19 },
+        .{ .viewport_cell = 7, .leading = 19, .trailing = 20 },
+    };
+
+    for (cases) |case| {
+        const point = pointForTextCell(3, 4, text, .character, scroll, case.viewport_cell) orelse return error.ExpectedSelectionPoint;
+        try std.testing.expectEqual(@as(usize, 3), point.hunk_index);
+        try std.testing.expectEqual(@as(usize, 4), point.line_index);
+        try std.testing.expectEqual(case.leading, point.leading);
+        try std.testing.expectEqual(case.trailing, point.trailing);
+    }
+
+    const trailing = pointForTextCell(3, 4, text, .character, scroll, 8) orelse return error.ExpectedTrailingBoundary;
+    try std.testing.expectEqual(text.len, trailing.leading);
+    try std.testing.expectEqual(text.len, trailing.trailing);
+
+    const saturated = pointForTextCell(3, 4, text, .character, std.math.maxInt(usize), 1) orelse return error.ExpectedTrailingBoundary;
+    try std.testing.expectEqual(text.len, saturated.leading);
+    try std.testing.expectEqual(text.len, saturated.trailing);
+
+    const invalid = [_]u8{0xff};
+    try std.testing.expect(pointForTextCell(3, 4, &invalid, .character, 0, 0) == null);
 }
 
 test "unified body selects characters while gutter keeps line gestures semantic" {
