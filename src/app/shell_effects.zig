@@ -267,13 +267,23 @@ pub const Controller = struct {
         ctx: *chasen.Ctx(app_message.Msg),
         request: CopyRequest,
     ) void {
+        _ = self.queueClipboardAccepted(ctx, request);
+    }
+
+    /// Queues a copy and reports whether the runtime accepted ownership of
+    /// the text. Rejections are still presented through the request origin.
+    pub fn queueClipboardAccepted(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        request: CopyRequest,
+    ) bool {
         if (request.text.len == 0) {
             self.setEffectStatus(request.origin, "nothing to copy: {s}", .{request.label});
-            return;
+            return false;
         }
         self.state.clipboard_copies.ensureUnusedCapacity(ctx.allocator(), 1) catch {
             self.setEffectStatus(request.origin, "could not track clipboard copy", .{});
-            return;
+            return false;
         };
         const request_id = ctx.terminal().copyToClipboard(.{
             .text = request.text,
@@ -281,17 +291,18 @@ pub const Controller = struct {
         }) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.setEffectStatus(request.origin, "could not prepare clipboard copy", .{});
-                return;
+                return false;
             },
             error.ClipboardCopyLimitExceeded => {
                 self.setEffectStatus(request.origin, "clipboard copy already queued", .{});
-                return;
+                return false;
             },
         };
         self.state.clipboard_copies.putAssumeCapacity(request_id.id, .{
             .origin = request.origin,
             .label = request.label,
         });
+        return true;
     }
 
     pub fn finishClipboard(

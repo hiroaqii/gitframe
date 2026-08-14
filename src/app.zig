@@ -565,6 +565,7 @@ pub const App = struct {
             .push_error_page_up => self.overlayScroll().pagePushError(-1),
             .push_error_page_down => self.overlayScroll().pagePushError(1),
             .copy_popup => self.copyPopup(ctx),
+            .copy_footer_status => self.copyFooterStatus(ctx),
             .confirm_discard_file => try self.localWorkflow().confirmDiscardFile(ctx),
             .cancel_discard_file => self.localWorkflow().cancelDiscardConfirmation(ctx.allocator()),
             .confirm_amend => try self.localWorkflow().confirmAmend(ctx),
@@ -974,6 +975,7 @@ pub const App = struct {
             .keymap = self.keymap,
             .overlay = &self.overlay,
             .layout = layout,
+            .footer_status_target = app_view.footerStatusTarget(self.shellViewContext(), layout.footer.width),
         };
     }
 
@@ -982,6 +984,15 @@ pub const App = struct {
     }
 
     fn activePageStatus(self: *const App) ?*const app_state.StatusMessage {
+        return switch (self.active_page) {
+            .review => &self.pages.review.status,
+            .repository => &self.pages.repository.status,
+            .compare => &self.pages.compare.status,
+            .config => null,
+        };
+    }
+
+    fn activePageStatusMut(self: *App) ?*app_state.StatusMessage {
         return switch (self.active_page) {
             .review => &self.pages.review.status,
             .repository => &self.pages.repository.status,
@@ -1079,6 +1090,33 @@ pub const App = struct {
             .label = target.label,
             .text = target.text,
         });
+    }
+
+    fn copyFooterStatus(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const visible = app_state.resolveVisibleStatus(&self.status, self.activePageStatus()) orelse return;
+        const source = visible.source;
+        const target_status = switch (source) {
+            .shell => &self.status,
+            .page => self.activePageStatusMut() orelse return,
+        };
+
+        const effects = self.shellEffects();
+        const origin = switch (self.active_page) {
+            .review => effects.reviewOrigin(),
+            .repository => effects.repositoryOrigin(),
+            .compare => effects.compareOrigin(),
+            .config => return,
+        };
+        const queued = effects.queueClipboardAccepted(ctx, .{
+            .origin = .{ .page = origin },
+            .label = "status message",
+            .text = visible.text,
+        });
+
+        // The runtime owns clipboard bytes once queueClipboard succeeds. On a
+        // synchronous failure, the page-owned diagnostic already replaced a
+        // page target; a shell target must still be cleared to reveal it.
+        if (queued or source == .shell) target_status.clear();
     }
 
     fn popupCopyTarget(self: *const App) ?PopupCopyTarget {

@@ -352,6 +352,35 @@ pub const StatusMessage = struct {
     }
 };
 
+pub const VisibleStatusSource = enum {
+    shell,
+    page,
+};
+
+pub const VisibleStatus = struct {
+    source: VisibleStatusSource,
+    text: []const u8,
+};
+
+/// Resolves the status rendered by the common footer. Shell notifications
+/// temporarily win over diagnostics owned by the active page.
+pub fn resolveVisibleStatus(
+    shell_status: *const StatusMessage,
+    page_status: ?*const StatusMessage,
+) ?VisibleStatus {
+    if (shell_status.text().len > 0) return .{
+        .source = .shell,
+        .text = shell_status.text(),
+    };
+    if (page_status) |status| {
+        if (status.text().len > 0) return .{
+            .source = .page,
+            .text = status.text(),
+        };
+    }
+    return null;
+}
+
 fn validUtf8PrefixLen(bytes: []const u8) usize {
     var len = bytes.len;
     while (len > 0 and !std.unicode.utf8ValidateSlice(bytes[0..len])) : (len -= 1) {}
@@ -605,6 +634,25 @@ test "StatusMessage clears only the matching source reload failure" {
     status.set("status failed", .{});
     try std.testing.expect(!status.clearSourceReloadFailure(first));
     try std.testing.expectEqualStrings("status failed", status.text());
+}
+
+test "visible footer status prefers shell notification over page diagnostic" {
+    var shell_status: StatusMessage = .{};
+    var page_status: StatusMessage = .{};
+
+    page_status.set("page diagnostic", .{});
+    const page_visible = resolveVisibleStatus(&shell_status, &page_status).?;
+    try std.testing.expectEqual(VisibleStatusSource.page, page_visible.source);
+    try std.testing.expectEqualStrings("page diagnostic", page_visible.text);
+
+    shell_status.set("shell notification", .{});
+    const shell_visible = resolveVisibleStatus(&shell_status, &page_status).?;
+    try std.testing.expectEqual(VisibleStatusSource.shell, shell_visible.source);
+    try std.testing.expectEqualStrings("shell notification", shell_visible.text);
+
+    shell_status.clear();
+    page_status.clear();
+    try std.testing.expect(resolveVisibleStatus(&shell_status, &page_status) == null);
 }
 
 test "ReviewDisplayState defaults to showing all files" {

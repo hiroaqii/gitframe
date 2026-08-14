@@ -108,6 +108,7 @@ pub const Msg = union(enum) {
     push_error_page_up,
     push_error_page_down,
     copy_popup,
+    copy_footer_status,
     confirm_discard_file,
     cancel_discard_file,
     confirm_amend,
@@ -191,6 +192,9 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         .auto_reload_tick,
         .focus_lost,
         .git_action_spinner_tick,
+        // The copy handler must resolve and queue the currently visible text
+        // before clearing its ephemeral status owner.
+        .copy_footer_status,
         => true,
         .repository => |repository_msg| switch (repository_msg) {
             .manifest_finished, .branch_finished, .path_history_finished => true,
@@ -208,6 +212,10 @@ test "Repository path history completion preserves root diagnostics while naviga
     }));
     try std.testing.expect(!keepsEphemeralStatus(.{ .repository = .move_down }));
     try std.testing.expect(!keepsEphemeralStatus(.{ .repository = .{ .source_search_insert = 'x' } }));
+}
+
+test "footer status copy preserves its ephemeral payload until update" {
+    try std.testing.expect(keepsEphemeralStatus(.copy_footer_status));
 }
 
 test "undelivered action result releases owned payloads" {

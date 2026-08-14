@@ -9,6 +9,7 @@ const app_message = @import("../message.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const app_state = @import("../state.zig");
 const app_view = @import("../view.zig");
+const action_lifecycle = @import("../workflow/action_lifecycle.zig");
 const page = @import("../page.zig");
 const review_page = @import("../pages/review.zig");
 const review_navigation = @import("../pages/review/navigation.zig");
@@ -46,6 +47,23 @@ fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
 
 fn terminalBodyHeight(terminal_height: u16) u16 {
     return app_shell_layout.bodyHeight(terminal_height);
+}
+
+fn footerStatusPress(app: *const App) ?App.Msg {
+    const layout = shellLayout(app);
+    if (layout.footer.height == 0) return null;
+    for (0..layout.footer.width) |offset| {
+        const msg = app.handleEvent(app_test_support.mouseEvent(
+            @as(i16, @intCast(@as(usize, layout.footer.col) + offset)),
+            @as(i16, @intCast(layout.footer.row)),
+            .left,
+        )) orelse continue;
+        switch (msg) {
+            .copy_footer_status => return msg,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn reviewNavigation(app: *App) review_navigation.Controller {
@@ -658,6 +676,104 @@ test "mouse horizontal wheel scrolls diff pane horizontally" {
 
     try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
     try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll > 0);
+}
+
+test "footer status click copies full page diagnostic across shared screens" {
+    const allocator = std.testing.allocator;
+    const status_text = "警告: clipped footerでも保持しているmessage全体をcopyする";
+    const page_ids = [_]page.Id{ .review, .repository, .compare };
+
+    for (page_ids, 0..) |page_id, index| {
+        var app: App = .{
+            .active_page = page_id,
+            .terminal_size = if (index == 0)
+                .{ .width = 34, .height = 8 }
+            else
+                .{ .width = 29, .height = 5 },
+        };
+        defer app.shell_effects_state.deinit(allocator);
+        const page_status = switch (page_id) {
+            .review => &app.pages.review.status,
+            .repository => &app.pages.repository.status,
+            .compare => &app.pages.compare.status,
+            .config => unreachable,
+        };
+        page_status.set("{s}", .{status_text});
+
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer ctx.runtimeClearPendingEffectCopies();
+        const msg = footerStatusPress(&app) orelse return error.ExpectedFooterStatusCopy;
+        switch (msg) {
+            .copy_footer_status => {},
+            else => return error.ExpectedFooterStatusCopy,
+        }
+        try app.update(msg, &ctx);
+
+        try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+        const entry = ctx._pending_clipboard_copies[0];
+        try std.testing.expectEqualStrings(status_text, entry.text);
+        try std.testing.expectEqualStrings("", page_status.text());
+        try std.testing.expectEqual(@as(usize, 1), app.shell_effects_state.clipboard_copies.count());
+        const pending = app.shell_effects_state.clipboard_copies.get(entry.request_id.id) orelse
+            return error.ExpectedClipboardState;
+        try std.testing.expectEqual(page_id, pending.origin.page.page_id);
+
+        try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+            .request_id = entry.request_id,
+            .outcome = .sent,
+        } } }, &ctx);
+        try std.testing.expectEqualStrings("clipboard copy sent: status message", page_status.text());
+        try std.testing.expectEqual(@as(usize, 0), app.shell_effects_state.clipboard_copies.count());
+    }
+}
+
+test "footer status click copies shell priority before revealing page completion" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .terminal_size = .{ .width = 80, .height = 12 },
+    };
+    defer app.shell_effects_state.deinit(allocator);
+    app.pages.review.status.set("page diagnostic", .{});
+    app.status.set("shell notification", .{});
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const msg = footerStatusPress(&app) orelse return error.ExpectedFooterStatusCopy;
+    try app.update(msg, &ctx);
+
+    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqualStrings("shell notification", entry.text);
+    try std.testing.expectEqualStrings("", app.status.text());
+    try std.testing.expectEqualStrings("page diagnostic", app.pages.review.status.text());
+
+    try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+        .request_id = entry.request_id,
+        .outcome = .unsupported_runtime,
+    } } }, &ctx);
+    try std.testing.expectEqualStrings(
+        "clipboard copy unavailable: status message",
+        app.pages.review.status.text(),
+    );
+}
+
+test "footer status click respects text input overlay and spinner mouse blockers" {
+    var app: App = .{
+        .terminal_size = .{ .width = 80, .height = 12 },
+    };
+    app.pages.review.status.set("review diagnostic", .{});
+    try std.testing.expect(footerStatusPress(&app) != null);
+
+    app.pages.review.search.mode = true;
+    try std.testing.expect(footerStatusPress(&app) == null);
+    app.pages.review.search.mode = false;
+
+    app.overlay.openHelpForPage(.review);
+    try std.testing.expect(footerStatusPress(&app) == null);
+    app.overlay.close();
+
+    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 1, .kind = .push });
+    action_lifecycle.testing.setSpinner(&app.action_runtime, 1, false);
+    try std.testing.expect(footerStatusPress(&app) == null);
 }
 
 test "mouse events are ignored outside body and prompt modes" {

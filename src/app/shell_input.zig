@@ -78,6 +78,7 @@ pub const View = struct {
     keymap: keymap.Effective,
     overlay: *const app_state.OverlayState,
     layout: app_shell_layout.Layout,
+    footer_status_target: ?app_view.FooterStatusTarget = null,
 
     pub fn handleEvent(self: View, event: chasen.Event) ?app_message.Msg {
         return switch (event) {
@@ -164,6 +165,11 @@ pub const View = struct {
         }
 
         if (mouse.button == .left) {
+            if (self.footer_status_target) |target| {
+                if (self.layout.terminalToFooter(mouse.col, mouse.row)) |point| {
+                    if (target.contains(point.col)) return .copy_footer_status;
+                }
+            }
             if (self.layout.page_bar) |bar| {
                 if (self.layout.terminalToContent(mouse.col, mouse.row)) |point| {
                     if (point.row == app_shell_layout.page_bar_label_row) {

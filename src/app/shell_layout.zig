@@ -48,6 +48,10 @@ pub const Layout = struct {
     pub fn terminalToBody(self: Layout, col: i16, row: i16) ?Point {
         return terminalToLocal(self.body, col, row);
     }
+
+    pub fn terminalToFooter(self: Layout, col: i16, row: i16) ?Point {
+        return terminalToLocal(self.footer, col, row);
+    }
 };
 
 pub const ContentSections = struct {
@@ -182,6 +186,10 @@ test "terminal conversion rejects frame page bar and footer points" {
         @intCast(layout.body.row),
     ).?);
     try std.testing.expect(layout.terminalToBody(1, @intCast(layout.footer.row)) == null);
+    try std.testing.expectEqual(Point{ .col = 0, .row = 0 }, layout.terminalToFooter(
+        @intCast(layout.footer.col),
+        @intCast(layout.footer.row),
+    ).?);
     try std.testing.expectEqual(Point{ .col = 0, .row = 0 }, layout.terminalToContent(1, 1).?);
 }
 

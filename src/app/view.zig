@@ -269,15 +269,92 @@ fn viewPlaceholderPage(id: page.Id, has_repository: bool, palette: theme.Palette
     if (row + 1 < size.height) draw.copyClippedTextAt(surface, 1, row + 1, description, palette.style(.muted)) catch {};
 }
 
+pub const FooterStatusTarget = struct {
+    start_col: u16,
+    end_col: u16,
+    text: []const u8,
+
+    pub fn contains(self: FooterStatusTarget, col: u16) bool {
+        return col >= self.start_col and col < self.end_col;
+    }
+};
+
+const FooterProjection = struct {
+    segments: FooterSegments,
+    hint_col: u16,
+    left_limit: u16,
+    status_segment: ?usize,
+};
+
+/// Projects the exact status cells rendered by the common footer. Input uses
+/// this projection too, so responsive segment dropping and clipped text cannot
+/// drift away from the mouse hit target.
+pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
+    if (width == 0 or app.active_page == .config) return null;
+    if (app.action.spinnerPresentation() != null) return null;
+    const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
+
+    var terminal_buffer: [32]u8 = undefined;
+    const terminal_text = std.fmt.bufPrint(terminal_buffer[0..], "{d}x{d}", .{
+        app.terminal_size.width,
+        app.terminal_size.height,
+    }) catch return null;
+    var item_storage: [8]ui.key_hint.Item = undefined;
+    var key_buffers: [8][16]u8 = undefined;
+    const hint_items = footerItems(app, &item_storage, &key_buffers);
+    const projection = projectFooter(app, width, hint_items, terminal_text, null);
+    const status_segment = projection.status_segment orelse return null;
+    const range = projection.segments.renderedRange(status_segment, projection.left_limit) orelse return null;
+    return .{
+        .start_col = range.start_col,
+        .end_col = range.end_col,
+        .text = visible.text,
+    };
+}
+
 fn viewFooter(app: Context, surface: *chasen.Surface) void {
     const width = surface.size().width;
     if (width == 0) return;
-    const review_footer = app.review.footer();
-    const compare_footer = app.compare.footer();
 
     var footer_item_storage: [8]ui.key_hint.Item = undefined;
     var footer_key_buffers: [8][16]u8 = undefined;
     const hint_items = footerItems(app, &footer_item_storage, &footer_key_buffers);
+    const terminal_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
+        app.terminal_size.width,
+        app.terminal_size.height,
+    }) catch return;
+    const spinner_text = gitActionSpinnerText(app, surface.frameAllocator());
+    const projection = projectFooter(app, width, hint_items, terminal_text, spinner_text);
+
+    var left_area = surface.child(.{
+        .col = 0,
+        .row = 0,
+        .width = projection.left_limit,
+        .height = 1,
+    });
+    projection.segments.render(&left_area, projection.left_limit);
+
+    const draw_col = if (projection.hint_col > 0) projection.hint_col else projection.segments.endCol();
+    if (hint_items.len > 0 and width > draw_col) {
+        var hint_area = surface.child(.{
+            .col = draw_col,
+            .row = 0,
+            .width = width - draw_col,
+            .height = 1,
+        });
+        _ = ui.key_hint.draw(&hint_area, 0, 0, hint_items, footerKeyHintOptions(app.theme)) catch {};
+    }
+}
+
+fn projectFooter(
+    app: Context,
+    width: u16,
+    hint_items: []const ui.key_hint.Item,
+    terminal_text: []const u8,
+    spinner_text: ?[]const u8,
+) FooterProjection {
+    const review_footer = app.review.footer();
+    const compare_footer = app.compare.footer();
     const hint_width = ui.key_hint.width(hint_items, footerKeyHintOptions(app.theme));
     var hint_col = if (hint_items.len == 0)
         width
@@ -289,10 +366,7 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
 
     var footer_segments = FooterSegments{};
     footer_segments.append(.{
-        .text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
-            app.terminal_size.width,
-            app.terminal_size.height,
-        }) catch return,
+        .text = terminal_text,
         .style = app.theme.style(.muted),
     });
     if (app.active_page == .review) {
@@ -334,15 +408,21 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
             },
         });
     }
-    if (gitActionSpinnerText(app, surface.frameAllocator())) |spinner_text| {
+    var status_segment: ?usize = null;
+    if (spinner_text) |text| {
         footer_segments.append(.{
-            .text = spinner_text,
+            .text = text,
             .style = app.theme.style(.prompt),
         });
-    } else if (visibleStatus(app).len > 0) footer_segments.append(.{
-        .text = visibleStatus(app),
-        .style = app.theme.style(.prompt),
-    });
+    } else if (app_state.resolveVisibleStatus(app.status, app.page_status)) |visible| {
+        if (footer_segments.len < footer_segments.items.len) {
+            status_segment = footer_segments.len;
+            footer_segments.append(.{
+                .text = visible.text,
+                .style = app.theme.style(.prompt),
+            });
+        }
+    }
 
     footer_segments.fit(left_limit);
     // A terminal outcome is transient and can carry recovery instructions;
@@ -352,24 +432,12 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
         left_limit = width;
         footer_segments.fit(left_limit);
     }
-    var left_area = surface.child(.{
-        .col = 0,
-        .row = 0,
-        .width = left_limit,
-        .height = 1,
-    });
-    footer_segments.render(&left_area, left_limit);
-
-    const draw_col = if (hint_col > 0) hint_col else footer_segments.endCol();
-    if (hint_items.len > 0 and width > draw_col) {
-        var hint_area = surface.child(.{
-            .col = draw_col,
-            .row = 0,
-            .width = width - draw_col,
-            .height = 1,
-        });
-        _ = ui.key_hint.draw(&hint_area, 0, 0, hint_items, footerKeyHintOptions(app.theme)) catch {};
-    }
+    return .{
+        .segments = footer_segments,
+        .hint_col = hint_col,
+        .left_limit = left_limit,
+        .status_segment = status_segment,
+    };
 }
 
 const FooterDropPriority = enum {
@@ -382,6 +450,11 @@ const FooterSegment = struct {
     style: chasen.TextStyle,
     drop_priority: ?FooterDropPriority = null,
     visible: bool = true,
+};
+
+const FooterCellRange = struct {
+    start_col: u16,
+    end_col: u16,
 };
 
 const FooterSegments = struct {
@@ -438,6 +511,29 @@ const FooterSegments = struct {
         }
     }
 
+    fn renderedRange(self: *const FooterSegments, target_index: usize, width: u16) ?FooterCellRange {
+        var col: u16 = 1;
+        for (self.items[0..self.len], 0..) |item, index| {
+            if (!item.visible or item.text.len == 0) continue;
+            if (col >= width) return null;
+            const available = width - col;
+            const clipped = chasen.text.clipToWidthWithMarker(item.text, available, "…");
+            const drawn_width: u16 = @intCast(
+                chasen.text.displayWidth(clipped.prefix) + chasen.text.displayWidth(clipped.marker),
+            );
+            if (index == target_index) {
+                if (drawn_width == 0) return null;
+                return .{
+                    .start_col = col,
+                    .end_col = col + drawn_width,
+                };
+            }
+            const segment_width = chasen.text.displayWidth(item.text);
+            col +|= @intCast(@min(segment_width + 2, std.math.maxInt(u16)));
+        }
+        return null;
+    }
+
     fn endCol(self: *const FooterSegments) u16 {
         return self.requiredWidth();
     }
@@ -471,9 +567,8 @@ fn isRemoteActionKind(kind: app_actions.ActionKind) bool {
 }
 
 fn visibleStatus(app: Context) []const u8 {
-    if (app.status.text().len > 0) return app.status.text();
-    if (app.page_status) |status| return status.text();
-    return "";
+    const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return "";
+    return visible.text;
 }
 
 fn pendingActionFallbackLabel(kind: app_actions.ActionKind) []const u8 {
@@ -1581,6 +1676,46 @@ test "footer segment fit includes left inset" {
 
     try std.testing.expectEqual(@as(u16, 3), segments.requiredWidth());
     try std.testing.expect(!segments.items[1].visible);
+}
+
+test "footer status target matches clipped rendered cells and retains full text" {
+    const status_text = "warning: repository status has a deliberately long diagnostic";
+    var app: ShellViewTestHarness = .{
+        .terminal_size = .{ .width = 40, .height = 8 },
+    };
+    app.status.set("{s}", .{status_text});
+    const context = app.context();
+    const target = footerStatusTarget(context, 40) orelse return error.ExpectedFooterStatusTarget;
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 1);
+    defer ts.deinit();
+    viewFooter(context, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expectEqualStrings(status_text, target.text);
+    try std.testing.expect(target.contains(target.start_col));
+    try std.testing.expect(target.contains(target.end_col - 1));
+    try std.testing.expect(!target.contains(target.end_col));
+    const visible_len: usize = target.end_col - target.start_col;
+    try std.testing.expectEqual(
+        @as(?usize, target.start_col),
+        std.mem.indexOf(u8, snapshot, status_text[0 .. visible_len - 1]),
+    );
+}
+
+test "footer status target is absent while spinner owns footer" {
+    var app: ShellViewTestHarness = .{};
+    app.status.set("pushing", .{});
+    action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 1, .kind = .push });
+    action_lifecycle.testing.setSpinner(&app.action_runtime, 1, false);
+
+    try std.testing.expect(footerStatusTarget(app.context(), 80) == null);
+
+    action_lifecycle.testing.clear(&app.action_runtime);
+    app.status.clear();
+    try std.testing.expect(footerStatusTarget(app.context(), 80) == null);
 }
 
 test "footer shows pending spinner with current status label" {
