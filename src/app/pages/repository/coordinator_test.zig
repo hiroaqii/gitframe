@@ -311,7 +311,7 @@ test "Repository branch App runtime terminals preserve diagnostic ownership" {
     undelivered.deinitUndelivered(allocator);
 }
 
-test "Repository branch App completion suppresses stale unchanged and inactive redraws" {
+test "Repository page header unchanged branch completion redraws fresh terminal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -361,7 +361,8 @@ test "Repository branch App completion suppresses stale unchanged and inactive r
         .generation = unchanged_request.generation,
         .result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .branch = "main" }) },
     } });
-    try std.testing.expect(app.redraw_plan.resolvesToSkip());
+    try std.testing.expect(app.pages.repository.branch.freshness == .fresh);
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 
     app.pages.repository.requestReload(true);
     app.pages.repository.needs_revalidation = false;

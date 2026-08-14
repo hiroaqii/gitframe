@@ -2983,7 +2983,7 @@ pub const Controller = struct {
                 if (same_root) {
                     self.page.branch_status_load.markSuccess();
                     _ = self.page.activation.finishMember(result.identity, .branch, .fresh);
-                    return .{ .skip_redraw = true, .terminal_admitted = true };
+                    return .{ .terminal_admitted = true };
                 }
                 self.page.branch_status.replace(result.repo_root, bundle) catch {
                     self.page.branch_status.clear();

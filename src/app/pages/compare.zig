@@ -337,6 +337,22 @@ pub const PinnedSelectionBasis = struct {
     }
 };
 
+/// Display-admission evidence captured with one accepted Compare bundle.
+/// This is not repository or Git operation authority.
+pub const AcceptedRepositoryIdentity = struct {
+    repo_epoch: u64,
+    root_identity: ?root_capability.Identity,
+
+    pub fn matches(
+        self: AcceptedRepositoryIdentity,
+        repo_epoch: u64,
+        root_identity: ?root_capability.Identity,
+    ) bool {
+        return self.repo_epoch == repo_epoch and
+            optionalRootIdentityEql(self.root_identity, root_identity);
+    }
+};
+
 pub const ComparePageState = struct {
     // Independently owned fields exposed through DiffSurface.
     activation: diff_surface.authority.Lifecycle = .init(.compare),
@@ -360,6 +376,7 @@ pub const ComparePageState = struct {
 
     // Compare-owned basis and refresh state.
     basis: ?diff_basis.BranchDiffBasis = null,
+    accepted_repository_identity: ?AcceptedRepositoryIdentity = null,
     base_target: ?diff_basis.BaseTarget = null,
     basis_failure: ?BasisFailureState = null,
     load_failure: ?[]u8 = null,
@@ -369,6 +386,9 @@ pub const ComparePageState = struct {
     refresh_anchor: ?diff_surface.ReloadAnchor = null,
 
     pub fn activate(self: *ComparePageState, repo_epoch: u64) u64 {
+        if (self.accepted_repository_identity) |identity| {
+            if (identity.repo_epoch != repo_epoch) self.accepted_repository_identity = null;
+        }
         return self.activation.activate(repo_epoch, .pending, .unavailable, .unavailable);
     }
 
@@ -443,6 +463,7 @@ pub const ComparePageState = struct {
         self.base_picker.close(allocator);
         if (self.base_target) |*old| old.deinit(allocator);
         self.base_target = target;
+        self.accepted_repository_identity = null;
         return true;
     }
 
@@ -534,6 +555,7 @@ pub const ComparePageState = struct {
     }
 
     pub fn markNoRepository(self: *ComparePageState, allocator: std.mem.Allocator) void {
+        self.accepted_repository_identity = null;
         self.clearRetainedSelection(allocator);
         self.load.replaceEmpty(allocator, .no_repository);
         self.resetAcceptedDisplayNavigation();
@@ -677,6 +699,10 @@ pub const ComparePageState = struct {
             };
             self.pinned_selection_basis = PinnedSelectionBasis.init(self.basis.?);
         }
+        self.accepted_repository_identity = .{
+            .repo_epoch = repo_epoch,
+            .root_identity = root_identity,
+        };
         self.clearBasisFailure(allocator);
         self.clearLoadFailure(allocator);
     }
@@ -1103,6 +1129,7 @@ test "Compare loaded acceptance atomically installs matching basis and diff" {
     try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 5, "/work/gitframe", null, &finished));
     try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
     try std.testing.expectEqualStrings("refs/heads/main", state.base_target.?.full_ref);
+    try std.testing.expect(state.accepted_repository_identity.?.matches(5, null));
     const loaded = switch (state.load.state) {
         .loaded => |session| session.loaded,
         else => return error.ExpectedLoadedCompare,
@@ -1472,6 +1499,7 @@ test "Compare picker and failed chosen-basis refresh retain the accepted selecti
     ));
     try std.testing.expect(try state.chooseBasePickerTarget(allocator));
     try std.testing.expectEqualStrings("refs/heads/topic", state.base_target.?.full_ref);
+    try std.testing.expect(state.accepted_repository_identity == null);
     try std.testing.expect(state.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
 

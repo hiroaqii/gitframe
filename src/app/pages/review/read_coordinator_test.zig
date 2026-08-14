@@ -2633,7 +2633,7 @@ test "stale branch status result is ignored" {
     try std.testing.expectEqual(@as(?u64, 2), if (app.pages.review.branch_status_load.pending) |pending| pending.generation else null);
 }
 
-test "background branch failure retains display and identical recovery restores freshness" {
+test "Review page header identical branch recovery redraws fresh terminal" {
     var app: ReadHarness = .{ .allocator = std.testing.allocator };
     defer app.pages.review.branch_status.deinit();
     var current = try branchStatusBundleForTest(std.testing.allocator, .{
@@ -2666,6 +2666,7 @@ test "background branch failure retains display and identical recovery restores 
 
     const recovery_generation = app.pages.review.branch_status_load.prepare(true);
     app.pages.review.branch_status_load.begin(null, .{});
+    app.redraw_plan = .{};
     const same = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc",
         .branch = "main",
@@ -2681,6 +2682,7 @@ test "background branch failure retains display and identical recovery restores 
     });
     try std.testing.expect(app.pages.review.branch_status_load.isFresh());
     try std.testing.expectEqual(root_ptr, app.pages.review.branch_status.repo_root.?.ptr);
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "generated projection syntax start failures preserve plain display and remain retryable" {

@@ -7,6 +7,7 @@ const draw = @import("draw");
 const keymap = @import("keymap");
 const theme = @import("theme");
 const branch_chrome = @import("../../branch_chrome.zig");
+const page_header = @import("../../page_header.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const page_link = @import("../../page_link.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
@@ -44,6 +45,48 @@ pub const ViewContext = struct {
     /// not duplicate path metadata merely to render its safe basename.
     repo_root: ?[]const u8 = null,
 };
+
+/// Project only an exact current Repository snapshot. Retained branch data
+/// from another epoch or physical root is never eligible for shell chrome.
+pub fn pageHeaderPresentation(context: ViewContext) ?page_header.Presentation {
+    const state = context.page_state;
+    const root_identity = state.root_identity orelse return null;
+    const snapshot_identity = repository_branch.SnapshotIdentity{
+        .repo_epoch = state.repo_epoch,
+        .root_identity = root_identity,
+    };
+    if (!state.branch.snapshot.matches(snapshot_identity)) return switch (state.branch.freshness) {
+        .validating => .{ .terminal = .{ .kind = .head, .state = .loading } },
+        .failed => .{ .terminal = .{ .kind = .head, .state = .unavailable } },
+        .unavailable, .fresh => null,
+    };
+
+    const freshness: page_header.Freshness = switch (state.branch.freshness) {
+        .fresh => .fresh,
+        .validating => .refreshing,
+        .failed => .stale,
+        .unavailable => return .{ .terminal = .{ .kind = .head, .state = .unavailable } },
+    };
+    return headPresentation(state.branch.snapshot.status, freshness);
+}
+
+fn headPresentation(
+    status: git_branch_status.BranchStatus,
+    freshness: page_header.Freshness,
+) page_header.Presentation {
+    return .{ .head = switch (status.head) {
+        .branch => |name| .{ .branch = .{
+            .display_name = name,
+            .upstream = if (status.upstream == null)
+                .no_upstream
+            else
+                .{ .ahead = if (status.ahead_behind) |counts| counts.ahead else 0 },
+            .freshness = freshness,
+        } },
+        .detached => .{ .detached = freshness },
+        .unknown => .{ .unknown = freshness },
+    } };
+}
 
 pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const size = surface.size();
@@ -2294,6 +2337,46 @@ test "Repository branch retains last good facts and bounds stale chrome" {
     defer allocator.free(unavailable);
     try std.testing.expect(std.mem.indexOf(u8, unavailable, "branch unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, unavailable, "main ↑0") == null);
+}
+
+test "Repository page header requires matching epoch and physical root" {
+    const allocator = std.testing.allocator;
+    var state = try repositoryBranchViewStateForTest();
+    defer state.deinit(allocator);
+    installRepositoryBranchSnapshotForTest(&state, .{
+        .head = .{ .branch = "main" },
+        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .ahead_behind = .{ .ahead = 1, .behind = 0 },
+    }, .validating);
+    const context: ViewContext = .{ .page_state = &state, .palette = .default() };
+
+    const refreshing = pageHeaderPresentation(context).?;
+    const text = (try page_header.formatAlloc(allocator, refreshing, 80)).?;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("HEAD main ↑1 loading", text);
+
+    state.branch.freshness = .{ .failed = .load_failed };
+    const stale = pageHeaderPresentation(context).?;
+    const stale_text = (try page_header.formatAlloc(allocator, stale, 80)).?;
+    defer allocator.free(stale_text);
+    try std.testing.expectEqualStrings("HEAD main ↑1 stale", stale_text);
+
+    state.branch.snapshot.identity.?.repo_epoch += 1;
+    try std.testing.expect(pageHeaderPresentation(context).? == .terminal);
+    state.branch.freshness = .fresh;
+    try std.testing.expect(pageHeaderPresentation(context) == null);
+
+    state.branch.snapshot.identity.?.repo_epoch = state.repo_epoch;
+    const root_identity = state.root_identity.?;
+    state.root_identity.?.inode +%= 1;
+    try std.testing.expect(pageHeaderPresentation(context) == null);
+    state.root_identity = root_identity;
+
+    state.branch.snapshot.status = .{ .head = .detached };
+    const detached = pageHeaderPresentation(context).?;
+    const detached_text = (try page_header.formatAlloc(allocator, detached, 80)).?;
+    defer allocator.free(detached_text);
+    try std.testing.expectEqualStrings("HEAD detached", detached_text);
 }
 
 test "Repository branch yields row zero to full page owners" {

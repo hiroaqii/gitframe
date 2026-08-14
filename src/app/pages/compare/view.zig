@@ -9,6 +9,7 @@ const compare_page = @import("../compare.zig");
 const commit_time = @import("commit_time.zig");
 const compare_navigation = @import("navigation.zig");
 const diff_surface = @import("../../diff_surface.zig");
+const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 
 pub const Context = struct {
@@ -26,6 +27,57 @@ pub const Context = struct {
         });
     }
 };
+
+/// Project one accepted BASE-HEAD pair. Identity and current target must both
+/// still match; otherwise a retained old BASE is never exposed in the header.
+pub fn pageHeaderPresentation(app: Context) ?page_header.Presentation {
+    if (app.repo_root == null) return null;
+    const pending = sourcePending(app.page);
+    const failed = app.page.basis_failure != null or
+        app.page.load_failure != null or
+        sourceFailed(app.page);
+    const identity = app.page.accepted_repository_identity orelse
+        return compareTerminal(pending, failed);
+    if (!identity.matches(app.repo_epoch, app.root_identity))
+        return compareTerminal(pending, failed);
+
+    const basis = app.page.basis orelse return compareTerminal(pending, failed);
+    const target = app.page.base_target orelse return compareTerminal(pending, failed);
+    if (!std.mem.eql(u8, target.full_ref, basis.base.full_ref))
+        return compareTerminal(pending, failed);
+    if (!app.page.hasAcceptedDisplay()) return compareTerminal(pending, failed);
+
+    return .{ .compare = .{
+        .base_display_name = basis.base.display_name,
+        .head_display_name = basis.head_display,
+        .freshness = if (pending)
+            .refreshing
+        else if (failed)
+            .stale
+        else
+            .fresh,
+    } };
+}
+
+fn sourcePending(page: *const compare_page.ComparePageState) bool {
+    return switch (page.activation.state) {
+        .active => |active| active.members.source == .pending,
+        .inactive => false,
+    };
+}
+
+fn sourceFailed(page: *const compare_page.ComparePageState) bool {
+    return switch (page.activation.state) {
+        .active => |active| active.members.source == .failed,
+        .inactive => false,
+    };
+}
+
+fn compareTerminal(pending: bool, failed: bool) ?page_header.Presentation {
+    if (pending) return .{ .terminal = .{ .kind = .compare, .state = .loading } };
+    if (failed) return .{ .terminal = .{ .kind = .compare, .state = .unavailable } };
+    return null;
+}
 
 pub fn view(app: Context, surface: *chasen.Surface) !void {
     const navigation_context = navigationView(app);
@@ -313,6 +365,69 @@ test "empty Compare state distinguishes zero ahead commits from an empty net fil
     const message = try emptyStateMessage(arena.allocator(), "main", 0);
     try std.testing.expectEqualStrings("Up to date with main", message.title);
     try std.testing.expectEqualStrings("No commits are ahead of main.", message.body);
+}
+
+test "Compare page header binds the accepted pair to repository and target" {
+    const allocator = std.testing.allocator;
+    var state: compare_page.ComparePageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(7);
+    state.activation.state.active.members.source = .fresh;
+    state.basis = .{
+        .base = .{
+            .full_ref = try allocator.dupe(u8, "refs/remotes/origin/main"),
+            .display_name = try allocator.dupe(u8, "origin/main"),
+            .kind = .remote_tracking,
+            .oid = .{},
+        },
+        .head_display = try allocator.dupe(u8, "HEAD@0123456"),
+        .merge_base_oid = .{},
+        .head_oid = .{},
+        .ahead_count = 2,
+    };
+    state.base_target = .{
+        .full_ref = try allocator.dupe(u8, "refs/remotes/origin/main"),
+        .display_name = try allocator.dupe(u8, "origin/main"),
+        .kind = .remote_tracking,
+    };
+    const root_identity: root_capability.Identity = .{ .device = 5, .inode = 8 };
+    state.accepted_repository_identity = .{ .repo_epoch = 7, .root_identity = root_identity };
+    state.load.state = .{ .empty = .no_changes };
+    var context: Context = .{
+        .page = &state,
+        .palette = .default(),
+        .repo_root = "/repo",
+        .repo_epoch = 7,
+        .root_identity = root_identity,
+        .layout = .{ .width = 80, .height = 12 },
+    };
+
+    const accepted = pageHeaderPresentation(context).?;
+    const text = (try page_header.formatAlloc(allocator, accepted, 80)).?;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("BASE origin/main  …  HEAD HEAD@0123456", text);
+
+    context.root_identity = .{ .device = 5, .inode = 9 };
+    try std.testing.expect(pageHeaderPresentation(context) == null);
+    context.root_identity = null;
+    try std.testing.expect(pageHeaderPresentation(context) == null);
+    context.root_identity = root_identity;
+
+    context.repo_epoch = 8;
+    try std.testing.expect(pageHeaderPresentation(context) == null);
+    state.activation.state.active.members.source = .pending;
+    try std.testing.expect(pageHeaderPresentation(context).? == .terminal);
+    context.repo_epoch = 7;
+    try std.testing.expect(pageHeaderPresentation(context).? == .compare);
+
+    state.activation.state.active.members.source = .failed;
+    const stale = pageHeaderPresentation(context).?;
+    const stale_text = (try page_header.formatAlloc(allocator, stale, 80)).?;
+    defer allocator.free(stale_text);
+    try std.testing.expectEqualStrings("BASE origin/main  …  HEAD HEAD@0123456 stale", stale_text);
+
+    state.base_target.?.full_ref[0] = 'x';
+    try std.testing.expect(pageHeaderPresentation(context).? == .terminal);
 }
 
 test "empty Compare state describes one ahead commit accurately" {

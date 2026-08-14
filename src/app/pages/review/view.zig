@@ -4,6 +4,7 @@ const chasen = @import("chasen");
 const draw = @import("draw");
 const branch_chrome = @import("../../branch_chrome.zig");
 const app_page = @import("../../page.zig");
+const page_header = @import("../../page_header.zig");
 const review_projection = @import("../../review_projection.zig");
 const diff_surface_view = @import("../../diff_surface/view.zig");
 const review_page = @import("../review.zig");
@@ -97,6 +98,52 @@ pub const Context = struct {
         return self.navigation.diffHeaderSelectionActive();
     }
 };
+
+/// Project Review's exact current-root branch snapshot into display-only page
+/// chrome. Foreground replacement never reuses the retained label; only an
+/// exact same-root background refresh may expose refreshing/stale state.
+pub fn pageHeaderPresentation(app: Context) ?page_header.Presentation {
+    const root = app.repo_root orelse return null;
+    const matching_snapshot = if (app.page.branch_status.repo_root) |snapshot_root|
+        std.mem.eql(u8, root, snapshot_root)
+    else
+        false;
+
+    if (app.page.branch_status_load.pending) |pending| if (pending.publication_allowed) {
+        if (pending.origin == .foreground or !matching_snapshot) return .{
+            .terminal = .{ .kind = .head, .state = .loading },
+        };
+        return headPresentation(app.page.branch_status.status, .refreshing);
+    };
+
+    if (!matching_snapshot) return switch (app.page.branch_status_load.freshness) {
+        .missing => .{ .terminal = .{ .kind = .head, .state = .unavailable } },
+        .fresh, .stale_refresh => null,
+    };
+    return switch (app.page.branch_status_load.freshness) {
+        .fresh => headPresentation(app.page.branch_status.status, .fresh),
+        .stale_refresh => headPresentation(app.page.branch_status.status, .stale),
+        .missing => .{ .terminal = .{ .kind = .head, .state = .unavailable } },
+    };
+}
+
+fn headPresentation(
+    status: git_branch_status.BranchStatus,
+    freshness: page_header.Freshness,
+) page_header.Presentation {
+    return .{ .head = switch (status.head) {
+        .branch => |name| .{ .branch = .{
+            .display_name = name,
+            .upstream = if (status.upstream == null)
+                .no_upstream
+            else
+                .{ .ahead = if (status.ahead_behind) |counts| counts.ahead else 0 },
+            .freshness = freshness,
+        } },
+        .detached => .{ .detached = freshness },
+        .unknown => .{ .unknown = freshness },
+    } };
+}
 
 fn activationPresentation(review: *const review_page.ReviewPageState, source: diff_source.SourceMode) ?ActivationPresentation {
     return diff_surface_view.activationPresentation(&review.activation, source);
@@ -549,6 +596,53 @@ test "branch sidebar retains background snapshot but shows foreground loading" {
     try std.testing.expectEqualStrings("loading branch", loading.text);
     try std.testing.expect(!loading.action_hints.push);
     try std.testing.expect(!loading.action_hints.pull);
+}
+
+test "Review page header admits only exact-root branch snapshots" {
+    var builder = git_branch_status.Builder.init(std.testing.allocator);
+    errdefer builder.deinit();
+    try builder.setBranchHead("feature/header");
+    try builder.setUpstream("origin/main");
+    builder.setAheadBehind(2, 0);
+    var bundle = builder.finish();
+    var branch_status: git_branch_status.State = .{};
+    try branch_status.replace("/repo", &bundle);
+
+    var page_state: review_page.ReviewPageState = .{
+        .branch_status = branch_status,
+        .branch_status_load = .{
+            .generation = 1,
+            .pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 },
+            .freshness = .stale_refresh,
+        },
+    };
+    defer page_state.branch_status.deinit();
+    var context = testContext(&page_state, .default(), 80, 12);
+    context.repo_root = "/repo";
+
+    const refreshing = pageHeaderPresentation(context).?;
+    const refreshing_text = (try page_header.formatAlloc(std.testing.allocator, refreshing, 80)).?;
+    defer std.testing.allocator.free(refreshing_text);
+    try std.testing.expectEqualStrings("HEAD feature/header ↑2 loading", refreshing_text);
+
+    page_state.branch_status_load.pending.?.publication_allowed = false;
+    const superseded = pageHeaderPresentation(context).?;
+    const superseded_text = (try page_header.formatAlloc(std.testing.allocator, superseded, 80)).?;
+    defer std.testing.allocator.free(superseded_text);
+    try std.testing.expectEqualStrings("HEAD feature/header ↑2 stale", superseded_text);
+
+    page_state.branch_status_load.pending.?.publication_allowed = true;
+    page_state.branch_status_load.pending.?.origin = .foreground;
+    try std.testing.expect(pageHeaderPresentation(context).? == .terminal);
+
+    page_state.branch_status_load.pending = null;
+    const stale = pageHeaderPresentation(context).?;
+    const stale_text = (try page_header.formatAlloc(std.testing.allocator, stale, 80)).?;
+    defer std.testing.allocator.free(stale_text);
+    try std.testing.expectEqualStrings("HEAD feature/header ↑2 stale", stale_text);
+
+    context.repo_root = "/other";
+    try std.testing.expect(pageHeaderPresentation(context) == null);
 }
 
 test "review branch action hint renders effective keys with Files stats style" {

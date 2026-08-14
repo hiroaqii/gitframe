@@ -87,6 +87,12 @@ pub fn tabAtColumn(bar_width: u16, col: u16) ?Id {
     return null;
 }
 
+/// Exclusive end of the fixed normal-mode tab reservation.
+pub fn tabExtent() u16 {
+    const last = tab(all[all.len - 1]);
+    return last.col +| last.width;
+}
+
 /// A non-Review page slot remains allocation-free until its owner replaces
 /// this placeholder with real state.
 pub const LazyPlaceholder = struct {
@@ -128,4 +134,11 @@ test "page bar hit testing excludes margins and gaps" {
     try std.testing.expect(tabAtColumn(80, review_tab.col + review_tab.width) == null);
     try std.testing.expectEqual(Id.repository, tabAtColumn(80, repository_tab.col).?);
     try std.testing.expect(tabAtColumn(repository_tab.col, repository_tab.col) == null);
+}
+
+test "page bar context starts after fixed tabs and remains a non-target" {
+    const config = tab(.config);
+    try std.testing.expectEqual(config.col + config.width, tabExtent());
+    try std.testing.expect(tabAtColumn(80, tabExtent()) == null);
+    try std.testing.expect(tabAtColumn(80, tabExtent() + 1) == null);
 }

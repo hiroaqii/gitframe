@@ -76,10 +76,7 @@ pub const Controller = struct {
                 var owned = finished;
                 defer owned.deinit();
                 const outcome = self.page_state.applyBranchFinished(ctx.allocator(), &owned);
-                const quiet = self.active_page != .repository or switch (outcome) {
-                    .changed, .failed => false,
-                    .discarded, .unchanged => true,
-                };
+                const quiet = self.active_page != .repository or outcome == .discarded;
                 return .{ .redraw = if (quiet) .skip else .default };
             },
             .path_history_finished => |finished| {
