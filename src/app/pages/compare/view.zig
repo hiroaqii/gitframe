@@ -9,6 +9,8 @@ const compare_page = @import("../compare.zig");
 const commit_time = @import("commit_time.zig");
 const compare_navigation = @import("navigation.zig");
 const diff_surface = @import("../../diff_surface.zig");
+const diff_render = @import("../../../diff/render.zig");
+const keymap = @import("keymap");
 const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 
@@ -19,6 +21,7 @@ pub const Context = struct {
     repo_epoch: u64,
     root_identity: ?root_capability.Identity,
     layout: diff_surface.Layout,
+    keymap: keymap.Effective = .{},
 
     pub fn footer(self: Context) diff_surface.view.FooterView {
         return diff_surface.view.footer(.{
@@ -81,7 +84,12 @@ fn compareTerminal(pending: bool, failed: bool) ?page_header.Presentation {
 
 pub fn view(app: Context, surface: *chasen.Surface) !void {
     const navigation_context = navigationView(app);
-    var pane_adapter = DiffPaneAdapter{ .context = navigation_context, .palette = app.palette };
+    var mode_key_buffer: [16]u8 = undefined;
+    var pane_adapter = DiffPaneAdapter{
+        .context = navigation_context,
+        .palette = app.palette,
+        .mode_toggle_key = displayModeToggleKey(app, mode_key_buffer[0..]),
+    };
     const branch = try branchPresentation(app, surface.frameAllocator());
     const empty_message: ?diff_surface.view.StateMessage = if (app.page.basis) |basis|
         try emptyStateMessage(surface.frameAllocator(), basis.base.display_name, basis.ahead_count)
@@ -245,6 +253,7 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
 const DiffPaneAdapter = struct {
     context: compare_navigation.View,
     palette: theme.Palette,
+    mode_toggle_key: ?[]const u8,
 
     fn interface(self: *DiffPaneAdapter) diff_surface.view.DiffPaneRenderer {
         return .{ .ctx = self, .render_fn = render };
@@ -259,18 +268,28 @@ const DiffPaneAdapter = struct {
             loaded,
             self.palette,
             null,
+            self.mode_toggle_key,
         );
     }
 };
 
 fn navigationView(app: Context) compare_navigation.View {
+    var key_buffer: [16]u8 = undefined;
     return .{
         .page = app.page,
         .repo_root = app.repo_root,
         .repo_epoch = app.repo_epoch,
         .root_identity = app.root_identity,
         .layout = app.layout,
+        .mode_toggle_hint_width = diff_render.modeToggleHintWidth(
+            displayModeToggleKey(app, key_buffer[0..]),
+        ),
     };
+}
+
+fn displayModeToggleKey(app: Context, buffer: []u8) ?[]const u8 {
+    if (app.page.search.mode or app.page.file_search.mode or app.page.base_picker.open) return null;
+    return app.keymap.display(.toggle_display_mode, buffer);
 }
 
 fn branchPresentation(app: Context, allocator: std.mem.Allocator) !?diff_surface.view.SidebarBranchPresentation {
@@ -512,6 +531,30 @@ fn pickerViewContext(page_state: *const compare_page.ComparePageState, width: u1
         .root_identity = null,
         .layout = .{ .width = width, .height = height },
     };
+}
+
+test "Compare display mode header key follows the effective keymap and modal owner" {
+    var page_state: compare_page.ComparePageState = .{};
+    var config: keymap.Config = .{};
+    config.set(.toggle_display_mode, .{ .plain_codepoint = 'z' });
+    var context = pickerViewContext(&page_state, 90, 10);
+    context.keymap = keymap.Effective.fromConfig(config);
+
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("z", displayModeToggleKey(context, buffer[0..]).?);
+    try std.testing.expectEqual(
+        diff_render.modeToggleHintWidth("z"),
+        navigationView(context).mode_toggle_hint_width,
+    );
+
+    page_state.search.mode = true;
+    try std.testing.expect(displayModeToggleKey(context, buffer[0..]) == null);
+    page_state.search.mode = false;
+    page_state.file_search.mode = true;
+    try std.testing.expect(displayModeToggleKey(context, buffer[0..]) == null);
+    page_state.file_search.mode = false;
+    page_state.base_picker.open = true;
+    try std.testing.expect(displayModeToggleKey(context, buffer[0..]) == null);
 }
 
 test "Compare base picker narrow and wide surfaces keep time independent from long branch names" {

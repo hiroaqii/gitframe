@@ -62,6 +62,7 @@ pub const SelectionActionHit = struct {
 pub const View = struct {
     surface: diff_surface.ReadSurface,
     repo_root: ?[]const u8,
+    mode_toggle_hint_width: u16 = 0,
 
     pub fn displayNavigationSnapshot(self: View) diff_surface.DisplayNavigationSnapshot {
         return .{
@@ -465,10 +466,24 @@ pub const BodyView = struct {
     pub fn displayedDiffHeaderLayout(self: BodyView, content_width: u16, display_path: []const u8) ?diff_render.HeaderLayout {
         const mode_width = diff_render.bodyWidth(content_width);
         if (self.generatedBody()) |body| {
-            return diff_render.generatedHeaderLayout(content_width, display_path, body.source.contentLineCount(), self.view.surface.viewer.display_mode, mode_width);
+            return diff_render.generatedHeaderLayout(
+                content_width,
+                display_path,
+                body.source.contentLineCount(),
+                self.view.surface.viewer.display_mode,
+                mode_width,
+                self.view.mode_toggle_hint_width,
+            );
         }
         const file = self.displayedDiffFile() orelse return null;
-        return diff_render.fileHeaderLayout(content_width, display_path, file, self.view.surface.viewer.display_mode, mode_width);
+        return diff_render.fileHeaderLayout(
+            content_width,
+            display_path,
+            file,
+            self.view.surface.viewer.display_mode,
+            mode_width,
+            self.view.mode_toggle_hint_width,
+        );
     }
 
     pub fn diffMouseHit(self: BodyView, point: diff_surface.MousePoint) ?diff_surface.DiffMouseHit {
@@ -786,12 +801,14 @@ pub const Controller = struct {
     surface: diff_surface.DiffSurface,
     repo_root: ?[]const u8,
     repo_epoch: u64 = 0,
+    mode_toggle_hint_width: u16 = 0,
     diagnostics: diff_surface.DiagnosticSink,
 
     pub fn view(self: Controller) View {
         return .{
             .surface = self.surface.readOnly(),
             .repo_root = self.repo_root,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
         };
     }
 

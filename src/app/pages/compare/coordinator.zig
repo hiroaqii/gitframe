@@ -59,6 +59,7 @@ pub const Controller = struct {
     page_state: *compare_page.ComparePageState,
     repo: repo_session.View,
     layout: diff_surface.Layout,
+    mode_toggle_hint_width: u16 = 0,
     env_map: ?*std.process.Environ.Map,
 
     pub fn navigation(self: Controller) compare_navigation.Controller {
@@ -68,6 +69,7 @@ pub const Controller = struct {
             .repo_epoch = self.repo.epoch(),
             .root_identity = self.repo.activeIdentity(),
             .layout = self.layout,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
         };
     }
 
@@ -78,6 +80,7 @@ pub const Controller = struct {
             .repo_epoch = self.repo.epoch(),
             .root_identity = self.repo.activeIdentity(),
             .layout = self.layout,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
         };
     }
 

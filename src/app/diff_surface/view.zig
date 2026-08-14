@@ -442,6 +442,7 @@ pub fn viewDiffPane(
     loaded: loaded_diff.LoadedDiff,
     palette: theme.Palette,
     status_only: ?StatusOnlyRenderer,
+    display_mode_toggle_key: ?[]const u8,
 ) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
@@ -462,17 +463,18 @@ pub fn viewDiffPane(
     switch (body.resolvedTarget().kind) {
         .none => return,
         .inert => {
-            try body.renderProjectedBody(projectedBodyRenderArgs(&diff_content, body, palette, active));
+            try body.renderProjectedBody(projectedBodyRenderArgs(&diff_content, body, palette, active, display_mode_toggle_key));
             drawPaneHeaderRule(surface, active, palette);
             return;
         },
-        .projected => try body.renderProjectedBody(projectedBodyRenderArgs(&diff_content, body, palette, active)),
+        .projected => try body.renderProjectedBody(projectedBodyRenderArgs(&diff_content, body, palette, active, display_mode_toggle_key)),
         .primary => {
             const file_index = body.view.selectedFileIndex(&loaded) orelse return;
             const file = loaded.document.files[file_index];
             const mode = diff_render.effectiveMode(diff_render.bodyWidth(diff_content.size().width), state.viewer.display_mode);
             try diff_render.renderFile(&diff_content, file, .{
                 .requested_mode = state.viewer.display_mode,
+                .display_mode_toggle_key = display_mode_toggle_key,
                 .scroll = body.renderDiffScroll(),
                 .horizontal_scroll = state.viewer.diff_horizontal_scroll,
                 .pane_active = active,
@@ -561,11 +563,18 @@ fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stat
     try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = palette.color(.danger), .bold = true });
 }
 
-fn projectedBodyRenderArgs(surface: *chasen.Surface, body: diff_surface.navigation.BodyView, palette: theme.Palette, active: bool) diff_surface.RenderProjectedBodyArgs {
+fn projectedBodyRenderArgs(
+    surface: *chasen.Surface,
+    body: diff_surface.navigation.BodyView,
+    palette: theme.Palette,
+    active: bool,
+    display_mode_toggle_key: ?[]const u8,
+) diff_surface.RenderProjectedBodyArgs {
     const state = body.view.surface;
     return .{
         .surface = surface,
         .requested_mode = state.viewer.display_mode,
+        .display_mode_toggle_key = display_mode_toggle_key,
         .scroll = body.renderDiffScroll(),
         .horizontal_scroll = state.viewer.diff_horizontal_scroll,
         .pane_active = active,
@@ -721,12 +730,12 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     try ts.init(80, 10);
     defer ts.deinit();
 
-    try viewDiffPane(&ts.surface, body, loaded, .default(), null);
+    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null);
     try std.testing.expectEqual(@as(usize, 1), fake.resolved);
     try std.testing.expectEqual(@as(usize, 0), fake.hunk_stage + fake.generated + fake.displayed_file + fake.line_index + fake.unexpected);
 
     fake = .{ .kind = .primary, .loaded = &loaded };
-    try viewDiffPane(&ts.surface, body, loaded, .default(), null);
+    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null);
     try std.testing.expectEqual(@as(usize, 3), fake.resolved);
     try std.testing.expectEqual(@as(usize, 1), fake.hunk_stage);
     try std.testing.expectEqual(@as(usize, 1), fake.generated);

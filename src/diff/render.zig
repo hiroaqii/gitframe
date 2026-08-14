@@ -47,6 +47,7 @@ pub const HunkStagePresentation = union(enum) {
 
 pub const RenderOptions = struct {
     requested_mode: DisplayMode = .unified,
+    display_mode_toggle_key: ?[]const u8 = null,
     scroll: usize = 0,
     horizontal_scroll: usize = 0,
     pane_active: bool = true,
@@ -384,6 +385,7 @@ pub const HeaderLayout = struct {
     path_target: ?HeaderRegion = null,
     stats: ?HeaderRegion = null,
     mode: ?HeaderRegion = null,
+    mode_toggle_hint: ?HeaderRegion = null,
 };
 
 pub fn effectiveMode(width: u16, requested_mode: DisplayMode) DisplayMode {
@@ -395,6 +397,18 @@ pub fn modeLabel(width: u16, requested_mode: DisplayMode) []const u8 {
     const mode = effectiveMode(width, requested_mode);
     if (mode != requested_mode) return "unified (auto)";
     return mode.label();
+}
+
+const mode_toggle_hint_prefix = "  (";
+const mode_toggle_hint_suffix = ": toggle)";
+
+pub fn modeToggleHintWidth(key: ?[]const u8) u16 {
+    const binding = key orelse return 0;
+    if (binding.len == 0) return 0;
+    const width = chasen.text.displayWidth(mode_toggle_hint_prefix) +
+        chasen.text.displayWidth(binding) +
+        chasen.text.displayWidth(mode_toggle_hint_suffix);
+    return @intCast(@min(width, std.math.maxInt(u16)));
 }
 
 pub fn fileStats(file: diff_parser.FileDiff) FileStats {
@@ -411,22 +425,36 @@ pub const HeaderStats = struct {
     detail_width: usize,
 };
 
-pub fn fileHeaderLayout(width: u16, path: []const u8, file: diff_parser.FileDiff, requested_mode: DisplayMode, mode_width: u16) HeaderLayout {
+pub fn fileHeaderLayout(
+    width: u16,
+    path: []const u8,
+    file: diff_parser.FileDiff,
+    requested_mode: DisplayMode,
+    mode_width: u16,
+    mode_toggle_hint_width: u16,
+) HeaderLayout {
     const stats = fileStats(file);
-    return headerLayout(width, path, .{
+    return headerLayoutWithModeToggleHint(width, path, .{
         .added = stats.added,
         .removed = stats.removed,
         .detail_width = std.fmt.count("{d} hunks", .{file.hunks.len}),
-    }, modeLabel(mode_width, requested_mode));
+    }, modeLabel(mode_width, requested_mode), mode_toggle_hint_width);
 }
 
-pub fn generatedHeaderLayout(width: u16, path: []const u8, added_lines: usize, requested_mode: DisplayMode, mode_width: u16) HeaderLayout {
+pub fn generatedHeaderLayout(
+    width: u16,
+    path: []const u8,
+    added_lines: usize,
+    requested_mode: DisplayMode,
+    mode_width: u16,
+    mode_toggle_hint_width: u16,
+) HeaderLayout {
     const detail = "generated";
-    return headerLayout(width, path, .{
+    return headerLayoutWithModeToggleHint(width, path, .{
         .added = added_lines,
         .removed = 0,
         .detail_width = chasen.text.displayWidth(detail),
-    }, modeLabel(mode_width, requested_mode));
+    }, modeLabel(mode_width, requested_mode), mode_toggle_hint_width);
 }
 
 fn headerStatsWidth(stats: HeaderStats) u16 {
@@ -443,10 +471,38 @@ fn modeLabelWidth(label: []const u8) u16 {
 }
 
 pub fn headerLayout(width: u16, path: []const u8, stats: ?HeaderStats, mode_label: []const u8) HeaderLayout {
+    return headerLayoutForModeWidth(width, path, stats, modeLabelWidth(mode_label));
+}
+
+pub fn headerLayoutWithModeToggleHint(
+    width: u16,
+    path: []const u8,
+    stats: ?HeaderStats,
+    mode_label: []const u8,
+    toggle_hint_width: u16,
+) HeaderLayout {
+    const base_width = modeLabelWidth(mode_label);
+    if (toggle_hint_width == 0) return headerLayoutForModeWidth(width, path, stats, base_width);
+
+    var hinted = headerLayoutForModeWidth(width, path, stats, base_width +| toggle_hint_width);
+    if (hinted.mode) |region| {
+        hinted.mode = .{ .col = region.col, .width = base_width };
+        hinted.mode_toggle_hint = .{
+            .col = region.col +| base_width,
+            .width = toggle_hint_width,
+        };
+        return hinted;
+    }
+
+    // The current mode is the primary fact. If the complete hint does not fit,
+    // retain the mode label and omit the hint as one atomic item.
+    return headerLayoutForModeWidth(width, path, stats, base_width);
+}
+
+fn headerLayoutForModeWidth(width: u16, path: []const u8, stats: ?HeaderStats, mode_width: u16) HeaderLayout {
     if (width == 0) return .{};
 
     const right_padding: u16 = 1;
-    const mode_width = modeLabelWidth(mode_label);
     var layout: HeaderLayout = .{};
 
     const stats_width = if (stats) |value| headerStatsWidth(value) else 0;
@@ -530,7 +586,15 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
     const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
-    try renderFileHeader(surface, file, options.requested_mode, content_width, options.header_selection, styles);
+    try renderFileHeader(
+        surface,
+        file,
+        options.requested_mode,
+        content_width,
+        options.display_mode_toggle_key,
+        options.header_selection,
+        styles,
+    );
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
@@ -608,7 +672,16 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, sour
     const styles = stylesForOptions(options);
     const content_width = bodyWidth(size.width);
     const mode = effectiveMode(content_width, options.requested_mode);
-    try renderGeneratedFileHeader(surface, path, source.contentLineCount(), options.requested_mode, content_width, options.header_selection, styles);
+    try renderGeneratedFileHeader(
+        surface,
+        path,
+        source.contentLineCount(),
+        options.requested_mode,
+        content_width,
+        options.display_mode_toggle_key,
+        options.header_selection,
+        styles,
+    );
     var body_surface = surface.child(.{
         .col = cursor_gutter_width,
         .row = 0,
@@ -656,6 +729,7 @@ fn renderFileHeader(
     file: diff_parser.FileDiff,
     requested_mode: DisplayMode,
     mode_width: u16,
+    mode_toggle_key: ?[]const u8,
     header_selected: bool,
     styles: RenderStyles,
 ) !void {
@@ -665,7 +739,7 @@ fn renderFileHeader(
         .added = stats.added,
         .removed = stats.removed,
         .detail = detail,
-    }, modeLabel(mode_width, requested_mode), header_selected, styles);
+    }, modeLabel(mode_width, requested_mode), mode_toggle_key, header_selected, styles);
 }
 
 fn renderGeneratedFileHeader(
@@ -674,6 +748,7 @@ fn renderGeneratedFileHeader(
     added_lines: usize,
     requested_mode: DisplayMode,
     mode_width: u16,
+    mode_toggle_key: ?[]const u8,
     header_selected: bool,
     styles: RenderStyles,
 ) !void {
@@ -681,7 +756,7 @@ fn renderGeneratedFileHeader(
         .added = added_lines,
         .removed = 0,
         .detail = "generated",
-    }, modeLabel(mode_width, requested_mode), header_selected, styles);
+    }, modeLabel(mode_width, requested_mode), mode_toggle_key, header_selected, styles);
 }
 
 const HeaderStatsText = struct {
@@ -690,15 +765,23 @@ const HeaderStatsText = struct {
     detail: []const u8,
 };
 
-fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, stats: HeaderStatsText, mode_label: []const u8, header_selected: bool, styles: RenderStyles) !void {
+fn drawHeaderLine(
+    surface: *chasen.Surface,
+    path: []const u8,
+    stats: HeaderStatsText,
+    mode_label: []const u8,
+    mode_toggle_key: ?[]const u8,
+    header_selected: bool,
+    styles: RenderStyles,
+) !void {
     const size = surface.size();
     if (size.width == 0) return;
 
-    const layout = headerLayout(size.width, path, .{
+    const layout = headerLayoutWithModeToggleHint(size.width, path, .{
         .added = stats.added,
         .removed = stats.removed,
         .detail_width = chasen.text.displayWidth(stats.detail),
-    }, mode_label);
+    }, mode_label, modeToggleHintWidth(mode_toggle_key));
 
     const path_width = if (layout.stats) |region| region.col -| 1 else if (layout.mode) |region| region.col -| 2 else size.width;
     if (path_width > 0) {
@@ -708,6 +791,17 @@ fn drawHeaderLine(surface: *chasen.Surface, path: []const u8, stats: HeaderStats
 
     if (layout.stats) |region| try drawHeaderStats(surface, region.col, stats, styles);
     if (layout.mode) |region| try draw.copyClippedTextAt(surface, region.col, 0, mode_label, headerMetadataStyle(styles));
+    if (layout.mode_toggle_hint) |region| {
+        const binding = mode_toggle_key orelse unreachable;
+        const hint = try std.fmt.allocPrint(
+            surface.frameAllocator(),
+            "{s}{s}{s}",
+            .{ mode_toggle_hint_prefix, binding, mode_toggle_hint_suffix },
+        );
+        var hint_style = headerMetadataStyle(styles);
+        hint_style.dim = true;
+        try draw.copyClippedTextAt(surface, region.col, 0, hint, hint_style);
+    }
 
     if (header_selected) {
         if (layout.path_target) |region| applyHeaderRegionStyle(surface, region, styles.header_selection);
@@ -1501,6 +1595,57 @@ test "display mode falls back to unified on narrow panes" {
 
     try std.testing.expectEqualStrings("unified (auto)", modeLabel(40, .side_by_side));
     try std.testing.expectEqualStrings("side-by-side", modeLabel(90, .side_by_side));
+}
+
+test "display mode header renders a dim configurable toggle hint" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{},
+    };
+    var surface: chasen.testing.TestSurface = undefined;
+    try surface.init(80, 3);
+    defer surface.deinit();
+
+    try renderFile(&surface.surface, file, .{ .display_mode_toggle_key = "z" });
+    const layout = fileHeaderLayout(
+        80,
+        displayPath(file),
+        file,
+        .unified,
+        bodyWidth(80),
+        modeToggleHintWidth("z"),
+    );
+    const mode = layout.mode orelse return error.ExpectedModeHeader;
+    const hint = layout.mode_toggle_hint orelse return error.ExpectedModeToggleHint;
+    try surface.expectCellText(mode.col, 0, "u");
+    try surface.expectCellText(hint.col + 2, 0, "(");
+    try surface.expectCellText(hint.col + 3, 0, "z");
+    const snapshot = try surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "unified  (z: toggle)") != null);
+    try std.testing.expect(!surface.surface.readCell(mode.col, 0).?.style.dim);
+    try std.testing.expect(surface.surface.readCell(hint.col + 2, 0).?.style.dim);
+    try std.testing.expect(layout.path_target.?.col + layout.path_target.?.width <= hint.col);
+}
+
+test "display mode header drops the complete toggle hint before the mode label" {
+    const mode_only = headerLayout(20, "a", null, "unified");
+    const hinted = headerLayoutWithModeToggleHint(
+        20,
+        "a",
+        null,
+        "unified",
+        modeToggleHintWidth("u"),
+    );
+
+    try std.testing.expect(mode_only.mode != null);
+    try std.testing.expect(hinted.mode != null);
+    try std.testing.expect(hinted.mode_toggle_hint == null);
+    try std.testing.expectEqual(mode_only.mode.?.col, hinted.mode.?.col);
+    try std.testing.expectEqual(mode_only.mode.?.width, hinted.mode.?.width);
 }
 
 test "fileStats counts added and removed hunk lines" {
@@ -3648,7 +3793,7 @@ test "parsed file header keeps semantic statistics and metadata when inactive" {
     try expectFocusStableHeaderStyleMatrix(
         &active.surface,
         &inactive.surface,
-        fileHeaderLayout(80, displayPath(file), file, .unified, bodyWidth(80)),
+        fileHeaderLayout(80, displayPath(file), file, .unified, bodyWidth(80), 0),
         "+1",
         "-1",
         palette,
@@ -3675,7 +3820,7 @@ test "generated file header keeps semantic statistics and metadata when inactive
     try expectFocusStableHeaderStyleMatrix(
         &active.surface,
         &inactive.surface,
-        generatedHeaderLayout(80, "src/new.zig", source.contentLineCount(), .unified, bodyWidth(80)),
+        generatedHeaderLayout(80, "src/new.zig", source.contentLineCount(), .unified, bodyWidth(80), 0),
         "+2",
         "-0",
         palette,

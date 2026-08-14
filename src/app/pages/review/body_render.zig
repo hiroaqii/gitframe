@@ -29,6 +29,7 @@ pub const ParsedBody = struct {
 pub fn renderParsed(body: ParsedBody, args: diff_surface.RenderProjectedBodyArgs) !void {
     try diff_render.renderFile(args.surface, body.file, .{
         .requested_mode = args.requested_mode,
+        .display_mode_toggle_key = args.display_mode_toggle_key,
         .scroll = args.scroll,
         .horizontal_scroll = args.horizontal_scroll,
         .pane_active = args.pane_active,
@@ -48,6 +49,7 @@ pub fn renderParsed(body: ParsedBody, args: diff_surface.RenderProjectedBodyArgs
 pub fn renderGenerated(bundle: *const review_projection.GeneratedFileBundle, args: diff_surface.RenderProjectedBodyArgs) !void {
     try diff_render.renderGeneratedAddedFile(args.surface, bundle.path, &bundle.source, .{
         .requested_mode = args.requested_mode,
+        .display_mode_toggle_key = args.display_mode_toggle_key,
         .scroll = args.scroll,
         .horizontal_scroll = args.horizontal_scroll,
         .pane_active = args.pane_active,

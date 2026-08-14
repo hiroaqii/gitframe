@@ -38,6 +38,7 @@ const workflow_remote = @import("app/workflow/remote.zig");
 const shell_effects = @import("app/shell_effects.zig");
 const context = @import("context.zig");
 const config_mod = @import("config.zig");
+const diff_render = @import("diff/render.zig");
 const diff_selection = @import("diff/selection.zig");
 const diff_source = @import("diff/source.zig");
 const keymap = @import("keymap");
@@ -179,6 +180,7 @@ pub const App = struct {
             .page_state = &self.pages.compare,
             .repo = self.repoSessionView(),
             .layout = .{ .width = body_size.width, .height = body_size.height },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
             .env_map = self.env_map,
         };
     }
@@ -234,6 +236,7 @@ pub const App = struct {
             .root_identity = self.repoSessionView().activeIdentity(),
             .source = self.config.source,
             .layout = .{ .width = size.width, .height = size.height },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
             .diagnostics = .{ .target = &self.pages.review.status },
         };
     }
@@ -247,7 +250,24 @@ pub const App = struct {
             .root_identity = self.repoSessionView().activeIdentity(),
             .source = self.config.source,
             .layout = .{ .width = size.width, .height = size.height },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
         };
+    }
+
+    fn displayModeToggleHintWidth(self: *const App, target: page.Id) u16 {
+        const reachable = switch (target) {
+            .review => !self.pages.review.search.mode and !self.pages.review.file_search.mode,
+            .compare => !self.pages.compare.search.mode and
+                !self.pages.compare.file_search.mode and
+                !self.pages.compare.base_picker.open,
+            .repository, .config => false,
+        };
+        if (!reachable) return 0;
+
+        var key_buffer: [16]u8 = undefined;
+        return diff_render.modeToggleHintWidth(
+            self.keymap.display(.toggle_display_mode, key_buffer[0..]),
+        );
     }
 
     fn reviewOperations(self: *const App) review_operations.View {
@@ -837,6 +857,7 @@ pub const App = struct {
                 .repo_epoch = self.repoSessionView().epoch(),
                 .root_identity = self.repoSessionView().activeIdentity(),
                 .layout = .{ .width = body_size.width, .height = body_size.height },
+                .keymap = self.keymap,
             },
             .repository = .{
                 .page_state = &self.pages.repository,
@@ -922,6 +943,7 @@ pub const App = struct {
             .repo_epoch = repo.epoch(),
             .root_identity = repo.activeIdentity(),
             .layout = .{ .width = body_size.width, .height = body_size.height },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
         };
         var compare_body_adapter = compare_navigation_view.resolver();
         const compare_body_view = compare_navigation_view.bodyView(&compare_body_adapter);

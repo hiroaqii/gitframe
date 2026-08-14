@@ -27,11 +27,13 @@ pub const View = struct {
     repo_epoch: u64,
     root_identity: ?root_capability.Identity,
     layout: diff_surface.Layout,
+    mode_toggle_hint_width: u16 = 0,
 
     pub fn view(self: View) diff_surface.navigation.View {
         return .{
             .surface = self.page.readSurface(source, self.layout),
             .repo_root = self.repo_root,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
         };
     }
 
@@ -82,12 +84,14 @@ pub const Controller = struct {
     repo_epoch: u64,
     root_identity: ?root_capability.Identity,
     layout: diff_surface.Layout,
+    mode_toggle_hint_width: u16 = 0,
 
     fn sharedController(self: Controller) diff_surface.navigation.Controller {
         return .{
             .surface = self.page.diffSurface(source, self.layout),
             .repo_root = self.repo_root,
             .repo_epoch = self.repo_epoch,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
             .diagnostics = .{ .target = &self.page.status },
         };
     }
@@ -99,6 +103,7 @@ pub const Controller = struct {
             .repo_epoch = self.repo_epoch,
             .root_identity = self.root_identity,
             .layout = self.layout,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
         };
     }
 

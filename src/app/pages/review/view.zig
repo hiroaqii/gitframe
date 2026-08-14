@@ -281,6 +281,8 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
+    var mode_key_buffer: [16]u8 = undefined;
+    const mode_toggle_key = displayModeToggleKey(app, mode_key_buffer[0..]);
     var resolver_adapter = app.navigation.contentResolverAdapter();
     var status_adapter: ReviewStatusOnlyRenderer = undefined;
     const status_renderer: ?diff_surface_view.StatusOnlyRenderer = if (app.selectedStatusEntry()) |entry| blk: {
@@ -293,6 +295,7 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
         loaded,
         app.theme,
         status_renderer,
+        mode_toggle_key,
     );
 }
 
@@ -313,6 +316,8 @@ const ReviewStatusOnlyRenderer = struct {
 fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.StatusEntry) !void {
     const active = app.page.viewer.sidebar_hidden or app.page.viewer.focus == .diff;
 
+    var mode_key_buffer: [16]u8 = undefined;
+    const mode_toggle_key = displayModeToggleKey(app, mode_key_buffer[0..]);
     var content = diffContentSurface(surface);
     const path = entry.canonicalPathKey() orelse entry.path;
 
@@ -324,7 +329,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .folded_hunks = &.{},
                 .hunk_stages = .all_staged,
                 .syntax = .initDirect(&bundle.loaded.syntax_spans, 0),
-            }, projectedBodyRenderArgs(app, &content, active));
+            }, projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             try finishProjectedBody(app, surface, &content, active);
             return;
         },
@@ -335,7 +340,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .folded_hunks = &.{},
                 .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.hunkStageStates()),
                 .syntax = bundle.syntaxView(),
-            }, projectedBodyRenderArgs(app, &content, active));
+            }, projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             try finishProjectedBody(app, surface, &content, active);
             return;
         },
@@ -346,27 +351,27 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
                 .folded_hunks = &.{},
                 .hunk_stages = .all_staged,
                 .syntax = bundle.syntaxView(),
-            }, projectedBodyRenderArgs(app, &content, active));
+            }, projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             try finishProjectedBody(app, surface, &content, active);
             return;
         },
         .generated => |bundle| {
-            try review_body_render.renderGenerated(bundle, projectedBodyRenderArgs(app, &content, active));
+            try review_body_render.renderGenerated(bundle, projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             try finishProjectedBody(app, surface, &content, active);
             return;
         },
         .inert_invalid_utf8 => |inert| {
-            try review_body_render.renderStatus(inert.display_path, review_navigation.invalid_utf8_body_message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active));
+            try review_body_render.renderStatus(inert.display_path, review_navigation.invalid_utf8_body_message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .status => |status| {
-            try review_body_render.renderStatus(status.path, status.message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active));
+            try review_body_render.renderStatus(status.path, status.message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .pending => {
-            try review_body_render.renderStatus(path, "Loading review projection...", app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active));
+            try review_body_render.renderStatus(path, "Loading review projection...", app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
@@ -376,10 +381,16 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
     try review_body_render.renderStatusOnlyFallback(&content, entry, app.selectedStatusLineStats(), active, app.theme);
 }
 
-fn projectedBodyRenderArgs(app: Context, surface: *chasen.Surface, active: bool) @import("../../diff_surface.zig").RenderProjectedBodyArgs {
+fn projectedBodyRenderArgs(
+    app: Context,
+    surface: *chasen.Surface,
+    active: bool,
+    display_mode_toggle_key: ?[]const u8,
+) @import("../../diff_surface.zig").RenderProjectedBodyArgs {
     return .{
         .surface = surface,
         .requested_mode = app.page.viewer.display_mode,
+        .display_mode_toggle_key = display_mode_toggle_key,
         .scroll = app.navigation.renderDiffScroll(),
         .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
         .pane_active = active,
@@ -390,6 +401,11 @@ fn projectedBodyRenderArgs(app: Context, surface: *chasen.Surface, active: bool)
         .selection = app.diffSelectionView(),
         .header_selection = app.diffHeaderSelectionActive(),
     };
+}
+
+fn displayModeToggleKey(app: Context, buffer: []u8) ?[]const u8 {
+    if (app.page.search.mode or app.page.file_search.mode) return null;
+    return app.keymap.display(.toggle_display_mode, buffer);
 }
 
 fn finishProjectedBody(app: Context, pane: *chasen.Surface, content: *chasen.Surface, active: bool) !void {
@@ -1545,15 +1561,37 @@ test "diff renderer owns header search marker gutter and input presentation" {
     try narrow.init(72, 8);
     defer narrow.deinit();
     try viewDiffPane(testContext(&page, palette, 72, 9), &narrow.surface, page.load.state.loaded.loaded);
-    try narrow.expectCellText(57, 0, "u");
-    try narrow.expectCellText(65, 0, "(");
+    const narrow_snapshot = try narrow.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(narrow_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "unified (auto)  (u: toggle)") != null);
 
     page.search.mode = true;
     try page.search.input.insertSlice("missing");
+    ts.surface.clear(.{ .col = 0, .row = 0, .width = 90, .height = 10 });
     try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(1, 1, "s");
     try ts.expectCellText(9, 1, "m");
     try ts.expectCellText(16, 1, " ");
+    const search_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(search_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, search_snapshot, "(u: toggle)") == null);
+}
+
+test "review display mode header key follows the effective keymap and input owner" {
+    var page: review_page.ReviewPageState = .{};
+    var config: keymap.Config = .{};
+    config.set(.toggle_display_mode, .{ .plain_codepoint = 'z' });
+    var context = testContext(&page, .default(), 90, 10);
+    context.keymap = keymap.Effective.fromConfig(config);
+
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("z", displayModeToggleKey(context, buffer[0..]).?);
+
+    page.search.mode = true;
+    try std.testing.expect(displayModeToggleKey(context, buffer[0..]) == null);
+    page.search.mode = false;
+    page.file_search.mode = true;
+    try std.testing.expect(displayModeToggleKey(context, buffer[0..]) == null);
 }
 
 test "status-only header keeps semantic statistics and metadata when inactive" {

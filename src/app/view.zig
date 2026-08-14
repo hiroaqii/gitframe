@@ -1869,6 +1869,7 @@ const ShellViewTestHarness = struct {
                 .repo_epoch = 0,
                 .root_identity = self.repo_state.activeIdentity(),
                 .layout = .{ .width = self.terminal_size.width, .height = self.terminal_size.height },
+                .keymap = self.keymap,
             },
             .repository = .{
                 .page_state = &self.repository,

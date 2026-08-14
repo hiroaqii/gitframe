@@ -297,6 +297,7 @@ pub const View = struct {
     root_identity: ?root_capability.Identity = null,
     source: diff_source.SourceMode,
     layout: Layout,
+    mode_toggle_hint_width: u16 = 0,
 
     /// Builds the short-lived shared read-only facade for one delegated call.
     /// The const-qualified surface prevents this View from acquiring write
@@ -305,6 +306,7 @@ pub const View = struct {
         return .{
             .surface = self.page.readSurface(self.source, self.layout),
             .repo_root = self.repo_root,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
         };
     }
 
@@ -1204,6 +1206,7 @@ pub const Controller = struct {
     root_identity: ?root_capability.Identity = null,
     source: diff_source.SourceMode,
     layout: Layout,
+    mode_toggle_hint_width: u16 = 0,
     diagnostics: DiagnosticSink,
 
     fn sharedController(self: Controller) diff_surface.navigation.Controller {
@@ -1211,6 +1214,7 @@ pub const Controller = struct {
             .surface = self.page.diffSurface(self.source, self.layout),
             .repo_root = self.repo_root,
             .repo_epoch = self.repo_epoch,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
             .diagnostics = self.diagnostics,
         };
     }
@@ -1258,6 +1262,7 @@ pub const Controller = struct {
             .root_identity = self.root_identity,
             .source = self.source,
             .layout = self.layout,
+            .mode_toggle_hint_width = self.mode_toggle_hint_width,
         };
     }
 

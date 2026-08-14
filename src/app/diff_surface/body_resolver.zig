@@ -97,6 +97,7 @@ pub const DiffHeaderTarget = struct {
 pub const RenderProjectedBodyArgs = struct {
     surface: *chasen.Surface,
     requested_mode: diff_render.DisplayMode,
+    display_mode_toggle_key: ?[]const u8 = null,
     scroll: usize,
     horizontal_scroll: usize,
     pane_active: bool,
