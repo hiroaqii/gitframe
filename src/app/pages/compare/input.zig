@@ -161,11 +161,11 @@ test "Compare exposes display actions but no write actions" {
 test "Compare routes admitted retained actions through shared input" {
     const retained: Context = .{ .retained_selection_action_available = true };
     try std.testing.expectEqual(
-        Msg{ .shared = .copy_completed_selection },
+        Msg{ .shared = .{ .selection_action = .copy } },
         keyToMsg(retained, .{ .codepoint = 'y' }).?,
     );
     try std.testing.expectEqual(
-        Msg{ .shared = .clear_completed_selection },
+        Msg{ .shared = .{ .selection_action = .clear } },
         keyToMsg(retained, .{ .codepoint = chasen.Key.escape }).?,
     );
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.escape }) == null);

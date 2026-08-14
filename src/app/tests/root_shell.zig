@@ -283,7 +283,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     const keyboard_copy = app.handleEvent(.{ .key_press = .{ .codepoint = 'y' } }) orelse
         return error.ExpectedCompareKeyboardCopy;
     try std.testing.expectEqual(
-        App.Msg{ .compare = .{ .shared = .copy_completed_selection } },
+        App.Msg{ .compare = .{ .shared = .{ .selection_action = .copy } } },
         keyboard_copy,
     );
     try app.update(keyboard_copy, &ctx);
@@ -326,7 +326,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     const keyboard_clear = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.escape } }) orelse
         return error.ExpectedCompareKeyboardClear;
     try std.testing.expectEqual(
-        App.Msg{ .compare = .{ .shared = .clear_completed_selection } },
+        App.Msg{ .compare = .{ .shared = .{ .selection_action = .clear } } },
         keyboard_clear,
     );
     try app.update(keyboard_clear, &ctx);

@@ -429,6 +429,7 @@ pub const App = struct {
                 const previous_compare_body = previous_compare_view.bodyView(&previous_compare_adapter);
                 const compare_selection_anchor = previous_compare_body.captureSelectionViewportAnchor();
                 self.pages.compare.selection_owner = .none;
+                const repository_selection_anchor = self.pages.repository.captureSelectionViewportAnchor();
                 self.pages.repository.cancelMouseOwner();
                 const previous_width = self.reviewNavigationView().diffPaneWidth();
                 const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
@@ -457,7 +458,11 @@ pub const App = struct {
                 compare_body.updateSearchMatchOffset();
                 compare_body.controller.scrollSearchMatchIntoView();
                 compare_body.clampDiffNavigation();
-                self.pages.repository.clampForBodySize(self.shellLayout().bodySize());
+                const repository_body_size = self.shellLayout().bodySize();
+                if (repository_selection_anchor) |anchor|
+                    self.pages.repository.restoreSelectionViewportAnchor(anchor, repository_body_size)
+                else
+                    self.pages.repository.clampForBodySize(repository_body_size);
                 self.overlayScroll().clampHelp();
                 self.overlayScroll().clampPushError();
             },

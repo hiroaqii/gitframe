@@ -355,7 +355,7 @@ test "Compare selection release installs pinned retained actions" {
     try std.testing.expect(page.retainedSelectionAdmitted());
     try std.testing.expect(page.selection_owner == .none);
 
-    var copied = try adapter.shared().apply(allocator, .copy_completed_selection);
+    var copied = try adapter.shared().apply(allocator, .{ .selection_action = .copy });
     defer copied.deinit(allocator);
     var effect = copied.takeEffect() orelse return error.ExpectedSelectionEffect;
     defer effect.deinit(allocator);
@@ -363,7 +363,7 @@ test "Compare selection release installs pinned retained actions" {
         .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
         .copy_diff_header_path => return error.ExpectedSelectionEffect,
     }
-    var cleared = try adapter.shared().apply(allocator, .clear_completed_selection);
+    var cleared = try adapter.shared().apply(allocator, .{ .selection_action = .clear });
     defer cleared.deinit(allocator);
     adapter.applyRetentionTransition(allocator, cleared.retention_transition);
     try std.testing.expectEqual(diff_surface.update.RetentionTransition.cleared, cleared.retention_transition);
@@ -393,7 +393,7 @@ test "Compare selection release installs pinned retained actions" {
         try std.testing.expect(released.effect == null);
         adapter.applyRetentionTransition(allocator, released.retention_transition);
         try std.testing.expectEqual(case.side, page.completed_selection.?.value.parsed_diff.side);
-        var copied_case = try adapter.shared().apply(allocator, .copy_completed_selection);
+        var copied_case = try adapter.shared().apply(allocator, .{ .selection_action = .copy });
         defer copied_case.deinit(allocator);
         var copied_effect = copied_case.takeEffect() orelse return error.ExpectedSelectionEffect;
         defer copied_effect.deinit(allocator);
@@ -401,7 +401,7 @@ test "Compare selection release installs pinned retained actions" {
             .copy_diff_selection => |text| try std.testing.expectEqualStrings(case.expected, text),
             .copy_diff_header_path => return error.ExpectedSelectionEffect,
         }
-        var cleared_case = try adapter.shared().apply(allocator, .clear_completed_selection);
+        var cleared_case = try adapter.shared().apply(allocator, .{ .selection_action = .clear });
         defer cleared_case.deinit(allocator);
         adapter.applyRetentionTransition(allocator, cleared_case.retention_transition);
     }

@@ -6,6 +6,7 @@ const diff_selection = @import("../../diff/selection.zig");
 const navigation = @import("navigation.zig");
 const message = @import("message.zig");
 const selection = @import("selection.zig");
+const selection_action = @import("../selection_action.zig");
 
 /// Owned output which a page adapter translates into its physical effect.
 pub const Effect = union(enum) {
@@ -135,10 +136,7 @@ pub const Controller = struct {
                     self.navigation.controller.surface.viewer.focus = .diff;
                     if (hit.target) |target| self.applyCompletedSelectionAction(
                         allocator orelse return error.MissingAllocator,
-                        switch (target) {
-                            .copy => .copy,
-                            .clear => .clear,
-                        },
+                        target,
                         &result,
                     );
                 } else {
@@ -151,14 +149,9 @@ pub const Controller = struct {
                 result.effect = release.effect;
                 result.retention_transition = release.retention_transition;
             },
-            .copy_completed_selection => self.applyCompletedSelectionAction(
+            .selection_action => |action| self.applyCompletedSelectionAction(
                 allocator orelse return error.MissingAllocator,
-                .copy,
-                &result,
-            ),
-            .clear_completed_selection => self.applyCompletedSelectionAction(
-                allocator orelse return error.MissingAllocator,
-                .clear,
+                action,
                 &result,
             ),
             .toggle_display_mode => {
@@ -305,31 +298,45 @@ pub const Controller = struct {
         };
     }
 
-    const CompletedSelectionAction = enum { copy, clear };
-
     fn applyCompletedSelectionAction(
         self: Controller,
         allocator: std.mem.Allocator,
-        action: CompletedSelectionAction,
+        action: selection_action.Action,
         result: *Update,
     ) void {
-        if (!self.navigation.view().retainedSelectionActionAvailable()) {
-            self.navigation.controller.setStatus("Retained selection is no longer available", .{});
-            return;
-        }
-        switch (action) {
-            .copy => {
-                const completed = self.navigation.controller.surface.completed_selection.* orelse return;
-                const text = completed.clipboardText(allocator) catch {
-                    self.navigation.controller.setStatus("Could not prepare selected text for copying", .{});
-                    return;
-                };
-                result.effect = .{ .copy_diff_selection = text };
-            },
-            .clear => {
-                self.navigation.controller.clearCompletedSelectionWithViewport(self.navigation.resolver, allocator);
+        const Adapter = struct {
+            controller: Controller,
+
+            pub fn available(adapter: *@This()) bool {
+                return adapter.controller.navigation.controller.surface.completed_selection.* != null;
+            }
+
+            pub fn copy(adapter: *@This(), owner: std.mem.Allocator) selection_action.CopyError![]u8 {
+                if (!adapter.controller.navigation.view().retainedSelectionActionAvailable()) {
+                    return error.AuthorityInvalid;
+                }
+                const completed = adapter.controller.navigation.controller.surface.completed_selection.* orelse
+                    return error.AuthorityInvalid;
+                return completed.clipboardText(owner) catch return error.OutOfMemory;
+            }
+
+            pub fn clear(adapter: *@This(), owner: std.mem.Allocator) void {
+                adapter.controller.navigation.controller.clearCompletedSelectionWithViewport(
+                    adapter.controller.navigation.resolver,
+                    owner,
+                );
+            }
+        };
+        var adapter: Adapter = .{ .controller = self };
+        switch (selection_action.dispatch(allocator, action, &adapter)) {
+            .none => {},
+            .copy => |text| result.effect = .{ .copy_diff_selection = text },
+            .cleared => result.retention_transition = .cleared,
+            .authority_invalid => {
                 result.retention_transition = .cleared;
+                self.navigation.controller.setStatus("Retained selection is no longer available", .{});
             },
+            .preparation_failed => self.navigation.controller.setStatus("Could not prepare selected text for copying", .{}),
         }
     }
 

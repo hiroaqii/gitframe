@@ -8,6 +8,7 @@ const chasen = @import("chasen");
 const text_projection = @import("chasen_ui").text_projection;
 const keymap = @import("keymap");
 const app_state = @import("../state.zig");
+const selection_action = @import("../selection_action.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const page = @import("../page.zig");
 const page_link = @import("../page_link.zig");
@@ -39,6 +40,7 @@ const repository_source_geometry = @import("repository/source_geometry.zig");
 const repository_tree_projection = @import("repository/tree_projection.zig");
 
 const repository_tab_width: usize = 4;
+pub const SelectionViewportAnchor = selection_action.ViewportAnchor(usize);
 
 pub const LoadState = enum { idle, no_repository, loading, loaded, empty, failed };
 
@@ -160,6 +162,7 @@ pub const Msg = union(enum) {
     file_search_paste: []const u8,
     wheel_up,
     wheel_down,
+    selection_action: selection_action.Action,
 
     pub fn deinitUndelivered(self: *Msg, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -209,6 +212,11 @@ pub const RepositoryUpdate = struct {
 pub const ApplyOutcome = enum { discarded, unchanged, changed, failed };
 
 pub const MouseButton = enum { left, wheel_up, wheel_down };
+
+const SelectionActionHit = union(enum) {
+    target: selection_action.Action,
+    inert,
+};
 
 /// Page-owned state for the read-only current working-tree browser. The zero
 /// value allocates nothing and is safe to deinitialize before first activation.
@@ -1267,6 +1275,12 @@ pub const RepositoryPageState = struct {
             return self.classifyMismatchedDocumentFinished();
         }
 
+        const previous_source = self.currentSource();
+        const viewport_anchor = if (previous_source) |document|
+            if (self.completed_selection != null) self.captureSourceViewportAnchor(document) else null
+        else
+            null;
+
         // The live drag borrows the displayed document and must always end
         // before its storage is replaced. A completed candidate is independent
         // owned state: retain it only when the incoming document proves the
@@ -1296,6 +1310,12 @@ pub const RepositoryPageState = struct {
         finished.metadata = null;
         self.viewer.resetSource();
         self.reconcileNoSourceFocus();
+        if (viewport_anchor) |anchor| if (self.currentSource()) |document| {
+            // Coordinator clamps against the real frame geometry after this
+            // allocation-free semantic restore. Zero visible rows deliberately
+            // avoid inventing a terminal height inside the page owner.
+            self.restoreSourceViewportAnchor(anchor, document, 0);
+        };
         self.source_search.clear();
         self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
         self.needs_change_map_request = self.currentSource() != null;
@@ -1586,17 +1606,18 @@ pub const RepositoryPageState = struct {
         const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         const body_height = layout.treeRows(body_size.height);
         const source = self.currentSource();
+        const source_projection = self.selectionActionProjection();
         const source_geometry = if (source) |document|
             repository_source_geometry.SourceGeometry.init(.{ .width = layout.source_width, .height = body_size.height }, document, self.viewer.line_numbers)
         else
             null;
         switch (msg) {
             .move_up => switch (self.viewer.focus) {
-                .source => if (source) |document| repository_navigation.moveSource(&self.viewer, document, -1, source_geometry.?),
+                .source => if (source) |document| repository_navigation.moveSourceProjected(&self.viewer, document, -1, source_geometry.?, source_projection),
                 .tree => if (!self.viewer.tree_hidden) self.moveCursor(-1, body_height),
             },
             .move_down => switch (self.viewer.focus) {
-                .source => if (source) |document| repository_navigation.moveSource(&self.viewer, document, 1, source_geometry.?),
+                .source => if (source) |document| repository_navigation.moveSourceProjected(&self.viewer, document, 1, source_geometry.?, source_projection),
                 .tree => if (!self.viewer.tree_hidden) self.moveCursor(1, body_height),
             },
             .wheel_up => if (!self.viewer.tree_hidden) {
@@ -1608,11 +1629,11 @@ pub const RepositoryPageState = struct {
                 self.moveCursor(1, body_height);
             },
             .page_up => switch (self.viewer.focus) {
-                .source => if (source) |document| repository_navigation.pageSource(&self.viewer, document, -1, source_geometry.?),
+                .source => if (source) |document| repository_navigation.pageSourceProjected(&self.viewer, document, -1, source_geometry.?, source_projection),
                 .tree => if (!self.viewer.tree_hidden) self.moveCursor(-@as(isize, @intCast(@max(body_height -| 1, 1))), body_height),
             },
             .page_down => switch (self.viewer.focus) {
-                .source => if (source) |document| repository_navigation.pageSource(&self.viewer, document, 1, source_geometry.?),
+                .source => if (source) |document| repository_navigation.pageSourceProjected(&self.viewer, document, 1, source_geometry.?, source_projection),
                 .tree => if (!self.viewer.tree_hidden) self.moveCursor(@intCast(@max(body_height -| 1, 1)), body_height),
             },
             .toggle_directory => if (!self.viewer.tree_hidden) self.toggleCursor(body_height),
@@ -1641,13 +1662,14 @@ pub const RepositoryPageState = struct {
             .mouse_owner_drag => |point| self.dragMouseOwner(point, body_size),
             .mouse_owner_release => |point| result.command = self.releaseMouseOwner(allocator, point, body_size),
             .cancel_mouse_owner => self.cancelMouseOwner(),
+            .selection_action => |action| result.command = self.applySelectionAction(allocator, action, body_size),
             .mouse_source_wheel_up => if (source) |document| {
                 self.viewer.focus = .source;
-                repository_navigation.wheelSource(&self.viewer, document, -1, source_geometry.?);
+                repository_navigation.wheelSourceProjected(&self.viewer, document, -1, source_geometry.?, source_projection);
             },
             .mouse_source_wheel_down => if (source) |document| {
                 self.viewer.focus = .source;
-                repository_navigation.wheelSource(&self.viewer, document, 1, source_geometry.?);
+                repository_navigation.wheelSourceProjected(&self.viewer, document, 1, source_geometry.?, source_projection);
             },
             .focus_tree => if (!self.viewer.tree_hidden) {
                 self.viewer.focus = .tree;
@@ -1663,15 +1685,16 @@ pub const RepositoryPageState = struct {
             .increase_tree_width => self.adjustTreeWidth(.grow, body_size),
             .tree_first => if (!self.viewer.tree_hidden) self.selectTreeEdge(false, body_height),
             .tree_last => if (!self.viewer.tree_hidden) self.selectTreeEdge(true, body_height),
-            .source_first => if (source) |document| repository_navigation.firstSource(&self.viewer, document, source_geometry.?),
-            .source_last => if (source) |document| repository_navigation.lastSource(&self.viewer, document, source_geometry.?),
+            .source_first => if (source) |document| repository_navigation.firstSourceProjected(&self.viewer, document, source_geometry.?, source_projection),
+            .source_last => if (source) |document| repository_navigation.lastSourceProjected(&self.viewer, document, source_geometry.?, source_projection),
             .toggle_changed_filter => self.toggleChangedFilter(allocator, body_height),
             .toggle_line_numbers => {
                 self.viewer.line_numbers = !self.viewer.line_numbers;
-                if (source) |document| repository_navigation.clampSource(
+                if (source) |document| repository_navigation.clampSourceProjected(
                     &self.viewer,
                     document,
                     self.sourceGeometry(body_size, document),
+                    source_projection,
                 );
             },
             .enter_source_search => if (source != null) {
@@ -1687,16 +1710,16 @@ pub const RepositoryPageState = struct {
                 self.source_search.mode = false;
                 self.source_search.query = self.source_search.input;
                 self.source_search.match = document.findNext(self.source_search.query.slice(), null);
-                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, source_geometry.?) else self.status.set("No source match", .{});
+                if (self.source_search.match) |match| repository_navigation.revealMatchProjected(&self.viewer, document, match, source_geometry.?, source_projection) else self.status.set("No source match", .{});
             },
             .clear_source_search => self.source_search.clear(),
             .next_source_match => if (source) |document| {
                 self.source_search.match = document.findNext(self.source_search.query.slice(), self.source_search.match);
-                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, source_geometry.?);
+                if (self.source_search.match) |match| repository_navigation.revealMatchProjected(&self.viewer, document, match, source_geometry.?, source_projection);
             },
             .previous_source_match => if (source) |document| {
                 self.source_search.match = document.findPrevious(self.source_search.query.slice(), self.source_search.match);
-                if (self.source_search.match) |match| repository_navigation.revealMatch(&self.viewer, document, match, source_geometry.?);
+                if (self.source_search.match) |match| repository_navigation.revealMatchProjected(&self.viewer, document, match, source_geometry.?, source_projection);
             },
             .source_search_backspace => self.source_search.input.backspace(),
             .source_search_move_left => self.source_search.input.moveLeft(),
@@ -1817,6 +1840,7 @@ pub const RepositoryPageState = struct {
             .tree_hidden = self.viewer.tree_hidden,
             .source_search_mode = self.source_search.mode,
             .file_search_mode = self.file_search.mode,
+            .retained_selection_action_available = self.completed_selection != null,
             .source_query_len = self.source_search.query.len,
             .keymap = effective_keymap,
         };
@@ -2052,10 +2076,11 @@ pub const RepositoryPageState = struct {
         const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         self.clampScroll(layout.treeRows(body_size.height));
         if (self.currentSource()) |document| {
-            repository_navigation.clampSource(
+            repository_navigation.clampSourceProjected(
                 &self.viewer,
                 document,
                 self.sourceGeometry(body_size, document),
+                self.selectionActionProjection(),
             );
         }
     }
@@ -2114,6 +2139,105 @@ pub const RepositoryPageState = struct {
     fn clearCompletedSelection(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
         if (self.completed_selection) |*completed| completed.deinit(allocator);
         self.completed_selection = null;
+    }
+
+    /// The one authority predicate consumed by Repository render, hit-test,
+    /// keyboard/mouse dispatch, and virtual-row projection.
+    pub fn retainedSourceSelection(
+        self: *const RepositoryPageState,
+    ) ?*const repository_selection.CompletedSelection {
+        const completed = if (self.completed_selection) |*value| value else return null;
+        const document = self.currentSource() orelse return null;
+        const token = self.currentContentToken() orelse return null;
+        return if (completed.isAdmitted(document, token)) completed else null;
+    }
+
+    pub fn selectionActionProjection(self: *const RepositoryPageState) ?selection_action.Projection {
+        const completed = self.retainedSourceSelection() orelse return null;
+        const document = self.currentSource() orelse return null;
+        return selection_action.Projection.init(document.rowCount(), completed.range.end.line_index);
+    }
+
+    fn sourceProjectionBasis(
+        self: *const RepositoryPageState,
+        document: *const source_document.Document,
+        projection: ?selection_action.Projection,
+    ) selection_action.ProjectionBasis {
+        return .{
+            .layout_revision = self.source_revision,
+            .source_rows = document.rowCount(),
+            .action_insertion_offset = if (projection) |value| value.insertionOffset() else null,
+        };
+    }
+
+    fn captureSourceViewportAnchor(
+        self: *const RepositoryPageState,
+        document: *const source_document.Document,
+    ) SelectionViewportAnchor {
+        const projection = self.selectionActionProjection();
+        const position = selection_action.captureAnchorPosition(
+            document.rowCount(),
+            projection,
+            self.viewer.source_vertical_scroll,
+        );
+        return .{
+            .semantic_source = position.source_offset_fallback,
+            .source_offset_fallback = position.source_offset_fallback,
+            .signed_screen_delta = position.signed_screen_delta,
+            .raw_presentation_scroll = self.viewer.source_vertical_scroll,
+            .basis = self.sourceProjectionBasis(document, projection),
+        };
+    }
+
+    fn restoreSourceViewportAnchor(
+        self: *RepositoryPageState,
+        anchor: SelectionViewportAnchor,
+        document: *const source_document.Document,
+        visible_rows: usize,
+    ) void {
+        const projection = self.selectionActionProjection();
+        self.viewer.source_vertical_scroll = selection_action.restoreViewportAnchor(
+            anchor,
+            self.sourceProjectionBasis(document, projection),
+            projection,
+            @min(anchor.semantic_source, document.rowCount() - 1),
+            visible_rows,
+        );
+    }
+
+    pub fn captureSelectionViewportAnchor(
+        self: *const RepositoryPageState,
+    ) ?SelectionViewportAnchor {
+        if (self.retainedSourceSelection() == null) return null;
+        const document = self.currentSource() orelse return null;
+        return self.captureSourceViewportAnchor(document);
+    }
+
+    pub fn restoreSelectionViewportAnchor(
+        self: *RepositoryPageState,
+        anchor: SelectionViewportAnchor,
+        body_size: chasen.Size,
+    ) void {
+        // First reconcile unrelated tree/cursor/horizontal bounds, then make
+        // the semantic source anchor the final vertical authority.
+        self.clampForBodySize(body_size);
+        const document = self.currentSource() orelse return;
+        const geometry = self.sourceGeometry(body_size, document);
+        self.restoreSourceViewportAnchor(anchor, document, geometry.visible_source_rows);
+    }
+
+    fn clearCompletedSelectionPreservingViewport(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        body_size: chasen.Size,
+    ) void {
+        const document = self.currentSource();
+        const anchor = if (document) |value| self.captureSourceViewportAnchor(value) else null;
+        self.clearCompletedSelection(allocator);
+        if (document) |value| if (anchor) |captured| {
+            const geometry = self.sourceGeometry(body_size, value);
+            self.restoreSourceViewportAnchor(captured, value, geometry.visible_source_rows);
+        };
     }
 
     /// Reconcile only an already accepted selected-document result. At this
@@ -2212,6 +2336,31 @@ pub const RepositoryPageState = struct {
         self.selection_owner = .{ .source_header = .{ .identity = identity } };
     }
 
+    fn selectionActionHit(
+        self: *const RepositoryPageState,
+        point: repository_layout.BodyPoint,
+        body_size: chasen.Size,
+    ) ?SelectionActionHit {
+        const document = self.currentSource() orelse return null;
+        const projection = self.selectionActionProjection() orelse return null;
+        const geometry = self.sourceGeometry(body_size, document);
+        const location = geometry.locationAt(
+            point.row,
+            self.viewer.source_vertical_scroll,
+            document,
+            projection,
+        ) orelse return null;
+        const action_row = switch (location) {
+            .source => return null,
+            .action => |row| row,
+        };
+        const layout = selection_action.actionLayout(.{ .col = 0, .width = geometry.width });
+        return if (layout.targetAt(point.col, action_row)) |action|
+            .{ .target = action }
+        else
+            .inert;
+    }
+
     fn dragMouseOwner(self: *RepositoryPageState, point: ?repository_layout.BodyPoint, body_size: chasen.Size) void {
         switch (self.selection_owner) {
             .none => {},
@@ -2271,9 +2420,14 @@ pub const RepositoryPageState = struct {
 
     fn pressSourceSelection(self: *RepositoryPageState, point: repository_layout.BodyPoint, body_size: chasen.Size) void {
         if (self.source_search.mode or self.file_search.mode) return;
-        const document = self.currentSource() orelse return;
+        const document = self.acceptedCurrentSourceForSelection() orelse return;
         const geometry = self.sourceGeometry(body_size, document);
-        const line_index = geometry.contentLineAt(point.row, self.viewer.source_vertical_scroll, document) orelse return;
+        const line_index = geometry.contentLineAtProjected(
+            point.row,
+            self.viewer.source_vertical_scroll,
+            document,
+            self.selectionActionProjection(),
+        ) orelse return;
         const region = geometry.regionAt(point.col) orelse return;
         const token = self.currentContentToken() orelse return;
         const mode: repository_selection.Mode = switch (region) {
@@ -2316,7 +2470,12 @@ pub const RepositoryPageState = struct {
             return;
         }
         const geometry = self.sourceGeometry(body_size, document);
-        const line_index = geometry.contentLineAt(local.row, self.viewer.source_vertical_scroll, document) orelse return;
+        const line_index = geometry.contentLineAtProjected(
+            local.row,
+            self.viewer.source_vertical_scroll,
+            document,
+            self.selectionActionProjection(),
+        ) orelse return;
         const region = geometry.regionAt(local.col) orelse return;
         const logical_point: repository_selection.Point = switch (live.mode) {
             .line => repository_selection.pointFromLine(line_index),
@@ -2347,7 +2506,7 @@ pub const RepositoryPageState = struct {
         const live = self.selection_owner.activeSource() orelse {
             // A defensive identity failure inside the final drag invalidates
             // the basis for both the gesture and any prior candidate.
-            self.clearCompletedSelection(allocator);
+            self.clearCompletedSelectionPreservingViewport(allocator, body_size);
             self.status.set("Source selection is no longer current", .{});
             return null;
         };
@@ -2359,48 +2518,114 @@ pub const RepositoryPageState = struct {
         }
 
         const document = self.currentSource() orelse {
-            self.clearCompletedSelection(allocator);
+            self.clearCompletedSelectionPreservingViewport(allocator, body_size);
             self.cancelMouseOwner();
             self.status.set("Source selection is no longer available", .{});
             return null;
         };
         const current_token = self.currentContentToken() orelse {
-            self.clearCompletedSelection(allocator);
+            self.clearCompletedSelectionPreservingViewport(allocator, body_size);
             self.cancelMouseOwner();
             self.status.set("Source selection has no current basis", .{});
             return null;
         };
         if (!live.token.eql(current_token)) {
-            self.clearCompletedSelection(allocator);
+            self.clearCompletedSelectionPreservingViewport(allocator, body_size);
             self.cancelMouseOwner();
             self.status.set("Source selection is no longer current", .{});
             return null;
         }
 
         var candidate = repository_selection.buildCompletedSelection(allocator, document, live) catch |err| {
-            self.clearCompletedSelection(allocator);
             self.cancelMouseOwner();
             self.status.set("Could not complete source selection: {s}", .{@errorName(err)});
             return null;
         };
+        const admitted_document = self.currentSource() orelse {
+            candidate.deinit(allocator);
+            self.clearCompletedSelectionPreservingViewport(allocator, body_size);
+            self.cancelMouseOwner();
+            self.status.set("Source selection is no longer available", .{});
+            return null;
+        };
+        const admitted_token = self.currentContentToken() orelse {
+            candidate.deinit(allocator);
+            self.clearCompletedSelectionPreservingViewport(allocator, body_size);
+            self.cancelMouseOwner();
+            self.status.set("Source selection has no current basis", .{});
+            return null;
+        };
+        if (!candidate.isAdmitted(admitted_document, admitted_token)) {
+            candidate.deinit(allocator);
+            self.clearCompletedSelectionPreservingViewport(allocator, body_size);
+            self.cancelMouseOwner();
+            self.status.set("Source selection is no longer current", .{});
+            return null;
+        }
+
+        const anchor = self.captureSourceViewportAnchor(admitted_document);
         self.clearCompletedSelection(allocator);
         self.completed_selection = candidate;
         candidate = undefined;
         self.cancelMouseOwner();
-
-        // A real empty line is a useful line anchor but has no clipboard
-        // payload. Keep the candidate and deliberately emit no shell command.
-        if (self.completed_selection.?.text.len == 0) {
-            self.status.set("Selected source line is empty", .{});
-            return null;
+        const geometry = self.sourceGeometry(body_size, admitted_document);
+        self.restoreSourceViewportAnchor(anchor, admitted_document, geometry.visible_source_rows);
+        if (self.selectionActionProjection()) |projection| {
+            self.viewer.source_vertical_scroll = projection.reveal(
+                self.viewer.source_vertical_scroll,
+                geometry.visible_source_rows,
+            );
         }
-        const clipboard = self.completed_selection.?.clipboardText(allocator) catch {
-            // Clipboard ownership begins only after candidate acceptance.
-            self.status.set("Could not prepare source selection copy", .{});
-            return null;
-        };
         self.status.clear();
-        return .{ .copy_source_selection = clipboard };
+        return null;
+    }
+
+    fn applySelectionAction(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        action: selection_action.Action,
+        body_size: chasen.Size,
+    ) ?Command {
+        const Adapter = struct {
+            state: *RepositoryPageState,
+            body_size: chasen.Size,
+
+            pub fn available(adapter: *@This()) bool {
+                return adapter.state.completed_selection != null;
+            }
+
+            pub fn copy(adapter: *@This(), owner: std.mem.Allocator) selection_action.CopyError![]u8 {
+                const completed = if (adapter.state.completed_selection) |*value| value else return error.AuthorityInvalid;
+                const document = adapter.state.currentSource() orelse return error.AuthorityInvalid;
+                const token = adapter.state.currentContentToken() orelse return error.AuthorityInvalid;
+                if (!completed.isAdmitted(document, token)) return error.AuthorityInvalid;
+                return completed.clipboardText(owner) catch return error.OutOfMemory;
+            }
+
+            pub fn clear(adapter: *@This(), owner: std.mem.Allocator) void {
+                adapter.state.clearCompletedSelectionPreservingViewport(owner, adapter.body_size);
+            }
+        };
+        var adapter: Adapter = .{ .state = self, .body_size = body_size };
+        return switch (selection_action.dispatch(allocator, action, &adapter)) {
+            .none => null,
+            .copy => |clipboard| blk: {
+                self.status.clear();
+                break :blk .{ .copy_source_selection = clipboard };
+            },
+            .cleared => blk: {
+                self.status.clear();
+                break :blk null;
+            },
+            .authority_invalid => blk: {
+                self.status.set("Source selection is no longer current", .{});
+                break :blk null;
+            },
+            .preparation_failed => blk: {
+                self.status.set("Could not prepare source selection copy", .{});
+                break :blk null;
+            },
+        };
     }
 
     pub fn mouseToMsg(self: *const RepositoryPageState, point: repository_layout.BodyPoint, button: MouseButton, size: chasen.Size) ?Msg {
@@ -2427,15 +2652,22 @@ pub const RepositoryPageState = struct {
         return switch (button) {
             .wheel_up => if (self.currentSource() != null) .mouse_source_wheel_up else null,
             .wheel_down => if (self.currentSource() != null) .mouse_source_wheel_down else null,
-            .left => if (self.sourceHeaderPathHit(source_point, size) != null)
-                .{ .mouse_source_header_press = source_point }
-            else if (self.currentSource()) |document|
-                if (source_point.row >= self.sourceGeometry(size, document).body_first_row)
-                    .{ .mouse_source_press = source_point }
-                else
-                    .focus_source
-            else
-                null,
+            .left => blk: {
+                if (self.selectionActionHit(source_point, size)) |hit| break :blk switch (hit) {
+                    .target => |action| .{ .selection_action = action },
+                    .inert => null,
+                };
+                if (self.sourceHeaderPathHit(source_point, size) != null) {
+                    break :blk .{ .mouse_source_header_press = source_point };
+                }
+                if (self.currentSource()) |document| {
+                    break :blk if (source_point.row >= self.sourceGeometry(size, document).body_first_row)
+                        .{ .mouse_source_press = source_point }
+                    else
+                        .focus_source;
+                }
+                break :blk null;
+            },
         };
     }
 };
@@ -3218,7 +3450,9 @@ fn selectionStateForTest(paths: []const u8, content: []const u8) !RepositoryPage
         .root_identity = .{ .device = 4, .inode = 5 },
         .bundle = try bundleForTest(paths),
         .load_state = .loaded,
+        .freshness = .fresh,
         .manifest_revision = 6,
+        .source_revision = 7,
     };
     errdefer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.firstFilePath();
@@ -5087,7 +5321,7 @@ test "repository selection accepted manifest and document replacement cancel liv
     try std.testing.expectEqualStrings("old source", state.currentSource().?.lineBody(0).?);
 }
 
-test "repository selection moved release installs candidate and independent copy command" {
+test "repository selection moved release installs candidate and explicit copy command" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "ABCDEFG\nHIJKLMN\n");
     defer state.deinit(allocator);
@@ -5107,7 +5341,11 @@ test "repository selection moved release installs candidate and independent copy
     try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.completed_selection != null);
     try std.testing.expectEqualStrings("DEFG\nHIJKL", state.completed_selection.?.text);
-    var command = update.takeCommand() orelse return error.ExpectedSourceCopyCommand;
+    try std.testing.expect(update.command == null);
+
+    var copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+    defer copy.deinit(allocator);
+    var command = copy.takeCommand() orelse return error.ExpectedSourceCopyCommand;
     defer command.deinit(allocator);
     switch (command) {
         .copy_source_selection => |text| {
@@ -5132,6 +5370,92 @@ test "repository selection moved release installs candidate and independent copy
     try std.testing.expectEqualStrings("DEFG\nHIJKL", state.completed_selection.?.text);
 }
 
+test "repository selection actions share wide narrow render geometry and dispatch" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "one\ntwo\nthree\n");
+    defer state.deinit(allocator);
+    try installFirstLineCandidateForTest(&state, allocator);
+
+    const wide: chasen.Size = .{ .width = 80, .height = 8 };
+    const wide_layout = repository_layout.bodyLayout(wide, state.viewer.tree_width, state.viewer.tree_hidden);
+    const geometry = state.sourceGeometry(wide, state.currentSource().?);
+    const controls_row = geometry.body_first_row + 2;
+    try std.testing.expect(state.mouseToMsg(.{
+        .col = wide_layout.source_col,
+        .row = geometry.body_first_row + 1,
+    }, .left, wide) == null);
+    try std.testing.expect(state.mouseToMsg(.{
+        .col = wide_layout.source_col + 8,
+        .row = controls_row,
+    }, .left, wide) == null);
+    try std.testing.expectEqual(
+        Msg{ .selection_action = .copy },
+        state.mouseToMsg(.{ .col = wide_layout.source_col, .row = controls_row }, .left, wide).?,
+    );
+    try std.testing.expectEqual(
+        Msg{ .selection_action = .clear },
+        state.mouseToMsg(.{ .col = wide_layout.source_col + 9, .row = controls_row }, .left, wide).?,
+    );
+    try std.testing.expect(!state.activeSourceRange());
+
+    var copied = state.applyNavigation(allocator, .{ .selection_action = .copy }, wide);
+    defer copied.deinit(allocator);
+    try std.testing.expect(copied.command != null);
+    try std.testing.expect(state.completed_selection != null);
+
+    state.viewer.tree_hidden = true;
+    const narrow: chasen.Size = .{ .width = 10, .height = 6 };
+    try std.testing.expectEqual(
+        Msg{ .selection_action = .copy },
+        state.mouseToMsg(.{ .col = 0, .row = controls_row }, .left, narrow).?,
+    );
+    try std.testing.expect(state.mouseToMsg(.{ .col = 9, .row = controls_row }, .left, narrow) == null);
+    try std.testing.expectEqual(
+        Msg{ .selection_action = .clear },
+        repository_input.keyToMsg(Msg, state.inputContext(.{}), .{ .codepoint = chasen.Key.escape }).?,
+    );
+
+    state.viewer.source_vertical_scroll = 1;
+    var cleared = state.applyNavigation(allocator, .{ .selection_action = .clear }, narrow);
+    defer cleared.deinit(allocator);
+    try std.testing.expect(cleared.command == null);
+    try std.testing.expect(state.completed_selection == null);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+}
+
+test "repository selection copy authority mismatch clears without command" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "one\ntwo\n");
+    defer state.deinit(allocator);
+    try installFirstLineCandidateForTest(&state, allocator);
+    state.completed_selection.?.token.repo_epoch +%= 1;
+
+    var copy = state.applyNavigation(
+        allocator,
+        .{ .selection_action = .copy },
+        .{ .width = 60, .height = 6 },
+    );
+    defer copy.deinit(allocator);
+    try std.testing.expect(copy.command == null);
+    try std.testing.expect(state.completed_selection == null);
+    try std.testing.expectEqualStrings("Source selection is no longer current", state.status.text());
+}
+
+test "repository selection resize restores semantic presentation anchor" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "one\ntwo\nthree\n");
+    defer state.deinit(allocator);
+    try installFirstLineCandidateForTest(&state, allocator);
+    state.viewer.source_vertical_scroll = 1;
+    const anchor = state.captureSelectionViewportAnchor() orelse return error.ExpectedSelectionViewportAnchor;
+
+    state.restoreSelectionViewportAnchor(anchor, .{ .width = 40, .height = 4 });
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll);
+    state.restoreSelectionViewportAnchor(anchor, .{ .width = 120, .height = 32 });
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expect(state.completed_selection != null);
+}
+
 test "repository selection first token to gutter keeps the token" {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "ABC\n");
@@ -5152,7 +5476,10 @@ test "repository selection first token to gutter keeps the token" {
     var update = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
     defer update.deinit(allocator);
     try std.testing.expectEqualStrings("A", state.completed_selection.?.text);
-    switch (update.command.?) {
+    try std.testing.expect(update.command == null);
+    var copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+    defer copy.deinit(allocator);
+    switch (copy.command.?) {
         .copy_source_selection => |text| try std.testing.expectEqualStrings("A", text),
         else => return error.ExpectedSourceCopyCommand,
     }
@@ -5179,7 +5506,7 @@ test "repository selection candidate and clipboard allocation failures have sepa
         var update = state.applyNavigation(failing.allocator(), .{ .mouse_owner_release = null }, size);
         defer update.deinit(failing.allocator());
         try std.testing.expect(update.command == null);
-        try std.testing.expect(state.completed_selection == null);
+        try std.testing.expectEqualStrings("ABC", state.completed_selection.?.text);
         try std.testing.expect(!state.activeSourceRange());
     }
 
@@ -5200,7 +5527,10 @@ test "repository selection candidate and clipboard allocation failures have sepa
         state.selection_owner = .{ .source = live };
         var update = state.applyNavigation(failing.allocator(), .{ .mouse_owner_release = null }, size);
         defer update.deinit(failing.allocator());
-        if (state.completed_selection != null and update.command == null) {
+        if (state.completed_selection != null) {
+            var copy = state.applyNavigation(failing.allocator(), .{ .selection_action = .copy }, size);
+            defer copy.deinit(failing.allocator());
+            if (copy.command != null) continue;
             observed_clipboard_failure = true;
             try std.testing.expectEqualStrings("ABC", state.completed_selection.?.text);
             try std.testing.expect(!state.activeSourceRange());
@@ -5248,7 +5578,14 @@ test "repository selection real empty line keeps candidate without copy command"
     try std.testing.expect(update.command == null);
     try std.testing.expect(state.completed_selection != null);
     try std.testing.expectEqualStrings("", state.completed_selection.?.text);
-    try std.testing.expectEqualStrings("Selected source line is empty", state.status.text());
+    try std.testing.expectEqualStrings("", state.status.text());
+    var copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, .{ .width = 60, .height = 6 });
+    defer copy.deinit(allocator);
+    switch (copy.command.?) {
+        .copy_source_selection => |text| try std.testing.expectEqualStrings("", text),
+        else => return error.ExpectedSourceCopyCommand,
+    }
+    try std.testing.expect(state.completed_selection != null);
 }
 
 test "repository selection reconciles accepted document and keeps other replacements fail closed" {
@@ -5290,6 +5627,58 @@ test "repository selection reconciles accepted document and keeps other replacem
     try expectDocumentReplacementCandidateForTest(null, false);
 }
 
+test "repository document replacement restores semantic viewport across projection terminals" {
+    const allocator = std.testing.allocator;
+    const original = "zero\none\ntwo\nthree\nfour\n";
+    var state = try selectionStateForTest("main.zig\x00", original);
+    defer state.deinit(allocator);
+    var drag = repository_selection.DragSelection.init(
+        state.currentContentToken().?,
+        .line,
+        repository_selection.pointFromLine(1),
+    );
+    drag.moved = true;
+    state.completed_selection = try repository_selection.buildCompletedSelection(
+        allocator,
+        state.currentSource().?,
+        drag,
+    );
+    state.viewer.source_vertical_scroll = 2;
+
+    state.document_generation = 8;
+    state.pending_document_generation = 8;
+    const exact_bytes = try allocator.dupe(u8, original);
+    var exact: repository_tasks.DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 8,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, exact_bytes, .init(exact_bytes)) },
+    };
+    defer exact.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &exact));
+    try std.testing.expect(state.completed_selection != null);
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_vertical_scroll);
+
+    state.document_generation = 9;
+    state.pending_document_generation = 9;
+    const changed_content = "ZERO\none\ntwo\nthree\nfour\n";
+    const changed_bytes = try allocator.dupe(u8, changed_content);
+    var changed: repository_tasks.DocumentFinished = .{
+        .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+        .root_identity = state.root_identity.?,
+        .generation = 9,
+        .manifest_revision = state.manifest_revision,
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .value = .{ .source = try source_document.Document.initOwned(allocator, changed_bytes, .init(changed_bytes)) },
+    };
+    defer changed.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &changed));
+    try std.testing.expect(state.completed_selection == null);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+}
+
 test "repository selection retains candidate across inactive page and presentation changes" {
     const allocator = std.testing.allocator;
     const size: chasen.Size = .{ .width = 60, .height = 6 };
@@ -5301,6 +5690,10 @@ test "repository selection retains candidate across inactive page and presentati
     state.deactivate();
     try std.testing.expect(state.completed_selection != null);
     state.activate(state.repo_epoch, state.root_identity);
+    try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
+    var pending_copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+    defer pending_copy.deinit(allocator);
+    try std.testing.expect(pending_copy.command != null);
     try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
 
     _ = state.applyNavigation(allocator, .focus_source, size);
@@ -5344,14 +5737,15 @@ test "repository selection retains candidate across inactive page and presentati
     try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyChangeMapFinished(allocator, &change_finished));
     try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
 
-    // Focus loss and resize cancel only a live borrow. The release-frozen
-    // candidate is owned independently and survives both presentation events.
+    // Reactivation retains last-good bytes but requires revalidation, so a new
+    // drag is not admitted. The release-frozen candidate still survives cancel
+    // and resize presentation events.
     const geometry = state.sourceGeometry(size, state.currentSource().?);
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
-    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expect(!state.activeSourceRange());
     _ = state.applyNavigation(allocator, .cancel_mouse_owner, size);
     try std.testing.expect(!state.activeSourceRange());
     try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));

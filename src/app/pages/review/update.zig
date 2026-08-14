@@ -551,7 +551,7 @@ test "review mouse release retains candidate until explicit copy or clear" {
     try std.testing.expect(update.command == null);
     try std.testing.expect(page.completed_selection != null);
 
-    var copied = try controller.apply(std.testing.allocator, .copy_completed_selection);
+    var copied = try controller.apply(std.testing.allocator, .{ .selection_action = .copy });
     defer copied.deinit(std.testing.allocator);
     var command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer command.deinit(std.testing.allocator);
@@ -585,7 +585,7 @@ test "review mouse release retains candidate until explicit copy or clear" {
     try std.testing.expect(page.completed_selection != null);
     try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
 
-    var cleared = try controller.apply(std.testing.allocator, .clear_completed_selection);
+    var cleared = try controller.apply(std.testing.allocator, .{ .selection_action = .clear });
     defer cleared.deinit(std.testing.allocator);
     try std.testing.expect(cleared.command == null);
     try std.testing.expect(page.completed_selection == null);
@@ -790,9 +790,16 @@ test "clipboard allocation failure retains the accepted candidate" {
     const retained_token = page.completed_selection.?.token;
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    var copy = try controller.apply(failing.allocator(), .copy_completed_selection);
+    var copy = try controller.apply(failing.allocator(), .{ .selection_action = .copy });
     defer copy.deinit(failing.allocator());
     try std.testing.expect(copy.command == null);
     try std.testing.expect(page.completed_selection != null);
     try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
+
+    page.completed_selection.?.token.source_session_revision +%= 1;
+    var stale = try controller.apply(allocator, .{ .selection_action = .copy });
+    defer stale.deinit(allocator);
+    try std.testing.expect(stale.command == null);
+    try std.testing.expect(page.completed_selection == null);
+    try std.testing.expectEqualStrings("Retained selection is no longer available", page.status.text());
 }

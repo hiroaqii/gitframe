@@ -6,6 +6,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const key_input = @import("../key_input.zig");
+const selection_action = @import("../selection_action.zig");
 const message = @import("message.zig");
 
 pub const Context = struct {
@@ -24,8 +25,9 @@ pub fn pasteToMsg(context: Context, text: []const u8) ?message.Msg {
 pub fn keyToMsg(context: Context, key: chasen.Key) ?message.Msg {
     if (context.search_mode) return searchKeyToMsg(key);
     if (context.file_search_mode) return fileSearchKeyToMsg(key);
-    if (context.retained_selection_action_available and key.matches(chasen.Key.escape, .{})) return .clear_completed_selection;
-    if (context.retained_selection_action_available and key.matches('y', .{})) return .copy_completed_selection;
+    if (context.retained_selection_action_available) {
+        if (selection_action.keyToAction(key)) |action| return .{ .selection_action = action };
+    }
     return null;
 }
 
@@ -51,8 +53,8 @@ fn fileSearchKeyToMsg(key: chasen.Key) ?message.Msg {
 
 test "retained actions are shared after modal owners" {
     const available: Context = .{ .retained_selection_action_available = true };
-    try std.testing.expectEqual(message.Msg.copy_completed_selection, keyToMsg(available, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(message.Msg.clear_completed_selection, keyToMsg(available, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(message.Msg{ .selection_action = .copy }, keyToMsg(available, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(message.Msg{ .selection_action = .clear }, keyToMsg(available, .{ .codepoint = chasen.Key.escape }).?);
 
     const search: Context = .{ .search_mode = true, .retained_selection_action_available = true };
     try std.testing.expectEqual(message.Msg{ .search_insert = 'y' }, keyToMsg(search, .{ .codepoint = 'y' }).?);

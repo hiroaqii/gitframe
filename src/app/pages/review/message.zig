@@ -5,6 +5,7 @@
 //! precedence before it can create one of these page-local messages.
 
 const shared_message = @import("../../diff_surface/message.zig");
+const selection_action = @import("../../selection_action.zig");
 
 pub const MousePoint = @import("../../diff_surface.zig").MousePoint;
 
@@ -81,8 +82,7 @@ pub const Msg = union(enum) {
     toggle_line_numbers,
     copy_current_line,
     copy_current_hunk,
-    copy_completed_selection,
-    clear_completed_selection,
+    selection_action: selection_action.Action,
     finish_review_approved,
     finish_review_needs_changes,
     finish_review_canceled,
@@ -117,8 +117,7 @@ pub const Msg = union(enum) {
             .mouse_diff_press,
             .mouse_diff_drag,
             .mouse_diff_release,
-            .copy_completed_selection,
-            .clear_completed_selection,
+            .selection_action,
             .toggle_focus,
             .page_diff_up,
             .page_diff_down,

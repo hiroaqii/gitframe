@@ -1,5 +1,6 @@
 const std = @import("std");
 const chasen = @import("chasen");
+const selection_action = @import("../app/selection_action.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const draw = @import("draw");
 const diff_file = @import("file.zig");
@@ -97,29 +98,47 @@ pub const SideBySideGeometry = struct {
     }
 };
 
-/// Generic presentation-only row insertion consumed synchronously by the
-/// renderer. The Review-owned selection-action module is the semantic owner;
-/// this value is deliberately model-agnostic.
+/// Diff renderer transport for the neutral fixed two-row projection. The
+/// explicit `virtual_rows` field preserves the synchronous render-block shape;
+/// all mapping behavior delegates to the neutral owner.
 pub const VirtualRowProjection = struct {
     source_rows: usize,
     after_source_row: usize,
     virtual_rows: usize,
 
+    pub fn init(source_rows: usize, after_source_row: usize) ?VirtualRowProjection {
+        const projection = selection_action.Projection.init(source_rows, after_source_row) orelse return null;
+        return fromNeutral(projection);
+    }
+
+    pub fn fromNeutral(projection: selection_action.Projection) VirtualRowProjection {
+        return .{
+            .source_rows = projection.source_rows,
+            .after_source_row = projection.after_source_row,
+            .virtual_rows = selection_action.virtual_row_count,
+        };
+    }
+
+    fn neutral(self: VirtualRowProjection) selection_action.Projection {
+        std.debug.assert(self.virtual_rows == selection_action.virtual_row_count);
+        return selection_action.Projection.init(self.source_rows, self.after_source_row).?;
+    }
+
     pub fn sourceToPresentation(self: VirtualRowProjection, source_row: usize) ?usize {
-        if (source_row >= self.source_rows) return null;
-        return source_row +| if (source_row > self.after_source_row) self.virtual_rows else 0;
+        return self.neutral().sourceToPresentation(source_row);
     }
 
     pub fn sourceAtOrAfter(self: VirtualRowProjection, presentation_row: usize) usize {
-        const insertion = self.after_source_row + 1;
-        if (presentation_row < insertion) return @min(presentation_row, self.source_rows);
-        if (presentation_row < insertion +| self.virtual_rows) return @min(insertion, self.source_rows);
-        return @min(presentation_row - self.virtual_rows, self.source_rows);
+        return self.neutral().sourceAtOrAfter(presentation_row);
     }
 
     pub fn actionPresentationRow(self: VirtualRowProjection, action_row: usize) ?usize {
-        if (action_row >= self.virtual_rows) return null;
-        return self.after_source_row +| 1 +| action_row;
+        if (action_row >= selection_action.virtual_row_count) return null;
+        return self.neutral().actionPresentationRow(@enumFromInt(action_row));
+    }
+
+    pub fn locate(self: VirtualRowProjection, presentation_row: usize) ?selection_action.Location {
+        return self.neutral().locate(presentation_row);
     }
 };
 
@@ -129,23 +148,8 @@ pub const SelectionActionBlock = struct {
     line_count: usize,
 };
 
-pub const SelectionActionTarget = enum {
-    copy,
-    clear,
-};
-
-pub const SelectionActionLayout = struct {
-    region: SideBySideRegion,
-    copy: ?SideBySideRegion,
-    clear: ?SideBySideRegion,
-
-    pub fn targetAt(self: SelectionActionLayout, col: u16, action_row: usize) ?SelectionActionTarget {
-        if (action_row != 1) return null;
-        if (self.copy) |region| if (region.contains(col)) return .copy;
-        if (self.clear) |region| if (region.contains(col)) return .clear;
-        return null;
-    }
-};
+pub const SelectionActionTarget = selection_action.Action;
+pub const SelectionActionLayout = selection_action.Layout;
 
 pub fn selectionActionLayout(width: u16, requested_mode: DisplayMode, side: diff_selection.Side) SelectionActionLayout {
     const mode = effectiveMode(width, requested_mode);
@@ -154,16 +158,7 @@ pub fn selectionActionLayout(width: u16, requested_mode: DisplayMode, side: diff
         .new => sideBySideGeometry(width).new,
     } else SideBySideRegion{ .col = 0, .width = width };
 
-    const copy_width: u16 = 8;
-    const clear_width: u16 = 11;
-    const copy_col = region.col;
-    const clear_col = copy_col +| copy_width +| 1;
-    const end = region.col +| region.width;
-    return .{
-        .region = region,
-        .copy = if (copy_col +| copy_width <= end) .{ .col = copy_col, .width = copy_width } else null,
-        .clear = if (clear_col +| clear_width <= end) .{ .col = clear_col, .width = clear_width } else null,
-    };
+    return selection_action.actionLayout(.{ .col = region.col, .width = region.width });
 }
 
 pub fn selectionActionSourceScroll(projection: VirtualRowProjection, presentation_scroll: usize) usize {
@@ -218,8 +213,14 @@ pub fn composeSelectionAction(
     for (0..visible_rows) |screen_row| {
         const presentation_row = presentation_scroll +| screen_row;
         const row: u16 = @intCast(@as(usize, body_start_row) + screen_row);
-        const action_index = presentationActionRow(block.projection, presentation_row);
-        if (action_index == null) {
+        const action_row: ?selection_action.ActionRow = if (block.projection.locate(presentation_row)) |location|
+            switch (location) {
+                .source => null,
+                .action => |value| value,
+            }
+        else
+            null;
+        if (action_row == null) {
             if (presentationSourceRow(block.projection, presentation_row) == null) {
                 clearSurfaceRow(surface, row);
             }
@@ -227,19 +228,14 @@ pub fn composeSelectionAction(
         }
 
         clearSurfaceRow(surface, row);
-        fillRowRegion(&body_surface, row, action_layout.region, action_style);
-        var action_surface = body_surface.child(.{
-            .col = action_layout.region.col,
-            .row = row,
-            .width = action_layout.region.width,
-            .height = 1,
-        });
-        const text = switch (action_index.?) {
-            0 => try std.fmt.allocPrint(surface.frameAllocator(), "{d} lines selected", .{block.line_count}),
-            1 => "[y Copy] [Esc Clear]",
-            else => unreachable,
-        };
-        try draw.copyClippedTextAt(&action_surface, 0, 0, text, action_style);
+        try selection_action.drawActionRow(
+            &body_surface,
+            row,
+            action_layout,
+            action_row.?,
+            block.line_count,
+            action_style,
+        );
         if (mode == .side_by_side) {
             const geometry = sideBySideGeometry(content_width);
             _ = body_surface.borrowTextAt(geometry.separator_col, row, "│", .{
@@ -251,17 +247,10 @@ pub fn composeSelectionAction(
 }
 
 fn presentationSourceRow(projection: VirtualRowProjection, presentation_row: usize) ?usize {
-    const insertion = projection.after_source_row + 1;
-    if (presentation_row < insertion) return if (presentation_row < projection.source_rows) presentation_row else null;
-    if (presentation_row < insertion +| projection.virtual_rows) return null;
-    const source_row = presentation_row - projection.virtual_rows;
-    return if (source_row < projection.source_rows) source_row else null;
-}
-
-fn presentationActionRow(projection: VirtualRowProjection, presentation_row: usize) ?usize {
-    const insertion = projection.after_source_row + 1;
-    if (presentation_row < insertion or presentation_row >= insertion +| projection.virtual_rows) return null;
-    return presentation_row - insertion;
+    return switch (projection.locate(presentation_row) orelse return null) {
+        .source => |source_row| source_row,
+        .action => null,
+    };
 }
 
 fn copySurfaceRow(surface: *chasen.Surface, source_row: u16, destination_row: u16) void {
@@ -284,7 +273,7 @@ test "selection action compositor inserts two virtual rows without source rows" 
         _ = try ts.surface.copyTextAt(0, body_start_row + index, label, .{});
     }
 
-    const projection: VirtualRowProjection = .{ .source_rows = 4, .after_source_row = 1, .virtual_rows = 2 };
+    const projection = VirtualRowProjection.init(4, 1).?;
     try composeSelectionAction(&ts.surface, .{
         .projection = projection,
         .side = .new,
@@ -321,7 +310,7 @@ test "side by side selection action stays on selected side and preserves separat
     try ts.init(100, 6);
     defer ts.deinit();
     const palette = theme.Palette.default();
-    const projection: VirtualRowProjection = .{ .source_rows = 2, .after_source_row = 0, .virtual_rows = 2 };
+    const projection = VirtualRowProjection.init(2, 0).?;
     try composeSelectionAction(&ts.surface, .{
         .projection = projection,
         .side = .old,
@@ -349,24 +338,24 @@ test "side by side selection action stays on selected side and preserves separat
 
 test "selection action layout exposes only rendered Copy and Clear targets" {
     const unified = selectionActionLayout(80, .unified, .new);
-    try std.testing.expectEqual(SelectionActionTarget.copy, unified.targetAt(0, 1).?);
-    try std.testing.expectEqual(SelectionActionTarget.copy, unified.targetAt(7, 1).?);
-    try std.testing.expectEqual(SelectionActionTarget.clear, unified.targetAt(9, 1).?);
-    try std.testing.expectEqual(SelectionActionTarget.clear, unified.targetAt(19, 1).?);
-    try std.testing.expect(unified.targetAt(8, 1) == null);
-    try std.testing.expect(unified.targetAt(20, 1) == null);
-    try std.testing.expect(unified.targetAt(0, 0) == null);
+    try std.testing.expectEqual(SelectionActionTarget.copy, unified.targetAt(0, .controls).?);
+    try std.testing.expectEqual(SelectionActionTarget.copy, unified.targetAt(7, .controls).?);
+    try std.testing.expectEqual(SelectionActionTarget.clear, unified.targetAt(9, .controls).?);
+    try std.testing.expectEqual(SelectionActionTarget.clear, unified.targetAt(19, .controls).?);
+    try std.testing.expect(unified.targetAt(8, .controls) == null);
+    try std.testing.expect(unified.targetAt(20, .controls) == null);
+    try std.testing.expect(unified.targetAt(0, .summary) == null);
 
     const narrow = selectionActionLayout(10, .unified, .new);
     try std.testing.expect(narrow.copy != null);
     try std.testing.expect(narrow.clear == null);
-    try std.testing.expectEqual(SelectionActionTarget.copy, narrow.targetAt(7, 1).?);
-    try std.testing.expect(narrow.targetAt(9, 1) == null);
+    try std.testing.expectEqual(SelectionActionTarget.copy, narrow.targetAt(7, .controls).?);
+    try std.testing.expect(narrow.targetAt(9, .controls) == null);
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(12, 6);
     defer ts.deinit();
-    const projection: VirtualRowProjection = .{ .source_rows = 1, .after_source_row = 0, .virtual_rows = 2 };
+    const projection = VirtualRowProjection.init(1, 0).?;
     try composeSelectionAction(&ts.surface, .{
         .projection = projection,
         .side = .new,

@@ -373,7 +373,7 @@ pub const BodyView = struct {
     pub fn selectionActionRenderBlock(self: BodyView) ?diff_render.SelectionActionBlock {
         const presentation = self.retainedSelectionPresentation() orelse return null;
         return .{
-            .projection = presentation.projection.renderProjection(),
+            .projection = diff_render.VirtualRowProjection.fromNeutral(presentation.projection),
             .side = presentation.view.side,
             .line_count = presentation.line_count,
         };
@@ -409,7 +409,7 @@ pub const BodyView = struct {
             self.view.surface.viewer.display_mode,
             presentation.view.side,
         );
-        return .{ .target = layout_value.targetAt(body_col, @intFromEnum(action)) };
+        return .{ .target = layout_value.targetAt(body_col, action) };
     }
 
     pub fn renderDiffScroll(self: BodyView) usize {
@@ -705,7 +705,7 @@ pub const BodyView = struct {
         const projection = self.selectionActionProjection();
         return .{
             .layout_revision = self.view.surface.selection_layout_revision.*,
-            .effective_mode = self.view.effectiveDisplayMode(),
+            .mapping_variant = @intFromEnum(self.view.effectiveDisplayMode()),
             .source_rows = self.sourceDiffLineCount(),
             .action_insertion_offset = if (projection) |value| value.insertionOffset() else null,
         };

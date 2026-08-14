@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
+const selection_action = @import("../../selection_action.zig");
 const source = @import("../../../repository/source.zig");
 
 /// Fixed Repository source chrome. The accepted path owns row 0, while source
@@ -75,10 +76,42 @@ pub const SourceGeometry = struct {
         vertical_scroll: usize,
         document: *const source.Document,
     ) ?usize {
+        return self.contentLineAtProjected(row, vertical_scroll, document, null);
+    }
+
+    /// Maps a physical body row through the optional presentation-only action
+    /// projection. Action rows are never exposed as source coordinates.
+    pub fn locationAt(
+        self: SourceGeometry,
+        row: u16,
+        vertical_scroll: usize,
+        document: *const source.Document,
+        projection: ?selection_action.Projection,
+    ) ?selection_action.Location {
         if (row < self.body_first_row or row >= self.height) return null;
-        const line_index = vertical_scroll + @as(usize, row - self.body_first_row);
-        if (line_index >= document.contentLineCount()) return null;
-        return line_index;
+        const presentation_row = vertical_scroll + @as(usize, row - self.body_first_row);
+        const location: selection_action.Location = if (projection) |value|
+            value.locate(presentation_row) orelse return null
+        else
+            .{ .source = presentation_row };
+        return switch (location) {
+            .source => |line_index| if (line_index < document.contentLineCount()) location else null,
+            .action => location,
+        };
+    }
+
+    pub fn contentLineAtProjected(
+        self: SourceGeometry,
+        row: u16,
+        vertical_scroll: usize,
+        document: *const source.Document,
+        projection: ?selection_action.Projection,
+    ) ?usize {
+        const location = self.locationAt(row, vertical_scroll, document, projection) orelse return null;
+        return switch (location) {
+            .source => |line_index| line_index,
+            .action => null,
+        };
     }
 };
 
@@ -126,4 +159,34 @@ test "repository selection geometry rejects the empty document synthetic row" {
     try std.testing.expectEqual(@as(usize, 1), document.rowCount());
     try std.testing.expectEqual(@as(usize, 0), document.contentLineCount());
     try std.testing.expectEqual(@as(?usize, null), geometry.contentLineAt(geometry.body_first_row, 0, &document));
+}
+
+test "repository source geometry never exposes action rows as content" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "one\ntwo\nthree\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const geometry = SourceGeometry.init(.{ .width = 20, .height = 8 }, &document, true);
+    const projection = selection_action.Projection.init(document.rowCount(), 0).?;
+
+    try std.testing.expectEqual(
+        selection_action.Location{ .source = 0 },
+        geometry.locationAt(geometry.body_first_row, 0, &document, projection).?,
+    );
+    try std.testing.expectEqual(
+        selection_action.Location{ .action = .summary },
+        geometry.locationAt(geometry.body_first_row + 1, 0, &document, projection).?,
+    );
+    try std.testing.expectEqual(
+        selection_action.Location{ .action = .controls },
+        geometry.locationAt(geometry.body_first_row + 2, 0, &document, projection).?,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        geometry.contentLineAtProjected(geometry.body_first_row + 1, 0, &document, projection),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 1),
+        geometry.contentLineAtProjected(geometry.body_first_row + 3, 0, &document, projection),
+    );
 }

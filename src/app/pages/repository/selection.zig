@@ -232,6 +232,42 @@ pub const CompletedSelection = struct {
     pub fn clipboardText(self: *const CompletedSelection, allocator: std.mem.Allocator) ![]u8 {
         return allocator.dupe(u8, self.text);
     }
+
+    /// Admit the retained candidate only against the exact current content
+    /// token and a range which is still meaningful for those source bytes.
+    /// Delivery generations and screen coordinates are intentionally absent.
+    pub fn isAdmitted(
+        self: *const CompletedSelection,
+        document: *const source.Document,
+        token: RepositoryContentToken,
+    ) bool {
+        if (!self.token.view().eql(token) or
+            !self.token.source_fingerprint.eql(document.fingerprint))
+        {
+            return false;
+        }
+        const content_lines = document.contentLineCount();
+        if (content_lines == 0 or
+            self.range.start.line_index >= content_lines or
+            self.range.end.line_index >= content_lines or
+            !self.range.start.beforeOrEqual(self.range.end))
+        {
+            return false;
+        }
+        const expected_line_count = self.range.end.line_index - self.range.start.line_index + 1;
+        if (self.line_count != expected_line_count or
+            @as(usize, self.source_start) != self.range.start.line_index + 1 or
+            @as(usize, self.source_end) != self.range.end.line_index + 1 or
+            (self.mode == .character and self.text.len == 0))
+        {
+            return false;
+        }
+        return switch (self.mode) {
+            .line => true,
+            .character => validCharacterPoint(document, self.range.start) and
+                validCharacterPoint(document, self.range.end),
+        };
+    }
 };
 
 pub const BuildError = error{
@@ -443,6 +479,10 @@ test "repository selection copies exact forward and reverse multiline text" {
     try std.testing.expectEqualStrings("DEFG\nHIJKL", completed.text);
     try std.testing.expectEqual(@as(u32, 1), completed.source_start);
     try std.testing.expectEqual(@as(u32, 2), completed.source_end);
+    try std.testing.expect(completed.isAdmitted(&document, token));
+    completed.line_count += 1;
+    try std.testing.expect(!completed.isAdmitted(&document, token));
+    completed.line_count -= 1;
 
     var reverse = forward;
     reverse.anchor = forward.focus;

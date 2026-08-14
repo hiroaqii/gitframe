@@ -10,6 +10,7 @@ const branch_chrome = @import("../../branch_chrome.zig");
 const page_header = @import("../../page_header.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const page_link = @import("../../page_link.zig");
+const selection_action = @import("../../selection_action.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const repository_page = @import("../repository.zig");
 const repository_branch = @import("branch.zig");
@@ -411,13 +412,15 @@ fn drawDocumentCheckpoint(
     switch (displayed.value) {
         .source => |*document| {
             const live_selection = state.liveSourceSelection();
-            try drawSource(
+            const retained_selection = state.retainedSourceSelection();
+            try drawSourceWithRetained(
                 surface,
                 document,
                 &displayed.syntax_spans,
                 displayed.change_decoration.map(),
                 state.viewer,
                 state.source_search,
+                retained_selection,
                 live_selection,
                 palette,
             );
@@ -614,19 +617,75 @@ pub fn drawSource(
     live_selection: ?selection.DragSelection,
     palette: theme.Palette,
 ) !void {
+    return drawSourceWithRetained(
+        surface,
+        document,
+        syntax,
+        changes,
+        viewer,
+        search,
+        null,
+        live_selection,
+        palette,
+    );
+}
+
+pub fn drawSourceWithRetained(
+    surface: *chasen.Surface,
+    document: *const source.Document,
+    syntax: ?*const source_syntax.SourceSpans,
+    changes: ?*const repository_change_map.Map,
+    viewer: model.ViewerState,
+    search: model.SourceSearchState,
+    retained_selection: ?*const selection.CompletedSelection,
+    live_selection: ?selection.DragSelection,
+    palette: theme.Palette,
+) !void {
     const size = surface.size();
     if (size.height == 0 or size.width == 0) return;
     const geometry = source_geometry.SourceGeometry.init(size, document, viewer.line_numbers);
     if (size.height <= geometry.body_first_row) return;
     const source_active = viewer.focus == .source;
 
+    const action_projection = if (retained_selection) |completed|
+        selection_action.Projection.init(document.rowCount(), completed.range.end.line_index)
+    else
+        null;
+    const presentation_rows = if (action_projection) |projection|
+        projection.presentationRows()
+    else
+        document.rowCount();
     const rows = geometry.navigationRows();
     var body_row: usize = 0;
-    while (body_row < rows and viewer.source_vertical_scroll + body_row < document.rowCount()) : (body_row += 1) {
-        const line_index = viewer.source_vertical_scroll + body_row;
+    while (body_row < rows and viewer.source_vertical_scroll + body_row < presentation_rows) : (body_row += 1) {
+        const presentation_row = viewer.source_vertical_scroll + body_row;
+        const location: selection_action.Location = if (action_projection) |projection|
+            projection.locate(presentation_row) orelse continue
+        else
+            .{ .source = presentation_row };
+        const row = geometry.body_first_row + @as(u16, @intCast(body_row));
+        const line_index = switch (location) {
+            .source => |value| value,
+            .action => |action_row| {
+                const completed = retained_selection orelse continue;
+                const style: chasen.TextStyle = .{
+                    .fg = palette.color(.foreground),
+                    .bg = palette.color(.pane_cursor_bg),
+                    .dim = !source_active,
+                };
+                try selection_action.drawActionRow(
+                    surface,
+                    row,
+                    selection_action.actionLayout(.{ .col = 0, .width = geometry.width }),
+                    action_row,
+                    completed.line_count,
+                    style,
+                );
+                continue;
+            },
+        };
         const line = document.lineBody(line_index).?;
         const projection = try text_projection.Projection.init(line, .{ .tab_width = repository_tab_width });
-        const row = geometry.body_first_row + @as(u16, @intCast(body_row));
         const current = line_index == viewer.source_cursor;
         if (source_active and current) fillSourceCursorRow(surface, row, palette.color(.pane_cursor_bg));
         const base_style = sourceRowStyle(palette.style(.foreground), source_active, current, palette);
@@ -650,7 +709,8 @@ pub fn drawSource(
             draw.copyClippedTextAt(surface, number_col, row, number, sourceRowStyle(palette.style(number_role), source_active, current, palette)) catch {};
         }
         if (geometry.text_width == 0) {
-            applySelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
+            applyCompletedSelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, retained_selection, palette.color(.diff_selection_bg));
+            applySelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_selection_bg));
             continue;
         }
         drawProjectedLine(surface, geometry.text_col, row, projection, viewer.source_horizontal_scroll, geometry.text_width, base_style);
@@ -678,7 +738,8 @@ pub fn drawSource(
                 sourceRowStyle(palette.boldStyle(.warning), source_active, current, palette),
             );
         };
-        applySelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_cursor));
+        applyCompletedSelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, retained_selection, palette.color(.diff_selection_bg));
+        applySelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_selection_bg));
     }
 }
 
@@ -730,6 +791,32 @@ fn applyByteRangeStyle(
     }
 }
 
+fn applyCompletedSelectionLineStyles(
+    surface: *chasen.Surface,
+    geometry: source_geometry.SourceGeometry,
+    row: u16,
+    document: *const source.Document,
+    line_index: usize,
+    projection: text_projection.Projection,
+    horizontal_scroll: usize,
+    retained_selection: ?*const selection.CompletedSelection,
+    background: chasen.Color,
+) void {
+    const selected = retained_selection orelse return;
+    if (!selected.token.source_fingerprint.eql(document.fingerprint)) return;
+    applySelectionRangeLineStyles(
+        surface,
+        geometry,
+        row,
+        line_index,
+        projection,
+        horizontal_scroll,
+        selected.mode,
+        selected.range,
+        background,
+    );
+}
+
 fn applySelectionLineStyles(
     surface: *chasen.Surface,
     geometry: source_geometry.SourceGeometry,
@@ -743,9 +830,32 @@ fn applySelectionLineStyles(
 ) void {
     const selected = live_selection orelse return;
     if (!selected.token.source_fingerprint.eql(document.fingerprint)) return;
-    const range = selected.range();
+    applySelectionRangeLineStyles(
+        surface,
+        geometry,
+        row,
+        line_index,
+        projection,
+        horizontal_scroll,
+        selected.mode,
+        selected.range(),
+        background,
+    );
+}
+
+fn applySelectionRangeLineStyles(
+    surface: *chasen.Surface,
+    geometry: source_geometry.SourceGeometry,
+    row: u16,
+    line_index: usize,
+    projection: text_projection.Projection,
+    horizontal_scroll: usize,
+    mode: selection.Mode,
+    range: selection.Range,
+    background: chasen.Color,
+) void {
     if (line_index < range.start.line_index or line_index > range.end.line_index) return;
-    if (selected.mode == .line) {
+    if (mode == .line) {
         var col: u16 = 0;
         while (col < geometry.width) : (col += 1) setCellBackground(surface, col, row, background);
         return;
@@ -1438,6 +1548,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
     palette.colors[@intFromEnum(theme.Role.pane_active_line_number)] = .{ .rgb = .{ 51, 52, 53 } };
     palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
+    palette.colors[@intFromEnum(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
 
     var active: chasen.testing.TestSurface = undefined;
     try active.init(30, 5);
@@ -1475,7 +1586,8 @@ test "repository source cursor row composes semantic overlays and active-only ba
         try std.testing.expect(style.bg.eql(palette.color(.pane_cursor_bg)));
     }
     try std.testing.expect(selected.style.fg.eql(palette.color(.foreground)));
-    try std.testing.expect(selected.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(selected.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(!selected.style.bg.eql(palette.color(.diff_cursor)));
     try std.testing.expect(!active.surface.readCell(0, cursor_row + 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     var inactive: chasen.testing.TestSurface = undefined;
@@ -1538,7 +1650,9 @@ test "repository selection background composes after cursor syntax and search st
     };
     var spans = try source_syntax.build(allocator, &document, &candidates);
     defer spans.deinit(allocator);
-    const palette: theme.Palette = .default();
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
+    palette.colors[@intFromEnum(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
     const token: selection.RepositoryContentToken = .{
         .repo_epoch = 1,
         .root_identity = .{ .device = 2, .inode = 3 },
@@ -1571,9 +1685,10 @@ test "repository selection background composes after cursor syntax and search st
     try std.testing.expectEqual(palette.color(.warning), searched.style.fg);
     try std.testing.expect(searched.style.bold);
     try std.testing.expectEqual(palette.color(.foreground), plain.style.fg);
-    try std.testing.expect(keyword.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(searched.style.bg.eql(palette.color(.diff_cursor)));
-    try std.testing.expect(plain.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(keyword.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(searched.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(plain.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(!plain.style.bg.eql(palette.color(.diff_cursor)));
     const trailing = test_surface.surface.readCell(29, geometry.body_first_row) orelse return error.ExpectedCursorTrailingCell;
     try std.testing.expect(trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
@@ -1607,8 +1722,63 @@ test "repository selection whole-line style covers gutter numbers body and trail
         .{ .col = 19, .row = geometry.body_first_row + 1 },
     }) |point| {
         const cell = test_surface.surface.readCell(point.col, point.row) orelse return error.ExpectedSelectedCell;
-        try std.testing.expect(cell.style.bg.eql(palette.color(.diff_cursor)));
+        try std.testing.expect(cell.style.bg.eql(palette.color(.diff_selection_bg)));
     }
+}
+
+test "repository retained selection inserts actions and shares its background with live selection" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "one\ntwo\nthree\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const token: selection.RepositoryContentToken = .{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .path = "main.zig",
+        .source_fingerprint = document.fingerprint,
+    };
+    var retained_drag = selection.DragSelection.init(token, .line, selection.pointFromLine(0));
+    retained_drag.update(selection.pointFromLine(1));
+    var completed = try selection.buildCompletedSelection(allocator, &document, retained_drag);
+    defer completed.deinit(allocator);
+
+    var live = selection.DragSelection.init(token, .character, selection.pointFromBoundary(0, 1));
+    live.update(selection.pointFromBoundary(0, 2));
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
+    palette.colors[@intFromEnum(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(32, 7);
+    defer test_surface.deinit();
+    try drawSourceWithRetained(
+        &test_surface.surface,
+        &document,
+        null,
+        null,
+        .{ .focus = .source, .source_horizontal_scroll = 1 },
+        .{},
+        &completed,
+        live,
+        palette,
+    );
+
+    const first = source_geometry.source_body_first_row;
+    try std.testing.expect(test_surface.surface.readCell(0, first).?.style.bg.eql(palette.color(.diff_selection_bg)));
+    const geometry = source_geometry.SourceGeometry.init(test_surface.surface.size(), &document, true);
+    const live_cell = test_surface.surface.readCell(geometry.text_col, first) orelse return error.ExpectedLiveSelectionCell;
+    try std.testing.expect(live_cell.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(!live_cell.style.bg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(test_surface.surface.readCell(0, first + 1).?.style.bg.eql(palette.color(.diff_selection_bg)));
+    try test_surface.expectCellText(0, first + 2, "2");
+    try test_surface.expectCellText(0, first + 3, "[");
+    try test_surface.expectCellText(geometry.line_number_col, first + 4, "3");
+    try std.testing.expect(test_surface.surface.readCell(0, first + 2).?.style.fg.eql(palette.color(.foreground)));
+    try std.testing.expect(test_surface.surface.readCell(0, first + 2).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 lines selected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, selection_action.controls_text) != null);
 }
 
 test "repository source syntax projection visits dense line and spans only once" {
@@ -2638,7 +2808,8 @@ test "repository source header page view keeps filesystem metadata outside commi
         layout.source_col + geometry.text_col,
         geometry.body_first_row,
     ) orelse return error.ExpectedLiveSelectionCell;
-    try std.testing.expect(selected_cell.style.bg.eql(theme.Palette.default().color(.diff_cursor)));
+    try std.testing.expect(selected_cell.style.bg.eql(theme.Palette.default().color(.diff_selection_bg)));
+    try std.testing.expect(!selected_cell.style.bg.eql(theme.Palette.default().color(.diff_cursor)));
     _ = state.applyNavigation(allocator, .cancel_mouse_owner, size);
 
     state.displayed_document.?.authority = .revalidation_required;

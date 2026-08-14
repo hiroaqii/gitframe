@@ -137,8 +137,8 @@ test "normal mapping is focus and review-mode aware" {
 
 test "retained selection actions override line copy and empty escape fallback" {
     const context: Context = .{ .retained_selection_action_available = true };
-    try std.testing.expectEqual(Msg.copy_completed_selection, keyToMsg(context, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(Msg.clear_completed_selection, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(Msg{ .selection_action = .copy }, keyToMsg(context, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(Msg{ .selection_action = .clear }, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(Msg.copy_current_line, keyToMsg(.{}, .{ .codepoint = 'y' }).?);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.escape }) == null);
 }

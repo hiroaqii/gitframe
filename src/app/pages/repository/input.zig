@@ -4,6 +4,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const keymap = @import("keymap");
 const key_input = @import("../../key_input.zig");
+const selection_action = @import("../../selection_action.zig");
 const model = @import("model.zig");
 
 pub const Context = struct {
@@ -12,6 +13,7 @@ pub const Context = struct {
     tree_hidden: bool = false,
     source_search_mode: bool = false,
     file_search_mode: bool = false,
+    retained_selection_action_available: bool = false,
     source_query_len: usize = 0,
     keymap: keymap.Effective = .{},
 };
@@ -26,6 +28,10 @@ pub fn pasteToMsg(comptime Msg: type, context: Context, text: []const u8) ?Msg {
 pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
     if (context.source_search_mode) return sourceSearchKey(Msg, key);
     if (context.file_search_mode) return fileSearchKey(Msg, key);
+
+    if (context.retained_selection_action_available) {
+        if (selection_action.keyToAction(key)) |action| return payload(Msg, "selection_action", action);
+    }
 
     // A configured action claims its normal-mode key even when Repository does
     // not own that action or its current precondition is unavailable. Falling
@@ -105,6 +111,7 @@ fn payload(comptime Msg: type, comptime field: []const u8, value: anytype) Msg {
 }
 
 const TestMsg = union(enum) {
+    selection_action: selection_action.Action,
     toggle_focus,
     toggle_directory,
     move_up,
@@ -154,6 +161,45 @@ test "repository input routes focus search and file search independently" {
     try std.testing.expectEqual(TestMsg{ .file_search_insert = 'B' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'B' }).?);
     try std.testing.expectEqual(TestMsg.file_search_next, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqualStrings("needle", pasteToMsg(TestMsg, .{ .source_search_mode = true }, "needle").?.source_search_paste);
+}
+
+test "repository retained actions follow modal owners and precede navigation" {
+    const retained: Context = .{ .retained_selection_action_available = true };
+    try std.testing.expectEqual(
+        TestMsg{ .selection_action = .copy },
+        keyToMsg(TestMsg, retained, .{ .codepoint = 'y' }).?,
+    );
+    try std.testing.expectEqual(
+        TestMsg{ .selection_action = .clear },
+        keyToMsg(TestMsg, retained, .{ .codepoint = chasen.Key.escape }).?,
+    );
+    try std.testing.expect(keyToMsg(TestMsg, retained, .{ .codepoint = 'y', .mods = .{ .ctrl = true } }) == null);
+
+    const source_modal: Context = .{
+        .source_search_mode = true,
+        .retained_selection_action_available = true,
+    };
+    try std.testing.expectEqual(
+        TestMsg{ .source_search_insert = 'y' },
+        keyToMsg(TestMsg, source_modal, .{ .codepoint = 'y' }).?,
+    );
+    try std.testing.expectEqual(
+        TestMsg.cancel_source_search,
+        keyToMsg(TestMsg, source_modal, .{ .codepoint = chasen.Key.escape }).?,
+    );
+
+    const file_modal: Context = .{
+        .file_search_mode = true,
+        .retained_selection_action_available = true,
+    };
+    try std.testing.expectEqual(
+        TestMsg{ .file_search_insert = 'y' },
+        keyToMsg(TestMsg, file_modal, .{ .codepoint = 'y' }).?,
+    );
+    try std.testing.expectEqual(
+        TestMsg.cancel_file_search,
+        keyToMsg(TestMsg, file_modal, .{ .codepoint = chasen.Key.escape }).?,
+    );
 }
 
 test "repository input uses configured changed-file filter binding" {
