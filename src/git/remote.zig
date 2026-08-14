@@ -265,6 +265,7 @@ fn runSecureRemoteOperation(
     request: RemoteOperationRequest,
 ) RemoteOperationResult {
     var warnings = request.environment.warnings;
+    var uses_http_remote = false;
     const remote_and_use: struct { remote: []const u8, use: RemoteUrlUse } = switch (request.kind) {
         .push => |push| .{ .remote = push.remote, .use = .push },
         .pull_refresh_ff_only => |pull| .{ .remote = pull.remote, .use = .fetch },
@@ -279,6 +280,7 @@ fn runSecureRemoteOperation(
         request.control,
         remote_and_use.remote,
         remote_and_use.use,
+        &uses_http_remote,
     )) |failure| return remoteFailureResult(failure, warnings);
 
     if (classifyCredentialPolicy(
@@ -289,6 +291,7 @@ fn runSecureRemoteOperation(
         request.control,
         &warnings,
     )) |failure| return remoteFailureResult(failure, warnings);
+    filterCredentialWarningsForRemote(&warnings, uses_http_remote);
 
     return switch (request.kind) {
         .push => |push| runSecureGitPush(allocator, io, request, push, warnings),
@@ -398,7 +401,9 @@ fn auditRemoteUrls(
     control: process_runner.ProcessControl,
     remote: []const u8,
     use: RemoteUrlUse,
+    uses_http_remote: *bool,
 ) ?RemoteFailure {
+    uses_http_remote.* = false;
     const effective_argv = switch (use) {
         .fetch => &[_][]const u8{ "git", "remote", "get-url", "--all", "--", remote },
         .push => &[_][]const u8{ "git", "remote", "get-url", "--push", "--all", "--", remote },
@@ -415,6 +420,7 @@ fn auditRemoteUrls(
         .userinfo => return .http_userinfo_rejected,
         .invalid => return .failed,
     }
+    uses_http_remote.* = lineFramedUrlsUseHttp(effective_bytes);
 
     const url_key = std.fmt.allocPrint(allocator, "remote.{s}.url", .{remote}) catch return .failed;
     defer allocator.free(url_key);
@@ -469,6 +475,15 @@ fn auditLineFramedUrls(bytes: []const u8) UrlAudit {
         start = if (relative_end == null) bytes.len else end + 1;
     }
     return if (count > 0) .accepted else .invalid;
+}
+
+fn lineFramedUrlsUseHttp(bytes: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |url| {
+        if (std.ascii.startsWithIgnoreCase(url, "http://") or
+            std.ascii.startsWithIgnoreCase(url, "https://")) return true;
+    }
+    return false;
 }
 
 fn auditNulFramedUrls(bytes: []const u8) UrlAudit {
@@ -569,6 +584,12 @@ fn classifyCredentialPolicy(
             warnings.gcm_plaintext_store = true;
     }
     return null;
+}
+
+fn filterCredentialWarningsForRemote(warnings: *RemoteWarningSet, uses_http_remote: bool) void {
+    // An unclassified helper is not involved in a non-HTTP Git transport.
+    // Keep positive plaintext detections visible regardless of transport.
+    if (!uses_http_remote) warnings.helper_policy_unknown = false;
 }
 
 fn classifyHelperRecords(bytes: []const u8, warnings: *RemoteWarningSet) bool {
@@ -682,6 +703,7 @@ fn runForegroundPushInspection(
     request: ForegroundPushInspectionRequest,
 ) ForegroundPushInspectionResult {
     var warnings = request.environment.warnings;
+    var uses_http_remote = false;
     if (auditRemoteUrls(
         allocator,
         io,
@@ -690,6 +712,7 @@ fn runForegroundPushInspection(
         request.control,
         request.push.remote,
         .push,
+        &uses_http_remote,
     )) |failure| return .{ .outcome = .{ .failed = failure }, .warnings = warnings };
     if (classifyCredentialPolicy(
         allocator,
@@ -699,6 +722,7 @@ fn runForegroundPushInspection(
         request.control,
         &warnings,
     )) |failure| return .{ .outcome = .{ .failed = failure }, .warnings = warnings };
+    filterCredentialWarningsForRemote(&warnings, uses_http_remote);
 
     const refs = validatePushRefNames(
         allocator,
@@ -2036,6 +2060,12 @@ test "remote URL audit rejects HTTP userinfo without exposing the sensitive diag
     try std.testing.expectEqual(UrlAudit.invalid, auditLineFramedUrls(
         "https://exam\x01ple.invalid/repo.git\n",
     ));
+    try std.testing.expect(lineFramedUrlsUseHttp(
+        "ssh://git@example.invalid/repo.git\nhttps://example.invalid/owner/repo.git\n",
+    ));
+    try std.testing.expect(!lineFramedUrlsUseHttp(
+        "git@example.invalid:owner/repo.git\nssh://git@example.invalid/repo.git\n",
+    ));
 }
 
 test "credential helper classification honors reset and plaintext store" {
@@ -2073,6 +2103,15 @@ test "credential helper classification honors reset and plaintext store" {
         &warnings,
     ));
     try std.testing.expect(warnings.potential_plaintext_store);
+    try std.testing.expect(warnings.helper_policy_unknown);
+
+    warnings = .{ .git_plaintext_store = true, .helper_policy_unknown = true };
+    filterCredentialWarningsForRemote(&warnings, false);
+    try std.testing.expect(warnings.git_plaintext_store);
+    try std.testing.expect(!warnings.helper_policy_unknown);
+
+    warnings = .{ .helper_policy_unknown = true };
+    filterCredentialWarningsForRemote(&warnings, true);
     try std.testing.expect(warnings.helper_policy_unknown);
 }
 
