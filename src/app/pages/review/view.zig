@@ -1533,7 +1533,7 @@ test "diff renderer owns header search marker gutter and input presentation" {
     try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(0, review_layout.diff_body_start_row, "»");
     try ts.expectCellText(1, review_layout.diff_body_start_row, "▌");
-    try ts.expectCellText(2, review_layout.diff_body_start_row, "╭");
+    try ts.expectCellText(2, review_layout.diff_body_start_row, "┏");
     try std.testing.expect(!ts.surface.readCell(0, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(ts.surface.readCell(1, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(ts.surface.readCell(2, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));

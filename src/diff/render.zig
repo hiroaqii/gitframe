@@ -574,6 +574,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                 const current_stage = if (current_hunk_highlighted) options.hunk_stages.stateForHunk(hunk.hunk_index) else null;
                 if (current_stage != null and !hunk.folded) drawHunkGuide(surface, row, guideGlyph(guide_index, hunk.hunk_index, body_offset), current_stage.?, presentation, styles);
                 try drawHunkHeaderRow(&body_surface, row, hunk, current_stage, mode, presentation, styles);
+                if (current_stage != null and !hunk.folded and mode == .side_by_side) drawSideBySideHunkGuide(&body_surface, row, separatorGuideGlyph(guide_index, hunk.hunk_index, body_offset), current_stage.?, presentation, styles);
             },
             .unified_line => |line| {
                 if (current_hunk_highlighted) {
@@ -591,6 +592,9 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                 switch (side_row) {
                     .single => |line| try drawSideBySideSingle(&body_surface, row, line, projections.side_by_side, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
                     .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, projections.side_by_side, geometry, options.horizontal_scroll, options.line_numbers, presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                }
+                if (current_hunk_highlighted) {
+                    if (rows.currentHunkIndex()) |hunk_index| drawSideBySideHunkGuide(&body_surface, row, separatorGuideGlyph(guide_index, hunk_index, body_offset), options.hunk_stages.stateForHunk(hunk_index), presentation, styles);
                 }
             },
         }
@@ -837,22 +841,53 @@ fn drawCursorMarker(surface: *chasen.Surface, row: u16, body_offset: usize, curs
     _ = surface.borrowTextAt(0, row, "▌", presentation.compose(styles.cursor, styles));
 }
 
-fn guideGlyph(index_opt: ?diff_view_model.RenderedLineIndex, hunk_index: usize, body_offset: usize) []const u8 {
-    const index = index_opt orelse return "│";
+const HunkGuidePosition = enum {
+    start,
+    middle,
+    end,
+};
+
+fn hunkGuidePosition(index_opt: ?diff_view_model.RenderedLineIndex, hunk_index: usize, body_offset: usize) HunkGuidePosition {
+    const index = index_opt orelse return .middle;
     const hunk_offset = index.hunkOffset(hunk_index);
     const line_count = index.hunkLineCount(hunk_index);
-    if (body_offset == hunk_offset) return "╭";
-    if (line_count > 1 and body_offset + 1 == hunk_offset + line_count) return "╰";
-    return "│";
+    if (body_offset == hunk_offset) return .start;
+    if (line_count > 1 and body_offset + 1 == hunk_offset + line_count) return .end;
+    return .middle;
+}
+
+fn guideGlyph(index_opt: ?diff_view_model.RenderedLineIndex, hunk_index: usize, body_offset: usize) []const u8 {
+    return switch (hunkGuidePosition(index_opt, hunk_index, body_offset)) {
+        .start => "┏",
+        .middle => "┃",
+        .end => "┗",
+    };
+}
+
+fn separatorGuideGlyph(index_opt: ?diff_view_model.RenderedLineIndex, hunk_index: usize, body_offset: usize) []const u8 {
+    return switch (hunkGuidePosition(index_opt, hunk_index, body_offset)) {
+        .start => "╻",
+        .middle => "┃",
+        .end => "╹",
+    };
+}
+
+fn hunkGuideStyle(stage: HunkStageState, styles: RenderStyles) chasen.TextStyle {
+    return switch (stage) {
+        .unstaged => styles.hunk_guide,
+        .staged => styles.staged_hunk_guide,
+    };
 }
 
 fn drawHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, stage: HunkStageState, presentation: RowPresentation, styles: RenderStyles) void {
     if (surface.size().width < 2) return;
-    const style = switch (stage) {
-        .unstaged => styles.hunk_guide,
-        .staged => styles.staged_hunk_guide,
-    };
-    _ = surface.borrowTextAt(1, row, glyph, presentation.compose(style, styles));
+    _ = surface.borrowTextAt(1, row, glyph, presentation.compose(hunkGuideStyle(stage, styles), styles));
+}
+
+fn drawSideBySideHunkGuide(surface: *chasen.Surface, row: u16, glyph: []const u8, stage: HunkStageState, presentation: RowPresentation, styles: RenderStyles) void {
+    if (surface.size().width == 0) return;
+    const geometry = sideBySideGeometry(surface.size().width);
+    _ = surface.borrowTextAt(geometry.separator_col, row, glyph, presentation.compose(hunkGuideStyle(stage, styles), styles));
 }
 
 const UnifiedSyntaxContext = struct {
@@ -1423,8 +1458,8 @@ const RenderStyles = struct {
             .palette = palette,
             .file_header = .{ .bold = true, .fg = palette.color(.accent) },
             .hunk = .{ .dim = true, .fg = palette.color(.diff_metadata) },
-            .selected_hunk = .{ .bold = true, .fg = palette.color(.diff_hunk) },
-            .staged_hunk_header = .{ .bold = true, .fg = palette.color(.staged) },
+            .selected_hunk = .{ .fg = palette.color(.diff_hunk) },
+            .staged_hunk_header = .{ .fg = palette.color(.staged) },
             .hunk_guide = .{ .bold = true, .fg = palette.color(.diff_hunk) },
             // Index membership colors current-hunk chrome only. Keeping it
             // out of body styles preserves syntax and diff-kind readability.
@@ -2108,8 +2143,8 @@ test "renderFile colors current header and guide from exact per-hunk stage state
         .hunk_stages = .{ .per_hunk = &states },
         .palette = palette,
     });
-    try staged.expectCellText(1, body_start_row, "╭");
-    try staged.expectCellText(1, body_start_row + 1, "╰");
+    try staged.expectCellText(1, body_start_row, "┏");
+    try staged.expectCellText(1, body_start_row + 1, "┗");
     try staged.expectCellText(1, body_start_row + 2, " ");
     try std.testing.expect(staged.surface.readCell(1, body_start_row).?.style.fg.eql(palette.color(.staged)));
     try std.testing.expect(staged.surface.readCell(2, body_start_row).?.style.fg.eql(palette.color(.staged)));
@@ -2125,8 +2160,8 @@ test "renderFile colors current header and guide from exact per-hunk stage state
         .palette = palette,
     });
     try unstaged.expectCellText(1, body_start_row, " ");
-    try unstaged.expectCellText(1, body_start_row + 2, "╭");
-    try unstaged.expectCellText(1, body_start_row + 3, "╰");
+    try unstaged.expectCellText(1, body_start_row + 2, "┏");
+    try unstaged.expectCellText(1, body_start_row + 3, "┗");
     try std.testing.expect(unstaged.surface.readCell(1, body_start_row + 2).?.style.fg.eql(palette.color(.diff_hunk)));
     try std.testing.expect(unstaged.surface.readCell(2, body_start_row + 2).?.style.fg.eql(palette.color(.diff_hunk)));
     try std.testing.expect(!unstaged.surface.readCell(cursor_gutter_width + lineTextStart(true, .unified), body_start_row + 3).?.style.dim);
@@ -2920,6 +2955,8 @@ test "hunkHeaderStyle colors current hunk from exact stage state" {
     try std.testing.expect(staged.fg.eql(styles.staged_hunk_header.fg));
     try std.testing.expect(!unstaged.reverse);
     try std.testing.expect(!staged.reverse);
+    try std.testing.expect(!unstaged.bold);
+    try std.testing.expect(!staged.bold);
     try std.testing.expect(!unstaged.dim);
     try std.testing.expect(!staged.dim);
     try std.testing.expect(unstaged.bg.eql(.default));
@@ -2971,11 +3008,59 @@ test "selected hunk guide is drawn only for highlighted hunk" {
 
     try ts.expectCellText(1, 3, " ");
     try ts.expectCellText(1, 4, " ");
-    try ts.expectCellText(1, 5, "╭");
-    try ts.expectCellText(1, 6, "╰");
+    try ts.expectCellText(1, 5, "┏");
+    try ts.expectCellText(1, 6, "┗");
 
     const guide_cell = ts.surface.readCell(1, 5).?;
     try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).hunk_guide.fg));
+}
+
+test "side-by-side selected hunk guide is mirrored in center separator" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(100, 8);
+    defer ts.deinit();
+
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/main.zig b/src/main.zig",
+        .old_path = "a/src/main.zig",
+        .new_path = "b/src/main.zig",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 1,
+                .new_start = 1,
+                .new_count = 1,
+                .section = "first",
+                .lines = &.{.{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 }},
+            },
+            .{
+                .old_start = 9,
+                .old_count = 2,
+                .new_start = 9,
+                .new_count = 2,
+                .section = "second",
+                .lines = &.{
+                    .{ .kind = .context, .text = "later", .old_line = 9, .new_line = 9 },
+                    .{ .kind = .context, .text = "latest", .old_line = 10, .new_line = 10 },
+                },
+            },
+        },
+    };
+
+    try renderFile(&ts.surface, file, .{
+        .requested_mode = .side_by_side,
+        .highlighted_hunk = 1,
+    });
+
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const separator_col = cursor_gutter_width + geometry.separator_col;
+    try ts.expectCellText(separator_col, 3, "│");
+    try ts.expectCellText(separator_col, 4, "│");
+    try ts.expectCellText(separator_col, 5, "╻");
+    try ts.expectCellText(separator_col, 6, "┃");
+    try ts.expectCellText(separator_col, 7, "╹");
+    try std.testing.expect(ts.surface.readCell(separator_col, 5).?.style.fg.eql(RenderStyles.fromPalette(.default()).hunk_guide.fg));
 }
 
 test "side-by-side staged hunk colors current chrome without dimming body" {
@@ -3011,18 +3096,22 @@ test "side-by-side staged hunk colors current chrome without dimming body" {
         .palette = palette,
     });
 
-    try ts.expectCellText(1, body_start_row, "╭");
-    try ts.expectCellText(1, body_start_row + 1, "╰");
+    try ts.expectCellText(1, body_start_row, "┏");
+    try ts.expectCellText(1, body_start_row + 1, "┗");
     try std.testing.expect(ts.surface.readCell(1, body_start_row).?.style.fg.eql(palette.color(.staged)));
     try std.testing.expect(ts.surface.readCell(2, body_start_row).?.style.fg.eql(palette.color(.staged)));
     const geometry = sideBySideGeometry(bodyWidth(100));
+    const separator_col = cursor_gutter_width + geometry.separator_col;
+    try ts.expectCellText(separator_col, body_start_row, "╻");
+    try ts.expectCellText(separator_col, body_start_row + 1, "╹");
+    try std.testing.expect(ts.surface.readCell(separator_col, body_start_row).?.style.fg.eql(palette.color(.staged)));
     const old_text_col = cursor_gutter_width + geometry.old.col + lineTextStart(true, .side_by_side);
     const new_text_col = cursor_gutter_width + geometry.new.col + lineTextStart(true, .side_by_side);
     try std.testing.expect(!ts.surface.readCell(old_text_col, body_start_row + 1).?.style.dim);
     try std.testing.expect(!ts.surface.readCell(new_text_col, body_start_row + 1).?.style.dim);
 }
 
-test "selected hunk guide is dim when pane is inactive" {
+test "selected hunk guides are dim when pane is inactive" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 7);
     defer ts.deinit();
@@ -3061,10 +3150,26 @@ test "selected hunk guide is dim when pane is inactive" {
 
     const guide_cell = ts.surface.readCell(1, 5).?;
     const header_cell = ts.surface.readCell(2, 5).?;
-    try ts.expectCellText(1, 5, "╭");
+    try ts.expectCellText(1, 5, "┏");
     try std.testing.expect(guide_cell.style.dim);
     try std.testing.expect(guide_cell.style.fg.eql(RenderStyles.fromPalette(.default()).staged_hunk_guide.fg));
     try std.testing.expect(header_cell.style.fg.eql(RenderStyles.fromPalette(.default()).staged_hunk_header.fg));
+
+    var side_by_side: chasen.testing.TestSurface = undefined;
+    try side_by_side.init(100, 7);
+    defer side_by_side.deinit();
+    try renderFile(&side_by_side.surface, file, .{
+        .requested_mode = .side_by_side,
+        .highlighted_hunk = 1,
+        .pane_active = false,
+        .hunk_stages = .all_staged,
+    });
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    const separator_col = cursor_gutter_width + geometry.separator_col;
+    const separator_guide = side_by_side.surface.readCell(separator_col, 5).?;
+    try side_by_side.expectCellText(separator_col, 5, "╻");
+    try std.testing.expect(separator_guide.style.dim);
+    try std.testing.expect(separator_guide.style.fg.eql(RenderStyles.fromPalette(.default()).staged_hunk_guide.fg));
 }
 
 test "selected hunk guide continues when hunk header is scrolled above viewport" {
@@ -3103,8 +3208,8 @@ test "selected hunk guide continues when hunk header is scrolled above viewport"
         .highlighted_hunk = 0,
     });
 
-    try ts.expectCellText(1, 3, "│");
-    try ts.expectCellText(1, 4, "│");
+    try ts.expectCellText(1, 3, "┃");
+    try ts.expectCellText(1, 4, "┃");
     try ts.expectCellText(14, 3, "o");
     try ts.expectCellText(14, 4, "t");
 }
@@ -3142,6 +3247,18 @@ test "selected hunk guide is suppressed for folded highlighted hunk" {
     try ts.expectCellText(1, 3, " ");
     try ts.expectCellText(2, 3, "▸");
     try std.testing.expect(ts.surface.readCell(2, 3).?.style.fg.eql(theme.Palette.default().color(.staged)));
+
+    var side_by_side: chasen.testing.TestSurface = undefined;
+    try side_by_side.init(100, 5);
+    defer side_by_side.deinit();
+    try renderFile(&side_by_side.surface, file, .{
+        .requested_mode = .side_by_side,
+        .highlighted_hunk = 0,
+        .hunk_stages = .all_staged,
+        .folded_hunks = &.{true},
+    });
+    const geometry = sideBySideGeometry(bodyWidth(100));
+    try side_by_side.expectCellText(cursor_gutter_width + geometry.separator_col, 3, "│");
 }
 
 test "displayPath prefers new path and strips git prefixes" {
