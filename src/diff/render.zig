@@ -1722,7 +1722,7 @@ test "full-row diff background fills unified rows without leaking into chrome" {
 
     const text_col = cursor_gutter_width + lineTextStart(true, .unified);
     try ts.expectCellText(text_col, removed_row, "c");
-    try std.testing.expect(ts.surface.readCell(text_col, removed_row).?.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(ts.surface.readCell(text_col, removed_row).?.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(ts.surface.readCell(cursor_gutter_width + 1, removed_row).?.style.fg.eql(palette.color(.foreground)));
     try ts.expectCellText(cursor_gutter_width + lineLayout(true, .unified).prefix_col, removed_row, " ");
     try ts.expectCellText(cursor_gutter_width + lineLayout(true, .unified).prefix_col, added_row, "+");
@@ -1884,7 +1884,7 @@ test "full-row diff background preserves cursor and selection precedence" {
     try std.testing.expect(character.surface.readCell(text_col + 1, row).?.style.bg.eql(selection_bg));
     try std.testing.expect(character.surface.readCell(text_col + 2, row).?.style.bg.eql(selection_bg));
     try std.testing.expect(character.surface.readCell(79, row).?.style.bg.eql(pane_bg));
-    try std.testing.expect(character.surface.readCell(text_col + 1, row).?.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(character.surface.readCell(text_col + 1, row).?.style.fg.eql(palette.color(.syntax_keyword)));
 
     const paired_file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
@@ -2220,7 +2220,9 @@ test "renderFile applies unified syntax spans without removing diff background" 
     try ts.init(80, 6);
     defer ts.deinit();
 
-    const palette = theme.Palette.default();
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.syntax_string)] = .{ .rgb = .{ 4, 5, 6 } };
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
         .old_path = "a/src/main.zig",
@@ -2254,11 +2256,11 @@ test "renderFile applies unified syntax spans without removing diff background" 
     });
 
     const removed_cell = ts.surface.readCell(14, 4).?;
-    try std.testing.expect(removed_cell.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(removed_cell.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(removed_cell.style.bg.eql(palette.color(.diff_removed_bg)));
 
     const added_cell = ts.surface.readCell(14, 5).?;
-    try std.testing.expect(added_cell.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(added_cell.style.fg.eql(palette.color(.syntax_string)));
     try std.testing.expect(added_cell.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
@@ -2347,7 +2349,7 @@ test "renderFile normalizes highlighted unified body base foreground" {
     try std.testing.expect(!context_cell.style.dim);
 
     const removed_keyword = ts.surface.readCell(14, 5).?;
-    try std.testing.expect(removed_keyword.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(removed_keyword.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(removed_keyword.style.bg.eql(palette.color(.diff_removed_bg)));
     try std.testing.expect(!removed_keyword.style.dim);
 
@@ -2445,9 +2447,9 @@ test "renderFile applies side-by-side context syntax spans per side" {
     });
 
     const old_cell = ts.surface.readCell(9, 4).?;
-    try std.testing.expect(old_cell.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(old_cell.style.fg.eql(palette.color(.syntax_keyword)));
     const new_cell = ts.surface.readCell(59, 4).?;
-    try std.testing.expect(new_cell.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(new_cell.style.fg.eql(palette.color(.syntax_string)));
 }
 
 test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
@@ -2550,10 +2552,10 @@ test "renderFile resolves reordered combined syntax in unified and side-by-side 
     };
     const syntax = diff_syntax_view.View.initCombined(&syntax_origins, &cached, &unstaged);
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@intFromEnum(theme.Role.warning)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.syntax_string)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.syntax_type)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.syntax_number)] = .{ .rgb = .{ 10, 11, 12 } };
 
     var unified: chasen.testing.TestSurface = undefined;
     try unified.init(80, 9);
@@ -2565,10 +2567,10 @@ test "renderFile resolves reordered combined syntax in unified and side-by-side 
     });
     const unified_text_col = cursor_gutter_width + lineTextStart(true, .unified);
     const unified_prefix_col = cursor_gutter_width + lineLayout(true, .unified).prefix_col;
-    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.prompt)));
-    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 2).?.style.fg.eql(palette.color(.warning)));
-    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 4).?.style.fg.eql(palette.color(.accent)));
-    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 5).?.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.syntax_type)));
+    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 2).?.style.fg.eql(palette.color(.syntax_number)));
+    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 4).?.style.fg.eql(palette.color(.syntax_keyword)));
+    try std.testing.expect(unified.surface.readCell(unified_text_col, body_start_row + 5).?.style.fg.eql(palette.color(.syntax_string)));
     try unified.expectCellText(unified_prefix_col, body_start_row + 1, " ");
     try unified.expectCellText(unified_prefix_col, body_start_row + 5, " ");
 
@@ -2585,10 +2587,10 @@ test "renderFile resolves reordered combined syntax in unified and side-by-side 
     const new_text_col = cursor_gutter_width + geometry.new.col + lineTextStart(true, .side_by_side);
     const old_prefix_col = cursor_gutter_width + geometry.old.col + lineLayout(true, .side_by_side).prefix_col;
     const new_prefix_col = cursor_gutter_width + geometry.new.col + lineLayout(true, .side_by_side).prefix_col;
-    try std.testing.expect(side_by_side.surface.readCell(old_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.prompt)));
-    try std.testing.expect(side_by_side.surface.readCell(new_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.warning)));
-    try std.testing.expect(side_by_side.surface.readCell(old_text_col, body_start_row + 3).?.style.fg.eql(palette.color(.accent)));
-    try std.testing.expect(side_by_side.surface.readCell(new_text_col, body_start_row + 3).?.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(side_by_side.surface.readCell(old_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.syntax_type)));
+    try std.testing.expect(side_by_side.surface.readCell(new_text_col, body_start_row + 1).?.style.fg.eql(palette.color(.syntax_number)));
+    try std.testing.expect(side_by_side.surface.readCell(old_text_col, body_start_row + 3).?.style.fg.eql(palette.color(.syntax_keyword)));
+    try std.testing.expect(side_by_side.surface.readCell(new_text_col, body_start_row + 3).?.style.fg.eql(palette.color(.syntax_string)));
     try side_by_side.expectCellText(old_prefix_col, body_start_row + 1, " ");
     try side_by_side.expectCellText(new_prefix_col, body_start_row + 3, " ");
 }
@@ -2701,8 +2703,8 @@ test "review diff cursor character selection preserves syntax without stage dim"
     try std.testing.expect(selected_c.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(last.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
-    try std.testing.expect(selected_b.style.fg.eql(palette.color(.accent)));
-    try std.testing.expect(selected_c.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(selected_b.style.fg.eql(palette.color(.syntax_keyword)));
+    try std.testing.expect(selected_c.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(!selected_b.style.dim);
     try std.testing.expect(!selected_c.style.dim);
 }
@@ -2806,7 +2808,7 @@ test "review diff cursor TAB selection and syntax use the same multi-cell projec
     try expectBgRange(&ts.surface, 4, text_col + 1, text_col + 4, palette.color(.diff_selection_bg));
     const b = ts.surface.readCell(text_col + 4, 4).?;
     try std.testing.expect(b.style.bg.eql(pane_bg));
-    try std.testing.expect(b.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(b.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
 }
 
@@ -2942,7 +2944,7 @@ test "renderFile clips syntax spans through horizontal scroll without splitting 
 
     try ts.expectCellText(14, 4, "あ");
     const cell = ts.surface.readCell(14, 4).?;
-    try std.testing.expect(cell.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(cell.style.fg.eql(palette.color(.syntax_string)));
     try std.testing.expect(cell.style.bg.eql(palette.color(.diff_added_bg)));
 }
 

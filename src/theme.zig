@@ -16,6 +16,16 @@ pub const Role = enum {
     pane_cursor_bg,
     pane_active_line_number,
 
+    syntax_keyword,
+    syntax_operator,
+    syntax_function,
+    syntax_property,
+    syntax_type,
+    syntax_constant,
+    syntax_string,
+    syntax_number,
+    syntax_comment,
+
     diff_added,
     diff_modified,
     diff_removed,
@@ -120,6 +130,7 @@ pub const Palette = struct {
         // uses it today; Review adopts the same presentation role separately.
         palette.set(.pane_active_line_number, .{ .rgb = .{ 255, 218, 170 } });
 
+        palette.deriveSyntaxRoles();
         palette.set(.diff_added, palette.color(.success));
         palette.set(.diff_modified, palette.color(.info));
         palette.set(.diff_removed, palette.color(.danger));
@@ -146,6 +157,7 @@ pub const Palette = struct {
                 }
             }
         }
+        palette.deriveSyntaxRoles();
         palette.deriveDiffRoles();
         inline for (@typeInfo(Role).@"enum".fields) |field| {
             const role: Role = @enumFromInt(field.value);
@@ -183,10 +195,31 @@ pub const Palette = struct {
         self.set(.diff_hunk, self.color(.accent));
         self.set(.diff_cursor, self.color(.warning));
     }
+
+    fn deriveSyntaxRoles(self: *Palette) void {
+        self.set(.syntax_keyword, self.color(.accent));
+        self.set(.syntax_operator, self.color(.accent));
+        self.set(.syntax_function, self.color(.info));
+        self.set(.syntax_property, self.color(.info));
+        self.set(.syntax_type, self.color(.prompt));
+        self.set(.syntax_constant, self.color(.prompt));
+        self.set(.syntax_string, self.color(.success));
+        self.set(.syntax_number, self.color(.warning));
+        self.set(.syntax_comment, self.color(.muted));
+    }
 };
 
 fn isDerivedRole(role: Role) bool {
     return switch (role) {
+        .syntax_keyword,
+        .syntax_operator,
+        .syntax_function,
+        .syntax_property,
+        .syntax_type,
+        .syntax_constant,
+        .syntax_string,
+        .syntax_number,
+        .syntax_comment,
         .diff_added,
         .diff_modified,
         .diff_removed,
@@ -277,6 +310,8 @@ test "roleFromKey maps known theme keys" {
     try std.testing.expectEqual(Role.diff_selection_bg, roleFromKey("diff_selection_bg").?);
     try std.testing.expectEqual(Role.pane_cursor_bg, roleFromKey("pane_cursor_bg").?);
     try std.testing.expectEqual(Role.pane_active_line_number, roleFromKey("pane_active_line_number").?);
+    try std.testing.expectEqual(Role.syntax_keyword, roleFromKey("syntax_keyword").?);
+    try std.testing.expectEqual(Role.syntax_comment, roleFromKey("syntax_comment").?);
     try std.testing.expect(roleFromKey("repository_active_line_number") == null);
     try std.testing.expect(roleFromKey("repository_cursor_bg") == null);
     try std.testing.expect(roleFromKey("diff-added") == null);
@@ -296,6 +331,19 @@ test "Palette.default uses the retained selection visual reference color" {
     try std.testing.expect(Palette.default().color(.diff_selection_bg).eql(.{ .rgb = .{ 48, 64, 82 } }));
 }
 
+test "Palette.default preserves syntax colors derived from generic roles" {
+    const palette = Palette.default();
+    try std.testing.expect(palette.color(.syntax_keyword).eql(palette.color(.accent)));
+    try std.testing.expect(palette.color(.syntax_operator).eql(palette.color(.accent)));
+    try std.testing.expect(palette.color(.syntax_function).eql(palette.color(.info)));
+    try std.testing.expect(palette.color(.syntax_property).eql(palette.color(.info)));
+    try std.testing.expect(palette.color(.syntax_type).eql(palette.color(.prompt)));
+    try std.testing.expect(palette.color(.syntax_constant).eql(palette.color(.prompt)));
+    try std.testing.expect(palette.color(.syntax_string).eql(palette.color(.success)));
+    try std.testing.expect(palette.color(.syntax_number).eql(palette.color(.warning)));
+    try std.testing.expect(palette.color(.syntax_comment).eql(palette.color(.muted)));
+}
+
 test "Palette.fromConfig derives diff roles from base role overrides" {
     const FakeConfig = struct {
         pub fn get(_: @This(), role: Role) ?ColorValue {
@@ -313,6 +361,33 @@ test "Palette.fromConfig derives diff roles from base role overrides" {
     try std.testing.expect(palette.color(.diff_modified).eql(.{ .rgb = .{ 7, 8, 9 } }));
 }
 
+test "Palette.fromConfig derives syntax roles from generic role overrides" {
+    const FakeConfig = struct {
+        pub fn get(_: @This(), role: Role) ?ColorValue {
+            return switch (role) {
+                .accent => .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
+                .info => .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } },
+                .prompt => .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } },
+                .success => .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } },
+                .warning => .{ .rgb = .{ .r = 13, .g = 14, .b = 15 } },
+                .muted => .{ .rgb = .{ .r = 16, .g = 17, .b = 18 } },
+                else => null,
+            };
+        }
+    };
+
+    const palette = Palette.fromConfig(FakeConfig{});
+    try std.testing.expect(palette.color(.syntax_keyword).eql(.{ .rgb = .{ 1, 2, 3 } }));
+    try std.testing.expect(palette.color(.syntax_operator).eql(.{ .rgb = .{ 1, 2, 3 } }));
+    try std.testing.expect(palette.color(.syntax_function).eql(.{ .rgb = .{ 4, 5, 6 } }));
+    try std.testing.expect(palette.color(.syntax_property).eql(.{ .rgb = .{ 4, 5, 6 } }));
+    try std.testing.expect(palette.color(.syntax_type).eql(.{ .rgb = .{ 7, 8, 9 } }));
+    try std.testing.expect(palette.color(.syntax_constant).eql(.{ .rgb = .{ 7, 8, 9 } }));
+    try std.testing.expect(palette.color(.syntax_string).eql(.{ .rgb = .{ 10, 11, 12 } }));
+    try std.testing.expect(palette.color(.syntax_number).eql(.{ .rgb = .{ 13, 14, 15 } }));
+    try std.testing.expect(palette.color(.syntax_comment).eql(.{ .rgb = .{ 16, 17, 18 } }));
+}
+
 test "Palette.fromConfig lets explicit role overrides win" {
     const FakeConfig = struct {
         pub fn get(_: @This(), role: Role) ?ColorValue {
@@ -323,6 +398,7 @@ test "Palette.fromConfig lets explicit role overrides win" {
                 .diff_added_bg => .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } },
                 .pane_cursor_bg => .{ .rgb = .{ .r = 10, .g = 11, .b = 12 } },
                 .pane_active_line_number => .{ .rgb = .{ .r = 13, .g = 14, .b = 15 } },
+                .syntax_string => .{ .index = 13 },
                 else => null,
             };
         }
@@ -335,4 +411,5 @@ test "Palette.fromConfig lets explicit role overrides win" {
     try std.testing.expect(palette.color(.diff_added_bg).eql(.{ .rgb = .{ 4, 5, 6 } }));
     try std.testing.expect(palette.color(.pane_cursor_bg).eql(.{ .rgb = .{ 10, 11, 12 } }));
     try std.testing.expect(palette.color(.pane_active_line_number).eql(.{ .rgb = .{ 13, 14, 15 } }));
+    try std.testing.expect(palette.color(.syntax_string).eql(.{ .index = 13 }));
 }

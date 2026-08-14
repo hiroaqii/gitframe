@@ -1409,7 +1409,9 @@ test "repository source syntax uses neutral styles below the search overlay" {
     };
     var spans = try source_syntax.build(allocator, &document, &candidates);
     defer spans.deinit(allocator);
-    const palette: theme.Palette = .default();
+    var palette: theme.Palette = .default();
+    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.syntax_comment)] = .{ .rgb = .{ 4, 5, 6 } };
 
     var syntax_surface: chasen.testing.TestSurface = undefined;
     try syntax_surface.init(24, 6);
@@ -1419,9 +1421,9 @@ test "repository source syntax uses neutral styles below the search overlay" {
     const plain_cell = syntax_surface.surface.readCell(9, 2) orelse return error.ExpectedPlainCell;
     const comment_cell = syntax_surface.surface.readCell(3, 3) orelse return error.ExpectedCommentCell;
     const foreground_cell = syntax_surface.surface.readCell(3, 4) orelse return error.ExpectedForegroundCell;
-    try std.testing.expectEqual(palette.color(.accent), keyword_cell.style.fg);
+    try std.testing.expectEqual(palette.color(.syntax_keyword), keyword_cell.style.fg);
     try std.testing.expectEqual(palette.color(.foreground), plain_cell.style.fg);
-    try std.testing.expectEqual(palette.color(.muted), comment_cell.style.fg);
+    try std.testing.expectEqual(palette.color(.syntax_comment), comment_cell.style.fg);
     try std.testing.expectEqual(palette.color(.foreground), foreground_cell.style.fg);
     try std.testing.expect(keyword_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(plain_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1499,7 +1501,7 @@ test "repository source focus does not dim semantic foregrounds" {
         .{ .col = 1, .row = source_geometry.source_search_or_rule_row, .role = .muted },
         .{ .col = 0, .row = body_row, .role = .diff_added },
         .{ .col = geometry.line_number_col, .row = body_row, .role = .diff_line_number },
-        .{ .col = geometry.text_col, .row = body_row, .role = .accent },
+        .{ .col = geometry.text_col, .row = body_row, .role = .syntax_keyword },
         .{ .col = geometry.text_col + 6, .row = body_row, .role = .warning },
         .{ .col = geometry.text_col + 12, .row = body_row, .role = .foreground },
     };
@@ -1544,7 +1546,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.foreground)] = .{ .rgb = .{ 21, 22, 23 } };
     palette.colors[@intFromEnum(theme.Role.diff_line_number)] = .{ .rgb = .{ 31, 32, 33 } };
-    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 41, 42, 43 } };
+    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 41, 42, 43 } };
     palette.colors[@intFromEnum(theme.Role.pane_active_line_number)] = .{ .rgb = .{ 51, 52, 53 } };
     palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
@@ -1579,7 +1581,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
     try std.testing.expect(!line_number.style.bold);
     try std.testing.expect(non_current_line_number.style.fg.eql(palette.color(.diff_line_number)));
     try std.testing.expect(!non_current_line_number.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(keyword.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(keyword.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(searched.style.fg.eql(palette.color(.warning)));
     try std.testing.expect(searched.style.bold);
     for ([_]chasen.TextStyle{ gutter.style, line_number.style, keyword.style, searched.style, trailing.style }) |style| {
@@ -1606,7 +1608,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
     for ([_]struct { col: u16, role: theme.Role }{
         .{ .col = 0, .role = .diff_modified },
         .{ .col = geometry.line_number_col, .role = .diff_line_number },
-        .{ .col = geometry.text_col, .role = .accent },
+        .{ .col = geometry.text_col, .role = .syntax_keyword },
         .{ .col = geometry.text_col + 6, .role = .warning },
     }) |point| {
         const cell = inactive.surface.readCell(point.col, cursor_row) orelse return error.ExpectedInactiveCursorCell;
@@ -1681,7 +1683,7 @@ test "repository selection background composes after cursor syntax and search st
     const keyword = test_surface.surface.readCell(geometry.text_col, geometry.body_first_row) orelse return error.ExpectedKeywordCell;
     const searched = test_surface.surface.readCell(geometry.text_col + 6, geometry.body_first_row) orelse return error.ExpectedSearchCell;
     const plain = test_surface.surface.readCell(geometry.text_col + 12, geometry.body_first_row) orelse return error.ExpectedPlainCell;
-    try std.testing.expectEqual(palette.color(.accent), keyword.style.fg);
+    try std.testing.expectEqual(palette.color(.syntax_keyword), keyword.style.fg);
     try std.testing.expectEqual(palette.color(.warning), searched.style.fg);
     try std.testing.expect(searched.style.bold);
     try std.testing.expectEqual(palette.color(.foreground), plain.style.fg);

@@ -947,6 +947,15 @@ test "loadConfig accepts theme color overrides" {
         \\pane_cursor_bg = "#292a2b"
         \\pane_active_line_number = "#ffdaaa"
         \\diff_selection_bg = "#304052"
+        \\syntax_keyword = "#111213"
+        \\syntax_operator = "bright-cyan"
+        \\syntax_function = "index:12"
+        \\syntax_property = "#212223"
+        \\syntax_type = "bright-yellow"
+        \\syntax_constant = "index:13"
+        \\syntax_string = "#313233"
+        \\syntax_number = "bright-red"
+        \\syntax_comment = "index:8"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -964,6 +973,50 @@ test "loadConfig accepts theme color overrides" {
     try std.testing.expect(loaded.value.theme.get(.pane_cursor_bg).?.toChasen().eql(.{ .rgb = .{ 41, 42, 43 } }));
     try std.testing.expect(loaded.value.theme.get(.pane_active_line_number).?.toChasen().eql(.{ .rgb = .{ 255, 218, 170 } }));
     try std.testing.expect(loaded.value.theme.get(.diff_selection_bg).?.toChasen().eql(.{ .rgb = .{ 48, 64, 82 } }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_keyword).?.toChasen().eql(.{ .rgb = .{ 17, 18, 19 } }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_operator).?.toChasen().eql(.{ .index = 14 }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_function).?.toChasen().eql(.{ .index = 12 }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_property).?.toChasen().eql(.{ .rgb = .{ 33, 34, 35 } }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_type).?.toChasen().eql(.{ .index = 11 }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_constant).?.toChasen().eql(.{ .index = 13 }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_string).?.toChasen().eql(.{ .rgb = .{ 49, 50, 51 } }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_number).?.toChasen().eql(.{ .index = 9 }));
+    try std.testing.expect(loaded.value.theme.get(.syntax_comment).?.toChasen().eql(.{ .index = 8 }));
+}
+
+test "parse config accepts every syntax role in each color form" {
+    const roles = [_]theme.Role{
+        .syntax_keyword,
+        .syntax_operator,
+        .syntax_function,
+        .syntax_property,
+        .syntax_type,
+        .syntax_constant,
+        .syntax_string,
+        .syntax_number,
+        .syntax_comment,
+    };
+    const cases = [_]struct {
+        text: []const u8,
+        expected: theme.ColorValue,
+    }{
+        .{ .text = "#010203", .expected = .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } } },
+        .{ .text = "bright-cyan", .expected = .{ .named = .bright_cyan } },
+        .{ .text = "index:12", .expected = .{ .index = 12 } },
+    };
+
+    for (roles) |role| {
+        for (cases) |case| {
+            const input = try std.fmt.allocPrint(std.testing.allocator,
+                \\[theme]
+                \\{s} = "{s}"
+                \\
+            , .{ @tagName(role), case.text });
+            defer std.testing.allocator.free(input);
+            const config = try parseConfigToml(input);
+            try std.testing.expect(config.theme.get(role).?.toChasen().eql(case.expected.toChasen()));
+        }
+    }
 }
 
 test "parse config rejects removed repository cursor theme key" {
@@ -1482,8 +1535,10 @@ test "loaded theme config feeds palette derivation" {
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
         \\schema_version = 1
         \\[theme]
+        \\accent = "#0a0b0c"
         \\success = "#010203"
         \\info = "#070809"
+        \\syntax_string = "index:13"
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -1499,6 +1554,11 @@ test "loaded theme config feeds palette derivation" {
     try std.testing.expect(palette.color(.success).eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(palette.color(.diff_added).eql(.{ .rgb = .{ 1, 2, 3 } }));
     try std.testing.expect(palette.color(.diff_modified).eql(.{ .rgb = .{ 7, 8, 9 } }));
+    try std.testing.expect(palette.color(.syntax_keyword).eql(.{ .rgb = .{ 10, 11, 12 } }));
+    try std.testing.expect(palette.color(.syntax_operator).eql(.{ .rgb = .{ 10, 11, 12 } }));
+    try std.testing.expect(palette.color(.syntax_function).eql(.{ .rgb = .{ 7, 8, 9 } }));
+    try std.testing.expect(palette.color(.syntax_property).eql(.{ .rgb = .{ 7, 8, 9 } }));
+    try std.testing.expect(palette.color(.syntax_string).eql(.{ .index = 13 }));
 }
 
 test "loadConfig rejects unknown theme keys" {
