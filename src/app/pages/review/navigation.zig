@@ -2544,7 +2544,7 @@ test "Review navigation keeps diff position at file selection boundary" {
     try std.testing.expectEqual(@as(?usize, 1), harness.view().selectedHunkIndex());
 }
 
-test "Review navigation keeps selected hunk visible across mode changes" {
+test "Review navigation keeps diff cursor visible across mode changes" {
     var harness = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{

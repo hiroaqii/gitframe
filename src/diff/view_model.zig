@@ -675,6 +675,11 @@ pub fn sideBySideLineIndexAtRenderedOffset(lines: []const diff_parser.DiffLine, 
     return null;
 }
 
+/// Converts a hunk's raw unified lines into indexed rows used by side-by-side mode.
+///
+/// Git commonly emits replacement blocks as a removed run followed by an added
+/// run (`-a -b +A +B`). Pairing those runs by index keeps the two sides aligned
+/// for rendering, counting, and search.
 pub const SideBySideIndexedIterator = struct {
     lines: []const diff_parser.DiffLine,
     index: usize = 0,
