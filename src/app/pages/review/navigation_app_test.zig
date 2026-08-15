@@ -451,3 +451,68 @@ test "explicit interim navigation creates override but automatic state does not"
     reviewNavigation(&app).clampDiffNavigation();
     try std.testing.expectEqual(revision_before_clamp, app.pages.review.display_navigation_input_revision);
 }
+
+test "Review drag auto-scroll advances input revision and captures pending restore override" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .pages = .{ .review = .{
+            .load = .{ .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
+            .source_session_revision = 31,
+            .status_load = .{ .freshness = .stale_refresh },
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } },
+                .diff_scroll = 1,
+                .sidebar_hidden = true,
+                .display_mode = .unified,
+            },
+            .selection_owner = .{ .diff = .{
+                .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+                .side = .new,
+                .mode = .line,
+                .anchor = .{ .hunk_index = 0, .line_index = 0 },
+                .focus = .{ .hunk_index = 0, .line_index = 1 },
+                .anchor_cell = .{ .col = 20, .row = diff_render.body_start_row + 1 },
+            } },
+        } },
+        .allocator = allocator,
+        .terminal_size = .{ .width = 100, .height = 10 },
+        .config = .{ .source = .unstaged },
+        .repo_session = .{ .repo_state = .{ .discovery = .{ .single_repo = .{
+            .label = "repo",
+            .display_path = "/repo",
+            .canonical_root = "/repo",
+        } } } },
+    };
+    defer reviewReload(&app).clearLoadedDiff(allocator);
+    app.pages.review.pending_display_navigation_restore = .{
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .source_kind = .unstaged,
+        .source_session_revision = app.pages.review.source_session_revision,
+        .original = .{
+            .path_key = try allocator.dupe(u8, "a"),
+            .sidebar_identity = .{ .file = try allocator.dupe(u8, "a") },
+            .selected_target_tag = .diff_file,
+            .visible_sidebar_row = 0,
+            .diff_cursor = .{ .hunk_header = 1 },
+            .diff_cursor_offset = 5,
+            .diff_scroll = 4,
+            .diff_horizontal_scroll = 0,
+            .sidebar_horizontal_scroll = 0,
+            .search_coordinate = null,
+        },
+        .captured_input_revision = 0,
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+
+    try app.update(.{ .review = .{ .mouse_diff_auto_scroll_step = .{
+        .direction = .up,
+        .endpoint = .{ .col = 20, .row = diff_render.body_start_row },
+    } } }, &ctx);
+
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(u64, 1), app.pages.review.display_navigation_input_revision);
+    const restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
+    const override = restore.override orelse return error.ExpectedNavigationOverride;
+    try std.testing.expectEqual(@as(usize, 0), override.diff_scroll);
+}

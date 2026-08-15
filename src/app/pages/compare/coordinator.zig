@@ -13,6 +13,7 @@ const effect_origin = @import("../../effect_origin.zig");
 const page = @import("../../page.zig");
 const repo_session = @import("../../repo_session.zig");
 const diff_surface = @import("../../diff_surface.zig");
+const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const diff_selection = @import("../../../diff/selection.zig");
 const compare_page = @import("../compare.zig");
 const compare_input = @import("input.zig");
@@ -42,6 +43,7 @@ pub const ClipboardEffect = struct {
 
 pub const UpdateOutcome = struct {
     clipboard: ?ClipboardEffect = null,
+    auto_scroll: ?drag_auto_scroll.StepOutcome = null,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -96,16 +98,23 @@ pub const Controller = struct {
                 var page_update = try update_adapter.shared().apply(ctx.allocator(), shared_msg);
                 defer page_update.deinit(ctx.allocator());
                 update_adapter.applyRetentionTransition(ctx.allocator(), page_update.retention_transition);
-                const effect = page_update.takeEffect() orelse return .{};
+                const auto_scroll = page_update.auto_scroll;
+                const effect = page_update.takeEffect() orelse return .{ .auto_scroll = auto_scroll };
                 return switch (effect) {
-                    .copy_diff_selection => |text| .{ .clipboard = self.ownedClipboard("diff selection", text) },
+                    .copy_diff_selection => |text| .{
+                        .clipboard = self.ownedClipboard("diff selection", text),
+                        .auto_scroll = auto_scroll,
+                    },
                     .copy_diff_header_path => |selection_value| blk: {
                         const selection = selection_value;
                         defer ctx.allocator().free(selection.identity.path_key);
                         const navigation_view = navigation_controller.view();
                         var content_adapter = navigation_view.resolver();
                         const path = navigation_view.contentView(&content_adapter).diffHeaderPath(selection) orelse break :blk .{};
-                        break :blk .{ .clipboard = self.borrowedClipboard("file path", path) };
+                        break :blk .{
+                            .clipboard = self.borrowedClipboard("file path", path),
+                            .auto_scroll = auto_scroll,
+                        };
                     },
                 };
             },
@@ -447,6 +456,16 @@ test "Compare changed reload restores semantic viewport after removing retained 
     );
     try std.testing.expect(compare.deferred_load_apply != null);
     try std.testing.expect(compare.completed_selection == null);
+
+    const scroll_before_auto = compare.viewer.diff_scroll;
+    var auto = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_auto_scroll_step = .{
+        .direction = .down,
+        .endpoint = .{ .col = 20, .row = 8 },
+    } } });
+    defer auto.deinit(allocator);
+    try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, auto.auto_scroll.?);
+    try std.testing.expectEqual(scroll_before_auto + 1, compare.viewer.diff_scroll);
+    try std.testing.expect(compare.deferred_load_apply != null);
 
     var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
     defer release.deinit(allocator);

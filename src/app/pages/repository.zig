@@ -8,6 +8,7 @@ const chasen = @import("chasen");
 const text_projection = @import("chasen_ui").text_projection;
 const keymap = @import("keymap");
 const app_state = @import("../state.zig");
+const drag_auto_scroll = @import("../drag_auto_scroll.zig");
 const selection_action = @import("../selection_action.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const page = @import("../page.zig");
@@ -126,6 +127,7 @@ pub const Msg = union(enum) {
     mouse_source_press: repository_layout.BodyPoint,
     mouse_owner_drag: ?repository_layout.BodyPoint,
     mouse_owner_release: ?repository_layout.BodyPoint,
+    mouse_source_auto_scroll_step: drag_auto_scroll.Step,
     cancel_mouse_owner,
     mouse_source_wheel_up,
     mouse_source_wheel_down,
@@ -196,6 +198,7 @@ pub const Command = union(enum) {
 pub const RepositoryUpdate = struct {
     selected_path_changed: bool = false,
     command: ?Command = null,
+    auto_scroll: ?drag_auto_scroll.StepOutcome = null,
 
     pub fn deinit(self: *RepositoryUpdate, allocator: std.mem.Allocator) void {
         if (self.command) |*command| command.deinit(allocator);
@@ -1595,11 +1598,11 @@ pub const RepositoryPageState = struct {
         // mutate retained browser state. Pure presentation/cancel commands do
         // not retarget the browser and therefore retain the owner.
         if (navigationDismissesIncoming(msg)) self.dismissIncoming(allocator);
-        // Drag/release are the only continuations of a live mouse owner.
+        // Drag/release/auto-scroll are the only continuations of a live mouse owner.
         // Any independent page command becomes an explicit cancel terminal so
         // keyboard navigation/search cannot silently retarget the gesture.
         switch (msg) {
-            .mouse_owner_drag, .mouse_owner_release, .cancel_mouse_owner => {},
+            .mouse_owner_drag, .mouse_owner_release, .mouse_source_auto_scroll_step, .cancel_mouse_owner => {},
             else => self.cancelMouseOwner(),
         }
         const previous = self.selected_path;
@@ -1661,6 +1664,7 @@ pub const RepositoryPageState = struct {
             .mouse_source_press => |point| self.pressSourceSelection(point, body_size),
             .mouse_owner_drag => |point| self.dragMouseOwner(point, body_size),
             .mouse_owner_release => |point| result.command = self.releaseMouseOwner(allocator, point, body_size),
+            .mouse_source_auto_scroll_step => |step| result.auto_scroll = self.autoScrollSourceSelection(step, body_size),
             .cancel_mouse_owner => self.cancelMouseOwner(),
             .selection_action => |action| result.command = self.applySelectionAction(allocator, action, body_size),
             .mouse_source_wheel_up => if (source) |document| {
@@ -2097,6 +2101,29 @@ pub const RepositoryPageState = struct {
         return self.selection_owner.activeSourceRange();
     }
 
+    /// Body-relative source viewport used only by the root pointer policy.
+    /// Source identity and token stay page-private and are revalidated again
+    /// when the semantic step is consumed.
+    pub fn sourceAutoScrollViewport(
+        self: *const RepositoryPageState,
+        body_size: chasen.Size,
+    ) ?drag_auto_scroll.Viewport {
+        const live = self.selection_owner.activeSource() orelse return null;
+        const token = self.currentContentToken() orelse return null;
+        if (!live.token.eql(token)) return null;
+        const document = self.currentSource() orelse return null;
+        const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+        if (layout.source_width == 0) return null;
+        const geometry = self.sourceGeometry(body_size, document);
+        if (geometry.visible_source_rows < 2) return null;
+        return .{
+            .first_col = layout.source_col,
+            .last_col = layout.source_col + layout.source_width - 1,
+            .first_row = geometry.body_first_row,
+            .last_row = geometry.body_first_row + geometry.visible_source_rows - 1,
+        };
+    }
+
     /// Returns only a live selection already proved against the current
     /// displayed source identity. The borrowed projection is valid for the
     /// caller's synchronous use of this immutable state snapshot.
@@ -2493,6 +2520,47 @@ pub const RepositoryPageState = struct {
         self.viewer.source_cursor = line_index;
         live.updateAtCell(logical_point, .{ .col = local.col, .row = local.row });
         self.selection_owner = .{ .source = live };
+    }
+
+    fn autoScrollSourceSelection(
+        self: *RepositoryPageState,
+        step: drag_auto_scroll.Step,
+        body_size: chasen.Size,
+    ) drag_auto_scroll.StepOutcome {
+        const live = self.selection_owner.activeSource() orelse {
+            self.cancelMouseOwner();
+            return .stale_owner;
+        };
+        const document = self.currentSource() orelse {
+            self.cancelMouseOwner();
+            return .stale_owner;
+        };
+        const token = self.currentContentToken() orelse {
+            self.cancelMouseOwner();
+            return .stale_owner;
+        };
+        if (!live.token.eql(token)) {
+            self.cancelMouseOwner();
+            return .stale_owner;
+        }
+
+        const geometry = self.sourceGeometry(body_size, document);
+        const old_scroll = self.viewer.source_vertical_scroll;
+        repository_navigation.wheelSourceProjected(
+            &self.viewer,
+            document,
+            if (step.direction == .up) -1 else 1,
+            geometry,
+            self.selectionActionProjection(),
+        );
+        if (self.viewer.source_vertical_scroll == old_scroll) return .content_edge;
+
+        self.dragSourceSelection(.{
+            .col = step.endpoint.col,
+            .row = step.endpoint.row,
+        }, body_size);
+        if (self.selection_owner.activeSource() == null) return .stale_owner;
+        return .moved;
     }
 
     fn releaseSourceSelection(
@@ -5112,6 +5180,150 @@ test "repository source comfort page routes wheel page search boundaries and mou
     } }, size);
     try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
+}
+
+test "repository drag auto-scroll validates token and steps one projected row" {
+    const allocator = std.testing.allocator;
+    const content =
+        "row 00\n" ++ "row 01\n" ++ "row 02\n" ++ "row 03\n" ++ "row 04\n" ++
+        "row 05\n" ++ "row 06\n" ++ "row 07\n" ++ "row 08\n" ++ "a\t界z\n" ++
+        "row 10\n" ++ "row 11\n" ++ "row 12\n" ++ "row 13\n" ++ "row 14\n" ++
+        "row 15\n" ++ "row 16\n" ++ "row 17\n" ++ "row 18\n" ++ "row 19\n";
+    var state = try selectionStateForTest("main.zig\x00", content);
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    const geometry = state.sourceGeometry(size, state.currentSource().?);
+    state.viewer.source_vertical_scroll = 5;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
+        .col = geometry.text_col,
+        .row = geometry.body_first_row,
+    } }, size);
+    try std.testing.expect(state.activeSourceRange());
+    const token_before = state.selection_owner.activeSource().?.token;
+    try std.testing.expect(state.selection_owner.activeSource().?.mode == .character);
+    const viewport = state.sourceAutoScrollViewport(size) orelse return error.ExpectedSourceViewport;
+    const layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    try std.testing.expectEqual(layout.source_col, viewport.first_col);
+    try std.testing.expectEqual(geometry.body_first_row, viewport.first_row);
+    try std.testing.expectEqual(size.height - 1, viewport.last_row);
+
+    var update = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
+        .direction = .down,
+        .endpoint = .{ .col = geometry.text_col + 5, .row = viewport.last_row },
+    } }, size);
+    defer update.deinit(allocator);
+    try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, update.auto_scroll.?);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
+    const live = state.selection_owner.activeSource().?;
+    try std.testing.expect(live.token.eql(token_before));
+    try std.testing.expect(live.mode == .character);
+    try std.testing.expectEqual(@as(usize, 9), live.focus.line_index);
+    try std.testing.expectEqual(@as(usize, 2), live.focus.leading_byte);
+    try std.testing.expectEqual(@as(usize, 5), live.focus.trailing_byte);
+
+    // The same live token and character mode continue through repeated steps
+    // beyond the original viewport. The completed bytes include the TAB and
+    // wide glyph traversed by the first tick, but stop at the exact terminal
+    // cell resolved by the last one.
+    for (0..2) |_| {
+        var repeated = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
+            .direction = .down,
+            .endpoint = .{ .col = geometry.text_col + 5, .row = viewport.last_row },
+        } }, size);
+        defer repeated.deinit(allocator);
+        try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, repeated.auto_scroll.?);
+    }
+    const character_live = state.selection_owner.activeSource().?;
+    try std.testing.expect(character_live.token.eql(token_before));
+    try std.testing.expect(character_live.mode == .character);
+    try std.testing.expectEqual(@as(usize, 11), character_live.focus.line_index);
+    var character_release = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
+    defer character_release.deinit(allocator);
+    const expected_character = "row 05\nrow 06\nrow 07\nrow 08\na\t界z\nrow 10\nrow 11";
+    try std.testing.expectEqualStrings(expected_character, state.completed_selection.?.text);
+    var character_copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+    defer character_copy.deinit(allocator);
+    var character_command = character_copy.takeCommand() orelse return error.ExpectedSourceCopyCommand;
+    defer character_command.deinit(allocator);
+    switch (character_command) {
+        .copy_source_selection => |text| try std.testing.expectEqualStrings(expected_character, text),
+        else => return error.ExpectedSourceCopyCommand,
+    }
+
+    // A retained #78 action row becomes the top edge row during a new line
+    // drag. It advances the viewport without replacing the semantic endpoint;
+    // subsequent repeated steps finish off-screen and Copy contains source
+    // lines only, never the virtual action label.
+    try installFirstLineCandidateForTest(&state, allocator);
+    state.viewer.source_vertical_scroll = 0;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
+        .col = geometry.gutter_col,
+        .row = viewport.first_row,
+    } }, size);
+    const line_token = state.selection_owner.activeSource().?.token;
+    try std.testing.expect(state.selection_owner.activeSource().?.mode == .line);
+    state.viewer.source_vertical_scroll = 2;
+    const focus_before_action = state.selection_owner.activeSource().?.focus;
+    var action_row = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
+        .direction = .up,
+        .endpoint = .{ .col = geometry.text_col, .row = viewport.first_row },
+    } }, size);
+    defer action_row.deinit(allocator);
+    try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, action_row.auto_scroll.?);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll);
+    try std.testing.expect(std.meta.eql(focus_before_action, state.selection_owner.activeSource().?.focus));
+
+    for (0..3) |_| {
+        var repeated = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
+            .direction = .down,
+            .endpoint = .{ .col = geometry.gutter_col, .row = viewport.last_row },
+        } }, size);
+        defer repeated.deinit(allocator);
+        try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, repeated.auto_scroll.?);
+    }
+    const line_live = state.selection_owner.activeSource().?;
+    try std.testing.expect(line_live.token.eql(line_token));
+    try std.testing.expect(line_live.mode == .line);
+    try std.testing.expectEqual(@as(usize, 5), line_live.focus.line_index);
+    var line_release = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
+    defer line_release.deinit(allocator);
+    const expected_lines = "row 00\nrow 01\nrow 02\nrow 03\nrow 04\nrow 05\n";
+    try std.testing.expectEqualStrings(expected_lines, state.completed_selection.?.text);
+    try std.testing.expect(std.mem.indexOf(u8, state.completed_selection.?.text, selection_action.controls_text) == null);
+    var line_copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+    defer line_copy.deinit(allocator);
+    var line_command = line_copy.takeCommand() orelse return error.ExpectedSourceCopyCommand;
+    defer line_command.deinit(allocator);
+    switch (line_command) {
+        .copy_source_selection => |text| {
+            try std.testing.expectEqualStrings(expected_lines, text);
+            try std.testing.expect(std.mem.indexOf(u8, text, selection_action.controls_text) == null);
+        },
+        else => return error.ExpectedSourceCopyCommand,
+    }
+
+    state.viewer.source_vertical_scroll = 0;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
+        .col = geometry.text_col,
+        .row = viewport.first_row,
+    } }, size);
+    state.viewer.source_vertical_scroll = state.selectionActionProjection().?.maxScroll(geometry.visible_source_rows);
+    var edge = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
+        .direction = .down,
+        .endpoint = .{ .col = geometry.text_col, .row = viewport.last_row },
+    } }, size);
+    defer edge.deinit(allocator);
+    try std.testing.expectEqual(drag_auto_scroll.StepOutcome.content_edge, edge.auto_scroll.?);
+    try std.testing.expect(state.activeSourceRange());
+
+    state.repo_epoch += 1;
+    var stale = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
+        .direction = .up,
+        .endpoint = .{ .col = geometry.text_col, .row = viewport.first_row },
+    } }, size);
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(drag_auto_scroll.StepOutcome.stale_owner, stale.auto_scroll.?);
+    try std.testing.expect(!state.activeMouseOwner());
 }
 
 test "repository selection live gesture fixes mode and resumes after leaving the pane" {

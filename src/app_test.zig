@@ -138,10 +138,20 @@ test "quit waits for pending git action" {
 test "quit exits when no git action is pending" {
     var app: App = .{ .allocator = std.testing.allocator };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    app.drag_auto_scroll.active = .{
+        .generation = 5,
+        .target = .review,
+        .intent = .{ .direction = .down, .endpoint = .{ .col = 4, .row = 8 } },
+    };
+    app.drag_auto_scroll.scheduled_generation = 5;
 
     try app.update(.quit, &ctx);
 
     try std.testing.expect(ctx.shouldQuit());
+    try std.testing.expect(app.drag_auto_scroll.active == null);
+    try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_cancels_len);
 }
 
 test "review cancel remains available when source validation failed" {

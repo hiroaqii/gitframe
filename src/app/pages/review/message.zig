@@ -5,6 +5,7 @@
 //! precedence before it can create one of these page-local messages.
 
 const shared_message = @import("../../diff_surface/message.zig");
+const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const selection_action = @import("../../selection_action.zig");
 
 pub const MousePoint = @import("../../diff_surface.zig").MousePoint;
@@ -38,6 +39,7 @@ pub const Msg = union(enum) {
     mouse_diff_press: MousePoint,
     mouse_diff_drag: ?MousePoint,
     mouse_diff_release: ?MousePoint,
+    mouse_diff_auto_scroll_step: drag_auto_scroll.Step,
     toggle_focus,
     page_diff_up,
     page_diff_down,
@@ -117,6 +119,7 @@ pub const Msg = union(enum) {
             .mouse_diff_press,
             .mouse_diff_drag,
             .mouse_diff_release,
+            .mouse_diff_auto_scroll_step,
             .selection_action,
             .toggle_focus,
             .page_diff_up,

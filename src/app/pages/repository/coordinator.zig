@@ -7,6 +7,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const app_message = @import("../../message.zig");
+const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const effect_origin = @import("../../effect_origin.zig");
 const page = @import("../../page.zig");
 const git_command = @import("../../../git/command.zig");
@@ -40,6 +41,7 @@ pub const ClipboardEffect = struct {
 pub const UpdateOutcome = struct {
     redraw: Redraw = .default,
     clipboard: ?ClipboardEffect = null,
+    auto_scroll: ?drag_auto_scroll.StepOutcome = null,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -107,8 +109,9 @@ pub const Controller = struct {
                 if (self.active_page != .repository) return .{ .redraw = .skip };
                 var page_update = self.page_state.applyNavigation(ctx.allocator(), msg, self.body_size);
                 defer page_update.deinit(ctx.allocator());
-                const command = page_update.takeCommand() orelse return .{};
-                return .{ .clipboard = switch (command) {
+                const auto_scroll = page_update.auto_scroll;
+                const command = page_update.takeCommand() orelse return .{ .auto_scroll = auto_scroll };
+                return .{ .auto_scroll = auto_scroll, .clipboard = switch (command) {
                     .copy_source_selection => |text| .{
                         .origin = .{ .page = self.effectOrigin() },
                         .label = "source selection",

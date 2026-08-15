@@ -14,6 +14,7 @@ const app_shell_layout = @import("shell_layout.zig");
 const app_state = @import("state.zig");
 const app_view = @import("view.zig");
 const diff_surface = @import("diff_surface.zig");
+const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const diff_selection = @import("../diff/selection.zig");
 const keymap = @import("keymap");
 const loaded_diff = @import("../loaded_diff.zig");
@@ -113,13 +114,25 @@ pub const View = struct {
         if (self.activeDiffSelectionOwner()) |selection| {
             if (selection.active()) switch (selection) {
                 .review => switch (mouse.type) {
-                    .drag => return .{ .review = .{ .mouse_diff_drag = self.bodyMousePoint(mouse) } },
-                    .release => return .{ .review = .{ .mouse_diff_release = self.bodyMousePoint(mouse) } },
+                    .drag => return .{ .mouse_selection_drag = .{
+                        .pointer = self.bodyPointerSample(mouse),
+                        .target = .{ .review = self.bodyMousePoint(mouse) },
+                    } },
+                    .release => return .{ .mouse_selection_release = .{
+                        .pointer = self.bodyPointerSample(mouse),
+                        .target = .{ .review = self.bodyMousePoint(mouse) },
+                    } },
                     else => {},
                 },
                 .compare => switch (mouse.type) {
-                    .drag => return .{ .compare = .{ .shared = .{ .mouse_diff_drag = self.bodyMousePoint(mouse) } } },
-                    .release => return .{ .compare = .{ .shared = .{ .mouse_diff_release = self.bodyMousePoint(mouse) } } },
+                    .drag => return .{ .mouse_selection_drag = .{
+                        .pointer = self.bodyPointerSample(mouse),
+                        .target = .{ .compare = self.bodyMousePoint(mouse) },
+                    } },
+                    .release => return .{ .mouse_selection_release = .{
+                        .pointer = self.bodyPointerSample(mouse),
+                        .target = .{ .compare = self.bodyMousePoint(mouse) },
+                    } },
                     else => {},
                 },
             };
@@ -137,8 +150,14 @@ pub const View = struct {
                 self.repository.page_state.viewer.tree_hidden,
             );
             switch (mouse.type) {
-                .drag => return .{ .repository = .{ .mouse_owner_drag = source_point } },
-                .release => return .{ .repository = .{ .mouse_owner_release = source_point } },
+                .drag => return .{ .mouse_selection_drag = .{
+                    .pointer = self.bodyPointerSample(mouse),
+                    .target = .{ .repository = source_point },
+                } },
+                .release => return .{ .mouse_selection_release = .{
+                    .pointer = self.bodyPointerSample(mouse),
+                    .target = .{ .repository = source_point },
+                } },
                 else => {},
             }
         }
@@ -305,6 +324,13 @@ pub const View = struct {
     fn bodyMousePoint(self: View, mouse: anytype) ?MousePoint {
         const point = self.layout.terminalToBody(mouse.col, mouse.row) orelse return null;
         return .{ .col = point.col, .row = point.row };
+    }
+
+    fn bodyPointerSample(self: View, mouse: anytype) drag_auto_scroll.PointerSample {
+        return .{
+            .col = @as(i32, mouse.col) - @as(i32, self.layout.body.col),
+            .row = @as(i32, mouse.row) - @as(i32, self.layout.body.row),
+        };
     }
 };
 

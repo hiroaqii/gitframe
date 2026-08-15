@@ -3,6 +3,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const app_message = @import("../../message.zig");
+const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const page = @import("../../page.zig");
 const page_link = @import("../../page_link.zig");
 const repo_session = @import("../../repo_session.zig");
@@ -70,6 +71,28 @@ const app_testing = struct {
         if (outcome.redraw == .skip) app.redraw_plan.requestSkip();
     }
 };
+
+test "Repository drag auto-scroll coordinator transfers terminal only for active page" {
+    const allocator = std.testing.allocator;
+    var app: TestApp = .{};
+    defer app.pages.repository.deinit(allocator);
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+    const step: repository_page.Msg = .{ .mouse_source_auto_scroll_step = .{
+        .direction = .down,
+        .endpoint = .{ .col = 4, .row = 8 },
+    } };
+
+    var active = app.controller().update(&ctx, step);
+    defer active.deinit(allocator);
+    try std.testing.expectEqual(drag_auto_scroll.StepOutcome.stale_owner, active.auto_scroll.?);
+    try std.testing.expectEqual(repository_coordinator.Redraw.default, active.redraw);
+
+    app.active_page = .compare;
+    var inactive = app.controller().update(&ctx, step);
+    defer inactive.deinit(allocator);
+    try std.testing.expect(inactive.auto_scroll == null);
+    try std.testing.expectEqual(repository_coordinator.Redraw.skip, inactive.redraw);
+}
 
 test "Repository branch App route runs owned task and preserves primary status" {
     const allocator = std.testing.allocator;

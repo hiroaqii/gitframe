@@ -4,6 +4,7 @@
 //! only these transitions and therefore cannot acquire page-only authority.
 
 const diff_surface = @import("../diff_surface.zig");
+const drag_auto_scroll = @import("../drag_auto_scroll.zig");
 const selection_action = @import("../selection_action.zig");
 
 pub const Msg = union(enum) {
@@ -35,6 +36,7 @@ pub const Msg = union(enum) {
     mouse_diff_press: diff_surface.MousePoint,
     mouse_diff_drag: ?diff_surface.MousePoint,
     mouse_diff_release: ?diff_surface.MousePoint,
+    mouse_diff_auto_scroll_step: drag_auto_scroll.Step,
     selection_action: selection_action.Action,
     toggle_focus,
     page_diff_up,

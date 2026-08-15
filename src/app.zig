@@ -11,12 +11,14 @@ const chasen = @import("chasen");
 const initial_selection = @import("app/initial_selection.zig");
 const app_load = @import("app/load.zig");
 const app_message = @import("app/message.zig");
+const drag_auto_scroll = @import("app/drag_auto_scroll.zig");
 const page = @import("app/page.zig");
 const page_coordinator = @import("app/page_coordinator.zig");
 const shell_input = @import("app/shell_input.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
 const compare_page = @import("app/pages/compare.zig");
 const compare_coordinator = @import("app/pages/compare/coordinator.zig");
+const compare_input = @import("app/pages/compare/input.zig");
 const compare_navigation = @import("app/pages/compare/navigation.zig");
 const review_page = @import("app/pages/review.zig");
 const review_content = @import("app/pages/review/content.zig");
@@ -29,6 +31,7 @@ const review_page_update = @import("app/pages/review/update.zig");
 const review_view = @import("app/pages/review/view.zig");
 const repository_page = @import("app/pages/repository.zig");
 const repository_coordinator = @import("app/pages/repository/coordinator.zig");
+const repository_layout = @import("app/pages/repository/layout.zig");
 const repo_session = @import("app/repo_session.zig");
 const app_state = @import("app/state.zig");
 const app_view = @import("app/view.zig");
@@ -38,6 +41,7 @@ const workflow_remote = @import("app/workflow/remote.zig");
 const shell_effects = @import("app/shell_effects.zig");
 const context = @import("context.zig");
 const config_mod = @import("config.zig");
+const diff_surface = @import("app/diff_surface.zig");
 const diff_render = @import("diff/render.zig");
 const diff_selection = @import("diff/selection.zig");
 const diff_source = @import("diff/source.zig");
@@ -106,6 +110,7 @@ pub const App = struct {
     remote_workflow: workflow_remote.State = .{},
     overlay: app_state.OverlayState = .{},
     shell_effects_state: shell_effects.State = .{},
+    drag_auto_scroll: drag_auto_scroll.State = .{},
 
     const PopupCopyTarget = struct {
         label: []const u8,
@@ -431,17 +436,22 @@ pub const App = struct {
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         self.redraw_plan = .{};
         defer if (self.redraw_plan.resolvesToSkip()) ctx.redraw().skip();
+        defer self.reconcileDragAutoScroll(ctx);
         self.clearEphemeralStatusForUserAction(msg);
 
         switch (msg) {
-            .switch_page => |target| try self.applyPageCoordinationIntent(
-                ctx,
-                self.pageCoordinator().requestSwitch(self.allocator orelse ctx.allocator(), target),
-            ),
+            .switch_page => |target| {
+                self.drag_auto_scroll.clear();
+                try self.applyPageCoordinationIntent(
+                    ctx,
+                    self.pageCoordinator().requestSwitch(self.allocator orelse ctx.allocator(), target),
+                );
+            },
             .terminal_resized => |size| {
                 // Mouse coordinates are relative to the old geometry. End the
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
+                self.drag_auto_scroll.clear();
                 const review_selection_anchor = self.reviewNavigation().captureSelectionViewportAnchor();
                 self.reviewNavigation().clearDiffSelection();
                 const previous_compare_view = self.compareCoordinator().navigationView();
@@ -494,34 +504,12 @@ pub const App = struct {
                 self.remoteWorkflow().finishPushUpstreamFinalize(ctx.allocator(), finished),
             ),
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
-            .review => |review_msg| try self.updateReview(ctx, review_msg),
-            .compare => |compare_msg| {
-                var outcome = try self.compareCoordinator().update(ctx, compare_msg);
-                defer outcome.deinit(ctx.allocator());
-                if (outcome.takeClipboard()) |taken| {
-                    var effect = taken;
-                    defer effect.deinit(ctx.allocator());
-                    self.shellEffects().queueClipboard(ctx, .{
-                        .origin = effect.origin,
-                        .label = effect.label,
-                        .text = effect.text,
-                    });
-                }
-            },
-            .repository => |repository_msg| {
-                var outcome = self.repositoryCoordinator().update(ctx, repository_msg);
-                defer outcome.deinit(ctx.allocator());
-                if (outcome.redraw == .skip) self.redraw_plan.requestSkip();
-                if (outcome.takeClipboard()) |taken| {
-                    var effect = taken;
-                    defer effect.deinit(ctx.allocator());
-                    self.shellEffects().queueClipboard(ctx, .{
-                        .origin = effect.origin,
-                        .label = effect.label,
-                        .text = effect.text,
-                    });
-                }
-            },
+            .review => |review_msg| _ = try self.updateReview(ctx, review_msg),
+            .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
+            .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
+            .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
+            .mouse_selection_release => |continuation| try self.updateMouseSelectionRelease(ctx, continuation),
+            .drag_auto_scroll_tick => |generation| try self.updateDragAutoScrollTick(ctx, generation),
             .cancel_commit_panel => self.localWorkflow().closeCommitPanel(),
             .submit_commit_panel => {
                 if (self.localWorkflowView().commitPanel().mode == .amend) {
@@ -542,6 +530,7 @@ pub const App = struct {
             .commit_panel_move_up => self.localWorkflow().commitPanelMoveUp(),
             .commit_panel_move_down => self.localWorkflow().commitPanelMoveDown(),
             .enter_repo_picker => {
+                self.drag_auto_scroll.clear();
                 if (self.active_page == .repository) self.pages.repository.cancelMouseOwner();
                 try self.repoSession().enterPicker(ctx.allocator());
             },
@@ -570,6 +559,7 @@ pub const App = struct {
             .repo_picker_move_left => self.repoSession().movePickerCursorLeft(),
             .repo_picker_move_right => self.repoSession().movePickerCursorRight(),
             .open_help => {
+                self.drag_auto_scroll.clear();
                 if (self.active_page == .review) self.reviewNavigation().clearDiffSelection();
                 if (self.active_page == .compare) self.pages.compare.selection_owner = .none;
                 if (self.active_page == .repository) self.pages.repository.cancelMouseOwner();
@@ -615,15 +605,21 @@ pub const App = struct {
                 .config => self.status.set("reload is not available on this page yet", .{}),
             },
             .auto_reload_tick => try self.reviewRead().autoReloadTick(ctx),
-            .focus_lost => switch (self.active_page) {
-                .review => self.reviewNavigation().clearDiffSelection(),
-                .repository => self.pages.repository.cancelMouseOwner(),
-                .compare => self.pages.compare.selection_owner = .none,
-                .config => {},
+            .focus_lost => {
+                self.drag_auto_scroll.clear();
+                switch (self.active_page) {
+                    .review => self.reviewNavigation().clearDiffSelection(),
+                    .repository => self.pages.repository.cancelMouseOwner(),
+                    .compare => self.pages.compare.selection_owner = .none,
+                    .config => {},
+                }
             },
             .git_action_spinner_tick => if (self.actionLifecycle().tick(ctx)) self.redraw_plan.requestSkip(),
             .cancel_remote_action => _ = self.remoteWorkflow().cancelActiveRemote(false),
-            .quit => self.requestQuit(ctx),
+            .quit => {
+                self.drag_auto_scroll.clear();
+                self.requestQuit(ctx);
+            },
         }
         self.reviewRead().retireSupersededActionCursor(ctx, self.actionLifecycleView().generation());
         try self.reviewRead().applyDeferredSourceIfReady(ctx);
@@ -665,17 +661,161 @@ pub const App = struct {
         ctx.quit();
     }
 
-    fn updateReview(self: *App, ctx: *chasen.Ctx(Msg), msg: review_message.Msg) !void {
+    fn updateMouseSelectionDrag(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        continuation: app_message.MouseSelectionContinuation,
+    ) !void {
+        const target: drag_auto_scroll.Target = switch (continuation.target) {
+            .review => |point| blk: {
+                if (self.active_page != .review) break :blk .review;
+                _ = try self.updateReview(ctx, .{ .mouse_diff_drag = point });
+                break :blk .review;
+            },
+            .compare => |point| blk: {
+                if (self.active_page != .compare) break :blk .compare;
+                _ = try self.updateCompare(ctx, .{ .shared = .{ .mouse_diff_drag = point } });
+                break :blk .compare;
+            },
+            .repository => |point| blk: {
+                if (self.active_page != .repository) break :blk .repository;
+                _ = self.updateRepository(ctx, .{ .mouse_owner_drag = point });
+                break :blk .repository;
+            },
+        };
+        const viewport = self.dragAutoScrollViewport(target) orelse {
+            self.drag_auto_scroll.clear();
+            return;
+        };
+        self.drag_auto_scroll.observe(target, continuation.pointer, viewport);
+    }
+
+    fn updateMouseSelectionRelease(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        continuation: app_message.MouseSelectionContinuation,
+    ) !void {
+        // Root intent ends before page completion can install/copy a candidate
+        // or drain a deferred replacement source.
+        self.drag_auto_scroll.clear();
+        switch (continuation.target) {
+            .review => |point| {
+                if (self.active_page == .review) _ = try self.updateReview(ctx, .{ .mouse_diff_release = point });
+            },
+            .compare => |point| {
+                if (self.active_page == .compare) _ = try self.updateCompare(ctx, .{ .shared = .{ .mouse_diff_release = point } });
+            },
+            .repository => |point| {
+                if (self.active_page == .repository) _ = self.updateRepository(ctx, .{ .mouse_owner_release = point });
+            },
+        }
+    }
+
+    fn updateDragAutoScrollTick(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        generation: u64,
+    ) !void {
+        const active = self.drag_auto_scroll.acceptedTick(generation) orelse {
+            self.redraw_plan.requestSkip();
+            return;
+        };
+        _ = self.dragAutoScrollViewport(active.target) orelse {
+            self.drag_auto_scroll.clear();
+            self.redraw_plan.requestSkip();
+            return;
+        };
+
+        const outcome: ?drag_auto_scroll.StepOutcome = switch (active.target) {
+            .review => try self.updateReview(ctx, .{ .mouse_diff_auto_scroll_step = active.intent }),
+            .compare => try self.updateCompare(ctx, .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } }),
+            .repository => blk: {
+                const body_size = self.shellLayout().bodySize();
+                const body_point: repository_layout.BodyPoint = .{
+                    .col = active.intent.endpoint.col,
+                    .row = active.intent.endpoint.row,
+                };
+                const source_point = repository_layout.sourceGesturePoint(
+                    body_point,
+                    body_size,
+                    self.pages.repository.viewer.tree_width,
+                    self.pages.repository.viewer.tree_hidden,
+                ) orelse break :blk null;
+                break :blk self.updateRepository(ctx, .{ .mouse_source_auto_scroll_step = .{
+                    .direction = active.intent.direction,
+                    .endpoint = .{ .col = source_point.col, .row = source_point.row },
+                } });
+            },
+        };
+        self.drag_auto_scroll.complete(generation, outcome orelse .stale_owner);
+    }
+
+    fn dragAutoScrollViewport(
+        self: *App,
+        target: drag_auto_scroll.Target,
+    ) ?drag_auto_scroll.Viewport {
+        if (self.active_page != switch (target) {
+            .review => page.Id.review,
+            .compare => page.Id.compare,
+            .repository => page.Id.repository,
+        }) return null;
+
+        return switch (target) {
+            .review => blk: {
+                var adapter = self.reviewNavigation().updateAdapter();
+                break :blk diffAutoScrollViewport(adapter.shared().navigation);
+            },
+            .compare => blk: {
+                var adapter = self.compareCoordinator().navigation().updateAdapter();
+                break :blk diffAutoScrollViewport(adapter.bodyController());
+            },
+            .repository => self.pages.repository.sourceAutoScrollViewport(self.shellLayout().bodySize()),
+        };
+    }
+
+    fn reconcileDragAutoScroll(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (self.drag_auto_scroll.active) |active| {
+            if (self.dragAutoScrollViewport(active.target) == null) self.drag_auto_scroll.clear();
+        }
+
+        const desired = if (self.drag_auto_scroll.active) |active| active.generation else null;
+        if (self.drag_auto_scroll.scheduled_generation == desired) return;
+
+        if (self.drag_auto_scroll.scheduled_generation != null) {
+            ctx.timer().cancel(drag_auto_scroll.timer_id) catch return;
+            self.drag_auto_scroll.scheduled_generation = null;
+        }
+
+        const active = self.drag_auto_scroll.active orelse return;
+        ctx.timer().every(
+            drag_auto_scroll.timer_id,
+            drag_auto_scroll.interval_ns,
+            .{ .drag_auto_scroll_tick = active.generation },
+        ) catch {
+            if (self.drag_auto_scroll.active) |current| {
+                if (current.generation == active.generation) self.drag_auto_scroll.clear();
+            }
+            return;
+        };
+        self.drag_auto_scroll.scheduled_generation = active.generation;
+    }
+
+    fn updateReview(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        msg: review_message.Msg,
+    ) !?drag_auto_scroll.StepOutcome {
         var page_update = try (review_page_update.Controller{
             .navigation = self.reviewNavigation(),
         }).apply(self.allocator, msg);
         defer page_update.deinit(self.allocator);
+        const auto_scroll = page_update.auto_scroll;
 
         if (page_update.capture_display_override) {
             try self.reviewRead().captureDisplayOverride(ctx.allocator());
         }
 
-        var command = page_update.takeCommand() orelse return;
+        var command = page_update.takeCommand() orelse return auto_scroll;
         const allocator = self.allocator orelse ctx.allocator();
         defer command.deinit(allocator);
         switch (command) {
@@ -707,6 +847,48 @@ pub const App = struct {
             .copy_diff_header_path => |selection| self.copyDiffHeaderPath(ctx, selection),
             .finish_review => |decision| try self.finishReview(ctx, decision),
         }
+        return auto_scroll;
+    }
+
+    fn updateCompare(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        msg: compare_input.Msg,
+    ) !?drag_auto_scroll.StepOutcome {
+        var outcome = try self.compareCoordinator().update(ctx, msg);
+        defer outcome.deinit(ctx.allocator());
+        const auto_scroll = outcome.auto_scroll;
+        if (outcome.takeClipboard()) |taken| {
+            var effect = taken;
+            defer effect.deinit(ctx.allocator());
+            self.shellEffects().queueClipboard(ctx, .{
+                .origin = effect.origin,
+                .label = effect.label,
+                .text = effect.text,
+            });
+        }
+        return auto_scroll;
+    }
+
+    fn updateRepository(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        msg: repository_page.Msg,
+    ) ?drag_auto_scroll.StepOutcome {
+        var outcome = self.repositoryCoordinator().update(ctx, msg);
+        defer outcome.deinit(ctx.allocator());
+        const auto_scroll = outcome.auto_scroll;
+        if (outcome.redraw == .skip) self.redraw_plan.requestSkip();
+        if (outcome.takeClipboard()) |taken| {
+            var effect = taken;
+            defer effect.deinit(ctx.allocator());
+            self.shellEffects().queueClipboard(ctx, .{
+                .origin = effect.origin,
+                .label = effect.label,
+                .text = effect.text,
+            });
+        }
+        return auto_scroll;
     }
 
     fn finishLoadResult(self: *App, ctx: *chasen.Ctx(Msg), finished: LoadFinishedMsg) !void {
@@ -1285,6 +1467,25 @@ pub const App = struct {
         );
     }
 };
+
+fn diffAutoScrollViewport(
+    body: diff_surface.navigation.BodyController,
+) ?drag_auto_scroll.Viewport {
+    const body_view = body.view();
+    const drag = body_view.view.surface.selection_owner.*.activeDiff() orelse return null;
+    if (!body_view.dragSelectionIdentityCurrent(drag)) return null;
+    const raw = body_view.view.rawDiffPaneGeometry() orelse return null;
+    const visible_rows = body_view.view.diffVisibleRows();
+    if (raw.width == 0 or visible_rows < 2) return null;
+    const last_row_value = @as(usize, diff_render.body_start_row) + visible_rows - 1;
+    if (last_row_value > std.math.maxInt(u16)) return null;
+    return .{
+        .first_col = raw.col,
+        .last_col = raw.col + raw.width - 1,
+        .first_row = diff_render.body_start_row,
+        .last_row = @intCast(last_row_value),
+    };
+}
 
 fn pathLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);

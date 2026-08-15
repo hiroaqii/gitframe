@@ -175,8 +175,8 @@ test "repository selection drag routes first and outside release terminates" {
         .drag,
     )) orelse return error.ExpectedRepositoryDrag;
     switch (drag) {
-        .repository => |message| switch (message) {
-            .mouse_owner_drag => |point| try std.testing.expectEqual(
+        .mouse_selection_drag => |continuation| switch (continuation.target) {
+            .repository => |point| try std.testing.expectEqual(
                 repository_layout.BodyPoint{ .col = 4, .row = 2 },
                 point.?,
             ),
@@ -201,8 +201,12 @@ test "repository selection drag routes first and outside release terminates" {
     const release = app.handleEvent(app_test_support.mouseEventTyped(0, 0, .left, .release)) orelse
         return error.ExpectedRepositoryRelease;
     switch (release) {
-        .repository => |message| switch (message) {
-            .mouse_owner_release => |point| try std.testing.expect(point == null),
+        .mouse_selection_release => |continuation| switch (continuation.target) {
+            .repository => |point| {
+                try std.testing.expect(point == null);
+                try std.testing.expect(continuation.pointer.col < 0);
+                try std.testing.expect(continuation.pointer.row < 0);
+            },
             else => return error.ExpectedRepositoryRelease,
         },
         else => return error.ExpectedRepositoryRelease,
@@ -285,6 +289,13 @@ test "repository selection shell blocks transition and cancels on focus or resiz
     };
     app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    app.drag_auto_scroll.active = .{
+        .generation = 4,
+        .target = .repository,
+        .intent = .{ .direction = .down, .endpoint = .{ .col = 50, .row = 10 } },
+    };
+    app.drag_auto_scroll.scheduled_generation = 4;
     try std.testing.expect(!@hasField(app_input.KeyContext, "repository_mouse_selection"));
     try std.testing.expect(app.pages.repository.activeMouseOwner());
     try std.testing.expect(app.pages.repository.activeSourceRange());
@@ -293,6 +304,9 @@ test "repository selection shell blocks transition and cancels on focus or resiz
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.activeSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
+    try std.testing.expect(app.drag_auto_scroll.active == null);
+    try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_cancels_len);
 
     app.status.clear();
     const shell = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });

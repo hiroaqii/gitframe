@@ -8,6 +8,7 @@ const page = @import("../../page.zig");
 const repo_session = @import("../../repo_session.zig");
 const diff_basis = @import("../../diff_basis.zig");
 const diff_surface = @import("../../diff_surface.zig");
+const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const app_test_support = @import("../../test_support.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
 const git_refs = @import("../../../git/refs.zig");
@@ -92,6 +93,49 @@ test "diff wheel comfort routes through Compare and recenters an edge cursor" {
         app.pages.compare.viewer.diff_scroll + visible_rows / 2,
         result_body.view().selectedDiffCursorOffset().?,
     );
+}
+
+test "Compare coordinator returns shared drag auto-scroll outcome" {
+    const allocator = std.testing.allocator;
+    var app: TestApp = .{
+        .pages = .{ .compare = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .display_mode = .side_by_side,
+                .sidebar_hidden = true,
+                .focus = .diff,
+                .diff_scroll = 2,
+            },
+            .selection_owner = .{ .diff = .{
+                .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+                .side = .old,
+                .mode = .line,
+                .anchor = .{ .hunk_index = 0, .line_index = 0 },
+                .focus = .{ .hunk_index = 0, .line_index = 1 },
+                .anchor_cell = .{ .col = 20, .row = 4 },
+            } },
+        } },
+        .layout = .{ .width = 100, .height = 9 },
+    };
+    defer app.pages.compare.deinit(allocator);
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+
+    var outcome = try app.controller().update(&ctx, .{
+        .shared = .{
+            .mouse_diff_auto_scroll_step = .{
+                .direction = .up,
+                // The opposite side is visible at this row, but the live drag's
+                // starting side remains authoritative.
+                .endpoint = .{ .col = 80, .row = 3 },
+            },
+        },
+    });
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, outcome.auto_scroll.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.compare.viewer.diff_scroll);
+    const selection = app.pages.compare.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expect(selection.side == .old);
+    try std.testing.expectEqual(@as(usize, 1), selection.focus.line_index);
 }
 
 test "Compare reload retries user intent and preserves accepted display on failure" {

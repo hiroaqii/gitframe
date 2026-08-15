@@ -7,6 +7,7 @@
 const std = @import("std");
 const layout = @import("layout.zig");
 const diff_surface = @import("../diff_surface.zig");
+const drag_auto_scroll = @import("../drag_auto_scroll.zig");
 const app_direction = @import("../direction.zig");
 const cursor_viewport = @import("../cursor_viewport.zig");
 const file_search = diff_surface.file_search;
@@ -294,6 +295,16 @@ pub const BodyView = struct {
             return drag.view();
         }
         return (self.retainedSelectionPresentation() orelse return null).view;
+    }
+
+    pub fn dragSelectionIdentityCurrent(self: BodyView, drag: diff_selection.DragSelection) bool {
+        return switch (drag.identity) {
+            .generated_file => |generated| blk: {
+                const body = self.generatedBody() orelse break :blk false;
+                break :blk std.mem.eql(u8, generated.path_key, body.path);
+            },
+            .loaded_file, .projection_file => self.parsedSelectionTarget(drag.identity) != null,
+        };
     }
 
     pub fn retainedSelectionPresentation(self: BodyView) ?selection_action.Presentation {
@@ -1383,6 +1394,46 @@ pub const BodyController = struct {
                 selection.updateAtCell(hit.point, .{ .col = point.col, .row = point.row });
             },
         }
+    }
+
+    /// One timer-owned semantic drag step. Scrolling is committed before the
+    /// endpoint is re-hit-tested, so a presentation-only action row can move
+    /// through the viewport without becoming selectable source content.
+    pub fn autoScrollDiffMouse(self: BodyController, step: drag_auto_scroll.Step) drag_auto_scroll.StepOutcome {
+        const drag = self.controller.surface.selection_owner.activeDiff() orelse {
+            self.controller.clearDiffSelection();
+            return .stale_owner;
+        };
+        if (!self.view().dragSelectionIdentityCurrent(drag)) {
+            self.controller.clearDiffSelection();
+            return .stale_owner;
+        }
+
+        const old_scroll = self.controller.surface.viewer.diff_scroll;
+        self.scrollDiff(if (step.direction == .up) .up else .down);
+        if (self.controller.surface.viewer.diff_scroll == old_scroll) return .content_edge;
+
+        const endpoint: diff_surface.MousePoint = .{
+            .col = step.endpoint.col,
+            .row = step.endpoint.row,
+        };
+        if (self.view().selectionActionHit(endpoint) != null) return .moved;
+        const hit = self.view().diffMouseDragHit(endpoint, drag) orelse return .moved;
+        if (!drag.identity.eql(hit.identity)) {
+            self.controller.clearDiffSelection();
+            return .stale_owner;
+        }
+        switch (self.controller.surface.selection_owner.*) {
+            .diff => |*selection| selection.updateAtCell(
+                hit.point,
+                .{ .col = endpoint.col, .row = endpoint.row },
+            ),
+            .none, .diff_header => {
+                self.controller.clearDiffSelection();
+                return .stale_owner;
+            },
+        }
+        return .moved;
     }
 
     pub fn selectFileDelta(self: BodyController, delta: i2) void {

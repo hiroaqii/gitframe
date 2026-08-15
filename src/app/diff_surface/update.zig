@@ -3,6 +3,7 @@
 const std = @import("std");
 const context = @import("../../context.zig");
 const diff_selection = @import("../../diff/selection.zig");
+const drag_auto_scroll = @import("../drag_auto_scroll.zig");
 const navigation = @import("navigation.zig");
 const message = @import("message.zig");
 const selection = @import("selection.zig");
@@ -29,6 +30,7 @@ pub const Update = struct {
     retention_transition: RetentionTransition = .none,
     explicit_sidebar_selection_changed: bool = false,
     display_navigation_changed: bool = false,
+    auto_scroll: ?drag_auto_scroll.StepOutcome = null,
 
     pub fn deinit(self: *Update, allocator: ?std.mem.Allocator) void {
         if (self.effect) |*effect| effect.deinit(allocator);
@@ -144,6 +146,7 @@ pub const Controller = struct {
                 }
             },
             .mouse_diff_drag => |point| self.navigation.dragDiffMouse(point),
+            .mouse_diff_auto_scroll_step => |step| result.auto_scroll = self.navigation.autoScrollDiffMouse(step),
             .mouse_diff_release => {
                 const release = try self.releaseDiffMouse(allocator orelse return error.MissingAllocator);
                 result.effect = release.effect;
@@ -418,6 +421,7 @@ fn tracksDisplayNavigation(msg: message.Msg) bool {
         .mouse_diff_wheel_down,
         .mouse_diff_wheel_left,
         .mouse_diff_wheel_right,
+        .mouse_diff_auto_scroll_step,
         .toggle_display_mode,
         .clear_search,
         .submit_search,

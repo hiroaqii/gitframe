@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const diff_surface = @import("../../diff_surface.zig");
+const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const diff_surface_update = @import("../../diff_surface/update.zig");
 const diff_surface_navigation = @import("../../diff_surface/navigation.zig");
 const message = @import("message.zig");
@@ -53,6 +54,7 @@ pub const Command = union(enum) {
 pub const ReviewUpdate = struct {
     command: ?Command = null,
     capture_display_override: bool = false,
+    auto_scroll: ?drag_auto_scroll.StepOutcome = null,
 
     pub fn deinit(self: *ReviewUpdate, allocator: ?std.mem.Allocator) void {
         if (self.command) |*command| command.deinit(allocator);
@@ -83,6 +85,7 @@ pub const Controller = struct {
                 .installed => self.navigation.revealCompletedSelectionAction(),
             }
             if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
+            result.auto_scroll = shared_update.auto_scroll;
 
             // This boundary sees semantic Review input after it has either
             // changed the sidebar/file intent or proved to be a no-op. Internal

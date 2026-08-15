@@ -9,7 +9,10 @@ const load = @import("load.zig");
 const page = @import("page.zig");
 const push_retry = @import("push_retry.zig");
 const compare_input = @import("pages/compare/input.zig");
+const diff_surface = @import("diff_surface.zig");
+const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const repository_page = @import("pages/repository.zig");
+const repository_layout = @import("pages/repository/layout.zig");
 const review_message = @import("pages/review/message.zig");
 
 pub const LoadFinished = load.ReadFinished;
@@ -54,6 +57,17 @@ pub const ShellEffectFinished = union(enum) {
     clipboard: ClipboardCopyFinished,
 };
 
+pub const MouseSelectionTarget = union(enum) {
+    review: ?review_message.MousePoint,
+    compare: ?diff_surface.MousePoint,
+    repository: ?repository_layout.BodyPoint,
+};
+
+pub const MouseSelectionContinuation = struct {
+    pointer: drag_auto_scroll.PointerSample,
+    target: MouseSelectionTarget,
+};
+
 pub const Msg = union(enum) {
     pub const undelivered_policy = .deinit;
 
@@ -67,6 +81,9 @@ pub const Msg = union(enum) {
     review: review_message.Msg,
     compare: compare_input.Msg,
     repository: repository_page.Msg,
+    mouse_selection_drag: MouseSelectionContinuation,
+    mouse_selection_release: MouseSelectionContinuation,
+    drag_auto_scroll_tick: u64,
     cancel_commit_panel,
     submit_commit_panel,
     assist_commit_message,
@@ -190,6 +207,7 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         .push_upstream_finalize_finished,
         .shell_effect_finished,
         .auto_reload_tick,
+        .drag_auto_scroll_tick,
         .focus_lost,
         .git_action_spinner_tick,
         // The copy handler must resolve and queue the currently visible text
