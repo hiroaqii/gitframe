@@ -19,7 +19,7 @@ const file_tree = @import("../../file_tree.zig");
 const git_refs = @import("../../git/refs.zig");
 const review_state = @import("../../review/state.zig");
 const root_capability = @import("../../repo/root_capability.zig");
-const commit_time = @import("compare/commit_time.zig");
+const commit_time = @import("../branch_commit_time.zig");
 
 pub const selection_source: diff_source.SourceMode = .{ .range = "compare" };
 

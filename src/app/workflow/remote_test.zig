@@ -376,6 +376,7 @@ const BranchListItemSpec = struct {
     name: []const u8,
     oid: []const u8,
     current: bool = false,
+    tip_committer_unix: ?i64 = null,
 };
 
 fn branchListForTest(
@@ -403,6 +404,7 @@ fn branchListForTest(
             .kind = .local,
             .oid = oid,
             .current = spec.current,
+            .tip_committer_unix = spec.tip_committer_unix,
         };
         initialized += 1;
     }
@@ -422,6 +424,7 @@ fn branchSwitchItemsForTest(
             .name = try allocator.dupe(u8, spec.name),
             .oid = try allocator.dupe(u8, spec.oid),
             .current = spec.current,
+            .tip_committer_unix = spec.tip_committer_unix,
         };
         initialized += 1;
     }
@@ -885,6 +888,7 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     for (list.branches) |branch| {
         saw_accepted = saw_accepted or std.mem.eql(u8, branch.name, "accepted-only");
         saw_replacement = saw_replacement or std.mem.eql(u8, branch.name, "replacement-only");
+        try std.testing.expect(branch.tip_committer_unix != null);
     }
     try std.testing.expect(saw_accepted);
     try std.testing.expect(!saw_replacement);
@@ -1006,7 +1010,7 @@ test "finishBranchListLoad ignores stale result and accepts matching generation"
         .generation = 2,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = try branchListForTest(std.testing.allocator, &.{
-            .{ .name = "main", .oid = "abc123", .current = true },
+            .{ .name = "main", .oid = "abc123", .current = true, .tip_committer_unix = 100 },
         }),
     });
     try std.testing.expect(app.remote_workflow.branch_switch.loading);
@@ -1019,15 +1023,23 @@ test "finishBranchListLoad ignores stale result and accepts matching generation"
         .generation = 3,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = try branchListForTest(std.testing.allocator, &.{
-            .{ .name = "main", .oid = "abc123", .current = true },
-            .{ .name = "feature/topic", .oid = "def456", .current = false },
+            .{ .name = "main", .oid = "abc123", .current = true, .tip_committer_unix = 100 },
+            .{ .name = "feature/older", .oid = "def456", .tip_committer_unix = 200 },
+            .{ .name = "feature/newest", .oid = "fedcba", .tip_committer_unix = 300 },
+            .{ .name = "feature/unknown", .oid = "456def" },
         }),
     });
 
     try std.testing.expect(!app.remote_workflow.branch_switch.loading);
-    try std.testing.expectEqual(@as(usize, 2), app.remote_workflow.branch_switch.branches.len);
-    try std.testing.expectEqual(@as(usize, 1), app.remote_workflow.branch_switch.selected_index);
-    try std.testing.expectEqualStrings("feature/topic", app.remote_workflow.branch_switch.branches[1].name);
+    try std.testing.expectEqual(@as(usize, 4), app.remote_workflow.branch_switch.branches.len);
+    try std.testing.expectEqual(@as(usize, 0), app.remote_workflow.branch_switch.selected_index);
+    try std.testing.expectEqualStrings("feature/newest", app.remote_workflow.branch_switch.branches[0].name);
+    try std.testing.expectEqual(@as(?i64, 300), app.remote_workflow.branch_switch.branches[0].tip_committer_unix);
+    try std.testing.expectEqualStrings("feature/older", app.remote_workflow.branch_switch.branches[1].name);
+    try std.testing.expectEqualStrings("main", app.remote_workflow.branch_switch.branches[2].name);
+    try std.testing.expect(app.remote_workflow.branch_switch.branches[2].current);
+    try std.testing.expectEqualStrings("feature/unknown", app.remote_workflow.branch_switch.branches[3].name);
+    try std.testing.expect(app.remote_workflow.branch_switch.branches[3].tip_committer_unix == null);
 }
 
 test "finishBranchListLoad rejects matching operation from stale repo epoch" {

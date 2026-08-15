@@ -1326,6 +1326,7 @@ pub fn runBranchListLoad(
     const raw_result = git_refs.loadBranchList(allocator, io, .{
         .context = context,
         .scope = .local,
+        .include_tip_committer_unix = true,
     }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Branch list load failed: {s}", .{@errorName(err)}) catch

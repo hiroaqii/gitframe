@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 const chasen = @import("chasen");
 
 const app_actions = @import("../actions.zig");
+const branch_commit_time = @import("../branch_commit_time.zig");
 const effect_origin = @import("../effect_origin.zig");
 const app_git_requests = @import("../git_requests.zig");
 const git_ops = @import("../git_ops.zig");
@@ -506,6 +507,15 @@ pub const Controller = struct {
         branch_switch.selected_index = wrapIndex(branch_switch.selected_index, branch_switch.branches.len, delta);
     }
 
+    pub fn prepareBranchSwitchModalRedraw(self: Controller, io: std.Io) void {
+        const branch_switch = &self.state.branch_switch;
+        if (!self.overlay.isSwitchBranch() or
+            !branch_switch.hasState() or
+            branch_switch.loading or
+            branch_switch.branches.len == 0) return;
+        branch_switch.render_now_unix = branch_commit_time.sampleUnixSeconds(io);
+    }
+
     pub fn confirmBranchSwitch(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         const branch_switch = &self.state.branch_switch;
         if (!branch_switch.hasState()) return;
@@ -702,6 +712,7 @@ pub const Controller = struct {
         const live = effect_origin.classify(origin, self.effect_snapshot) != .stale;
         switch (result.result) {
             .loaded => |list| {
+                branch_commit_time.sortBranches(list.branches);
                 const branches = try copyBranchSwitchItems(allocator, list.branches);
                 errdefer deinitBranchSwitchItems(allocator, branches);
                 deinitBranchSwitchItems(allocator, self.state.branch_switch.branches);
@@ -1252,6 +1263,7 @@ fn copyBranchSwitchItems(allocator: std.mem.Allocator, source: []const git_refs.
             .name = try allocator.dupe(u8, branch.name),
             .oid = &.{},
             .current = branch.current,
+            .tip_committer_unix = branch.tip_committer_unix,
         };
         initialized += 1;
         items[index].oid = try allocator.dupe(u8, branch.oid);

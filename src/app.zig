@@ -650,6 +650,9 @@ pub const App = struct {
         {
             self.compareCoordinator().prepareModalRedraw(ctx.io());
         }
+        if (!self.redraw_plan.resolvesToSkip() and self.overlay.isSwitchBranch()) {
+            self.remoteWorkflow().prepareBranchSwitchModalRedraw(ctx.io());
+        }
     }
 
     fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {

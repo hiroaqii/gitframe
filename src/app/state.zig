@@ -218,6 +218,7 @@ pub const BranchSwitchItem = struct {
     name: []u8,
     oid: []u8,
     current: bool,
+    tip_committer_unix: ?i64 = null,
 
     pub fn deinit(self: *BranchSwitchItem, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -234,6 +235,7 @@ pub const BranchSwitchState = struct {
     loading: bool = false,
     selected_index: usize = 0,
     branches: []BranchSwitchItem = &.{},
+    render_now_unix: ?i64 = null,
 
     pub fn deinit(self: *BranchSwitchState, allocator: std.mem.Allocator) void {
         if (self.repo_root.len > 0) allocator.free(self.repo_root);

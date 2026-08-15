@@ -1,7 +1,7 @@
-//! Compare-owned ordering and presentation for branch-tip commit times.
+//! Shared ordering and presentation for branch-tip commit times.
 
 const std = @import("std");
-const git_refs = @import("../../../git/refs.zig");
+const git_refs = @import("../git/refs.zig");
 
 pub const Relative = struct {
     bytes: [24]u8 = undefined,

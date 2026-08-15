@@ -214,7 +214,7 @@ test "grouped result messages keep previous ephemeral status" {
     try std.testing.expect(app_message.keepsEphemeralStatus(.git_action_spinner_tick));
 }
 
-test "Compare base picker samples one real-clock snapshot at every non-skipped redraw tail" {
+test "branch time pickers sample one real-clock snapshot at every non-skipped redraw tail" {
     const allocator = std.testing.allocator;
     var app: App = .{ .allocator = allocator, .active_page = .compare };
     defer app.pages.compare.deinit(allocator);
@@ -261,9 +261,31 @@ test "Compare base picker samples one real-clock snapshot at every non-skipped r
     app.pages.compare.closeBasePicker(allocator);
     try app.update(.{ .terminal_resized = .{ .width = 90, .height = 20 } }, &ctx);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
+
+    var repo_root = "/repo".*;
+    var branch = "main".*;
+    var oid = "abc123".*;
+    var branches = [_]app_state.BranchSwitchItem{.{
+        .name = &branch,
+        .oid = &oid,
+        .current = true,
+        .tip_committer_unix = 1_700_000_000,
+    }};
+    app.remote_workflow.branch_switch = .{
+        .repo_root = &repo_root,
+        .current_branch = &branch,
+        .current_oid = &oid,
+        .branches = &branches,
+    };
+    app.overlay.openSwitchBranch();
+    app.active_page = .review;
+    clock.seconds += 1;
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_062), app.remote_workflow.branch_switch.render_now_unix);
+    try std.testing.expectEqual(@as(usize, 3), clock.samples);
 }
 
-test "Compare base picker fails closed for unavailable and zero-resolution real clocks" {
+test "branch time pickers fail closed for unavailable and zero-resolution real clocks" {
     const allocator = std.testing.allocator;
     var app: App = .{ .allocator = allocator, .active_page = .compare };
     defer app.pages.compare.deinit(allocator);
@@ -281,6 +303,28 @@ test "Compare base picker fails closed for unavailable and zero-resolution real 
     clock.resolution_ns = 0;
     try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx);
     try std.testing.expect(app.pages.compare.base_picker.render_now_unix == null);
+    try std.testing.expectEqual(@as(usize, 0), clock.samples);
+
+    var repo_root = "/repo".*;
+    var branch = "main".*;
+    var oid = "abc123".*;
+    var branches = [_]app_state.BranchSwitchItem{.{
+        .name = &branch,
+        .oid = &oid,
+        .current = true,
+        .tip_committer_unix = 1_700_000_000,
+    }};
+    app.pages.compare.closeBasePicker(allocator);
+    app.remote_workflow.branch_switch = .{
+        .repo_root = &repo_root,
+        .current_branch = &branch,
+        .current_oid = &oid,
+        .branches = &branches,
+    };
+    app.overlay.openSwitchBranch();
+    app.active_page = .review;
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx);
+    try std.testing.expect(app.remote_workflow.branch_switch.render_now_unix == null);
     try std.testing.expectEqual(@as(usize, 0), clock.samples);
 }
 

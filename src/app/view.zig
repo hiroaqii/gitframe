@@ -5,6 +5,7 @@ const ui = @import("chasen_ui");
 const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
 const app_actions = @import("actions.zig");
+const branch_commit_time = @import("branch_commit_time.zig");
 const action_lifecycle = @import("workflow/action_lifecycle.zig");
 const app_state = @import("state.zig");
 const shell_layout = @import("shell_layout.zig");
@@ -1181,19 +1182,73 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
         return;
     }
 
-    const footer_rows_needed: u16 = 2;
+    const selected = @min(state.selected_index, state.branches.len - 1);
+    if (size.height >= 4) {
+        const branch = state.branches[selected];
+        const exact = branch_commit_time.formatExactUtc(branch.tip_committer_unix);
+        const detail = if (exact) |value|
+            try std.fmt.allocPrint(content.frameAllocator(), "last commit: {s}", .{value.text()})
+        else
+            "last commit: unknown";
+        try draw.copyClippedTextAt(&content, 0, 1, detail, app.theme.style(.muted));
+    }
+
+    const footer_rows_needed: u16 = 1;
     const list_start: u16 = 2;
     const list_rows: u16 = size.height -| (list_start + footer_rows_needed);
-    const selected = @min(state.selected_index, state.branches.len - 1);
     const start = listWindowStart(selected, state.branches.len, list_rows);
     var row: u16 = 0;
     while (row < list_rows and start + row < state.branches.len) : (row += 1) {
         const index = start + row;
         const branch = state.branches[index];
-        const marker: []const u8 = if (index == selected) ">" else " ";
+        const focused = index == selected;
+        const marker: []const u8 = if (focused) ">" else " ";
         const current: []const u8 = if (branch.current) "*" else " ";
-        const line = try std.fmt.allocPrint(content.frameAllocator(), "{s} {s} {s}", .{ marker, current, branch.name });
-        try draw.copyClippedTextAt(&content, 0, list_start + row, line, chasen.TextStyle{});
+        if (size.width > 0) {
+            try draw.copyClippedTextAt(&content, 0, list_start + row, marker, app.theme.style(.accent));
+        }
+        if (size.width > 2) {
+            try draw.copyClippedTextAt(
+                &content,
+                2,
+                list_start + row,
+                current,
+                if (focused) app.theme.boldStyle(.accent) else app.theme.style(.muted),
+            );
+        }
+
+        const relative = branch_commit_time.formatRelative(branch.tip_committer_unix, state.render_now_unix);
+        const time_field_width: u16 = if (size.width >= 24) 14 else 0;
+        const time_col = size.width - time_field_width;
+        if (time_field_width > 0) {
+            const relative_width = content.displayWidth(relative.text());
+            const rendered_relative_width = @min(relative_width, time_field_width);
+            try draw.copyClippedTextAt(
+                &content,
+                time_col + time_field_width - rendered_relative_width,
+                list_start + row,
+                relative.text(),
+                if (focused) app.theme.boldStyle(.accent) else app.theme.style(.muted),
+            );
+        }
+
+        const branch_col: u16 = @min(size.width, 4);
+        const branch_end = if (time_field_width > 0) time_col -| 1 else size.width;
+        if (branch_end > branch_col) {
+            var branch_surface = content.child(.{
+                .col = branch_col,
+                .row = list_start + row,
+                .width = branch_end - branch_col,
+                .height = 1,
+            });
+            try draw.copyClippedTextAt(
+                &branch_surface,
+                0,
+                0,
+                branch.name,
+                if (focused) app.theme.boldStyle(.accent) else chasen.TextStyle{},
+            );
+        }
     }
 
     if (size.height >= 2) {
@@ -2550,6 +2605,81 @@ test "push confirmation renders set-upstream detail without fake ahead behind" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "feature/topic -> origin/feature/topic") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "will set upstream") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "ahead 0 / behind 0") == null);
+}
+
+const BranchSwitchViewSpec = struct {
+    name: []const u8,
+    current: bool = false,
+    tip_committer_unix: ?i64 = null,
+};
+
+fn branchSwitchStateForViewTest(
+    allocator: std.mem.Allocator,
+    specs: []const BranchSwitchViewSpec,
+) !app_state.BranchSwitchState {
+    var state: app_state.BranchSwitchState = .{};
+    errdefer if (state.hasState()) state.deinit(allocator);
+    state.repo_root = try allocator.dupe(u8, "/repo");
+    state.current_branch = try allocator.dupe(u8, "main");
+    state.current_oid = try allocator.dupe(u8, "abc123");
+
+    const branches = try allocator.alloc(app_state.BranchSwitchItem, specs.len);
+    errdefer allocator.free(branches);
+    var initialized: usize = 0;
+    errdefer for (branches[0..initialized]) |*branch| branch.deinit(allocator);
+    for (specs, branches) |spec, *branch| {
+        const name = try allocator.dupe(u8, spec.name);
+        errdefer allocator.free(name);
+        branch.* = .{
+            .name = name,
+            .oid = try allocator.dupe(u8, "abc123"),
+            .current = spec.current,
+            .tip_committer_unix = spec.tip_committer_unix,
+        };
+        initialized += 1;
+    }
+    state.branches = branches;
+    return state;
+}
+
+test "branch switch popup renders relative times and selected exact commit detail" {
+    const allocator = std.testing.allocator;
+    const now: i64 = 1_700_000_000;
+    var app: ShellViewTestHarness = .{};
+    app.branch_switch = try branchSwitchStateForViewTest(allocator, &.{
+        .{ .name = "feature/recent", .tip_committer_unix = now - 2 * 60 * 60 },
+        .{ .name = "main", .current = true, .tip_committer_unix = now - 3 * 24 * 60 * 60 },
+        .{ .name = "feature/unknown" },
+    });
+    defer app.branch_switch.deinit(allocator);
+    app.branch_switch.render_now_unix = now;
+
+    var known: chasen.testing.TestSurface = undefined;
+    try known.init(80, 20);
+    defer known.deinit();
+    try viewBranchSwitchPopup(app.context(), &known.surface);
+    const known_snapshot = try known.snapshot(allocator);
+    defer allocator.free(known_snapshot);
+
+    const detail_index = std.mem.indexOf(
+        u8,
+        known_snapshot,
+        "last commit: 2023-11-14 20:13:20 +00:00",
+    ).?;
+    const branch_index = std.mem.indexOf(u8, known_snapshot, "feature/recent").?;
+    try std.testing.expect(detail_index < branch_index);
+    try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "2h ago") != null);
+    try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "3d ago") != null);
+    try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "* main") != null);
+
+    app.branch_switch.selected_index = 2;
+    var unknown: chasen.testing.TestSurface = undefined;
+    try unknown.init(80, 20);
+    defer unknown.deinit();
+    try viewBranchSwitchPopup(app.context(), &unknown.surface);
+    const unknown_snapshot = try unknown.snapshot(allocator);
+    defer allocator.free(unknown_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_snapshot, "last commit: unknown") != null);
 }
 
 const HelpItem = struct {
