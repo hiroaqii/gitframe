@@ -29,9 +29,11 @@ pub const Context = struct {
     search_query_len: usize = 0,
     focus: diff_surface.Focus = .sidebar,
     sidebar_hidden: bool = false,
+    side_by_side: bool = false,
     base_picker_open: bool = false,
     base_picker_query_mode: bool = false,
     base_picker_query_len: usize = 0,
+    selection_owner: diff_surface.input.SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
     keymap: keymap.Effective = .{},
 
@@ -39,6 +41,7 @@ pub const Context = struct {
         return .{
             .search_mode = self.search_mode,
             .file_search_mode = self.file_search_mode,
+            .selection_owner = self.selection_owner,
             .retained_selection_action_available = self.retained_selection_action_available,
         };
     }
@@ -76,6 +79,10 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
     return normalKeyToMsg(context, key);
 }
 
+pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?Msg {
+    return .{ .shared = diff_surface.input.selectionKeyToMsg(context.shared(), key) orelse return null };
+}
+
 fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return shared(.toggle_focus);
     if (key.matches(chasen.Key.escape, .{}) and context.search_query_len > 0) return shared(.clear_search);
@@ -87,6 +94,8 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return shared(.scroll_diff_left);
     if (context.focus == .sidebar and key.matches('h', .{})) return shared(.scroll_sidebar_left);
     if (context.focus == .sidebar and key.matches('l', .{})) return shared(.scroll_sidebar_right);
+    if (context.focus == .diff and context.side_by_side and key.matches('h', .{})) return shared(.{ .keyboard_select_side = .old });
+    if (context.focus == .diff and context.side_by_side and key.matches('l', .{})) return shared(.{ .keyboard_select_side = .new });
     if (key.matches(chasen.Key.home, .{})) return shared(.select_first_file);
     if (key.matches(chasen.Key.end, .{})) return shared(.select_last_file);
 
@@ -94,6 +103,8 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     // intentionally does not expose. This is what lets a user-bound `m` win
     // over the page-local picker mnemonic.
     if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action);
+
+    if (context.focus == .diff and key_input.matchesShiftedAscii(key, 'v', 'V')) return shared(.begin_keyboard_line_selection);
 
     if (key_input.matchesShiftedAscii(key, 'j', 'J')) return if (context.focus == .diff) shared(.select_next_hunk) else null;
     if (key_input.matchesShiftedAscii(key, 'k', 'K')) return if (context.focus == .diff) shared(.select_previous_hunk) else null;
@@ -169,6 +180,28 @@ test "Compare routes admitted retained actions through shared input" {
         keyToMsg(retained, .{ .codepoint = chasen.Key.escape }).?,
     );
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.escape }) == null);
+}
+
+test "Compare keyboard line selection maps side start and movement" {
+    const normal: Context = .{ .focus = .diff, .side_by_side = true };
+    try std.testing.expectEqual(Msg{ .shared = .{ .keyboard_select_side = .old } }, keyToMsg(normal, .{ .codepoint = 'h' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .begin_keyboard_line_selection }, keyToMsg(normal, .{ .codepoint = 'V' }).?);
+
+    const active: Context = .{ .selection_owner = .keyboard_line, .retained_selection_action_available = true };
+    try std.testing.expectEqual(Msg{ .shared = .{ .keyboard_line_selection_move = .up } }, keyToMsg(active, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .selection_action_unavailable }, keyToMsg(active, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .scroll_diff_right }, keyToMsg(.{
+        .focus = .diff,
+        .selection_owner = .keyboard_line,
+    }, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(Msg{ .shared = .expand_directory }, keyToMsg(.{
+        .focus = .sidebar,
+        .selection_owner = .mouse,
+    }, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(Msg{ .shared = .collapse_or_parent_directory }, keyToMsg(.{
+        .focus = .sidebar,
+        .selection_owner = .header,
+    }, .{ .codepoint = chasen.Key.left }).?);
 }
 
 test "base picker owns its modal grammar" {

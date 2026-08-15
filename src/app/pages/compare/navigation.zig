@@ -122,21 +122,25 @@ pub const Controller = struct {
         }
 
         pub fn shared(self: *UpdateAdapter) diff_surface.update.Controller {
-            return .{ .navigation = self.bodyController() };
+            return .{
+                .navigation = self.bodyController(),
+                .retained_selection_install = .{ .ctx = self, .callback = installRetainedSelection },
+            };
+        }
+
+        fn installRetainedSelection(ctx: *anyopaque) bool {
+            const self: *UpdateAdapter = @ptrCast(@alignCast(ctx));
+            return self.navigation.page.installPinnedSelectionBasis();
         }
 
         pub fn applyRetentionTransition(
             self: *UpdateAdapter,
-            allocator: std.mem.Allocator,
+            _: std.mem.Allocator,
             transition: diff_surface.update.RetentionTransition,
         ) void {
             switch (transition) {
                 .none => {},
                 .installed => {
-                    if (!self.navigation.page.installPinnedSelectionBasis()) {
-                        self.navigation.page.clearRetainedSelection(allocator);
-                        return;
-                    }
                     var body = self.bodyController();
                     body.controller.revealCompletedSelectionAction(body.resolver);
                 },
@@ -424,6 +428,87 @@ test "Compare selection release installs pinned retained actions" {
     try std.testing.expect(page.completed_selection == null);
     try std.testing.expect(page.selection_owner == .none);
     try std.testing.expectEqualStrings("Could not retain selected text", page.status.text());
+}
+
+test "Compare keyboard line selection completes with exact pin and retries allocation failure" {
+    const allocator = std.testing.allocator;
+    var page: compare_page.ComparePageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .basis = .{
+            .base = .{
+                .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+                .display_name = try allocator.dupe(u8, "main"),
+                .kind = .local,
+                .oid = .{},
+            },
+            .head_display = try allocator.dupe(u8, "topic"),
+            .merge_base_oid = .{},
+            .head_oid = .{},
+            .ahead_count = 1,
+        },
+        .viewer = .{
+            .focus = .diff,
+            .sidebar_hidden = true,
+            .display_mode = .side_by_side,
+        },
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{
+        .page = &page,
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = 120, .height = 20 },
+    };
+    var adapter = controller.updateAdapter();
+
+    var choose = try adapter.shared().apply(null, .{ .keyboard_select_side = .new });
+    choose.deinit(null);
+    var begin = try adapter.shared().apply(null, .begin_keyboard_line_selection);
+    begin.deinit(null);
+    for (0..2) |_| {
+        var moved = try adapter.shared().apply(null, .{ .keyboard_line_selection_move = .down });
+        moved.deinit(null);
+    }
+    try std.testing.expect(page.selection_owner.activeKeyboardLineSelection());
+    try std.testing.expectEqual(@as(usize, 3), page.selection_owner.activeDiff().?.selected_line_count);
+
+    var copied = try adapter.shared().apply(allocator, .{ .selection_action = .copy });
+    defer copied.deinit(allocator);
+    try std.testing.expectEqual(diff_surface.update.RetentionTransition.installed, copied.retention_transition);
+    try std.testing.expect(page.pinned_selection_basis.?.eql(compare_page.PinnedSelectionBasis.init(page.basis.?)));
+    var effect = copied.takeEffect() orelse return error.ExpectedSelectionEffect;
+    defer effect.deinit(allocator);
+    switch (effect) {
+        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
+        .copy_diff_header_path => return error.ExpectedSelectionEffect,
+    }
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expect(page.completed_selection != null);
+    const prior_pin = page.pinned_selection_basis.?;
+    const prior_text = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(prior_text);
+
+    var second_begin = try adapter.shared().apply(null, .begin_keyboard_line_selection);
+    second_begin.deinit(null);
+    var second_move = try adapter.shared().apply(null, .{ .keyboard_line_selection_move = .down });
+    second_move.deinit(null);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var rejected = try adapter.shared().apply(failing.allocator(), .{ .selection_action = .copy });
+    rejected.deinit(failing.allocator());
+    try std.testing.expect(page.selection_owner.activeKeyboardLineSelection());
+    try std.testing.expect(page.pinned_selection_basis.?.eql(prior_pin));
+    const retained_text = try page.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(retained_text);
+    try std.testing.expectEqualStrings(prior_text, retained_text);
+    try std.testing.expectEqualStrings("Could not retain selected text; press y to retry", page.status.text());
+
+    var cleared = try adapter.shared().apply(allocator, .{ .selection_action = .clear });
+    defer cleared.deinit(allocator);
+    adapter.applyRetentionTransition(allocator, cleared.retention_transition);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expect(page.completed_selection == null);
+    try std.testing.expect(page.pinned_selection_basis == null);
 }
 
 test "Compare retained candidate and pin replace transactionally and survive rejected installs" {

@@ -15,6 +15,11 @@ pub const Mode = enum {
     character,
 };
 
+pub const Origin = enum {
+    mouse,
+    keyboard_line,
+};
+
 pub const Point = struct {
     hunk_index: usize,
     line_index: usize,
@@ -22,11 +27,19 @@ pub const Point = struct {
     leading: usize = 0,
     trailing: usize = 0,
 
+    pub fn order(self: Point, other: Point) std.math.Order {
+        if (self.hunk_index != other.hunk_index) return std.math.order(self.hunk_index, other.hunk_index);
+        if (self.line_index != other.line_index) return std.math.order(self.line_index, other.line_index);
+        if (self.leading != other.leading) return std.math.order(self.leading, other.leading);
+        return std.math.order(self.trailing, other.trailing);
+    }
+
+    pub fn eql(self: Point, other: Point) bool {
+        return self.order(other) == .eq;
+    }
+
     fn beforeOrEqual(self: Point, other: Point) bool {
-        return self.hunk_index < other.hunk_index or
-            (self.hunk_index == other.hunk_index and (self.line_index < other.line_index or
-                (self.line_index == other.line_index and (self.leading < other.leading or
-                    (self.leading == other.leading and self.trailing <= other.trailing)))));
+        return self.order(other) != .gt;
     }
 };
 
@@ -115,10 +128,14 @@ pub const DragSelection = struct {
     identity: Identity,
     side: Side,
     mode: Mode = .line,
+    origin: Origin = .mouse,
     anchor: Point,
     focus: Point,
     moved: bool = false,
     anchor_cell: ?Cell = null,
+    /// Allocation-free active keyboard count. Mouse selections derive their
+    /// owned count only when completion builds fragments.
+    selected_line_count: usize = 0,
 
     pub fn init(identity: Identity, side: Side, point: Point) DragSelection {
         return .{
@@ -140,6 +157,19 @@ pub const DragSelection = struct {
         };
     }
 
+    pub fn initKeyboardLine(identity: Identity, side: Side, point: Point) DragSelection {
+        return .{
+            .identity = identity,
+            .side = side,
+            .mode = .line,
+            .origin = .keyboard_line,
+            .anchor = point,
+            .focus = point,
+            .moved = true,
+            .selected_line_count = 1,
+        };
+    }
+
     pub fn update(self: *DragSelection, point: Point) void {
         if (point.hunk_index != self.focus.hunk_index or point.line_index != self.focus.line_index or
             point.leading != self.focus.leading or point.trailing != self.focus.trailing)
@@ -154,6 +184,14 @@ pub const DragSelection = struct {
             if (!anchor_cell.eql(cell)) self.moved = true;
         }
         self.focus = point;
+    }
+
+    pub fn updateKeyboardLine(self: *DragSelection, point: Point, selected_line_count: usize) void {
+        std.debug.assert(self.origin == .keyboard_line);
+        std.debug.assert(self.mode == .line);
+        std.debug.assert(selected_line_count > 0);
+        self.update(point);
+        self.selected_line_count = selected_line_count;
     }
 
     pub fn range(self: DragSelection) Range {
@@ -207,7 +245,15 @@ pub const Owner = union(enum) {
     pub fn activeMouseSelection(self: Owner) bool {
         return switch (self) {
             .none => false,
-            .diff, .diff_header => true,
+            .diff => |selection| selection.origin == .mouse,
+            .diff_header => true,
+        };
+    }
+
+    pub fn activeKeyboardLineSelection(self: Owner) bool {
+        return switch (self) {
+            .diff => |selection| selection.origin == .keyboard_line,
+            .none, .diff_header => false,
         };
     }
 };
@@ -268,6 +314,36 @@ pub fn lineVisibleOnSide(line: diff_parser.DiffLine, side: Side) bool {
         .old => line.kind == .context or line.kind == .removed,
         .new => line.kind == .context or line.kind == .added,
     };
+}
+
+/// Number of semantic lines on `side` strictly after one endpoint through the
+/// other endpoint. Both endpoints must identify selectable lines. This lets a
+/// single presentation step account for folded hunks without rebuilding an
+/// owned selection or rescanning the complete active range.
+pub fn semanticLineDistance(file: diff_parser.FileDiff, side: Side, a: Point, b: Point) ?usize {
+    if (a.eql(b)) return 0;
+    const start = if (a.order(b) == .lt) a else b;
+    const end = if (a.order(b) == .lt) b else a;
+    if (!selectablePoint(file, side, start) or !selectablePoint(file, side, end)) return null;
+
+    var count: usize = 0;
+    var hunk_index = start.hunk_index;
+    while (hunk_index <= end.hunk_index) : (hunk_index += 1) {
+        const hunk = file.hunks[hunk_index];
+        var line_index: usize = if (hunk_index == start.hunk_index) start.line_index + 1 else 0;
+        const stop = if (hunk_index == end.hunk_index) end.line_index else hunk.lines.len -| 1;
+        while (line_index < hunk.lines.len and line_index <= stop) : (line_index += 1) {
+            if (lineVisibleOnSide(hunk.lines[line_index], side)) count += 1;
+        }
+    }
+    return count;
+}
+
+fn selectablePoint(file: diff_parser.FileDiff, side: Side, point: Point) bool {
+    if (point.hunk_index >= file.hunks.len) return false;
+    const hunk = file.hunks[point.hunk_index];
+    if (point.line_index >= hunk.lines.len) return false;
+    return lineVisibleOnSide(hunk.lines[point.line_index], side);
 }
 
 pub fn copyText(
@@ -442,6 +518,42 @@ test "copyText preserves side-specific lines and whitespace" {
     });
     defer std.testing.allocator.free(new_text);
     try std.testing.expectEqualStrings(" same \n  new\n", new_text);
+}
+
+test "semantic line distance counts selected side across holes and hunk boundaries" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff",
+        .metadata = &.{},
+        .hunks = &.{
+            .{
+                .old_start = 1,
+                .old_count = 3,
+                .new_start = 1,
+                .new_count = 3,
+                .section = "",
+                .lines = &.{
+                    .{ .kind = .context, .text = "one", .old_line = 1, .new_line = 1 },
+                    .{ .kind = .removed, .text = "old", .old_line = 2 },
+                    .{ .kind = .added, .text = "new", .new_line = 2 },
+                    .{ .kind = .context, .text = "three", .old_line = 3, .new_line = 3 },
+                },
+            },
+            .{
+                .old_start = 20,
+                .old_count = 1,
+                .new_start = 20,
+                .new_count = 1,
+                .section = "",
+                .lines = &.{.{ .kind = .context, .text = "twenty", .old_line = 20, .new_line = 20 }},
+            },
+        },
+    };
+    const first = pointFromLine(0, 0);
+    const last = pointFromLine(1, 0);
+    try std.testing.expectEqual(@as(?usize, 3), semanticLineDistance(file, .new, first, last));
+    try std.testing.expectEqual(@as(?usize, 3), semanticLineDistance(file, .old, last, first));
+    try std.testing.expectEqual(@as(?usize, 1), semanticLineDistance(file, .new, first, pointFromLine(0, 2)));
+    try std.testing.expect(semanticLineDistance(file, .old, first, pointFromLine(0, 2)) == null);
 }
 
 test "character fragments copy exact forward and reverse multi-line bytes" {

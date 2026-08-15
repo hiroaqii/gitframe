@@ -156,6 +156,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
     if (context.push_error_mode) return pushErrorKeyToMsg(key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
+    if (selectionKeyToMsg(context, key)) |msg| return msg;
     if (pageForKey(context.keymap, key)) |target| return .{ .switch_page = target };
     if (context.keymap.spec(.help)) |spec| if (spec.matches(key)) return app_message.Msg.open_help;
     if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(key)) return app_message.Msg.enter_repo_picker;
@@ -177,6 +178,14 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     }
     if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return app_message.Msg.quit;
     return null;
+}
+
+fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
+    return switch (context.active_page) {
+        .review => translateReviewMsg(review_input.selectionKeyToMsg(context.review, key) orelse return null),
+        .compare => .{ .compare = compare_input.selectionKeyToMsg(context.compare, key) orelse return null },
+        .repository, .config => null,
+    };
 }
 
 fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
@@ -417,6 +426,96 @@ test "normal page keys map after text and overlay precedence" {
     const remapped = keymap.Effective.fromConfig(config);
     try expectMsg(.{ .switch_page = .repository }, keyToMsg(.{ .keymap = remapped }, .{ .codepoint = 'w' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .keymap = remapped }, .{ .codepoint = '2' }));
+}
+
+test "root selection preflight preserves modal and configured V precedence" {
+    var root_config: keymap.Config = .{};
+    root_config.set(.page_repository, .{ .plain_codepoint = 'V' });
+    const root_keymap = keymap.Effective.fromConfig(root_config);
+    const v = chasen.Key{ .codepoint = 'V' };
+
+    try std.testing.expectEqual(
+        app_message.Msg{ .switch_page = .repository },
+        keyToMsg(.{ .keymap = root_keymap, .review = .{ .focus = .diff } }, v).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg{ .switch_page = .repository },
+        keyToMsg(.{
+            .keymap = root_keymap,
+            .review = .{ .focus = .diff, .retained_selection_action_available = true },
+        }, v).?,
+    );
+    try std.testing.expectEqual(
+        reviewMsg(.selection_owned_noop),
+        keyToMsg(.{
+            .keymap = root_keymap,
+            .review = .{ .focus = .diff, .selection_owner = .keyboard_line, .retained_selection_action_available = true },
+        }, v).?,
+    );
+    try std.testing.expectEqual(
+        reviewMsg(.selection_owned_noop),
+        keyToMsg(.{ .keymap = root_keymap, .review = .{ .focus = .diff, .selection_owner = .mouse } }, v).?,
+    );
+    try std.testing.expectEqual(
+        reviewMsg(.selection_owned_noop),
+        keyToMsg(.{ .keymap = root_keymap, .review = .{ .focus = .diff, .selection_owner = .header } }, v).?,
+    );
+    try std.testing.expectEqual(
+        reviewMsg(.begin_keyboard_line_selection),
+        keyToMsg(.{ .review = .{ .focus = .diff } }, v).?,
+    );
+
+    var page_config: keymap.Config = .{};
+    page_config.set(.toggle_line_numbers, .{ .plain_codepoint = 'V' });
+    const page_keymap = keymap.Effective.fromConfig(page_config);
+    try std.testing.expectEqual(
+        reviewMsg(.toggle_line_numbers),
+        keyToMsg(.{
+            .review = .{ .focus = .diff, .retained_selection_action_available = true, .keymap = page_keymap },
+        }, v).?,
+    );
+
+    const active: KeyContext = .{
+        .review = .{
+            .focus = .diff,
+            .review_mode = true,
+            .selection_owner = .keyboard_line,
+            .retained_selection_action_available = true,
+        },
+    };
+    try std.testing.expectEqual(reviewMsg(.selection_action_unavailable), keyToMsg(active, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(reviewMsg(.{ .selection_action = .clear }), keyToMsg(active, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(reviewMsg(.scroll_diff_left), keyToMsg(active, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(
+        app_message.Msg{ .compare = .{ .shared = .scroll_diff_right } },
+        keyToMsg(.{
+            .active_page = .compare,
+            .compare = .{ .focus = .diff, .selection_owner = .keyboard_line },
+        }, .{ .codepoint = chasen.Key.right }).?,
+    );
+    try std.testing.expectEqual(
+        reviewMsg(.expand_directory),
+        keyToMsg(.{ .review = .{ .focus = .sidebar, .selection_owner = .mouse } }, .{ .codepoint = chasen.Key.right }).?,
+    );
+    try std.testing.expectEqual(
+        reviewMsg(.collapse_or_parent_directory),
+        keyToMsg(.{ .review = .{ .focus = .sidebar, .selection_owner = .header } }, .{ .codepoint = chasen.Key.left }).?,
+    );
+    try std.testing.expectEqual(app_message.Msg.cancel_remote_action, keyToMsg(.{
+        .remote_action_cancelable = true,
+        .review = active.review,
+    }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(reviewMsg(.cancel_search), keyToMsg(.{
+        .review = .{
+            .search_mode = true,
+            .selection_owner = .keyboard_line,
+            .retained_selection_action_available = true,
+        },
+    }, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{
+        .help_mode = true,
+        .review = active.review,
+    }, .{ .codepoint = chasen.Key.escape }).?);
 }
 
 test "eventToMsg maps winsize event" {

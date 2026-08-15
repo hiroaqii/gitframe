@@ -453,12 +453,14 @@ pub const App = struct {
                 // the common post-update boundary below.
                 self.drag_auto_scroll.clear();
                 const review_selection_anchor = self.reviewNavigation().captureSelectionViewportAnchor();
-                self.reviewNavigation().clearDiffSelection();
+                self.reviewNavigation().clearMouseDiffSelection();
                 const previous_compare_view = self.compareCoordinator().navigationView();
                 var previous_compare_adapter = previous_compare_view.resolver();
                 const previous_compare_body = previous_compare_view.bodyView(&previous_compare_adapter);
                 const compare_selection_anchor = previous_compare_body.captureSelectionViewportAnchor();
-                self.pages.compare.selection_owner = .none;
+                if (self.pages.compare.selection_owner.activeMouseSelection()) {
+                    self.pages.compare.selection_owner = .none;
+                }
                 const repository_selection_anchor = self.pages.repository.captureSelectionViewportAnchor();
                 self.pages.repository.cancelMouseOwner();
                 const previous_width = self.reviewNavigationView().diffPaneWidth();
@@ -467,7 +469,10 @@ pub const App = struct {
                 const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
                 self.terminal_size = size;
                 self.reviewNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-                if (previous_mode != self.reviewNavigationView().effectiveDisplayMode()) self.reviewNavigation().clearDiffSelection();
+                if (previous_mode != self.reviewNavigationView().effectiveDisplayMode()) {
+                    self.reviewNavigation().clearMouseDiffSelection();
+                    self.pages.review.advanceSelectionLayoutRevision();
+                }
                 if (review_selection_anchor) |anchor| self.reviewNavigation().restoreSelectionViewportAnchor(anchor);
                 self.reviewNavigation().clampSidebarHorizontalScroll();
                 self.reviewNavigation().clampDiffNavigationKeepingHunkVisible();
@@ -479,7 +484,7 @@ pub const App = struct {
                 var compare_body = compare_adapter.bodyController();
                 compare_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_compare_width);
                 if (previous_compare_mode != compare_body.controller.view().effectiveDisplayMode()) {
-                    compare_body.controller.clearDiffSelection();
+                    compare_body.controller.clearMouseDiffSelection();
                     self.pages.compare.advanceSelectionLayoutRevision();
                 }
                 if (compare_selection_anchor) |anchor| compare_body.restoreSelectionViewportAnchor(anchor);
@@ -560,8 +565,10 @@ pub const App = struct {
             .repo_picker_move_right => self.repoSession().movePickerCursorRight(),
             .open_help => {
                 self.drag_auto_scroll.clear();
-                if (self.active_page == .review) self.reviewNavigation().clearDiffSelection();
-                if (self.active_page == .compare) self.pages.compare.selection_owner = .none;
+                if (self.active_page == .review) self.reviewNavigation().clearMouseDiffSelection();
+                if (self.active_page == .compare and self.pages.compare.selection_owner.activeMouseSelection()) {
+                    self.pages.compare.selection_owner = .none;
+                }
                 if (self.active_page == .repository) self.pages.repository.cancelMouseOwner();
                 self.overlay.openHelpForPage(self.active_page);
             },
@@ -1143,7 +1150,9 @@ pub const App = struct {
                     .search_query_len = self.pages.review.search.query.len,
                     .focus = self.pages.review.viewer.focus,
                     .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
+                    .side_by_side = review_navigation_view.effectiveDisplayMode() == .side_by_side,
                     .review_mode = self.config.review_mode,
+                    .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.review.selection_owner),
                     .retained_selection_action_available = review_navigation_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,
                 },
@@ -1160,9 +1169,11 @@ pub const App = struct {
                     .search_query_len = self.pages.compare.search.query.len,
                     .focus = self.pages.compare.viewer.focus,
                     .sidebar_hidden = self.pages.compare.viewer.sidebar_hidden,
+                    .side_by_side = compare_navigation_view.view().effectiveDisplayMode() == .side_by_side,
                     .base_picker_open = self.pages.compare.base_picker.open,
                     .base_picker_query_mode = self.pages.compare.base_picker.input_mode == .query,
                     .base_picker_query_len = self.pages.compare.base_picker.query.len,
+                    .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.compare.selection_owner),
                     .retained_selection_action_available = compare_body_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,
                 },

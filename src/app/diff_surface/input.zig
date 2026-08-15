@@ -6,14 +6,31 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const key_input = @import("../key_input.zig");
+const diff_selection = @import("../../diff/selection.zig");
 const selection_action = @import("../selection_action.zig");
 const message = @import("message.zig");
+
+pub const SelectionOwnerKind = enum {
+    none,
+    mouse,
+    keyboard_line,
+    header,
+};
 
 pub const Context = struct {
     search_mode: bool = false,
     file_search_mode: bool = false,
+    selection_owner: SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
 };
+
+pub fn selectionOwnerKind(owner: diff_selection.Owner) SelectionOwnerKind {
+    return switch (owner) {
+        .none => .none,
+        .diff => |selection| if (selection.origin == .keyboard_line) .keyboard_line else .mouse,
+        .diff_header => .header,
+    };
+}
 
 pub fn pasteToMsg(context: Context, text: []const u8) ?message.Msg {
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
@@ -25,10 +42,51 @@ pub fn pasteToMsg(context: Context, text: []const u8) ?message.Msg {
 pub fn keyToMsg(context: Context, key: chasen.Key) ?message.Msg {
     if (context.search_mode) return searchKeyToMsg(key);
     if (context.file_search_mode) return fileSearchKeyToMsg(key);
-    if (context.retained_selection_action_available) {
-        if (selection_action.keyToAction(key)) |action| return .{ .selection_action = action };
-    }
-    return null;
+    return selectionKeyToMsg(context, key);
+}
+
+/// Bounded selection grammar used both by page-local input and by the root
+/// preflight that runs after modal owners but before configured root actions.
+pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?message.Msg {
+    const escape = key.matches(chasen.Key.escape, .{});
+    const copy = key.matches('y', .{});
+    const ask = key.matches('a', .{});
+    const begin = key_input.matchesShiftedAscii(key, 'v', 'V');
+    const up = key.matches('k', .{}) or key.matches(chasen.Key.up, .{});
+    const down = key.matches('j', .{}) or key.matches(chasen.Key.down, .{});
+    const lateral = key.matches('h', .{}) or key.matches('l', .{});
+
+    return switch (context.selection_owner) {
+        .keyboard_line => if (escape)
+            .{ .selection_action = .clear }
+        else if (copy)
+            .{ .selection_action = .copy }
+        else if (ask)
+            .selection_action_unavailable
+        else if (up)
+            .{ .keyboard_line_selection_move = .up }
+        else if (down)
+            .{ .keyboard_line_selection_move = .down }
+        else if (begin or lateral)
+            .selection_owned_noop
+        else
+            null,
+        .mouse, .header => if (escape)
+            .{ .selection_action = .clear }
+        else if (copy or ask or begin or up or down or lateral)
+            .selection_owned_noop
+        else
+            null,
+        .none => if (context.retained_selection_action_available)
+            if (selection_action.keyToAction(key)) |action|
+                .{ .selection_action = action }
+            else if (ask)
+                .selection_action_unavailable
+            else
+                null
+        else
+            null,
+    };
 }
 
 fn searchKeyToMsg(key: chasen.Key) ?message.Msg {
@@ -59,4 +117,25 @@ test "retained actions are shared after modal owners" {
     const search: Context = .{ .search_mode = true, .retained_selection_action_available = true };
     try std.testing.expectEqual(message.Msg{ .search_insert = 'y' }, keyToMsg(search, .{ .codepoint = 'y' }).?);
     try std.testing.expectEqual(message.Msg.cancel_search, keyToMsg(search, .{ .codepoint = chasen.Key.escape }).?);
+}
+
+test "keyboard line selection owns its bounded grammar" {
+    const active: Context = .{ .selection_owner = .keyboard_line, .retained_selection_action_available = true };
+    try std.testing.expectEqual(message.Msg{ .keyboard_line_selection_move = .down }, selectionKeyToMsg(active, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(message.Msg{ .keyboard_line_selection_move = .up }, selectionKeyToMsg(active, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(message.Msg{ .selection_action = .copy }, selectionKeyToMsg(active, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(message.Msg.selection_action_unavailable, selectionKeyToMsg(active, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(active, .{ .codepoint = 'V' }).?);
+    try std.testing.expect(selectionKeyToMsg(active, .{ .codepoint = chasen.Key.left }) == null);
+    try std.testing.expect(selectionKeyToMsg(active, .{ .codepoint = chasen.Key.right }) == null);
+}
+
+test "mouse and header selection consume selection keys without acquiring keyboard authority" {
+    for ([_]SelectionOwnerKind{ .mouse, .header }) |owner| {
+        const context: Context = .{ .selection_owner = owner };
+        try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(context, .{ .codepoint = 'j' }).?);
+        try std.testing.expectEqual(message.Msg{ .selection_action = .clear }, selectionKeyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+        try std.testing.expect(selectionKeyToMsg(context, .{ .codepoint = chasen.Key.left }) == null);
+        try std.testing.expect(selectionKeyToMsg(context, .{ .codepoint = chasen.Key.right }) == null);
+    }
 }

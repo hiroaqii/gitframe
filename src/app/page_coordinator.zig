@@ -232,6 +232,7 @@ pub const Controller = struct {
         std.debug.assert(self.active_page.* == .review);
         std.debug.assert(!self.review.deferredSourceBlocksPageTransition());
         self.reviewReload().retireCanonicalPublicationForPageExit(allocator);
+        self.review.selection_owner = .none;
         self.review.activation.deactivate();
     }
 

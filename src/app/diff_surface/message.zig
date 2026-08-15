@@ -4,7 +4,9 @@
 //! only these transitions and therefore cannot acquire page-only authority.
 
 const diff_surface = @import("../diff_surface.zig");
+const app_direction = @import("../direction.zig");
 const drag_auto_scroll = @import("../drag_auto_scroll.zig");
+const diff_selection = @import("../../diff/selection.zig");
 const selection_action = @import("../selection_action.zig");
 
 pub const Msg = union(enum) {
@@ -38,6 +40,11 @@ pub const Msg = union(enum) {
     mouse_diff_release: ?diff_surface.MousePoint,
     mouse_diff_auto_scroll_step: drag_auto_scroll.Step,
     selection_action: selection_action.Action,
+    selection_owned_noop,
+    keyboard_select_side: diff_selection.Side,
+    begin_keyboard_line_selection,
+    keyboard_line_selection_move: app_direction.Vertical,
+    selection_action_unavailable,
     toggle_focus,
     page_diff_up,
     page_diff_down,

@@ -393,6 +393,7 @@ pub const ComparePageState = struct {
     }
 
     pub fn deactivate(self: *ComparePageState) void {
+        self.selection_owner = .none;
         self.activation.deactivate();
     }
 
@@ -449,7 +450,7 @@ pub const ComparePageState = struct {
 
     pub fn beginBasePicker(self: *ComparePageState, allocator: std.mem.Allocator) ?BasePickerRequest {
         const identity = self.activation.currentIdentity() orelse return null;
-        self.selection_owner = .none;
+        if (self.selection_owner.activeMouseSelection()) self.selection_owner = .none;
         return self.base_picker.begin(allocator, identity);
     }
 

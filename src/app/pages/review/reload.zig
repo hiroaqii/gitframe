@@ -4066,6 +4066,7 @@ pub const Controller = struct {
     pub fn advanceSourceSessionRevision(self: Controller, allocator: ?std.mem.Allocator) void {
         // Candidate paths borrow the accepted load arena. Revoke that complete
         // namespace before any source transition can free or replace it.
+        self.navigation.clearDiffSelection();
         self.page.advanceAcceptedSidebarRevision(allocator);
         if (allocator) |owner| {
             self.clearCompletedSelection(owner);
@@ -4086,6 +4087,7 @@ pub const Controller = struct {
         // and active changed-file eligibility. Revoke the old candidate basis
         // before the status owner is committed; the later sidebar projection
         // republishes the retained query from the accepted model.
+        self.navigation.clearDiffSelection();
         self.page.advanceAcceptedSidebarRevision(allocator);
         if (allocator) |owner| {
             self.clearStatusInvalidatedCompletedSelection(owner);

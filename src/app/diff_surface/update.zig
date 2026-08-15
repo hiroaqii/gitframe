@@ -59,11 +59,21 @@ pub const Hook = struct {
     }
 };
 
+pub const InstallHook = struct {
+    ctx: *anyopaque,
+    callback: *const fn (ctx: *anyopaque) bool,
+
+    pub fn install(self: InstallHook) bool {
+        return self.callback(self.ctx);
+    }
+};
+
 pub const Controller = struct {
     navigation: navigation.BodyController,
     /// Review retains a richer mixed-stage fold presentation policy. Compare
     /// can use the shared body operation directly.
     toggle_hunk_fold: ?Hook = null,
+    retained_selection_install: ?InstallHook = null,
 
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !Update {
         const tracks_navigation = tracksDisplayNavigation(msg);
@@ -157,9 +167,16 @@ pub const Controller = struct {
                 action,
                 &result,
             ),
+            .selection_owned_noop => {},
+            .keyboard_select_side => |side| self.navigation.selectKeyboardSelectionSide(side),
+            .begin_keyboard_line_selection => if (!self.navigation.beginKeyboardLineSelection()) {
+                self.navigation.controller.setStatus("No selectable code line for keyboard selection", .{});
+            },
+            .keyboard_line_selection_move => |direction| _ = self.navigation.moveKeyboardLineSelection(direction),
+            .selection_action_unavailable => self.navigation.controller.setStatus("Ask is not available for this selection", .{}),
             .toggle_display_mode => {
-                self.navigation.controller.clearDiffSelection();
                 const selection_anchor = self.navigation.captureSelectionViewportAnchor();
+                self.navigation.controller.clearDiffSelection();
                 const old_mode = self.navigation.controller.view().effectiveDisplayMode();
                 const old_scroll = self.navigation.view().renderDiffScroll();
                 self.navigation.controller.surface.viewer.display_mode = self.navigation.controller.surface.viewer.display_mode.toggled();
@@ -258,6 +275,7 @@ pub const Controller = struct {
         return switch (owner) {
             .none => .{},
             .diff => |drag| blk: {
+                if (drag.origin != .mouse) break :blk .{};
                 if (!drag.moved) {
                     self.navigation.controller.clearDiffSelection();
                     break :blk .{};
@@ -282,6 +300,14 @@ pub const Controller = struct {
                     self.navigation.controller.setStatus("Could not retain selected text", .{});
                     break :blk .{};
                 };
+                if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions and
+                    !self.commitRetainedSelectionInstall())
+                {
+                    candidate.deinit(allocator);
+                    self.navigation.controller.clearDiffSelection();
+                    self.navigation.controller.setStatus("Could not retain selected text", .{});
+                    break :blk .{};
+                }
                 if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
                 self.navigation.controller.surface.completed_selection.* = candidate;
                 candidate = undefined;
@@ -307,11 +333,14 @@ pub const Controller = struct {
         action: selection_action.Action,
         result: *Update,
     ) void {
+        if (action == .copy and self.completeKeyboardSelection(allocator, result)) return;
+
         const Adapter = struct {
             controller: Controller,
 
             pub fn available(adapter: *@This()) bool {
-                return adapter.controller.navigation.controller.surface.completed_selection.* != null;
+                return adapter.controller.navigation.controller.surface.selection_owner.* != .none or
+                    adapter.controller.navigation.controller.surface.completed_selection.* != null;
             }
 
             pub fn copy(adapter: *@This(), owner: std.mem.Allocator) selection_action.CopyError![]u8 {
@@ -341,6 +370,55 @@ pub const Controller = struct {
             },
             .preparation_failed => self.navigation.controller.setStatus("Could not prepare selected text for copying", .{}),
         }
+    }
+
+    fn completeKeyboardSelection(self: Controller, allocator: std.mem.Allocator, result: *Update) bool {
+        const drag = self.navigation.controller.surface.selection_owner.activeDiff() orelse return false;
+        if (drag.origin != .keyboard_line) return false;
+        if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions and
+            !self.navigation.controller.surface.retained_selection_install_available)
+        {
+            self.navigation.controller.setStatus("Could not retain selected text; press y to retry", .{});
+            return true;
+        }
+
+        var candidate = self.buildCompletedSelection(allocator, drag) catch {
+            self.navigation.controller.setStatus("Could not retain selected text; press y to retry", .{});
+            return true;
+        };
+        if (candidate.lineCount() != drag.selected_line_count) {
+            candidate.deinit(allocator);
+            self.navigation.controller.setStatus("Could not validate selected text; press y to retry", .{});
+            return true;
+        }
+        if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions and
+            !self.commitRetainedSelectionInstall())
+        {
+            candidate.deinit(allocator);
+            self.navigation.controller.setStatus("Could not retain selected text; press y to retry", .{});
+            return true;
+        }
+
+        if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
+        self.navigation.controller.surface.completed_selection.* = candidate;
+        candidate = undefined;
+        self.navigation.controller.clearDiffSelection();
+        if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions) {
+            result.retention_transition = .installed;
+        }
+
+        const clipboard = self.navigation.controller.surface.completed_selection.*.?.clipboardText(allocator) catch {
+            self.navigation.controller.setStatus("Could not prepare selected text for copying; press y to retry", .{});
+            return true;
+        };
+        result.effect = .{ .copy_diff_selection = clipboard };
+        return true;
+    }
+
+    fn commitRetainedSelectionInstall(self: Controller) bool {
+        if (!self.navigation.controller.surface.retained_selection_install_available) return false;
+        const install = self.retained_selection_install orelse return true;
+        return install.install();
     }
 
     fn buildCompletedSelection(self: Controller, allocator: std.mem.Allocator, drag: diff_selection.DragSelection) !selection.CompletedSelection {

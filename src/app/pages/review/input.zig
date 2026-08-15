@@ -20,7 +20,9 @@ pub const Context = struct {
     search_query_len: usize = 0,
     focus: review_page.Focus = .sidebar,
     sidebar_hidden: bool = false,
+    side_by_side: bool = false,
     review_mode: bool = false,
+    selection_owner: diff_surface_input.SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
     keymap: keymap.Effective = .{},
 
@@ -28,6 +30,7 @@ pub const Context = struct {
         return .{
             .search_mode = self.search_mode,
             .file_search_mode = self.file_search_mode,
+            .selection_owner = self.selection_owner,
             .retained_selection_action_available = self.retained_selection_action_available,
         };
     }
@@ -43,6 +46,10 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
     return normalKeyToMsg(context, key);
 }
 
+pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?Msg {
+    return review_message.fromShared(diff_surface_input.selectionKeyToMsg(context.shared(), key) orelse return null);
+}
+
 fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.tab, .{}) and !context.sidebar_hidden) return .toggle_focus;
     if (key.matches(chasen.Key.escape, .{}) and context.search_query_len > 0) return .clear_search;
@@ -54,10 +61,14 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return .scroll_diff_left;
     if (context.focus == .sidebar and key.matches('h', .{})) return .scroll_sidebar_left;
     if (context.focus == .sidebar and key.matches('l', .{})) return .scroll_sidebar_right;
+    if (context.focus == .diff and context.side_by_side and key.matches('h', .{})) return .{ .keyboard_select_side = .old };
+    if (context.focus == .diff and context.side_by_side and key.matches('l', .{})) return .{ .keyboard_select_side = .new };
     if (key.matches(chasen.Key.home, .{})) return .select_first_file;
     if (key.matches(chasen.Key.end, .{})) return .select_last_file;
 
     if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action);
+
+    if (context.focus == .diff and key_input.matchesShiftedAscii(key, 'v', 'V')) return .begin_keyboard_line_selection;
 
     if (key_input.matchesShiftedAscii(key, 'j', 'J')) return if (context.focus == .diff) .select_next_hunk else null;
     if (key_input.matchesShiftedAscii(key, 'k', 'K')) return if (context.focus == .diff) .select_previous_hunk else null;
@@ -141,6 +152,29 @@ test "retained selection actions override line copy and empty escape fallback" {
     try std.testing.expectEqual(Msg{ .selection_action = .clear }, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(Msg.copy_current_line, keyToMsg(.{}, .{ .codepoint = 'y' }).?);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.escape }) == null);
+}
+
+test "Review keyboard line selection maps side start movement and unavailable Ask" {
+    const normal: Context = .{ .focus = .diff, .side_by_side = true };
+    try std.testing.expectEqual(Msg{ .keyboard_select_side = .old }, keyToMsg(normal, .{ .codepoint = 'h' }).?);
+    try std.testing.expectEqual(Msg{ .keyboard_select_side = .new }, keyToMsg(normal, .{ .codepoint = 'l' }).?);
+    try std.testing.expectEqual(Msg.begin_keyboard_line_selection, keyToMsg(normal, .{ .codepoint = 'V' }).?);
+
+    const active: Context = .{ .selection_owner = .keyboard_line, .retained_selection_action_available = true };
+    try std.testing.expectEqual(Msg{ .keyboard_line_selection_move = .down }, keyToMsg(active, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(Msg.selection_action_unavailable, keyToMsg(active, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(Msg.scroll_diff_left, keyToMsg(.{
+        .focus = .diff,
+        .selection_owner = .keyboard_line,
+    }, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(Msg.expand_directory, keyToMsg(.{
+        .focus = .sidebar,
+        .selection_owner = .mouse,
+    }, .{ .codepoint = chasen.Key.right }).?);
+    try std.testing.expectEqual(Msg.collapse_or_parent_directory, keyToMsg(.{
+        .focus = .sidebar,
+        .selection_owner = .header,
+    }, .{ .codepoint = chasen.Key.left }).?);
 }
 
 test "shell-owned configured commands are not duplicated by Review" {

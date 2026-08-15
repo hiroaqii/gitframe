@@ -1292,6 +1292,10 @@ pub const Controller = struct {
         self.sharedController().clearDiffSelection();
     }
 
+    pub fn clearMouseDiffSelection(self: Controller) void {
+        self.sharedController().clearMouseDiffSelection();
+    }
+
     pub fn clearCompletedSelectionWithViewport(self: Controller, allocator: std.mem.Allocator) void {
         var adapter = self.bodyResolverAdapter();
         self.sharedController().clearCompletedSelectionWithViewport(adapter.interface(), allocator);

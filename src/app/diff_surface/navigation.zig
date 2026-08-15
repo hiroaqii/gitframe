@@ -52,6 +52,16 @@ pub const ParsedMouseLine = struct {
     region: SelectionRegion,
 };
 
+pub const KeyboardLineHit = struct {
+    source_offset: usize,
+    hit: diff_surface.DiffMouseHit,
+};
+
+const KeyboardLine = struct {
+    side: diff_selection.Side,
+    line_index: usize,
+};
+
 pub const SelectionActionHit = struct {
     target: ?diff_render.SelectionActionTarget,
 };
@@ -378,12 +388,71 @@ pub const BodyView = struct {
         };
     }
 
+    pub fn activeKeyboardSelectionPresentation(self: BodyView) ?selection_action.Presentation {
+        const drag = self.view.surface.selection_owner.activeDiff() orelse return null;
+        if (drag.origin != .keyboard_line or drag.mode != .line or drag.selected_line_count == 0) return null;
+        const selected_range = drag.range();
+
+        return switch (drag.identity) {
+            .loaded_file, .projection_file => blk: {
+                const target = self.parsedSelectionTarget(drag.identity) orelse break :blk null;
+                if (selected_range.start.hunk_index >= target.file.hunks.len or selected_range.end.hunk_index >= target.file.hunks.len) break :blk null;
+                if (selected_range.start.line_index >= target.file.hunks[selected_range.start.hunk_index].lines.len or
+                    selected_range.end.line_index >= target.file.hunks[selected_range.end.hunk_index].lines.len) break :blk null;
+
+                var tail = diff_view_model.renderedOffsetForCoordinate(
+                    target.file,
+                    self.view.effectiveDisplayMode(),
+                    .{ .hunk_line = .{
+                        .hunk_index = selected_range.end.hunk_index,
+                        .line_index = selected_range.end.line_index,
+                    } },
+                    target.folded_hunks,
+                    target.line_index,
+                );
+                if (tail == null and selected_range.end.hunk_index < target.folded_hunks.len and target.folded_hunks[selected_range.end.hunk_index]) {
+                    tail = diff_view_model.renderedOffsetForCoordinate(
+                        target.file,
+                        self.view.effectiveDisplayMode(),
+                        .{ .hunk_header = selected_range.end.hunk_index },
+                        target.folded_hunks,
+                        target.line_index,
+                    );
+                }
+                break :blk .{
+                    .view = drag.view(),
+                    .line_count = drag.selected_line_count,
+                    .projection = selection_action.Projection.init(
+                        target.line_index.lineCount(),
+                        tail orelse break :blk null,
+                    ) orelse break :blk null,
+                };
+            },
+            .generated_file => |generated| blk: {
+                const body = self.generatedBody() orelse break :blk null;
+                if (!std.mem.eql(u8, generated.path_key, body.path)) break :blk null;
+                if (selected_range.start.hunk_index != 0 or selected_range.end.hunk_index != 0) break :blk null;
+                const source_rows = body.source.rowCount();
+                if (selected_range.start.line_index >= source_rows or selected_range.end.line_index >= source_rows) break :blk null;
+                break :blk .{
+                    .view = drag.view(),
+                    .line_count = drag.selected_line_count,
+                    .projection = selection_action.Projection.init(source_rows, selected_range.end.line_index) orelse break :blk null,
+                };
+            },
+        };
+    }
+
+    pub fn selectionPresentation(self: BodyView) ?selection_action.Presentation {
+        return self.activeKeyboardSelectionPresentation() orelse self.retainedSelectionPresentation();
+    }
+
     pub fn selectionActionProjection(self: BodyView) ?selection_action.Projection {
-        return (self.retainedSelectionPresentation() orelse return null).projection;
+        return (self.selectionPresentation() orelse return null).projection;
     }
 
     pub fn selectionActionRenderBlock(self: BodyView) ?diff_render.SelectionActionBlock {
-        const presentation = self.retainedSelectionPresentation() orelse return null;
+        const presentation = self.selectionPresentation() orelse return null;
         return .{
             .projection = diff_render.VirtualRowProjection.fromNeutral(presentation.projection),
             .side = presentation.view.side,
@@ -392,11 +461,11 @@ pub const BodyView = struct {
     }
 
     pub fn retainedSelectionActionAvailable(self: BodyView) bool {
-        return self.retainedSelectionPresentation() != null;
+        return self.selectionPresentation() != null;
     }
 
     pub fn selectionActionHit(self: BodyView, point: diff_surface.MousePoint) ?SelectionActionHit {
-        const presentation = self.retainedSelectionPresentation() orelse return null;
+        const presentation = self.selectionPresentation() orelse return null;
         const raw_diff = self.view.rawDiffPaneGeometry() orelse return null;
         if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
         if (point.row < diff_render.body_start_row) return null;
@@ -499,6 +568,124 @@ pub const BodyView = struct {
 
     pub fn diffMouseHit(self: BodyView, point: diff_surface.MousePoint) ?diff_surface.DiffMouseHit {
         return self.diffMouseHitLocked(point, null);
+    }
+
+    /// Resolve one line-wise endpoint from semantic body presentation without
+    /// terminal coordinates. Presentation-only rows and opposite-side holes
+    /// never become endpoints.
+    pub fn keyboardLineHitAtOffset(
+        self: BodyView,
+        source_offset: usize,
+        requested_side: ?diff_selection.Side,
+    ) ?diff_surface.DiffMouseHit {
+        if (self.generatedBody()) |body| {
+            if (requested_side == .old or source_offset >= body.source.rowCount()) return null;
+            return .{
+                .identity = .{ .generated_file = .{ .path_key = body.path } },
+                .side = .new,
+                .mode = .line,
+                .point = diff_selection.pointFromLine(0, source_offset),
+            };
+        }
+
+        const target = self.parsedSelectionTarget(null) orelse return null;
+        const mode = self.view.effectiveDisplayMode();
+        const has_index = target.line_index.mode == mode and target.line_index.hunk_offsets.len == target.file.hunks.len;
+        var rows = if (has_index)
+            diff_view_model.BodyRowIterator.initAtWithFolded(
+                target.file,
+                mode,
+                target.line_index,
+                source_offset,
+                target.folded_hunks,
+            )
+        else
+            diff_view_model.BodyRowIterator.initWithFolded(target.file, mode, target.folded_hunks);
+        var skipped: usize = if (has_index) source_offset else 0;
+        var row = rows.next() orelse return null;
+        while (skipped < source_offset) : (skipped += 1) row = rows.next() orelse return null;
+
+        const selected: KeyboardLine = (switch (row) {
+            .unified_line => |line| blk: {
+                const line_index = rows.currentUnifiedLineIndex() orelse break :blk null;
+                const side = requested_side orelse switch (line.kind) {
+                    .removed => diff_selection.Side.old,
+                    .added, .context => diff_selection.Side.new,
+                    .metadata => break :blk null,
+                };
+                if (!diff_selection.lineVisibleOnSide(line, side)) break :blk null;
+                break :blk KeyboardLine{ .side = side, .line_index = line_index };
+            },
+            .side_by_side => blk: {
+                const side = requested_side orelse diff_selection.Side.new;
+                const indexed = rows.currentSideBySideRow() orelse break :blk null;
+                const line = indexedLineForSide(indexed, side) orelse break :blk null;
+                break :blk KeyboardLine{ .side = side, .line_index = line.line_index };
+            },
+            .metadata, .binary_marker, .hunk_header => null,
+        }) orelse return null;
+        return .{
+            .identity = target.identity,
+            .side = selected.side,
+            .mode = .line,
+            .point = diff_selection.pointFromLine(rows.currentHunkIndex() orelse return null, selected.line_index),
+        };
+    }
+
+    pub fn keyboardLineHitNearOffset(
+        self: BodyView,
+        source_offset: usize,
+        requested_side: ?diff_selection.Side,
+    ) ?KeyboardLineHit {
+        const line_count = self.sourceDiffLineCount();
+        if (line_count == 0) return null;
+        const start = @min(source_offset, line_count - 1);
+        if (self.keyboardLineHitAtOffset(start, requested_side)) |hit| {
+            return .{ .source_offset = start, .hit = hit };
+        }
+
+        var forward = start +| 1;
+        while (forward < line_count) : (forward += 1) {
+            if (self.keyboardLineHitAtOffset(forward, requested_side)) |hit| {
+                return .{ .source_offset = forward, .hit = hit };
+            }
+        }
+        var backward = start;
+        while (backward > 0) {
+            backward -= 1;
+            if (self.keyboardLineHitAtOffset(backward, requested_side)) |hit| {
+                return .{ .source_offset = backward, .hit = hit };
+            }
+        }
+        return null;
+    }
+
+    pub fn keyboardLineSourceOffset(self: BodyView, selection: diff_selection.DragSelection) ?usize {
+        return switch (selection.identity) {
+            .generated_file => |generated| blk: {
+                const body = self.generatedBody() orelse break :blk null;
+                if (!std.mem.eql(u8, generated.path_key, body.path) or selection.side != .new or
+                    selection.focus.hunk_index != 0 or selection.focus.line_index >= body.source.rowCount()) break :blk null;
+                break :blk selection.focus.line_index;
+            },
+            .loaded_file, .projection_file => blk: {
+                const target = self.parsedSelectionTarget(selection.identity) orelse break :blk null;
+                if (selection.focus.hunk_index >= target.file.hunks.len) break :blk null;
+                const hunk = target.file.hunks[selection.focus.hunk_index];
+                if (selection.focus.line_index >= hunk.lines.len or
+                    !diff_selection.lineVisibleOnSide(hunk.lines[selection.focus.line_index], selection.side)) break :blk null;
+                break :blk diff_view_model.renderedOffsetForCoordinate(
+                    target.file,
+                    self.view.effectiveDisplayMode(),
+                    .{ .hunk_line = .{
+                        .hunk_index = selection.focus.hunk_index,
+                        .line_index = selection.focus.line_index,
+                    } },
+                    target.folded_hunks,
+                    target.line_index,
+                );
+            },
+        };
     }
 
     pub fn diffMouseDragHit(self: BodyView, point: diff_surface.MousePoint, drag: diff_selection.DragSelection) ?diff_surface.DiffMouseHit {
@@ -846,6 +1033,15 @@ pub const Controller = struct {
         self.surface.selection_owner.* = .none;
     }
 
+    pub fn clearMouseDiffSelection(self: Controller) void {
+        if (self.surface.selection_owner.activeMouseSelection()) self.clearDiffSelection();
+    }
+
+    pub fn advanceSelectionLayoutRevision(self: Controller) void {
+        self.surface.selection_layout_revision.* +%= 1;
+        if (self.surface.selection_layout_revision.* == 0) self.surface.selection_layout_revision.* = 1;
+    }
+
     pub fn revealCompletedSelectionAction(self: Controller, resolver: diff_surface.BodyResolver) void {
         const body = (BodyController{ .controller = self, .resolver = resolver }).view();
         const projection = body.selectionActionProjection() orelse return;
@@ -858,6 +1054,7 @@ pub const Controller = struct {
     pub fn clearCompletedSelectionWithViewport(self: Controller, resolver: diff_surface.BodyResolver, allocator: std.mem.Allocator) void {
         const body = (BodyController{ .controller = self, .resolver = resolver }).view();
         const anchor = body.captureSelectionViewportAnchor();
+        self.clearDiffSelection();
         if (self.surface.completed_selection.*) |*completed| completed.deinit(allocator);
         self.surface.completed_selection.* = null;
         if (anchor) |value| {
@@ -903,7 +1100,7 @@ pub const Controller = struct {
     }
 
     pub fn enterFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
-        self.clearDiffSelection();
+        self.clearMouseDiffSelection();
         self.surface.file_search_return_focus.* = if (self.surface.viewer.sidebar_hidden) .diff else self.surface.viewer.focus;
         if (!self.surface.viewer.sidebar_hidden) self.surface.viewer.focus = .sidebar;
         self.surface.file_search.mode = true;
@@ -1333,7 +1530,10 @@ pub const BodyController = struct {
         self.controller.surface.viewer.sidebar_hidden = !self.controller.surface.viewer.sidebar_hidden;
         if (self.controller.surface.viewer.sidebar_hidden) self.controller.surface.viewer.focus = .diff;
         self.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-        if (previous_mode != self.controller.view().effectiveDisplayMode()) self.controller.clearDiffSelection();
+        if (previous_mode != self.controller.view().effectiveDisplayMode()) {
+            self.controller.clearMouseDiffSelection();
+            self.controller.advanceSelectionLayoutRevision();
+        }
         if (selection_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
@@ -1356,7 +1556,10 @@ pub const BodyController = struct {
         self.controller.surface.viewer.sidebar_width = sidebarWidth(total_width, next);
         self.controller.clampSidebarHorizontalScroll();
         self.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-        if (previous_mode != self.controller.view().effectiveDisplayMode()) self.controller.clearDiffSelection();
+        if (previous_mode != self.controller.view().effectiveDisplayMode()) {
+            self.controller.clearMouseDiffSelection();
+            self.controller.advanceSelectionLayoutRevision();
+        }
         if (selection_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
@@ -1383,12 +1586,112 @@ pub const BodyController = struct {
         ) };
     }
 
+    pub fn selectKeyboardSelectionSide(self: BodyController, side: diff_selection.Side) void {
+        if (self.controller.surface.viewer.focus != .diff or self.controller.view().effectiveDisplayMode() != .side_by_side) {
+            self.controller.setStatus("Keyboard side selection requires a side-by-side diff", .{});
+            return;
+        }
+        self.controller.surface.viewer.keyboard_selection_side = side;
+        self.controller.setStatus(
+            "Keyboard selection side: {s}",
+            .{if (side == .old) "Before" else "After"},
+        );
+    }
+
+    pub fn beginKeyboardLineSelection(self: BodyController) bool {
+        if (self.controller.surface.viewer.focus != .diff or self.controller.surface.selection_owner.* != .none) return false;
+        if (self.view().selectedDiffCursorOffset() == null) self.initializeDiffCursorForSelectedFile();
+        const current = self.view().selectedDiffCursorOffset() orelse return false;
+        const requested_side: ?diff_selection.Side = if (self.controller.view().effectiveDisplayMode() == .side_by_side)
+            self.controller.surface.viewer.keyboard_selection_side
+        else
+            null;
+        const resolved = self.view().keyboardLineHitNearOffset(current, requested_side) orelse return false;
+        const viewport_anchor = self.captureSelectionViewportAnchor();
+        self.controller.surface.selection_owner.* = .{ .diff = diff_selection.DragSelection.initKeyboardLine(
+            resolved.hit.identity,
+            resolved.hit.side,
+            resolved.hit.point,
+        ) };
+        self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(resolved.source_offset) orelse
+            self.controller.surface.viewer.diff_cursor;
+        self.controller.advanceSelectionLayoutRevision();
+        if (viewport_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
+        self.keepDiffCursorVisible();
+        self.controller.revealCompletedSelectionAction(self.resolver);
+        return true;
+    }
+
+    pub fn moveKeyboardLineSelection(self: BodyController, direction: VerticalDirection) bool {
+        const active = self.controller.surface.selection_owner.activeDiff() orelse return false;
+        if (active.origin != .keyboard_line or active.selected_line_count == 0) return false;
+        const current = self.view().keyboardLineSourceOffset(active) orelse return false;
+        const line_count = self.view().sourceDiffLineCount();
+        if (line_count == 0) return false;
+
+        var offset = current;
+        while (true) {
+            offset = switch (direction) {
+                .up => if (offset == 0) return false else offset - 1,
+                .down => if (offset + 1 >= line_count) return false else offset + 1,
+            };
+            const hit = self.view().keyboardLineHitAtOffset(offset, active.side) orelse continue;
+            if (!active.identity.eql(hit.identity)) return false;
+            const step = self.keyboardLineStepDistance(active, hit.point) orelse return false;
+            if (step == 0) continue;
+            const shrinking = switch (direction) {
+                .up => active.focus.order(active.anchor) == .gt,
+                .down => active.focus.order(active.anchor) == .lt,
+            };
+            const next_count = if (shrinking)
+                active.selected_line_count -| step
+            else
+                active.selected_line_count +| step;
+            if (next_count == 0) return false;
+
+            const viewport_anchor = self.captureSelectionViewportAnchor();
+            switch (self.controller.surface.selection_owner.*) {
+                .diff => |*selection| selection.updateKeyboardLine(hit.point, next_count),
+                .none, .diff_header => return false,
+            }
+            self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(offset) orelse
+                self.controller.surface.viewer.diff_cursor;
+            self.controller.advanceSelectionLayoutRevision();
+            if (viewport_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
+            self.keepDiffCursorVisible();
+            const updated = self.controller.surface.selection_owner.activeDiff() orelse return true;
+            if (updated.focus.eql(updated.range().end)) {
+                self.controller.revealCompletedSelectionAction(self.resolver);
+            }
+            return true;
+        }
+    }
+
+    fn keyboardLineStepDistance(self: BodyController, active: diff_selection.DragSelection, target: diff_selection.Point) ?usize {
+        return switch (active.identity) {
+            .generated_file => |generated| blk: {
+                const body = self.view().generatedBody() orelse break :blk null;
+                if (!std.mem.eql(u8, generated.path_key, body.path) or active.side != .new or
+                    active.focus.hunk_index != 0 or target.hunk_index != 0) break :blk null;
+                break :blk if (active.focus.line_index > target.line_index)
+                    active.focus.line_index - target.line_index
+                else
+                    target.line_index - active.focus.line_index;
+            },
+            .loaded_file, .projection_file => blk: {
+                const parsed = self.view().parsedSelectionTarget(active.identity) orelse break :blk null;
+                break :blk diff_selection.semanticLineDistance(parsed.file, active.side, active.focus, target);
+            },
+        };
+    }
+
     pub fn dragDiffMouse(self: BodyController, point_opt: ?diff_surface.MousePoint) void {
         const point = point_opt orelse return;
         switch (self.controller.surface.selection_owner.*) {
             .none => return,
             .diff_header => |*selection| selection.update(),
             .diff => |*selection| {
+                if (selection.origin != .mouse) return;
                 const hit = self.view().diffMouseDragHit(point, selection.*) orelse return;
                 if (!selection.identity.eql(hit.identity)) return;
                 selection.updateAtCell(hit.point, .{ .col = point.col, .row = point.row });
@@ -1404,6 +1707,7 @@ pub const BodyController = struct {
             self.controller.clearDiffSelection();
             return .stale_owner;
         };
+        if (drag.origin != .mouse) return .stale_owner;
         if (!self.view().dragSelectionIdentityCurrent(drag)) {
             self.controller.clearDiffSelection();
             return .stale_owner;
@@ -1677,13 +1981,18 @@ pub const BodyController = struct {
         const hunk_index = self.view().selectedHunkIndex() orelse return;
         if (hunk_index >= file.hunks.len) return;
 
+        const viewport_anchor = self.captureSelectionViewportAnchor();
+        const had_keyboard_selection = self.controller.surface.selection_owner.activeKeyboardLineSelection();
+        self.controller.clearDiffSelection();
+        if (had_keyboard_selection) self.controller.advanceSelectionLayoutRevision();
+
         if (!loaded.isHunkFolded(file_index, hunk_index) and
             self.controller.view().currentSearchMatchInHunkBody(hunk_index))
         {
+            if (viewport_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
             return;
         }
 
-        const viewport_anchor = self.captureSelectionViewportAnchor();
         const folding = !loaded.isHunkFolded(file_index, hunk_index);
         loaded.toggleHunkFold(file_index, hunk_index);
         if (folding) {
@@ -1726,7 +2035,7 @@ pub const BodyController = struct {
 
     pub fn enterSearchMode(self: BodyController) void {
         if (self.blockUnsupportedSearchTarget()) return;
-        self.controller.clearDiffSelection();
+        self.controller.clearMouseDiffSelection();
         self.controller.surface.search.input = self.controller.surface.search.query;
         self.controller.surface.search.mode = true;
     }

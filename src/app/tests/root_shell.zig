@@ -498,6 +498,55 @@ test "terminal resize cancels live drag before geometry and retains completed se
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
 }
 
+test "terminal resize preserves semantic keyboard line selection while focus loss clears it" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .pages = .{
+            .review = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                .viewer = .{ .focus = .diff, .sidebar_hidden = true },
+            },
+            .compare = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                .viewer = .{ .focus = .diff, .sidebar_hidden = true },
+            },
+        },
+        .allocator = allocator,
+        .terminal_size = .{ .width = 120, .height = 32 },
+    };
+    defer reviewReload(&app).clearLoadedDiff(allocator);
+    defer app.pages.compare.deinit(allocator);
+
+    var selection = diff_selection.DragSelection.initKeyboardLine(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    );
+    selection.updateKeyboardLine(.{ .hunk_index = 0, .line_index = 1 }, 2);
+    app.pages.review.selection_owner = .{ .diff = selection };
+    app.pages.compare.selection_owner = .{ .diff = selection };
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    const content = app_shell_layout.contentRect(app.terminal_size);
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEventTyped(
+        content.col + 20,
+        content.row + 5,
+        .left,
+        .release,
+    )) == null);
+
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &tc.ctx);
+    try std.testing.expect(app.pages.review.selection_owner.activeKeyboardLineSelection());
+    try std.testing.expect(app.pages.compare.selection_owner.activeKeyboardLineSelection());
+    try std.testing.expectEqual(@as(usize, 2), app.pages.review.selection_owner.activeDiff().?.selected_line_count);
+    try std.testing.expectEqual(chasen.Size{ .width = 80, .height = 12 }, app.terminal_size);
+
+    try app.update(.focus_lost, &tc.ctx);
+    try std.testing.expect(app.pages.review.selection_owner == .none);
+    try std.testing.expect(app.pages.compare.selection_owner.activeKeyboardLineSelection());
+}
+
 test "Compare retained actions route keyboard and mouse through App after narrow resize" {
     const allocator = std.testing.allocator;
     var app: App = .{

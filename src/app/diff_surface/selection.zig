@@ -159,6 +159,13 @@ pub const CompletedSelection = struct {
         };
     }
 
+    pub fn lineCount(self: CompletedSelection) usize {
+        return switch (self.value) {
+            .parsed_diff => |parsed| parsed.fragments.line_count,
+            .generated_untracked => |generated| generated.fragment.line_count,
+        };
+    }
+
     pub fn clipboardText(self: CompletedSelection, allocator: std.mem.Allocator) ![]u8 {
         return switch (self.value) {
             .parsed_diff => |parsed| parsed.fragments.clipboardText(allocator),
