@@ -24,9 +24,12 @@ pub const Context = struct {
     keymap: keymap.Effective = .{},
 
     pub fn footer(self: Context) diff_surface.view.FooterView {
+        const navigation = navigationView(self);
+        var resolver = navigation.resolver();
         return diff_surface.view.footer(.{
             .surface = self.page.readSurface(.{ .range = "compare" }, self.layout),
             .auto_reload_enabled = false,
+            .selection_action_visible = navigation.bodyView(&resolver).retainedSelectionActionAvailable(),
         });
     }
 };

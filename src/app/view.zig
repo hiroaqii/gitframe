@@ -22,6 +22,8 @@ const theme = @import("theme");
 const review_page = if (builtin.is_test) @import("pages/review.zig") else struct {};
 const compare_page = if (builtin.is_test) @import("pages/compare.zig") else struct {};
 const repository_page = if (builtin.is_test) @import("pages/repository.zig") else struct {};
+const repository_source = if (builtin.is_test) @import("../repository/source.zig") else struct {};
+const content_fingerprint = if (builtin.is_test) @import("../content_fingerprint.zig") else struct {};
 
 /// Rendering-only helpers for App.
 ///
@@ -68,6 +70,7 @@ pub const Context = struct {
     repository: repository_view.ViewContext,
     active_page: page.Id,
     page_bar_visible: bool,
+    review_mode: bool,
     theme: theme.Palette,
     keymap: keymap.Effective,
     terminal_size: chasen.Size,
@@ -279,8 +282,61 @@ pub const FooterStatusTarget = struct {
     }
 };
 
+const footer_hint_capacity: usize = 8;
+
+const FooterHintPriority = enum {
+    repository_switch,
+    primary,
+    help,
+    focus,
+    secondary,
+    quit,
+};
+
+const FooterHints = struct {
+    items: [footer_hint_capacity]ui.key_hint.Item = undefined,
+    priorities: [footer_hint_capacity]FooterHintPriority = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const FooterHints) []const ui.key_hint.Item {
+        return self.items[0..self.len];
+    }
+
+    fn append(self: *FooterHints, item: ui.key_hint.Item, priority: FooterHintPriority) void {
+        if (self.len >= self.items.len) return;
+        self.items[self.len] = item;
+        self.priorities[self.len] = priority;
+        self.len += 1;
+    }
+
+    fn widthForPriority(
+        self: *const FooterHints,
+        priority: FooterHintPriority,
+        opts: ui.key_hint.DrawOptions,
+    ) u16 {
+        var storage: [footer_hint_capacity]ui.key_hint.Item = undefined;
+        var len: usize = 0;
+        for (self.items[0..self.len], self.priorities[0..self.len]) |item, item_priority| {
+            if (item_priority != priority) continue;
+            storage[len] = item;
+            len += 1;
+        }
+        return ui.key_hint.width(storage[0..len], opts);
+    }
+};
+
+const FooterHintProjection = struct {
+    items: [footer_hint_capacity]ui.key_hint.Item = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const FooterHintProjection) []const ui.key_hint.Item {
+        return self.items[0..self.len];
+    }
+};
+
 const FooterProjection = struct {
     segments: FooterSegments,
+    hints: FooterHintProjection,
     hint_col: u16,
     left_limit: u16,
     status_segment: ?usize,
@@ -299,10 +355,9 @@ pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
         app.terminal_size.width,
         app.terminal_size.height,
     }) catch return null;
-    var item_storage: [8]ui.key_hint.Item = undefined;
-    var key_buffers: [8][16]u8 = undefined;
-    const hint_items = footerItems(app, &item_storage, &key_buffers);
-    const projection = projectFooter(app, width, hint_items, terminal_text, null);
+    var key_buffers: [footer_hint_capacity][16]u8 = undefined;
+    const hints = footerHints(app, &key_buffers);
+    const projection = projectFooter(app, width, &hints, terminal_text, null);
     const status_segment = projection.status_segment orelse return null;
     const range = projection.segments.renderedRange(status_segment, projection.left_limit) orelse return null;
     return .{
@@ -316,15 +371,14 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     const width = surface.size().width;
     if (width == 0) return;
 
-    var footer_item_storage: [8]ui.key_hint.Item = undefined;
-    var footer_key_buffers: [8][16]u8 = undefined;
-    const hint_items = footerItems(app, &footer_item_storage, &footer_key_buffers);
+    var footer_key_buffers: [footer_hint_capacity][16]u8 = undefined;
+    const hints = footerHints(app, &footer_key_buffers);
     const terminal_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
         app.terminal_size.width,
         app.terminal_size.height,
     }) catch return;
     const spinner_text = gitActionSpinnerText(app, surface.frameAllocator());
-    const projection = projectFooter(app, width, hint_items, terminal_text, spinner_text);
+    const projection = projectFooter(app, width, &hints, terminal_text, spinner_text);
 
     var left_area = surface.child(.{
         .col = 0,
@@ -334,12 +388,12 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     });
     projection.segments.render(&left_area, projection.left_limit);
 
-    const draw_col = if (projection.hint_col > 0) projection.hint_col else projection.segments.endCol();
-    if (hint_items.len > 0 and width > draw_col) {
+    const hint_items = projection.hints.slice();
+    if (hint_items.len > 0 and width > projection.hint_col) {
         var hint_area = surface.child(.{
-            .col = draw_col,
+            .col = projection.hint_col,
             .row = 0,
-            .width = width - draw_col,
+            .width = width - projection.hint_col,
             .height = 1,
         });
         _ = ui.key_hint.draw(&hint_area, 0, 0, hint_items, footerKeyHintOptions(app.theme)) catch {};
@@ -349,27 +403,18 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
 fn projectFooter(
     app: Context,
     width: u16,
-    hint_items: []const ui.key_hint.Item,
+    hints: *const FooterHints,
     terminal_text: []const u8,
     spinner_text: ?[]const u8,
 ) FooterProjection {
-    const review_footer = app.review.footer();
-    const compare_footer = app.compare.footer();
-    const hint_width = ui.key_hint.width(hint_items, footerKeyHintOptions(app.theme));
-    var hint_col = if (hint_items.len == 0)
-        width
-    else if (width > hint_width + 1)
-        width - hint_width - 1
-    else
-        0;
-    var left_limit = if (hint_items.len == 0 or hint_col == 0) width else hint_col;
-
     var footer_segments = FooterSegments{};
     footer_segments.append(.{
         .text = terminal_text,
         .style = app.theme.style(.muted),
+        .drop_priority = .terminal,
     });
     if (app.active_page == .review) {
+        const review_footer = app.review.footer();
         if (review_footer.source_label) |label| footer_segments.append(.{
             .text = label,
             .style = app.theme.style(.prompt),
@@ -392,6 +437,7 @@ fn projectFooter(
         });
     }
     if (app.active_page == .compare) {
+        const compare_footer = app.compare.footer();
         if (compare_footer.source_label) |label| footer_segments.append(.{
             .text = label,
             .style = app.theme.style(.prompt),
@@ -424,25 +470,81 @@ fn projectFooter(
         }
     }
 
-    footer_segments.fit(left_limit);
-    // A terminal outcome is transient and can carry recovery instructions;
-    // let it use the footer row before reserving space for normal key hints.
-    if (hint_items.len > 0 and hint_col > 0 and footer_segments.requiredWidth() > left_limit) {
-        hint_col = 0;
-        left_limit = width;
-        footer_segments.fit(left_limit);
-    }
+    const hint_options = footerKeyHintOptions(app.theme);
+    const essential_hint_width = hints.widthForPriority(.repository_switch, hint_options);
+    const essential_reserve = if (essential_hint_width == 0)
+        0
+    else
+        essential_hint_width +| 1;
+    footer_segments.fit(width -| essential_reserve);
+
+    const segment_width = footer_segments.requiredWidth();
+    const hint_budget = if (segment_width == 0)
+        width
+    else if (width > segment_width)
+        width - segment_width - 1
+    else
+        0;
+    const projected_hints = projectFooterHints(hints, hint_budget, hint_options);
+    const hint_width = ui.key_hint.width(projected_hints.slice(), hint_options);
+    var hint_col = if (hint_width == 0) width else width -| hint_width;
+    if (hint_col > segment_width) hint_col -= 1;
+    const left_limit = if (projected_hints.len == 0) width else hint_col;
+
     return .{
         .segments = footer_segments,
+        .hints = projected_hints,
         .hint_col = hint_col,
         .left_limit = left_limit,
         .status_segment = status_segment,
     };
 }
 
+fn projectFooterHints(
+    hints: *const FooterHints,
+    width: u16,
+    opts: ui.key_hint.DrawOptions,
+) FooterHintProjection {
+    var result: FooterHintProjection = .{};
+    if (width == 0 or hints.len == 0) return result;
+
+    const priority_order = [_]FooterHintPriority{
+        .repository_switch,
+        .primary,
+        .help,
+        .focus,
+        .secondary,
+        .quit,
+    };
+    var selected = [_]bool{false} ** footer_hint_capacity;
+    var selected_count: usize = 0;
+    var used_width: usize = 0;
+    const separator_width = chasen.text.displayWidth(opts.separator);
+
+    for (priority_order) |priority| {
+        for (hints.items[0..hints.len], hints.priorities[0..hints.len], 0..) |_, item_priority, index| {
+            if (item_priority != priority) continue;
+            const item_width: usize = ui.key_hint.width(hints.items[index .. index + 1], opts);
+            const needed = item_width + if (selected_count == 0) @as(usize, 0) else separator_width;
+            if (used_width + needed > width) continue;
+            selected[index] = true;
+            selected_count += 1;
+            used_width += needed;
+        }
+    }
+
+    for (hints.items[0..hints.len], selected[0..hints.len]) |item, keep| {
+        if (!keep) continue;
+        result.items[result.len] = item;
+        result.len += 1;
+    }
+    return result;
+}
+
 const FooterDropPriority = enum {
     source,
     auto,
+    terminal,
 };
 
 const FooterSegment = struct {
@@ -468,7 +570,7 @@ const FooterSegments = struct {
     }
 
     fn fit(self: *FooterSegments, width: u16) void {
-        const order = [_]FooterDropPriority{ .source, .auto };
+        const order = [_]FooterDropPriority{ .source, .auto, .terminal };
         for (order) |priority| {
             if (self.requiredWidth() <= width) return;
             self.drop(priority);
@@ -1358,63 +1460,106 @@ fn stagedSummaryText(allocator: std.mem.Allocator, summary: app_commit_panel.Sta
     };
 }
 
-fn footerItems(app: Context, storage: *[8]ui.key_hint.Item, key_buffers: *[8][16]u8) []const ui.key_hint.Item {
-    var len: usize = 0;
-    if (app.active_page == .compare) {
-        const footer = app.compare.footer();
-        if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open) return storage[0..0];
-        if (footer.sidebar_hidden) {
-            appendFooterItem(app, storage, key_buffers, &len, .toggle_sidebar, "sidebar");
-        } else {
-            storage[len] = ui.key_hint.item("Tab", "focus");
-            len += 1;
-        }
-        storage[len] = ui.key_hint.item("m", "base");
-        len += 1;
-        appendFooterItem(app, storage, key_buffers, &len, .reload, "refresh");
-        appendFooterItem(app, storage, key_buffers, &len, .help, "help");
-        storage[len] = ui.key_hint.item("q", "quit");
-        len += 1;
-        return storage[0..len];
+fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterHints {
+    var result: FooterHints = .{};
+    if (!shellNormalActionHintsEnabled(app)) return result;
+
+    switch (app.active_page) {
+        .review => {
+            const footer = app.review.footer();
+            if (!footer.normal_action_hints_enabled) return result;
+            if (footer.sidebar_hidden) {
+                appendFooterAction(app, &result, key_buffers, .toggle_sidebar, "sidebar", .focus);
+            } else {
+                result.append(ui.key_hint.item("Tab", "focus"), .focus);
+            }
+
+            if (app.review_mode) {
+                appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'a' }, "a", "approve", .primary);
+                appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'N' }, "N", "changes", .primary);
+            } else {
+                appendUnclaimedFooterItem(app, &result, .{ .codepoint = 's' }, "s", "stage", .primary);
+                appendFooterAction(app, &result, key_buffers, .commit, "commit", .secondary);
+            }
+            appendFooterAction(app, &result, key_buffers, .branch_switch, "branch", .secondary);
+            appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
+            appendFooterAction(app, &result, key_buffers, .help, "help", .help);
+            result.append(ui.key_hint.item("q", if (app.review_mode) "cancel" else "quit"), .quit);
+        },
+        .repository => {
+            const input = app.repository.page_state.inputContext(app.keymap);
+            if (input.source_search_mode or
+                input.file_search_mode or
+                app.repository.page_state.retainedSourceSelection() != null)
+            {
+                return result;
+            }
+
+            if (input.tree_hidden) {
+                appendFooterAction(app, &result, key_buffers, .toggle_sidebar, "tree", .focus);
+            } else if (input.source_available) {
+                result.append(ui.key_hint.item("Tab", "focus"), .focus);
+            }
+            appendFooterAction(app, &result, key_buffers, .file_search, "find file", .primary);
+            if (input.source_available) {
+                appendFooterAction(app, &result, key_buffers, .search, "search", .secondary);
+            }
+            appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
+            appendFooterAction(app, &result, key_buffers, .help, "help", .help);
+            result.append(ui.key_hint.item("q", "quit"), .quit);
+        },
+        .compare => {
+            const footer = app.compare.footer();
+            if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open) return result;
+            if (footer.sidebar_hidden) {
+                appendFooterAction(app, &result, key_buffers, .toggle_sidebar, "sidebar", .focus);
+            } else {
+                result.append(ui.key_hint.item("Tab", "focus"), .focus);
+            }
+            appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "base", .primary);
+            appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
+            appendFooterAction(app, &result, key_buffers, .help, "help", .help);
+            result.append(ui.key_hint.item("q", "quit"), .quit);
+        },
+        .config => {
+            appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
+            appendFooterAction(app, &result, key_buffers, .help, "help", .help);
+            result.append(ui.key_hint.item("q", "quit"), .quit);
+        },
     }
-    if (app.active_page != .review) {
-        appendFooterItem(app, storage, key_buffers, &len, .page_review, "review");
-        appendFooterItem(app, storage, key_buffers, &len, .page_repository, "repo");
-        appendFooterItem(app, storage, key_buffers, &len, .page_compare, "compare");
-        appendFooterItem(app, storage, key_buffers, &len, .page_config, "config");
-        appendFooterItem(app, storage, key_buffers, &len, .repo_picker, "repository");
-        appendFooterItem(app, storage, key_buffers, &len, .reload, "reload");
-        appendFooterItem(app, storage, key_buffers, &len, .help, "help");
-        storage[len] = ui.key_hint.item("q", "quit");
-        len += 1;
-        return storage[0..len];
-    }
-    const review_footer = app.review.footer();
-    if (!review_footer.normal_action_hints_enabled) return storage[0..0];
-    if (review_footer.sidebar_hidden) {
-        appendFooterItem(app, storage, key_buffers, &len, .toggle_sidebar, "sidebar");
-    } else {
-        storage[len] = ui.key_hint.item("Tab", "focus");
-        len += 1;
-    }
-    appendFooterItem(app, storage, key_buffers, &len, .commit, "commit");
-    appendFooterItem(app, storage, key_buffers, &len, .help, "help");
-    storage[len] = ui.key_hint.item("q", "quit");
-    len += 1;
-    return storage[0..len];
+    return result;
 }
 
-fn appendFooterItem(
+fn shellNormalActionHintsEnabled(app: Context) bool {
+    return !app.action.hasPending() and
+        !app.repo_picker.mode and
+        !app.commit_panel.is_open and
+        app.overlay.kind == .none;
+}
+
+fn appendFooterAction(
     app: Context,
-    storage: *[8]ui.key_hint.Item,
-    key_buffers: *[8][16]u8,
-    len: *usize,
+    hints: *FooterHints,
+    key_buffers: *[footer_hint_capacity][16]u8,
     action: keymap.PublicAction,
     description: []const u8,
+    priority: FooterHintPriority,
 ) void {
-    const key = app.keymap.display(action, key_buffers[len.*][0..]) orelse return;
-    storage[len.*] = ui.key_hint.item(key, description);
-    len.* += 1;
+    if (hints.len >= footer_hint_capacity) return;
+    const key = app.keymap.display(action, key_buffers[hints.len][0..]) orelse return;
+    hints.append(ui.key_hint.item(key, description), priority);
+}
+
+fn appendUnclaimedFooterItem(
+    app: Context,
+    hints: *FooterHints,
+    key: chasen.Key,
+    display_key: []const u8,
+    description: []const u8,
+    priority: FooterHintPriority,
+) void {
+    if (app.keymap.actionForKey(key) != null) return;
+    hints.append(ui.key_hint.item(display_key, description), priority);
 }
 
 fn viewHelpPopup(app: Context, surface: *chasen.Surface) !void {
@@ -1828,9 +1973,8 @@ test "review file search keeps footer status but suppresses unreachable action h
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "help") == null);
 
-    var item_storage: [8]ui.key_hint.Item = undefined;
-    var key_buffers: [8][16]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), footerItems(app.context(), &item_storage, &key_buffers).len);
+    var key_buffers: [footer_hint_capacity][16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), footerHints(app.context(), &key_buffers).len);
 }
 
 const ShellViewTestHarness = struct {
@@ -1851,6 +1995,7 @@ const ShellViewTestHarness = struct {
     branch_switch: app_state.BranchSwitchState = .{},
     push_confirmation: ?app_state.PushConfirmation = null,
     remote_cancelable: bool = false,
+    review_mode: bool = false,
 
     fn context(self: *const ShellViewTestHarness) Context {
         const navigation: @import("pages/review/navigation.zig").View = .{
@@ -1879,6 +2024,7 @@ const ShellViewTestHarness = struct {
             },
             .active_page = .review,
             .page_bar_visible = false,
+            .review_mode = self.review_mode,
             .theme = self.theme,
             .keymap = self.keymap,
             .terminal_size = self.terminal_size,
@@ -1907,6 +2053,200 @@ const ShellViewTestHarness = struct {
         };
     }
 };
+
+fn expectFooterHintItems(actual: *const FooterHints, expected: []const ui.key_hint.Item) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (actual.slice(), expected) |actual_item, expected_item| {
+        try std.testing.expectEqualStrings(expected_item.keys, actual_item.keys);
+        try std.testing.expectEqualStrings(expected_item.action, actual_item.action);
+    }
+}
+
+fn expectProjectedFooterHintItems(actual: *const FooterHintProjection, expected: []const ui.key_hint.Item) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (actual.slice(), expected) |actual_item, expected_item| {
+        try std.testing.expectEqualStrings(expected_item.keys, actual_item.keys);
+        try std.testing.expectEqualStrings(expected_item.action, actual_item.action);
+    }
+}
+
+fn installRepositorySourceForFooterTest(harness: *ShellViewTestHarness) !void {
+    const allocator = std.testing.allocator;
+    const path = try allocator.dupe(u8, "src/main.zig");
+    errdefer allocator.free(path);
+    const bytes = try allocator.dupe(u8, "const main = 1;\n");
+    errdefer allocator.free(bytes);
+    var document = try repository_source.Document.initOwned(
+        allocator,
+        bytes,
+        content_fingerprint.Fingerprint.init(bytes),
+    );
+    errdefer document.deinit(allocator);
+
+    harness.repository.selected_path = path;
+    harness.repository.displayed_document = .{
+        .path = path,
+        .manifest_revision = harness.repository.manifest_revision,
+        .authority = .accepted,
+        .value = .{ .source = document },
+    };
+}
+
+test "footer normal-mode hints match the decided page lists" {
+    var harness: ShellViewTestHarness = .{};
+    try installRepositorySourceForFooterTest(&harness);
+    defer if (harness.repository.displayed_document) |*displayed| displayed.deinit(std.testing.allocator);
+
+    var key_buffers: [footer_hint_capacity][16]u8 = undefined;
+    var context = harness.context();
+    var hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Tab", "focus"),
+        ui.key_hint.item("s", "stage"),
+        ui.key_hint.item("c", "commit"),
+        ui.key_hint.item("b", "branch"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    context = harness.context();
+    context.active_page = .repository;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Tab", "focus"),
+        ui.key_hint.item("f", "find file"),
+        ui.key_hint.item("/", "search"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    context = harness.context();
+    context.active_page = .compare;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Tab", "focus"),
+        ui.key_hint.item("m", "base"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    context = harness.context();
+    context.active_page = .config;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+}
+
+test "footer normal-mode hints follow state and local key ownership" {
+    var harness: ShellViewTestHarness = .{};
+    var key_buffers: [footer_hint_capacity][16]u8 = undefined;
+
+    harness.review.viewer.sidebar_hidden = true;
+    var hints = footerHints(harness.context(), &key_buffers);
+    try std.testing.expectEqualStrings("B", hints.items[0].keys);
+    try std.testing.expectEqualStrings("sidebar", hints.items[0].action);
+
+    harness.review.viewer.sidebar_hidden = false;
+    harness.review_mode = true;
+    hints = footerHints(harness.context(), &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Tab", "focus"),
+        ui.key_hint.item("a", "approve"),
+        ui.key_hint.item("N", "changes"),
+        ui.key_hint.item("b", "branch"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "cancel"),
+    });
+
+    harness.review_mode = false;
+    var config: keymap.Config = .{};
+    config.set(.branch_switch, .{ .plain_codepoint = 'm' });
+    harness.keymap = keymap.Effective.fromConfig(config);
+    var context = harness.context();
+    context.active_page = .compare;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Tab", "focus"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    harness.keymap = .{};
+    context = harness.context();
+    context.active_page = .repository;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("f", "find file"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    harness.repository.viewer.tree_hidden = true;
+    context = harness.context();
+    context.active_page = .repository;
+    hints = footerHints(context, &key_buffers);
+    try std.testing.expectEqualStrings("B", hints.items[0].keys);
+    try std.testing.expectEqualStrings("tree", hints.items[0].action);
+
+    harness.repository.viewer.tree_hidden = false;
+    harness.review.search.mode = true;
+    try std.testing.expectEqual(@as(usize, 0), footerHints(harness.context(), &key_buffers).len);
+    harness.review.search.mode = false;
+    harness.repo_picker.mode = true;
+    try std.testing.expectEqual(@as(usize, 0), footerHints(harness.context(), &key_buffers).len);
+}
+
+test "footer hint projection keeps priority items and original display order" {
+    var hints: FooterHints = .{};
+    hints.append(ui.key_hint.item("Tab", "focus"), .focus);
+    hints.append(ui.key_hint.item("s", "stage"), .primary);
+    hints.append(ui.key_hint.item("c", "commit"), .secondary);
+    hints.append(ui.key_hint.item("b", "branch"), .secondary);
+    hints.append(ui.key_hint.item("R", "switch repo"), .repository_switch);
+    hints.append(ui.key_hint.item("?", "help"), .help);
+    hints.append(ui.key_hint.item("q", "quit"), .quit);
+
+    var projected = projectFooterHints(&hints, 33, .{});
+    try expectProjectedFooterHintItems(&projected, &.{
+        ui.key_hint.item("s", "stage"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+    });
+
+    projected = projectFooterHints(&hints, 14, .{});
+    try expectProjectedFooterHintItems(&projected, &.{
+        ui.key_hint.item("R", "switch repo"),
+    });
+
+    projected = projectFooterHints(&hints, 200, .{});
+    try expectProjectedFooterHintItems(&projected, hints.slice());
+}
+
+test "narrow footer keeps repository switch and primary page action" {
+    var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 40, .height = 12 } };
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 1);
+    defer ts.deinit();
+
+    viewFooter(harness.context(), &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "s: stage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "R: switch repo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "?: help") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Tab: focus") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "q: quit") == null);
+}
 
 test "shell notification temporarily wins over Review diagnostic" {
     var harness: ShellViewTestHarness = .{};

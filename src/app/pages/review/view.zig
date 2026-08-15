@@ -67,6 +67,7 @@ pub const Context = struct {
         return diff_surface_view.footer(.{
             .surface = self.page.readSurface(self.source, self.navigation.layout),
             .auto_reload_enabled = self.page.auto_reload.enabled(),
+            .selection_action_visible = self.navigation.retainedSelectionActionAvailable(),
         });
     }
 

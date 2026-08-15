@@ -867,6 +867,7 @@ pub const App = struct {
             },
             .active_page = self.active_page,
             .page_bar_visible = true,
+            .review_mode = self.config.review_mode,
             .theme = self.theme,
             .keymap = self.keymap,
             .terminal_size = self.terminal_size,

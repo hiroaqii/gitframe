@@ -51,11 +51,17 @@ pub const FooterArgs = struct {
     surface: diff_surface.ReadSurface,
     /// Page-owned policy narrowed to a presentation-only value.
     auto_reload_enabled: bool,
+    /// True only when the retained selection action block is admitted for the
+    /// exact body currently on screen. A stale retained candidate must not
+    /// suppress otherwise reachable normal-mode hints.
+    selection_action_visible: bool = false,
 };
 
 pub fn footer(args: FooterArgs) FooterView {
     return .{
-        .normal_action_hints_enabled = !args.surface.file_search.mode,
+        .normal_action_hints_enabled = !args.surface.search.mode and
+            !args.surface.file_search.mode and
+            !args.selection_action_visible,
         .sidebar_hidden = args.surface.viewer.sidebar_hidden,
         .auto_reload_enabled = args.auto_reload_enabled,
         .source_label = sourceFooterLabel(args.surface.source),
