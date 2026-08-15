@@ -104,6 +104,7 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .state = app.page.readSurface(.{ .range = "compare" }, app.layout),
         .palette = app.palette,
         .source_label = "branch comparison",
+        .repo_root = app.repo_root,
         .no_changes_actions = .{},
         .empty_message = empty_message,
         .branch = branch,

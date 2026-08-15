@@ -169,6 +169,7 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .state = app.page.readSurface(app.source, app.navigation.layout),
         .palette = app.theme,
         .source_label = app.source_label,
+        .repo_root = app.repo_root,
         .no_changes_actions = viewNoChangesActionPresentation(app, fetch_key_buffer[0..]),
         .empty_message = null,
         .branch = viewBranchRowPresentation(app, surface, &branch_scratch),
@@ -661,7 +662,7 @@ test "Review page header admits only exact-root branch snapshots" {
     try std.testing.expect(pageHeaderPresentation(context) == null);
 }
 
-test "review branch action hint renders effective keys with Files stats style" {
+test "review branch action hint renders effective keys with muted hint style" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("main");
@@ -1179,7 +1180,7 @@ test "review file search uses full body when compact sidebar leaves no prompt pa
     }
 }
 
-test "sidebar renderer owns badges titles selection styles and horizontal scroll" {
+test "sidebar renderer owns badges summaries selection styles and horizontal scroll" {
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{ .focus = .sidebar },
@@ -1196,11 +1197,11 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(2, review_layout.sidebar_header_rows, "A");
     try ts.expectCellText(2, review_layout.sidebar_header_rows + 1, "D");
-    try ts.expectCellText(1, 2, "F");
+    try ts.expectCellText(1, 2, "2");
     const active_badge = ts.surface.readCell(2, selected_row) orelse return error.ExpectedActiveBadge;
     const active_path = ts.surface.readCell(6, selected_row) orelse return error.ExpectedActivePath;
     const active_trailing = ts.surface.readCell(33, selected_row) orelse return error.ExpectedActiveTrailingCell;
-    const active_title = ts.surface.readCell(1, 2) orelse return error.ExpectedActiveTitle;
+    const active_summary = ts.surface.readCell(1, 2) orelse return error.ExpectedActiveSummary;
     try std.testing.expect(active_badge.style.fg.eql(palette.color(.success)));
     for ([_]chasen.Cell{ active_badge, active_path, active_trailing }) |cell| {
         try std.testing.expect(cell.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1209,9 +1210,7 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     }
     try std.testing.expect(active_path.style.bold);
     try std.testing.expect(active_trailing.style.bold);
-    try std.testing.expect(active_title.style.fg.eql(palette.color(.accent)));
-    try std.testing.expect(active_title.style.bold);
-    try std.testing.expect(!active_title.style.dim);
+    try std.testing.expect(active_summary.style.eql(palette.style(.muted)));
 
     page.viewer.focus = .diff;
     ts.surface.clearAll();
@@ -1219,7 +1218,7 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     const inactive_badge = ts.surface.readCell(2, selected_row) orelse return error.ExpectedInactiveBadge;
     const inactive_path = ts.surface.readCell(6, selected_row) orelse return error.ExpectedInactivePath;
     const inactive_trailing = ts.surface.readCell(33, selected_row) orelse return error.ExpectedInactiveTrailingCell;
-    const inactive_title = ts.surface.readCell(1, 2) orelse return error.ExpectedInactiveTitle;
+    const inactive_summary = ts.surface.readCell(1, 2) orelse return error.ExpectedInactiveSummary;
     try std.testing.expect(inactive_badge.style.fg.eql(palette.color(.success)));
     for ([_]chasen.Cell{ inactive_badge, inactive_path, inactive_trailing }) |cell| {
         try std.testing.expect(!cell.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1227,9 +1226,7 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
         try std.testing.expect(!cell.style.reverse);
     }
     try std.testing.expect(inactive_path.style.bold);
-    try std.testing.expect(inactive_title.style.fg.eql(palette.color(.accent)));
-    try std.testing.expect(inactive_title.style.bold);
-    try std.testing.expect(!inactive_title.style.dim);
+    try std.testing.expect(inactive_summary.style.eql(palette.style(.muted)));
 
     page.viewer.focus = .sidebar;
     page.file_search.mode = true;
@@ -1273,7 +1270,7 @@ test "sidebar renderer owns badges titles selection styles and horizontal scroll
     try short.init(12, review_layout.sidebar_header_rows);
     defer short.deinit();
     try viewSidebar(testContext(&page, palette, 80, 9), &short.surface, page.load.state.loaded.loaded);
-    try short.expectCellText(1, 2, "F");
+    try short.expectCellText(1, 2, "2");
 
     const nodes = [_]file_tree.Node{.{
         .kind = .file,

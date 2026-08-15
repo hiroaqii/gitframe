@@ -277,6 +277,7 @@ pub const ViewArgs = struct {
     state: diff_surface.ReadSurface,
     palette: theme.Palette,
     source_label: []const u8,
+    repo_root: ?[]const u8 = null,
     no_changes_actions: NoChangesActionPresentation,
     empty_message: ?StateMessage = null,
     branch: ?SidebarBranchPresentation,
@@ -357,7 +358,8 @@ fn viewEmptySidebarChrome(surface: *chasen.Surface, args: ViewArgs) !void {
     if (size.width == 0 or size.height == 0) return;
 
     try drawSidebarDetailRow(surface, 0, args.state, args.palette, args.branch);
-    try drawEmptySidebarTitle(surface, args.palette);
+    try drawSidebarSummary(surface, 0, 0, args.palette);
+    try drawEmptySidebarRoot(surface, args.repo_root, args.palette);
 }
 
 fn viewLoadedDiff(surface: *chasen.Surface, args: ViewArgs, loaded: loaded_diff.LoadedDiff) !void {
@@ -886,16 +888,69 @@ fn drawFileSearchInput(surface: *chasen.Surface, col: u16, row: u16, text: []con
     try draw.copyClippedTextAt(surface, col, row, text[view_primitives.inputVisibleStart(text, cursor, width)..], style);
 }
 
-pub fn drawEmptySidebarTitle(surface: *chasen.Surface, palette: theme.Palette) !void {
+pub fn drawSidebarSummary(surface: *chasen.Surface, file_count: usize, hunk_count: usize, palette: theme.Palette) !void {
     const size = surface.size();
     if (size.width == 0 or size.height <= 2) return;
 
-    const title = " Files";
-    _ = surface.borrowTextAt(0, 2, title, palette.boldStyle(.accent));
-    const stats_col = chasen.text.displayWidth(title) + 1;
+    const stats_col: u16 = 1;
     if (stats_col < size.width) {
-        _ = try surface.printAt(stats_col, 2, palette.style(.muted), "0 files / 0 hunks", .{});
+        _ = try surface.printAt(stats_col, 2, palette.style(.muted), "{d} files / {d} hunks", .{ file_count, hunk_count });
     }
+}
+
+fn drawEmptySidebarRoot(surface: *chasen.Surface, repo_root: ?[]const u8, palette: theme.Palette) !void {
+    const root = repo_root orelse return;
+    if (surface.size().height <= layout.sidebar_header_rows) return;
+
+    const name = repoRootLabel(root);
+    try drawSidebarRow(surface, layout.sidebar_header_rows, .{
+        .node_index = 0,
+        .kind = .repo_root,
+        .selected = false,
+        .depth = 0,
+        .name = name,
+        .path = "",
+        .stats = .{},
+        .status = null,
+        .stage_presence = .clean_or_unknown,
+        .mode_changed = false,
+        .reviewed = false,
+        .fold = .none,
+    }, false, 0, palette);
+}
+
+fn repoRootLabel(repo_root: []const u8) []const u8 {
+    const base = std.fs.path.basename(repo_root);
+    return if (base.len == 0) repo_root else base;
+}
+
+test "sidebar summary omits Files label and empty state keeps repository root" {
+    var surface: chasen.testing.TestSurface = undefined;
+    try surface.init(34, 5);
+    defer surface.deinit();
+    const palette: theme.Palette = .default();
+
+    try drawSidebarSummary(&surface.surface, 0, 0, palette);
+    try drawEmptySidebarRoot(&surface.surface, "/work/gitframe", palette);
+
+    const snapshot = try surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "0 files / 0 hunks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "gitframe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+0 -0") == null);
+
+    const root_cell = surface.surface.readCell(1, layout.sidebar_header_rows) orelse
+        return error.ExpectedEmptyRepositoryRoot;
+    try std.testing.expect(root_cell.style.fg.eql(palette.color(.accent)));
+    try std.testing.expect(root_cell.style.bold);
+
+    surface.surface.clearAll();
+    try drawSidebarSummary(&surface.surface, 12, 5, palette);
+    const loaded_snapshot = try surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(loaded_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, loaded_snapshot, "12 files / 5 hunks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded_snapshot, "Files") == null);
 }
 
 /// Fully normalized page-owned branch chrome. The shared renderer owns only
@@ -930,17 +985,7 @@ pub fn viewSidebar(
 
     try drawSidebarDetailRow(surface, 0, state, palette, branch);
 
-    if (size.height <= 2) return;
-    const title = " Files";
-    _ = surface.borrowTextAt(0, 2, title, palette.boldStyle(.accent));
-    const title_width = chasen.text.displayWidth(title);
-    const stats_col = title_width + 1;
-    if (stats_col < size.width) {
-        _ = try surface.printAt(stats_col, 2, palette.style(.muted), "{d} files / {d} hunks", .{
-            loaded.document.files.len,
-            loaded.document.totalHunks(),
-        });
-    }
+    try drawSidebarSummary(surface, loaded.document.files.len, loaded.document.totalHunks(), palette);
 
     if (size.height <= layout.sidebar_header_rows) return;
 
