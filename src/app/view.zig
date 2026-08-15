@@ -1533,7 +1533,7 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                 appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'a' }, "a", "approve", .primary);
                 appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'N' }, "N", "changes", .primary);
             } else {
-                appendUnclaimedFooterItem(app, &result, .{ .codepoint = 's' }, "s", "stage", .primary);
+                appendUnclaimedFooterItem(app, &result, .{ .codepoint = ' ' }, "Space", "stage", .primary);
                 appendFooterAction(app, &result, key_buffers, .commit, "commit", .secondary);
             }
             appendFooterAction(app, &result, key_buffers, .branch_switch, "branch", .secondary);
@@ -2157,7 +2157,7 @@ test "footer normal-mode hints match the decided page lists" {
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("Tab", "focus"),
-        ui.key_hint.item("s", "stage"),
+        ui.key_hint.item("Space", "stage"),
         ui.key_hint.item("c", "commit"),
         ui.key_hint.item("b", "branch"),
         ui.key_hint.item("R", "switch repo"),
@@ -2263,16 +2263,16 @@ test "footer normal-mode hints follow state and local key ownership" {
 test "footer hint projection keeps priority items and original display order" {
     var hints: FooterHints = .{};
     hints.append(ui.key_hint.item("Tab", "focus"), .focus);
-    hints.append(ui.key_hint.item("s", "stage"), .primary);
+    hints.append(ui.key_hint.item("Space", "stage"), .primary);
     hints.append(ui.key_hint.item("c", "commit"), .secondary);
     hints.append(ui.key_hint.item("b", "branch"), .secondary);
     hints.append(ui.key_hint.item("R", "switch repo"), .repository_switch);
     hints.append(ui.key_hint.item("?", "help"), .help);
     hints.append(ui.key_hint.item("q", "quit"), .quit);
 
-    var projected = projectFooterHints(&hints, 33, .{});
+    var projected = projectFooterHints(&hints, 37, .{});
     try expectProjectedFooterHintItems(&projected, &.{
-        ui.key_hint.item("s", "stage"),
+        ui.key_hint.item("Space", "stage"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2296,9 +2296,9 @@ test "narrow footer keeps repository switch and primary page action" {
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "s: stage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space: stage") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "R: switch repo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "?: help") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "?: help") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Tab: focus") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "q: quit") == null);
 }
@@ -2747,7 +2747,7 @@ const help_compare_items = [_]HelpItem{
     .{ .key = .{ .action = .toggle_display_mode }, .description = "unified / side-by-side" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
     .{ .key = .{ .text = "y / Y" }, .description = "copy current line / hunk" },
-    .{ .key = .{ .text = "s / P / U / b" }, .description = "write operations unavailable" },
+    .{ .key = .{ .text = "Space / P / U / b" }, .description = "write operations unavailable" },
 };
 
 const help_compare_sections = [_]HelpSection{
@@ -2761,7 +2761,7 @@ const help_sidebar_items = [_]HelpItem{
     .{ .key = .{ .text = "h / l" }, .description = "scroll file tree horizontally" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .action = .changed_file_filter }, .description = "cycle file filter" },
-    .{ .key = .{ .text = "s" }, .description = "stage / unstage file or directory" },
+    .{ .key = .{ .text = "Space" }, .description = "stage / unstage file or directory" },
     .{ .key = .{ .action = .mark_reviewed }, .description = "mark reviewed" },
     .{ .key = .{ .pair = .{ .left = .hide_reviewed, .right = .toggle_line_numbers } }, .description = "hide reviewed / line numbers" },
     .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize sidebar" },
@@ -2778,7 +2778,7 @@ const help_diff_items = [_]HelpItem{
     .{ .key = .{ .text = "J / K" }, .description = "next / previous hunk" },
     .{ .key = .{ .text = "n / p" }, .description = "next / previous match or hunk" },
     .{ .key = .{ .text = "N" }, .description = "previous search match" },
-    .{ .key = .{ .text = "s" }, .description = "stage / unstage hunk" },
+    .{ .key = .{ .text = "Space" }, .description = "stage / unstage hunk" },
 };
 
 const help_mouse_items = [_]HelpItem{

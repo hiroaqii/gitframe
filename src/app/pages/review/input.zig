@@ -76,7 +76,6 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
         if (context.search_query_len > 0) return .select_previous_search_match;
         return if (context.review_mode) .finish_review_needs_changes else null;
     }
-    if (key_input.matchesShiftedAscii(key, 's', 'S')) return null;
     if (context.review_mode and key.matches('a', .{})) return .finish_review_approved;
     if (key_input.hasCommandModifier(key)) return null;
 
@@ -85,7 +84,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
         'j', chasen.Key.down => if (context.focus == .diff) .scroll_diff_down else .select_next_file,
         'n' => if (context.search_query_len > 0) .select_next_search_match else .select_next_hunk,
         'p' => if (context.search_query_len > 0) .select_previous_search_match else .select_previous_hunk,
-        's' => if (context.focus == .diff) .toggle_selected_hunk else .toggle_selected_file,
+        ' ' => if (context.focus == .diff) .toggle_selected_hunk else .toggle_selected_file,
         'q' => if (context.review_mode) .finish_review_canceled else null,
         else => null,
     };
@@ -127,6 +126,7 @@ test "search input owns editing navigation and paste" {
     const context: Context = .{ .search_mode = true };
     try std.testing.expectEqual(Msg.search_move_left, keyToMsg(context, chasen.Key{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(Msg{ .search_insert = 'x' }, keyToMsg(context, chasen.Key{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(Msg{ .search_insert = ' ' }, keyToMsg(context, chasen.Key{ .codepoint = ' ' }).?);
     try std.testing.expectEqualStrings("needle", pasteToMsg(context, "needle").?.search_paste);
 }
 
@@ -137,6 +137,7 @@ test "file search input owns printable text and candidate movement" {
     try std.testing.expectEqual(Msg.file_search_next, keyToMsg(context, chasen.Key{ .codepoint = chasen.Key.down }).?);
     try std.testing.expectEqual(Msg{ .file_search_insert = 'q' }, keyToMsg(context, chasen.Key{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(Msg{ .file_search_insert = 'j' }, keyToMsg(context, chasen.Key{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(Msg{ .file_search_insert = ' ' }, keyToMsg(context, chasen.Key{ .codepoint = ' ' }).?);
 }
 
 test "normal mapping is focus and review-mode aware" {
@@ -190,8 +191,10 @@ test "focus controls enter arrows sidebar scroll and stage target" {
     try std.testing.expectEqual(Msg.expand_directory, keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = chasen.Key.right }).?);
     try std.testing.expectEqual(Msg.scroll_diff_right, keyToMsg(.{ .focus = .diff }, .{ .codepoint = chasen.Key.right }).?);
     try std.testing.expectEqual(Msg.scroll_sidebar_left, keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = 'h' }).?);
-    try std.testing.expectEqual(Msg.toggle_selected_file, keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = 's' }).?);
-    try std.testing.expectEqual(Msg.toggle_selected_hunk, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 's' }).?);
+    try std.testing.expectEqual(Msg.toggle_selected_file, keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = ' ' }).?);
+    try std.testing.expectEqual(Msg.toggle_selected_hunk, keyToMsg(.{ .focus = .diff }, .{ .codepoint = ' ' }).?);
+    try std.testing.expect(keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = 's' }) == null);
+    try std.testing.expect(keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'S' }) == null);
 }
 
 test "sidebar visibility and width commands remain Review-local" {
