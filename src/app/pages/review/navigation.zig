@@ -2503,6 +2503,13 @@ fn setAndRebuildFileSearch(app: *TestHarness, query: []const u8) void {
     app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
 }
 
+fn applySharedNavigation(app: *TestHarness, msg: diff_surface.message.Msg) !bool {
+    var adapter = app.controller().updateAdapter();
+    var outcome = try adapter.shared().apply(null, msg);
+    defer outcome.deinit(null);
+    return outcome.display_navigation_changed;
+}
+
 const file_search_nested_nodes = [_]file_tree.Node{
     .{ .kind = .directory, .name = "src", .path = "src", .path_key = "src", .depth = 0 },
     .{ .kind = .file, .name = "a", .path = "src/a", .path_key = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
@@ -2597,12 +2604,24 @@ test "Review navigation initializes cursor at first rendered body row" {
     try std.testing.expectEqual(diff_view_model.BodyCoordinate.binary_marker, binary.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 0), binary.view().visibleDiffCursorOffset());
     const binary_cursor = binary.pages.review.viewer.diff_cursor;
+    const binary_snapshot = binary.view().displayNavigationSnapshot();
+    for ([_]diff_surface.message.Msg{
+        .document_first,
+        .document_last,
+        .half_page_up,
+        .half_page_down,
+        .page_diff_up,
+        .page_diff_down,
+    }) |msg| {
+        try std.testing.expect(!try applySharedNavigation(&binary, msg));
+        try std.testing.expectEqualDeep(binary_snapshot, binary.view().displayNavigationSnapshot());
+    }
     binary.controller().scrollDiff(.down);
     try std.testing.expectEqual(@as(usize, 0), binary.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(binary_cursor, binary.pages.review.viewer.diff_cursor);
 }
 
-test "diff cursor comfort applies keyboard page hunk and search placement" {
+test "document navigation applies first last half and full page on rendered rows" {
     var harness = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
@@ -2613,6 +2632,46 @@ test "diff cursor comfort applies keyboard page hunk and search placement" {
     const visible_rows = harness.view().diffVisibleRows();
     const margin = @min(@as(usize, 8), visible_rows / 3);
     const band_last = visible_rows - 1 -| margin;
+    const line_count = harness.view().displayedDiffLineCount();
+
+    harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
+        return error.ExpectedCoordinate;
+    try std.testing.expect(try applySharedNavigation(&harness, .half_page_down));
+    try std.testing.expectEqual(
+        @as(?usize, @min(@max(visible_rows / 2, 1), line_count - 1)),
+        harness.view().selectedDiffCursorOffset(),
+    );
+    try std.testing.expect(try applySharedNavigation(&harness, .document_last));
+    try std.testing.expectEqual(@as(?usize, line_count - 1), harness.view().selectedDiffCursorOffset());
+    try std.testing.expect(try applySharedNavigation(&harness, .document_first));
+    try std.testing.expectEqual(@as(?usize, 0), harness.view().selectedDiffCursorOffset());
+
+    const viewport_cases = [_]struct { height: u16, visible_rows: usize }{
+        .{ .height = 8, .visible_rows = 0 },
+        .{ .height = 9, .visible_rows = 1 },
+        .{ .height = 10, .visible_rows = 2 },
+        .{ .height = 11, .visible_rows = 3 },
+        .{ .height = 12, .visible_rows = 4 },
+    };
+    for (viewport_cases) |case| {
+        harness.terminal_size.height = case.height;
+        try std.testing.expectEqual(case.visible_rows, harness.view().diffVisibleRows());
+        harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
+            return error.ExpectedCoordinate;
+        _ = try applySharedNavigation(&harness, .half_page_down);
+        const half_step = @max(harness.view().diffVisibleRows() / 2, 1);
+        try std.testing.expectEqual(
+            @as(?usize, @min(half_step, line_count - 1)),
+            harness.view().selectedDiffCursorOffset(),
+        );
+    }
+    harness.terminal_size.height = 15;
+    harness.pages.review.viewer.display_mode = .side_by_side;
+    harness.pages.review.viewer.keyboard_selection_side = .old;
+    _ = try applySharedNavigation(&harness, .document_last);
+    try std.testing.expectEqual(diff_selection.Side.old, harness.pages.review.viewer.keyboard_selection_side);
+    _ = try applySharedNavigation(&harness, .document_first);
+    harness.pages.review.viewer.display_mode = .unified;
 
     harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(band_last - 1) orelse
         return error.ExpectedCoordinate;
@@ -2627,10 +2686,9 @@ test "diff cursor comfort applies keyboard page hunk and search placement" {
     harness.pages.review.viewer.diff_scroll = 0;
     harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
         return error.ExpectedCoordinate;
-    harness.controller().moveDiffCursorPage(.down);
+    _ = try applySharedNavigation(&harness, .page_diff_down);
     const page_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
     try std.testing.expectEqual(@as(usize, visible_rows), page_offset);
-    const line_count = harness.view().displayedDiffLineCount();
     try std.testing.expectEqual(
         @min(page_offset -| (visible_rows / 2), line_count -| visible_rows),
         harness.pages.review.viewer.diff_scroll,
@@ -2877,6 +2935,18 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    const inert_snapshot = harness.view().displayNavigationSnapshot();
+    for ([_]diff_surface.message.Msg{
+        .document_first,
+        .document_last,
+        .half_page_up,
+        .half_page_down,
+        .page_diff_up,
+        .page_diff_down,
+    }) |msg| {
+        try std.testing.expect(!try applySharedNavigation(&harness, msg));
+        try std.testing.expectEqualDeep(inert_snapshot, harness.view().displayNavigationSnapshot());
+    }
     harness.controller().moveDiffCursorPage(.down);
     harness.controller().scrollDiff(.down);
     harness.controller().scrollDiffHorizontal(.right);
@@ -3697,6 +3767,18 @@ test "none body preserves underlying folded hunks through resolver seam" {
     try std.testing.expect(harness.view().displayedReviewBody() == .none);
     try std.testing.expectEqual(diff_surface.FoldedHunksSource.underlying_load, harness.view().resolvedTarget().folded_hunks_source);
     try std.testing.expectEqualSlices(bool, &collapsed, harness.view().selectedFoldedHunks());
+    const snapshot = harness.view().displayNavigationSnapshot();
+    for ([_]diff_surface.message.Msg{
+        .document_first,
+        .document_last,
+        .half_page_up,
+        .half_page_down,
+        .page_diff_up,
+        .page_diff_down,
+    }) |msg| {
+        try std.testing.expect(!try applySharedNavigation(&harness, msg));
+        try std.testing.expectEqualDeep(snapshot, harness.view().displayNavigationSnapshot());
+    }
 }
 
 test "layout changes reset horizontal scroll only when diff pane width changes" {
@@ -4094,6 +4176,13 @@ test "folded coordinate offset uses display folds without a cached index" {
         .line_index = 0,
     } };
     try std.testing.expect(app.reviewNavigationView().selectedDiffCursorOffset() == null);
+
+    app.pages.review.viewer.keyboard_selection_side = .old;
+    _ = try applySharedNavigation(&app, .document_last);
+    const line_count = app.reviewNavigationView().displayedDiffLineCount();
+    try std.testing.expectEqual(@as(?usize, line_count - 1), app.reviewNavigationView().selectedDiffCursorOffset());
+    try std.testing.expect(loaded.collapsed_hunks[0]);
+    try std.testing.expectEqual(diff_selection.Side.old, app.pages.review.viewer.keyboard_selection_side);
 }
 
 test "projection hunk fold authority preserves primary fold behavior" {
@@ -5441,6 +5530,16 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
     try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
     app.reviewNavigation().selectHunkDelta(1);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
+
+    _ = try applySharedNavigation(&app, .document_last);
+    try std.testing.expectEqual(@as(?usize, 7), app.visibleDiffCursorOffset());
+    _ = try applySharedNavigation(&app, .document_first);
+    try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
+    _ = try applySharedNavigation(&app, .half_page_down);
+    try std.testing.expectEqual(
+        @as(?usize, @min(@max(app.view().diffVisibleRows() / 2, 1), 7)),
+        app.visibleDiffCursorOffset(),
+    );
 
     app.pages.review.viewer.diff_scroll = 0;
     app.pages.review.viewer.diff_cursor = .{ .metadata = 0 };

@@ -42,6 +42,22 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?message.Msg {
     return selectionKeyToMsg(context, key);
 }
 
+/// Maps the page-neutral document vocabulary after page modal and selection
+/// owners have declined the key. A configured action is still claimed when
+/// the diff is not focused; returning null makes that terminal a safe no-op.
+pub fn documentNavigationMsg(action: keymap.PublicAction, diff_focused: bool) ?message.Msg {
+    if (!diff_focused or !keymap.isDocumentNavigationAction(action)) return null;
+    return switch (action) {
+        .document_first => .document_first,
+        .document_last => .document_last,
+        .half_page_up => .half_page_up,
+        .half_page_down => .half_page_down,
+        .page_backward => .page_diff_up,
+        .page_forward => .page_diff_down,
+        else => unreachable,
+    };
+}
+
 /// Bounded selection grammar used both by page-local input and by the root
 /// preflight that runs after modal owners but before configured root actions.
 pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?message.Msg {
@@ -111,7 +127,7 @@ test "mouse and header selection consume selection keys without acquiring keyboa
     }
 }
 
-test "diff selection forwards default and custom document navigation bindings" {
+test "diff selection and document navigation honor owners focus aliases and custom bindings" {
     const active: Context = .{ .selection_owner = .keyboard_line };
     try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(active, .{ .codepoint = 'g' }).?);
     try std.testing.expectEqual(
@@ -127,4 +143,13 @@ test "diff selection forwards default and custom document navigation bindings" {
     };
     try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(custom, .{ .codepoint = 'z' }).?);
     try std.testing.expect(selectionKeyToMsg(custom, .{ .codepoint = 'g' }) == null);
+
+    try std.testing.expectEqual(message.Msg.document_first, documentNavigationMsg(.document_first, true).?);
+    try std.testing.expectEqual(message.Msg.document_last, documentNavigationMsg(.document_last, true).?);
+    try std.testing.expectEqual(message.Msg.half_page_up, documentNavigationMsg(.half_page_up, true).?);
+    try std.testing.expectEqual(message.Msg.half_page_down, documentNavigationMsg(.half_page_down, true).?);
+    try std.testing.expectEqual(message.Msg.page_diff_up, documentNavigationMsg(.page_backward, true).?);
+    try std.testing.expectEqual(message.Msg.page_diff_down, documentNavigationMsg(.page_forward, true).?);
+    try std.testing.expect(documentNavigationMsg(.document_first, false) == null);
+    try std.testing.expect(documentNavigationMsg(.search, true) == null);
 }

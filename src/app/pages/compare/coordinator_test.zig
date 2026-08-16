@@ -58,7 +58,7 @@ const TestApp = struct {
     }
 };
 
-test "diff wheel comfort routes through Compare and recenters an edge cursor" {
+test "Compare document navigation and diff wheel share rendered cursor authority" {
     const allocator = std.testing.allocator;
     var app: TestApp = .{
         .pages = .{ .compare = .{
@@ -80,6 +80,32 @@ test "diff wheel comfort routes through Compare and recenters an edge cursor" {
     var update_adapter = navigation.updateAdapter();
     const body = update_adapter.bodyController();
     const visible_rows = body.view().view.diffVisibleRows();
+    const line_count = body.view().sourceDiffLineCount();
+
+    app.pages.compare.viewer.diff_cursor = body.view().selectedCoordinateAtOffset(0) orelse
+        return error.ExpectedCoordinate;
+    try app.update(.{ .compare = .{ .shared = .document_last } }, &ctx);
+    var document_adapter = app.controller().navigation().updateAdapter();
+    try std.testing.expectEqual(
+        @as(?usize, line_count - 1),
+        document_adapter.bodyController().view().selectedDiffCursorOffset(),
+    );
+    try app.update(.{ .compare = .{ .shared = .document_first } }, &ctx);
+    document_adapter = app.controller().navigation().updateAdapter();
+    try std.testing.expectEqual(@as(?usize, 0), document_adapter.bodyController().view().selectedDiffCursorOffset());
+    try app.update(.{ .compare = .{ .shared = .half_page_down } }, &ctx);
+    document_adapter = app.controller().navigation().updateAdapter();
+    try std.testing.expectEqual(
+        @as(?usize, @min(@max(visible_rows / 2, 1), line_count - 1)),
+        document_adapter.bodyController().view().selectedDiffCursorOffset(),
+    );
+
+    app.pages.compare.viewer.display_mode = .side_by_side;
+    app.pages.compare.viewer.keyboard_selection_side = .old;
+    try app.update(.{ .compare = .{ .shared = .page_diff_down } }, &ctx);
+    try std.testing.expect(app.pages.compare.viewer.keyboard_selection_side == .old);
+    app.pages.compare.viewer.display_mode = .unified;
+    app.pages.compare.viewer.diff_scroll = old_scroll;
     app.pages.compare.viewer.diff_cursor = body.view().selectedCoordinateAtOffset(old_scroll) orelse
         return error.ExpectedCoordinate;
 

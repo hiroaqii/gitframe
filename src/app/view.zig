@@ -1819,7 +1819,10 @@ fn drawHelpLine(
 
 fn drawHelpItem(app: Context, surface: *chasen.Surface, row: u16, item: HelpItem) !void {
     if (surface.size().width == 0) return;
-    const desired_key_width: u16 = if (app.active_page == .repository) 18 else 12;
+    const desired_key_width: u16 = switch (app.active_page) {
+        .review, .repository, .compare => 18,
+        .config => 12,
+    };
     const key_width: u16 = @min(desired_key_width, surface.size().width);
     var key_buffer: [16]u8 = undefined;
     var left_buffer: [16]u8 = undefined;
@@ -2503,7 +2506,7 @@ test "help popup max scroll helper separates outer and content sizes" {
     try std.testing.expectEqual(helpMaxScrollForContentSize(content, .review), helpMaxScroll(outer, .review));
 }
 
-test "repository help uses effective navigation labels and reaches its tail at 80x12" {
+test "help popup uses effective document navigation labels and reaches its tail at 80x12" {
     const size = chasen.Size{ .width = 80, .height = 12 };
     const content = helpContentSize(size);
     try std.testing.expect(!helpUsesTwoColumns(content, .repository));
@@ -2544,6 +2547,44 @@ test "repository help uses effective navigation labels and reaches its tail at 8
     defer std.testing.allocator.free(tail_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "Mouse") != null);
     try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "wheel") != null);
+
+    for ([_]page.Id{ .review, .compare }) |help_page| {
+        harness.overlay.openHelpForPage(help_page);
+        const sections = helpSectionsForPage(help_page);
+        const shared_section_index: usize = if (help_page == .review) 2 else 1;
+        harness.overlay.help_scroll = rowsForSections(sections[0..shared_section_index]) + 1;
+        context = harness.context();
+        context.active_page = help_page;
+
+        var navigation: chasen.testing.TestSurface = undefined;
+        try navigation.init(size.width, size.height);
+        defer navigation.deinit();
+        try viewHelpPopup(context, &navigation.surface);
+        const navigation_snapshot = try navigation.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(navigation_snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, navigation_snapshot, "z / G") != null);
+        try std.testing.expect(std.mem.indexOf(u8, navigation_snapshot, "Ctrl+u / x") != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            navigation_snapshot,
+            "Ctrl+b / Ctrl+f   page backward / forward",
+        ) != null);
+
+        harness.overlay.help_scroll = helpMaxScroll(size, help_page);
+        context = harness.context();
+        context.active_page = help_page;
+        var page_tail: chasen.testing.TestSurface = undefined;
+        try page_tail.init(size.width, size.height);
+        defer page_tail.deinit();
+        try viewHelpPopup(context, &page_tail.surface);
+        const page_tail_snapshot = try page_tail.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(page_tail_snapshot);
+        if (help_page == .review) {
+            try std.testing.expect(std.mem.indexOf(u8, page_tail_snapshot, "Mouse") != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, page_tail_snapshot, "previous search match") != null);
+        }
+    }
 }
 
 test "push error paragraph viewport max scroll follows wrapped line count" {
@@ -2770,9 +2811,7 @@ const help_compare_items = [_]HelpItem{
     .{ .key = .{ .text = "m" }, .description = "choose comparison base (user assignment wins)" },
     .{ .key = .{ .action = .reload }, .description = "refresh comparison against selected base" },
     .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
-    .{ .key = .{ .action = .search }, .description = "search diff" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
-    .{ .key = .{ .action = .toggle_display_mode }, .description = "unified / side-by-side" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
     .{ .key = .{ .text = "y / Y" }, .description = "copy current line / hunk" },
     .{ .key = .{ .text = "Space / P / U / b" }, .description = "write operations unavailable" },
@@ -2780,6 +2819,7 @@ const help_compare_items = [_]HelpItem{
 
 const help_compare_sections = [_]HelpSection{
     .{ .title = "Compare", .items = &help_compare_items },
+    .{ .title = "Diff", .items = &help_diff_navigation_items },
 };
 
 const help_repository_global_items = [_]HelpItem{
@@ -2840,8 +2880,11 @@ const help_sidebar_items = [_]HelpItem{
     .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize sidebar" },
 };
 
-const help_diff_items = [_]HelpItem{
+const help_diff_navigation_items = [_]HelpItem{
     .{ .key = .{ .text = "↑/↓ j/k" }, .description = "scroll" },
+    .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last source row" },
+    .{ .key = .{ .pair = .{ .left = .half_page_up, .right = .half_page_down } }, .description = "half page up / down" },
+    .{ .key = .{ .pair = .{ .left = .page_backward, .right = .page_forward } }, .description = "page backward / forward" },
     .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page scroll" },
     .{ .key = .{ .text = "←/→" }, .description = "horizontal scroll" },
     .{ .key = .{ .text = "Enter" }, .description = "fold / unfold hunk" },
@@ -2850,7 +2893,10 @@ const help_diff_items = [_]HelpItem{
     .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
     .{ .key = .{ .text = "J / K" }, .description = "next / previous hunk" },
     .{ .key = .{ .text = "n / p" }, .description = "next / previous match or hunk" },
-    .{ .key = .{ .text = "N" }, .description = "previous search match" },
+    .{ .key = .{ .text = "N" }, .description = "previous search match when query is active" },
+};
+
+const help_review_diff_items = [_]HelpItem{
     .{ .key = .{ .text = "Space" }, .description = "stage / unstage hunk" },
 };
 
@@ -2865,13 +2911,15 @@ const help_left_sections = [_]HelpSection{
 };
 
 const help_right_sections = [_]HelpSection{
-    .{ .title = "Diff", .items = &help_diff_items },
+    .{ .title = "Diff", .items = &help_diff_navigation_items },
+    .{ .title = "Review diff", .items = &help_review_diff_items },
     .{ .title = "Mouse", .items = &help_mouse_items },
 };
 
 const help_all_sections = [_]HelpSection{
     .{ .title = "Global", .items = &help_global_items },
     .{ .title = "Sidebar", .items = &help_sidebar_items },
-    .{ .title = "Diff", .items = &help_diff_items },
+    .{ .title = "Diff", .items = &help_diff_navigation_items },
+    .{ .title = "Review diff", .items = &help_review_diff_items },
     .{ .title = "Mouse", .items = &help_mouse_items },
 };

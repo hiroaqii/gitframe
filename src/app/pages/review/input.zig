@@ -67,7 +67,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.home, .{})) return .select_first_file;
     if (key.matches(chasen.Key.end, .{})) return .select_last_file;
 
-    if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action);
+    if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action, context.focus == .diff);
 
     if (context.focus == .diff and key_input.matchesShiftedAscii(key, 'v', 'V')) return .begin_keyboard_line_selection;
 
@@ -91,8 +91,10 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     };
 }
 
-fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
-    if (keymap.isDocumentNavigationAction(action)) return null;
+fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
+    if (keymap.isDocumentNavigationAction(action)) {
+        return review_message.fromShared(diff_surface_input.documentNavigationMsg(action, diff_focused) orelse return null);
+    }
     return switch (action) {
         .page_review, .page_repository, .page_compare, .page_config => null,
         .help, .reload => null,
@@ -154,6 +156,10 @@ test "retained selection actions override line copy and empty escape fallback" {
     try std.testing.expectEqual(Msg{ .selection_action = .clear }, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(Msg.copy_current_line, keyToMsg(.{}, .{ .codepoint = 'y' }).?);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.escape }) == null);
+    try std.testing.expectEqual(Msg.document_first, keyToMsg(.{
+        .focus = .diff,
+        .retained_selection_action_available = true,
+    }, .{ .codepoint = 'g' }).?);
 }
 
 test "Review keyboard line selection maps side start movement and unavailable Ask" {
@@ -251,15 +257,22 @@ test "static Review command matrix preserves configurable defaults" {
     for (cases) |case| try std.testing.expectEqual(case.expected, keyToMsg(.{}, .{ .codepoint = case.codepoint }).?);
 }
 
-test "Review keeps Home End and owns new document actions as no-op until follow-up" {
+test "Review document navigation preserves Home End focus and custom bindings" {
     try std.testing.expectEqual(Msg.select_first_file, keyToMsg(.{}, .{ .codepoint = chasen.Key.home }).?);
     try std.testing.expectEqual(Msg.select_last_file, keyToMsg(.{}, .{ .codepoint = chasen.Key.end }).?);
-    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'g' }) == null);
-    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'f', .mods = .{ .ctrl = true } }) == null);
+    try std.testing.expect(keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = 'g' }) == null);
+    try std.testing.expectEqual(Msg.document_first, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'g' }).?);
+    try std.testing.expectEqual(Msg.document_last, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'G' }).?);
+    try std.testing.expectEqual(Msg.half_page_up, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'u', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(Msg.half_page_down, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(Msg.page_diff_up, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'b', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(Msg.page_diff_down, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'f', .mods = .{ .ctrl = true } }).?);
 
     var config: keymap.Config = .{};
     config.set(.document_first, .{ .plain_codepoint = 'z' });
-    try std.testing.expect(keyToMsg(.{ .keymap = keymap.Effective.fromConfig(config) }, .{ .codepoint = 'z' }) == null);
+    const custom = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(Msg.document_first, keyToMsg(.{ .focus = .diff, .keymap = custom }, .{ .codepoint = 'z' }).?);
+    try std.testing.expect(keyToMsg(.{ .focus = .diff, .keymap = custom }, .{ .codepoint = 'g' }) == null);
 }
 
 test "shifted terminal encodings preserve Review commands" {

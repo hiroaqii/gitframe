@@ -1935,20 +1935,54 @@ pub const BodyController = struct {
         self.placeDiffCursorInComfortBand();
     }
 
+    pub fn moveDiffCursorFirst(self: BodyController) void {
+        self.moveDiffCursorToDocumentEdge(false);
+    }
+
+    pub fn moveDiffCursorLast(self: BodyController) void {
+        self.moveDiffCursorToDocumentEdge(true);
+    }
+
+    pub fn moveDiffCursorHalfPage(self: BodyController, direction: VerticalDirection) void {
+        const step = @max(self.controller.view().diffVisibleRows() / 2, 1);
+        self.moveDiffCursorByDocumentStep(direction, step);
+    }
+
     pub fn moveDiffCursorPage(self: BodyController, direction: VerticalDirection) void {
-        const current = self.view().selectedDiffCursorOffset() orelse {
-            self.initializeDiffCursorForSelectedFile();
-            self.centerDiffCursor();
-            return;
-        };
-        const line_count = self.view().sourceDiffLineCount();
-        if (line_count == 0) return;
         const step = @max(self.controller.view().diffVisibleRows(), 1);
-        const target = switch (direction) {
-            .up => current -| step,
-            .down => @min(current +| step, line_count - 1),
-        };
-        self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(target) orelse self.controller.surface.viewer.diff_cursor;
+        self.moveDiffCursorByDocumentStep(direction, step);
+    }
+
+    fn moveDiffCursorToDocumentEdge(self: BodyController, last: bool) void {
+        const line_count = self.documentNavigationLineCount() orelse return;
+        const target = if (last) line_count - 1 else 0;
+        self.commitDocumentNavigation(target);
+    }
+
+    fn moveDiffCursorByDocumentStep(self: BodyController, direction: VerticalDirection, step: usize) void {
+        const line_count = self.documentNavigationLineCount() orelse return;
+        const current = self.view().selectedDiffCursorOffset();
+        const target = if (current) |offset| switch (direction) {
+            .up => offset -| step,
+            .down => @min(offset +| step, line_count - 1),
+        } else 0;
+        self.commitDocumentNavigation(target);
+    }
+
+    fn documentNavigationLineCount(self: BodyController) ?usize {
+        const body = self.view();
+        switch (body.resolvedTarget().kind) {
+            .none, .inert => return null,
+            .primary, .projected => {},
+        }
+        if (body.displayedDiffFile()) |file| if (file.is_binary) return null;
+        const line_count = body.sourceDiffLineCount();
+        return if (line_count == 0) null else line_count;
+    }
+
+    fn commitDocumentNavigation(self: BodyController, target: usize) void {
+        const coordinate = self.view().selectedCoordinateAtOffset(target) orelse return;
+        self.controller.surface.viewer.diff_cursor = coordinate;
         self.centerDiffCursor();
     }
 

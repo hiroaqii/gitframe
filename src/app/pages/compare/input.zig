@@ -103,7 +103,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     // A user binding consumes the key even when it names an operation Compare
     // intentionally does not expose. This is what lets a user-bound `m` win
     // over the page-local picker mnemonic.
-    if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action);
+    if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action, context.focus == .diff);
 
     if (context.focus == .diff and key_input.matchesShiftedAscii(key, 'v', 'V')) return shared(.begin_keyboard_line_selection);
 
@@ -124,8 +124,10 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     };
 }
 
-fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
-    if (keymap.isDocumentNavigationAction(action)) return null;
+fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
+    if (keymap.isDocumentNavigationAction(action)) {
+        return shared(diff_surface.input.documentNavigationMsg(action, diff_focused) orelse return null);
+    }
     return switch (action) {
         .search => shared(.enter_search),
         .file_search => shared(.enter_file_search),
@@ -170,15 +172,22 @@ test "Compare exposes display actions but no write actions" {
     try std.testing.expectEqual(Msg.branch_switch_unavailable, keyToMsg(.{}, .{ .codepoint = 'b' }).?);
 }
 
-test "Compare keeps Home End and owns new document actions as no-op until follow-up" {
+test "Compare document navigation preserves Home End focus and custom bindings" {
     try std.testing.expectEqual(Msg{ .shared = .select_first_file }, keyToMsg(.{}, .{ .codepoint = chasen.Key.home }).?);
     try std.testing.expectEqual(Msg{ .shared = .select_last_file }, keyToMsg(.{}, .{ .codepoint = chasen.Key.end }).?);
-    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'G' }) == null);
-    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'b', .mods = .{ .ctrl = true } }) == null);
+    try std.testing.expect(keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = 'G' }) == null);
+    try std.testing.expectEqual(Msg{ .shared = .document_first }, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'g' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .document_last }, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'G' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .half_page_up }, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'u', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(Msg{ .shared = .half_page_down }, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(Msg{ .shared = .page_diff_up }, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'b', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(Msg{ .shared = .page_diff_down }, keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'f', .mods = .{ .ctrl = true } }).?);
 
     var config: keymap.Config = .{};
     config.set(.document_last, .{ .plain_codepoint = 'z' });
-    try std.testing.expect(keyToMsg(.{ .keymap = keymap.Effective.fromConfig(config) }, .{ .codepoint = 'z' }) == null);
+    const custom = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(Msg{ .shared = .document_last }, keyToMsg(.{ .focus = .diff, .keymap = custom }, .{ .codepoint = 'z' }).?);
+    try std.testing.expect(keyToMsg(.{ .focus = .diff, .keymap = custom }, .{ .codepoint = 'G' }) == null);
 }
 
 test "Compare routes admitted retained actions through shared input" {
@@ -192,6 +201,10 @@ test "Compare routes admitted retained actions through shared input" {
         keyToMsg(retained, .{ .codepoint = chasen.Key.escape }).?,
     );
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.escape }) == null);
+    try std.testing.expectEqual(
+        Msg{ .shared = .document_first },
+        keyToMsg(.{ .focus = .diff, .retained_selection_action_available = true }, .{ .codepoint = 'g' }).?,
+    );
 }
 
 test "Compare keyboard line selection maps side start and movement" {

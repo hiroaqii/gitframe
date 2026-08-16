@@ -384,7 +384,7 @@ test "active diff display uses ready combined projection by identity" {
     }
 }
 
-test "explicit interim navigation creates override but automatic state does not" {
+test "Review document navigation updates pending restore only on display changes" {
     var app: App = .{
         .pages = .{ .review = .{
             .load = .{ .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
@@ -442,6 +442,39 @@ test "explicit interim navigation creates override but automatic state does not"
 
     try app.update(.{ .review = .scroll_diff_down }, &ctx);
     try std.testing.expectEqual(@as(u64, 2), app.pages.review.display_navigation_input_revision);
+    restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
+    override = restore.override orelse return error.ExpectedNavigationOverride;
+    try std.testing.expectEqual(app.pages.review.viewer.diff_cursor, override.diff_cursor);
+    try std.testing.expectEqual(reviewNavigationView(&app).selectedDiffCursorOffset(), override.diff_cursor_offset);
+
+    try app.update(.{ .review = .document_last }, &ctx);
+    try std.testing.expectEqual(@as(u64, 3), app.pages.review.display_navigation_input_revision);
+    restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
+    override = restore.override orelse return error.ExpectedNavigationOverride;
+    const latest_cursor = app.pages.review.viewer.diff_cursor;
+    const latest_cursor_offset = reviewNavigationView(&app).selectedDiffCursorOffset();
+    const latest_scroll = app.pages.review.viewer.diff_scroll;
+    try std.testing.expectEqual(latest_cursor, override.diff_cursor);
+    try std.testing.expectEqual(latest_cursor_offset, override.diff_cursor_offset);
+    try std.testing.expectEqual(latest_scroll, override.diff_scroll);
+
+    // A delayed projection completion restores the latest user override, not
+    // the acceptance-time cursor and viewport.
+    app.pages.review.viewer.diff_cursor = restore.original.diff_cursor;
+    app.pages.review.viewer.diff_scroll = restore.original.diff_scroll;
+    reviewReload(&app).restoreDisplayedNavigation(restore.authoritative());
+    try std.testing.expectEqual(latest_cursor, app.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(latest_cursor_offset, reviewNavigationView(&app).selectedDiffCursorOffset());
+    try std.testing.expectEqual(latest_scroll, app.pages.review.viewer.diff_scroll);
+
+    const revision_before_edge = app.pages.review.display_navigation_input_revision;
+    try app.update(.{ .review = .document_last }, &ctx);
+    try std.testing.expectEqual(revision_before_edge, app.pages.review.display_navigation_input_revision);
+    restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
+    try std.testing.expectEqual(latest_cursor, restore.override.?.diff_cursor);
+
+    try app.update(.{ .review = .half_page_up }, &ctx);
+    try std.testing.expectEqual(revision_before_edge + 1, app.pages.review.display_navigation_input_revision);
     restore = app.pages.review.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     override = restore.override orelse return error.ExpectedNavigationOverride;
     try std.testing.expectEqual(app.pages.review.viewer.diff_cursor, override.diff_cursor);
