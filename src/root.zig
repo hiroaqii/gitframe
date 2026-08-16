@@ -3,7 +3,7 @@ const build_options = @import("build_options");
 pub const config = @import("config.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
-pub const review_session = @import("review/session.zig");
+pub const review_session = @import("review_session/session.zig");
 pub const theme = @import("theme");
 const diff_source = @import("diff/source.zig");
 
@@ -118,8 +118,8 @@ test {
     _ = @import("repository/path.zig");
     _ = @import("repository/source.zig");
     _ = @import("repository/tree.zig");
-    _ = @import("review/session.zig");
-    _ = @import("review/state.zig");
+    _ = @import("review_session/session.zig");
+    _ = @import("review_session/state.zig");
     _ = @import("syntax/provider.zig");
     _ = @import("syntax/style.zig");
     _ = @import("syntax/token.zig");

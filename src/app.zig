@@ -46,7 +46,7 @@ const diff_render = @import("diff/render.zig");
 const diff_selection = @import("diff/selection.zig");
 const diff_source = @import("diff/source.zig");
 const keymap = @import("keymap");
-const review_session = @import("review/session.zig");
+const review_session = @import("review_session/session.zig");
 const theme = @import("theme");
 
 const auto_reload_timer_id = "gitframe.auto_reload";

@@ -7,7 +7,7 @@ const context = @import("context.zig");
 const git_status = @import("git/status.zig");
 const test_support = @import("app/test_support.zig");
 const action_lifecycle = @import("app/workflow/action_lifecycle.zig");
-const review_session = @import("review/session.zig");
+const review_session = @import("review_session/session.zig");
 
 const App = app_module.App;
 

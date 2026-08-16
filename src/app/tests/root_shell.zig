@@ -27,7 +27,7 @@ const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_status = @import("../../git/status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
-const review_session = @import("../../review/session.zig");
+const review_session = @import("../../review_session/session.zig");
 
 const App = app_mod.App;
 const OverlayKind = app_state.OverlayKind;

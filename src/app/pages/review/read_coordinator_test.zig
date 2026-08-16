@@ -48,7 +48,7 @@ const git_status = @import("../../../git/status.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
-const review_state = @import("../../../review/state.zig");
+const review_session_state = @import("../../../review_session/state.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
 
 const DiffLoadFinished = app_load.DiffLoadFinished;

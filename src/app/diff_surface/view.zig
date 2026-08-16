@@ -600,7 +600,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     const diff_selection = @import("../../diff/selection.zig");
     const diff_parser = @import("../../diff/parser.zig");
     const diff_view_model = @import("../../diff/view_model.zig");
-    const review_state = @import("../../review/state.zig");
+    const review_session_state = @import("../../review_session/state.zig");
     const Fake = struct {
         kind: diff_surface.ReducedBodyKind,
         loaded: *const loaded_diff.LoadedDiff,
@@ -697,7 +697,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     var search_focus: diff_surface.Focus = .sidebar;
     var revision: u64 = 0;
     var display: app_state.ReviewDisplayState = .{};
-    var reviewed: review_state.Store = .{};
+    var reviewed: review_session_state.Store = .{};
     var order: file_tree.StableOrder = .{};
     var order_scope: ?[]u8 = null;
     var selection_owner: diff_selection.Owner = .none;

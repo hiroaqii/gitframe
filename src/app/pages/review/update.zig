@@ -20,7 +20,7 @@ const diff_selection = @import("../../../diff/selection.zig");
 const diff_render = @import("../../../diff/render.zig");
 const file_tree = if (builtin.is_test) @import("../../../file_tree.zig") else struct {};
 const loaded_diff = if (builtin.is_test) @import("../../../loaded_diff.zig") else struct {};
-const review_session = @import("../../../review/session.zig");
+const review_session = @import("../../../review_session/session.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
 pub const Command = union(enum) {

@@ -19,7 +19,7 @@ const diff_source = @import("../diff/source.zig");
 const diff_parser = @import("../diff/parser.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
-const review_state = @import("../review/state.zig");
+const review_session_state = @import("../review_session/state.zig");
 
 pub const authority = @import("diff_surface/authority.zig");
 pub const body_resolver = @import("diff_surface/body_resolver.zig");
@@ -194,7 +194,7 @@ pub const ReadSurface = struct {
     file_search_return_focus: *const Focus,
     accepted_sidebar_revision: *const u64,
     review_display: *const app_state.ReviewDisplayState,
-    reviewed_store: *const review_state.Store,
+    reviewed_store: *const review_session_state.Store,
     tree_order: *const file_tree.StableOrder,
     tree_order_scope: *const ?[]u8,
     selection_owner: *const diff_selection.Owner,
@@ -230,7 +230,7 @@ pub const DiffSurface = struct {
     file_search_return_focus: *Focus,
     accepted_sidebar_revision: *u64,
     review_display: *app_state.ReviewDisplayState,
-    reviewed_store: *review_state.Store,
+    reviewed_store: *review_session_state.Store,
     tree_order: *file_tree.StableOrder,
     tree_order_scope: *?[]u8,
     selection_owner: *diff_selection.Owner,
