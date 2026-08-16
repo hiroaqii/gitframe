@@ -139,11 +139,11 @@ const RenderContext = struct {
         capture_index: usize,
         _: *const flow_syntax.Node,
     ) error{Stop}!void {
-        if (capture_index != 0) return;
+        const role = token.roleFromScope(scope);
+        if (capture_index != 0 and !token.isSemanticRefinement(role)) return;
         const start: usize = @intCast(range.start_byte);
         const end: usize = @intCast(range.end_byte);
         if (start >= end or start >= self.document.bytes.len) return;
-        const role = token.roleFromScope(scope);
         if (role == .plain) return;
         self.appendRange(start, @min(end, self.document.bytes.len), role) catch |err| {
             self.failure = err;
@@ -193,13 +193,76 @@ test "source syntax byte lookup selects the containing logical line" {
 
 test "flow syntax builds source-shaped spans from one full file instance" {
     const allocator = std.testing.allocator;
-    const bytes = try allocator.dupe(u8, "const value: usize = 42;\n// comment\n");
-    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
-    defer document.deinit(allocator);
-    var spans = try buildSourceSpans(allocator, std.testing.io, &document, "main.zig");
-    defer spans.deinit(allocator);
-    try std.testing.expect(spans.spans.len > 0);
-    try std.testing.expect(spans.lineSpans(0).spans.len > 0);
+    {
+        const bytes = try allocator.dupe(u8,
+            \\const Item = struct { name: []const u8 };
+            \\fn read(item: Item) void {
+            \\    _ = item.name;
+            \\}
+            \\
+        );
+        var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+        defer document.deinit(allocator);
+        var spans = try buildSourceSpans(allocator, std.testing.io, &document, "main.zig");
+        defer spans.deinit(allocator);
+        try std.testing.expect(spans.spans.len > 0);
+        try std.testing.expect(spans.lineSpans(0).spans.len > 0);
+        try std.testing.expect(roleTextCount(&document, spans, .parameter, "item") > 0);
+        try std.testing.expect(roleTextCount(&document, spans, .member, "name") > 0);
+    }
+
+    {
+        const bytes = try allocator.dupe(u8,
+            \\fn read(value: crate::Point) {
+            \\    let crate::Point { x } = value;
+            \\    println!("{}", x);
+            \\}
+            \\
+        );
+        var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+        defer document.deinit(allocator);
+        var spans = try buildSourceSpans(allocator, std.testing.io, &document, "main.rs");
+        defer spans.deinit(allocator);
+        try std.testing.expect(roleTextCount(&document, spans, .constructor, "Point") > 0);
+        try std.testing.expect(roleTextCount(&document, spans, .macro, "println") > 0);
+        try std.testing.expect(roleTextCount(&document, spans, .macro, "!") > 0);
+    }
+
+    {
+        const bytes = try allocator.dupe(u8, "const message = `Hello ${name}`;\n");
+        var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+        defer document.deinit(allocator);
+        var spans = try buildSourceSpans(allocator, std.testing.io, &document, "main.js");
+        defer spans.deinit(allocator);
+        try std.testing.expect(roleTextCount(&document, spans, .special_punctuation, "${") > 0);
+        try std.testing.expect(roleTextCount(&document, spans, .special_punctuation, "}") > 0);
+    }
+
+    {
+        const bytes = try allocator.dupe(u8, "message = f\"Hello {name}\"\n");
+        var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+        defer document.deinit(allocator);
+        var spans = try buildSourceSpans(allocator, std.testing.io, &document, "main.py");
+        defer spans.deinit(allocator);
+        try std.testing.expect(roleTextCount(&document, spans, .special_punctuation, "{") > 0);
+        try std.testing.expect(roleTextCount(&document, spans, .special_punctuation, "}") > 0);
+    }
+}
+
+fn roleTextCount(
+    document: *const source_document.Document,
+    spans: source_spans.SourceSpans,
+    role: token.TokenRole,
+    expected: []const u8,
+) usize {
+    var count: usize = 0;
+    for (spans.line_entries) |entry| {
+        const line = document.lineBody(entry.line_index) orelse continue;
+        for (spans.lineSpans(entry.line_index).spans) |span| {
+            if (span.role == role and std.mem.eql(u8, line[span.start..span.end], expected)) count += 1;
+        }
+    }
+    return count;
 }
 
 test "flow syntax capacity inspection reports raw and retained roles" {

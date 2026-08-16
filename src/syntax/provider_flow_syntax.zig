@@ -136,10 +136,11 @@ const RenderContext = struct {
         capture_index: usize,
         _: *const flow_syntax.Node,
     ) error{Stop}!void {
-        // Capture groups often include nested scopes. Keep the outermost range
-        // for now so overlapping captures do not churn colors within one token.
-        if (capture_index != 0) return;
         const role = token.roleFromScope(scope);
+        // Preserve the established first-capture behavior for generic scopes,
+        // but retain later detailed captures such as the closing delimiter of
+        // an interpolation or the punctuation in a macro invocation.
+        if (capture_index != 0 and !token.isSemanticRefinement(role)) return;
         provider.appendRangeSpans(self.allocator, self.line_maps, self.line_lists, .{
             .start = @intCast(range.start_byte),
             .end = @intCast(range.end_byte),
@@ -156,11 +157,12 @@ test "mixed eligibility skips invalid files without shifting valid span indices"
         .text = "bad\xff",
         .new_line = 1,
     }};
-    const valid_lines = [_]diff_parser.DiffLine{.{
-        .kind = .added,
-        .text = "const value: usize = 1;",
-        .new_line = 1,
-    }};
+    const valid_lines = [_]diff_parser.DiffLine{
+        .{ .kind = .added, .text = "const Item = struct { name: []const u8 };", .new_line = 1 },
+        .{ .kind = .added, .text = "fn read(item: Item) void {", .new_line = 2 },
+        .{ .kind = .added, .text = "    _ = item.name;", .new_line = 3 },
+        .{ .kind = .added, .text = "}", .new_line = 4 },
+    };
     const files = [_]diff_parser.FileDiff{
         .{
             .header = "diff --git a/invalid.zig b/invalid.zig",
@@ -185,7 +187,7 @@ test "mixed eligibility skips invalid files without shifting valid span indices"
                 .old_start = 1,
                 .old_count = 0,
                 .new_start = 1,
-                .new_count = 1,
+                .new_count = valid_lines.len,
                 .section = "",
                 .lines = &valid_lines,
             }},
@@ -210,4 +212,23 @@ test "mixed eligibility skips invalid files without shifting valid span indices"
     });
     try std.testing.expect(valid.spans.len > 0);
     try std.testing.expectEqual(token.TokenRole.keyword, valid.spans[0].role);
+    try std.testing.expect(lineHasRoleText(valid_lines[1].text, spans.lineSpans(.{
+        .file_index = 1,
+        .hunk_index = 0,
+        .line_index = 1,
+        .side = .new,
+    }), .parameter, "item"));
+    try std.testing.expect(lineHasRoleText(valid_lines[2].text, spans.lineSpans(.{
+        .file_index = 1,
+        .hunk_index = 0,
+        .line_index = 2,
+        .side = .new,
+    }), .member, "name"));
+}
+
+fn lineHasRoleText(line: []const u8, spans: token.LineSpans, role: token.TokenRole, expected: []const u8) bool {
+    for (spans.spans) |span| {
+        if (span.role == role and std.mem.eql(u8, line[span.start..span.end], expected)) return true;
+    }
+    return false;
 }

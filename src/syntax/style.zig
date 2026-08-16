@@ -24,8 +24,8 @@ fn paletteRole(role: token.TokenRole) ?theme.Role {
         .keyword => .syntax_keyword,
         .operator => .syntax_operator,
         .function => .syntax_function,
-        .property => .syntax_property,
-        .type => .syntax_type,
+        .property, .parameter, .member, .macro, .special_punctuation => .syntax_property,
+        .type, .constructor => .syntax_type,
         .constant => .syntax_constant,
         .string => .syntax_string,
         .number => .syntax_number,
@@ -39,7 +39,12 @@ test "token roles map only colored syntax to dedicated theme roles" {
     try std.testing.expectEqual(theme.Role.syntax_operator, paletteRole(.operator).?);
     try std.testing.expectEqual(theme.Role.syntax_function, paletteRole(.function).?);
     try std.testing.expectEqual(theme.Role.syntax_property, paletteRole(.property).?);
+    try std.testing.expectEqual(theme.Role.syntax_property, paletteRole(.parameter).?);
+    try std.testing.expectEqual(theme.Role.syntax_property, paletteRole(.member).?);
+    try std.testing.expectEqual(theme.Role.syntax_property, paletteRole(.macro).?);
+    try std.testing.expectEqual(theme.Role.syntax_property, paletteRole(.special_punctuation).?);
     try std.testing.expectEqual(theme.Role.syntax_type, paletteRole(.type).?);
+    try std.testing.expectEqual(theme.Role.syntax_type, paletteRole(.constructor).?);
     try std.testing.expectEqual(theme.Role.syntax_constant, paletteRole(.constant).?);
     try std.testing.expectEqual(theme.Role.syntax_string, paletteRole(.string).?);
     try std.testing.expectEqual(theme.Role.syntax_number, paletteRole(.number).?);
