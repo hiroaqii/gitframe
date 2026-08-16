@@ -1,4 +1,4 @@
-//! Stage-level performance profiler for GitFrame's staged Review projection.
+//! Stage-level performance profiler for GitFrame's staged Changes projection.
 //!
 //! This developer-only tool measures parse, flow-syntax, tree/cache construction,
 //! and first-redraw costs from a recorded unified-diff patch. Its component-pair

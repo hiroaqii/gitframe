@@ -70,7 +70,7 @@ pub const InstallHook = struct {
 
 pub const Controller = struct {
     navigation: navigation.BodyController,
-    /// Review retains a richer mixed-stage fold presentation policy. Compare
+    /// Changes retains a richer mixed-stage fold presentation policy. Review
     /// can use the shared body operation directly.
     toggle_hunk_fold: ?Hook = null,
     retained_selection_install: ?InstallHook = null,

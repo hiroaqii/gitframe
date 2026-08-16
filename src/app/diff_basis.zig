@@ -1,6 +1,6 @@
 //! Page-independent identity and ownership types for read-only committed diffs.
 //!
-//! Compare v1 constructs branch bases. The tagged `DiffBasis` is defined now
+//! Review v1 constructs branch bases. The tagged `DiffBasis` is defined now
 //! so later History work can add its lossless commit-detail payload without
 //! changing consumers back to an untagged branch-only contract.
 
@@ -28,7 +28,7 @@ pub const Oid = struct {
 
 pub const BaseKind = git_ref.BranchKind;
 
-/// User intent: which full ref should be resolved by the next Compare load.
+/// User intent: which full ref should be resolved by the next Review load.
 pub const BaseTarget = struct {
     full_ref: []u8,
     display_name: []u8,
@@ -104,7 +104,7 @@ pub const BranchDiffBasis = struct {
 };
 
 /// Reserved for a future lossless History payload with selected parent/root,
-/// merge policy, and ordered parents. Compare never constructs this minimal
+/// merge policy, and ordered parents. Review never constructs this minimal
 /// identity placeholder.
 pub const CommitDiffBasis = struct {
     selected_commit_oid: Oid,

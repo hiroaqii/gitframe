@@ -431,7 +431,7 @@ fn shellSeparatorStyle(_: theme.Palette) chasen.TextStyle {
     return .{ .dim = true };
 }
 
-/// Synchronous page renderer for Changes-only status rows. Compare passes null;
+/// Synchronous page renderer for Changes-only status rows. Review passes null;
 /// the shared pane owns primary and resolver-projected diff bodies.
 pub const StatusOnlyRenderer = struct {
     ctx: *anyopaque,

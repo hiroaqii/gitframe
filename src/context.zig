@@ -29,7 +29,7 @@ pub const SourceContext = struct {
 };
 
 /// Canonical repo-relative path used to connect diff files, status entries,
-/// review state, and sidebar targets.
+/// reviewed state, and sidebar targets.
 ///
 /// The slice is borrowed from the source document. Async payloads or persistent
 /// stores must duplicate the key before keeping it beyond the active load.

@@ -1,4 +1,4 @@
-//! Canonical identity for one normalized Review diff presentation.
+//! Canonical identity for one normalized Changes diff presentation.
 //!
 //! This module deliberately separates what a person can see, navigate, search,
 //! select, or copy from the index-dependent authority used by stage operations.
@@ -224,7 +224,7 @@ fn canonicalPaths(file: diff_parser.FileDiff) CanonicalPaths {
         .new = new,
         // `displayPath` normally resolves to one of these canonical sides. Its
         // header fallback is retained because that exact value is exposed by
-        // the current Review chrome for metadata-only inputs.
+        // the current Changes chrome for metadata-only inputs.
         .display = if (new) |path| path else if (old) |path| path else diff_file.displayPath(file),
     };
 }

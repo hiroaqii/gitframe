@@ -1,7 +1,7 @@
 //! Repository-local tree/source split geometry.
 //!
-//! The user-visible width contract intentionally matches Review, but this
-//! module does not import Review state or layout. Keeping the calculation pure
+//! The user-visible width contract intentionally matches Changes, but this
+//! module does not import Changes state or layout. Keeping the calculation pure
 //! lets rendering, hit testing, source selection, and resize reconciliation use
 //! one Repository-owned authority without coupling the two page domains.
 
@@ -22,7 +22,7 @@ pub const BodyLayout = struct {
     tree_visible: bool,
     source_col: u16,
     source_width: u16,
-    /// Rows 0-1 intentionally mirror Review's spacer before the row-2 Files
+    /// Rows 0-1 intentionally mirror the Changes page's spacer before the row-2 Files
     /// heading. Projected root/tree navigation begins at row 3.
     header_rows: u16 = 3,
 

@@ -370,7 +370,7 @@ test "layout shows stats only for repository root rows" {
     try std.testing.expectEqual(@as(?u16, null), directory_layout.stats_col);
 }
 
-test "review root row has no disclosure state" {
+test "diff root row has no disclosure state" {
     const nodes = [_]file_tree.Node{.{
         .kind = .repo_root,
         .name = "repo",
@@ -387,7 +387,7 @@ test "review root row has no disclosure state" {
     try std.testing.expect(!file_tree.isCollapsed(&collapsed, ""));
 }
 
-test "review markerless root has exact stats and horizontal geometry" {
+test "diff markerless root has exact stats and horizontal geometry" {
     const root_name = "0123456789abcdefghijklmnopqrstuv";
     try std.testing.expectEqual(@as(usize, 32), chasen.text.displayWidth(root_name));
     const nodes = [_]file_tree.Node{.{

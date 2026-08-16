@@ -1,6 +1,6 @@
 //! flow-syntax adapter for one complete Repository source file.
 //!
-//! Unlike Review's hunk-side adapter, Repository already owns a complete file.
+//! Unlike the Changes page's hunk-side adapter, Repository already owns a complete file.
 //! One query cache, syntax instance, refresh, and render preserve cross-hunk
 //! language context and avoid multiplying parser setup by the number of hunks.
 

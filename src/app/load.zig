@@ -3556,16 +3556,16 @@ test "ReviewLoadTask duplicate retains physical root after path replacement" {
     defer root.deinit();
     var parent_env = std.process.Environ.Map.init(allocator);
     defer parent_env.deinit();
-    try parent_env.put("UTSUWA_COMPARE_CANARY", "queue-time");
+    try parent_env.put("UTSUWA_REVIEW_CANARY", "queue-time");
     try parent_env.put("GIT_DIR", "/definitely/not/the/pinned/repository");
 
     const task = try allocator.create(Task);
     task.* = try Task.init(page.RequestIdentity.review(2, 3), 1, root, null, &parent_env, allocator);
-    try std.testing.expectEqualStrings("queue-time", task.environment.map.get("UTSUWA_COMPARE_CANARY").?);
+    try std.testing.expectEqualStrings("queue-time", task.environment.map.get("UTSUWA_REVIEW_CANARY").?);
     try std.testing.expect(task.environment.map.get("GIT_DIR") == null);
     try std.testing.expect(parent_env.get("GIT_DIR") != null);
-    try parent_env.put("UTSUWA_COMPARE_CANARY", "mutated-after-queue");
-    try std.testing.expectEqualStrings("queue-time", task.environment.map.get("UTSUWA_COMPARE_CANARY").?);
+    try parent_env.put("UTSUWA_REVIEW_CANARY", "mutated-after-queue");
+    try std.testing.expectEqualStrings("queue-time", task.environment.map.get("UTSUWA_REVIEW_CANARY").?);
     try tmp.dir.rename("repo", tmp.dir, "pinned-repo", io);
     try tmp.dir.createDir(io, "repo", .default_dir);
     var replacement = try tmp.dir.openDir(io, "repo", .{});

@@ -127,7 +127,7 @@ pub const Palette = struct {
         palette.set(.pane_cursor_bg, .{ .rgb = .{ 45, 48, 58 } });
         // Keep the active pane line marker independent from syntax accent
         // colors so it stays distinct from adjacent source tokens. Repository
-        // uses it today; Review adopts the same presentation role separately.
+        // uses it directly; Changes and Review use it through shared diff rendering.
         palette.set(.pane_active_line_number, .{ .rgb = .{ 255, 218, 170 } });
 
         palette.deriveSyntaxRoles();

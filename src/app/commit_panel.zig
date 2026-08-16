@@ -199,7 +199,7 @@ pub const StagedSummary = union(enum) {
     unavailable,
 };
 
-/// Self-owned state for the review-screen commit popup.
+/// Self-owned state for the Changes-screen commit popup.
 ///
 /// Text storage is allocator-backed because commit messages are variable-size
 /// user input. Closing the popup clears content while retaining capacity;

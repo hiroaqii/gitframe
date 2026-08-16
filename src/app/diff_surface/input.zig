@@ -1,6 +1,6 @@
 //! Modal keyboard and paste mapping shared by read-only diff surfaces.
 //!
-//! Normal-mode mapping remains page-owned because Review and Compare extend
+//! Normal-mode mapping remains page-owned because Changes and Review extend
 //! the shared vocabulary with different commands and authority.
 
 const std = @import("std");

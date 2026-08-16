@@ -128,7 +128,7 @@ pub fn sourceAllowsEditorAction(source: SourceMode) bool {
     };
 }
 
-/// Whether a Review model has current-repository path authority for a direct
+/// Whether a Changes model has current-repository path authority for a direct
 /// Repository page link. Repository-backed history still lacks a claim about
 /// the current working-tree surface, so `range` remains intentionally false.
 pub fn sourceAllowsRepositoryLink(source: SourceMode) bool {
@@ -657,7 +657,7 @@ test "stage action is narrower than stage projection" {
     try std.testing.expect(!sourceAllowsEditorAction(.{ .range = "main...HEAD" }));
 }
 
-test "repository link accepts only current repository review sources" {
+test "repository link accepts only current repository Changes sources" {
     try std.testing.expect(sourceAllowsRepositoryLink(.unstaged));
     try std.testing.expect(sourceAllowsRepositoryLink(.cached));
     try std.testing.expect(!sourceAllowsRepositoryLink(.stdin));

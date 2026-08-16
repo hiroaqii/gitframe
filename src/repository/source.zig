@@ -1,5 +1,5 @@
 //! Bounded current-file source coordinates shared by Repository source view
-//! and Review's generated preview for an untracked file.
+//! and the Changes page's generated preview for an untracked file.
 //!
 //! `Document` owns the safe UTF-8 bytes accepted by `repository/document.zig`.
 //! Lines borrow those bytes through 32-bit offsets; no per-line text is copied.

@@ -105,7 +105,7 @@ pub fn pendingReloadConsumption(
 ///
 /// App computes text equality and performs any visible mutation. A non-consumed
 /// pending reload is represented as `consumed_pending_is_watch = false`, keeping
-/// this helper independent of Review-owned `ReloadKind` and `PendingReload`.
+/// this helper independent of Changes-owned `ReloadKind` and `PendingReload`.
 pub fn watchReloadRebuildDecision(
     consumed_pending_is_watch: bool,
     has_current_loaded: bool,

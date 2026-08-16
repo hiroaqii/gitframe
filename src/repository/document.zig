@@ -1,7 +1,7 @@
 //! Descriptor-safe, bounded snapshot of one repository-relative object.
 //!
 //! This module is page-neutral: Repository uses it for selected-file browsing,
-//! while Review uses the same contract for primary and syntax rereads of an
+//! while the Changes page uses the same contract for primary and syntax rereads of an
 //! untracked generated preview. Keeping one loader is important because a
 //! separate stat-then-open helper would reintroduce symlink substitution and
 //! blocking special-file windows at exactly the async ownership boundary.

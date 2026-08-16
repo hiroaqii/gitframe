@@ -1,4 +1,4 @@
-//! Parse-only ownership for one raw diff component of a Review projection.
+//! Parse-only ownership for one raw diff component of a Changes projection.
 //!
 //! A mixed staged/unstaged presentation first needs the exact Git patch and
 //! parsed hunk authority, but syntax, tree, and rendered-row decoration are

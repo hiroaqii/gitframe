@@ -323,7 +323,7 @@ const PreparedVisibleNodeRebuild = struct {
     }
 };
 
-test "review root expansion keeps repository root children in filtered projection" {
+test "diff root expansion keeps repository root children in filtered projection" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();

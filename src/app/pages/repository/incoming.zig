@@ -1,4 +1,4 @@
-//! Repository-owned half of contextual Review -> Repository navigation.
+//! Repository-owned half of contextual Changes -> Repository navigation.
 //!
 //! The shell prepares `page_link.RepositoryIncoming` before page mutation.
 //! `State.accept` is the allocation-free, infallible commit boundary: it

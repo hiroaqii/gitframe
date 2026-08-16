@@ -721,7 +721,7 @@ pub fn drawSourceWithRetained(
         if (viewer.line_numbers) {
             const number = try std.fmt.allocPrint(surface.frameAllocator(), "{d}", .{line_index + 1});
             const number_col: u16 = @intCast(@as(usize, geometry.line_number_col) + geometry.line_number_width - chasen.text.displayWidth(number));
-            // Repository has no separate Review-style cursor gutter marker.
+            // Repository has no separate Changes-style cursor gutter marker.
             // Promote only the active current line-number digits so retained
             // source position never looks focused while the tree is active.
             // The dedicated role keeps this focus cue distinct from syntax.
@@ -3110,7 +3110,7 @@ test "repository filter discoverability distinguishes loading unavailable and no
         try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
-        // The Review-compatible default keeps the source pane usable instead
+        // The Changes-compatible default keeps the source pane usable instead
         // of widening for prose, so assert the distinct state label that is
         // guaranteed to fit and let the existing narrow matrix cover clipping.
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed-file status unavailable") != null);

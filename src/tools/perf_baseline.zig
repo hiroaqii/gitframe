@@ -11,7 +11,7 @@
 //!   zig build perf-baseline -Doptimize=ReleaseFast
 //!
 //! `zig build test` compiles this executable but does not run the benchmark. This tool
-//! does not profile staged Review projection or flow-syntax stages; use
+//! does not profile staged Changes projection or flow-syntax stages; use
 //! `projection-perf` with a recorded patch for that purpose.
 
 const std = @import("std");

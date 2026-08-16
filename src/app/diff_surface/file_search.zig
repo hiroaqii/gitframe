@@ -1,8 +1,8 @@
-//! Review file-search candidate ownership and semantic identity.
+//! Changes file-search candidate ownership and semantic identity.
 //!
 //! A candidate is more than a tree index: it borrows an exact path from one
 //! accepted sidebar owner and is valid only for that owner's repository,
-//! source session, and sidebar revision. Keeping this contract in Review page
+//! source session, and sidebar revision. Keeping this contract in Changes page
 //! state lets rendering and submit consume the same typed candidate while
 //! reload code can clear every borrow before replacing its arena.
 
@@ -97,7 +97,7 @@ pub const BuildOptions = struct {
 ///
 /// The scan intentionally uses every accepted tree node rather than only the
 /// materialized visible rows: a matching file remains discoverable below a
-/// collapsed root/directory, while Review's hide-reviewed and changed-file
+/// collapsed root/directory, while Changes' hide-reviewed and changed-file
 /// lenses still define candidate eligibility. Only matching rows consume the
 /// fixed result budget, so an early non-match cannot hide a later match.
 pub fn buildProjection(
@@ -155,7 +155,7 @@ pub fn buildProjection(
     };
 }
 
-/// Review-owned prompt and candidate projection.
+/// Changes-owned prompt and candidate projection.
 ///
 /// Prompt input survives an unavailable rebuild. Candidate data does not: an
 /// unavailable state always owns no arrays and therefore cannot accidentally
@@ -259,7 +259,7 @@ pub fn advanceAcceptedSidebarRevision(
     revision.* = nextAcceptedSidebarRevision(revision.*);
 }
 
-test "review file search basis requires a nonzero accepted sidebar revision" {
+test "Changes file search basis requires a nonzero accepted sidebar revision" {
     const invalid: Basis = .{ .repo_epoch = 4, .source_session_revision = 9, .accepted_sidebar_revision = 0 };
     const valid: Basis = .{ .repo_epoch = 4, .source_session_revision = 9, .accepted_sidebar_revision = 1 };
     try std.testing.expect(!invalid.valid());
@@ -271,7 +271,7 @@ test "review file search basis requires a nonzero accepted sidebar revision" {
     try std.testing.expectEqual(@as(u64, 1), nextAcceptedSidebarRevision(std.math.maxInt(u64)));
 }
 
-test "review file search publishes and focuses one exact typed candidate" {
+test "Changes file search publishes and focuses one exact typed candidate" {
     const allocator = std.testing.allocator;
     const basis: Basis = .{ .repo_epoch = 2, .source_session_revision = 3, .accepted_sidebar_revision = 4 };
     const candidates = try allocator.dupe(Candidate, &.{
@@ -322,7 +322,7 @@ test "review file search publishes and focuses one exact typed candidate" {
     try std.testing.expect(!focused.matchesNode(basis, 2, wrong_path));
 }
 
-test "review file search unavailable terminal keeps prompt and owns no stale candidates" {
+test "Changes file search unavailable terminal keeps prompt and owns no stale candidates" {
     const allocator = std.testing.allocator;
     const basis: Basis = .{ .repo_epoch = 1, .source_session_revision = 1, .accepted_sidebar_revision = 1 };
     const candidates = try allocator.dupe(Candidate, &.{.{
@@ -352,7 +352,7 @@ test "review file search unavailable terminal keeps prompt and owns no stale can
     try std.testing.expect(state.focusedCandidate() == null);
 }
 
-test "review file search builder applies lenses but searches collapsed descendants" {
+test "Changes file search builder applies lenses but searches collapsed descendants" {
     const allocator = std.testing.allocator;
     const nodes = [_]file_tree.Node{
         .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
@@ -397,7 +397,7 @@ test "review file search builder applies lenses but searches collapsed descendan
     try std.testing.expectEqualStrings("src/reviewed.zig", modified.filter.labels[1]);
 }
 
-test "review file search builder bounds matching candidates and reports truncation" {
+test "Changes file search builder bounds matching candidates and reports truncation" {
     const allocator = std.testing.allocator;
     const nodes = try allocator.alloc(file_tree.Node, max_candidates + 1);
     defer allocator.free(nodes);
@@ -425,7 +425,7 @@ test "review file search builder bounds matching candidates and reports truncati
     try std.testing.expect(projection.truncated);
 }
 
-test "review file search builder releases every partial allocation" {
+test "Changes file search builder releases every partial allocation" {
     const nodes = [_]file_tree.Node{.{
         .kind = .file,
         .name = "main.zig",

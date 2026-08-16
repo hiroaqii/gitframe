@@ -94,7 +94,7 @@ pub fn build(
 /// Build one normalized display while placing retained presentation facts and
 /// replaceable index authority in independent allocation domains. Passing the
 /// same allocator preserves the convenient single-owner form used by leaf
-/// tests and the developer profiler; Review uses distinct arenas.
+/// tests and the developer profiler; Changes uses distinct arenas.
 pub fn buildWithAllocators(
     presentation_allocator: std.mem.Allocator,
     authority_allocator: std.mem.Allocator,
