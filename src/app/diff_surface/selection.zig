@@ -1,4 +1,4 @@
-//! Owned Review selection candidates and their stable content basis.
+//! Owned Changes selection candidates and their stable content basis.
 //!
 //! Live drag coordinates borrow the currently displayed model. Release must
 //! convert them transactionally into this module's owned paths, fragments, and
@@ -87,10 +87,6 @@ pub const ContentToken = struct {
     }
 };
 
-/// Compatibility alias while Review-local callers migrate to the shared
-/// diff-surface vocabulary.
-pub const ReviewContentToken = ContentToken;
-
 pub const Parsed = struct {
     canonical_path: []u8,
     old_path: ?[]u8,
@@ -138,7 +134,7 @@ pub const Generated = struct {
 };
 
 pub const CompletedSelection = struct {
-    token: ReviewContentToken,
+    token: ContentToken,
     value: union(enum) {
         parsed_diff: Parsed,
         generated_untracked: Generated,
@@ -184,7 +180,7 @@ pub const CompletedSelection = struct {
 
 pub fn buildParsed(
     allocator: std.mem.Allocator,
-    token: ReviewContentToken,
+    token: ContentToken,
     file: diff_parser.FileDiff,
     selection: diff_selection.DragSelection,
 ) !CompletedSelection {
@@ -226,7 +222,7 @@ pub fn buildParsed(
 
 pub fn buildGenerated(
     allocator: std.mem.Allocator,
-    token: ReviewContentToken,
+    token: ContentToken,
     path: []const u8,
     document: *const repository_source.Document,
     selection: diff_selection.DragSelection,
@@ -291,7 +287,7 @@ fn optionalRootIdentityEql(left: ?root_capability.Identity, right: ?root_capabil
 }
 
 test "content token ignores delivery identity by construction and separates source parameters" {
-    const base = ReviewContentToken{
+    const base = ContentToken{
         .repo_epoch = 3,
         .root_identity = .{ .device = 1, .inode = 2 },
         .source = SourceBasis.init(.{ .range = "main...HEAD" }),
@@ -316,7 +312,7 @@ test "content token ignores delivery identity by construction and separates sour
     changed.display = .{ .loaded = Fingerprint.init("other diff") };
     try std.testing.expect(!base.eql(changed));
 
-    const cached = ReviewContentToken{
+    const cached = ContentToken{
         .repo_epoch = base.repo_epoch,
         .root_identity = base.root_identity,
         .source = base.source,
@@ -333,7 +329,7 @@ test "content token ignores delivery identity by construction and separates sour
     changed.display.cached_projection.cached = Fingerprint.init("changed cached");
     try std.testing.expect(!cached.eql(changed));
 
-    const combined = ReviewContentToken{
+    const combined = ContentToken{
         .repo_epoch = base.repo_epoch,
         .root_identity = base.root_identity,
         .source = base.source,
@@ -344,7 +340,7 @@ test "content token ignores delivery identity by construction and separates sour
     changed.display.combined_projection = .init(10);
     try std.testing.expect(!combined.eql(changed));
 
-    const generated = ReviewContentToken{
+    const generated = ContentToken{
         .repo_epoch = base.repo_epoch,
         .root_identity = base.root_identity,
         .source = base.source,

@@ -431,7 +431,7 @@ fn shellSeparatorStyle(_: theme.Palette) chasen.TextStyle {
     return .{ .dim = true };
 }
 
-/// Synchronous page renderer for Review-only status rows. Compare passes null;
+/// Synchronous page renderer for Changes-only status rows. Compare passes null;
 /// the shared pane owns primary and resolver-projected diff bodies.
 pub const StatusOnlyRenderer = struct {
     ctx: *anyopaque,
@@ -687,7 +687,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     };
 
     const loaded = test_support.loadedDiffOne();
-    var activation = diff_surface.authority.Lifecycle.init(.review);
+    var activation = diff_surface.authority.Lifecycle.init(.changes);
     var status: app_state.StatusMessage = .{};
     var load = test_support.loadState(loaded);
     defer load.clearCurrent(null);

@@ -1,10 +1,10 @@
-//! Page-independent read-only diff surface shared by Review and, from issue
+//! Page-independent read-only diff surface shared by Changes and, from issue
 //! #34 on, the Compare page.
 //!
 //! This module owns the shared view-state vocabulary (viewer, search,
 //! file-search, selection, activation) and the `DiffSurface` pointer bundle
 //! that page adapters build per call. It must not import any page namespace
-//! (`pages/review*`, `pages/compare*`): pages depend on the surface, never the
+//! (`pages/changes*`, `pages/compare*`): pages depend on the surface, never the
 //! other way around.
 
 const std = @import("std");
@@ -213,7 +213,7 @@ pub const ReadSurface = struct {
 
 /// Borrowed, per-call capability over one page's shared diff state.
 ///
-/// Pages own the fields; an adapter (`ReviewPageState.diffSurface`) builds this
+/// Pages own the fields; an adapter (`ChangesPageState.diffSurface`) builds this
 /// bundle on demand, so no field moves and no long-lived aliasing exists. The
 /// two partial-lift members are narrowed on purpose: the surface sees a reload
 /// anchor and whether a live-drag deferred source apply is held, never the

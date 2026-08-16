@@ -1,13 +1,13 @@
 const std = @import("std");
 
 const app_actions = @import("../actions.zig");
-const review_page = @import("../pages/review.zig");
-const action_fence = @import("../pages/review/action_fence.zig");
+const changes_page = @import("../pages/changes.zig");
+const action_fence = @import("../pages/changes/action_fence.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 
 const Harness = struct {
     runtime: action_lifecycle.ActionRuntime = .{},
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
 
     fn controller(self: *Harness) action_lifecycle.Controller {
         return .{
@@ -18,12 +18,12 @@ const Harness = struct {
 
     fn fence(self: *Harness) action_fence.Controller {
         return .{
-            .read_authority = &self.review.repository_read_authority,
-            .activation = &self.review.activation,
-            .action_cursor = &self.review.action_cursor,
-            .auto_reload = &self.review.auto_reload,
-            .review_projection = &self.review.review_projection,
-            .deferred_projection_apply = &self.review.deferred_projection_apply,
+            .read_authority = &self.changes.repository_read_authority,
+            .activation = &self.changes.activation,
+            .action_cursor = &self.changes.action_cursor,
+            .auto_reload = &self.changes.auto_reload,
+            .changes_projection = &self.changes.changes_projection,
+            .deferred_projection_apply = &self.changes.deferred_projection_apply,
         };
     }
 

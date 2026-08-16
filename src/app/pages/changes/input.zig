@@ -1,7 +1,7 @@
-//! Review-local keyboard and paste mapping.
+//! Changes-local keyboard and paste mapping.
 //!
 //! The shell resolves prompt/overlay precedence before delegating here. This
-//! module returns Review-owned semantic messages and has no dependency on App,
+//! module returns Changes-owned semantic messages and has no dependency on App,
 //! shell overlays, processes, or effect handles.
 
 const std = @import("std");
@@ -9,16 +9,16 @@ const chasen = @import("chasen");
 const keymap = @import("keymap");
 const diff_surface_input = @import("../../diff_surface/input.zig");
 const key_input = @import("../../key_input.zig");
-const review_page = @import("../review.zig");
-const review_message = @import("message.zig");
+const changes_page = @import("../changes.zig");
+const changes_message = @import("message.zig");
 
-pub const Msg = review_message.Msg;
+pub const Msg = changes_message.Msg;
 
 pub const Context = struct {
     search_mode: bool = false,
     file_search_mode: bool = false,
     search_query_len: usize = 0,
-    focus: review_page.Focus = .sidebar,
+    focus: changes_page.Focus = .sidebar,
     sidebar_hidden: bool = false,
     side_by_side: bool = false,
     review_mode: bool = false,
@@ -38,17 +38,17 @@ pub const Context = struct {
 };
 
 pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
-    return review_message.fromShared(diff_surface_input.pasteToMsg(context.shared(), text) orelse return null);
+    return changes_message.fromShared(diff_surface_input.pasteToMsg(context.shared(), text) orelse return null);
 }
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
-    if (diff_surface_input.keyToMsg(context.shared(), key)) |msg| return review_message.fromShared(msg);
+    if (diff_surface_input.keyToMsg(context.shared(), key)) |msg| return changes_message.fromShared(msg);
     if (context.search_mode or context.file_search_mode) return null;
     return normalKeyToMsg(context, key);
 }
 
 pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?Msg {
-    return review_message.fromShared(diff_surface_input.selectionKeyToMsg(context.shared(), key) orelse return null);
+    return changes_message.fromShared(diff_surface_input.selectionKeyToMsg(context.shared(), key) orelse return null);
 }
 
 fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
@@ -93,10 +93,10 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
 
 fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
     if (keymap.isDocumentNavigationAction(action)) {
-        return review_message.fromShared(diff_surface_input.documentNavigationMsg(action, diff_focused) orelse return null);
+        return changes_message.fromShared(diff_surface_input.documentNavigationMsg(action, diff_focused) orelse return null);
     }
     return switch (action) {
-        .page_review, .page_repository, .page_compare, .page_config => null,
+        .page_changes, .page_repository, .page_compare, .page_config => null,
         .help, .reload => null,
         .search => .enter_search,
         .file_search => .enter_file_search,
@@ -143,7 +143,7 @@ test "file search input owns printable text and candidate movement" {
     try std.testing.expectEqual(Msg{ .file_search_insert = ' ' }, keyToMsg(context, chasen.Key{ .codepoint = ' ' }).?);
 }
 
-test "normal mapping is focus and review-mode aware" {
+test "normal mapping is focus and changes-mode aware" {
     try std.testing.expectEqual(Msg.select_next_file, keyToMsg(.{}, chasen.Key{ .codepoint = 'j' }).?);
     try std.testing.expectEqual(Msg.scroll_diff_down, keyToMsg(.{ .focus = .diff }, chasen.Key{ .codepoint = 'j' }).?);
     try std.testing.expect(keyToMsg(.{}, chasen.Key{ .codepoint = 'q' }) == null);
@@ -162,7 +162,7 @@ test "retained selection actions override line copy and empty escape fallback" {
     }, .{ .codepoint = 'g' }).?);
 }
 
-test "Review keyboard line selection maps side start movement and unavailable Ask" {
+test "Changes keyboard line selection maps side start movement and unavailable Ask" {
     const normal: Context = .{ .focus = .diff, .side_by_side = true };
     try std.testing.expectEqual(Msg{ .keyboard_select_side = .old }, keyToMsg(normal, .{ .codepoint = 'h' }).?);
     try std.testing.expectEqual(Msg{ .keyboard_select_side = .new }, keyToMsg(normal, .{ .codepoint = 'l' }).?);
@@ -185,7 +185,7 @@ test "Review keyboard line selection maps side start movement and unavailable As
     }, .{ .codepoint = chasen.Key.left }).?);
 }
 
-test "shell-owned configured commands are not duplicated by Review" {
+test "shell-owned configured commands are not duplicated by Changes" {
     var config: keymap.Config = .{};
     config.set(.reload, .{ .ctrl = .s });
     const effective = keymap.Effective.fromConfig(config);
@@ -204,7 +204,7 @@ test "focus controls enter arrows sidebar scroll and stage target" {
     try std.testing.expect(keyToMsg(.{ .focus = .diff }, .{ .codepoint = 'S' }) == null);
 }
 
-test "sidebar visibility and width commands remain Review-local" {
+test "sidebar visibility and width commands remain Changes-local" {
     try std.testing.expectEqual(Msg.toggle_focus, keyToMsg(.{}, .{ .codepoint = chasen.Key.tab }).?);
     try std.testing.expect(keyToMsg(.{ .sidebar_hidden = true }, .{ .codepoint = chasen.Key.tab }) == null);
     try std.testing.expectEqual(Msg.toggle_sidebar_visibility, keyToMsg(.{}, .{ .codepoint = 'b', .mods = .{ .shift = true } }).?);
@@ -228,7 +228,7 @@ test "review result commands require review mode" {
     try std.testing.expectEqual(Msg.finish_review_canceled, keyToMsg(.{ .review_mode = true }, .{ .codepoint = 'q' }).?);
 }
 
-test "configured view copy and operation commands map through Review owner" {
+test "configured view copy and operation commands map through Changes owner" {
     var config: keymap.Config = .{};
     config.set(.copy_current_line, .{ .ctrl = .s });
     const effective = keymap.Effective.fromConfig(config);
@@ -238,12 +238,12 @@ test "configured view copy and operation commands map through Review owner" {
     try std.testing.expectEqual(Msg.request_push, keyToMsg(.{}, .{ .codepoint = 'P' }).?);
 }
 
-test "command modifiers do not trigger static Review commands" {
+test "command modifiers do not trigger static Changes commands" {
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'j', .mods = .{ .ctrl = true } }) == null);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'N', .mods = .{ .ctrl = true } }) == null);
 }
 
-test "static Review command matrix preserves configurable defaults" {
+test "static Changes command matrix preserves configurable defaults" {
     const Case = struct { codepoint: u21, expected: Msg };
     const cases = [_]Case{
         .{ .codepoint = 'L', .expected = .toggle_line_numbers },
@@ -257,7 +257,7 @@ test "static Review command matrix preserves configurable defaults" {
     for (cases) |case| try std.testing.expectEqual(case.expected, keyToMsg(.{}, .{ .codepoint = case.codepoint }).?);
 }
 
-test "Review document navigation preserves Home End focus and custom bindings" {
+test "Changes document navigation preserves Home End focus and custom bindings" {
     try std.testing.expectEqual(Msg.select_first_file, keyToMsg(.{}, .{ .codepoint = chasen.Key.home }).?);
     try std.testing.expectEqual(Msg.select_last_file, keyToMsg(.{}, .{ .codepoint = chasen.Key.end }).?);
     try std.testing.expect(keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = 'g' }) == null);
@@ -275,7 +275,7 @@ test "Review document navigation preserves Home End focus and custom bindings" {
     try std.testing.expect(keyToMsg(.{ .focus = .diff, .keymap = custom }, .{ .codepoint = 'g' }) == null);
 }
 
-test "shifted terminal encodings preserve Review commands" {
+test "shifted terminal encodings preserve Changes commands" {
     const Case = struct { lower: u21, upper: u21, expected: Msg };
     const cases = [_]Case{
         .{ .lower = 'f', .upper = 'F', .expected = .cycle_changed_file_filter },

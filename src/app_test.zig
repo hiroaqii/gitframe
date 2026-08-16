@@ -11,17 +11,17 @@ const review_session = @import("review_session/session.zig");
 
 const App = app_module.App;
 
-test "App starts with Review as the only reachable page" {
+test "App starts with Changes as the only reachable working-tree page" {
     const app: App = .{};
 
-    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expectEqual(@as(u64, 0), app.repo_session.repo_epoch);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "selectionContext exposes selected diff file model coordinate" {
     const app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = test_support.loadState(test_support.loadedDiffTwo()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -52,7 +52,7 @@ test "selectionContext exposes selected diff file model coordinate" {
 
 test "selectionContext returns null for unresolved status-only target" {
     const app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .status_only = 2 } },
         } },
@@ -67,7 +67,7 @@ test "selectionContext returns null for unresolved status-only target" {
 
 test "selectionContext resolves status-only target without loaded diff" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .viewer = .{ .selected_target = .{ .status_only = 0 } },
         } },
         .config = .{ .source = .unstaged },
@@ -79,10 +79,10 @@ test "selectionContext resolves status-only target without loaded diff" {
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
     const selection = app.selectionContext();
     try std.testing.expectEqualStrings("/repo", selection.repo_root.?);
@@ -109,7 +109,7 @@ test "selectionContext keeps no-index source paths" {
 
 test "selectionContext returns null selected without a target" {
     const app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .viewer = .{ .selected_target = null },
         } },
         .config = .{ .source = .unstaged },
@@ -141,7 +141,7 @@ test "quit exits when no git action is pending" {
     defer ctx.runtimeClearPendingEffectCopies();
     app.drag_auto_scroll.active = .{
         .generation = 5,
-        .target = .review,
+        .target = .changes,
         .intent = .{ .direction = .down, .endpoint = .{ .col = 4, .row = 8 } },
     };
     app.drag_auto_scroll.scheduled_generation = 5;
@@ -154,22 +154,22 @@ test "quit exits when no git action is pending" {
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_cancels_len);
 }
 
-test "review cancel remains available when source validation failed" {
+test "changes cancel remains available when source validation failed" {
     var output: review_session.Output = .{};
     defer output.deinit(std.testing.allocator);
     var app: App = .{
         .allocator = std.testing.allocator,
         .review_output = &output,
     };
-    _ = app.pages.review.activation.activate(0, .failed, .unavailable, .unavailable);
+    _ = app.pages.changes.activation.activate(0, .failed, .unavailable, .unavailable);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.update(.{ .review = .finish_review_approved }, &ctx);
+    try app.update(.{ .changes = .finish_review_approved }, &ctx);
     try std.testing.expect(!ctx.shouldQuit());
     try std.testing.expect(!output.ready);
-    try std.testing.expectEqualStrings("review source is still being validated", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("review source is still being validated", app.pages.changes.status.text());
 
-    try app.update(.{ .review = .finish_review_canceled }, &ctx);
+    try app.update(.{ .changes = .finish_review_canceled }, &ctx);
     try std.testing.expect(ctx.shouldQuit());
     try std.testing.expect(output.ready);
     try std.testing.expectEqual(@as(u8, 130), output.exit_code);
@@ -187,12 +187,12 @@ test "finishReview waits for pending git action before writing output" {
     var tc: chasen.testing.TestCtx(App.Msg) = .{};
     defer tc.resetTransient();
 
-    try app.update(.{ .review = .finish_review_canceled }, &tc.ctx);
+    try app.update(.{ .changes = .finish_review_canceled }, &tc.ctx);
 
     try std.testing.expect(!tc.ctx.shouldQuit());
     try std.testing.expect(!output.ready);
     try std.testing.expect(app.action_runtime.view().hasPending());
-    try std.testing.expectEqualStrings("finish current git action before finishing review", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("finish current git action before finishing review", app.pages.changes.status.text());
 }
 
 test "finishReview writes output and quits when no git action is pending" {
@@ -202,10 +202,10 @@ test "finishReview writes output and quits when no git action is pending" {
         .allocator = std.testing.allocator,
         .review_output = &output,
     };
-    _ = app.pages.review.activation.activate(0, .fresh, .unavailable, .unavailable);
+    _ = app.pages.changes.activation.activate(0, .fresh, .unavailable, .unavailable);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.update(.{ .review = .finish_review_approved }, &ctx);
+    try app.update(.{ .changes = .finish_review_approved }, &ctx);
 
     try std.testing.expect(ctx.shouldQuit());
     try std.testing.expect(output.ready);
@@ -215,7 +215,7 @@ test "finishReview writes output and quits when no git action is pending" {
 
 test "selectionContext keeps status-only selection while status load is pending" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .viewer = .{ .selected_target = .{ .status_only = 0 } },
             .status_load = .{ .generation = 9, .pending = .{ .generation = 9 } },
         } },
@@ -227,10 +227,10 @@ test "selectionContext keeps status-only selection while status load is pending"
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
     const selection = app.selectionContext();
     const status = selection.selected.?.status_only;
@@ -240,7 +240,7 @@ test "selectionContext keeps status-only selection while status load is pending"
 
 test "selectionContext rejects stale status-only identities" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .viewer = .{ .selected_target = .{ .status_only = 0 } },
         } },
         .repo_session = .{
@@ -251,15 +251,15 @@ test "selectionContext rejects stale status-only identities" {
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/other", &status_bundle);
+    try app.pages.changes.git_status.replace("/other", &status_bundle);
     try std.testing.expect(app.selectionContext().selected == null);
 
-    app.pages.review.git_status.deinit();
+    app.pages.changes.git_status.deinit();
     var matching = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &matching);
-    app.pages.review.viewer.selected_target = .{ .status_only = 1 };
+    try app.pages.changes.git_status.replace("/repo", &matching);
+    app.pages.changes.viewer.selected_target = .{ .status_only = 1 };
     try std.testing.expect(app.selectionContext().selected == null);
 }

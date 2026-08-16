@@ -1,4 +1,4 @@
-//! Review-owned boundary between mutating actions and repository-derived
+//! Changes-owned boundary between mutating actions and repository-derived
 //! reads. The action lifecycle may close or reopen the exact mutation owner;
 //! read coordination receives only the corresponding read-only view.
 
@@ -6,8 +6,8 @@ const std = @import("std");
 const app_actions = @import("../../actions.zig");
 const app_auto_reload = @import("../../auto_reload.zig");
 const diff_authority = @import("../../diff_surface/authority.zig");
-const app_review_projection = @import("../../review_projection.zig");
-const review_page = @import("../review.zig");
+const app_changes_projection = @import("../../changes_projection.zig");
+const changes_page = @import("../changes.zig");
 
 pub const ReloadIntent = union(enum) {
     none,
@@ -17,9 +17,9 @@ pub const ReloadIntent = union(enum) {
 };
 
 pub const View = struct {
-    read_authority: *const review_page.repository_read_authority.ReviewRepositoryReadAuthority,
+    read_authority: *const changes_page.repository_read_authority.ChangesRepositoryReadAuthority,
     activation: *const diff_authority.Lifecycle,
-    action_cursor: *const review_page.action_cursor.State,
+    action_cursor: *const changes_page.action_cursor.State,
 
     pub fn mayStartRepositoryRead(self: View) bool {
         return self.read_authority.mayStartRepositoryRead();
@@ -40,12 +40,12 @@ pub const View = struct {
 };
 
 pub const Controller = struct {
-    read_authority: *review_page.repository_read_authority.ReviewRepositoryReadAuthority,
+    read_authority: *changes_page.repository_read_authority.ChangesRepositoryReadAuthority,
     activation: *diff_authority.Lifecycle,
-    action_cursor: *review_page.action_cursor.State,
+    action_cursor: *changes_page.action_cursor.State,
     auto_reload: *app_auto_reload.State,
-    review_projection: *app_review_projection.State,
-    deferred_projection_apply: *?review_page.DeferredProjectionApply,
+    changes_projection: *app_changes_projection.State,
+    deferred_projection_apply: *?changes_page.DeferredProjectionApply,
 
     pub fn view(self: Controller) View {
         return .{
@@ -65,8 +65,8 @@ pub const Controller = struct {
         if (!self.read_authority.closeForMutation(pending)) return false;
 
         self.auto_reload.supersedeActiveCycleByMutation();
-        self.review_projection.clearPending(allocator);
-        self.review_projection.clearSyntaxPending(allocator);
+        self.changes_projection.clearPending(allocator);
+        self.changes_projection.clearSyntaxPending(allocator);
         if (self.deferred_projection_apply.*) |*deferred| deferred.deinit(allocator);
         self.deferred_projection_apply.* = null;
         return true;

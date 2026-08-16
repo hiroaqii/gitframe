@@ -1,6 +1,6 @@
-//! Review-owned rendering for non-primary diff bodies.
+//! Changes-owned rendering for non-primary diff bodies.
 //!
-//! Both the current Review view and the page-independent `BodyResolver`
+//! Both the current Changes view and the page-independent `BodyResolver`
 //! adapter delegate here. Keeping the presentation in one module prevents the
 //! resolver seam from becoming a second rendering authority.
 
@@ -13,7 +13,7 @@ const diff_syntax_view = @import("../../../diff/syntax_view.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
 const file_tree = @import("../../../file_tree.zig");
 const git_status = @import("../../../git/status.zig");
-const review_projection = @import("../../review_projection.zig");
+const changes_projection = @import("../../changes_projection.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const diff_surface_view = @import("../../diff_surface/view.zig");
 const theme = @import("theme");
@@ -46,7 +46,7 @@ pub fn renderParsed(body: ParsedBody, args: diff_surface.RenderProjectedBodyArgs
     });
 }
 
-pub fn renderGenerated(bundle: *const review_projection.GeneratedFileBundle, args: diff_surface.RenderProjectedBodyArgs) !void {
+pub fn renderGenerated(bundle: *const changes_projection.GeneratedFileBundle, args: diff_surface.RenderProjectedBodyArgs) !void {
     try diff_render.renderGeneratedAddedFile(args.surface, bundle.path, &bundle.source, .{
         .requested_mode = args.requested_mode,
         .display_mode_toggle_key = args.display_mode_toggle_key,
@@ -71,7 +71,7 @@ pub fn renderStatus(path: []const u8, message: []const u8, stats: ?file_tree.Sta
     return diff_surface_view.renderStatusBody(path, message, stats, args);
 }
 
-/// Review-local status-only fallback. This is intentionally not part of the
+/// Changes-local status-only fallback. This is intentionally not part of the
 /// non-primary resolver callback contract.
 pub fn renderStatusOnlyFallback(
     surface: *chasen.Surface,
@@ -98,7 +98,7 @@ pub fn renderStatusOnlyFallback(
         },
         else => {
             try draw.copyClippedTextAt(surface, 0, 4, "No diff is available for this file yet.", .{ .fg = palette.color(.muted), .dim = !active });
-            try draw.copyClippedTextAt(surface, 0, 5, "Loading generated review preview if available.", .{ .fg = palette.color(.muted), .dim = !active });
+            try draw.copyClippedTextAt(surface, 0, 5, "Loading generated changes preview if available.", .{ .fg = palette.color(.muted), .dim = !active });
         },
     }
 }

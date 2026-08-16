@@ -1,4 +1,4 @@
-//! Review-local semantic update ownership.
+//! Changes-local semantic update ownership.
 //!
 //! Shell input, mouse hit-testing, and future Session API producers all route the
 //! same `message.Msg` through this controller. State-only transitions terminate
@@ -14,7 +14,7 @@ const diff_surface_navigation = @import("../../diff_surface/navigation.zig");
 const message = @import("message.zig");
 const navigation = @import("navigation.zig");
 const context = @import("../../../context.zig");
-const review_page = @import("../review.zig");
+const changes_page = @import("../changes.zig");
 const diff_parser = if (builtin.is_test) @import("../../../diff/parser.zig") else struct {};
 const diff_selection = @import("../../../diff/selection.zig");
 const diff_render = @import("../../../diff/render.zig");
@@ -53,17 +53,17 @@ pub const Command = union(enum) {
     }
 };
 
-pub const ReviewUpdate = struct {
+pub const ChangesUpdate = struct {
     command: ?Command = null,
     capture_display_override: bool = false,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
 
-    pub fn deinit(self: *ReviewUpdate, allocator: ?std.mem.Allocator) void {
+    pub fn deinit(self: *ChangesUpdate, allocator: ?std.mem.Allocator) void {
         if (self.command) |*command| command.deinit(allocator);
         self.* = .{};
     }
 
-    pub fn takeCommand(self: *ReviewUpdate) ?Command {
+    pub fn takeCommand(self: *ChangesUpdate) ?Command {
         const command = self.command;
         self.command = null;
         return command;
@@ -76,8 +76,8 @@ pub const Controller = struct {
     /// `allocator` may be null only for transitions that neither allocate nor
     /// return an owned command. Runtime App initialization always supplies one;
     /// the optional form keeps pure page transitions independent of Chasen Ctx.
-    pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !ReviewUpdate {
-        var result: ReviewUpdate = .{};
+    pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !ChangesUpdate {
+        var result: ChangesUpdate = .{};
         var adapter = self.navigation.updateAdapter();
         if (msg.shared()) |shared_msg| {
             var shared_update = try adapter.shared().apply(allocator, shared_msg);
@@ -89,7 +89,7 @@ pub const Controller = struct {
             if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
             result.auto_scroll = shared_update.auto_scroll;
 
-            // This boundary sees semantic Review input after it has either
+            // This boundary sees semantic Changes input after it has either
             // changed the sidebar/file intent or proved to be a no-op. Internal
             // tree rebuild/remap helpers cannot revoke restoration authority.
             if (shared_update.explicit_sidebar_selection_changed) {
@@ -130,8 +130,8 @@ fn commandFromEffect(effect: diff_surface_update.Effect) Command {
     };
 }
 
-test "review update owns state transition and shell intent" {
-    var page: @import("../review.zig").ReviewPageState = .{};
+test "changes update owns state transition and shell intent" {
+    var page: @import("../changes.zig").ChangesPageState = .{};
     var controller: Controller = .{ .navigation = .{
         .page = &page,
         .repo_root = null,
@@ -142,7 +142,7 @@ test "review update owns state transition and shell intent" {
 
     var state_update = try controller.apply(std.testing.allocator, .toggle_focus);
     defer state_update.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@import("../review.zig").Focus.diff, page.viewer.focus);
+    try std.testing.expectEqual(@import("../changes.zig").Focus.diff, page.viewer.focus);
     try std.testing.expect(state_update.command == null);
 
     var shell_update = try controller.apply(std.testing.allocator, .request_push);
@@ -150,13 +150,13 @@ test "review update owns state transition and shell intent" {
     try std.testing.expectEqual(Command.request_push, shell_update.command.?);
 }
 
-test "Review advances selection layout revision only for mapping mode and fold changes" {
+test "Changes advances selection layout revision only for mapping mode and fold changes" {
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = test_support.loadedDiffTwo();
     loaded.collapsed_hunks = try arena.allocator().alloc(bool, loaded.document.totalHunks());
     @memset(loaded.collapsed_hunks, false);
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
@@ -190,11 +190,11 @@ test "Review advances selection layout revision only for mapping mode and fold c
 }
 
 fn installUpdateTestActionCursor(
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
     allocator: std.mem.Allocator,
     path: []const u8,
 ) !void {
-    var prepared = try review_page.action_cursor.Prepared.init(
+    var prepared = try changes_page.action_cursor.Prepared.init(
         allocator,
         3,
         .{ .device = 5, .inode = 8 },
@@ -211,7 +211,7 @@ test "explicit sidebar update supersedes action restore while internal remap doe
     var loaded = test_support.loadedDiffTwo();
     loaded.tree.nodes = &file_search_input_nodes;
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 0 },
     };
@@ -249,7 +249,7 @@ test "file search supersedes action restore only when submit changes selection" 
     var loaded = test_support.loadedDiffTwo();
     loaded.tree.nodes = &file_search_input_nodes;
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 0 },
         .source_session_revision = 5,
@@ -309,7 +309,7 @@ test "explicit parent selection supersedes file action restore" {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var loaded = test_support.loadedDiffRootedNested();
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 2 },
     };
@@ -334,11 +334,11 @@ const file_search_input_nodes = [_]file_tree.Node{
     .{ .kind = .file, .name = "b", .path = "b", .path_key = "b", .depth = 0, .status = .added, .target = .{ .diff_file = 1 } },
 };
 
-test "review file search publishes candidates from enter and input edits" {
+test "changes file search publishes candidates from enter and input edits" {
     const allocator = std.testing.allocator;
     var loaded = test_support.loadedDiffTwo();
     loaded.tree.nodes = &file_search_input_nodes;
-    var page: @import("../review.zig").ReviewPageState = .{
+    var page: @import("../changes.zig").ChangesPageState = .{
         .load = test_support.loadState(loaded),
         .source_session_revision = 5,
         .accepted_sidebar_revision = 7,
@@ -440,11 +440,11 @@ test "review file search publishes candidates from enter and input edits" {
     try std.testing.expectEqualStrings("file search query is too long", page.status.text());
 }
 
-test "review file search candidate failure retains edited input as unavailable" {
+test "changes file search candidate failure retains edited input as unavailable" {
     const allocator = std.testing.allocator;
     var loaded = test_support.loadedDiffTwo();
     loaded.tree.nodes = &file_search_input_nodes;
-    var page: @import("../review.zig").ReviewPageState = .{
+    var page: @import("../changes.zig").ChangesPageState = .{
         .load = test_support.loadState(loaded),
     };
     defer page.deinit(allocator);
@@ -481,11 +481,11 @@ test "review file search candidate failure retains edited input as unavailable" 
     try std.testing.expect(page.file_search.focusedCandidate() == null);
 }
 
-test "review file search missing allocator preserves the published query generation" {
+test "changes file search missing allocator preserves the published query generation" {
     const allocator = std.testing.allocator;
     var loaded = test_support.loadedDiffTwo();
     loaded.tree.nodes = &file_search_input_nodes;
-    var page: @import("../review.zig").ReviewPageState = .{
+    var page: @import("../changes.zig").ChangesPageState = .{
         .load = test_support.loadState(loaded),
         .source_session_revision = 5,
         .accepted_sidebar_revision = 7,
@@ -530,8 +530,8 @@ test "review file search missing allocator preserves the published query generat
     try std.testing.expect(page.file_search.basis.?.eql(a_basis));
 }
 
-test "review mouse release retains candidate until explicit copy or clear" {
-    var page: @import("../review.zig").ReviewPageState = .{
+test "changes mouse release retains candidate until explicit copy or clear" {
+    var page: @import("../changes.zig").ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
     };
     defer page.deinit(std.testing.allocator);
@@ -596,9 +596,9 @@ test "review mouse release retains candidate until explicit copy or clear" {
     try std.testing.expect(page.completed_selection == null);
 }
 
-test "Review keyboard line selection locks side moves allocation-free and completes once" {
+test "Changes keyboard line selection locks side moves allocation-free and completes once" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .focus = .diff,
@@ -729,12 +729,12 @@ test "Review keyboard line selection locks side moves allocation-free and comple
     final_clear.deinit(allocator);
 }
 
-test "Review keyboard line selection clipboard preparation failure installs a retryable candidate" {
+test "Changes keyboard line selection clipboard preparation failure installs a retryable candidate" {
     const allocator = std.testing.allocator;
     var observed_clipboard_failure = false;
     var fail_index: usize = 0;
     while (fail_index < 32 and !observed_clipboard_failure) : (fail_index += 1) {
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .focus = .diff, .sidebar_hidden = true },
         };
@@ -777,7 +777,7 @@ test "Review keyboard line selection clipboard preparation failure installs a re
     try std.testing.expect(observed_clipboard_failure);
 }
 
-test "Review keyboard line selection skips a folded hunk but counts and copies its semantic lines" {
+test "Changes keyboard line selection skips a folded hunk but counts and copies its semantic lines" {
     const Fixture = struct {
         const first_lines = [_]diff_parser.DiffLine{
             .{ .kind = .context, .text = "start", .old_line = 1, .new_line = 1 },
@@ -818,7 +818,7 @@ test "Review keyboard line selection skips a folded hunk but counts and copies i
         .bytes = 0,
         .lines = 0,
     };
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(loaded),
         .viewer = .{
             .focus = .diff,
@@ -859,9 +859,9 @@ test "Review keyboard line selection skips a folded hunk but counts and copies i
     try std.testing.expectEqual(@as(usize, 4), page.completed_selection.?.lineCount());
 }
 
-test "review action rows route mouse Copy and Clear for retained and active keyboard selections" {
+test "changes action rows route mouse Copy and Clear for retained and active keyboard selections" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .sidebar_hidden = true },
     };
@@ -961,9 +961,9 @@ test "review action rows route mouse Copy and Clear for retained and active keyb
     try std.testing.expect(page.completed_selection != null);
 }
 
-test "review header release returns an independent owned path command" {
+test "changes header release returns an independent owned path command" {
     const borrowed_path = "src/app.zig";
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .selection_owner = .{ .diff_header = .{
             .identity = .{ .kind = .loaded_file, .path_key = borrowed_path },
             .moved = true,
@@ -994,9 +994,9 @@ test "review header release returns an independent owned path command" {
     }
 }
 
-test "review header release allocation failure retains active selection" {
+test "changes header release allocation failure retains active selection" {
     const borrowed_path = "src/app.zig";
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .selection_owner = .{ .diff_header = .{
             .identity = .{ .kind = .loaded_file, .path_key = borrowed_path },
             .moved = true,
@@ -1027,7 +1027,7 @@ test "review header release allocation failure retains active selection" {
 
 test "failed moved release preserves prior candidate without emitting clipboard work" {
     const allocator = std.testing.allocator;
-    var page: @import("../review.zig").ReviewPageState = .{
+    var page: @import("../changes.zig").ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
     };
     defer page.deinit(allocator);
@@ -1068,7 +1068,7 @@ test "failed moved release preserves prior candidate without emitting clipboard 
 
 test "clipboard allocation failure retains the accepted candidate" {
     const allocator = std.testing.allocator;
-    var page: @import("../review.zig").ReviewPageState = .{
+    var page: @import("../changes.zig").ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
     };
     defer page.deinit(allocator);

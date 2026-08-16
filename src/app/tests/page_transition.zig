@@ -17,8 +17,8 @@ const repository_coordinator = @import("../pages/repository/coordinator.zig");
 const repository_layout = @import("../pages/repository/layout.zig");
 const repository_tasks = @import("../pages/repository/tasks.zig");
 const repository_selection = @import("../pages/repository/selection.zig");
-const review_page = @import("../pages/review.zig");
-const review_authority = @import("../diff_surface/authority.zig");
+const changes_page = @import("../pages/changes.zig");
+const changes_authority = @import("../diff_surface/authority.zig");
 const context = @import("../../context.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_basis = @import("../diff_basis.zig");
@@ -52,9 +52,9 @@ const RepositoryDocumentTask = repository_tasks.DocumentTask(app_message.Msg);
 const RepositorySyntaxTask = repository_tasks.SyntaxTask(app_message.Msg);
 const RepositoryChangeMapTask = repository_tasks.ChangeMapTask(app_message.Msg);
 
-fn activateReview(app: *App) u64 {
-    const source_member: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        switch (app.pages.review.load.state) {
+fn activateChanges(app: *App) u64 {
+    const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+        switch (app.pages.changes.load.state) {
             .loaded, .empty => .immutable,
             .loading => .pending,
             .failed => .failed,
@@ -62,8 +62,8 @@ fn activateReview(app: *App) u64 {
         }
     else
         .pending;
-    const auxiliary: review_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
-    return app.pages.review.activation.activate(
+    const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
+    return app.pages.changes.activation.activate(
         app.repo_session.view().epoch(),
         source_member,
         auxiliary,
@@ -78,7 +78,7 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     var app: App = .{
         .allocator = allocator,
         .config = .{ .source = .stdin },
-        .pages = .{ .review = .{ .viewer = .{ .diff_scroll = 17 } } },
+        .pages = .{ .changes = .{ .viewer = .{ .diff_scroll = 17 } } },
         .repo_session = .{
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
@@ -86,7 +86,7 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     defer app.pages.compare.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
-    _ = activateReview(&app);
+    _ = activateChanges(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
@@ -107,7 +107,7 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     ) } } }, &ctx);
     try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
     try std.testing.expect(app.pages.compare.load.state == .loaded);
-    try std.testing.expectEqual(@as(usize, 17), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 17), app.pages.changes.viewer.diff_scroll);
 
     // The production shared-input route must consume the same-owner bound
     // UpdateAdapter rather than reintroducing a raw controller/resolver pair.
@@ -221,9 +221,9 @@ test "keyboard and page bar mouse share the page switch transition" {
     var app: App = .{
         .config = .{ .source = .stdin },
         .terminal_size = .{ .width = 100, .height = 20 },
-        .pages = .{ .review = .{ .load = .{ .state = .{ .empty = .no_changes } } } },
+        .pages = .{ .changes = .{ .load = .{ .state = .{ .empty = .no_changes } } } },
     };
-    _ = activateReview(&app);
+    _ = activateChanges(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }) orelse return error.ExpectedPageSwitch;
@@ -231,7 +231,7 @@ test "keyboard and page bar mouse share the page switch transition" {
     try app.update(keyboard, &ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.initialized);
-    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expect(app.pages.changes.activation.state == .inactive);
 
     try app.update(.reload, &ctx);
     try std.testing.expectEqualStrings("", app.status.text());
@@ -239,29 +239,29 @@ test "keyboard and page bar mouse share the page switch transition" {
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 
     const layout = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
-    const review_tab = page.tab(.review);
+    const changes_tab = page.tab(.changes);
     const bar = layout.page_bar orelse return error.ExpectedPageBar;
     const mouse = app.handleEvent(app_test_support.mouseEvent(
-        bar.col + review_tab.col,
+        bar.col + changes_tab.col,
         bar.row,
         .left,
     )) orelse return error.ExpectedPageSwitch;
-    try std.testing.expectEqual(App.Msg{ .switch_page = .review }, mouse);
+    try std.testing.expectEqual(App.Msg{ .switch_page = .changes }, mouse);
     try app.update(mouse, &ctx);
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expect(app.pages.review.activation.state.satisfiesAction(.read_diff));
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try std.testing.expect(app.pages.changes.activation.state.satisfiesAction(.read_diff));
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
-test "page key 3 activates Compare without replacing retained Review state" {
+test "page key 3 activates Compare without replacing retained Changes state" {
     var app: App = .{
         .config = .{ .source = .stdin },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
             .viewer = .{ .diff_scroll = 11 },
         } },
     };
-    _ = activateReview(&app);
+    _ = activateChanges(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const message = app.handleEvent(.{ .key_press = .{ .codepoint = '3' } }) orelse
@@ -275,9 +275,9 @@ test "page key 3 activates Compare without replacing retained Review state" {
         page.Id.compare,
         app.pages.compare.activation.currentIdentity().?.origin,
     );
-    try std.testing.expect(app.pages.review.activation.state == .inactive);
-    try std.testing.expectEqual(@as(usize, 11), app.pages.review.viewer.diff_scroll);
-    try std.testing.expect(app.pages.review.load.state == .empty);
+    try std.testing.expect(app.pages.changes.activation.state == .inactive);
+    try std.testing.expectEqual(@as(usize, 11), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expect(app.pages.changes.load.state == .empty);
     try std.testing.expect(!app.redraw_plan.resolvesToSkip());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
@@ -311,8 +311,8 @@ test "repository selection shell blocks transition and cancels on focus or resiz
     app.status.clear();
     const shell = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
     const bar = shell.page_bar orelse return error.ExpectedPageBar;
-    const review_tab = page.tab(.review);
-    const mouse_switch = app.handleEvent(app_test_support.mouseEvent(bar.col + review_tab.col, bar.row, .left)) orelse
+    const changes_tab = page.tab(.changes);
+    const mouse_switch = app.handleEvent(app_test_support.mouseEvent(bar.col + changes_tab.col, bar.row, .left)) orelse
         return error.ExpectedPageSwitch;
     try app.update(mouse_switch, &ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
@@ -330,7 +330,7 @@ test "repository selection shell blocks transition and cancels on focus or resiz
     try std.testing.expectEqual(chasen.Size{ .width = 70, .height = 12 }, app.terminal_size);
 }
 
-test "review repository transition common switch commits exact path before revalidation" {
+test "changes repository transition common switch commits exact path before revalidation" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -343,7 +343,7 @@ test "review repository transition common switch commits exact path before reval
         },
         .config = .{ .source = .unstaged },
         .pages = .{
-            .review = .{
+            .changes = .{
                 .repository_read_authority = .{ .epoch = .{ .value = 31 } },
                 .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                 .viewer = .{
@@ -358,7 +358,7 @@ test "review repository transition common switch commits exact path before reval
             },
         },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -367,15 +367,15 @@ test "review repository transition common switch commits exact path before reval
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app.update(.{ .switch_page = .review }, &ctx);
+    try app.update(.{ .switch_page = .changes }, &ctx);
 
-    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expect(!app.pages.repository.active);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 0), app.status.text().len);
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
-    const active = app.pages.review.activation.state.active;
+    const active = app.pages.changes.activation.state.active;
     const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
     const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
     const branch_task: *BranchStatusLoadTask = @ptrCast(@alignCast(entries[1].ctx));
@@ -388,7 +388,7 @@ test "review repository transition common switch commits exact path before reval
     try std.testing.expect(diff_task.read_epoch.eql(.{ .value = 31 }));
 }
 
-test "review repository transition blocker retains page owner and Review state" {
+test "changes repository transition blocker retains page owner and Changes state" {
     const allocator = std.testing.allocator;
     const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
     var app: App = .{
@@ -399,7 +399,7 @@ test "review repository transition blocker retains page owner and Review state" 
         },
         .config = .{ .source = .unstaged },
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
@@ -416,7 +416,7 @@ test "review repository transition blocker retains page owner and Review state" 
             },
         },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     var incoming = try page_link.RepositoryIncoming.initOwned(
         allocator,
@@ -427,20 +427,20 @@ test "review repository transition blocker retains page owner and Review state" 
     app.pages.repository.acceptIncoming(allocator, &incoming);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    try app.update(.{ .switch_page = .review }, &ctx);
+    try app.update(.{ .switch_page = .changes }, &ctx);
 
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.active);
     try std.testing.expect(app.pages.repository.incoming == .awaiting_manifest);
     try std.testing.expectEqualStrings("pending.zig", app.pages.repository.incoming.manifestIntent().?.path);
-    try std.testing.expect(app.pages.review.activation.state == .inactive);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 6), app.pages.review.viewer.diff_scroll);
+    try std.testing.expect(app.pages.changes.activation.state == .inactive);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqualStrings("finish file search before switching pages", app.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
-test "review repository transition keyboard and page bar open the same exact Review path" {
+test "changes repository transition keyboard and page bar open the same exact Changes path" {
     const allocator = std.testing.allocator;
     const inputs = [_]enum { keyboard, page_bar }{ .keyboard, .page_bar };
 
@@ -457,7 +457,7 @@ test "review repository transition keyboard and page bar open the same exact Rev
             .terminal_size = .{ .width = 100, .height = 20 },
             .config = .{ .source = .unstaged },
             .pages = .{
-                .review = .{
+                .changes = .{
                     .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                     .viewer = .{
                         .selected_target = .{ .diff_file = 0 },
@@ -471,7 +471,7 @@ test "review repository transition keyboard and page bar open the same exact Rev
                 },
             },
         };
-        defer app.pages.review.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
         app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -483,28 +483,28 @@ test "review repository transition keyboard and page bar open the same exact Rev
             .keyboard => app.handleEvent(.{ .key_press = .{ .codepoint = '1' } }),
             .page_bar => blk: {
                 const layout = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
-                const review_tab = page.tab(.review);
+                const changes_tab = page.tab(.changes);
                 const bar = layout.page_bar orelse return error.ExpectedPageBar;
                 break :blk app.handleEvent(app_test_support.mouseEvent(
-                    bar.col + review_tab.col,
+                    bar.col + changes_tab.col,
                     bar.row,
                     .left,
                 ));
             },
         } orelse return error.ExpectedPageSwitch;
-        try std.testing.expectEqual(App.Msg{ .switch_page = .review }, message);
+        try std.testing.expectEqual(App.Msg{ .switch_page = .changes }, message);
 
         try app.update(message, &ctx);
 
-        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expectEqual(page.Id.changes, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
-        try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+        try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
         try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
     }
 }
 
-test "review repository transition active Repository controls remain same-page no-ops" {
+test "changes repository transition active Repository controls remain same-page no-ops" {
     const allocator = std.testing.allocator;
     const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
     const inputs = [_]enum { keyboard, page_bar }{ .keyboard, .page_bar };
@@ -556,12 +556,12 @@ test "review repository transition active Repository controls remain same-page n
         try std.testing.expect(app.pages.repository.incoming == .awaiting_manifest);
         try std.testing.expectEqualStrings("pending.zig", app.pages.repository.incoming.manifestIntent().?.path);
         try std.testing.expectEqualStrings("retained.zig", app.pages.repository.selected_path.?);
-        try std.testing.expect(app.pages.review.activation.state == .inactive);
+        try std.testing.expect(app.pages.changes.activation.state == .inactive);
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     }
 }
 
-test "review repository transition common switch maps retained-location outcomes" {
+test "changes repository transition common switch maps retained-location outcomes" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
         path: ?[]const u8,
@@ -570,11 +570,11 @@ test "review repository transition common switch maps retained-location outcomes
         identity_mismatch: bool = false,
         status: []const u8,
     }{
-        .{ .path = "b", .status = "Repository file is already selected in Review" },
-        .{ .path = "missing.zig", .status = "Repository file is not part of the current Review" },
-        .{ .path = "b", .retained_index = 0, .hide_reviewed = true, .status = "Repository file is hidden by Review filters" },
-        .{ .path = "b", .retained_index = 0, .identity_mismatch = true, .status = "Repository changed before Review navigation" },
-        .{ .path = null, .status = "Repository has no resolved file to open in Review" },
+        .{ .path = "b", .status = "Repository file is already selected in Changes" },
+        .{ .path = "missing.zig", .status = "Repository file is not part of the current Changes" },
+        .{ .path = "b", .retained_index = 0, .hide_reviewed = true, .status = "Repository file is hidden by Changes filters" },
+        .{ .path = "b", .retained_index = 0, .identity_mismatch = true, .status = "Repository changed before Changes navigation" },
+        .{ .path = null, .status = "Repository has no resolved file to open in Changes" },
     };
 
     for (cases) |case| {
@@ -592,7 +592,7 @@ test "review repository transition common switch maps retained-location outcomes
             },
             .config = .{ .source = .unstaged },
             .pages = .{
-                .review = .{
+                .changes = .{
                     .load = app_test_support.loadState(loaded),
                     .viewer = .{
                         .selected_target = .{ .diff_file = case.retained_index },
@@ -609,7 +609,7 @@ test "review repository transition common switch maps retained-location outcomes
                 },
             },
         };
-        defer app.pages.review.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
         app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -621,27 +621,27 @@ test "review repository transition common switch maps retained-location outcomes
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
         defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-        try app.update(.{ .switch_page = .review }, &ctx);
+        try app.update(.{ .switch_page = .changes }, &ctx);
 
-        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expectEqual(page.Id.changes, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
-        try std.testing.expectEqual(case.retained_index, app.pages.review.viewer.selected_node);
-        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = case.retained_index }, app.pages.review.viewer.selected_target.?);
+        try std.testing.expectEqual(case.retained_index, app.pages.changes.viewer.selected_node);
+        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = case.retained_index }, app.pages.changes.viewer.selected_target.?);
         try std.testing.expect(std.meta.eql(
             if (case.retained_index == 0)
                 diff_view_model.BodyCoordinate{ .metadata = 0 }
             else
                 diff_view_model.BodyCoordinate{ .metadata = 1 },
-            app.pages.review.viewer.diff_cursor,
+            app.pages.changes.viewer.diff_cursor,
         ));
-        try std.testing.expectEqual(@as(usize, 9), app.pages.review.viewer.diff_scroll);
-        try std.testing.expectEqual(case.hide_reviewed, app.pages.review.review_display.hide_reviewed_files);
+        try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(case.hide_reviewed, app.pages.changes.review_display.hide_reviewed_files);
         try std.testing.expectEqualStrings(case.status, app.status.text());
         try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
     }
 }
 
-test "review repository transition common switch consumes pending and unavailable no context" {
+test "changes repository transition common switch consumes pending and unavailable no context" {
     const allocator = std.testing.allocator;
     const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
     const cases = [_]enum { pending, unavailable }{ .pending, .unavailable };
@@ -655,7 +655,7 @@ test "review repository transition common switch consumes pending and unavailabl
             },
             .config = .{ .source = .stdin },
             .pages = .{
-                .review = .{
+                .changes = .{
                     .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
                     .viewer = .{
                         .selected_target = .{ .diff_file = 0 },
@@ -671,7 +671,7 @@ test "review repository transition common switch consumes pending and unavailabl
                 },
             },
         };
-        defer app.pages.review.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
         var incoming = try page_link.RepositoryIncoming.initOwned(
             allocator,
@@ -688,19 +688,19 @@ test "review repository transition common switch consumes pending and unavailabl
         app.pages.repository.acceptIncoming(allocator, &incoming);
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-        try app.update(.{ .switch_page = .review }, &ctx);
+        try app.update(.{ .switch_page = .changes }, &ctx);
 
-        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expectEqual(page.Id.changes, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
         try std.testing.expect(app.pages.repository.incoming == .none);
-        try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-        try std.testing.expectEqual(@as(usize, 6), app.pages.review.viewer.diff_scroll);
-        try std.testing.expectEqualStrings("Repository has no resolved file to open in Review", app.status.text());
+        try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+        try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqualStrings("Repository has no resolved file to open in Changes", app.status.text());
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     }
 }
 
-test "review repository transition inactive Repository retains contextual selection" {
+test "changes repository transition inactive Repository retains contextual selection" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -713,7 +713,7 @@ test "review repository transition inactive Repository retains contextual select
         },
         .config = .{ .source = .unstaged },
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
@@ -727,7 +727,7 @@ test "review repository transition inactive Repository retains contextual select
             },
         },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -743,18 +743,18 @@ test "review repository transition inactive Repository retains contextual select
     try std.testing.expect(app.pages.repository.active);
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
 
-    try app.update(.{ .switch_page = .review }, &ctx);
-    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try app.update(.{ .switch_page = .changes }, &ctx);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     // Public App updates also run the common tail: the two Repository members
-    // join Review's three reads and Compare's retained snapshot task.
+    // join Changes's three reads and Compare's retained snapshot task.
     try std.testing.expectEqual(@as(u8, 6), ctx._pending_tasks_with_len);
 }
 
-test "review repository transition keyboard opens exact retained path with line owner" {
+test "changes repository transition keyboard opens exact retained path with line owner" {
     const allocator = std.testing.allocator;
     const repository_manifest = @import("../../repository/manifest.zig");
     const repository_tree = @import("../../repository/tree.zig");
@@ -775,7 +775,7 @@ test "review repository transition keyboard opens exact retained path with line 
         },
         .config = .{ .source = .unstaged },
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
                 .viewer = .{ .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
             },
@@ -789,7 +789,7 @@ test "review repository transition keyboard opens exact retained path with line 
         },
     };
     document_owned = false;
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.discovery = try testSingleRepoDiscovery(allocator, roots.a);
@@ -805,7 +805,7 @@ test "review repository transition keyboard opens exact retained path with line 
     try app.update(keyboard, &ctx);
 
     try std.testing.expectEqual(page.Id.repository, app.active_page);
-    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expect(app.pages.changes.activation.state == .inactive);
     try std.testing.expectEqualStrings("a", app.pages.repository.selected_path.?);
     try std.testing.expect(app.pages.repository.incoming == .awaiting_document);
     const pending = app.pages.repository.incoming.documentIntent().?;
@@ -814,12 +814,12 @@ test "review repository transition keyboard opens exact retained path with line 
     try std.testing.expectEqual(@as(u64, 2), pending.manifest_revision);
     try std.testing.expect(std.meta.eql(
         diff_view_model.BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } },
-        app.pages.review.viewer.diff_cursor,
+        app.pages.changes.viewer.diff_cursor,
     ));
     try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
 }
 
-test "review repository transition page bar exposes deleted target as unavailable" {
+test "changes repository transition page bar exposes deleted target as unavailable" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -831,7 +831,7 @@ test "review repository transition page bar exposes deleted target as unavailabl
         },
         .terminal_size = .{ .width = 100, .height = 20 },
         .config = .{ .source = .unstaged },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
             .viewer = .{
                 .selected_node = 1,
@@ -839,7 +839,7 @@ test "review repository transition page bar exposes deleted target as unavailabl
             },
         } },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -858,7 +858,7 @@ test "review repository transition page bar exposes deleted target as unavailabl
     try app.update(mouse, &ctx);
 
     try std.testing.expectEqual(page.Id.repository, app.active_page);
-    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expect(app.pages.changes.activation.state == .inactive);
     const unavailable = app.pages.repository.incomingUnavailable().?;
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.no_current_path, unavailable.reason);
     try std.testing.expectEqualStrings("src/deleted.zig", unavailable.path);
@@ -872,17 +872,17 @@ test "live review waiter blocks direct keyboard and mouse page switches with one
         .review_output = &output,
         .terminal_size = .{ .width = 100, .height = 20 },
     };
-    _ = activateReview(&app);
+    _ = activateChanges(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.update(.{ .switch_page = .repository }, &ctx);
-    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
 
     app.status.clear();
     const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '3' } }) orelse return error.ExpectedPageSwitch;
     try app.update(keyboard, &ctx);
-    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
 
     app.status.clear();
@@ -892,7 +892,7 @@ test "live review waiter blocks direct keyboard and mouse page switches with one
     const mouse = app.handleEvent(app_test_support.mouseEvent(bar.col + config_tab.col, bar.row, .left)) orelse
         return error.ExpectedPageSwitch;
     try app.update(mouse, &ctx);
-    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
 }
 
@@ -1097,12 +1097,12 @@ const TestRepoPair = struct {
     }
 };
 
-fn repositoryIncomingViewportReviewDiffForTest() LoadedDiff {
+fn repositoryIncomingViewportChangesDiffForTest() LoadedDiff {
     return .{
         .text = "",
-        .document = .{ .files = &repository_incoming_viewport_review_files },
-        .file_text_eligibility = &repository_incoming_viewport_review_eligibility,
-        .tree = .{ .nodes = &repository_incoming_viewport_review_tree_nodes },
+        .document = .{ .files = &repository_incoming_viewport_changes_files },
+        .file_text_eligibility = &repository_incoming_viewport_changes_eligibility,
+        .tree = .{ .nodes = &repository_incoming_viewport_changes_tree_nodes },
         .collapsed_dirs = .{},
         .bytes = 0,
         .lines = 0,
@@ -1141,24 +1141,24 @@ fn expectRepositoryProjectedPathForTest(
 }
 
 fn acceptTestSource(app: *App) void {
-    app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
+    app.pages.changes.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
     syncTestActivation(app);
 }
 
 fn syncTestActivation(app: *App) void {
-    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
         .immutable
-    else if (app.pages.review.auto_reload.sourceIsActionable())
+    else if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
-    else if (app.pages.review.load.hasPending())
+    else if (app.pages.changes.load.hasPending())
         .pending
     else
         .unavailable;
-    _ = app.pages.review.activation.activate(
+    _ = app.pages.changes.activation.activate(
         app.repo_session.repo_epoch,
         source,
-        review_authority.auxiliaryMember(app.pages.review.status_load),
-        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.branch_status_load),
     );
 }
 
@@ -1176,7 +1176,7 @@ fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.
     }
 }
 
-const repository_incoming_viewport_review_files = [_]diff_parser.FileDiff{
+const repository_incoming_viewport_changes_files = [_]diff_parser.FileDiff{
     .{
         .header = "diff --git a/src/app.zig b/src/app.zig",
         .old_path = "a/src/app.zig",
@@ -1193,10 +1193,10 @@ const repository_incoming_viewport_review_files = [_]diff_parser.FileDiff{
     },
 };
 
-const repository_incoming_viewport_review_eligibility =
+const repository_incoming_viewport_changes_eligibility =
     [_]loaded_diff.FileTextEligibility{ .selectable_utf8, .selectable_utf8 };
 
-const repository_incoming_viewport_review_tree_nodes = [_]file_tree.Node{
+const repository_incoming_viewport_changes_tree_nodes = [_]file_tree.Node{
     .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
     .{ .kind = .directory, .name = "app", .path = "src/app", .depth = 1 },
     .{ .kind = .directory, .name = "pages", .path = "src/app/pages", .depth = 2 },

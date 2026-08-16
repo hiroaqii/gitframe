@@ -16,9 +16,9 @@ pub fn include() void {
     _ = @import("page_coordinator_test.zig");
     _ = @import("pages/compare/coordinator_test.zig");
     _ = @import("pages/repository/coordinator_test.zig");
-    _ = @import("pages/review/content_app_test.zig");
-    _ = @import("pages/review/navigation_app_test.zig");
-    _ = @import("pages/review/read_coordinator_test.zig");
+    _ = @import("pages/changes/content_app_test.zig");
+    _ = @import("pages/changes/navigation_app_test.zig");
+    _ = @import("pages/changes/read_coordinator_test.zig");
     _ = @import("tests/page_transition.zig");
     _ = @import("tests/canonical_publication.zig");
     _ = @import("tests/local_workflow.zig");

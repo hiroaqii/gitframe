@@ -11,11 +11,11 @@ const app_message = @import("../message.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const app_state = @import("../state.zig");
 const app_test_support = @import("../test_support.zig");
-const review_page = @import("../pages/review.zig");
-const review_action_fence = @import("../pages/review/action_fence.zig");
-const review_navigation = @import("../pages/review/navigation.zig");
-const review_reload = @import("../pages/review/reload.zig");
-const review_authority = @import("../diff_surface/authority.zig");
+const changes_page = @import("../pages/changes.zig");
+const changes_action_fence = @import("../pages/changes/action_fence.zig");
+const changes_navigation = @import("../pages/changes/navigation.zig");
+const changes_reload = @import("../pages/changes/reload.zig");
+const changes_authority = @import("../diff_surface/authority.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_source = @import("../../diff/source.zig");
 const git_ops = @import("../git_ops.zig");
@@ -30,8 +30,8 @@ const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
 const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
 const test_action_root_identity: repo_root_capability.Identity = .{ .device = 41, .inode = 73 };
 
-fn activateReview(app: *App) void {
-    _ = app.pages.review.activation.activate(
+fn activateChanges(app: *App) void {
+    _ = app.pages.changes.activation.activate(
         app.repo_session.view().epoch(),
         .pending,
         .pending,
@@ -39,26 +39,26 @@ fn activateReview(app: *App) void {
     );
 }
 
-fn reviewNavigation(app: *App) review_navigation.Controller {
+fn changesNavigation(app: *App) changes_navigation.Controller {
     const body = app_shell_layout.compute(
         app.terminal_size,
         .{ .page_bar_visible = true },
     ).bodySize();
     return .{
-        .page = &app.pages.review,
+        .page = &app.pages.changes,
         .repo_root = app.repo_session.view().activeRoot(),
         .repo_epoch = app.repo_session.view().epoch(),
         .root_identity = app.repo_session.view().activeIdentity(),
         .source = app.config.source,
         .layout = .{ .width = body.width, .height = body.height },
-        .diagnostics = .{ .target = &app.pages.review.status },
+        .diagnostics = .{ .target = &app.pages.changes.status },
     };
 }
 
-fn reviewReload(app: *App) review_reload.Controller {
+fn changesReload(app: *App) changes_reload.Controller {
     return .{
-        .page = &app.pages.review,
-        .navigation = reviewNavigation(app),
+        .page = &app.pages.changes,
+        .navigation = changesNavigation(app),
         .source = app.config.source,
         .repo_root = app.repo_session.view().activeRoot(),
         .repo_epoch = app.repo_session.view().epoch(),
@@ -73,36 +73,36 @@ fn beginAcceptedTestAction(app: *App, kind: app_actions.ActionKind) app_actions.
 }
 
 fn actionLifecycle(app: *App) action_lifecycle.Controller {
-    return .{ .runtime = &app.action_runtime, .fence = reviewActionFence(app) };
+    return .{ .runtime = &app.action_runtime, .fence = changesActionFence(app) };
 }
 
-fn reviewActionFence(app: *App) review_action_fence.Controller {
+fn changesActionFence(app: *App) changes_action_fence.Controller {
     return .{
-        .read_authority = &app.pages.review.repository_read_authority,
-        .activation = &app.pages.review.activation,
-        .action_cursor = &app.pages.review.action_cursor,
-        .auto_reload = &app.pages.review.auto_reload,
-        .review_projection = &app.pages.review.review_projection,
-        .deferred_projection_apply = &app.pages.review.deferred_projection_apply,
+        .read_authority = &app.pages.changes.repository_read_authority,
+        .activation = &app.pages.changes.activation,
+        .action_cursor = &app.pages.changes.action_cursor,
+        .auto_reload = &app.pages.changes.auto_reload,
+        .changes_projection = &app.pages.changes.changes_projection,
+        .deferred_projection_apply = &app.pages.changes.deferred_projection_apply,
     };
 }
 
 fn installTestActionCursor(
     app: *App,
     allocator: std.mem.Allocator,
-    kind: review_page.action_cursor.TargetKind,
+    kind: changes_page.action_cursor.TargetKind,
     path_key: []const u8,
     action_generation: u64,
 ) !void {
     const identity = app.repo_session.view().activeIdentity() orelse test_action_root_identity;
-    var prepared = try reviewNavigation(app).prepareActionCursor(
+    var prepared = try changesNavigation(app).prepareActionCursor(
         allocator,
         app.repo_session.view().epoch(),
         identity,
         kind,
         path_key,
     );
-    reviewNavigation(app).installActionCursor(allocator, &prepared, action_generation);
+    changesNavigation(app).installActionCursor(allocator, &prepared, action_generation);
 }
 
 fn finishStageFileForTest(
@@ -130,24 +130,24 @@ fn finishUnstageHunkForTest(
 }
 
 fn syncTestActivation(app: *App) void {
-    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
         .immutable
-    else if (app.pages.review.auto_reload.sourceIsActionable())
+    else if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
-    else if (app.pages.review.load.hasPending())
+    else if (app.pages.changes.load.hasPending())
         .pending
     else
         .unavailable;
-    _ = app.pages.review.activation.activate(
+    _ = app.pages.changes.activation.activate(
         app.repo_session.view().epoch(),
         source,
-        review_authority.auxiliaryMember(app.pages.review.status_load),
-        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.branch_status_load),
     );
 }
 
 fn acceptTestSource(app: *App) void {
-    app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
+    app.pages.changes.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
     syncTestActivation(app);
 }
 
@@ -208,7 +208,7 @@ fn initStageHunkLaunchApp(
             .discovery = discovery,
             .root = root,
         } },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .viewer = .{
                 .focus = .diff,
@@ -223,12 +223,12 @@ fn initStageHunkLaunchApp(
     discovery_owned = false;
     arena_owned = false;
     errdefer {
-        app.pages.review.deinit(allocator);
+        app.pages.changes.deinit(allocator);
         app.repo_session.repo_state.deinit(allocator);
     }
     var status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00 M b\x00");
     defer status.deinit();
-    try app.pages.review.git_status.replace(repo_root, &status);
+    try app.pages.changes.git_status.replace(repo_root, &status);
     acceptTestSource(&app);
     return app;
 }
@@ -263,11 +263,11 @@ test "successful file action binds the exact source and status generations start
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer reviewReload(&app).clearPendingReload(allocator);
-    defer reviewReload(&app).clearLoadedDiff(app.allocator);
-    defer app.pages.review.git_status.deinit();
-    defer reviewNavigation(&app).clearActionCursor(allocator);
-    _ = activateReview(&app);
+    defer changesReload(&app).clearPendingReload(allocator);
+    defer changesReload(&app).clearLoadedDiff(app.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer changesNavigation(&app).clearActionCursor(allocator);
+    _ = activateChanges(&app);
 
     const pending = beginAcceptedTestAction(&app, .stage_file);
     try installTestActionCursor(&app, allocator, .directory, "src", pending.generation);
@@ -284,12 +284,12 @@ test "successful file action binds the exact source and status generations start
     try std.testing.expectEqual(@as(usize, 3), entries.len);
     const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
     const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
-    const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
-    try std.testing.expectEqual(pending.generation, app.pages.review.action_cursor.actionGeneration().?);
+    const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
+    try std.testing.expectEqual(pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
     try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
     try std.testing.expectEqual(source_task.generation, basis.memberState(.source).?.generation.?);
-    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.memberState(.status).?.terminal);
-    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.memberState(.source).?.terminal);
+    try std.testing.expectEqual(changes_page.action_cursor.Terminal.pending, basis.memberState(.status).?.terminal);
+    try std.testing.expectEqual(changes_page.action_cursor.Terminal.pending, basis.memberState(.source).?.terminal);
 }
 
 test "successful hunk action binds an exact status-only refresh" {
@@ -305,9 +305,9 @@ test "successful hunk action binds an exact status-only refresh" {
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.git_status.deinit();
-    defer reviewNavigation(&app).clearActionCursor(allocator);
-    _ = activateReview(&app);
+    defer app.pages.changes.git_status.deinit();
+    defer changesNavigation(&app).clearActionCursor(allocator);
+    _ = activateChanges(&app);
 
     const pending = beginAcceptedTestAction(&app, .stage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
@@ -325,11 +325,11 @@ test "successful hunk action binds an exact status-only refresh" {
     const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
-    const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
-    try std.testing.expectEqual(review_page.action_cursor.RefreshRequirement.status_only, std.meta.activeTag(basis));
+    const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
+    try std.testing.expectEqual(changes_page.action_cursor.RefreshRequirement.status_only, std.meta.activeTag(basis));
     try std.testing.expect(basis.memberState(.source) == null);
     try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
-    try std.testing.expectEqual(review_page.action_cursor.Terminal.pending, basis.memberState(.status).?.terminal);
+    try std.testing.expectEqual(changes_page.action_cursor.Terminal.pending, basis.memberState(.status).?.terminal);
 }
 
 test "cached hunk unstage binds exact source and status refresh members" {
@@ -338,7 +338,7 @@ test "cached hunk unstage binds exact source and status refresh members" {
     defer roots.deinit();
     var app = try initStageHunkLaunchApp(allocator, roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
 
     const pending = beginAcceptedTestAction(&app, .unstage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
@@ -358,8 +358,8 @@ test "cached hunk unstage binds exact source and status refresh members" {
     try std.testing.expectEqual(@as(usize, 3), entries.len);
     const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
     const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
-    const basis = app.pages.review.action_cursor.owner.?.phase.awaiting_action_refresh;
-    try std.testing.expectEqual(review_page.action_cursor.RefreshRequirement.source_and_status, std.meta.activeTag(basis));
+    const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
+    try std.testing.expectEqual(changes_page.action_cursor.RefreshRequirement.source_and_status, std.meta.activeTag(basis));
     try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
     try std.testing.expectEqual(source_task.generation, basis.memberState(.source).?.generation.?);
 }
@@ -370,7 +370,7 @@ test "status-only hunk refresh spawn rejection closes its exact owner" {
     defer roots.deinit();
     var app = try initStageHunkLaunchApp(allocator, roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
 
     const pending = beginAcceptedTestAction(&app, .stage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
@@ -386,8 +386,8 @@ test "status-only hunk refresh spawn rejection closes its exact owner" {
     ctx._pending_tasks_with_len = 0;
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
-    try std.testing.expect(app.pages.review.status_load.pending == null);
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(app.pages.changes.status_load.pending == null);
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 }
 
 test "inert diff hunk command reports bounded encoding diagnostic" {
@@ -395,19 +395,19 @@ test "inert diff hunk command reports bounded encoding diagnostic" {
     var loaded = app_test_support.loadedDiffOne();
     loaded.file_text_eligibility = &eligibility;
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(loaded),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         } },
         .allocator = std.testing.allocator,
     };
-    defer reviewReload(&app).clearLoadedDiff(std.testing.allocator);
+    defer changesReload(&app).clearLoadedDiff(std.testing.allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.update(.{ .review = .toggle_selected_hunk }, &ctx);
+    try app.update(.{ .changes = .toggle_selected_hunk }, &ctx);
 
-    try std.testing.expectEqualStrings(git_ops.inert_hunk_action_message, app.pages.review.status.text());
-    try std.testing.expect(std.mem.indexOfScalar(u8, app.pages.review.status.text(), 0xff) == null);
+    try std.testing.expectEqualStrings(git_ops.inert_hunk_action_message, app.pages.changes.status.text());
+    try std.testing.expect(std.mem.indexOfScalar(u8, app.pages.changes.status.text(), 0xff) == null);
 }
 
 test "opening amend confirmation cancels active discard confirmation" {

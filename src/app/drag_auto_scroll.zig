@@ -10,7 +10,7 @@ pub const timer_id = "gitframe.drag_auto_scroll";
 pub const interval_ns: u64 = 80 * std.time.ns_per_ms;
 
 pub const Target = enum {
-    review,
+    changes,
     compare,
     repository,
 };
@@ -155,15 +155,15 @@ test "drag auto-scroll classifies only horizontal in-pane edge samples" {
 test "drag auto-scroll keeps one generation at an edge and rejects stale ticks after rearm" {
     const viewport: Viewport = .{ .first_col = 0, .last_col = 30, .first_row = 3, .last_row = 10 };
     var state: State = .{};
-    state.observe(.review, .{ .col = 5, .row = 3 }, viewport);
+    state.observe(.changes, .{ .col = 5, .row = 3 }, viewport);
     const first = state.active.?;
-    state.observe(.review, .{ .col = 7, .row = 1 }, viewport);
+    state.observe(.changes, .{ .col = 7, .row = 1 }, viewport);
     try std.testing.expectEqual(first.generation, state.active.?.generation);
     try std.testing.expectEqual(@as(u16, 7), state.active.?.intent.endpoint.col);
 
     state.scheduled_generation = first.generation;
     try std.testing.expect(state.acceptedTick(first.generation) != null);
-    state.observe(.review, .{ .col = 7, .row = 6 }, viewport);
+    state.observe(.changes, .{ .col = 7, .row = 6 }, viewport);
     try std.testing.expect(state.active == null);
     state.observe(.compare, .{ .col = 7, .row = 10 }, viewport);
     try std.testing.expect(state.active.?.generation != first.generation);
@@ -184,9 +184,9 @@ test "drag auto-scroll terminal outcomes stop intent while moved retains it" {
 test "drag auto-scroll generation exhaustion fails closed after issuing max exactly once" {
     const viewport: Viewport = .{ .first_col = 0, .last_col = 30, .first_row = 3, .last_row = 10 };
     var state: State = .{ .next_generation = std.math.maxInt(u64) - 1 };
-    state.observe(.review, .{ .col = 5, .row = 3 }, viewport);
+    state.observe(.changes, .{ .col = 5, .row = 3 }, viewport);
     try std.testing.expectEqual(std.math.maxInt(u64), state.active.?.generation);
     state.clear();
-    state.observe(.review, .{ .col = 5, .row = 10 }, viewport);
+    state.observe(.changes, .{ .col = 5, .row = 10 }, viewport);
     try std.testing.expect(state.active == null);
 }

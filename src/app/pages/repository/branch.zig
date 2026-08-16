@@ -36,7 +36,7 @@ pub const SnapshotIdentity = struct {
 ///
 /// The backend bundle already owns every status slice in one arena. Taking
 /// that arena here avoids a second copy while keeping the snapshot wholly
-/// page-local and independently releasable from Review's branch owner.
+/// page-local and independently releasable from Changes's branch owner.
 pub const Snapshot = struct {
     arena: ?std.heap.ArenaAllocator = null,
     identity: ?SnapshotIdentity = null,
@@ -388,7 +388,7 @@ test "Repository branch identity mismatches are cleanup-only and preserve exact 
         };
         defer stale.deinit();
         switch (mismatch) {
-            0 => stale.identity.origin = .review,
+            0 => stale.identity.origin = .changes,
             1 => stale.identity.repo_epoch +%= 1,
             2 => stale.identity.activation_id +%= 1,
             3 => stale.root_identity.inode +%= 1,

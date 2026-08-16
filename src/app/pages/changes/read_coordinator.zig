@@ -1,4 +1,4 @@
-//! Sole shell-side coordinator for Review repository reads.
+//! Sole shell-side coordinator for Changes repository reads.
 //!
 //! The page-local reload owner prepares and reconciles model transitions;
 //! this short-lived controller owns task allocation/spawn, completion routing,
@@ -14,13 +14,13 @@ const diff_surface = @import("../../diff_surface.zig");
 const app_load = @import("../../load.zig");
 const app_message = @import("../../message.zig");
 const app_page = @import("../../page.zig");
-const app_review_projection = @import("../../review_projection.zig");
+const app_changes_projection = @import("../../changes_projection.zig");
 const repo_session = @import("../../repo_session.zig");
-const review_page = @import("../review.zig");
+const changes_page = @import("../changes.zig");
 const action_fence = @import("action_fence.zig");
-const review_navigation = @import("navigation.zig");
-const review_reload = @import("reload.zig");
-const review_repository_session = @import("repository_session.zig");
+const changes_navigation = @import("navigation.zig");
+const changes_reload = @import("reload.zig");
+const changes_repository_session = @import("repository_session.zig");
 const diff_source = @import("../../../diff/source.zig");
 const git_command = @import("../../../git/command.zig");
 const git_read = @import("../../../git/read.zig");
@@ -36,8 +36,8 @@ const StatusLoadFinished = app_load.StatusLoadFinished;
 const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
 const BranchStatusLoadFinished = app_load.BranchStatusLoadFinished;
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(app_message.Msg);
-const ReviewProjectionFinished = app_load.ReviewProjectionFinished;
-const ReviewProjectionTask = app_load.ReviewProjectionTask(app_message.Msg);
+const ChangesProjectionFinished = app_load.ChangesProjectionFinished;
+const ChangesProjectionTask = app_load.ChangesProjectionTask(app_message.Msg);
 const GeneratedSyntaxTask = app_load.GeneratedSyntaxTask(app_message.Msg);
 
 pub const RedrawSink = struct {
@@ -60,11 +60,11 @@ pub const ShellBlockers = struct {
 
 const DiffLoadStartOptions = struct {
     clear_visible_state: bool,
-    kind: review_page.ReloadKind,
+    kind: changes_page.ReloadKind,
     background_cycle_id: ?u64 = null,
     action_cursor_generation: ?u64 = null,
 
-    fn sourceOptions(self: DiffLoadStartOptions) review_reload.SourceLoadOptions {
+    fn sourceOptions(self: DiffLoadStartOptions) changes_reload.SourceLoadOptions {
         return .{
             .clear_visible_state = self.clear_visible_state,
             .kind = self.kind,
@@ -113,7 +113,7 @@ pub const PendingDiscoveryCommit = struct {
 };
 
 pub const Controller = struct {
-    page_state: *review_page.ReviewPageState,
+    page_state: *changes_page.ChangesPageState,
     fence: action_fence.View,
     active_page: app_page.Id,
     repo: repo_session.View,
@@ -128,7 +128,7 @@ pub const Controller = struct {
         self.page_state.status.set(fmt, args);
     }
 
-    fn navigationOwner(self: Controller) review_navigation.Controller {
+    fn navigationOwner(self: Controller) changes_navigation.Controller {
         return .{
             .page = self.page_state,
             .repo_root = self.repo.activeRoot(),
@@ -140,7 +140,7 @@ pub const Controller = struct {
         };
     }
 
-    fn reloadOwner(self: Controller) review_reload.Controller {
+    fn reloadOwner(self: Controller) changes_reload.Controller {
         return .{
             .page = self.page_state,
             .navigation = self.navigationOwner(),
@@ -151,7 +151,7 @@ pub const Controller = struct {
         };
     }
 
-    pub fn repositorySessionPort(self: Controller) review_repository_session.Controller {
+    pub fn repositorySessionPort(self: Controller) changes_repository_session.Controller {
         return .{
             .page = self.page_state,
             .navigation = self.navigationOwner(),
@@ -187,7 +187,7 @@ pub const Controller = struct {
     }
 
     pub fn requestRevalidation(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.active_page != .review) return;
+        if (self.active_page != .changes) return;
         if (diff_source.sourceIsOneShotInput(self.source)) return;
         self.page_state.activation.queueRevalidation();
         if (self.readBusy()) return;
@@ -195,7 +195,7 @@ pub const Controller = struct {
     }
 
     fn startRevalidation(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.active_page != .review) return;
+        if (self.active_page != .changes) return;
         var cycle_id = self.page_state.auto_reload.beginCycle();
         errdefer if (cycle_id) |id| self.page_state.auto_reload.discardEmptyCycle(id);
         const outcome = try self.startReload(ctx, .{
@@ -211,7 +211,7 @@ pub const Controller = struct {
     }
 
     pub fn maybeStartQueuedRevalidation(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.active_page != .review or self.readBusy()) return;
+        if (self.active_page != .changes or self.readBusy()) return;
         if (!self.page_state.activation.hasQueuedFullRevalidation()) return;
         if (diff_source.sourceIsOneShotInput(self.source)) {
             self.page_state.activation.discardTerminalRevalidation();
@@ -226,9 +226,9 @@ pub const Controller = struct {
         background_cycle_id: ?u64,
     ) !void {
         if (!self.fence.mayStartRepositoryRead()) return;
-        var review_update = try self.reloadOwner().prepareRepoDiscovery(ctx.allocator(), background_cycle_id);
-        defer review_update.deinit(ctx.allocator());
-        var command = review_update.takeCommand() orelse unreachable;
+        var changes_update = try self.reloadOwner().prepareRepoDiscovery(ctx.allocator(), background_cycle_id);
+        defer changes_update.deinit(ctx.allocator());
+        var command = changes_update.takeCommand() orelse unreachable;
         var command_consumed = false;
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const discovery = &command.repo_discovery;
@@ -266,7 +266,7 @@ pub const Controller = struct {
         finished: RepoDiscoveryFinished,
     ) !?PendingDiscoveryCommit {
         var completion_admitted = false;
-        defer if (self.active_page != .review and !completion_admitted) self.redraw.requestSkip();
+        defer if (self.active_page != .changes and !completion_admitted) self.redraw.requestSkip();
         var result = finished;
         defer result.deinit(allocator);
         const identity = result.identity;
@@ -301,7 +301,7 @@ pub const Controller = struct {
         switch (self.reloadOwner().applyRepoDiscoveryCommit(
             ctx.allocator(),
             self.repo.activeRoot() != null,
-            self.active_page == .review,
+            self.active_page == .changes,
         )) {
             .none => {},
             .start_initial_read => try self.startDiffLoad(ctx, .initial),
@@ -311,7 +311,7 @@ pub const Controller = struct {
     pub fn startDiffLoad(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        kind: review_page.ReloadKind,
+        kind: changes_page.ReloadKind,
     ) !void {
         if (!self.fence.mayStartRepositoryRead()) return;
         const repo_root = self.repo.rootForSource(self.source) catch {
@@ -392,7 +392,7 @@ pub const Controller = struct {
             _ = self.navigationOwner().finalizeActionCursor(ctx.allocator());
         };
 
-        var review_update = self.reloadOwner().prepareSourceLoad(
+        var changes_update = self.reloadOwner().prepareSourceLoad(
             ctx.allocator(),
             repo_root,
             options.sourceOptions(),
@@ -404,8 +404,8 @@ pub const Controller = struct {
             self.reloadOwner().failActiveMember(.source);
             return err;
         };
-        defer review_update.deinit(ctx.allocator());
-        var command = review_update.takeCommand() orelse unreachable;
+        defer changes_update.deinit(ctx.allocator());
+        var command = changes_update.takeCommand() orelse unreachable;
         var command_consumed = false;
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const source_read = &command.source_load;
@@ -492,7 +492,7 @@ pub const Controller = struct {
         action_cursor_generation: ?u64,
     ) !app_auto_reload.AuxiliaryTerminal {
         if (!self.fence.mayStartRepositoryRead()) return error.RepositoryReadAuthorityClosed;
-        var review_update = self.reloadOwner().prepareStatusLoad(
+        var changes_update = self.reloadOwner().prepareStatusLoad(
             ctx.allocator(),
             repo_root,
             origin,
@@ -505,8 +505,8 @@ pub const Controller = struct {
             self.setStatus("could not allocate status repo root", .{});
             return err;
         };
-        defer review_update.deinit(ctx.allocator());
-        var command = review_update.takeCommand() orelse unreachable;
+        defer changes_update.deinit(ctx.allocator());
+        var command = changes_update.takeCommand() orelse unreachable;
         var command_consumed = false;
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const status_read = &command.status_load;
@@ -595,7 +595,7 @@ pub const Controller = struct {
         background_cycle_id: ?u64,
     ) ?app_auto_reload.AuxiliaryTerminal {
         if (!self.fence.mayStartRepositoryRead()) return null;
-        var review_update = self.reloadOwner().prepareBranchStatusLoad(
+        var changes_update = self.reloadOwner().prepareBranchStatusLoad(
             ctx.allocator(),
             repo_root,
             background_cycle_id,
@@ -604,8 +604,8 @@ pub const Controller = struct {
             self.setStatus("could not allocate branch status repo root", .{});
             return null;
         };
-        defer review_update.deinit(ctx.allocator());
-        var command = review_update.takeCommand() orelse unreachable;
+        defer changes_update.deinit(ctx.allocator());
+        var command = changes_update.takeCommand() orelse unreachable;
         var command_consumed = false;
         defer if (!command_consumed) command.deinit(ctx.allocator());
         const branch_read = &command.branch_status_load;
@@ -683,7 +683,7 @@ pub const Controller = struct {
         ) orelse return;
         defer applied.deinit(ctx.allocator());
         self.applySourceOutcome(applied.source);
-        if (self.active_page == .review and applied.source.redraw == .normal) self.redraw.requireFrame();
+        if (self.active_page == .changes and applied.source.redraw == .normal) self.redraw.requireFrame();
     }
 
     pub fn applyDeferredProjectionIfReady(
@@ -703,9 +703,9 @@ pub const Controller = struct {
         ctx: *chasen.Ctx(app_message.Msg),
     ) !void {
         if (!self.fence.mayStartRepositoryRead()) return;
-        var review_update = try self.reloadOwner().prepareProjection(self.allocator);
-        if (review_update.display_changed) self.redraw.requireFrame();
-        if (review_update.takeCommand()) |command| {
+        var changes_update = try self.reloadOwner().prepareProjection(self.allocator);
+        if (changes_update.display_changed) self.redraw.requireFrame();
+        if (changes_update.takeCommand()) |command| {
             const allocator = ctx.allocator();
             var owned_command = command;
             var command_consumed = false;
@@ -713,7 +713,7 @@ pub const Controller = struct {
 
             switch (owned_command) {
                 .repo_discovery, .source_load, .status_load, .branch_status_load => unreachable,
-                .review_projection => |*request| {
+                .changes_projection => |*request| {
                     const request_id = request.id;
                     const capability = self.repo.activeCapability() orelse {
                         self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
@@ -735,7 +735,7 @@ pub const Controller = struct {
                     };
                     var environment_consumed = false;
                     defer if (!environment_consumed) environment.deinit();
-                    const task = allocator.create(ReviewProjectionTask) catch |err| {
+                    const task = allocator.create(ChangesProjectionTask) catch |err| {
                         self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
                         return err;
                     };
@@ -744,7 +744,7 @@ pub const Controller = struct {
                     environment_consumed = true;
                     request.* = undefined;
                     command_consumed = true;
-                    ctx.task().spawnWith(.{ .ctx = task, .run = ReviewProjectionTask.run, .failed = ReviewProjectionTask.failed }) catch |err| {
+                    ctx.task().spawnWith(.{ .ctx = task, .run = ChangesProjectionTask.run, .failed = ChangesProjectionTask.failed }) catch |err| {
                         task.destroy(allocator);
                         self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
                         return err;
@@ -808,7 +808,7 @@ pub const Controller = struct {
             _ = self.page_state.action_cursor.clearMatchingAction(allocator, pending.generation);
             return null;
         };
-        const requirement: review_page.action_cursor.RefreshRequirement = switch (intent) {
+        const requirement: changes_page.action_cursor.RefreshRequirement = switch (intent) {
             .none => {
                 _ = self.page_state.action_cursor.clearMatchingAction(allocator, pending.generation);
                 return null;
@@ -914,7 +914,7 @@ pub const Controller = struct {
     }
 
     /// Atomically promotes any exact action cursor and starts the read work
-    /// selected by the accepted Review-local outcome. No half-promoted state
+    /// selected by the accepted Changes-local outcome. No half-promoted state
     /// is observable by the shell between these two transitions.
     pub fn applyActionOutcome(
         self: Controller,
@@ -957,7 +957,7 @@ pub const Controller = struct {
     }
 
     pub fn autoReloadTick(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.active_page != .review) {
+        if (self.active_page != .changes) {
             self.redraw.requestSkip();
             return;
         }
@@ -976,7 +976,7 @@ pub const Controller = struct {
         }
         if (self.page_state.auto_reload.background_cycle != null or self.page_state.load.hasPending() or
             self.page_state.load.state == .loading or self.page_state.status_load.isPending() or
-            self.page_state.branch_status_load.isPending() or self.page_state.review_projection.hasPending())
+            self.page_state.branch_status_load.isPending() or self.page_state.changes_projection.hasPending())
         {
             self.redraw.requestSkip();
             return;
@@ -1016,7 +1016,7 @@ pub const Controller = struct {
     fn finishActionCursorCompletion(
         self: Controller,
         allocator: std.mem.Allocator,
-        token: review_page.action_cursor.CompletionToken,
+        token: changes_page.action_cursor.CompletionToken,
         succeeded: bool,
     ) !bool {
         if (!self.page_state.action_cursor.finishCompletion(token, succeeded)) return false;
@@ -1066,7 +1066,7 @@ pub const Controller = struct {
         self.applySourceOutcome(applied);
     }
 
-    fn applySourceOutcome(self: Controller, applied: review_reload.SourceApply) void {
+    fn applySourceOutcome(self: Controller, applied: changes_reload.SourceApply) void {
         var recovered_failure_cleared = false;
         if (applied.recovered_failure) |failure| {
             recovered_failure_cleared = self.page_state.status.clearSourceReloadFailure(failure.digest);
@@ -1078,7 +1078,7 @@ pub const Controller = struct {
                 .{failure.message},
             );
         }
-        if (self.active_page != .review) {
+        if (self.active_page != .changes) {
             self.redraw.requestSkip();
             return;
         }
@@ -1127,7 +1127,7 @@ pub const Controller = struct {
             .status_load_failed => |message| self.setStatus("status load failed: {s}", .{message}),
             else => unreachable,
         };
-        if ((applied.skip_redraw and !finalized_action_cursor) or self.active_page != .review) self.redraw.requestSkip();
+        if ((applied.skip_redraw and !finalized_action_cursor) or self.active_page != .changes) self.redraw.requestSkip();
     }
 
     pub fn finishBranchStatusLoad(
@@ -1146,38 +1146,38 @@ pub const Controller = struct {
             .branch_status_parse_failed => self.setStatus("branch status parse failed", .{}),
             else => unreachable,
         };
-        if (applied.skip_redraw or self.active_page != .review) self.redraw.requestSkip();
+        if (applied.skip_redraw or self.active_page != .changes) self.redraw.requestSkip();
     }
 
     pub fn finishProjectionLoad(
         self: Controller,
         allocator: std.mem.Allocator,
-        finished: ReviewProjectionFinished,
+        finished: ChangesProjectionFinished,
     ) !void {
         var result = finished;
         var result_transferred = false;
         defer if (!result_transferred) result.deinit(allocator);
         const applied = try self.reloadOwner().applyProjectionFinished(allocator, &result);
         result_transferred = applied.result_transferred;
-        if (applied.skip_redraw or self.active_page != .review) self.redraw.requestSkip();
+        if (applied.skip_redraw or self.active_page != .changes) self.redraw.requestSkip();
     }
 
     pub fn finishGeneratedProjectionSyntax(
         self: Controller,
         allocator: std.mem.Allocator,
-        finished: app_review_projection.GeneratedSyntaxFinished,
+        finished: app_changes_projection.GeneratedSyntaxFinished,
     ) void {
         var result = finished;
         defer result.deinit(allocator);
         const applied = self.reloadOwner().applyGeneratedSyntaxFinished(allocator, &result);
-        if (applied.skip_redraw or self.active_page != .review) self.redraw.requestSkip();
+        if (applied.skip_redraw or self.active_page != .changes) self.redraw.requestSkip();
     }
 };
 
 pub const testing = if (builtin.is_test) struct {
     pub const StartOptions = struct {
         clear_visible_state: bool,
-        kind: review_page.ReloadKind,
+        kind: changes_page.ReloadKind,
         background_cycle_id: ?u64 = null,
         action_cursor_generation: ?u64 = null,
     };

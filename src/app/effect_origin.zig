@@ -41,7 +41,7 @@ pub const Liveness = enum {
 pub const Snapshot = struct {
     active_page: page.Id,
     repo_epoch: u64,
-    review_activation_id: u64,
+    changes_activation_id: u64,
     repository_activation_id: u64,
     compare_activation_id: u64,
     push_error_instance_id: ?u64,
@@ -52,7 +52,7 @@ pub fn classify(origin: Origin, current: Snapshot) Liveness {
     return switch (origin) {
         .page => |captured| blk: {
             const activation_matches = switch (captured.page_id) {
-                .review => captured.activation_id == current.review_activation_id,
+                .changes => captured.activation_id == current.changes_activation_id,
                 .repository => captured.activation_id == current.repository_activation_id,
                 .compare => captured.activation_id == current.compare_activation_id,
                 .config => true,
@@ -73,9 +73,9 @@ pub fn classify(origin: Origin, current: Snapshot) Liveness {
 
 test "repository selection inactive page accepts same-instance clipboard completion" {
     const current: Snapshot = .{
-        .active_page = .review,
+        .active_page = .changes,
         .repo_epoch = 4,
-        .review_activation_id = 9,
+        .changes_activation_id = 9,
         .repository_activation_id = 5,
         .compare_activation_id = 7,
         .push_error_instance_id = null,
@@ -87,7 +87,7 @@ test "repository selection inactive page accepts same-instance clipboard complet
     );
     try @import("std").testing.expectEqual(
         Liveness.live_active,
-        classify(.{ .page = .{ .page_id = .review, .repo_epoch = 4, .activation_id = 9 } }, current),
+        classify(.{ .page = .{ .page_id = .changes, .repo_epoch = 4, .activation_id = 9 } }, current),
     );
     try @import("std").testing.expectEqual(
         Liveness.stale,
@@ -105,9 +105,9 @@ test "repository selection inactive page accepts same-instance clipboard complet
 
 test "reopened shell surface rejects prior clipboard completion" {
     const current: Snapshot = .{
-        .active_page = .review,
+        .active_page = .changes,
         .repo_epoch = 4,
-        .review_activation_id = 9,
+        .changes_activation_id = 9,
         .repository_activation_id = 5,
         .compare_activation_id = 7,
         .push_error_instance_id = 12,

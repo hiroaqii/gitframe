@@ -2,8 +2,8 @@ const std = @import("std");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_push = @import("../git/push.zig");
 const loaded_diff = @import("../loaded_diff.zig");
-const review_selection = @import("diff_surface/selection.zig");
-const session_hunk_mark = @import("pages/review/session_hunk_mark.zig");
+const content_selection = @import("diff_surface/selection.zig");
+const session_hunk_mark = @import("pages/changes/session_hunk_mark.zig");
 const page = @import("page.zig");
 const remote_request = @import("remote_request.zig");
 
@@ -77,7 +77,7 @@ pub const OverlayState = struct {
     }
 
     pub fn openHelp(self: *OverlayState) void {
-        self.openHelpForPage(.review);
+        self.openHelpForPage(.changes);
     }
 
     pub fn openHelpForPage(self: *OverlayState, owner_page: page.Id) void {
@@ -88,34 +88,34 @@ pub const OverlayState = struct {
 
     pub fn openDiscardFile(self: *OverlayState) void {
         self.kind = .discard_file;
-        self.owner_page = .review;
+        self.owner_page = .changes;
     }
 
     pub fn openAmendCommit(self: *OverlayState) void {
         self.kind = .amend_commit;
-        self.owner_page = .review;
+        self.owner_page = .changes;
     }
 
     pub fn openPushBranch(self: *OverlayState) void {
         self.kind = .push_branch;
-        self.owner_page = .review;
+        self.owner_page = .changes;
     }
 
     pub fn openPullBranch(self: *OverlayState) void {
         self.kind = .pull_branch;
-        self.owner_page = .review;
+        self.owner_page = .changes;
     }
 
     pub fn openSwitchBranch(self: *OverlayState) void {
         self.kind = .switch_branch;
-        self.owner_page = .review;
+        self.owner_page = .changes;
     }
 
     pub fn openPushError(self: *OverlayState) void {
         self.push_error_instance_id +%= 1;
         if (self.push_error_instance_id == 0) self.push_error_instance_id = 1;
         self.kind = .push_error;
-        self.owner_page = .review;
+        self.owner_page = .changes;
         self.push_error_scroll = 0;
     }
 
@@ -389,7 +389,7 @@ fn validUtf8PrefixLen(bytes: []const u8) usize {
     return len;
 }
 
-/// Display-only review filters applied to the active loaded diff.
+/// Display-only changes filters applied to the active loaded diff.
 ///
 /// The reviewed store remains the source of truth; this state only controls
 /// how the active sidebar projection is filtered.
@@ -410,9 +410,9 @@ pub const StagedHunkMark = struct {
     }
 };
 
-/// Session-only marks for hunks staged from the review pane.
+/// Session-only marks for hunks staged from the changes pane.
 ///
-/// Git reloads expose only unstaged hunks, but review needs staged hunks to
+/// Git reloads expose only unstaged hunks, but changes needs staged hunks to
 /// remain visible with local stage presentation while fresh projection/status
 /// catches up. A display ordinal is meaningful only inside its exact content
 /// token; callers must explicitly rebind or clear a path lineage when an exact
@@ -505,7 +505,7 @@ pub const StagedHunkMarks = struct {
         allocator: std.mem.Allocator,
         repo_root: []const u8,
         path_key: []const u8,
-        content: review_selection.ReviewContentToken,
+        content: content_selection.ContentToken,
     ) void {
         var index: usize = 0;
         while (index < self.items.items.len) {
@@ -527,8 +527,8 @@ pub const StagedHunkMarks = struct {
         allocator: std.mem.Allocator,
         repo_root: []const u8,
         path_key: []const u8,
-        from: review_selection.ReviewContentToken,
-        to: review_selection.ReviewContentToken,
+        from: content_selection.ContentToken,
+        to: content_selection.ContentToken,
     ) void {
         if (from.eql(to)) return;
 
@@ -568,12 +568,12 @@ test "OverlayState opens help and resets its scroll" {
 
     overlay.openHelp();
     try std.testing.expectEqual(OverlayKind.help, overlay.kind);
-    try std.testing.expectEqual(page.Id.review, overlay.owner_page.?);
+    try std.testing.expectEqual(page.Id.changes, overlay.owner_page.?);
     try std.testing.expectEqual(@as(usize, 0), overlay.help_scroll);
 
     overlay.openHelpForPage(.repository);
     try std.testing.expect(overlay.visibleOn(.repository));
-    try std.testing.expect(!overlay.visibleOn(.review));
+    try std.testing.expect(!overlay.visibleOn(.changes));
 }
 
 test "StatusMessage owns its formatted text buffer" {
@@ -669,7 +669,7 @@ fn testHunkMarkKey(source_session_revision: u64, display_hunk_index: usize) sess
         .content = .{
             .repo_epoch = 1,
             .root_identity = null,
-            .source = review_selection.SourceBasis.init(.unstaged),
+            .source = content_selection.SourceBasis.init(.unstaged),
             .source_session_revision = source_session_revision,
             .display = .{ .loaded = .init("diff") },
         },

@@ -1,4 +1,4 @@
-//! Review-local reload, projection identity, and navigation-restore ownership.
+//! Changes-local reload, projection identity, and navigation-restore ownership.
 //!
 //! Async task allocation and spawning remain shell effects. This module owns
 //! the page state transitions which prepare and reconcile those
@@ -15,15 +15,15 @@ const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
 const load_state = @import("../../load_state.zig");
 const projection_component = @import("../../projection_component.zig");
-const review_projection = @import("../../review_projection.zig");
+const changes_projection = @import("../../changes_projection.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const source_syntax_runtime = @import("../../../syntax/source_runtime.zig");
-const review_page = @import("../review.zig");
-const ReviewRepositoryReadEpoch = review_page.repository_read_authority.ReviewRepositoryReadEpoch;
-const review_selection = @import("../../diff_surface/selection.zig");
+const changes_page = @import("../changes.zig");
+const ChangesRepositoryReadEpoch = changes_page.repository_read_authority.ChangesRepositoryReadEpoch;
+const content_selection = @import("../../diff_surface/selection.zig");
 const selection_action = @import("../../diff_surface/selection_action.zig");
 const session_hunk_mark = @import("session_hunk_mark.zig");
-const review_operations = if (builtin.is_test) @import("operations.zig") else struct {};
+const changes_operations = if (builtin.is_test) @import("operations.zig") else struct {};
 const file_search = @import("../../diff_surface/file_search.zig");
 const authority = @import("../../diff_surface/authority.zig");
 const navigation = @import("navigation.zig");
@@ -56,9 +56,9 @@ pub const CompletionApply = struct {
     terminal_admitted: bool = false,
 };
 
-/// Owned cross-boundary command produced only after Review has accepted the
+/// Owned cross-boundary command produced only after Changes has accepted the
 /// discovery task identity. App consumes the discovery to commit active-repo
-/// identity; Review never mutates shell repository state directly.
+/// identity; Changes never mutates shell repository state directly.
 pub const DiscoveryApply = struct {
     commit_discovery: ?repo_discovery.DiscoveryResult = null,
 
@@ -173,8 +173,8 @@ pub const DeferredSourceApplyOutcome = struct {
 pub const ProjectionTarget = struct {
     repo_root: []const u8,
     path_key: []const u8,
-    kind: review_projection.Kind,
-    source_kind: review_projection.SourceKind,
+    kind: changes_projection.Kind,
+    source_kind: changes_projection.SourceKind,
 };
 
 const OwnedCombinedPresentationKind = enum {
@@ -188,7 +188,7 @@ const OwnedCombinedPresentationKind = enum {
 /// intentionally share `CombinedPresentation` ownership.
 const OwnedCombinedPresentation = struct {
     kind: OwnedCombinedPresentationKind,
-    presentation: *const review_projection.CombinedPresentation,
+    presentation: *const changes_projection.CombinedPresentation,
     display_file: diff_parser.FileDiff,
 };
 
@@ -200,13 +200,13 @@ const CombinedToOrdinaryOwner = enum {
     primary_backed,
 };
 
-/// One visible Review presentation lineage scoped to the repository/path
+/// One visible Changes presentation lineage scoped to the repository/path
 /// whose display ordinals it names. The slices remain borrowed from live page
 /// or request ownership; only the scalar content token crosses transitions.
 const PresentationLineage = struct {
     repo_root: []const u8,
     path_key: []const u8,
-    content: review_selection.ReviewContentToken,
+    content: content_selection.ContentToken,
 };
 
 /// Exact proof that display ordinals keep their meaning across an owner or
@@ -215,8 +215,8 @@ const PresentationLineage = struct {
 const PresentationLineageTransfer = struct {
     repo_root: []const u8,
     path_key: []const u8,
-    from: review_selection.ReviewContentToken,
-    to: review_selection.ReviewContentToken,
+    from: content_selection.ContentToken,
+    to: content_selection.ContentToken,
 };
 
 /// The projection lifecycle is local to one repository path. Keeping this
@@ -234,7 +234,7 @@ const CombinedToOrdinaryBoundary = struct {
 
 pub const SourceLoadOptions = struct {
     clear_visible_state: bool,
-    kind: review_page.ReloadKind,
+    kind: changes_page.ReloadKind,
     background_cycle_id: ?u64 = null,
 };
 
@@ -250,7 +250,7 @@ pub const OwnedRepoDiscoveryRead = struct {
 
 pub const OwnedSourceRead = struct {
     identity: app_page.RequestIdentity,
-    read_epoch: ReviewRepositoryReadEpoch,
+    read_epoch: ChangesRepositoryReadEpoch,
     request: diff_source.LoadRequest,
     generation: u64,
     expected_fingerprint: ?content_fingerprint.Fingerprint,
@@ -264,7 +264,7 @@ pub const OwnedSourceRead = struct {
 
 pub const OwnedStatusRead = struct {
     identity: app_page.RequestIdentity,
-    read_epoch: ReviewRepositoryReadEpoch,
+    read_epoch: ChangesRepositoryReadEpoch,
     repo_root: []u8,
     generation: u64,
     origin: git_read.ReadOrigin,
@@ -278,7 +278,7 @@ pub const OwnedStatusRead = struct {
 
 pub const OwnedBranchStatusRead = struct {
     identity: app_page.RequestIdentity,
-    read_epoch: ReviewRepositoryReadEpoch,
+    read_epoch: ChangesRepositoryReadEpoch,
     repo_root: []u8,
     generation: u64,
     background_cycle_id: ?u64,
@@ -289,7 +289,7 @@ pub const OwnedBranchStatusRead = struct {
     }
 };
 
-/// One owned Review read effect transferred to the shell. The page keeps a
+/// One owned Changes read effect transferred to the shell. The page keeps a
 /// separately cloned pending identity; the command alone owns the request that
 /// crosses into the async task.
 pub const OwnedReadCommand = union(enum) {
@@ -297,7 +297,7 @@ pub const OwnedReadCommand = union(enum) {
     source_load: OwnedSourceRead,
     status_load: OwnedStatusRead,
     branch_status_load: OwnedBranchStatusRead,
-    review_projection: review_projection.Request,
+    changes_projection: changes_projection.Request,
 
     pub fn deinit(self: *OwnedReadCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -305,13 +305,13 @@ pub const OwnedReadCommand = union(enum) {
             .source_load => |*request| request.deinit(allocator),
             .status_load => |*request| request.deinit(allocator),
             .branch_status_load => |*request| request.deinit(allocator),
-            .review_projection => |*request| request.deinit(allocator),
+            .changes_projection => |*request| request.deinit(allocator),
         }
         self.* = undefined;
     }
 };
 
-pub const ReviewUpdate = struct {
+pub const ChangesUpdate = struct {
     command: ?OwnedReadCommand = null,
     /// True when this call itself published new visual state (cache
     /// promotion, combined-to-ordinary boundary, canonical primary commit).
@@ -319,12 +319,12 @@ pub const ReviewUpdate = struct {
     /// uses this bit to force a frame past an earlier skip latch.
     display_changed: bool = false,
 
-    pub fn deinit(self: *ReviewUpdate, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ChangesUpdate, allocator: std.mem.Allocator) void {
         if (self.command) |*command| command.deinit(allocator);
         self.command = null;
     }
 
-    pub fn takeCommand(self: *ReviewUpdate) ?OwnedReadCommand {
+    pub fn takeCommand(self: *ChangesUpdate) ?OwnedReadCommand {
         const command = self.command;
         self.command = null;
         return command;
@@ -332,12 +332,12 @@ pub const ReviewUpdate = struct {
 };
 
 pub const View = struct {
-    page: *const review_page.ReviewPageState,
+    page: *const changes_page.ChangesPageState,
     navigation: navigation.View,
     source: diff_source.SourceMode,
     repo_root: ?[]const u8,
 
-    pub fn captureAnchor(self: View, allocator: std.mem.Allocator) !?review_page.ReloadAnchor {
+    pub fn captureAnchor(self: View, allocator: std.mem.Allocator) !?changes_page.ReloadAnchor {
         const loaded = self.navigation.activeLoadedDiffConst() orelse return null;
         const path_key = self.navigation.selectedStagePathKey() orelse return null;
         const sidebar_identity = self.navigation.selectedSidebarIdentity() orelse return null;
@@ -363,7 +363,7 @@ pub const View = struct {
         };
     }
 
-    pub fn captureDisplayRestore(self: View, allocator: std.mem.Allocator) !?review_page.PendingDisplayNavigationRestore {
+    pub fn captureDisplayRestore(self: View, allocator: std.mem.Allocator) !?changes_page.PendingDisplayNavigationRestore {
         const repo_root = self.repo_root orelse return null;
         var anchor = try self.captureAnchor(allocator) orelse return null;
         errdefer anchor.deinit(allocator);
@@ -387,8 +387,8 @@ pub const View = struct {
     /// status-only session path instead of starting an eager cached
     /// projection.
     fn ownsProjectionForPath(self: View, repo_root: []const u8, path_key: []const u8) bool {
-        const request = self.page.review_projection.displayed.request() orelse
-            (if (self.page.review_projection.pending) |*pending| pending else null) orelse
+        const request = self.page.changes_projection.displayed.request() orelse
+            (if (self.page.changes_projection.pending) |*pending| pending else null) orelse
             return false;
         return request.matchesDisplayIdentity(
             repo_root,
@@ -459,7 +459,7 @@ pub const View = struct {
     }
 
     pub fn displayedMatchesStableIdentity(self: View, target: ProjectionTarget) bool {
-        const request = self.page.review_projection.displayed.request() orelse return false;
+        const request = self.page.changes_projection.displayed.request() orelse return false;
         return request.matchesDisplayIdentity(
             target.repo_root,
             target.path_key,
@@ -469,7 +469,7 @@ pub const View = struct {
     }
 
     pub fn canRetainDisplayedProjection(self: View) bool {
-        const request = self.page.review_projection.displayed.request() orelse return false;
+        const request = self.page.changes_projection.displayed.request() orelse return false;
         const repo_root = self.repo_root orelse return false;
         const path_key = self.navigation.selectedStagePathKey() orelse return false;
         return request.matchesDisplayIdentity(
@@ -490,7 +490,7 @@ pub const View = struct {
 };
 
 pub const Controller = struct {
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
     navigation: navigation.Controller,
     source: diff_source.SourceMode,
     repo_root: ?[]const u8,
@@ -506,7 +506,7 @@ pub const Controller = struct {
     /// would incorrectly reject a valid exact terminal.
     fn acceptsRepositoryReadCompletion(
         self: Controller,
-        read_epoch: ReviewRepositoryReadEpoch,
+        read_epoch: ChangesRepositoryReadEpoch,
         background_cycle_id: ?u64,
     ) bool {
         return self.page.repository_read_authority.acceptsRead(read_epoch) and
@@ -552,7 +552,7 @@ pub const Controller = struct {
     }
 
     fn ownedCombinedPresentation(self: Controller) ?OwnedCombinedPresentation {
-        return switch (self.navigation.view().displayedReviewBody()) {
+        return switch (self.navigation.view().displayedChangesBody()) {
             .combined => |bundle| .{
                 .kind = .combined,
                 .presentation = &bundle.presentation,
@@ -580,15 +580,15 @@ pub const Controller = struct {
         }
     }
 
-    fn contentTokenForReady(self: Controller, ready: *const review_projection.Ready) ?review_selection.ReviewContentToken {
-        const display: review_selection.DisplayBasis = switch (ready.*) {
+    fn contentTokenForReady(self: Controller, ready: *const changes_projection.Ready) ?content_selection.ContentToken {
+        const display: content_selection.DisplayBasis = switch (ready.*) {
             .cached_diff => |bundle| .{ .cached_projection = .{
                 .status_snapshot_revision = self.page.status_snapshot_revision,
                 .cached = bundle.fingerprint,
             } },
             .combined_hunks => |bundle| .{ .combined_projection = bundle.presentation.content_token },
             .primary_combined_authority => blk: {
-                const primary = switch (self.navigation.view().displayedReviewBody()) {
+                const primary = switch (self.navigation.view().displayedChangesBody()) {
                     .primary => |primary| primary,
                     else => return null,
                 };
@@ -596,7 +596,7 @@ pub const Controller = struct {
             },
             .retained_staged_only => |bundle| .{ .combined_projection = bundle.presentation.content_token },
             .primary_staged_only_authority => blk: {
-                const primary = switch (self.navigation.view().displayedReviewBody()) {
+                const primary = switch (self.navigation.view().displayedChangesBody()) {
                     .primary => |primary| primary,
                     else => return null,
                 };
@@ -611,7 +611,7 @@ pub const Controller = struct {
         return .{
             .repo_epoch = self.repo_epoch,
             .root_identity = self.root_identity,
-            .source = review_selection.SourceBasis.init(self.source),
+            .source = content_selection.SourceBasis.init(self.source),
             .source_session_revision = self.page.source_session_revision,
             .display = display,
         };
@@ -639,7 +639,7 @@ pub const Controller = struct {
     /// the independently owned loaded token and therefore need no clear when
     /// the overlay alone disappears.
     fn currentOwnedProjectionLineage(self: Controller) ?PresentationLineage {
-        switch (self.navigation.view().displayedReviewBody()) {
+        switch (self.navigation.view().displayedChangesBody()) {
             .cached, .combined, .retained_staged_only => {},
             .primary, .none, .generated, .inert_invalid_utf8, .status, .pending => return null,
         }
@@ -649,7 +649,7 @@ pub const Controller = struct {
         return self.currentPresentationLineageForPath(repo_root, path_key);
     }
 
-    /// Apply an already-proved presentation transfer to every Review-local
+    /// Apply an already-proved presentation transfer to every Changes-local
     /// consumer of display ordinals. No Git/action authority is changed here.
     fn applyPresentationLineageTransfer(
         self: Controller,
@@ -741,7 +741,7 @@ pub const Controller = struct {
         const entry = self.navigation.view().freshStatusEntryForPathKey(repo_root, path_key) orelse return null;
         if (file_tree.stagePresenceFromEntry(entry) != .unstaged_only) return null;
 
-        const ready = switch (self.page.review_projection.displayed) {
+        const ready = switch (self.page.changes_projection.displayed) {
             .ready => |*ready| ready,
             .idle, .failed => return null,
         };
@@ -769,10 +769,10 @@ pub const Controller = struct {
         if (!diff_presentation_identity.exactEqual(combined_file, primary_file)) return null;
 
         const displayed_content = self.contentTokenForReady(&ready.value) orelse return null;
-        const ordinary_content: review_selection.ReviewContentToken = .{
+        const ordinary_content: content_selection.ContentToken = .{
             .repo_epoch = self.repo_epoch,
             .root_identity = self.root_identity,
-            .source = review_selection.SourceBasis.init(self.source),
+            .source = content_selection.SourceBasis.init(self.source),
             .source_session_revision = self.page.source_session_revision,
             .display = .{ .loaded = .init(loaded.text) },
         };
@@ -796,7 +796,7 @@ pub const Controller = struct {
         self: Controller,
         repo_root: []const u8,
         path_key: []const u8,
-        ready: *review_projection.Ready,
+        ready: *changes_projection.Ready,
     ) ?PresentationLineageTransfer {
         const outgoing = self.currentPresentationLineageForPath(repo_root, path_key) orelse return null;
         const incoming = switch (ready.*) {
@@ -822,7 +822,7 @@ pub const Controller = struct {
     fn expectedPresentationForTarget(
         self: Controller,
         target: ProjectionTarget,
-    ) ?review_projection.ExpectedPresentation {
+    ) ?changes_projection.ExpectedPresentation {
         switch (target.kind) {
             .combined_hunks, .cached_diff => {},
             .generated_added_file => return null,
@@ -840,7 +840,7 @@ pub const Controller = struct {
             };
         }
 
-        const primary = switch (self.navigation.view().displayedReviewBody()) {
+        const primary = switch (self.navigation.view().displayedChangesBody()) {
             .primary => |primary| primary,
             else => return null,
         };
@@ -879,8 +879,8 @@ pub const Controller = struct {
     /// normalized candidate exactly equal.
     fn admitCombinedReuse(
         self: Controller,
-        request: review_projection.Request,
-        candidate: *const review_projection.CombinedReuseCandidate,
+        request: changes_projection.Request,
+        candidate: *const changes_projection.CombinedReuseCandidate,
         basis: ReuseAdmissionBasis,
     ) bool {
         const expected = request.expected_presentation orelse return false;
@@ -906,7 +906,7 @@ pub const Controller = struct {
                     const live = self.expectedPresentationForTarget(target) orelse break :blk false;
                     if (!live.eql(expected) or live.owner != .primary_loaded) break :blk false;
                 }
-                const primary = switch (self.navigation.view().displayedReviewBody()) {
+                const primary = switch (self.navigation.view().displayedChangesBody()) {
                     .primary => |primary| primary,
                     else => break :blk false,
                 };
@@ -930,7 +930,7 @@ pub const Controller = struct {
     fn installCombinedReuseExact(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
+        result: *app_load.ChangesProjectionFinished,
     ) ?PresentationLineage {
         const candidate = &result.result.reuse_candidate;
         const outgoing_lineage = self.currentPresentationLineageForPath(
@@ -944,7 +944,7 @@ pub const Controller = struct {
         // or payload.
         const returns_from_staged_only = switch (result.request.expected_presentation.?.owner) {
             .combined_projection => self.ownedCombinedPresentation().?.kind == .retained_staged_only,
-            .primary_loaded => switch (self.navigation.view().displayedReviewBody()) {
+            .primary_loaded => switch (self.navigation.view().displayedChangesBody()) {
                 .primary => |primary| if (primary.hunk_authority) |hunk_authority|
                     hunk_authority == .staged_only
                 else
@@ -953,16 +953,16 @@ pub const Controller = struct {
             },
         };
 
-        self.page.review_projection.finishEagerRetry();
-        self.page.review_projection.clearPending(allocator);
+        self.page.changes_projection.finishEagerRetry();
+        self.page.changes_projection.clearPending(allocator);
         const request = result.request;
         result.request = undefined;
         switch (request.expected_presentation.?.owner) {
             .combined_projection => if (returns_from_staged_only)
-                self.page.review_projection.installCombinedFromRetainedStagedOnlyReuse(allocator, request, candidate)
+                self.page.changes_projection.installCombinedFromRetainedStagedOnlyReuse(allocator, request, candidate)
             else
-                self.page.review_projection.installCombinedReuse(allocator, request, candidate),
-            .primary_loaded => self.page.review_projection.installPrimaryCombinedReuse(allocator, request, candidate),
+                self.page.changes_projection.installCombinedReuse(allocator, request, candidate),
+            .primary_loaded => self.page.changes_projection.installPrimaryCombinedReuse(allocator, request, candidate),
         }
         candidate.deinit();
         result.result = undefined;
@@ -972,7 +972,7 @@ pub const Controller = struct {
     fn applyCombinedReuseCandidate(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
+        result: *app_load.ChangesProjectionFinished,
     ) ProjectionApply {
         if (!self.admitCombinedReuse(result.request, &result.result.reuse_candidate, .live_target)) {
             self.rejectPresentationReuseCandidate(allocator);
@@ -990,8 +990,8 @@ pub const Controller = struct {
 
     fn admitStagedOnlyReuse(
         self: Controller,
-        request: review_projection.Request,
-        candidate: *const review_projection.StagedOnlyReuseCandidate,
+        request: changes_projection.Request,
+        candidate: *const changes_projection.StagedOnlyReuseCandidate,
         basis: ReuseAdmissionBasis,
     ) bool {
         if (request.kind != .cached_diff) return false;
@@ -1031,7 +1031,7 @@ pub const Controller = struct {
                 break :blk diff_presentation_identity.exactEqual(projection.displayFile(), candidate.displayFile());
             },
             .primary_loaded => blk: {
-                const primary = switch (self.navigation.view().displayedReviewBody()) {
+                const primary = switch (self.navigation.view().displayedChangesBody()) {
                     .primary => |primary| primary,
                     else => break :blk false,
                 };
@@ -1055,14 +1055,14 @@ pub const Controller = struct {
         // hint-free eager retry. A target/owner change consumes the marker.
         if (self.view().projectionTarget()) |target| {
             if (self.expectedPresentationForTarget(target)) |live| {
-                self.page.review_projection.scheduleEagerRetry(live);
+                self.page.changes_projection.scheduleEagerRetry(live);
             } else {
-                self.page.review_projection.finishEagerRetry();
+                self.page.changes_projection.finishEagerRetry();
             }
         } else {
-            self.page.review_projection.finishEagerRetry();
+            self.page.changes_projection.finishEagerRetry();
         }
-        self.page.review_projection.clearPending(allocator);
+        self.page.changes_projection.clearPending(allocator);
     }
 
     /// Installs an exactly accepted staged-only reuse candidate. Same contract
@@ -1071,7 +1071,7 @@ pub const Controller = struct {
     fn installStagedOnlyReuseExact(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
+        result: *app_load.ChangesProjectionFinished,
     ) ?PresentationLineage {
         const candidate = &result.result.staged_only_reuse_candidate;
         const outgoing_lineage = self.currentPresentationLineageForPath(
@@ -1079,13 +1079,13 @@ pub const Controller = struct {
             result.request.path_key,
         );
 
-        self.page.review_projection.finishEagerRetry();
-        self.page.review_projection.clearPending(allocator);
+        self.page.changes_projection.finishEagerRetry();
+        self.page.changes_projection.clearPending(allocator);
         const request = result.request;
         result.request = undefined;
         switch (request.expected_presentation.?.owner) {
-            .combined_projection => self.page.review_projection.installRetainedStagedOnlyReuse(allocator, request, candidate),
-            .primary_loaded => self.page.review_projection.installPrimaryStagedOnlyReuse(allocator, request, candidate),
+            .combined_projection => self.page.changes_projection.installRetainedStagedOnlyReuse(allocator, request, candidate),
+            .primary_loaded => self.page.changes_projection.installPrimaryStagedOnlyReuse(allocator, request, candidate),
         }
         candidate.deinit();
         result.result = undefined;
@@ -1095,7 +1095,7 @@ pub const Controller = struct {
     fn applyStagedOnlyReuseCandidate(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
+        result: *app_load.ChangesProjectionFinished,
     ) ProjectionApply {
         if (!self.admitStagedOnlyReuse(result.request, &result.result.staged_only_reuse_candidate, .live_target)) {
             self.rejectPresentationReuseCandidate(allocator);
@@ -1117,7 +1117,7 @@ pub const Controller = struct {
         self: Controller,
         allocator: std.mem.Allocator,
         scope: ProjectionSelectionScope,
-        ready: *const review_projection.Ready,
+        ready: *const changes_projection.Ready,
     ) void {
         const completed = self.page.completed_selection orelse return;
         const active_root = self.repo_root orelse return;
@@ -1143,17 +1143,17 @@ pub const Controller = struct {
         const scope: ProjectionSelectionScope = .{ .repo_root = repo_root, .path_key = path_key };
         const completed = self.page.completed_selection orelse return;
         if (!std.mem.eql(u8, completed.pathKey(), path_key)) return;
-        const primary = switch (self.navigation.view().displayedReviewBody()) {
+        const primary = switch (self.navigation.view().displayedChangesBody()) {
             .primary => |primary| primary,
             else => {
                 self.clearCompletedSelectionForProjection(allocator, scope);
                 return;
             },
         };
-        const current = review_selection.ReviewContentToken{
+        const current = content_selection.ContentToken{
             .repo_epoch = self.repo_epoch,
             .root_identity = self.root_identity,
-            .source = review_selection.SourceBasis.init(self.source),
+            .source = content_selection.SourceBasis.init(self.source),
             .source_session_revision = self.page.source_session_revision,
             .display = .{ .loaded = .init(primary.loaded.text) },
         };
@@ -1205,7 +1205,7 @@ pub const Controller = struct {
         }
         if (!diff_source.sourceAllowsStageProjection(self.source)) return null;
         const basis_path = blk: {
-            if (self.page.review_projection.displayed.request()) |displayed| {
+            if (self.page.changes_projection.displayed.request()) |displayed| {
                 if (std.mem.eql(u8, displayed.repo_root, repo_root) and
                     displayed.source_kind == sourceKind(self.source))
                 {
@@ -1215,7 +1215,7 @@ pub const Controller = struct {
             if (!sourceIsUnstaged(self.source)) return null;
             const active_root = self.repo_root orelse return null;
             if (!std.mem.eql(u8, active_root, repo_root)) return null;
-            const primary = switch (self.navigation.view().displayedReviewBody()) {
+            const primary = switch (self.navigation.view().displayedChangesBody()) {
                 .primary => |value| value,
                 else => return null,
             };
@@ -1322,8 +1322,8 @@ pub const Controller = struct {
                     self.page.deferred_projection_apply = null;
                 }
             }
-            if (self.page.review_projection.pending) |pending| {
-                if (pending.id == request_id) self.page.review_projection.clearPending(allocator);
+            if (self.page.changes_projection.pending) |pending| {
+                if (pending.id == request_id) self.page.changes_projection.clearPending(allocator);
             }
         }
 
@@ -1355,7 +1355,7 @@ pub const Controller = struct {
         gate.deinit(allocator);
     }
 
-    /// Closes an activation-bound canonical transaction before Review becomes
+    /// Closes an activation-bound canonical transaction before Changes becomes
     /// inactive. Ordinary live-drag deferred source owns a separate borrow and
     /// must remain protected by the page-transition policy instead.
     pub fn retireCanonicalPublicationForPageExit(
@@ -1376,7 +1376,7 @@ pub const Controller = struct {
         std.debug.assert(self.page.deferred_source_apply == null);
     }
 
-    pub fn beginPendingReload(self: Controller, allocator: std.mem.Allocator, generation: u64, kind: review_page.ReloadKind) !void {
+    pub fn beginPendingReload(self: Controller, allocator: std.mem.Allocator, generation: u64, kind: changes_page.ReloadKind) !void {
         self.clearPendingReload(allocator);
         const anchor = switch (kind) {
             .manual, .watch => try self.view().captureAnchor(allocator),
@@ -1391,7 +1391,7 @@ pub const Controller = struct {
         };
     }
 
-    pub fn takePendingReloadIfGeneration(self: Controller, generation: u64) ?review_page.PendingReload {
+    pub fn takePendingReloadIfGeneration(self: Controller, generation: u64) ?changes_page.PendingReload {
         const pending_generation = if (self.page.pending_reload) |pending| pending.generation else null;
         return switch (load_state.pendingReloadConsumption(pending_generation, generation)) {
             .consume_generation_match => blk: {
@@ -1413,11 +1413,11 @@ pub const Controller = struct {
 
     /// Retire source ownership only for the exact generation/epoch terminal.
     /// Admission is intentionally separate: an old epoch still owns cleanup,
-    /// but can no longer publish any Review state or shell consequence.
+    /// but can no longer publish any Changes state or shell consequence.
     fn takeOwnedSourceTerminal(
         self: Controller,
         finished: *const app_load.DiffLoadFinished,
-    ) ?review_page.PendingReload {
+    ) ?changes_page.PendingReload {
         if (!self.sourceTerminalOwnsPending(finished)) return null;
         std.debug.assert(self.page.load.finishPending(.{ .diff_load = finished.generation }));
         const pending = self.page.pending_reload.?;
@@ -1446,7 +1446,7 @@ pub const Controller = struct {
         self.page.pending_reload = null;
     }
 
-    pub fn installDisplayRestore(self: Controller, allocator: std.mem.Allocator, restore: review_page.PendingDisplayNavigationRestore) void {
+    pub fn installDisplayRestore(self: Controller, allocator: std.mem.Allocator, restore: changes_page.PendingDisplayNavigationRestore) void {
         self.clearDisplayRestore(allocator);
         self.page.pending_display_navigation_restore = restore;
         self.page.pending_display_navigation_restore.?.source_session_revision = self.page.source_session_revision;
@@ -1508,7 +1508,7 @@ pub const Controller = struct {
         self.page.deferred_projection_apply = null;
     }
 
-    /// Completes the deferred-source state machine entirely inside the Review
+    /// Completes the deferred-source state machine entirely inside the Changes
     /// owner. The returned value contains only shell-facing status/redraw data;
     /// this method consumes or transfers the deferred task payload itself.
     pub fn applyDeferredSource(
@@ -1553,9 +1553,9 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         repo_root: ?[]const u8,
         options: SourceLoadOptions,
-    ) !ReviewUpdate {
+    ) !ChangesUpdate {
         try self.requireRepositoryReadStart();
-        const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
+        const identity = self.page.activation.currentIdentity() orelse return error.InactiveChangesPage;
         self.abortCanonicalPublication(allocator);
         if (options.kind != .watch) self.clearDeferredSourceApply(allocator);
         if (options.kind == .repo_switch) self.page.auto_reload.clearAcceptedSource();
@@ -1599,9 +1599,9 @@ pub const Controller = struct {
         self: Controller,
         allocator: std.mem.Allocator,
         background_cycle_id: ?u64,
-    ) !ReviewUpdate {
+    ) !ChangesUpdate {
         try self.requireRepositoryReadStart();
-        const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
+        const identity = self.page.activation.currentIdentity() orelse return error.InactiveChangesPage;
         const generation = self.page.load.beginRepoDiscovery();
         self.clearPendingReload(allocator);
         self.clearSourceDisplay(allocator);
@@ -1638,9 +1638,9 @@ pub const Controller = struct {
         repo_root: []const u8,
         origin: git_read.ReadOrigin,
         background_cycle_id: ?u64,
-    ) !ReviewUpdate {
+    ) !ChangesUpdate {
         try self.requireRepositoryReadStart();
-        const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
+        const identity = self.page.activation.currentIdentity() orelse return error.InactiveChangesPage;
         const canonical_prerequisite = if (self.page.canonical_publication) |gate|
             gate.phase == .waiting_members and
                 gate.read_epoch.eql(self.page.repository_read_authority.epoch) and
@@ -1696,9 +1696,9 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         repo_root: []const u8,
         background_cycle_id: ?u64,
-    ) !ReviewUpdate {
+    ) !ChangesUpdate {
         try self.requireRepositoryReadStart();
-        const identity = self.page.activation.currentIdentity() orelse return error.InactiveReviewPage;
+        const identity = self.page.activation.currentIdentity() orelse return error.InactiveChangesPage;
         if (self.page.branch_status.repo_root) |current_root| {
             if (std.mem.eql(u8, current_root, repo_root)) {
                 _ = self.page.branch_status_load.prepare(true);
@@ -1817,12 +1817,12 @@ pub const Controller = struct {
         self: Controller,
         gate: anytype,
         target: ProjectionTarget,
-    ) ?review_projection.ExpectedPresentation {
+    ) ?changes_projection.ExpectedPresentation {
         const expected = self.expectedPresentationForTarget(target) orelse return null;
         if (expected.owner != .primary_loaded or !self.canonicalSourceChanges(gate)) {
             return expected;
         }
-        const primary = switch (self.navigation.view().displayedReviewBody()) {
+        const primary = switch (self.navigation.view().displayedChangesBody()) {
             .primary => |value| value,
             else => return null,
         };
@@ -1839,7 +1839,7 @@ pub const Controller = struct {
     fn canonicalProjectionKind(
         self: Controller,
         gate: anytype,
-    ) ?review_projection.Kind {
+    ) ?changes_projection.Kind {
         const status_document = self.canonicalStatusDocument(gate);
         for (status_document.entries) |entry| {
             const path_key = entry.canonicalPathKey() orelse continue;
@@ -1966,10 +1966,10 @@ pub const Controller = struct {
             );
             self.page.advanceSelectionLayoutRevision();
         }
-        self.page.review_projection.clearPending(allocator);
-        self.page.review_projection.clearSyntaxPending(allocator);
-        self.page.review_projection.clearDisplayed(allocator);
-        self.page.review_projection.clearCache(allocator);
+        self.page.changes_projection.clearPending(allocator);
+        self.page.changes_projection.clearSyntaxPending(allocator);
+        self.page.changes_projection.clearDisplayed(allocator);
+        self.page.changes_projection.clearCache(allocator);
         self.clearCompletedSelection(allocator);
         self.page.staged_hunks.clear(allocator);
 
@@ -2036,7 +2036,7 @@ pub const Controller = struct {
     fn prepareCanonicalProjection(
         self: Controller,
         allocator_opt: ?std.mem.Allocator,
-    ) !ReviewUpdate {
+    ) !ChangesUpdate {
         const gate = if (self.page.canonical_publication) |*value| value else return .{};
         if (gate.phase == .waiting_projection) return .{};
         if (gate.phase != .waiting_members or !gate.status.ready()) return .{};
@@ -2063,7 +2063,7 @@ pub const Controller = struct {
             .source_kind = sourceKind(self.source),
         };
         if (!source_changes and !status_changes) {
-            const displayed = self.page.review_projection.displayed.request();
+            const displayed = self.page.changes_projection.displayed.request();
             if (displayed != null and displayed.?.matchesBorrowed(
                 gate.read_epoch,
                 target.repo_root,
@@ -2081,9 +2081,9 @@ pub const Controller = struct {
             @intFromBool(source_changes);
         const status_revision = self.canonicalStatusRevision(gate);
 
-        self.page.review_projection_next_id +%= 1;
-        if (self.page.review_projection_next_id == 0) self.page.review_projection_next_id = 1;
-        const request_id = self.page.review_projection_next_id;
+        self.page.changes_projection_next_id +%= 1;
+        if (self.page.changes_projection_next_id == 0) self.page.changes_projection_next_id = 1;
+        const request_id = self.page.changes_projection_next_id;
         var pair = try self.buildProjectionRequestPair(
             allocator,
             gate.identity,
@@ -2098,17 +2098,17 @@ pub const Controller = struct {
             },
         );
 
-        self.page.review_projection.clearPending(allocator);
-        self.page.review_projection.pending = pair.pending;
+        self.page.changes_projection.clearPending(allocator);
+        self.page.changes_projection.pending = pair.pending;
         pair.pending = undefined;
         gate.phase = .waiting_projection;
         gate.projection_request_id = request_id;
-        return .{ .command = .{ .review_projection = pair.task } };
+        return .{ .command = .{ .changes_projection = pair.task } };
     }
 
     const ProjectionRequestPair = struct {
-        pending: review_projection.Request,
-        task: review_projection.Request,
+        pending: changes_projection.Request,
+        task: changes_projection.Request,
     };
 
     /// Builds the page-owned pending clone and the task-owned clone of one
@@ -2123,10 +2123,10 @@ pub const Controller = struct {
         target: ProjectionTarget,
         source_revision: u64,
         status_revision: u64,
-        options: review_projection.RequestCloneOptions,
+        options: changes_projection.RequestCloneOptions,
     ) !ProjectionRequestPair {
         _ = self;
-        var state_request = try review_projection.cloneRequestWithOptions(
+        var state_request = try changes_projection.cloneRequestWithOptions(
             allocator,
             identity,
             request_id,
@@ -2139,7 +2139,7 @@ pub const Controller = struct {
             options,
         );
         errdefer state_request.deinit(allocator);
-        const task_request = try review_projection.cloneRequestWithOptions(
+        const task_request = try changes_projection.cloneRequestWithOptions(
             allocator,
             identity,
             request_id,
@@ -2165,7 +2165,7 @@ pub const Controller = struct {
     /// root — keeps the ordinary cache-or-clear path.
     fn boundaryInertRetention(self: Controller) bool {
         const repo_root = self.repo_root orelse return false;
-        const request = self.page.review_projection.displayed.request() orelse return false;
+        const request = self.page.changes_projection.displayed.request() orelse return false;
         const view_state = self.view();
         if (view_state.navigation.selectedFile() != null) return false;
         const path_key = view_state.navigation.selectedStagePathKey() orelse return false;
@@ -2185,7 +2185,7 @@ pub const Controller = struct {
     /// Reconciles projection identity and, only when a read is required,
     /// transfers one owned task request to the shell. The pending page identity
     /// is a distinct clone so task and page never share allocator ownership.
-    pub fn prepareProjection(self: Controller, allocator_opt: ?std.mem.Allocator) !ReviewUpdate {
+    pub fn prepareProjection(self: Controller, allocator_opt: ?std.mem.Allocator) !ChangesUpdate {
         // A closed mutation phase retains the old displayed/cache owners as
         // inert visual state. Do not reconcile, promote a cache hit, clear a
         // no-target display, or prepare a current-epoch request until the exact
@@ -2202,18 +2202,18 @@ pub const Controller = struct {
         const read_epoch = self.page.repository_read_authority.epoch;
 
         const target = self.view().projectionTarget() orelse {
-            _ = self.page.review_projection.shouldForceEagerRetry(null);
+            _ = self.page.changes_projection.shouldForceEagerRetry(null);
             if (self.view().canRetainDisplayedProjection()) return .{};
             if (self.page.pending_display_navigation_restore != null and !self.page.status_load.isFresh()) return .{};
             const allocator = allocator_opt orelse {
-                if (!self.page.review_projection.hasPending() and
-                    !self.page.review_projection.hasDisplayed() and
-                    self.page.review_projection.cacheLen() == 0 and
+                if (!self.page.changes_projection.hasPending() and
+                    !self.page.changes_projection.hasDisplayed() and
+                    self.page.changes_projection.cacheLen() == 0 and
                     self.page.pending_display_navigation_restore == null) return .{};
                 return error.MissingAllocator;
             };
             const outgoing_lineage = self.currentOwnedProjectionLineage();
-            self.page.review_projection.clearPending(allocator);
+            self.page.changes_projection.clearPending(allocator);
             if (self.combinedToOrdinaryBoundary()) |boundary| {
                 // A self-owned combined body is always unfolded, while the
                 // underlying primary may retain folds from before projection
@@ -2233,7 +2233,7 @@ pub const Controller = struct {
                     local_navigation != null;
                 if (has_navigation_authority) {
                     self.applyPresentationLineageTransfer(allocator, boundary.transfer);
-                    self.page.review_projection.finishCombinedToOrdinaryPrimary(allocator);
+                    self.page.changes_projection.finishCombinedToOrdinaryPrimary(allocator);
                     if (boundary.owner == .self_owned) self.page.advanceSelectionLayoutRevision();
                     switch (boundary.owner) {
                         .self_owned => self.reconcileInstalledProjectionNavigation(
@@ -2257,7 +2257,7 @@ pub const Controller = struct {
                 self.page.activation.queueRevalidation();
                 return .{};
             }
-            const changes_selected_body_mapping = self.page.review_projection.hasDisplayed();
+            const changes_selected_body_mapping = self.page.changes_projection.hasDisplayed();
             const selection_viewport = if (changes_selected_body_mapping)
                 self.navigation.captureSelectionViewportAnchor()
             else
@@ -2266,7 +2266,7 @@ pub const Controller = struct {
             self.reconcileCompletedSelectionForNoProjectionTarget(allocator);
             if (self.page.pending_display_navigation_restore != null) self.clearDisplayRestore(allocator);
             if (self.repo_root) |repo_root| {
-                self.page.review_projection.cacheOrClearDisplayed(
+                self.page.changes_projection.cacheOrClearDisplayed(
                     allocator,
                     read_epoch,
                     repo_root,
@@ -2275,8 +2275,8 @@ pub const Controller = struct {
                     self.page.status_snapshot_revision,
                 );
             } else {
-                self.page.review_projection.clearDisplayed(allocator);
-                self.page.review_projection.clearCache(allocator);
+                self.page.changes_projection.clearDisplayed(allocator);
+                self.page.changes_projection.clearCache(allocator);
             }
             if (changes_selected_body_mapping) {
                 self.page.advanceSelectionLayoutRevision();
@@ -2290,7 +2290,7 @@ pub const Controller = struct {
         if (self.page.pending_display_navigation_restore != null and !self.view().pendingDisplayRestoreMatchesTarget(target)) {
             self.clearDisplayRestore(allocator);
         }
-        const displayed_matches = self.page.review_projection.displayedMatches(
+        const displayed_matches = self.page.changes_projection.displayedMatches(
             read_epoch,
             target.repo_root,
             target.path_key,
@@ -2301,9 +2301,9 @@ pub const Controller = struct {
         );
         if (displayed_matches and
             (target.kind != .generated_added_file or
-                self.page.review_projection.displayed.request().?.matchesRootIdentity(self.root_identity))) return .{};
+                self.page.changes_projection.displayed.request().?.matchesRootIdentity(self.root_identity))) return .{};
 
-        if (self.page.review_projection.cacheHas(
+        if (self.page.changes_projection.cacheHas(
             read_epoch,
             target.repo_root,
             target.path_key,
@@ -2318,7 +2318,7 @@ pub const Controller = struct {
                 null;
             defer if (local_navigation) |*anchor| anchor.deinit(allocator);
 
-            var hit = self.page.review_projection.takeCached(
+            var hit = self.page.changes_projection.takeCached(
                 read_epoch,
                 target.repo_root,
                 target.path_key,
@@ -2352,8 +2352,8 @@ pub const Controller = struct {
                     .repo_root = target.repo_root,
                     .path_key = target.path_key,
                 }, &hit.value);
-                self.page.review_projection.clearPending(allocator);
-                self.page.review_projection.cacheOrClearDisplayed(
+                self.page.changes_projection.clearPending(allocator);
+                self.page.changes_projection.cacheOrClearDisplayed(
                     allocator,
                     read_epoch,
                     target.repo_root,
@@ -2361,13 +2361,13 @@ pub const Controller = struct {
                     self.page.source_session_revision,
                     self.page.status_snapshot_revision,
                 );
-                self.page.review_projection.installReady(hit);
+                self.page.changes_projection.installReady(hit);
                 hit_owned = false;
                 self.reconcileInstalledProjectionNavigation(allocator, if (local_navigation) |*anchor| anchor else null);
                 return .{ .display_changed = true };
             }
         }
-        if (self.page.review_projection.pendingMatches(
+        if (self.page.changes_projection.pendingMatches(
             read_epoch,
             target.repo_root,
             target.path_key,
@@ -2377,7 +2377,7 @@ pub const Controller = struct {
             self.page.status_snapshot_revision,
         )) return .{};
 
-        self.page.review_projection.clearPending(allocator);
+        self.page.changes_projection.clearPending(allocator);
         const live_expected_presentation = self.expectedPresentationForTarget(target);
         const primary_reuse_candidate = if (live_expected_presentation) |expected|
             expected.owner == .primary_loaded
@@ -2393,8 +2393,8 @@ pub const Controller = struct {
             // owner to cache or clear. Avoid consuming its eager-retry marker
             // and keep the owned primary selection until exact acceptance or
             // the terminal eager replacement decides its content basis.
-            if (!primary_reuse_candidate or self.page.review_projection.hasDisplayed()) {
-                self.page.review_projection.cacheOrClearDisplayed(
+            if (!primary_reuse_candidate or self.page.changes_projection.hasDisplayed()) {
+                self.page.changes_projection.cacheOrClearDisplayed(
                     allocator,
                     read_epoch,
                     target.repo_root,
@@ -2404,9 +2404,9 @@ pub const Controller = struct {
                 );
             }
         }
-        self.page.review_projection_next_id +%= 1;
-        if (self.page.review_projection_next_id == 0) self.page.review_projection_next_id = 1;
-        const request_id = self.page.review_projection_next_id;
+        self.page.changes_projection_next_id +%= 1;
+        if (self.page.changes_projection_next_id == 0) self.page.changes_projection_next_id = 1;
+        const request_id = self.page.changes_projection_next_id;
         const identity = self.page.activation.currentIdentity() orelse {
             self.clearCompletedSelectionForProjection(allocator, selection_scope);
             return .{};
@@ -2419,7 +2419,7 @@ pub const Controller = struct {
         errdefer self.clearCompletedSelectionForProjection(allocator, selection_scope);
 
         const request_root_identity = self.root_identity;
-        const force_eager_retry = self.page.review_projection.shouldForceEagerRetry(live_expected_presentation);
+        const force_eager_retry = self.page.changes_projection.shouldForceEagerRetry(live_expected_presentation);
         const expected_presentation = if (force_eager_retry) null else live_expected_presentation;
         var pair = try self.buildProjectionRequestPair(
             allocator,
@@ -2435,9 +2435,9 @@ pub const Controller = struct {
             },
         );
 
-        self.page.review_projection.pending = pair.pending;
+        self.page.changes_projection.pending = pair.pending;
         pair.pending = undefined;
-        return .{ .command = .{ .review_projection = pair.task } };
+        return .{ .command = .{ .changes_projection = pair.task } };
     }
 
     /// Shell validation/allocation/spawn failure terminal for a prepared read.
@@ -2445,7 +2445,7 @@ pub const Controller = struct {
     /// awaiting that replacement. The command/task owner frees its own request
     /// independently; a stale rejection cannot disturb a newer request.
     pub fn rejectProjectionSpawn(self: Controller, allocator: std.mem.Allocator, request_id: u64) void {
-        const pending = if (self.page.review_projection.pending) |*request| request else return;
+        const pending = if (self.page.changes_projection.pending) |*request| request else return;
         if (pending.id != request_id) return;
         if (self.page.canonical_publication) |gate| {
             if (gate.projection_request_id == request_id) {
@@ -2457,7 +2457,7 @@ pub const Controller = struct {
             .repo_root = pending.repo_root,
             .path_key = pending.path_key,
         });
-        self.page.review_projection.clearPending(allocator);
+        self.page.changes_projection.clearPending(allocator);
     }
 
     /// Retire an already-proved exact async terminal without publishing it.
@@ -2468,20 +2468,20 @@ pub const Controller = struct {
         self: Controller,
         allocator: std.mem.Allocator,
     ) ProjectionApply {
-        self.page.review_projection.clearPending(allocator);
+        self.page.changes_projection.clearPending(allocator);
         return .{ .skip_redraw = true };
     }
 
     /// Prepares optional syntax only for the current plain generated preview.
     /// The bundle remains `eligible` while the page-owned pending request is
     /// in flight, so immutable cache admission never needs to mutate an entry.
-    pub fn prepareGeneratedSyntax(self: Controller, allocator: std.mem.Allocator) !?review_projection.GeneratedSyntaxRequest {
+    pub fn prepareGeneratedSyntax(self: Controller, allocator: std.mem.Allocator) !?changes_projection.GeneratedSyntaxRequest {
         if (!self.page.repository_read_authority.mayStartRepositoryRead()) return null;
         if (!source_syntax_runtime.enabled) return null;
         const target = self.view().projectionTarget() orelse return null;
         if (target.kind != .generated_added_file) return null;
 
-        const ready = switch (self.page.review_projection.displayed) {
+        const ready = switch (self.page.changes_projection.displayed) {
             .ready => |*ready| ready,
             .idle, .failed => return null,
         };
@@ -2505,7 +2505,7 @@ pub const Controller = struct {
         }
         const current_identity = self.page.activation.currentIdentity() orelse return null;
 
-        if (self.page.review_projection.syntax_pending) |pending| {
+        if (self.page.changes_projection.syntax_pending) |pending| {
             if (pending.projection_id == ready.request.id and
                 pending.read_epoch.eql(ready.request.read_epoch) and
                 pending.identity.origin == current_identity.origin and
@@ -2513,40 +2513,40 @@ pub const Controller = struct {
                 pending.identity.activation_id == current_identity.activation_id and
                 pending.root_identity.eql(ready.request.root_identity.?) and
                 pending.expected_fingerprint.eql(bundle.fingerprint())) return null;
-            self.page.review_projection.clearSyntaxPending(allocator);
+            self.page.changes_projection.clearSyntaxPending(allocator);
         }
 
-        self.page.review_projection.syntax_next_id +%= 1;
-        if (self.page.review_projection.syntax_next_id == 0) self.page.review_projection.syntax_next_id = 1;
-        var state_request = try review_projection.generatedSyntaxRequestForProjection(
+        self.page.changes_projection.syntax_next_id +%= 1;
+        if (self.page.changes_projection.syntax_next_id == 0) self.page.changes_projection.syntax_next_id = 1;
+        var state_request = try changes_projection.generatedSyntaxRequestForProjection(
             allocator,
-            self.page.review_projection.syntax_next_id,
+            self.page.changes_projection.syntax_next_id,
             current_identity,
             ready.request,
             bundle.fingerprint(),
         );
         errdefer state_request.deinit(allocator);
-        const task_request = try review_projection.cloneGeneratedSyntaxRequest(allocator, state_request);
-        self.page.review_projection.syntax_pending = state_request;
+        const task_request = try changes_projection.cloneGeneratedSyntaxRequest(allocator, state_request);
+        self.page.changes_projection.syntax_pending = state_request;
         return task_request;
     }
 
     pub fn rejectGeneratedSyntaxSpawn(self: Controller, allocator: std.mem.Allocator, request_id: u64) void {
-        const pending_id = if (self.page.review_projection.syntax_pending) |request| request.id else return;
-        if (pending_id == request_id) self.page.review_projection.clearSyntaxPending(allocator);
+        const pending_id = if (self.page.changes_projection.syntax_pending) |request| request.id else return;
+        if (pending_id == request_id) self.page.changes_projection.clearSyntaxPending(allocator);
     }
 
     pub fn applyGeneratedSyntaxFinished(
         self: Controller,
         allocator: std.mem.Allocator,
-        finished: *review_projection.GeneratedSyntaxFinished,
+        finished: *changes_projection.GeneratedSyntaxFinished,
     ) GeneratedSyntaxApply {
         // Pending equality proves cleanup ownership independently of current
         // publication authority. Drain the exact page clone first; every
         // rejection below leaves the retained generated body unchanged.
-        const pending = self.page.review_projection.syntax_pending orelse return .{ .skip_redraw = true };
+        const pending = self.page.changes_projection.syntax_pending orelse return .{ .skip_redraw = true };
         if (!pending.matches(finished.request)) return .{ .skip_redraw = true };
-        self.page.review_projection.clearSyntaxPending(allocator);
+        self.page.changes_projection.clearSyntaxPending(allocator);
 
         const current_identity = self.page.activation.currentIdentity() orelse return .{ .skip_redraw = true };
         if (current_identity.origin != finished.request.identity.origin or
@@ -2563,7 +2563,7 @@ pub const Controller = struct {
 
         const target = self.view().projectionTarget() orelse return .{ .skip_redraw = true };
         if (target.kind != .generated_added_file) return .{ .skip_redraw = true };
-        const ready = switch (self.page.review_projection.displayed) {
+        const ready = switch (self.page.changes_projection.displayed) {
             .ready => |*ready| ready,
             .idle, .failed => return .{ .skip_redraw = true },
         };
@@ -2601,7 +2601,7 @@ pub const Controller = struct {
                 }
                 bundle.decoration = .{ .decorated = .{
                     .spans = spans,
-                    .has_visible_syntax = review_projection.sourceSpansHaveVisibleSyntax(spans),
+                    .has_visible_syntax = changes_projection.sourceSpansHaveVisibleSyntax(spans),
                 } };
                 finished.result = .stale;
             },
@@ -2614,7 +2614,7 @@ pub const Controller = struct {
     fn reconcileInstalledProjectionNavigation(
         self: Controller,
         allocator: std.mem.Allocator,
-        local_navigation: ?*const review_page.ReloadAnchor,
+        local_navigation: ?*const changes_page.ReloadAnchor,
     ) void {
         if (self.page.pending_display_navigation_restore) |*restore| {
             self.restoreDisplayedNavigation(restore.authoritative());
@@ -2632,7 +2632,7 @@ pub const Controller = struct {
     /// stale source or virtual-row ordinal cannot survive the owner change.
     fn reconcileInstalledProjectionFailureViewport(
         self: Controller,
-        local_navigation: ?*const review_page.ReloadAnchor,
+        local_navigation: ?*const changes_page.ReloadAnchor,
     ) void {
         const navigation_anchor = if (self.page.pending_display_navigation_restore) |*restore|
             restore.authoritative()
@@ -2663,7 +2663,7 @@ pub const Controller = struct {
         }
     }
 
-    /// Accepts the Review-owned half of repository discovery and returns the
+    /// Accepts the Changes-owned half of repository discovery and returns the
     /// only owned value allowed to cross into the App repository coordinator.
     pub fn applyRepoDiscoveryFinished(
         self: Controller,
@@ -2717,7 +2717,7 @@ pub const Controller = struct {
         return .start_initial_read;
     }
 
-    /// Terminates a repository-discovery completion that Review accepted but
+    /// Terminates a repository-discovery completion that Changes accepted but
     /// the repository coordinator could not commit. The discovery preparation
     /// already cleared the old display, so no allocator-backed failure value
     /// is needed to leave this route retryable and close source freshness.
@@ -2734,7 +2734,7 @@ pub const Controller = struct {
         return true;
     }
 
-    /// Accepts one status task result into the Review page. The caller retains
+    /// Accepts one status task result into the Changes page. The caller retains
     /// ownership of the enclosing result and consumes the returned shell-facing
     /// diagnostic/redraw intent synchronously.
     pub fn applyStatusFinished(
@@ -3134,7 +3134,7 @@ pub const Controller = struct {
         self: Controller,
         allocator: std.mem.Allocator,
         gate: anytype,
-        deferred: *review_page.DeferredSourceApply,
+        deferred: *changes_page.DeferredSourceApply,
     ) !PreparedCanonicalSource {
         if (!self.canonicalSourceChanges(gate)) return .unchanged;
         const status_document = self.canonicalStatusDocument(gate);
@@ -3248,7 +3248,7 @@ pub const Controller = struct {
     }
 
     fn canonicalSourceFingerprint(
-        deferred: *const review_page.DeferredSourceApply,
+        deferred: *const changes_page.DeferredSourceApply,
     ) content_fingerprint.Fingerprint {
         return switch (deferred.finished.result) {
             .empty => content_fingerprint.Fingerprint.init(""),
@@ -3273,14 +3273,14 @@ pub const Controller = struct {
     fn applyCanonicalProjectionFinished(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
+        result: *app_load.ChangesProjectionFinished,
     ) !ProjectionApply {
         const gate = if (self.page.canonical_publication) |*value| value else return .{ .skip_redraw = true };
         if (gate.phase != .waiting_projection or
             gate.projection_request_id != result.request.id) return .{ .skip_redraw = true };
         errdefer self.abortCanonicalPublication(allocator);
         if (try self.refreshCanonicalPath(allocator, gate)) {
-            self.page.review_projection.clearPending(allocator);
+            self.page.changes_projection.clearPending(allocator);
             gate.phase = .waiting_members;
             gate.projection_request_id = null;
             return .{ .skip_redraw = true };
@@ -3337,7 +3337,7 @@ pub const Controller = struct {
             return .{ .skip_redraw = true };
         }
         var static_failure = switch (result.result) {
-            .failed_static => |message| try review_projection.statusBodyAlloc(
+            .failed_static => |message| try changes_projection.statusBodyAlloc(
                 allocator,
                 result.request.path_key,
                 "{s}",
@@ -3421,7 +3421,7 @@ pub const Controller = struct {
             self.page.accepted_sidebar_revision = file_search.nextAcceptedSidebarRevision(
                 self.page.accepted_sidebar_revision,
             );
-            self.page.review_projection.clearCache(allocator);
+            self.page.changes_projection.clearCache(allocator);
             if (!reused) self.page.advanceSelectionLayoutRevision();
         }
 
@@ -3481,7 +3481,7 @@ pub const Controller = struct {
                 .path_key = result.request.path_key,
             });
             self.page.staged_hunks.clear(allocator);
-            self.page.review_projection.finishEagerRetry();
+            self.page.changes_projection.finishEagerRetry();
             // The publication route owns its static failure body: it was
             // preallocated before the no-fail commit, so the arm converts to a
             // consuming `.failed` terminal here (route difference from the
@@ -3527,9 +3527,9 @@ pub const Controller = struct {
     /// reuse cache; the publication route replaces wholesale and never caches.
     const ProjectionCachePolicy = union(enum) {
         cache_or_clear: struct {
-            read_epoch: ReviewRepositoryReadEpoch,
+            read_epoch: ChangesRepositoryReadEpoch,
             repo_root: []const u8,
-            source_kind: review_projection.SourceKind,
+            source_kind: changes_projection.SourceKind,
         },
         clear_displayed,
     };
@@ -3546,12 +3546,12 @@ pub const Controller = struct {
     fn commitProjectionTerminal(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
+        result: *app_load.ChangesProjectionFinished,
         cache_policy: ProjectionCachePolicy,
     ) void {
-        self.page.review_projection.clearPending(allocator);
+        self.page.changes_projection.clearPending(allocator);
         switch (cache_policy) {
-            .cache_or_clear => |scope| self.page.review_projection.cacheOrClearDisplayed(
+            .cache_or_clear => |scope| self.page.changes_projection.cacheOrClearDisplayed(
                 allocator,
                 scope.read_epoch,
                 scope.repo_root,
@@ -3559,21 +3559,21 @@ pub const Controller = struct {
                 self.page.source_session_revision,
                 self.page.status_snapshot_revision,
             ),
-            .clear_displayed => self.page.review_projection.clearDisplayed(allocator),
+            .clear_displayed => self.page.changes_projection.clearDisplayed(allocator),
         }
         const request = result.request;
         result.request = undefined;
         switch (result.result) {
             .ready => |ready| {
                 result.result = undefined;
-                self.page.review_projection.installReady(.{
+                self.page.changes_projection.installReady(.{
                     .request = request,
                     .value = ready,
                 });
             },
             .failed => |body| {
                 result.result = undefined;
-                self.page.review_projection.displayed = .{ .failed = .{
+                self.page.changes_projection.displayed = .{ .failed = .{
                     .request = request,
                     .body = body,
                 } };
@@ -3582,7 +3582,7 @@ pub const Controller = struct {
         }
     }
 
-    /// Consumes a matching projection result into retained Review state. A
+    /// Consumes a matching projection result into retained Changes state. A
     /// true `result_transferred` means the caller must not deinitialize the
     /// task result: ordinary ready values move into the page, while an exact
     /// reuse candidate is split into retained authority and locally released
@@ -3590,9 +3590,9 @@ pub const Controller = struct {
     pub fn applyProjectionFinished(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: *app_load.ReviewProjectionFinished,
+        result: *app_load.ChangesProjectionFinished,
     ) !ProjectionApply {
-        const pending = if (self.page.review_projection.pending) |*request| request else return .{ .skip_redraw = true };
+        const pending = if (self.page.changes_projection.pending) |*request| request else return .{ .skip_redraw = true };
         if (pending.id != result.request.id or !pending.sameSemanticKey(result.request)) {
             return .{ .skip_redraw = true };
         }
@@ -3665,7 +3665,7 @@ pub const Controller = struct {
         // stale display. The caller still owns and cleans up `result`.
         var local_navigation = if (self.page.pending_display_navigation_restore == null)
             self.view().captureAnchor(allocator) catch |err| {
-                self.page.review_projection.clearPending(allocator);
+                self.page.changes_projection.clearPending(allocator);
                 return err;
             }
         else
@@ -3675,7 +3675,7 @@ pub const Controller = struct {
         // A matching non-candidate terminal consumes the single eager retry
         // budget only after all fallible admission work succeeds. Failure
         // terminals remain terminal instead of scheduling another loop.
-        self.page.review_projection.finishEagerRetry();
+        self.page.changes_projection.finishEagerRetry();
 
         const outgoing_lineage = self.currentPresentationLineageForPath(
             current.repo_root,
@@ -3733,8 +3733,8 @@ pub const Controller = struct {
             },
             .reuse_candidate, .staged_only_reuse_candidate => unreachable,
             .failed_static => |message| {
-                self.page.review_projection.clearPending(allocator);
-                self.page.review_projection.cacheOrClearDisplayed(
+                self.page.changes_projection.clearPending(allocator);
+                self.page.changes_projection.cacheOrClearDisplayed(
                     allocator,
                     self.page.repository_read_authority.epoch,
                     current.repo_root,
@@ -3742,7 +3742,7 @@ pub const Controller = struct {
                     self.page.source_session_revision,
                     self.page.status_snapshot_revision,
                 );
-                var request = try review_projection.cloneRequestWithOptions(
+                var request = try changes_projection.cloneRequestWithOptions(
                     allocator,
                     result.request.identity,
                     result.request.id,
@@ -3759,9 +3759,9 @@ pub const Controller = struct {
                     },
                 );
                 errdefer request.deinit(allocator);
-                var body = try review_projection.statusBodyAlloc(allocator, result.request.path_key, "{s}", .{message});
+                var body = try changes_projection.statusBodyAlloc(allocator, result.request.path_key, "{s}", .{message});
                 errdefer body.deinit(allocator);
-                self.page.review_projection.displayed = .{ .failed = .{ .request = request, .body = body } };
+                self.page.changes_projection.displayed = .{ .failed = .{ .request = request, .body = body } };
                 self.reconcileInstalledProjectionFailureViewport(if (local_navigation) |*anchor| anchor else null);
                 self.clearDisplayRestore(allocator);
                 return .{};
@@ -4006,7 +4006,7 @@ pub const Controller = struct {
     fn applySourceFailure(
         self: Controller,
         allocator: std.mem.Allocator,
-        pending_reload: ?review_page.PendingReload,
+        pending_reload: ?changes_page.PendingReload,
         message: []const u8,
     ) !SourceApply {
         if (pending_reload != null and pending_reload.?.kind == .watch) {
@@ -4029,7 +4029,7 @@ pub const Controller = struct {
     /// reloads do so only after a later explicit sidebar selection has revoked
     /// the original action target; this captures the current user path before
     /// replacing the source arena.
-    fn shouldCaptureAcceptanceRestore(self: Controller, kind: review_page.ReloadKind) bool {
+    fn shouldCaptureAcceptanceRestore(self: Controller, kind: changes_page.ReloadKind) bool {
         return kind == .watch or
             (kind == .action_result and self.page.action_cursor.hasOwner() and
                 !self.page.action_cursor.hasRestoreAuthority());
@@ -4039,7 +4039,7 @@ pub const Controller = struct {
         return if (diff_source.sourceIsOneShotInput(self.source)) .immutable else .fresh;
     }
 
-    pub fn restoreDisplayedNavigation(self: Controller, anchor: *const review_page.ReloadAnchor) void {
+    pub fn restoreDisplayedNavigation(self: Controller, anchor: *const changes_page.ReloadAnchor) void {
         self.page.viewer.diff_cursor = anchor.diff_cursor;
         if (self.navigation.view().selectedDiffCursorOffset() == null) {
             if (anchor.diff_cursor_offset) |offset| {
@@ -4070,9 +4070,9 @@ pub const Controller = struct {
         self.page.advanceAcceptedSidebarRevision(allocator);
         if (allocator) |owner| {
             self.clearCompletedSelection(owner);
-            self.page.review_projection.clearCache(owner);
+            self.page.changes_projection.clearCache(owner);
         } else {
-            std.debug.assert(self.page.review_projection.cacheLen() == 0);
+            std.debug.assert(self.page.changes_projection.cacheLen() == 0);
             std.debug.assert(self.page.completed_selection == null);
         }
         self.page.source_session_revision +%= 1;
@@ -4091,9 +4091,9 @@ pub const Controller = struct {
         self.page.advanceAcceptedSidebarRevision(allocator);
         if (allocator) |owner| {
             self.clearStatusInvalidatedCompletedSelection(owner);
-            self.page.review_projection.clearCache(owner);
+            self.page.changes_projection.clearCache(owner);
         } else {
-            std.debug.assert(self.page.review_projection.cacheLen() == 0);
+            std.debug.assert(self.page.changes_projection.cacheLen() == 0);
             if (self.page.completed_selection) |completed| switch (completed.token.display) {
                 .loaded, .combined_projection => {},
                 .cached_projection, .generated_untracked => unreachable,
@@ -4116,7 +4116,7 @@ pub const Controller = struct {
         self.page.load.installPreparedFailed(&failed);
     }
 
-    /// Projection/session teardown for the current Review display. This does
+    /// Projection/session teardown for the current Changes display. This does
     /// not revoke accepted source authority; callers choose the destructive or
     /// replacement transition below explicitly.
     pub fn clearLoadedDiff(self: Controller, allocator: ?std.mem.Allocator) void {
@@ -4125,12 +4125,12 @@ pub const Controller = struct {
         // pending-reload clear, repo discovery, page exit). Assert that
         // invariant instead of silently tearing down a transaction's owner.
         std.debug.assert(self.page.canonical_publication == null);
-        if (allocator == null) std.debug.assert(self.page.review_projection.isEmpty());
+        if (allocator == null) std.debug.assert(self.page.changes_projection.isEmpty());
         self.advanceSourceSessionRevision(allocator);
         self.navigation.clearDiffSelection();
         self.page.load.clearCurrent(allocator);
         if (allocator) |owned_allocator| {
-            self.page.review_projection.deinit(owned_allocator);
+            self.page.changes_projection.deinit(owned_allocator);
             self.page.staged_hunks.clear(owned_allocator);
             self.clearDisplayRestore(owned_allocator);
         }
@@ -4287,7 +4287,7 @@ pub const Controller = struct {
     }
 };
 
-pub fn sourceKind(source: diff_source.SourceMode) review_projection.SourceKind {
+pub fn sourceKind(source: diff_source.SourceMode) changes_projection.SourceKind {
     return switch (source) {
         .unstaged => .unstaged,
         .cached => .cached,
@@ -4310,7 +4310,7 @@ fn isCombinedHunkProjectionCandidate(file: diff_parser.FileDiff, entry: git_stat
 }
 
 fn testController(
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
     status_message: *@import("../../state.zig").StatusMessage,
     source: diff_source.SourceMode,
 ) Controller {
@@ -4331,23 +4331,23 @@ fn testController(
     };
 }
 
-fn testActionFence(page: *review_page.ReviewPageState) action_fence.Controller {
+fn testActionFence(page: *changes_page.ChangesPageState) action_fence.Controller {
     return .{
         .read_authority = &page.repository_read_authority,
         .activation = &page.activation,
         .action_cursor = &page.action_cursor,
         .auto_reload = &page.auto_reload,
-        .review_projection = &page.review_projection,
+        .changes_projection = &page.changes_projection,
         .deferred_projection_apply = &page.deferred_projection_apply,
     };
 }
 
 fn addTestSessionHunkMarks(
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     path_key: []const u8,
-    content: review_selection.ReviewContentToken,
+    content: content_selection.ContentToken,
     ordinals: []const usize,
 ) !void {
     for (ordinals) |display_hunk_index| {
@@ -4359,10 +4359,10 @@ fn addTestSessionHunkMarks(
 }
 
 fn expectTestSessionHunkMarks(
-    page: *const review_page.ReviewPageState,
+    page: *const changes_page.ChangesPageState,
     repo_root: []const u8,
     path_key: []const u8,
-    content: review_selection.ReviewContentToken,
+    content: content_selection.ContentToken,
     ordinals: []const usize,
 ) !void {
     for (ordinals) |display_hunk_index| {
@@ -4478,7 +4478,7 @@ fn testCombinedBundle(
     status_snapshot_revision: u64,
     cached_patch: []const u8,
     unstaged_patch: []const u8,
-) !review_projection.CombinedHunkBundle {
+) !changes_projection.CombinedHunkBundle {
     var cached_bundle = try app_load.buildLoadedBundle(allocator, cached_patch);
     errdefer cached_bundle.deinit();
     var unstaged_bundle = try app_load.buildLoadedBundle(allocator, unstaged_patch);
@@ -4521,7 +4521,7 @@ fn testCombinedReuseCandidate(
     status_snapshot_revision: u64,
     cached_patch: []const u8,
     unstaged_patch: []const u8,
-) !review_projection.CombinedReuseCandidate {
+) !changes_projection.CombinedReuseCandidate {
     var cached = try projection_component.ParsedComponent.parse(allocator, cached_patch);
     errdefer cached.deinit();
     var unstaged = try projection_component.ParsedComponent.parse(allocator, unstaged_patch);
@@ -4536,7 +4536,7 @@ fn testCombinedReuseCandidate(
         cached.document.files[0],
         unstaged.document.files[0],
     );
-    const candidate: review_projection.CombinedReuseCandidate = .{
+    const candidate: changes_projection.CombinedReuseCandidate = .{
         .candidate_arena = candidate_arena,
         .projection = projection.presentation,
         .fingerprint = diff_presentation_identity.fingerprint(projection.presentation.file),
@@ -4557,7 +4557,7 @@ fn testStagedOnlyReuseCandidate(
     allocator: std.mem.Allocator,
     status_snapshot_revision: u64,
     cached_patch: []const u8,
-) !review_projection.StagedOnlyReuseCandidate {
+) !changes_projection.StagedOnlyReuseCandidate {
     var cached = try projection_component.ParsedComponent.parse(allocator, cached_patch);
     errdefer cached.deinit();
     if (cached.document.files.len != 1) return error.ExpectedSingleCachedFile;
@@ -4567,7 +4567,7 @@ fn testStagedOnlyReuseCandidate(
     @memset(stage_states, .staged);
     const action_origins = try owner.alloc(diff_hunk_projection.HunkActionOrigin, hunk_count);
     for (action_origins, 0..) |*origin, hunk_index| origin.* = .{ .cached = hunk_index };
-    const candidate: review_projection.StagedOnlyReuseCandidate = .{
+    const candidate: changes_projection.StagedOnlyReuseCandidate = .{
         .fingerprint = diff_presentation_identity.fingerprint(cached.document.files[0]),
         .fresh_authority = .{
             .projection = .{
@@ -4598,7 +4598,7 @@ fn testPrimaryCandidate(
     controller: Controller,
     allocator: std.mem.Allocator,
     file: diff_parser.FileDiff,
-) !review_selection.CompletedSelection {
+) !content_selection.CompletedSelection {
     return testPrimaryCandidateAt(controller, allocator, file, 1);
 }
 
@@ -4607,11 +4607,11 @@ fn testPrimaryCandidateAt(
     allocator: std.mem.Allocator,
     file: diff_parser.FileDiff,
     line_index: usize,
-) !review_selection.CompletedSelection {
-    const token: review_selection.ReviewContentToken = .{
+) !content_selection.CompletedSelection {
+    const token: content_selection.ContentToken = .{
         .repo_epoch = controller.repo_epoch,
         .root_identity = controller.root_identity,
-        .source = review_selection.SourceBasis.init(controller.source),
+        .source = content_selection.SourceBasis.init(controller.source),
         .source_session_revision = controller.page.source_session_revision,
         .display = .{ .loaded = .init(controller.navigation.view().activeLoadedDiffConst().?.text) },
     };
@@ -4621,7 +4621,7 @@ fn testPrimaryCandidateAt(
         .{ .hunk_index = 0, .line_index = line_index },
     );
     drag.moved = true;
-    return review_selection.buildParsed(allocator, token, file, drag);
+    return content_selection.buildParsed(allocator, token, file, drag);
 }
 
 fn testPrimaryCandidateForFile(
@@ -4629,16 +4629,16 @@ fn testPrimaryCandidateForFile(
     allocator: std.mem.Allocator,
     file_index: usize,
     line_index: usize,
-) !review_selection.CompletedSelection {
+) !content_selection.CompletedSelection {
     const loaded = controller.navigation.view().activeLoadedDiffConst() orelse
         return error.ExpectedLoadedDiff;
     if (file_index >= loaded.document.files.len) return error.ExpectedDiffFile;
     const file = loaded.document.files[file_index];
     const path_key = diff_file.canonicalPathKey(file) orelse return error.ExpectedPathKey;
-    const token: review_selection.ReviewContentToken = .{
+    const token: content_selection.ContentToken = .{
         .repo_epoch = controller.repo_epoch,
         .root_identity = controller.root_identity,
-        .source = review_selection.SourceBasis.init(controller.source),
+        .source = content_selection.SourceBasis.init(controller.source),
         .source_session_revision = controller.page.source_session_revision,
         .display = .{ .loaded = .init(loaded.text) },
     };
@@ -4648,7 +4648,7 @@ fn testPrimaryCandidateForFile(
         .{ .hunk_index = 0, .line_index = line_index },
     );
     drag.moved = true;
-    return review_selection.buildParsed(allocator, token, file, drag);
+    return content_selection.buildParsed(allocator, token, file, drag);
 }
 
 const TestProjectionSelectionOwner = enum {
@@ -4672,7 +4672,7 @@ const TestSelectionViewportTop = enum {
     action_after,
 };
 
-/// Places a real Review viewport at each boundary around the retained action
+/// Places a real Changes viewport at each boundary around the retained action
 /// projection.  These assertions intentionally inspect the captured scalar
 /// anchor, rather than merely duplicating the pure projection tests: every
 /// caller below then drives that anchor through an actual projection owner
@@ -4763,7 +4763,7 @@ fn testMultiFileProjectionSelectionScope(
     owner: TestProjectionSelectionOwner,
     terminal: TestProjectionTerminal,
 ) !void {
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryLoadState(allocator, test_multi_file_primary),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -4810,8 +4810,8 @@ fn testMultiFileProjectionSelectionScope(
 
     switch (terminal) {
         .cache_hit => {
-            page.review_projection.installReady(.{
-                .request = try review_projection.testing.cloneRequest(
+            page.changes_projection.installReady(.{
+                .request = try changes_projection.testing.cloneRequest(
                     allocator,
                     page.activation.currentIdentity().?,
                     90,
@@ -4830,7 +4830,7 @@ fn testMultiFileProjectionSelectionScope(
                     test_combined_changed_unstaged,
                 ) },
             });
-            page.review_projection.cacheOrClearDisplayed(
+            page.changes_projection.cacheOrClearDisplayed(
                 allocator,
                 .{},
                 "/repo",
@@ -4838,7 +4838,7 @@ fn testMultiFileProjectionSelectionScope(
                 page.source_session_revision,
                 page.status_snapshot_revision,
             );
-            try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+            try std.testing.expectEqual(@as(usize, 1), page.changes_projection.cacheLen());
             if (owner == .target_path) {
                 viewport_anchor = try captureTestSelectionViewportTop(controller, .summary);
                 try expectParsedTestSelectionViewport(viewport_anchor.?);
@@ -4852,20 +4852,20 @@ fn testMultiFileProjectionSelectionScope(
             defer update.deinit(allocator);
             if (terminal == .spawn_rejected) {
                 const request_id = switch (update.command orelse return error.ExpectedProjectionCommand) {
-                    .review_projection => |request| request.id,
+                    .changes_projection => |request| request.id,
                     else => return error.ExpectedProjectionCommand,
                 };
                 controller.rejectProjectionSpawn(allocator, request_id);
             } else {
                 var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
                 const request = switch (command) {
-                    .review_projection => |request| request,
+                    .changes_projection => |request| request,
                     else => return error.ExpectedProjectionCommand,
                 };
                 command = undefined;
                 switch (terminal) {
                     .normal_ready => {
-                        var finished: app_load.ReviewProjectionFinished = .{
+                        var finished: app_load.ChangesProjectionFinished = .{
                             .request = request,
                             .result = .{ .ready = .{ .combined_hunks = try testCombinedBundle(
                                 allocator,
@@ -4879,9 +4879,9 @@ fn testMultiFileProjectionSelectionScope(
                         try std.testing.expect(applied.result_transferred);
                     },
                     .failed => {
-                        var finished: app_load.ReviewProjectionFinished = .{
+                        var finished: app_load.ChangesProjectionFinished = .{
                             .request = request,
-                            .result = .{ .failed = try review_projection.statusBodyAlloc(
+                            .result = .{ .failed = try changes_projection.statusBodyAlloc(
                                 allocator,
                                 "a",
                                 "{s}",
@@ -4892,7 +4892,7 @@ fn testMultiFileProjectionSelectionScope(
                         try std.testing.expect(applied.result_transferred);
                     },
                     .failed_static => {
-                        var finished: app_load.ReviewProjectionFinished = .{
+                        var finished: app_load.ChangesProjectionFinished = .{
                             .request = request,
                             .result = .{ .failed_static = "failed static" },
                         };
@@ -4907,7 +4907,7 @@ fn testMultiFileProjectionSelectionScope(
                             test_combined_before_cached,
                             test_combined_before_unstaged,
                         );
-                        var finished: app_load.ReviewProjectionFinished = .{
+                        var finished: app_load.ChangesProjectionFinished = .{
                             .request = request,
                             .result = .{ .reuse_candidate = candidate },
                         };
@@ -4934,7 +4934,7 @@ fn testMultiFileProjectionSelectionScope(
         try std.testing.expect(page.completed_selection == null);
         if (viewport_anchor) |anchor| try expectTestSelectionViewportRestored(controller, anchor);
         if (terminal == .failed or terminal == .failed_static) {
-            try std.testing.expect(controller.navigation.view().displayedReviewBody() == .status);
+            try std.testing.expect(controller.navigation.view().displayedChangesBody() == .status);
             try std.testing.expectEqual(@as(usize, 1), controller.navigation.view().displayedDiffLineCount());
             try std.testing.expectEqual(@as(usize, 0), page.viewer.diff_scroll);
         }
@@ -4960,9 +4960,9 @@ test "projection lifecycle invalidates completed selection only for its target p
 
 fn cloneTestProjectionRequest(
     allocator: std.mem.Allocator,
-    request: review_projection.Request,
-) !review_projection.Request {
-    return review_projection.cloneRequestWithOptions(
+    request: changes_projection.Request,
+) !changes_projection.Request {
+    return changes_projection.cloneRequestWithOptions(
         allocator,
         request.identity,
         request.id,
@@ -4983,9 +4983,9 @@ fn cloneTestProjectionRequest(
 fn testCombinedCandidate(
     controller: Controller,
     allocator: std.mem.Allocator,
-    bundle: *const review_projection.CombinedHunkBundle,
-) !review_selection.CompletedSelection {
-    const ready: review_projection.Ready = .{ .combined_hunks = bundle.* };
+    bundle: *const changes_projection.CombinedHunkBundle,
+) !content_selection.CompletedSelection {
+    const ready: changes_projection.Ready = .{ .combined_hunks = bundle.* };
     const token = controller.contentTokenForReady(&ready) orelse return error.ExpectedContentToken;
     var drag = @import("../../../diff/selection.zig").DragSelection.init(
         .{ .projection_file = .{ .kind = .combined, .path_key = "a" } },
@@ -4993,7 +4993,7 @@ fn testCombinedCandidate(
         .{ .hunk_index = 0, .line_index = 1 },
     );
     drag.moved = true;
-    return review_selection.buildParsed(allocator, token, bundle.displayFile(), drag);
+    return content_selection.buildParsed(allocator, token, bundle.displayFile(), drag);
 }
 
 fn installTestCombinedCandidate(
@@ -5003,8 +5003,8 @@ fn installTestCombinedCandidate(
     token_generation: u64,
     status_snapshot_revision: u64,
 ) !void {
-    controller.page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    controller.page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             controller.page.activation.currentIdentity().?,
             request_id,
@@ -5023,7 +5023,7 @@ fn installTestCombinedCandidate(
             test_combined_before_unstaged,
         ) },
     });
-    const live = &controller.page.review_projection.displayed.ready.value.combined_hunks;
+    const live = &controller.page.changes_projection.displayed.ready.value.combined_hunks;
     controller.page.completed_selection = try testCombinedCandidate(controller, allocator, live);
 }
 
@@ -5047,7 +5047,7 @@ fn installTestRetainedStagedOnly(
         test_combined_primary,
     );
     defer candidate.deinit();
-    const request = try review_projection.testing.cloneRequest(
+    const request = try changes_projection.testing.cloneRequest(
         allocator,
         controller.page.activation.currentIdentity().?,
         request_id + 1,
@@ -5058,7 +5058,7 @@ fn installTestRetainedStagedOnly(
         controller.page.source_session_revision,
         status_snapshot_revision,
     );
-    controller.page.review_projection.installRetainedStagedOnlyReuse(
+    controller.page.changes_projection.installRetainedStagedOnlyReuse(
         allocator,
         request,
         &candidate,
@@ -5085,8 +5085,8 @@ fn installTestPrimaryStagedOnly(
         test_combined_before_unstaged,
     );
     defer combined.deinit();
-    controller.page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    controller.page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             controller.page.activation.currentIdentity().?,
             request_id,
@@ -5106,7 +5106,7 @@ fn installTestPrimaryStagedOnly(
         test_combined_primary,
     );
     defer staged_only.deinit();
-    const request = try review_projection.testing.cloneRequest(
+    const request = try changes_projection.testing.cloneRequest(
         allocator,
         controller.page.activation.currentIdentity().?,
         request_id + 1,
@@ -5117,7 +5117,7 @@ fn installTestPrimaryStagedOnly(
         controller.page.source_session_revision,
         status_snapshot_revision,
     );
-    controller.page.review_projection.installPrimaryStagedOnlyReuse(
+    controller.page.changes_projection.installPrimaryStagedOnlyReuse(
         allocator,
         request,
         &staged_only,
@@ -5129,13 +5129,13 @@ fn applyTestCombinedBundle(
     allocator: std.mem.Allocator,
     request_id: u64,
     status_snapshot_revision: u64,
-    bundle: review_projection.CombinedHunkBundle,
+    bundle: changes_projection.CombinedHunkBundle,
 ) !void {
     var owned_bundle = bundle;
     var bundle_owned = true;
     errdefer if (bundle_owned) owned_bundle.deinit();
     try std.testing.expectEqual(status_snapshot_revision, controller.page.status_snapshot_revision);
-    controller.page.review_projection.pending = try review_projection.testing.cloneRequest(
+    controller.page.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
         controller.page.activation.currentIdentity().?,
         request_id,
@@ -5146,8 +5146,8 @@ fn applyTestCombinedBundle(
         controller.page.source_session_revision,
         status_snapshot_revision,
     );
-    var finished: app_load.ReviewProjectionFinished = .{
-        .request = try review_projection.testing.cloneRequest(
+    var finished: app_load.ChangesProjectionFinished = .{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             controller.page.activation.currentIdentity().?,
             request_id,
@@ -5171,7 +5171,7 @@ fn applyTestCombinedBundle(
 
 test "reload pending generation consumes only its owner" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller: Controller = .{
@@ -5194,11 +5194,11 @@ test "reload pending generation consumes only its owner" {
     try std.testing.expect(page.pending_reload == null);
 }
 
-test "owned Review update consumes command exactly once" {
+test "owned Changes update consumes command exactly once" {
     const allocator = std.testing.allocator;
-    var request = try review_projection.testing.cloneRequest(
+    var request = try changes_projection.testing.cloneRequest(
         allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         4,
         "/repo",
         "src/main.zig",
@@ -5207,7 +5207,7 @@ test "owned Review update consumes command exactly once" {
         2,
         3,
     );
-    var update: ReviewUpdate = .{ .command = .{ .review_projection = request } };
+    var update: ChangesUpdate = .{ .command = .{ .changes_projection = request } };
     request = undefined;
     var command = update.takeCommand() orelse return error.ExpectedCommand;
     update.deinit(allocator);
@@ -5217,15 +5217,15 @@ test "owned Review update consumes command exactly once" {
 test "owned read command variants release every payload" {
     const allocator = std.testing.allocator;
 
-    var discovery_update: ReviewUpdate = .{ .command = .{ .repo_discovery = .{
-        .identity = app_page.RequestIdentity.review(0, 1),
+    var discovery_update: ChangesUpdate = .{ .command = .{ .repo_discovery = .{
+        .identity = app_page.RequestIdentity.changes(0, 1),
         .generation = 1,
         .background_cycle_id = null,
     } } };
     discovery_update.deinit(allocator);
 
-    var source_update: ReviewUpdate = .{ .command = .{ .source_load = .{
-        .identity = app_page.RequestIdentity.review(0, 1),
+    var source_update: ChangesUpdate = .{ .command = .{ .source_load = .{
+        .identity = app_page.RequestIdentity.changes(0, 1),
         .read_epoch = .{},
         .request = try diff_source.cloneLoadRequest(allocator, .{ .source = .{ .range = "main...HEAD" }, .repo_root = "/repo" }),
         .generation = 1,
@@ -5234,8 +5234,8 @@ test "owned read command variants release every payload" {
     } } };
     source_update.deinit(allocator);
 
-    var status_update: ReviewUpdate = .{ .command = .{ .status_load = .{
-        .identity = app_page.RequestIdentity.review(0, 1),
+    var status_update: ChangesUpdate = .{ .command = .{ .status_load = .{
+        .identity = app_page.RequestIdentity.changes(0, 1),
         .read_epoch = .{},
         .repo_root = try allocator.dupe(u8, "/repo"),
         .generation = 2,
@@ -5244,8 +5244,8 @@ test "owned read command variants release every payload" {
     } } };
     status_update.deinit(allocator);
 
-    var branch_update: ReviewUpdate = .{ .command = .{ .branch_status_load = .{
-        .identity = app_page.RequestIdentity.review(0, 1),
+    var branch_update: ChangesUpdate = .{ .command = .{ .branch_status_load = .{
+        .identity = app_page.RequestIdentity.changes(0, 1),
         .read_epoch = .{},
         .repo_root = try allocator.dupe(u8, "/repo"),
         .generation = 3,
@@ -5253,9 +5253,9 @@ test "owned read command variants release every payload" {
     } } };
     branch_update.deinit(allocator);
 
-    var projection_update: ReviewUpdate = .{ .command = .{ .review_projection = try review_projection.testing.cloneRequest(
+    var projection_update: ChangesUpdate = .{ .command = .{ .changes_projection = try changes_projection.testing.cloneRequest(
         allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         4,
         "/repo",
         "src/main.zig",
@@ -5267,9 +5267,9 @@ test "owned read command variants release every payload" {
     projection_update.deinit(allocator);
 }
 
-test "review read epoch is captured by source status and branch commands" {
+test "changes read epoch is captured by source status and branch commands" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     page.repository_read_authority.epoch = .{ .value = 41 };
     var status_message = @import("../../state.zig").StatusMessage{};
@@ -5309,7 +5309,7 @@ test "review read epoch is captured by source status and branch commands" {
 
 test "mutation read start gate rejects every repository read preparation without changing owners" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     _ = page.activation.activate(0, .fresh, .fresh, .fresh);
     var status_message = @import("../../state.zig").StatusMessage{};
@@ -5356,7 +5356,7 @@ test "mutation read start gate rejects every repository read preparation without
 }
 
 test "repository read completion admission requires current open epoch and cycle" {
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(std.testing.allocator);
     page.repository_read_authority.epoch = .{ .value = 11 };
     page.auto_reload = .init(.inherit, .{}, .unstaged);
@@ -5381,9 +5381,9 @@ test "repository read completion admission requires current open epoch and cycle
 }
 
 fn expectMutationFenceRetainedReadOwners(
-    page: *const review_page.ReviewPageState,
+    page: *const changes_page.ChangesPageState,
     source_generation: u64,
-    read_epoch: ReviewRepositoryReadEpoch,
+    read_epoch: ChangesRepositoryReadEpoch,
     cycle_id: u64,
     anchor_path_ptr: [*]const u8,
     status_pending: auto_reload.AuxiliaryPending,
@@ -5398,7 +5398,7 @@ fn expectMutationFenceRetainedReadOwners(
     const pending_reload = page.pending_reload orelse return error.ExpectedPendingReload;
     try std.testing.expectEqual(source_generation, pending_reload.generation);
     try std.testing.expect(pending_reload.read_epoch.eql(read_epoch));
-    try std.testing.expectEqual(review_page.ReloadKind.watch, pending_reload.kind);
+    try std.testing.expectEqual(changes_page.ReloadKind.watch, pending_reload.kind);
     const anchor = pending_reload.anchor orelse return error.ExpectedReloadAnchor;
     try std.testing.expectEqual(anchor_path_ptr, @as([*]const u8, anchor.path_key.ptr));
     try std.testing.expect(std.meta.eql(
@@ -5415,9 +5415,9 @@ fn expectMutationFenceRetainedReadOwners(
     try std.testing.expect(cycle.pending.owns(.status));
     try std.testing.expect(cycle.pending.owns(.branch));
     try std.testing.expect(!cycle.pending.owns(.deferred_source_apply));
-    try std.testing.expectEqual(cache_len, page.review_projection.cacheLen());
-    try std.testing.expectEqual(cache_retained_bytes, page.review_projection.cacheRetainedBytes());
-    try std.testing.expect(page.review_projection.cacheHas(
+    try std.testing.expectEqual(cache_len, page.changes_projection.cacheLen());
+    try std.testing.expectEqual(cache_retained_bytes, page.changes_projection.cacheRetainedBytes());
+    try std.testing.expect(page.changes_projection.cacheHas(
         read_epoch,
         "/repo",
         "cached",
@@ -5430,7 +5430,7 @@ fn expectMutationFenceRetainedReadOwners(
 
 test "mutation read fence closes one exact owner and preserves read drain ownership" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -5482,14 +5482,14 @@ test "mutation read fence closes one exact owner and preserves read drain owners
     const status_pending = page.status_load.pending orelse return error.ExpectedStatusPending;
     const branch_pending = page.branch_status_load.pending orelse return error.ExpectedBranchPending;
 
-    page.review_projection.installReady(try testGeneratedReady(
+    page.changes_projection.installReady(try testGeneratedReady(
         allocator,
         9,
         "cached",
         page.source_session_revision,
         page.status_snapshot_revision,
     ));
-    page.review_projection.cacheOrClearDisplayed(
+    page.changes_projection.cacheOrClearDisplayed(
         allocator,
         old_epoch,
         "/repo",
@@ -5497,12 +5497,12 @@ test "mutation read fence closes one exact owner and preserves read drain owners
         page.source_session_revision,
         page.status_snapshot_revision,
     );
-    const cache_len = page.review_projection.cacheLen();
-    const cache_retained_bytes = page.review_projection.cacheRetainedBytes();
+    const cache_len = page.changes_projection.cacheLen();
+    const cache_retained_bytes = page.changes_projection.cacheRetainedBytes();
     try std.testing.expectEqual(@as(usize, 1), cache_len);
     try std.testing.expect(cache_retained_bytes > 0);
 
-    var displayed_request = try review_projection.cloneRequestWithOptions(
+    var displayed_request = try changes_projection.cloneRequestWithOptions(
         allocator,
         identity,
         1,
@@ -5516,10 +5516,10 @@ test "mutation read fence closes one exact owner and preserves read drain owners
     );
     var displayed_request_owned = true;
     defer if (displayed_request_owned) displayed_request.deinit(allocator);
-    var displayed_bundle = try review_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n");
+    var displayed_bundle = try changes_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n");
     var displayed_bundle_owned = true;
     defer if (displayed_bundle_owned) displayed_bundle.deinit(allocator);
-    page.review_projection.installReady(.{
+    page.changes_projection.installReady(.{
         .request = displayed_request,
         .value = .{ .generated_added_file = displayed_bundle },
     });
@@ -5527,16 +5527,16 @@ test "mutation read fence closes one exact owner and preserves read drain owners
     displayed_bundle_owned = false;
     displayed_request = undefined;
     displayed_bundle = undefined;
-    const displayed_source = page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
+    const displayed_source = page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
 
-    page.review_projection.syntax_pending = try review_projection.generatedSyntaxRequestForProjection(
+    page.changes_projection.syntax_pending = try changes_projection.generatedSyntaxRequestForProjection(
         allocator,
         1,
         identity,
-        page.review_projection.displayed.ready.request,
-        page.review_projection.displayed.ready.value.generated_added_file.fingerprint(),
+        page.changes_projection.displayed.ready.request,
+        page.changes_projection.displayed.ready.value.generated_added_file.fingerprint(),
     );
-    page.review_projection.pending = try review_projection.cloneRequestWithOptions(
+    page.changes_projection.pending = try changes_projection.cloneRequestWithOptions(
         allocator,
         identity,
         2,
@@ -5549,7 +5549,7 @@ test "mutation read fence closes one exact owner and preserves read drain owners
         .{ .read_epoch = old_epoch, .root_identity = root_identity },
     );
     page.deferred_projection_apply = .{ .finished = .{
-        .request = try cloneTestProjectionRequest(allocator, page.review_projection.pending.?),
+        .request = try cloneTestProjectionRequest(allocator, page.changes_projection.pending.?),
         .result = .{ .failed_static = "pre-mutation result" },
     } };
 
@@ -5559,8 +5559,8 @@ test "mutation read fence closes one exact owner and preserves read drain owners
     };
     try std.testing.expect(!testActionFence(&page).closeForAcceptedMutation(allocator, assistance));
     try std.testing.expect(page.repository_read_authority.epoch.eql(old_epoch));
-    try std.testing.expect(page.review_projection.pending != null);
-    try std.testing.expect(page.review_projection.syntax_pending != null);
+    try std.testing.expect(page.changes_projection.pending != null);
+    try std.testing.expect(page.changes_projection.syntax_pending != null);
     try std.testing.expect(page.deferred_projection_apply != null);
     try std.testing.expect(page.auto_reload.acceptsCycle(cycle_id));
     try expectMutationFenceRetainedReadOwners(
@@ -5584,13 +5584,13 @@ test "mutation read fence closes one exact owner and preserves read drain owners
     try std.testing.expect(fenced_epoch.eql(old_epoch.next()));
     try std.testing.expect(page.repository_read_authority.ownsMutation(mutation));
     try std.testing.expect(!page.repository_read_authority.mayStartRepositoryRead());
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.syntax_pending == null);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.syntax_pending == null);
     try std.testing.expect(page.deferred_projection_apply == null);
-    try std.testing.expect(page.review_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.hasDisplayed());
     try std.testing.expectEqual(
         displayed_source,
-        page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr,
+        page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr,
     );
     try std.testing.expectEqual(
         auto_reload.CycleAcceptance.superseded_by_mutation,
@@ -5667,9 +5667,9 @@ test "mutation read fence closes one exact owner and preserves read drain owners
     try std.testing.expect(branch_applied.skip_redraw);
     try std.testing.expect(page.branch_status_load.pending == null);
     try std.testing.expect(page.auto_reload.background_cycle == null);
-    try std.testing.expectEqual(cache_len, page.review_projection.cacheLen());
-    try std.testing.expectEqual(cache_retained_bytes, page.review_projection.cacheRetainedBytes());
-    try std.testing.expect(page.review_projection.cacheHas(
+    try std.testing.expectEqual(cache_len, page.changes_projection.cacheLen());
+    try std.testing.expectEqual(cache_retained_bytes, page.changes_projection.cacheRetainedBytes());
+    try std.testing.expect(page.changes_projection.cacheHas(
         old_epoch,
         "/repo",
         "cached",
@@ -5680,13 +5680,13 @@ test "mutation read fence closes one exact owner and preserves read drain owners
     ));
     try std.testing.expectEqual(
         displayed_source,
-        page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr,
+        page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr,
     );
 }
 
 test "mutation read fence retains deferred source until production apply drains it" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -5771,7 +5771,7 @@ test "mutation read fence retains deferred source until production apply drains 
 
 test "mutation read fence terminal reopens exact owner and queues active revalidation" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     const activation_id = page.activation.activate(13, .fresh, .fresh, .fresh);
     const old_epoch = page.repository_read_authority.epoch;
@@ -5827,7 +5827,7 @@ test "mutation read fence terminal reopens exact owner and queues active revalid
 
 test "mutation read fence terminal coalesces current intent and never targets a future activation" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     const activation_id = page.activation.activate(17, .fresh, .fresh, .fresh);
     const first: app_actions.PendingAction = .{
@@ -5879,7 +5879,7 @@ test "mutation read fence terminal coalesces current intent and never targets a 
 test "mutation read promotion gate retains current visual and cache owners until reopen" {
     const allocator = std.testing.allocator;
     const root = root_capability.Identity{ .device = 41, .inode = 43 };
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -5897,8 +5897,8 @@ test "mutation read promotion gate retains current visual and cache owners until
     try std.testing.expect(page.repository_read_authority.closeForMutation(owner));
     const fenced_epoch = page.repository_read_authority.epoch;
 
-    page.review_projection.installReady(.{
-        .request = try review_projection.cloneRequestWithOptions(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.cloneRequestWithOptions(
             allocator,
             page.activation.currentIdentity().?,
             1,
@@ -5910,13 +5910,13 @@ test "mutation read promotion gate retains current visual and cache owners until
             0,
             .{ .read_epoch = fenced_epoch, .root_identity = root },
         ),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "cached\n") },
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "cached\n") },
     });
-    const cached_source = page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
-    page.review_projection.cacheOrClearDisplayed(allocator, fenced_epoch, "/repo", .unstaged, 0, 0);
+    const cached_source = page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
+    page.changes_projection.cacheOrClearDisplayed(allocator, fenced_epoch, "/repo", .unstaged, 0, 0);
 
-    page.review_projection.installReady(.{
-        .request = try review_projection.cloneRequestWithOptions(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.cloneRequestWithOptions(
             allocator,
             page.activation.currentIdentity().?,
             2,
@@ -5928,16 +5928,16 @@ test "mutation read promotion gate retains current visual and cache owners until
             0,
             .{ .read_epoch = fenced_epoch, .root_identity = root },
         ),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "b", "retained\n") },
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "b", "retained\n") },
     });
-    const retained_source = page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
+    const retained_source = page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr;
 
     var blocked = try controller.prepareProjection(allocator);
     defer blocked.deinit(allocator);
     try std.testing.expect(blocked.command == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expectEqual(retained_source, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
-    try std.testing.expect(page.review_projection.cacheHas(
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expectEqual(retained_source, page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
+    try std.testing.expect(page.changes_projection.cacheHas(
         fenced_epoch,
         "/repo",
         "a",
@@ -5951,14 +5951,14 @@ test "mutation read promotion gate retains current visual and cache owners until
     var promoted = try controller.prepareProjection(allocator);
     defer promoted.deinit(allocator);
     try std.testing.expect(promoted.command == null);
-    try std.testing.expectEqual(cached_source, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
+    try std.testing.expectEqual(cached_source, page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
 }
 
 test "mutation read promotion gate blocks generated syntax preparation until reopen" {
     if (!source_syntax_runtime.enabled) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const root = root_capability.Identity{ .device = 47, .inode = 53 };
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -5974,8 +5974,8 @@ test "mutation read promotion gate blocks generated syntax preparation until reo
         .kind = .unstage_file,
     };
     try std.testing.expect(page.repository_read_authority.closeForMutation(owner));
-    page.review_projection.installReady(.{
-        .request = try review_projection.cloneRequestWithOptions(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.cloneRequestWithOptions(
             allocator,
             page.activation.currentIdentity().?,
             3,
@@ -5990,7 +5990,7 @@ test "mutation read promotion gate blocks generated syntax preparation until reo
                 .root_identity = root,
             },
         ),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(
             allocator,
             "a",
             "const value = 1;\n",
@@ -5998,20 +5998,20 @@ test "mutation read promotion gate blocks generated syntax preparation until reo
     });
 
     try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
-    try std.testing.expect(!page.review_projection.hasSyntaxPending());
-    try std.testing.expect(page.review_projection.displayed.ready.value.generated_added_file.decoration == .eligible);
+    try std.testing.expect(!page.changes_projection.hasSyntaxPending());
+    try std.testing.expect(page.changes_projection.displayed.ready.value.generated_added_file.decoration == .eligible);
 
     try std.testing.expect(page.repository_read_authority.reopenForMutation(owner));
     var request = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRequest;
     defer request.deinit(allocator);
-    try std.testing.expect(page.review_projection.hasSyntaxPending());
+    try std.testing.expect(page.changes_projection.hasSyntaxPending());
     controller.rejectGeneratedSyntaxSpawn(allocator, request.id);
-    try std.testing.expect(!page.review_projection.hasSyntaxPending());
+    try std.testing.expect(!page.changes_projection.hasSyntaxPending());
 }
 
 test "old repository read source terminal retires ownership without publication" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -6055,7 +6055,7 @@ test "old repository read source terminal retires ownership without publication"
 
 test "superseded repository read status terminal drains without publication" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var initial = try git_status.StatusBundle.parseOwned(allocator, "M  retained.zig\x00");
     try page.git_status.replace("/repo", &initial);
@@ -6098,7 +6098,7 @@ test "superseded repository read status terminal drains without publication" {
 
 test "old repository read branch terminal retires ownership without publication" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
@@ -6131,9 +6131,9 @@ test "old repository read branch terminal retires ownership without publication"
     try std.testing.expectEqual(authority.MemberFreshness.pending, page.activation.state.members().?.branch);
 }
 
-test "repository discovery transfers ownership only after Review acceptance" {
+test "repository discovery transfers ownership only after Changes acceptance" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
@@ -6186,7 +6186,7 @@ test "repository discovery transfers ownership only after Review acceptance" {
     const stale_instance_generation = page.load.beginRepoDiscovery();
     const current_activation = page.activation.activate(0, .pending, .pending, .pending);
     var stale_instance: app_load.RepoDiscoveryFinished = .{
-        .identity = app_page.RequestIdentity.review(0, reopened_activation),
+        .identity = app_page.RequestIdentity.changes(0, reopened_activation),
         .generation = stale_instance_generation,
         .result = .{ .discovered = .{ .none = .{
             .current_root = try allocator.dupe(u8, "/stale-instance"),
@@ -6204,7 +6204,7 @@ test "repository discovery transfers ownership only after Review acceptance" {
     const failed_generation = page.load.beginRepoDiscovery();
     page.load.state = .loading;
     var failed: app_load.RepoDiscoveryFinished = .{
-        .identity = app_page.RequestIdentity.review(0, current_activation),
+        .identity = app_page.RequestIdentity.changes(0, current_activation),
         .generation = failed_generation,
         .result = .{ .failed_static = "discovery failed" },
     };
@@ -6217,7 +6217,7 @@ test "repository discovery transfers ownership only after Review acceptance" {
 
 test "stale repository epoch retains discovery ownership with task completion" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
@@ -6225,7 +6225,7 @@ test "stale repository epoch retains discovery ownership with task completion" {
     const generation = page.load.beginRepoDiscovery();
 
     var finished: app_load.RepoDiscoveryFinished = .{
-        .identity = app_page.RequestIdentity.review(identity.repo_epoch + 1, identity.activation_id),
+        .identity = app_page.RequestIdentity.changes(identity.repo_epoch + 1, identity.activation_id),
         .generation = generation,
         .result = .{ .discovered = .{ .none = .{
             .current_root = try allocator.dupe(u8, "/stale"),
@@ -6240,9 +6240,9 @@ test "stale repository epoch retains discovery ownership with task completion" {
     try std.testing.expect(page.load.pending != null);
 }
 
-test "repository discovery commit leaves load policy with Review" {
+test "repository discovery commit leaves load policy with Changes" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
@@ -6267,7 +6267,7 @@ test "source command allocation failure rolls back pending identities" {
     const backing = std.testing.allocator;
     var fail_index: usize = 0;
     while (fail_index < 3) : (fail_index += 1) {
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         };
@@ -6289,7 +6289,7 @@ test "source command allocation failure rolls back pending identities" {
 test "auxiliary command allocation failure does not create pending ownership" {
     const backing = std.testing.allocator;
 
-    var status_page: review_page.ReviewPageState = .{};
+    var status_page: changes_page.ChangesPageState = .{};
     defer status_page.deinit(backing);
     var status_message = @import("../../state.zig").StatusMessage{};
     const status_controller = testController(&status_page, &status_message, .unstaged);
@@ -6302,7 +6302,7 @@ test "auxiliary command allocation failure does not create pending ownership" {
     ));
     try std.testing.expect(status_page.status_load.pending == null);
 
-    var branch_page: review_page.ReviewPageState = .{};
+    var branch_page: changes_page.ChangesPageState = .{};
     defer branch_page.deinit(backing);
     const branch_controller = testController(&branch_page, &status_message, .unstaged);
     var branch_failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
@@ -6318,7 +6318,7 @@ test "projection command partial allocation failure leaves no pending clone" {
     const backing = std.testing.allocator;
     var fail_index: usize = 0;
     while (fail_index < 4) : (fail_index += 1) {
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         };
@@ -6331,13 +6331,13 @@ test "projection command partial allocation failure leaves no pending clone" {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
 
         try std.testing.expectError(error.OutOfMemory, controller.prepareProjection(failing.allocator()));
-        try std.testing.expect(page.review_projection.pending == null);
+        try std.testing.expect(page.changes_projection.pending == null);
     }
 }
 
 test "projection read epoch is captured by page pending and task command" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -6353,14 +6353,14 @@ test "projection read epoch is captured by page pending and task command" {
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     defer command.deinit(allocator);
 
-    try std.testing.expect(command.review_projection.read_epoch.eql(.{ .value = 41 }));
-    try std.testing.expect(page.review_projection.pending.?.read_epoch.eql(.{ .value = 41 }));
-    try std.testing.expect(command.review_projection.sameSemanticKey(page.review_projection.pending.?));
+    try std.testing.expect(command.changes_projection.read_epoch.eql(.{ .value = 41 }));
+    try std.testing.expect(page.changes_projection.pending.?.read_epoch.eql(.{ .value = 41 }));
+    try std.testing.expect(command.changes_projection.sameSemanticKey(page.changes_projection.pending.?));
 }
 
 test "repository read projection terminals require current open epoch and exact pending owner" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -6377,15 +6377,15 @@ test "repository read projection terminals require current open epoch and exact 
         defer update.deinit(allocator);
         var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
         const request = switch (command) {
-            .review_projection => |request| request,
+            .changes_projection => |request| request,
             else => return error.ExpectedProjectionCommand,
         };
         command = undefined;
         page.repository_read_authority.epoch = request.read_epoch.next();
 
-        var finished: app_load.ReviewProjectionFinished = .{
+        var finished: app_load.ChangesProjectionFinished = .{
             .request = request,
-            .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+            .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(
                 allocator,
                 "a",
                 "must not publish\n",
@@ -6396,9 +6396,9 @@ test "repository read projection terminals require current open epoch and exact 
 
         try std.testing.expect(!applied.result_transferred);
         try std.testing.expect(applied.skip_redraw);
-        try std.testing.expect(page.review_projection.pending == null);
-        try std.testing.expect(!page.review_projection.hasDisplayed());
-        try std.testing.expect(page.review_projection.eager_retry_basis == null);
+        try std.testing.expect(page.changes_projection.pending == null);
+        try std.testing.expect(!page.changes_projection.hasDisplayed());
+        try std.testing.expect(page.changes_projection.eager_retry_basis == null);
     }
 
     // Equality of the scalar epoch is insufficient while the page-owned read
@@ -6408,7 +6408,7 @@ test "repository read projection terminals require current open epoch and exact 
         defer update.deinit(allocator);
         var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
         const request = switch (command) {
-            .review_projection => |request| request,
+            .changes_projection => |request| request,
             else => return error.ExpectedProjectionCommand,
         };
         command = undefined;
@@ -6417,7 +6417,7 @@ test "repository read projection terminals require current open epoch and exact 
             .kind = .stage_hunk,
         } };
 
-        var finished: app_load.ReviewProjectionFinished = .{
+        var finished: app_load.ChangesProjectionFinished = .{
             .request = request,
             .result = .{ .failed_static = "must not publish" },
         };
@@ -6426,8 +6426,8 @@ test "repository read projection terminals require current open epoch and exact 
 
         try std.testing.expect(!applied.result_transferred);
         try std.testing.expect(applied.skip_redraw);
-        try std.testing.expect(page.review_projection.pending == null);
-        try std.testing.expect(!page.review_projection.hasDisplayed());
+        try std.testing.expect(page.changes_projection.pending == null);
+        try std.testing.expect(!page.changes_projection.hasDisplayed());
     }
 
     // A wrong/duplicate terminal never consumes the page clone belonging to
@@ -6437,9 +6437,9 @@ test "repository read projection terminals require current open epoch and exact 
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     defer command.deinit(allocator);
-    const pending = page.review_projection.pending.?;
-    var wrong: app_load.ReviewProjectionFinished = .{
-        .request = try review_projection.cloneRequestWithOptions(
+    const pending = page.changes_projection.pending.?;
+    var wrong: app_load.ChangesProjectionFinished = .{
+        .request = try changes_projection.cloneRequestWithOptions(
             allocator,
             pending.identity,
             pending.id + 1,
@@ -6460,12 +6460,12 @@ test "repository read projection terminals require current open epoch and exact 
     defer wrong.deinit(allocator);
     const wrong_apply = try controller.applyProjectionFinished(allocator, &wrong);
     try std.testing.expect(wrong_apply.skip_redraw);
-    try std.testing.expectEqual(pending.id, page.review_projection.pending.?.id);
+    try std.testing.expectEqual(pending.id, page.changes_projection.pending.?.id);
 }
 
 test "read command reject terminals clear only matching page state" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
@@ -6485,9 +6485,9 @@ test "read command reject terminals clear only matching page state" {
     controller.rejectBranchStatusSpawn(null);
     try std.testing.expect(page.branch_status_load.pending == null);
 
-    page.review_projection.pending = try review_projection.testing.cloneRequest(
+    page.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         9,
         "/repo",
         "a",
@@ -6497,9 +6497,9 @@ test "read command reject terminals clear only matching page state" {
         2,
     );
     controller.rejectProjectionSpawn(allocator, 8);
-    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expect(page.changes_projection.pending != null);
     controller.rejectProjectionSpawn(allocator, 9);
-    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.changes_projection.pending == null);
 
     page.load.generation = 11;
     page.load.pending = .{ .diff_load = 11 };
@@ -6509,9 +6509,9 @@ test "read command reject terminals clear only matching page state" {
     try std.testing.expect(page.pending_reload == null);
 }
 
-test "repository discovery preparation owns Review load state" {
+test "repository discovery preparation owns Changes load state" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     _ = page.activation.activate(4, .pending, .pending, .pending);
     var status_message = @import("../../state.zig").StatusMessage{};
@@ -6532,7 +6532,7 @@ test "repository discovery preparation owns Review load state" {
 
 test "projection cache revisits A after B without a third read command" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -6549,11 +6549,11 @@ test "projection cache revisits A after B without a third read command" {
     page.viewer.selected_target = .{ .status_only = 1 };
     var second = try controller.prepareProjection(allocator);
     defer second.deinit(allocator);
-    try std.testing.expect(page.review_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(page.changes_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
     _ = try finishGeneratedProjection(controller, allocator, &second, "b");
 
     page.viewer.selected_target = .{ .status_only = 0 };
-    page.review_projection.pending = try review_projection.testing.cloneRequest(
+    page.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
         page.activation.currentIdentity().?,
         99,
@@ -6564,8 +6564,8 @@ test "projection cache revisits A after B without a third read command" {
         0,
         0,
     );
-    var late: app_load.ReviewProjectionFinished = .{
-        .request = try review_projection.testing.cloneRequest(
+    var late: app_load.ChangesProjectionFinished = .{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             99,
@@ -6576,24 +6576,24 @@ test "projection cache revisits A after B without a third read command" {
             0,
             0,
         ),
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "b", "late\n") } },
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "b", "late\n") } },
     };
     defer late.deinit(allocator);
     var revisit = try controller.prepareProjection(allocator);
     defer revisit.deinit(allocator);
     try std.testing.expect(revisit.command == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
-    try std.testing.expect(page.review_projection.cacheHas(.{}, "/repo", "b", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expectEqual(a_lines, page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
+    try std.testing.expect(page.changes_projection.cacheHas(.{}, "/repo", "b", .generated_added_file, .unstaged, 0, 0));
 
     const late_apply = try controller.applyProjectionFinished(allocator, &late);
     try std.testing.expect(!late_apply.result_transferred);
-    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
+    try std.testing.expectEqual(a_lines, page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
 }
 
 test "projection cache survives selecting a file that needs no projection" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwo()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -6611,19 +6611,19 @@ test "projection cache survives selecting a file that needs no projection" {
     var ordinary = try controller.prepareProjection(allocator);
     defer ordinary.deinit(allocator);
     try std.testing.expect(ordinary.command == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
-    try std.testing.expect(page.review_projection.cacheHas(.{}, "/repo", "c", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.cacheHas(.{}, "/repo", "c", .generated_added_file, .unstaged, 0, 0));
 
     page.viewer.selected_target = .{ .status_only = 0 };
     var revisit = try controller.prepareProjection(allocator);
     defer revisit.deinit(allocator);
     try std.testing.expect(revisit.command == null);
-    try std.testing.expectEqual(c_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
+    try std.testing.expectEqual(c_lines, page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
 }
 
 test "full projection cache promotes LRU before old display admission" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -6638,13 +6638,13 @@ test "full projection cache promotes LRU before old display admission" {
     for (paths, 0..) |path, index| {
         const ready = try testGeneratedReady(allocator, index + 1, path, 0, 0);
         if (index == 0) a_lines = ready.value.generated_added_file.source.bytes.ptr;
-        page.review_projection.installReady(ready);
-        page.review_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
+        page.changes_projection.installReady(ready);
+        page.changes_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
     }
-    try std.testing.expectEqual(review_projection.max_cached_entries, page.review_projection.cacheLen());
+    try std.testing.expectEqual(changes_projection.max_cached_entries, page.changes_projection.cacheLen());
 
-    page.review_projection.installReady(try testGeneratedReady(allocator, 5, "e", 0, 0));
-    page.review_projection.pending = try review_projection.testing.cloneRequest(
+    page.changes_projection.installReady(try testGeneratedReady(allocator, 5, "e", 0, 0));
+    page.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
         page.activation.currentIdentity().?,
         99,
@@ -6666,18 +6666,18 @@ test "full projection cache promotes LRU before old display admission" {
 
     try std.testing.expect(update.command == null);
     try std.testing.expectEqual(@as(usize, 2), failing.alloc_index);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expectEqual(a_lines, page.review_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
-    try std.testing.expectEqual(review_projection.max_cached_entries, page.review_projection.cacheLen());
-    try std.testing.expect(page.review_projection.cacheHas(.{}, "/repo", "e", .generated_added_file, .unstaged, 0, 0));
-    try std.testing.expect(page.review_projection.cacheRetainedBytes() <= review_projection.max_cached_retained_bytes);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expectEqual(a_lines, page.changes_projection.displayed.ready.value.generated_added_file.source.bytes.ptr);
+    try std.testing.expectEqual(changes_projection.max_cached_entries, page.changes_projection.cacheLen());
+    try std.testing.expect(page.changes_projection.cacheHas(.{}, "/repo", "e", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(page.changes_projection.cacheRetainedBytes() <= changes_projection.max_cached_retained_bytes);
 }
 
 test "generated syntax lifecycle separates pending decorated terminal and cache states" {
     if (!source_syntax_runtime.enabled) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const root = root_capability.Identity{ .device = 9, .inode = 17 };
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -6689,8 +6689,8 @@ test "generated syntax lifecycle separates pending decorated terminal and cache 
     var controller = testController(&page, &status_message, .unstaged);
     controller.root_identity = root;
 
-    page.review_projection.installReady(.{
-        .request = try review_projection.cloneRequestWithOptions(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.cloneRequestWithOptions(
             allocator,
             page.activation.currentIdentity().?,
             11,
@@ -6705,14 +6705,14 @@ test "generated syntax lifecycle separates pending decorated terminal and cache 
                 .root_identity = root,
             },
         ),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "const value = 1;\n") },
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "const value = 1;\n") },
     });
 
     var task_request = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRequest;
     defer task_request.deinit(allocator);
-    try std.testing.expect(page.review_projection.hasSyntaxPending());
+    try std.testing.expect(page.changes_projection.hasSyntaxPending());
     try std.testing.expect(task_request.read_epoch.eql(.{ .value = 47 }));
-    try std.testing.expect(page.review_projection.syntax_pending.?.read_epoch.eql(.{ .value = 47 }));
+    try std.testing.expect(page.changes_projection.syntax_pending.?.read_epoch.eql(.{ .value = 47 }));
     try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
 
     const entries = try allocator.dupe(@import("../../../syntax/source.zig").LineEntry, &.{.{
@@ -6725,28 +6725,28 @@ test "generated syntax lifecycle separates pending decorated terminal and cache 
         .end = 5,
         .role = .keyword,
     }});
-    var finished = review_projection.GeneratedSyntaxFinished{
-        .request = try review_projection.cloneGeneratedSyntaxRequest(allocator, task_request),
+    var finished = changes_projection.GeneratedSyntaxFinished{
+        .request = try changes_projection.cloneGeneratedSyntaxRequest(allocator, task_request),
         .snapshot_fingerprint = task_request.expected_fingerprint,
         .result = .{ .loaded = .{ .line_entries = entries, .spans = spans } },
     };
     defer finished.deinit(allocator);
     const applied = controller.applyGeneratedSyntaxFinished(allocator, &finished);
     try std.testing.expect(!applied.skip_redraw);
-    try std.testing.expect(!page.review_projection.hasSyntaxPending());
-    const decorated_bundle = &page.review_projection.displayed.ready.value.generated_added_file;
+    try std.testing.expect(!page.changes_projection.hasSyntaxPending());
+    const decorated_bundle = &page.changes_projection.displayed.ready.value.generated_added_file;
     try std.testing.expect(decorated_bundle.decoration == .decorated);
     try std.testing.expect(decorated_bundle.decoration.hasVisibleSyntax());
     try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
 
-    page.review_projection.cacheOrClearDisplayed(allocator, .{ .value = 47 }, "/repo", .unstaged, 0, 0);
+    page.changes_projection.cacheOrClearDisplayed(allocator, .{ .value = 47 }, "/repo", .unstaged, 0, 0);
     var promoted = try controller.prepareProjection(allocator);
     defer promoted.deinit(allocator);
     try std.testing.expect(promoted.command == null);
     try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
 
-    page.review_projection.displayed.ready.value.generated_added_file.decoration.deinit(allocator);
-    page.review_projection.displayed.ready.value.generated_added_file.decoration = .{ .terminal_plain = .provider_unavailable };
+    page.changes_projection.displayed.ready.value.generated_added_file.decoration.deinit(allocator);
+    page.changes_projection.displayed.ready.value.generated_added_file.decoration = .{ .terminal_plain = .provider_unavailable };
     try std.testing.expect((try controller.prepareGeneratedSyntax(allocator)) == null);
 }
 
@@ -6754,7 +6754,7 @@ test "generated syntax completion after cache admission cannot mutate immutable 
     if (!source_syntax_runtime.enabled) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const root = root_capability.Identity{ .device = 4, .inode = 8 };
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -6764,8 +6764,8 @@ test "generated syntax completion after cache admission cannot mutate immutable 
     var status_message = @import("../../state.zig").StatusMessage{};
     var controller = testController(&page, &status_message, .unstaged);
     controller.root_identity = root;
-    page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequestWithRootIdentity(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequestWithRootIdentity(
             allocator,
             page.activation.currentIdentity().?,
             31,
@@ -6777,28 +6777,28 @@ test "generated syntax completion after cache admission cannot mutate immutable 
             0,
             root,
         ),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "const x = 1;\n") },
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "const x = 1;\n") },
     });
     var task_request = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRequest;
     defer task_request.deinit(allocator);
-    page.review_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
-    try std.testing.expect(!page.review_projection.hasSyntaxPending());
-    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+    page.changes_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
+    try std.testing.expect(!page.changes_projection.hasSyntaxPending());
+    try std.testing.expectEqual(@as(usize, 1), page.changes_projection.cacheLen());
 
-    var late = review_projection.GeneratedSyntaxFinished{
-        .request = try review_projection.cloneGeneratedSyntaxRequest(allocator, task_request),
+    var late = changes_projection.GeneratedSyntaxFinished{
+        .request = try changes_projection.cloneGeneratedSyntaxRequest(allocator, task_request),
         .snapshot_fingerprint = task_request.expected_fingerprint,
         .result = .{ .loaded = .empty() },
     };
     defer late.deinit(allocator);
     const late_apply = controller.applyGeneratedSyntaxFinished(allocator, &late);
     try std.testing.expect(late_apply.skip_redraw);
-    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+    try std.testing.expectEqual(@as(usize, 1), page.changes_projection.cacheLen());
 
     var promoted = try controller.prepareProjection(allocator);
     defer promoted.deinit(allocator);
     try std.testing.expect(promoted.command == null);
-    try std.testing.expect(page.review_projection.displayed.ready.value.generated_added_file.decoration == .eligible);
+    try std.testing.expect(page.changes_projection.displayed.ready.value.generated_added_file.decoration == .eligible);
     var retried = (try controller.prepareGeneratedSyntax(allocator)) orelse return error.ExpectedSyntaxRetry;
     defer retried.deinit(allocator);
 }
@@ -6806,7 +6806,7 @@ test "generated syntax completion after cache admission cannot mutate immutable 
 test "old repository read generated syntax terminal drains without decorating retained projection" {
     const allocator = std.testing.allocator;
     const root = root_capability.Identity{ .device = 19, .inode = 23 };
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -6818,8 +6818,8 @@ test "old repository read generated syntax terminal drains without decorating re
     var controller = testController(&page, &status_message, .unstaged);
     controller.root_identity = root;
 
-    page.review_projection.installReady(.{
-        .request = try review_projection.cloneRequestWithOptions(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.cloneRequestWithOptions(
             allocator,
             page.activation.currentIdentity().?,
             11,
@@ -6834,26 +6834,26 @@ test "old repository read generated syntax terminal drains without decorating re
                 .root_identity = root,
             },
         ),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(
             allocator,
             "a",
             "const retained = true;\n",
         ) },
     });
-    const bundle = &page.review_projection.displayed.ready.value.generated_added_file;
+    const bundle = &page.changes_projection.displayed.ready.value.generated_added_file;
     // Model an in-flight optional provider even in provider-none test builds.
     bundle.decoration = .eligible;
-    page.review_projection.syntax_pending = try review_projection.generatedSyntaxRequestForProjection(
+    page.changes_projection.syntax_pending = try changes_projection.generatedSyntaxRequestForProjection(
         allocator,
         17,
         page.activation.currentIdentity().?,
-        page.review_projection.displayed.ready.request,
+        page.changes_projection.displayed.ready.request,
         bundle.fingerprint(),
     );
-    var finished: review_projection.GeneratedSyntaxFinished = .{
-        .request = try review_projection.cloneGeneratedSyntaxRequest(
+    var finished: changes_projection.GeneratedSyntaxFinished = .{
+        .request = try changes_projection.cloneGeneratedSyntaxRequest(
             allocator,
-            page.review_projection.syntax_pending.?,
+            page.changes_projection.syntax_pending.?,
         ),
         .snapshot_fingerprint = bundle.fingerprint(),
         .result = .{ .terminal_plain = .provider_unavailable },
@@ -6864,13 +6864,13 @@ test "old repository read generated syntax terminal drains without decorating re
     const applied = controller.applyGeneratedSyntaxFinished(allocator, &finished);
 
     try std.testing.expect(applied.skip_redraw);
-    try std.testing.expect(page.review_projection.syntax_pending == null);
+    try std.testing.expect(page.changes_projection.syntax_pending == null);
     try std.testing.expect(bundle.decoration == .eligible);
 }
 
 test "status line stats change invalidates retained projection cache" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var initial = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
     try initial.attachLineStats(&.{.{ .path_key = "a", .stats = .{ .added = 1, .removed = 1 } }});
@@ -6878,9 +6878,9 @@ test "status line stats change invalidates retained projection cache" {
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
-    page.review_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
-    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+    page.changes_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    page.changes_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), page.changes_projection.cacheLen());
 
     _ = page.status_load.prepare(false);
     page.status_load.begin(null, .{});
@@ -6896,7 +6896,7 @@ test "status line stats change invalidates retained projection cache" {
     defer identical_finished.deinit(allocator);
     _ = try controller.applyStatusFinished(allocator, &identical_finished, false);
     try std.testing.expectEqual(@as(u64, 0), page.status_snapshot_revision);
-    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+    try std.testing.expectEqual(@as(usize, 1), page.changes_projection.cacheLen());
 
     _ = page.status_load.prepare(false);
     page.status_load.begin(null, .{});
@@ -6913,29 +6913,29 @@ test "status line stats change invalidates retained projection cache" {
 
     _ = try controller.applyStatusFinished(allocator, &finished, false);
     try std.testing.expectEqual(@as(u64, 1), page.status_snapshot_revision);
-    try std.testing.expectEqual(@as(usize, 0), page.review_projection.cacheLen());
+    try std.testing.expectEqual(@as(usize, 0), page.changes_projection.cacheLen());
 }
 
 test "source session replacement clears populated projection cache" {
     const allocator = std.testing.allocator;
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
     defer status_bundle.deinit();
-    var page: review_page.ReviewPageState = .{};
+    var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
-    page.review_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
-    try std.testing.expectEqual(@as(usize, 1), page.review_projection.cacheLen());
+    page.changes_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    page.changes_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), page.changes_projection.cacheLen());
 
     try controller.createStatusOnlyLoadedSession(allocator, status_bundle.document);
     try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
-    try std.testing.expectEqual(@as(usize, 0), page.review_projection.cacheLen());
-    try std.testing.expect(!page.review_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), page.changes_projection.cacheLen());
+    try std.testing.expect(!page.changes_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
 }
 
-fn testPageWithOwnedFileSearchCandidate(allocator: std.mem.Allocator) !review_page.ReviewPageState {
+fn testPageWithOwnedFileSearchCandidate(allocator: std.mem.Allocator) !changes_page.ChangesPageState {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     var arena_transferred = false;
     errdefer if (!arena_transferred) arena.deinit();
@@ -6960,7 +6960,7 @@ fn testPageWithOwnedFileSearchCandidate(allocator: std.mem.Allocator) !review_pa
         .lines = 0,
     };
 
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
     };
     arena_transferred = true;
@@ -6988,7 +6988,7 @@ fn testPageWithOwnedFileSearchCandidate(allocator: std.mem.Allocator) !review_pa
     return page;
 }
 
-fn testPageWithDiffAndStatusOnlyFileSearchCandidate(allocator: std.mem.Allocator) !review_page.ReviewPageState {
+fn testPageWithDiffAndStatusOnlyFileSearchCandidate(allocator: std.mem.Allocator) !changes_page.ChangesPageState {
     const text =
         \\diff --git a/src/current.zig b/src/current.zig
         \\--- a/src/current.zig
@@ -7019,7 +7019,7 @@ fn testPageWithDiffAndStatusOnlyFileSearchCandidate(allocator: std.mem.Allocator
     };
     try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
 
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadStateWithArena(arena, loaded),
     };
     arena_transferred = true;
@@ -7045,7 +7045,7 @@ fn testPageWithDiffAndStatusOnlyFileSearchCandidate(allocator: std.mem.Allocator
 fn acceptEmptyStatus(
     allocator: std.mem.Allocator,
     controller: Controller,
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
 ) !CompletionApply {
     _ = page.status_load.prepare(false);
     page.status_load.begin(null, .{});
@@ -7196,7 +7196,7 @@ test "empty status action refresh keeps retained tree candidate unavailable" {
     defer page.deinit(allocator);
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
-    var prepared = try review_page.action_cursor.Prepared.init(
+    var prepared = try changes_page.action_cursor.Prepared.init(
         allocator,
         0,
         .{ .device = 1, .inode = 2 },
@@ -7226,7 +7226,7 @@ test "empty status action refresh keeps retained tree candidate unavailable" {
 
 test "old revision display is not admitted when fresh completion replaces it" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -7236,9 +7236,9 @@ test "old revision display is not admitted when fresh completion replaces it" {
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    page.changes_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
     controller.advanceStatusSnapshotRevision(allocator);
-    page.review_projection.pending = try review_projection.testing.cloneRequest(
+    page.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
         page.activation.currentIdentity().?,
         2,
@@ -7249,8 +7249,8 @@ test "old revision display is not admitted when fresh completion replaces it" {
         0,
         1,
     );
-    var finished: app_load.ReviewProjectionFinished = .{
-        .request = try review_projection.testing.cloneRequest(
+    var finished: app_load.ChangesProjectionFinished = .{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             2,
@@ -7261,7 +7261,7 @@ test "old revision display is not admitted when fresh completion replaces it" {
             0,
             1,
         ),
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "fresh\n") } },
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "fresh\n") } },
     };
     var finished_owned = true;
     defer if (finished_owned) finished.deinit(allocator);
@@ -7269,26 +7269,26 @@ test "old revision display is not admitted when fresh completion replaces it" {
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
     finished_owned = false;
-    try std.testing.expectEqual(@as(usize, 0), page.review_projection.cacheLen());
-    try std.testing.expectEqual(@as(u64, 1), page.review_projection.displayed.ready.request.status_snapshot_revision);
+    try std.testing.expectEqual(@as(usize, 0), page.changes_projection.cacheLen());
+    try std.testing.expectEqual(@as(u64, 1), page.changes_projection.displayed.ready.request.status_snapshot_revision);
 }
 
 fn finishGeneratedProjection(
     controller: Controller,
     allocator: std.mem.Allocator,
-    update: *ReviewUpdate,
+    update: *ChangesUpdate,
     path: []const u8,
 ) ![*]const u8 {
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
 
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n") } },
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, path, "one\ntwo\n") } },
     };
     var finished_owned = true;
     defer if (finished_owned) finished.deinit(allocator);
@@ -7305,10 +7305,10 @@ fn testGeneratedReady(
     path: []const u8,
     source_session_revision: u64,
     status_snapshot_revision: u64,
-) !review_projection.ReadyDisplay {
-    var request = try review_projection.testing.cloneRequest(
+) !changes_projection.ReadyDisplay {
+    var request = try changes_projection.testing.cloneRequest(
         allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         id,
         "/repo",
         path,
@@ -7320,16 +7320,16 @@ fn testGeneratedReady(
     errdefer request.deinit(allocator);
     return .{
         .request = request,
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, path, "one\ntwo\n") },
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, path, "one\ntwo\n") },
     };
 }
 
 fn testGeneratedCandidate(
     controller: Controller,
     allocator: std.mem.Allocator,
-    bundle: *const review_projection.GeneratedFileBundle,
-) !review_selection.CompletedSelection {
-    const ready: review_projection.Ready = .{ .generated_added_file = bundle.* };
+    bundle: *const changes_projection.GeneratedFileBundle,
+) !content_selection.CompletedSelection {
+    const ready: changes_projection.Ready = .{ .generated_added_file = bundle.* };
     const token = controller.contentTokenForReady(&ready) orelse return error.ExpectedContentToken;
     var drag = @import("../../../diff/selection.zig").DragSelection.init(
         .{ .generated_file = .{ .path_key = bundle.path } },
@@ -7338,12 +7338,12 @@ fn testGeneratedCandidate(
     );
     drag.mode = .character;
     drag.moved = true;
-    return review_selection.buildGenerated(allocator, token, bundle.path, &bundle.source, drag);
+    return content_selection.buildGenerated(allocator, token, bundle.path, &bundle.source, drag);
 }
 
 test "projection completion defers without moving displayed ownership during live drag" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -7357,7 +7357,7 @@ test "projection completion defers without moving displayed ownership during liv
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -7367,9 +7367,9 @@ test "projection completion defers without moving displayed ownership during liv
         .new,
         .{ .hunk_index = 0, .line_index = 0 },
     ) };
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n") } },
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n") } },
     };
     var finished_owned = true;
     defer if (finished_owned) finished.deinit(allocator);
@@ -7378,14 +7378,14 @@ test "projection completion defers without moving displayed ownership during liv
     try std.testing.expect(applied.result_transferred);
     finished_owned = false;
     try std.testing.expect(page.deferred_projection_apply != null);
-    try std.testing.expect(page.review_projection.pending != null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.pending != null);
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
 
-    var duplicate: app_load.ReviewProjectionFinished = .{
-        .request = try review_projection.testing.cloneRequest(
+    var duplicate: app_load.ChangesProjectionFinished = .{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
-            page.review_projection.pending.?.id,
+            page.changes_projection.pending.?.id,
             "/repo",
             "a",
             .generated_added_file,
@@ -7393,7 +7393,7 @@ test "projection completion defers without moving displayed ownership during liv
             0,
             0,
         ),
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "duplicate\n") } },
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "duplicate\n") } },
     };
     defer duplicate.deinit(allocator);
     const duplicate_apply = try controller.applyProjectionFinished(allocator, &duplicate);
@@ -7410,15 +7410,15 @@ test "projection completion defers without moving displayed ownership during liv
     page.selection_owner = .none;
     _ = try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.hasDisplayed());
 }
 
 test "projection failed terminals defer through the same owned result slot" {
     const allocator = std.testing.allocator;
     var status_message = @import("../../state.zig").StatusMessage{};
 
-    var owned_page: review_page.ReviewPageState = .{
+    var owned_page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -7430,7 +7430,7 @@ test "projection failed terminals defer through the same owned result slot" {
     defer owned_update.deinit(allocator);
     var owned_command = owned_update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const owned_request = switch (owned_command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     owned_command = undefined;
@@ -7439,17 +7439,17 @@ test "projection failed terminals defer through the same owned result slot" {
         .new,
         .{ .hunk_index = 0, .line_index = 0 },
     ) };
-    var failed: app_load.ReviewProjectionFinished = .{
+    var failed: app_load.ChangesProjectionFinished = .{
         .request = owned_request,
-        .result = .{ .failed = try review_projection.statusBodyAlloc(allocator, "a", "{s}", .{"failed"}) },
+        .result = .{ .failed = try changes_projection.statusBodyAlloc(allocator, "a", "{s}", .{"failed"}) },
     };
     const failed_apply = try owned_controller.applyProjectionFinished(allocator, &failed);
     try std.testing.expect(failed_apply.result_transferred);
     owned_page.selection_owner = .none;
     _ = try owned_controller.applyDeferredProjection(allocator);
-    try std.testing.expect(owned_page.review_projection.displayed == .failed);
+    try std.testing.expect(owned_page.changes_projection.displayed == .failed);
 
-    var static_page: review_page.ReviewPageState = .{
+    var static_page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -7461,7 +7461,7 @@ test "projection failed terminals defer through the same owned result slot" {
     defer static_update.deinit(allocator);
     var static_command = static_update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const static_request = switch (static_command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     static_command = undefined;
@@ -7470,7 +7470,7 @@ test "projection failed terminals defer through the same owned result slot" {
         .new,
         .{ .hunk_index = 0, .line_index = 0 },
     ) };
-    var failed_static: app_load.ReviewProjectionFinished = .{
+    var failed_static: app_load.ChangesProjectionFinished = .{
         .request = static_request,
         .result = .{ .failed_static = "failed static" },
     };
@@ -7478,14 +7478,14 @@ test "projection failed terminals defer through the same owned result slot" {
     try std.testing.expect(static_apply.result_transferred);
     static_page.selection_owner = .none;
     _ = try static_controller.applyDeferredProjection(allocator);
-    try std.testing.expect(static_page.review_projection.displayed == .failed);
+    try std.testing.expect(static_page.changes_projection.displayed == .failed);
 }
 
 test "cached and combined ready completions use the live drag deferral slot" {
     const allocator = std.testing.allocator;
     var status_message = @import("../../state.zig").StatusMessage{};
 
-    var cached_page: review_page.ReviewPageState = .{
+    var cached_page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -7497,7 +7497,7 @@ test "cached and combined ready completions use the live drag deferral slot" {
     defer cached_update.deinit(allocator);
     var cached_command = cached_update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const cached_request = switch (cached_command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     cached_command = undefined;
@@ -7506,7 +7506,7 @@ test "cached and combined ready completions use the live drag deferral slot" {
         .new,
         .{ .hunk_index = 0, .line_index = 0 },
     ) };
-    var cached_finished: app_load.ReviewProjectionFinished = .{
+    var cached_finished: app_load.ChangesProjectionFinished = .{
         .request = cached_request,
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_support.diff_cached_projection) } },
     };
@@ -7515,9 +7515,9 @@ test "cached and combined ready completions use the live drag deferral slot" {
     try std.testing.expect(cached_page.deferred_projection_apply != null);
     cached_page.selection_owner = .none;
     _ = try cached_controller.applyDeferredProjection(allocator);
-    try std.testing.expect(cached_page.review_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(cached_page.changes_projection.displayed.ready.value == .cached_diff);
 
-    var combined_page: review_page.ReviewPageState = .{
+    var combined_page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -7530,7 +7530,7 @@ test "cached and combined ready completions use the live drag deferral slot" {
     defer combined_update.deinit(allocator);
     var combined_command = combined_update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const combined_request = switch (combined_command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     combined_command = undefined;
@@ -7563,7 +7563,7 @@ test "cached and combined ready completions use the live drag deferral slot" {
         .new,
         .{ .hunk_index = 0, .line_index = 0 },
     ) };
-    var combined_finished: app_load.ReviewProjectionFinished = .{
+    var combined_finished: app_load.ChangesProjectionFinished = .{
         .request = combined_request,
         .result = .{ .ready = .{ .combined_hunks = .{
             .presentation = .{
@@ -7594,7 +7594,7 @@ test "cached and combined ready completions use the live drag deferral slot" {
     try std.testing.expect(combined_page.deferred_projection_apply != null);
     combined_page.selection_owner = .none;
     _ = try combined_controller.applyDeferredProjection(allocator);
-    try std.testing.expect(combined_page.review_projection.displayed.ready.value == .combined_hunks);
+    try std.testing.expect(combined_page.changes_projection.displayed.ready.value == .combined_hunks);
 }
 
 test "either inert combined component defers caches promotes and deinits exactly once" {
@@ -7618,7 +7618,7 @@ test "either inert combined component defers caches promotes and deinits exactly
 
     for ([_]bool{ true, false }) |cached_is_invalid| {
         var status_message = @import("../../state.zig").StatusMessage{};
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         };
@@ -7631,7 +7631,7 @@ test "either inert combined component defers caches promotes and deinits exactly
         defer update.deinit(allocator);
         var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
         const request = switch (command) {
-            .review_projection => |owned| owned,
+            .changes_projection => |owned| owned,
             else => return error.ExpectedProjectionCommand,
         };
         command = undefined;
@@ -7647,7 +7647,7 @@ test "either inert combined component defers caches promotes and deinits exactly
             .new,
             .{ .hunk_index = 0, .line_index = 0 },
         ) };
-        var finished: app_load.ReviewProjectionFinished = .{
+        var finished: app_load.ChangesProjectionFinished = .{
             .request = request,
             .result = .{ .ready = .{ .inert_combined = .{
                 .cached_bundle = cached,
@@ -7659,25 +7659,25 @@ test "either inert combined component defers caches promotes and deinits exactly
         cached_owned = false;
         unstaged_owned = false;
         try std.testing.expect(page.deferred_projection_apply != null);
-        try std.testing.expect(!page.review_projection.hasDisplayed());
+        try std.testing.expect(!page.changes_projection.hasDisplayed());
 
         page.selection_owner = .none;
         _ = try controller.applyDeferredProjection(allocator);
         try std.testing.expect(page.deferred_projection_apply == null);
-        try std.testing.expect(page.review_projection.displayed.ready.value == .inert_combined);
+        try std.testing.expect(page.changes_projection.displayed.ready.value == .inert_combined);
 
-        page.review_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
-        try std.testing.expect(page.review_projection.cacheHas(.{}, "/repo", "a", .combined_hunks, .unstaged, 0, 0));
+        page.changes_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
+        try std.testing.expect(page.changes_projection.cacheHas(.{}, "/repo", "a", .combined_hunks, .unstaged, 0, 0));
         var promoted = try controller.prepareProjection(allocator);
         defer promoted.deinit(allocator);
         try std.testing.expect(promoted.command == null);
-        try std.testing.expect(page.review_projection.displayed.ready.value == .inert_combined);
+        try std.testing.expect(page.changes_projection.displayed.ready.value == .inert_combined);
     }
 }
 
 test "projection cache promotion and no-target clear wait for live drag release" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -7687,8 +7687,8 @@ test "projection cache promotion and no-target clear wait for live drag release"
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
-    page.review_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
+    page.changes_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    page.changes_projection.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 0, 0);
     page.selection_owner = .{ .diff = .init(
         .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .new,
@@ -7697,14 +7697,14 @@ test "projection cache promotion and no-target clear wait for live drag release"
     var blocked_promotion = try controller.prepareProjection(allocator);
     defer blocked_promotion.deinit(allocator);
     try std.testing.expect(blocked_promotion.command == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
-    try std.testing.expect(page.review_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
 
     page.selection_owner = .none;
     var promoted = try controller.prepareProjection(allocator);
     defer promoted.deinit(allocator);
     try std.testing.expect(promoted.command == null);
-    try std.testing.expect(page.review_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.hasDisplayed());
 
     page.selection_owner = .{ .diff = .init(
         .{ .generated_file = .{ .path_key = "a" } },
@@ -7715,19 +7715,19 @@ test "projection cache promotion and no-target clear wait for live drag release"
     var blocked_clear = try controller.prepareProjection(allocator);
     defer blocked_clear.deinit(allocator);
     try std.testing.expect(blocked_clear.command == null);
-    try std.testing.expect(page.review_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.hasDisplayed());
 
     page.selection_owner = .none;
     var cleared = try controller.prepareProjection(allocator);
     defer cleared.deinit(allocator);
     try std.testing.expect(cleared.command == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
-    try std.testing.expect(page.review_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
 }
 
 test "source replacement before deferred projection rejects and frees the stale result" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -7741,7 +7741,7 @@ test "source replacement before deferred projection rejects and frees the stale 
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -7750,9 +7750,9 @@ test "source replacement before deferred projection rejects and frees the stale 
         .new,
         .{ .hunk_index = 0, .line_index = 0 },
     ) };
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "stale\n") } },
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "stale\n") } },
     };
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
@@ -7764,12 +7764,12 @@ test "source replacement before deferred projection rejects and frees the stale 
     try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
     _ = try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
 }
 
 test "mutation read promotion gate drains deferred projection without publication" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -7783,7 +7783,7 @@ test "mutation read promotion gate drains deferred projection without publicatio
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -7792,9 +7792,9 @@ test "mutation read promotion gate drains deferred projection without publicatio
         .new,
         .{ .hunk_index = 0, .line_index = 0 },
     ) };
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(
             allocator,
             "a",
             "must not publish\n",
@@ -7808,7 +7808,7 @@ test "mutation read promotion gate drains deferred projection without publicatio
     finished_owned = false;
     try std.testing.expect(deferred.skip_redraw);
     try std.testing.expect(page.deferred_projection_apply != null);
-    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expect(page.changes_projection.pending != null);
 
     const owner: app_actions.PendingAction = .{
         .generation = 55,
@@ -7820,13 +7820,13 @@ test "mutation read promotion gate drains deferred projection without publicatio
     _ = try controller.applyDeferredProjection(allocator);
 
     try std.testing.expect(page.deferred_projection_apply == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
 }
 
 test "selection viewport reload exact transfer preserves candidate and changed content invalidates" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -7838,8 +7838,8 @@ test "selection viewport reload exact transfer preserves candidate and changed c
     var controller = testController(&page, &status_message, .unstaged);
     controller.navigation.layout.height = 7;
 
-    page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             1,
@@ -7858,12 +7858,12 @@ test "selection viewport reload exact transfer preserves candidate and changed c
             test_combined_before_unstaged,
         ) },
     });
-    const original = &page.review_projection.displayed.ready.value.combined_hunks;
+    const original = &page.changes_projection.displayed.ready.value.combined_hunks;
     const original_token = original.presentation.content_token;
     const original_cached_authority = original.authority.cached_component.fingerprint;
     page.completed_selection = try testCombinedCandidate(controller, allocator, original);
     const original_content = controller.navigation.view().currentContentToken() orelse
-        return error.ExpectedReviewContentToken;
+        return error.ExpectedContentToken;
     try addTestSessionHunkMarks(&page, allocator, "/repo", "a", original_content, &.{ 0, 2 });
     try addTestSessionHunkMarks(&page, allocator, "/repo", "other.zig", original_content, &.{0});
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
@@ -7887,7 +7887,7 @@ test "selection viewport reload exact transfer preserves candidate and changed c
     repartitioned = undefined;
     try std.testing.expectEqual(original_layout_revision, page.selection_layout_revision);
 
-    const accepted = &page.review_projection.displayed.ready.value.combined_hunks;
+    const accepted = &page.changes_projection.displayed.ready.value.combined_hunks;
     try std.testing.expect(accepted.presentation.content_token.eql(original_token));
     try std.testing.expectEqual(@as(u64, 1), accepted.authority.status_snapshot_revision);
     try std.testing.expect(!accepted.authority.cached_component.fingerprint.eql(original_cached_authority));
@@ -7917,17 +7917,17 @@ test "selection viewport reload exact transfer preserves candidate and changed c
     try std.testing.expect(page.completed_selection == null);
     try expectTestSelectionViewportRestored(controller, changed_viewport);
     try std.testing.expect(page.selection_layout_revision != original_layout_revision);
-    try std.testing.expect(page.review_projection.displayed.ready.value.combined_hunks.presentation.content_token.eql(.init(3)));
+    try std.testing.expect(page.changes_projection.displayed.ready.value.combined_hunks.presentation.content_token.eql(.init(3)));
     try std.testing.expect(!page.staged_hunks.containsExact("/repo", "a", .{
         .content = original_content,
         .display_hunk_index = 0,
     }));
     try expectTestSessionHunkMarks(&page, "/repo", "other.zig", original_content, &.{0});
 
-    const changed_live = &page.review_projection.displayed.ready.value.combined_hunks;
+    const changed_live = &page.changes_projection.displayed.ready.value.combined_hunks;
     page.completed_selection = try testCombinedCandidate(controller, allocator, changed_live);
     const changed_content = controller.navigation.view().currentContentToken() orelse
-        return error.ExpectedReviewContentToken;
+        return error.ExpectedContentToken;
     try addTestSessionHunkMarks(&page, allocator, "/repo", "a", changed_content, &.{ 0, 1 });
     var forced_digest_match = try testCombinedBundle(
         allocator,
@@ -7948,14 +7948,14 @@ test "selection viewport reload exact transfer preserves candidate and changed c
         .display_hunk_index = 0,
     }));
     try expectTestSessionHunkMarks(&page, "/repo", "other.zig", original_content, &.{0});
-    const forced_accepted = &page.review_projection.displayed.ready.value.combined_hunks;
+    const forced_accepted = &page.changes_projection.displayed.ready.value.combined_hunks;
     try std.testing.expect(forced_accepted.presentation.content_token.eql(.init(4)));
     try std.testing.expectEqual(@as(u64, 3), forced_accepted.authority.status_snapshot_revision);
 }
 
 test "combined replacement snapshots live presentation hint into page and task requests" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -7967,8 +7967,8 @@ test "combined replacement snapshots live presentation hint into page and task r
     const controller = testController(&page, &status_message, .unstaged);
 
     try installTestCombinedCandidate(controller, allocator, 1, 41, 0);
-    const live = &page.review_projection.displayed.ready.value.combined_hunks.presentation;
-    const expected = review_projection.ExpectedPresentation{
+    const live = &page.changes_projection.displayed.ready.value.combined_hunks.presentation;
+    const expected = changes_projection.ExpectedPresentation{
         .fingerprint = live.fingerprint,
         .content_token = live.content_token,
     };
@@ -7979,11 +7979,11 @@ test "combined replacement snapshots live presentation hint into page and task r
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     defer command.deinit(allocator);
     const task_request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
 
-    const page_request = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const page_request = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     try std.testing.expectEqual(@as(u64, 1), page_request.status_snapshot_revision);
     try std.testing.expectEqual(@as(u64, 1), task_request.status_snapshot_revision);
     try std.testing.expect(page_request.expected_presentation.?.eql(expected));
@@ -7993,7 +7993,7 @@ test "combined replacement snapshots live presentation hint into page and task r
 
 test "combined reuse acceptance retains presentation and installs fresh authority" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -8005,7 +8005,7 @@ test "combined reuse acceptance retains presentation and installs fresh authorit
     const controller = testController(&page, &status_message, .unstaged);
 
     try installTestCombinedCandidate(controller, allocator, 1, 51, 0);
-    const live_before = &page.review_projection.displayed.ready.value.combined_hunks;
+    const live_before = &page.changes_projection.displayed.ready.value.combined_hunks;
     const presentation_text_ptr = live_before.presentation.cached_bundle.loaded.text.ptr;
     const presentation_syntax_ptr = live_before.presentation.cached_bundle.loaded.syntax_spans.files.ptr;
     const presentation_token = live_before.presentation.content_token;
@@ -8017,7 +8017,7 @@ test "combined reuse acceptance retains presentation and installs fresh authorit
     controller.advanceStatusSnapshotRevision(allocator);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     var candidate = try testCombinedReuseCandidate(
         allocator,
         1,
@@ -8029,7 +8029,7 @@ test "combined reuse acceptance retains presentation and installs fresh authorit
     try std.testing.expect(candidate.fresh_authority.?.cached_component.text.ptr != old_authority_text_ptr);
     try std.testing.expect(candidate.fresh_authority.?.projection.hunk_action_origins[1] == .cached);
 
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = try cloneTestProjectionRequest(allocator, pending),
         .result = .{ .reuse_candidate = candidate },
     };
@@ -8040,9 +8040,9 @@ test "combined reuse acceptance retains presentation and installs fresh authorit
     try std.testing.expect(applied.result_transferred);
     finished_owned = false;
 
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.eager_retry_basis == null);
-    const accepted = &page.review_projection.displayed.ready;
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.eager_retry_basis == null);
+    const accepted = &page.changes_projection.displayed.ready;
     try std.testing.expectEqual(@as(u64, 1), accepted.request.status_snapshot_revision);
     const bundle = &accepted.value.combined_hunks;
     try std.testing.expect(bundle.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
@@ -8060,7 +8060,7 @@ test "combined reuse acceptance retains presentation and installs fresh authorit
 
 test "ordinary primary exact combined candidate retains primary presentation and installs authority" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -8071,7 +8071,7 @@ test "ordinary primary exact combined candidate retains primary presentation and
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_before = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedPrimaryDisplay,
     };
@@ -8082,20 +8082,20 @@ test "ordinary primary exact combined candidate retains primary presentation and
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
     const primary_token = controller.navigation.view().currentContentToken() orelse
-        return error.ExpectedReviewContentToken;
+        return error.ExpectedContentToken;
     try addTestSessionHunkMarks(&page, allocator, "/repo", "a", primary_token, &.{ 0, 1 });
 
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     const expected = pending.expected_presentation orelse return error.ExpectedPrimaryPresentationHint;
-    try std.testing.expectEqual(review_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
+    try std.testing.expectEqual(changes_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
     try std.testing.expect(expected.fingerprint.eql(diff_presentation_identity.fingerprint(primary_file)));
     try std.testing.expect(expected.content_token.eql(.init(page.source_session_revision)));
 
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -8109,7 +8109,7 @@ test "ordinary primary exact combined candidate retains primary presentation and
     try std.testing.expect(candidate.fingerprint.eql(expected.fingerprint));
     try std.testing.expect(diff_presentation_identity.exactEqual(primary_file, candidate.displayFile()));
 
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -8117,7 +8117,7 @@ test "ordinary primary exact combined candidate retains primary presentation and
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
 
-    const ready = &page.review_projection.displayed.ready;
+    const ready = &page.changes_projection.displayed.ready;
     try std.testing.expect(ready.value == .primary_combined_authority);
     try std.testing.expect(!ready.value.cacheable());
     try std.testing.expectEqual(page.status_snapshot_revision, ready.value.primary_combined_authority.status_snapshot_revision);
@@ -8129,7 +8129,7 @@ test "ordinary primary exact combined candidate retains primary presentation and
     try std.testing.expect(authority_view.hunkActionOrigins()[1] == .cached);
     try std.testing.expect(authority_view.hunkActionOrigins()[2] == .unstaged);
 
-    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_after = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedRetainedPrimaryDisplay,
     };
@@ -8163,7 +8163,7 @@ test "ordinary primary exact combined candidate retains primary presentation and
 
 test "ordinary primary exact combined reuse retains active search match and cursor" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified },
     };
@@ -8187,7 +8187,7 @@ test "ordinary primary exact combined reuse retains active search match and curs
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -8198,7 +8198,7 @@ test "ordinary primary exact combined reuse retains active search match and curs
         test_combined_after_unstaged,
     );
     try std.testing.expect(candidate.fingerprint.eql(request.expected_presentation.?.fingerprint));
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -8219,7 +8219,7 @@ test "ordinary primary exact combined reuse retains active search match and curs
 
 test "publication snapshot staged-only admission requires live presentation identity" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified },
     };
@@ -8238,7 +8238,7 @@ test "publication snapshot staged-only admission requires live presentation iden
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     var request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -8259,7 +8259,7 @@ test "publication snapshot staged-only admission requires live presentation iden
 
 test "publication snapshot combined reuse returns retained staged-only owner to combined" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified },
     };
@@ -8271,7 +8271,7 @@ test "publication snapshot combined reuse returns retained staged-only owner to 
     const controller = testController(&page, &status_message, .unstaged);
 
     try installTestRetainedStagedOnly(controller, allocator, 1, 101, page.status_snapshot_revision);
-    const retained = &page.review_projection.displayed.ready.value.retained_staged_only;
+    const retained = &page.changes_projection.displayed.ready.value.retained_staged_only;
     const presentation_text_ptr = retained.presentation.cached_bundle.loaded.text.ptr;
     const presentation_token = retained.presentation.content_token;
 
@@ -8282,7 +8282,7 @@ test "publication snapshot combined reuse returns retained staged-only owner to 
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -8292,7 +8292,7 @@ test "publication snapshot combined reuse returns retained staged-only owner to 
         test_combined_after_cached,
         test_combined_after_unstaged,
     );
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -8310,7 +8310,7 @@ test "publication snapshot combined reuse returns retained staged-only owner to 
     controller.finishExactPresentationTransfer(allocator, outgoing_lineage);
     controller.reconcileRetainedPresentationNavigation(allocator);
 
-    const ready = &page.review_projection.displayed.ready;
+    const ready = &page.changes_projection.displayed.ready;
     try std.testing.expect(ready.value == .combined_hunks);
     const combined = &ready.value.combined_hunks;
     try std.testing.expect(combined.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
@@ -8320,7 +8320,7 @@ test "publication snapshot combined reuse returns retained staged-only owner to 
 
 test "ordinary primary staged-only status does not enter final-hunk projection boundary" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryLoadState(allocator, test_support.diff_one),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -8337,7 +8337,7 @@ test "ordinary primary staged-only status does not enter final-hunk projection b
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_before = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedPrimaryDisplay,
     };
@@ -8350,7 +8350,7 @@ test "ordinary primary staged-only status does not enter final-hunk projection b
         2,
     );
     const mark_key: session_hunk_mark.Key = .{
-        .content = controller.navigation.view().currentContentToken() orelse return error.ExpectedReviewContentToken,
+        .content = controller.navigation.view().currentContentToken() orelse return error.ExpectedContentToken,
         .display_hunk_index = 0,
     };
     try page.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
@@ -8368,10 +8368,10 @@ test "ordinary primary staged-only status does not enter final-hunk projection b
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.displayed == .idle);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.displayed == .idle);
 
-    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_after = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedRetainedPrimaryDisplay,
     };
@@ -8389,7 +8389,7 @@ test "ordinary primary staged-only status does not enter final-hunk projection b
 
 test "final hunk stage retains owned combined presentation with staged-only authority" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -8407,12 +8407,12 @@ test "final hunk stage retains owned combined presentation with staged-only auth
     const controller = testController(&page, &status_message, .unstaged);
 
     try installTestCombinedCandidate(controller, allocator, 1, 81, 0);
-    const live = &page.review_projection.displayed.ready.value.combined_hunks;
+    const live = &page.changes_projection.displayed.ready.value.combined_hunks;
     const presentation_text_ptr = live.presentation.cached_bundle.loaded.text.ptr;
     const presentation_syntax_ptr = live.presentation.cached_bundle.loaded.syntax_spans.files.ptr;
     const presentation_token = live.presentation.content_token;
     const combined_content = controller.navigation.view().currentContentToken() orelse
-        return error.ExpectedReviewContentToken;
+        return error.ExpectedContentToken;
     try addTestSessionHunkMarks(&page, allocator, "/repo", "a", combined_content, &.{ 0, 2 });
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
@@ -8434,21 +8434,21 @@ test "final hunk stage retains owned combined presentation with staged-only auth
     try page.git_status.replace("/repo", &staged_status);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, pending.kind);
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, pending.kind);
     const expected = pending.expected_presentation orelse return error.ExpectedCombinedPresentationHint;
-    try std.testing.expectEqual(review_projection.ExpectedPresentationOwner.combined_projection, expected.owner);
+    try std.testing.expectEqual(changes_projection.ExpectedPresentationOwner.combined_projection, expected.owner);
 
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
     var candidate = try testStagedOnlyReuseCandidate(allocator, page.status_snapshot_revision, test_combined_primary);
     try std.testing.expect(candidate.fingerprint.eql(expected.fingerprint));
     try std.testing.expect(diff_presentation_identity.exactEqual(live.displayFile(), candidate.displayFile()));
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .staged_only_reuse_candidate = candidate },
     };
@@ -8456,8 +8456,8 @@ test "final hunk stage retains owned combined presentation with staged-only auth
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
 
-    const ready = &page.review_projection.displayed.ready;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, ready.request.kind);
+    const ready = &page.changes_projection.displayed.ready;
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, ready.request.kind);
     try std.testing.expect(ready.value == .retained_staged_only);
     try std.testing.expect(ready.value.cacheable());
     const retained = &ready.value.retained_staged_only;
@@ -8487,7 +8487,7 @@ test "final hunk stage retains owned combined presentation with staged-only auth
 
 test "final hunk stage retains primary presentation with staged-only authority" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -8504,7 +8504,7 @@ test "final hunk stage retains primary presentation with staged-only authority" 
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_before = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedPrimaryDisplay,
     };
@@ -8520,7 +8520,7 @@ test "final hunk stage retains primary presentation with staged-only authority" 
         test_combined_before_cached,
         test_combined_before_unstaged,
     );
-    const mixed_request = try review_projection.cloneRequestWithOptions(
+    const mixed_request = try changes_projection.cloneRequestWithOptions(
         allocator,
         page.activation.currentIdentity().?,
         1,
@@ -8539,7 +8539,7 @@ test "final hunk stage retains primary presentation with staged-only authority" 
             },
         },
     );
-    page.review_projection.installReady(.{
+    page.changes_projection.installReady(.{
         .request = mixed_request,
         .value = .{ .primary_combined_authority = mixed_candidate.discardCandidateAndTakeAuthority() },
     });
@@ -8558,7 +8558,7 @@ test "final hunk stage retains primary presentation with staged-only authority" 
     controller.advanceStatusSnapshotRevision(allocator);
     var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
     try page.git_status.replace("/repo", &staged_status);
-    const boundary_body = switch (controller.navigation.view().displayedReviewBody()) {
+    const boundary_body = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedPrimaryBoundaryDisplay,
     };
@@ -8568,19 +8568,19 @@ test "final hunk stage retains primary presentation with staged-only authority" 
     try std.testing.expect(controller.expectedPresentationForTarget(boundary_target) != null);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, pending.kind);
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, pending.kind);
     const expected = pending.expected_presentation orelse return error.ExpectedPrimaryPresentationHint;
-    try std.testing.expectEqual(review_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
+    try std.testing.expectEqual(changes_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
 
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
     var candidate = try testStagedOnlyReuseCandidate(allocator, page.status_snapshot_revision, test_combined_primary);
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .staged_only_reuse_candidate = candidate },
     };
@@ -8588,10 +8588,10 @@ test "final hunk stage retains primary presentation with staged-only authority" 
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
 
-    const ready = &page.review_projection.displayed.ready;
+    const ready = &page.changes_projection.displayed.ready;
     try std.testing.expect(ready.value == .primary_staged_only_authority);
     try std.testing.expect(!ready.value.cacheable());
-    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_after = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedRetainedPrimaryDisplay,
     };
@@ -8613,7 +8613,7 @@ test "final hunk stage retains primary presentation with staged-only authority" 
 
 test "retained staged-only owner derives its own target after boundary install" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -8625,21 +8625,21 @@ test "retained staged-only owner derives its own target after boundary install" 
     const controller = testController(&page, &status_message, .unstaged);
     try installTestRetainedStagedOnly(controller, allocator, 1, 82, page.status_snapshot_revision);
 
-    const retained_before = &page.review_projection.displayed.ready.value.retained_staged_only;
+    const retained_before = &page.changes_projection.displayed.ready.value.retained_staged_only;
     const presentation_text_ptr = retained_before.presentation.cached_bundle.loaded.text.ptr;
 
     const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedStagedTarget;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, target.kind);
     try std.testing.expectEqualStrings("a", target.path_key);
     try std.testing.expect(controller.view().displayedMatchesStableIdentity(target));
 
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .retained_staged_only);
-    const retained_after = &page.review_projection.displayed.ready.value.retained_staged_only;
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .retained_staged_only);
+    const retained_after = &page.changes_projection.displayed.ready.value.retained_staged_only;
     try std.testing.expect(retained_after.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
     const authority_view = controller.navigation.view().activeHunkAuthority() orelse return error.ExpectedStagedOnlyAuthority;
     try std.testing.expect(authority_view.authority == .staged_only);
@@ -8647,7 +8647,7 @@ test "retained staged-only owner derives its own target after boundary install" 
 
 test "staged-only ready cached body derives its own target after boundary install" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -8666,35 +8666,35 @@ test "staged-only ready cached body derives its own target after boundary instal
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
 
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_combined_primary) } },
     };
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
-    const cached_text_ptr = page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .cached_diff);
+    const cached_text_ptr = page.changes_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
 
     const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedStagedTarget;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, target.kind);
     var second = try controller.prepareProjection(allocator);
     defer second.deinit(allocator);
     try std.testing.expect(second.command == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
-    try std.testing.expect(page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == cached_text_ptr);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(page.changes_projection.displayed.ready.value.cached_diff.loaded.text.ptr == cached_text_ptr);
 }
 
 test "primary staged-only authority survives following prepareProjection" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -8706,7 +8706,7 @@ test "primary staged-only authority survives following prepareProjection" {
     const controller = testController(&page, &status_message, .unstaged);
     try installTestPrimaryStagedOnly(controller, allocator, 1, page.status_snapshot_revision);
 
-    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_before = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedPrimaryDisplay,
     };
@@ -8714,15 +8714,15 @@ test "primary staged-only authority survives following prepareProjection" {
     const primary_owner = primary_before.loaded;
 
     const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedStagedTarget;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, target.kind);
 
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .primary_staged_only_authority);
-    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .primary_staged_only_authority);
+    const primary_after = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedRetainedPrimaryDisplay,
     };
@@ -8734,7 +8734,7 @@ test "primary staged-only authority survives following prepareProjection" {
 
 test "hint-free retry install keeps deriving its target at the staged boundary" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -8751,18 +8751,18 @@ test "hint-free retry install keeps deriving its target at the staged boundary" 
     try page.git_status.replace("/repo", &staged_status);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     const expected = pending.expected_presentation orelse return error.ExpectedCombinedPresentationHint;
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
 
     var candidate = try testStagedOnlyReuseCandidate(allocator, page.status_snapshot_revision, test_combined_primary_changed);
     candidate.fingerprint = expected.fingerprint;
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .staged_only_reuse_candidate = candidate },
     };
@@ -8775,32 +8775,32 @@ test "hint-free retry install keeps deriving its target at the staged boundary" 
     defer retry.deinit(allocator);
     var retry_command = retry.takeCommand() orelse return error.ExpectedProjectionCommand;
     const retry_request = switch (retry_command) {
-        .review_projection => |retry_request| retry_request,
+        .changes_projection => |retry_request| retry_request,
         else => return error.ExpectedProjectionCommand,
     };
     retry_command = undefined;
     try std.testing.expect(retry_request.expected_presentation == null);
 
-    var retry_finished: app_load.ReviewProjectionFinished = .{
+    var retry_finished: app_load.ChangesProjectionFinished = .{
         .request = retry_request,
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_combined_primary) } },
     };
     const applied = try controller.applyProjectionFinished(allocator, &retry_finished);
     try std.testing.expect(applied.result_transferred);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .cached_diff);
 
     var third = try controller.prepareProjection(allocator);
     defer third.deinit(allocator);
     try std.testing.expect(third.command == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .cached_diff);
 }
 
 test "mixed entry without combined candidate keeps staged preview target" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -8818,21 +8818,21 @@ test "mixed entry without combined candidate keeps staged preview target" {
     var deleted_worktree_status = try git_status.StatusBundle.parseOwned(allocator, "MD a\x00");
     try page.git_status.replace("/repo", &deleted_worktree_status);
 
-    const retained_before = &page.review_projection.displayed.ready.value.retained_staged_only;
+    const retained_before = &page.changes_projection.displayed.ready.value.retained_staged_only;
     const presentation_text_ptr = retained_before.presentation.cached_bundle.loaded.text.ptr;
 
     const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedStagedTarget;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, target.kind);
 
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     if (update.command) |command| switch (command) {
-        .review_projection => |issued| try std.testing.expect(issued.kind != .combined_hunks),
+        .changes_projection => |issued| try std.testing.expect(issued.kind != .combined_hunks),
         else => {},
     };
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .retained_staged_only);
-    const retained_after = &page.review_projection.displayed.ready.value.retained_staged_only;
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .retained_staged_only);
+    const retained_after = &page.changes_projection.displayed.ready.value.retained_staged_only;
     try std.testing.expect(retained_after.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
 }
 
@@ -8840,8 +8840,8 @@ fn installTestCachedPreviewOwner(
     controller: Controller,
     allocator: std.mem.Allocator,
 ) !void {
-    controller.page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    controller.page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             controller.page.activation.currentIdentity().?,
             1,
@@ -8858,7 +8858,7 @@ fn installTestCachedPreviewOwner(
 
 test "unstaged-only boundary retains staged preview and queues repair" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
     defer page.deinit(allocator);
@@ -8868,7 +8868,7 @@ test "unstaged-only boundary retains staged preview and queues repair" {
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
     try installTestCachedPreviewOwner(controller, allocator);
-    const text_ptr = page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
+    const text_ptr = page.changes_projection.displayed.ready.value.cached_diff.loaded.text.ptr;
 
     // The only staged hunk gets unstaged and the entry turns unstaged-only; no
     // target arm exists for the still-selected row.
@@ -8880,9 +8880,9 @@ test "unstaged-only boundary retains staged preview and queues repair" {
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .cached_diff);
-    try std.testing.expect(page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .cached_diff);
+    try std.testing.expect(page.changes_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr);
     try std.testing.expect(page.activation.hasQueuedFullRevalidation());
 
     // A conflict entry keeps the same inert retention.
@@ -8891,13 +8891,13 @@ test "unstaged-only boundary retains staged preview and queues repair" {
     var second = try controller.prepareProjection(allocator);
     defer second.deinit(allocator);
     try std.testing.expect(second.command == null);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value.cached_diff.loaded.text.ptr == text_ptr);
 }
 
 test "boundary retention does not survive entry disappearance" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
     defer page.deinit(allocator);
@@ -8915,13 +8915,13 @@ test "boundary retention does not survive entry disappearance" {
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(page.review_projection.displayed == .idle);
+    try std.testing.expect(page.changes_projection.displayed == .idle);
     try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
 }
 
 test "boundary retention yields to selection moved to another path" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
     defer page.deinit(allocator);
@@ -8942,14 +8942,14 @@ test "boundary retention yields to selection moved to another path" {
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(page.review_projection.displayed == .idle);
-    try std.testing.expect(page.review_projection.cacheLen() == 1);
+    try std.testing.expect(page.changes_projection.displayed == .idle);
+    try std.testing.expect(page.changes_projection.cacheLen() == 1);
     try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
 }
 
 test "ordinary projection request id survives counter wrap without hitting the zero sentinel" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
     defer page.deinit(allocator);
@@ -8959,17 +8959,17 @@ test "ordinary projection request id survives counter wrap without hitting the z
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    page.review_projection_next_id = std.math.maxInt(u64);
+    page.changes_projection_next_id = std.math.maxInt(u64);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     try std.testing.expect(pending.id != 0);
     try std.testing.expectEqual(@as(u64, 1), pending.id);
 }
 
 test "status-only session cleans stale owner through successor target" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
     defer page.deinit(allocator);
@@ -8988,18 +8988,18 @@ test "status-only session cleans stale owner through successor target" {
     // source generation; the stale owner is cleaned through the successor
     // preparation path, not the no-target path.
     const target = controller.view().projectionTarget() orelse return error.ExpectedSuccessorTarget;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, target.kind);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedSuccessorPending;
+    const pending = page.changes_projection.pending orelse return error.ExpectedSuccessorPending;
     try std.testing.expectEqual(page.source_session_revision, pending.source_session_revision);
     try std.testing.expect(update.command != null);
-    try std.testing.expect(page.review_projection.displayed == .idle);
+    try std.testing.expect(page.changes_projection.displayed == .idle);
 }
 
 test "status-only session cleans stale owner through no-target path" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
     defer page.deinit(allocator);
@@ -9019,14 +9019,14 @@ test "status-only session cleans stale owner through no-target path" {
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.displayed == .idle);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.displayed == .idle);
     try std.testing.expect(!page.activation.hasQueuedFullRevalidation());
 }
 
 test "failed displayed request derives its own target" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -9036,8 +9036,8 @@ test "failed displayed request derives its own target" {
     page.status_load.markSuccess();
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
-    page.review_projection.displayed = .{ .failed = .{
-        .request = try review_projection.testing.cloneRequest(
+    page.changes_projection.displayed = .{ .failed = .{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             1,
@@ -9048,23 +9048,23 @@ test "failed displayed request derives its own target" {
             page.source_session_revision,
             page.status_snapshot_revision,
         ),
-        .body = try review_projection.statusBodyAlloc(allocator, "a", "Preview unavailable", .{}),
+        .body = try changes_projection.statusBodyAlloc(allocator, "a", "Preview unavailable", .{}),
     } };
 
     // The ownership predicate includes a failed displayed request: the failed
     // body keeps deriving its target instead of being dropped at the staged
     // boundary.
     const target = controller.view().projectionTarget() orelse return error.ExpectedOwnedTarget;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, target.kind);
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, target.kind);
     try std.testing.expectEqualStrings("a", target.path_key);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    try std.testing.expect(page.review_projection.displayed == .failed);
+    try std.testing.expect(page.changes_projection.displayed == .failed);
 }
 
 test "failed displayed body joins boundary inert retention" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
     defer page.deinit(allocator);
@@ -9073,8 +9073,8 @@ test "failed displayed body joins boundary inert retention" {
     page.status_load.markSuccess();
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
-    page.review_projection.displayed = .{ .failed = .{
-        .request = try review_projection.testing.cloneRequest(
+    page.changes_projection.displayed = .{ .failed = .{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             1,
@@ -9085,7 +9085,7 @@ test "failed displayed body joins boundary inert retention" {
             page.source_session_revision,
             page.status_snapshot_revision,
         ),
-        .body = try review_projection.statusBodyAlloc(allocator, "a", "Preview unavailable", .{}),
+        .body = try changes_projection.statusBodyAlloc(allocator, "a", "Preview unavailable", .{}),
     } };
 
     controller.advanceStatusSnapshotRevision(allocator);
@@ -9096,13 +9096,13 @@ test "failed displayed body joins boundary inert retention" {
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(page.review_projection.displayed == .failed);
+    try std.testing.expect(page.changes_projection.displayed == .failed);
     try std.testing.expect(page.activation.hasQueuedFullRevalidation());
 }
 
 test "one hunk unstage restores combined authority over retained owned presentation" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -9120,12 +9120,12 @@ test "one hunk unstage restores combined authority over retained owned presentat
     const controller = testController(&page, &status_message, .unstaged);
 
     try installTestRetainedStagedOnly(controller, allocator, 1, 101, page.status_snapshot_revision);
-    const retained = &page.review_projection.displayed.ready.value.retained_staged_only;
+    const retained = &page.changes_projection.displayed.ready.value.retained_staged_only;
     const presentation_text_ptr = retained.presentation.cached_bundle.loaded.text.ptr;
     const presentation_syntax_ptr = retained.presentation.cached_bundle.loaded.syntax_spans.files.ptr;
     const presentation_token = retained.presentation.content_token;
     const retained_content = controller.navigation.view().currentContentToken() orelse
-        return error.ExpectedReviewContentToken;
+        return error.ExpectedContentToken;
     try addTestSessionHunkMarks(&page, allocator, "/repo", "a", retained_content, &.{ 0, 1 });
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
@@ -9145,15 +9145,15 @@ test "one hunk unstage restores combined authority over retained owned presentat
     try page.git_status.replace("/repo", &mixed_status);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
-    try std.testing.expectEqual(review_projection.Kind.combined_hunks, pending.kind);
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expectEqual(changes_projection.Kind.combined_hunks, pending.kind);
     const expected = pending.expected_presentation orelse return error.ExpectedRetainedPresentationHint;
-    try std.testing.expectEqual(review_projection.ExpectedPresentationOwner.combined_projection, expected.owner);
+    try std.testing.expectEqual(changes_projection.ExpectedPresentationOwner.combined_projection, expected.owner);
     try std.testing.expect(expected.content_token.eql(presentation_token));
 
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -9165,7 +9165,7 @@ test "one hunk unstage restores combined authority over retained owned presentat
     );
     try std.testing.expect(candidate.fingerprint.eql(expected.fingerprint));
     try std.testing.expect(diff_presentation_identity.exactEqual(retained.displayFile(), candidate.displayFile()));
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -9173,8 +9173,8 @@ test "one hunk unstage restores combined authority over retained owned presentat
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
 
-    const ready = &page.review_projection.displayed.ready;
-    try std.testing.expectEqual(review_projection.Kind.combined_hunks, ready.request.kind);
+    const ready = &page.changes_projection.displayed.ready;
+    try std.testing.expectEqual(changes_projection.Kind.combined_hunks, ready.request.kind);
     try std.testing.expect(ready.value == .combined_hunks);
     const combined = &ready.value.combined_hunks;
     try std.testing.expect(combined.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
@@ -9199,7 +9199,7 @@ test "one hunk unstage restores combined authority over retained owned presentat
 
 test "one hunk unstage restores combined authority over retained primary presentation" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -9217,7 +9217,7 @@ test "one hunk unstage restores combined authority over retained primary present
     const controller = testController(&page, &status_message, .unstaged);
 
     try installTestPrimaryStagedOnly(controller, allocator, 1, page.status_snapshot_revision);
-    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_before = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedPrimaryDisplay,
     };
@@ -9247,14 +9247,14 @@ test "one hunk unstage restores combined authority over retained primary present
     try page.git_status.replace("/repo", &mixed_status);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
-    try std.testing.expectEqual(review_projection.Kind.combined_hunks, pending.kind);
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expectEqual(changes_projection.Kind.combined_hunks, pending.kind);
     const expected = pending.expected_presentation orelse return error.ExpectedPrimaryPresentationHint;
-    try std.testing.expectEqual(review_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
+    try std.testing.expectEqual(changes_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
 
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -9264,7 +9264,7 @@ test "one hunk unstage restores combined authority over retained primary present
         test_combined_after_cached,
         test_combined_after_unstaged,
     );
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -9272,10 +9272,10 @@ test "one hunk unstage restores combined authority over retained primary present
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(applied.result_transferred);
 
-    const ready = &page.review_projection.displayed.ready;
+    const ready = &page.changes_projection.displayed.ready;
     try std.testing.expect(ready.value == .primary_combined_authority);
     try std.testing.expect(!ready.value.cacheable());
-    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_after = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedRetainedPrimaryDisplay,
     };
@@ -9296,7 +9296,7 @@ test "one hunk unstage restores combined authority over retained primary present
 
 test "final staged hunk unstage returns owned combined display to exact ordinary primary" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -9338,8 +9338,8 @@ test "final staged hunk unstage returns owned combined display to exact ordinary
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
-    const ordinary = switch (controller.navigation.view().displayedReviewBody()) {
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
+    const ordinary = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |body| body,
         else => return error.ExpectedOrdinaryPrimaryDisplay,
     };
@@ -9361,7 +9361,7 @@ test "final staged hunk unstage returns owned combined display to exact ordinary
     try std.testing.expect(page.completed_selection.?.token.display == .loaded);
     try std.testing.expect(page.completed_selection.?.token.display.loaded.eql(.init(primary.text)));
     const ordinary_token = controller.navigation.view().currentContentToken() orelse
-        return error.ExpectedReviewContentToken;
+        return error.ExpectedContentToken;
     try expectTestSessionHunkMarks(&page, "/repo", "a", ordinary_token, &.{ 0, 2 });
     try std.testing.expect(!page.staged_hunks.containsExact("/repo", "a", .{
         .content = combined_token,
@@ -9375,7 +9375,7 @@ test "final staged hunk unstage returns owned combined display to exact ordinary
 
 test "owned combined to folded primary remaps hidden cursor and clamps scroll" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -9408,7 +9408,7 @@ test "owned combined to folded primary remaps hidden cursor and clamps scroll" {
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
     try std.testing.expect(primary.isHunkFolded(0, 2));
 
     const ordinary_line_count = controller.navigation.view().displayedDiffLineCount();
@@ -9428,7 +9428,7 @@ test "owned combined to folded primary remaps hidden cursor and clamps scroll" {
 
 test "final staged hunk unstage removes primary combined authority without replacing primary" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -9445,7 +9445,7 @@ test "final staged hunk unstage removes primary combined authority without repla
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    const primary_before = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_before = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedPrimaryDisplay,
     };
@@ -9478,8 +9478,8 @@ test "final staged hunk unstage removes primary combined authority without repla
         test_combined_before_unstaged,
     );
     defer candidate.deinit();
-    page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             1,
@@ -9499,9 +9499,9 @@ test "final staged hunk unstage removes primary combined authority without repla
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
 
-    const primary_after = switch (controller.navigation.view().displayedReviewBody()) {
+    const primary_after = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedOrdinaryPrimaryDisplay,
     };
@@ -9523,7 +9523,7 @@ test "final staged hunk unstage removes primary combined authority without repla
 
 test "session-staged hunk projected unstage removes exact mark before next toggle" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -9539,14 +9539,14 @@ test "session-staged hunk projected unstage removes exact mark before next toggl
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
-    var operation_view: review_operations.View = .{
+    var operation_view: changes_operations.View = .{
         .page = &page,
         .navigation = controller.navigation.view(),
         .source = .unstaged,
         .repo_root = "/repo",
         .activation_state = page.activation.state,
     };
-    var operation_controller: review_operations.Controller = .{
+    var operation_controller: changes_operations.Controller = .{
         .page = &page,
         .navigation = controller.navigation,
         .view_state = operation_view,
@@ -9577,7 +9577,7 @@ test "session-staged hunk projected unstage removes exact mark before next toggl
     defer update.deinit(allocator);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -9587,7 +9587,7 @@ test "session-staged hunk projected unstage removes exact mark before next toggl
         test_combined_before_cached,
         test_combined_before_unstaged,
     );
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -9631,9 +9631,9 @@ test "session-staged hunk projected unstage removes exact mark before next toggl
     var final_update = try controller.prepareProjection(allocator);
     defer final_update.deinit(allocator);
     try std.testing.expect(final_update.command == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
 
-    const final_view: review_operations.View = .{
+    const final_view: changes_operations.View = .{
         .page = &page,
         .navigation = controller.navigation.view(),
         .source = .unstaged,
@@ -9648,7 +9648,7 @@ test "session-staged hunk projected unstage removes exact mark before next toggl
 
 test "combined to ordinary mismatch clears projection selection before revealing primary" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryLoadState(allocator, test_combined_primary_changed),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -9660,7 +9660,7 @@ test "combined to ordinary mismatch clears projection selection before revealing
     const controller = testController(&page, &status_message, .unstaged);
     try installTestCombinedCandidate(controller, allocator, 1, 131, page.status_snapshot_revision);
     try std.testing.expect(!diff_presentation_identity.exactEqual(
-        page.review_projection.displayed.ready.value.combined_hunks.displayFile(),
+        page.changes_projection.displayed.ready.value.combined_hunks.displayFile(),
         controller.navigation.view().selectedFile().?,
     ));
 
@@ -9670,9 +9670,9 @@ test "combined to ordinary mismatch clears projection selection before revealing
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
-    try std.testing.expect(!page.review_projection.hasDisplayed());
+    try std.testing.expect(!page.changes_projection.hasDisplayed());
     try std.testing.expect(page.completed_selection == null);
-    const ordinary = switch (controller.navigation.view().displayedReviewBody()) {
+    const ordinary = switch (controller.navigation.view().displayedChangesBody()) {
         .primary => |primary| primary,
         else => return error.ExpectedOrdinaryPrimaryDisplay,
     };
@@ -9684,7 +9684,7 @@ test "combined to ordinary mismatch clears projection selection before revealing
 
 test "staged-only to combined exact mismatch keeps retained owner for bounded eager retry" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -9701,11 +9701,11 @@ test "staged-only to combined exact mismatch keeps retained owner for bounded ea
     try page.git_status.replace("/repo", &mixed_status);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     const expected = pending.expected_presentation orelse return error.ExpectedRetainedPresentationHint;
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -9717,7 +9717,7 @@ test "staged-only to combined exact mismatch keeps retained owner for bounded ea
         test_combined_changed_unstaged,
     );
     candidate.fingerprint = expected.fingerprint;
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -9725,26 +9725,26 @@ test "staged-only to combined exact mismatch keeps retained owner for bounded ea
     defer finished.deinit(allocator);
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(!applied.result_transferred);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .retained_staged_only);
-    try std.testing.expect(page.review_projection.eager_retry_basis.?.eql(expected));
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .retained_staged_only);
+    try std.testing.expect(page.changes_projection.eager_retry_basis.?.eql(expected));
 
     var retry = try controller.prepareProjection(allocator);
     defer retry.deinit(allocator);
-    const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
-    try std.testing.expectEqual(review_projection.Kind.combined_hunks, retry_pending.kind);
+    const retry_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expectEqual(changes_projection.Kind.combined_hunks, retry_pending.kind);
     try std.testing.expect(retry_pending.expected_presentation == null);
     var retry_command = retry.takeCommand() orelse return error.ExpectedProjectionCommand;
     defer retry_command.deinit(allocator);
     switch (retry_command) {
-        .review_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
+        .changes_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
         else => return error.ExpectedProjectionCommand,
     }
 }
 
 test "staged-only exact mismatch schedules one eager cached boundary" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -9761,11 +9761,11 @@ test "staged-only exact mismatch schedules one eager cached boundary" {
     try page.git_status.replace("/repo", &staged_status);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     const expected = pending.expected_presentation orelse return error.ExpectedCombinedPresentationHint;
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -9776,7 +9776,7 @@ test "staged-only exact mismatch schedules one eager cached boundary" {
         candidate.displayFile(),
     ));
     candidate.fingerprint = expected.fingerprint;
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .staged_only_reuse_candidate = candidate },
     };
@@ -9784,19 +9784,19 @@ test "staged-only exact mismatch schedules one eager cached boundary" {
     defer finished.deinit(allocator);
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(!applied.result_transferred);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.eager_retry_basis.?.eql(expected));
-    try std.testing.expect(page.review_projection.displayed.ready.value == .combined_hunks);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.eager_retry_basis.?.eql(expected));
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .combined_hunks);
 
     var retry = try controller.prepareProjection(allocator);
     defer retry.deinit(allocator);
-    const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, retry_pending.kind);
+    const retry_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, retry_pending.kind);
     try std.testing.expect(retry_pending.expected_presentation == null);
     var retry_command = retry.takeCommand() orelse return error.ExpectedProjectionCommand;
     defer retry_command.deinit(allocator);
     switch (retry_command) {
-        .review_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
+        .changes_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
         else => return error.ExpectedProjectionCommand,
     }
 }
@@ -9806,7 +9806,7 @@ test "malformed staged-only candidate shape rejects before file access" {
     const allocator = std.testing.allocator;
 
     for ([_]MalformedShape{ .zero_files, .multiple_files }) |shape| {
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         };
@@ -9823,11 +9823,11 @@ test "malformed staged-only candidate shape rejects before file access" {
         try page.git_status.replace("/repo", &staged_status);
         var update = try controller.prepareProjection(allocator);
         defer update.deinit(allocator);
-        const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
         const expected = pending.expected_presentation orelse return error.ExpectedCombinedPresentationHint;
         var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
         const request = switch (command) {
-            .review_projection => |request| request,
+            .changes_projection => |request| request,
             else => return error.ExpectedProjectionCommand,
         };
         command = undefined;
@@ -9843,7 +9843,7 @@ test "malformed staged-only candidate shape rejects before file access" {
             .zero_files => &.{},
             .multiple_files => duplicate_files[0..],
         };
-        var finished: app_load.ReviewProjectionFinished = .{
+        var finished: app_load.ChangesProjectionFinished = .{
             .request = request,
             .result = .{ .staged_only_reuse_candidate = candidate },
         };
@@ -9852,20 +9852,20 @@ test "malformed staged-only candidate shape rejects before file access" {
 
         const applied = try controller.applyProjectionFinished(allocator, &finished);
         try std.testing.expect(!applied.result_transferred);
-        try std.testing.expect(page.review_projection.pending == null);
-        try std.testing.expect(page.review_projection.eager_retry_basis.?.eql(expected));
-        try std.testing.expect(page.review_projection.displayed.ready.value == .combined_hunks);
+        try std.testing.expect(page.changes_projection.pending == null);
+        try std.testing.expect(page.changes_projection.eager_retry_basis.?.eql(expected));
+        try std.testing.expect(page.changes_projection.displayed.ready.value == .combined_hunks);
         try std.testing.expect(controller.navigation.view().activeHunkAuthority().?.authority == .combined);
         try std.testing.expect(finished.result.staged_only_reuse_candidate.fresh_authority != null);
 
         var retry = try controller.prepareProjection(allocator);
         defer retry.deinit(allocator);
-        const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        const retry_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
         try std.testing.expect(retry_pending.expected_presentation == null);
         var retry_command = retry.takeCommand() orelse return error.ExpectedProjectionCommand;
         defer retry_command.deinit(allocator);
         switch (retry_command) {
-            .review_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
+            .changes_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
             else => return error.ExpectedProjectionCommand,
         }
     }
@@ -9873,7 +9873,7 @@ test "malformed staged-only candidate shape rejects before file access" {
 
 test "ordinary primary combined candidate exact mismatch schedules one eager boundary" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = try testPrimaryCombinedLoadState(allocator),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -9886,12 +9886,12 @@ test "ordinary primary combined candidate exact mismatch schedules one eager bou
 
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     const expected = pending.expected_presentation orelse return error.ExpectedPrimaryPresentationHint;
-    try std.testing.expectEqual(review_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
+    try std.testing.expectEqual(changes_projection.ExpectedPresentationOwner.primary_loaded, expected.owner);
     var command = update.takeCommand() orelse return error.ExpectedProjectionCommand;
     const request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.ExpectedProjectionCommand,
     };
     command = undefined;
@@ -9907,7 +9907,7 @@ test "ordinary primary combined candidate exact mismatch schedules one eager bou
         candidate.displayFile(),
     ));
     candidate.fingerprint = expected.fingerprint;
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -9915,23 +9915,23 @@ test "ordinary primary combined candidate exact mismatch schedules one eager bou
     defer finished.deinit(allocator);
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(!applied.result_transferred);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.eager_retry_basis != null);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.eager_retry_basis != null);
     try std.testing.expectEqual(
-        review_projection.ExpectedPresentationOwner.primary_loaded,
-        page.review_projection.eager_retry_basis.?.owner,
+        changes_projection.ExpectedPresentationOwner.primary_loaded,
+        page.changes_projection.eager_retry_basis.?.owner,
     );
-    try std.testing.expect(controller.navigation.view().displayedReviewBody() == .primary);
+    try std.testing.expect(controller.navigation.view().displayedChangesBody() == .primary);
     try std.testing.expect(controller.navigation.view().activeHunkAuthority() == null);
 
     var retry = try controller.prepareProjection(allocator);
     defer retry.deinit(allocator);
-    const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const retry_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     try std.testing.expect(retry_pending.expected_presentation == null);
     var retry_command = retry.takeCommand() orelse return error.ExpectedProjectionCommand;
     defer retry_command.deinit(allocator);
     switch (retry_command) {
-        .review_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
+        .changes_projection => |retry_request| try std.testing.expect(retry_request.expected_presentation == null),
         else => return error.ExpectedProjectionCommand,
     }
 }
@@ -9946,7 +9946,7 @@ fn testCombinedReuseRejection(
     allocator: std.mem.Allocator,
     rejection: CombinedReuseRejection,
 ) !void {
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -9958,14 +9958,14 @@ fn testCombinedReuseRejection(
     const controller = testController(&page, &status_message, .unstaged);
 
     try installTestCombinedCandidate(controller, allocator, 1, 61, 0);
-    const live_before = &page.review_projection.displayed.ready.value.combined_hunks;
+    const live_before = &page.changes_projection.displayed.ready.value.combined_hunks;
     const presentation_text_ptr = live_before.presentation.cached_bundle.loaded.text.ptr;
     const authority_text_ptr = live_before.authority.cached_component.text.ptr;
     const presentation_token = live_before.presentation.content_token;
     controller.advanceStatusSnapshotRevision(allocator);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
 
     const candidate_unstaged = if (rejection == .forced_fingerprint_collision)
         test_combined_changed_unstaged
@@ -9987,7 +9987,7 @@ fn testCombinedReuseRejection(
         .stale_authority_revision => candidate.fresh_authority.?.status_snapshot_revision = 0,
     }
 
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = request,
         .result = .{ .reuse_candidate = candidate },
     };
@@ -9996,10 +9996,10 @@ fn testCombinedReuseRejection(
     defer finished.deinit(allocator);
     const applied = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(!applied.result_transferred);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.eager_retry_basis != null);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.eager_retry_basis != null);
 
-    const retained = &page.review_projection.displayed.ready.value.combined_hunks;
+    const retained = &page.changes_projection.displayed.ready.value.combined_hunks;
     try std.testing.expect(retained.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
     try std.testing.expect(retained.authority.cached_component.text.ptr == authority_text_ptr);
     try std.testing.expect(retained.presentation.content_token.eql(presentation_token));
@@ -10009,39 +10009,39 @@ fn testCombinedReuseRejection(
     if (rejection == .forced_fingerprint_collision) {
         var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
         try std.testing.expectError(error.OutOfMemory, controller.prepareProjection(failing.allocator()));
-        try std.testing.expect(page.review_projection.pending == null);
-        try std.testing.expect(page.review_projection.eager_retry_basis != null);
+        try std.testing.expect(page.changes_projection.pending == null);
+        try std.testing.expect(page.changes_projection.eager_retry_basis != null);
     }
 
     var retry_update = try controller.prepareProjection(allocator);
     defer retry_update.deinit(allocator);
-    const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const retry_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     try std.testing.expect(retry_pending.expected_presentation == null);
     var retry_command = retry_update.takeCommand() orelse return error.ExpectedProjectionCommand;
     defer retry_command.deinit(allocator);
     const retry_request = switch (retry_command) {
-        .review_projection => |owned_request| owned_request,
+        .changes_projection => |owned_request| owned_request,
         else => return error.ExpectedProjectionCommand,
     };
     try std.testing.expect(retry_request.expected_presentation == null);
     try std.testing.expectEqual(retry_pending.id, retry_request.id);
-    try std.testing.expect(page.review_projection.eager_retry_basis != null);
+    try std.testing.expect(page.changes_projection.eager_retry_basis != null);
 
     if (rejection == .forced_fingerprint_collision) {
         const rejected_spawn_id = retry_pending.id;
         controller.rejectProjectionSpawn(allocator, rejected_spawn_id);
-        try std.testing.expect(page.review_projection.pending == null);
-        try std.testing.expect(page.review_projection.eager_retry_basis != null);
+        try std.testing.expect(page.changes_projection.pending == null);
+        try std.testing.expect(page.changes_projection.eager_retry_basis != null);
 
         var respawn_update = try controller.prepareProjection(allocator);
         defer respawn_update.deinit(allocator);
-        const respawn_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        const respawn_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
         try std.testing.expect(respawn_pending.expected_presentation == null);
         try std.testing.expect(respawn_pending.id != rejected_spawn_id);
         var respawn_command = respawn_update.takeCommand() orelse return error.ExpectedProjectionCommand;
         defer respawn_command.deinit(allocator);
         switch (respawn_command) {
-            .review_projection => |owned_request| try std.testing.expect(owned_request.expected_presentation == null),
+            .changes_projection => |owned_request| try std.testing.expect(owned_request.expected_presentation == null),
             else => return error.ExpectedProjectionCommand,
         }
     }
@@ -10056,7 +10056,7 @@ test "combined reuse rejection keeps old display inert and schedules one eager r
 
 test "combined reuse candidate crosses live drag deferral with one owner" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -10071,14 +10071,14 @@ test "combined reuse candidate crosses live drag deferral with one owner" {
     controller.advanceStatusSnapshotRevision(allocator);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     var candidate = try testCombinedReuseCandidate(
         allocator,
         1,
         test_combined_after_cached,
         test_combined_after_unstaged,
     );
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = try cloneTestProjectionRequest(allocator, pending),
         .result = .{ .reuse_candidate = candidate },
     };
@@ -10092,19 +10092,19 @@ test "combined reuse candidate crosses live drag deferral with one owner" {
     const deferred = try controller.applyProjectionFinished(allocator, &finished);
     try std.testing.expect(deferred.result_transferred);
     try std.testing.expect(page.deferred_projection_apply != null);
-    try std.testing.expect(page.review_projection.pending != null);
-    try std.testing.expectEqual(@as(u64, 0), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
+    try std.testing.expect(page.changes_projection.pending != null);
+    try std.testing.expectEqual(@as(u64, 0), page.changes_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
 
     page.selection_owner = .none;
     _ = try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expectEqual(@as(u64, 1), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expectEqual(@as(u64, 1), page.changes_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
 }
 
 test "deferred combined reuse rejection schedules the same bounded eager retry" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -10119,7 +10119,7 @@ test "deferred combined reuse rejection schedules the same bounded eager retry" 
     controller.advanceStatusSnapshotRevision(allocator);
     var initial_update = try controller.prepareProjection(allocator);
     defer initial_update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     var candidate = try testCombinedReuseCandidate(
         allocator,
         1,
@@ -10127,7 +10127,7 @@ test "deferred combined reuse rejection schedules the same bounded eager retry" 
         test_combined_changed_unstaged,
     );
     candidate.fingerprint = pending.expected_presentation.?.fingerprint;
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = try cloneTestProjectionRequest(allocator, pending),
         .result = .{ .reuse_candidate = candidate },
     };
@@ -10145,25 +10145,25 @@ test "deferred combined reuse rejection schedules the same bounded eager retry" 
     page.selection_owner = .none;
     _ = try controller.applyDeferredProjection(allocator);
     try std.testing.expect(page.deferred_projection_apply == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    try std.testing.expect(page.review_projection.eager_retry_basis != null);
-    try std.testing.expectEqual(@as(u64, 0), page.review_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
+    try std.testing.expect(page.changes_projection.pending == null);
+    try std.testing.expect(page.changes_projection.eager_retry_basis != null);
+    try std.testing.expectEqual(@as(u64, 0), page.changes_projection.displayed.ready.value.combined_hunks.authority.status_snapshot_revision);
 
     var retry_update = try controller.prepareProjection(allocator);
     defer retry_update.deinit(allocator);
-    const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const retry_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     try std.testing.expect(retry_pending.expected_presentation == null);
     var retry_command = retry_update.takeCommand() orelse return error.ExpectedProjectionCommand;
     defer retry_command.deinit(allocator);
     switch (retry_command) {
-        .review_projection => |request| try std.testing.expect(request.expected_presentation == null),
+        .changes_projection => |request| try std.testing.expect(request.expected_presentation == null),
         else => return error.ExpectedProjectionCommand,
     }
 }
 
 test "hint-free eager completion consumes retry budget and preserves exact presentation token" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -10175,15 +10175,15 @@ test "hint-free eager completion consumes retry budget and preserves exact prese
     const controller = testController(&page, &status_message, .unstaged);
 
     try installTestCombinedCandidate(controller, allocator, 1, 73, 0);
-    const old_token = page.review_projection.displayed.ready.value.combined_hunks.presentation.content_token;
+    const old_token = page.changes_projection.displayed.ready.value.combined_hunks.presentation.content_token;
     controller.advanceStatusSnapshotRevision(allocator);
-    page.review_projection.scheduleEagerRetry(.{
-        .fingerprint = page.review_projection.displayed.ready.value.combined_hunks.presentation.fingerprint,
+    page.changes_projection.scheduleEagerRetry(.{
+        .fingerprint = page.changes_projection.displayed.ready.value.combined_hunks.presentation.fingerprint,
         .content_token = old_token,
     });
     var retry_update = try controller.prepareProjection(allocator);
     defer retry_update.deinit(allocator);
-    const pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+    const pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
     try std.testing.expect(pending.expected_presentation == null);
 
     var eager_bundle = try testCombinedBundle(
@@ -10193,7 +10193,7 @@ test "hint-free eager completion consumes retry budget and preserves exact prese
         test_combined_after_cached,
         test_combined_after_unstaged,
     );
-    var finished: app_load.ReviewProjectionFinished = .{
+    var finished: app_load.ChangesProjectionFinished = .{
         .request = try cloneTestProjectionRequest(allocator, pending),
         .result = .{ .ready = .{ .combined_hunks = eager_bundle } },
     };
@@ -10204,9 +10204,9 @@ test "hint-free eager completion consumes retry budget and preserves exact prese
     try std.testing.expect(applied.result_transferred);
     finished_owned = false;
 
-    try std.testing.expect(page.review_projection.eager_retry_basis == null);
-    try std.testing.expect(page.review_projection.pending == null);
-    const accepted = &page.review_projection.displayed.ready.value.combined_hunks;
+    try std.testing.expect(page.changes_projection.eager_retry_basis == null);
+    try std.testing.expect(page.changes_projection.pending == null);
+    const accepted = &page.changes_projection.displayed.ready.value.combined_hunks;
     try std.testing.expectEqual(@as(u64, 1), accepted.authority.status_snapshot_revision);
     try std.testing.expect(accepted.presentation.content_token.eql(old_token));
     try std.testing.expect(page.completed_selection != null);
@@ -10216,7 +10216,7 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
     const backing = std.testing.allocator;
     var fail_index: usize = 0;
     while (fail_index < 2) : (fail_index += 1) {
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         };
@@ -10231,14 +10231,14 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
         try installTestCombinedCandidate(controller, backing, 1, 74 + fail_index, 0);
         const viewport_anchor = try captureTestSelectionViewportTop(controller, .summary);
         try expectParsedTestSelectionViewport(viewport_anchor);
-        const retained_before = &page.review_projection.displayed.ready.value.combined_hunks;
+        const retained_before = &page.changes_projection.displayed.ready.value.combined_hunks;
         const presentation_text_ptr = retained_before.presentation.cached_bundle.loaded.text.ptr;
         const authority_text_ptr = retained_before.authority.cached_component.text.ptr;
         controller.advanceStatusSnapshotRevision(backing);
 
         var candidate_update = try controller.prepareProjection(backing);
         defer candidate_update.deinit(backing);
-        const candidate_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        const candidate_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
         var candidate = try testCombinedReuseCandidate(
             backing,
             1,
@@ -10248,7 +10248,7 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
         // Force the fingerprint gate to reach the exact comparison, which
         // rejects this changed presentation and schedules the eager fallback.
         candidate.fingerprint = candidate_pending.expected_presentation.?.fingerprint;
-        var candidate_finished: app_load.ReviewProjectionFinished = .{
+        var candidate_finished: app_load.ChangesProjectionFinished = .{
             .request = try cloneTestProjectionRequest(backing, candidate_pending),
             .result = .{ .reuse_candidate = candidate },
         };
@@ -10256,17 +10256,17 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
         defer candidate_finished.deinit(backing);
         const rejected = try controller.applyProjectionFinished(backing, &candidate_finished);
         try std.testing.expect(!rejected.result_transferred);
-        try std.testing.expect(page.review_projection.pending == null);
-        const retry_basis = page.review_projection.eager_retry_basis orelse return error.ExpectedEagerRetry;
+        try std.testing.expect(page.changes_projection.pending == null);
+        const retry_basis = page.changes_projection.eager_retry_basis orelse return error.ExpectedEagerRetry;
 
         var retry_update = try controller.prepareProjection(backing);
         defer retry_update.deinit(backing);
-        const retry_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        const retry_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
         const failed_request_id = retry_pending.id;
         try std.testing.expect(retry_pending.expected_presentation == null);
         const retry_task = retry_update.command orelse return error.ExpectedProjectionCommand;
         switch (retry_task) {
-            .review_projection => |request| try std.testing.expect(request.expected_presentation == null),
+            .changes_projection => |request| try std.testing.expect(request.expected_presentation == null),
             else => return error.ExpectedProjectionCommand,
         }
 
@@ -10277,7 +10277,7 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
             test_combined_after_cached,
             test_combined_after_unstaged,
         );
-        var eager_finished: app_load.ReviewProjectionFinished = .{
+        var eager_finished: app_load.ChangesProjectionFinished = .{
             .request = try cloneTestProjectionRequest(backing, retry_pending),
             .result = .{ .ready = .{ .combined_hunks = eager_bundle } },
         };
@@ -10290,9 +10290,9 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
             controller.applyProjectionFinished(failing.allocator(), &eager_finished),
         );
 
-        try std.testing.expect(page.review_projection.pending == null);
-        try std.testing.expect(page.review_projection.eager_retry_basis.?.eql(retry_basis));
-        const retained_after = &page.review_projection.displayed.ready.value.combined_hunks;
+        try std.testing.expect(page.changes_projection.pending == null);
+        try std.testing.expect(page.changes_projection.eager_retry_basis.?.eql(retry_basis));
+        const retained_after = &page.changes_projection.displayed.ready.value.combined_hunks;
         try std.testing.expect(retained_after.presentation.cached_bundle.loaded.text.ptr == presentation_text_ptr);
         try std.testing.expect(retained_after.authority.cached_component.text.ptr == authority_text_ptr);
         try std.testing.expectEqual(@as(u64, 0), retained_after.authority.status_snapshot_revision);
@@ -10301,13 +10301,13 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
 
         var replacement_update = try controller.prepareProjection(backing);
         defer replacement_update.deinit(backing);
-        const replacement_pending = page.review_projection.pending orelse return error.ExpectedPendingProjection;
+        const replacement_pending = page.changes_projection.pending orelse return error.ExpectedPendingProjection;
         try std.testing.expect(replacement_pending.id != failed_request_id);
         try std.testing.expect(replacement_pending.expected_presentation == null);
         var replacement_command = replacement_update.takeCommand() orelse return error.ExpectedProjectionCommand;
         defer replacement_command.deinit(backing);
         switch (replacement_command) {
-            .review_projection => |request| try std.testing.expect(request.expected_presentation == null),
+            .changes_projection => |request| try std.testing.expect(request.expected_presentation == null),
             else => return error.ExpectedProjectionCommand,
         }
     }
@@ -10317,7 +10317,7 @@ test "combined candidate closes when replacement request allocation fails" {
     const backing = std.testing.allocator;
     var fail_index: usize = 0;
     while (fail_index < 4) : (fail_index += 1) {
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         };
@@ -10343,7 +10343,7 @@ test "combined candidate closes when replacement request allocation fails" {
 
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         try std.testing.expectError(error.OutOfMemory, controller.prepareProjection(failing.allocator()));
-        try std.testing.expect(page.review_projection.pending == null);
+        try std.testing.expect(page.changes_projection.pending == null);
         try std.testing.expect(page.completed_selection == null);
         try expectTestSelectionViewportRestored(controller, viewport_anchor);
     }
@@ -10351,7 +10351,7 @@ test "combined candidate closes when replacement request allocation fails" {
 
 test "combined candidate spawn rejection closes only the matching replacement" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -10370,26 +10370,26 @@ test "combined candidate spawn rejection closes only the matching replacement" {
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
     const request_id = switch (update.command orelse return error.ExpectedProjectionCommand) {
-        .review_projection => |request| request.id,
+        .changes_projection => |request| request.id,
         else => return error.ExpectedProjectionCommand,
     };
-    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expect(page.changes_projection.pending != null);
     try std.testing.expect(page.completed_selection != null);
 
     controller.rejectProjectionSpawn(allocator, request_id +% 1);
-    try std.testing.expect(page.review_projection.pending != null);
+    try std.testing.expect(page.changes_projection.pending != null);
     try std.testing.expect(page.completed_selection != null);
     try expectTestSelectionViewportRawReuse(controller, viewport_anchor);
 
     controller.rejectProjectionSpawn(allocator, request_id);
-    try std.testing.expect(page.review_projection.pending == null);
+    try std.testing.expect(page.changes_projection.pending == null);
     try std.testing.expect(page.completed_selection == null);
     try expectTestSelectionViewportRestored(controller, viewport_anchor);
 }
 
 test "projection candidate survives exact rebuild and clears on changed content basis" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -10400,13 +10400,13 @@ test "projection candidate survives exact rebuild and clears on changed content 
     var controller = testController(&page, &status_message, .unstaged);
     controller.navigation.layout.height = 6;
 
-    page.review_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
-    const displayed = &page.review_projection.displayed.ready.value.generated_added_file;
+    page.changes_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
+    const displayed = &page.changes_projection.displayed.ready.value.generated_added_file;
     page.completed_selection = try testGeneratedCandidate(controller, allocator, displayed);
     const exact_viewport = try captureTestSelectionViewportTop(controller, .summary);
     try expectGeneratedTestSelectionViewport(exact_viewport);
 
-    page.review_projection.pending = try review_projection.testing.cloneRequest(
+    page.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
         page.activation.currentIdentity().?,
         2,
@@ -10417,8 +10417,8 @@ test "projection candidate survives exact rebuild and clears on changed content 
         0,
         0,
     );
-    var exact: app_load.ReviewProjectionFinished = .{
-        .request = try review_projection.testing.cloneRequest(
+    var exact: app_load.ChangesProjectionFinished = .{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             2,
@@ -10429,7 +10429,7 @@ test "projection candidate survives exact rebuild and clears on changed content 
             0,
             0,
         ),
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n") } },
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "one\ntwo\n") } },
     };
     var exact_owned = true;
     defer if (exact_owned) exact.deinit(allocator);
@@ -10445,7 +10445,7 @@ test "projection candidate survives exact rebuild and clears on changed content 
     const changed_viewport = try captureTestSelectionViewportTop(controller, .controls);
     try expectGeneratedTestSelectionViewport(changed_viewport);
 
-    page.review_projection.pending = try review_projection.testing.cloneRequest(
+    page.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
         page.activation.currentIdentity().?,
         3,
@@ -10456,8 +10456,8 @@ test "projection candidate survives exact rebuild and clears on changed content 
         0,
         0,
     );
-    var changed: app_load.ReviewProjectionFinished = .{
-        .request = try review_projection.testing.cloneRequest(
+    var changed: app_load.ChangesProjectionFinished = .{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             3,
@@ -10468,7 +10468,7 @@ test "projection candidate survives exact rebuild and clears on changed content 
             0,
             0,
         ),
-        .result = .{ .ready = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "changed\n") } },
+        .result = .{ .ready = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "changed\n") } },
     };
     var changed_owned = true;
     defer if (changed_owned) changed.deinit(allocator);
@@ -10484,7 +10484,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     const allocator = std.testing.allocator;
     var status_message = @import("../../state.zig").StatusMessage{};
 
-    var blocked_page: review_page.ReviewPageState = .{};
+    var blocked_page: changes_page.ChangesPageState = .{};
     defer blocked_page.deinit(allocator);
     blocked_page.auto_reload = .init(.inherit, .{}, .unstaged);
     const blocked_cycle = blocked_page.auto_reload.beginCycle().?;
@@ -10496,7 +10496,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     blocked_page.deferred_source_apply = .{
         .cycle_id = blocked_cycle,
         .finished = .{
-            .identity = app_page.RequestIdentity.review(0, 1),
+            .identity = app_page.RequestIdentity.changes(0, 1),
             .generation = 1,
             .background_cycle_id = blocked_cycle,
             .result = .{ .failed_static = "blocked" },
@@ -10510,7 +10510,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     try std.testing.expect(blocked_page.pending_reload == null);
     try std.testing.expect(blocked_page.auto_reload.background_cycle == null);
 
-    var accepted_page: review_page.ReviewPageState = .{};
+    var accepted_page: changes_page.ChangesPageState = .{};
     defer accepted_page.deinit(allocator);
     accepted_page.auto_reload = .init(.inherit, .{}, .unstaged);
     const accepted_cycle = accepted_page.auto_reload.beginCycle().?;
@@ -10522,7 +10522,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     accepted_page.deferred_source_apply = .{
         .cycle_id = accepted_cycle,
         .finished = .{
-            .identity = app_page.RequestIdentity.review(0, 1),
+            .identity = app_page.RequestIdentity.changes(0, 1),
             .generation = 2,
             .background_cycle_id = accepted_cycle,
             .result = .{ .unchanged = content_fingerprint.Fingerprint.init("same") },
@@ -10546,7 +10546,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     accepted_page.deferred_source_apply = .{
         .cycle_id = failure_cycle,
         .finished = .{
-            .identity = app_page.RequestIdentity.review(0, 1),
+            .identity = app_page.RequestIdentity.changes(0, 1),
             .generation = 3,
             .background_cycle_id = failure_cycle,
             .result = .{ .failed = try allocator.dupe(u8, "owned deferred failure") },
@@ -10560,7 +10560,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
 
 test "superseded deferred source retires exact ownership without publication" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -10580,7 +10580,7 @@ test "superseded deferred source retires exact ownership without publication" {
     page.deferred_source_apply = .{
         .cycle_id = cycle_id,
         .finished = .{
-            .identity = app_page.RequestIdentity.review(0, 1),
+            .identity = app_page.RequestIdentity.changes(0, 1),
             .read_epoch = old_epoch,
             .generation = 7,
             .background_cycle_id = cycle_id,

@@ -14,7 +14,7 @@ const syntax_style = @import("../syntax/style.zig");
 const app_load = @import("load.zig");
 const page = @import("page.zig");
 const projection_component = @import("projection_component.zig");
-const review_read_epoch = @import("review_read_epoch.zig");
+const changes_read_epoch = @import("changes_read_epoch.zig");
 
 pub const max_cached_entries = 4;
 pub const max_cached_retained_bytes = 32 * 1024 * 1024;
@@ -57,7 +57,7 @@ pub const ExpectedPresentation = struct {
 pub const Request = struct {
     identity: page.RequestIdentity,
     id: u64,
-    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+    read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
     repo_root: []u8,
     path_key: []u8,
     kind: Kind,
@@ -73,7 +73,7 @@ pub const Request = struct {
         self.* = undefined;
     }
 
-    pub fn matchesBorrowed(self: Request, read_epoch: review_read_epoch.ReviewRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+    pub fn matchesBorrowed(self: Request, read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
         return self.read_epoch.eql(read_epoch) and
             self.kind == kind and
             self.source_kind == source_kind and
@@ -108,7 +108,7 @@ pub const Request = struct {
         );
     }
 
-    pub fn matchesAuthority(self: Request, read_epoch: review_read_epoch.ReviewRepositoryReadEpoch, repo_root: []const u8, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+    pub fn matchesAuthority(self: Request, read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch, repo_root: []const u8, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
         return self.read_epoch.eql(read_epoch) and
             self.source_kind == source_kind and
             self.source_session_revision == source_session_revision and
@@ -553,7 +553,7 @@ pub const GeneratedSyntaxRequest = struct {
     identity: page.RequestIdentity,
     id: u64,
     projection_id: u64,
-    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+    read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
     root_identity: root_capability.Identity,
     repo_root: []u8,
     path_key: []u8,
@@ -686,7 +686,7 @@ const Cache = struct {
 
     fn hasMatching(
         self: *const Cache,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -699,7 +699,7 @@ const Cache = struct {
 
     fn takeMatching(
         self: *Cache,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -717,7 +717,7 @@ const Cache = struct {
 
     fn matchingIndex(
         self: *const Cache,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -881,7 +881,7 @@ pub const State = struct {
 
     pub fn cacheHas(
         self: *const State,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -894,7 +894,7 @@ pub const State = struct {
 
     pub fn takeCached(
         self: *State,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         repo_root: []const u8,
         path_key: []const u8,
         kind: Kind,
@@ -906,12 +906,12 @@ pub const State = struct {
     }
 
     /// Moves the current display to the bounded cache only when it remains
-    /// reusable under the current Review authority. Failed/status displays and
+    /// reusable under the current Changes authority. Failed/status displays and
     /// old-revision values are deinitialized instead.
     pub fn cacheOrClearDisplayed(
         self: *State,
         allocator: std.mem.Allocator,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         repo_root: []const u8,
         source_kind: SourceKind,
         source_session_revision: u64,
@@ -1093,12 +1093,12 @@ pub const State = struct {
         return self.displayed.request() != null;
     }
 
-    pub fn pendingMatches(self: State, read_epoch: review_read_epoch.ReviewRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+    pub fn pendingMatches(self: State, read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
         const request = self.pending orelse return false;
         return request.matchesBorrowed(read_epoch, repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
     }
 
-    pub fn displayedMatches(self: *const State, read_epoch: review_read_epoch.ReviewRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
+    pub fn displayedMatches(self: *const State, read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch, repo_root: []const u8, path_key: []const u8, kind: Kind, source_kind: SourceKind, source_session_revision: u64, status_snapshot_revision: u64) bool {
         const request = self.displayed.request() orelse return false;
         return request.matchesBorrowed(read_epoch, repo_root, path_key, kind, source_kind, source_session_revision, status_snapshot_revision);
     }
@@ -1121,7 +1121,7 @@ fn optionalRootIdentityEql(left: ?root_capability.Identity, right: ?root_capabil
 
 pub const RequestCloneOptions = struct {
     /// Production request preparation must provide the page-owned value.
-    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+    read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
     root_identity: ?root_capability.Identity = null,
     expected_presentation: ?ExpectedPresentation = null,
 };
@@ -1370,7 +1370,7 @@ test "generated decoration distinguishes terminal empty and visible outcomes" {
 test "projection read epoch participates in request semantic identity" {
     var request = try cloneRequestWithOptions(
         std.testing.allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "src/main.zig",
@@ -1382,7 +1382,7 @@ test "projection read epoch participates in request semantic identity" {
     );
     defer request.deinit(std.testing.allocator);
 
-    const current: review_read_epoch.ReviewRepositoryReadEpoch = .{ .value = 31 };
+    const current: changes_read_epoch.ChangesRepositoryReadEpoch = .{ .value = 31 };
     try std.testing.expect(request.matchesBorrowed(current, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
     try std.testing.expect(!request.matchesBorrowed(.{ .value = 32 }, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
     try std.testing.expect(request.matchesDisplayIdentity("/repo", "src/main.zig", .unstaged, 10));
@@ -1401,7 +1401,7 @@ test "request clone owns paths and snapshots scalar presentation hint" {
     };
     var request = try cloneRequestWithOptions(
         allocator,
-        page.RequestIdentity.review(3, 5),
+        page.RequestIdentity.changes(3, 5),
         9,
         "/repo",
         "src/a.zig",
@@ -1485,7 +1485,7 @@ test "generated syntax request and clone retain projection read epoch" {
     const root = root_capability.Identity{ .device = 7, .inode = 11 };
     var projection = try cloneRequestWithOptions(
         allocator,
-        page.RequestIdentity.review(3, 5),
+        page.RequestIdentity.changes(3, 5),
         9,
         "/repo",
         "src/new.zig",
@@ -1528,14 +1528,14 @@ test "projection cache lookup requires matching read epoch" {
 
 test "projection read epoch fences pending display and cache admission" {
     const allocator = std.testing.allocator;
-    const captured: review_read_epoch.ReviewRepositoryReadEpoch = .{ .value = 53 };
-    const successor: review_read_epoch.ReviewRepositoryReadEpoch = .{ .value = 54 };
+    const captured: changes_read_epoch.ChangesRepositoryReadEpoch = .{ .value = 53 };
+    const successor: changes_read_epoch.ChangesRepositoryReadEpoch = .{ .value = 54 };
     var state: State = .{};
     defer state.deinit(allocator);
 
     state.pending = try cloneRequestWithOptions(
         allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "a",
@@ -1654,7 +1654,7 @@ test "projection cache rejects status body and cleans metadata allocation failur
     var cache: Cache = .{};
     defer cache.deinit(allocator);
     var status_projection = ReadyDisplay{
-        .request = try testing.cloneRequest(allocator, page.RequestIdentity.review(0, 1), 1, "/repo", "status", .cached_diff, .unstaged, 10, 20),
+        .request = try testing.cloneRequest(allocator, page.RequestIdentity.changes(0, 1), 1, "/repo", "status", .cached_diff, .unstaged, 10, 20),
         .value = .{ .status_body = try statusBodyAlloc(allocator, "status", "No staged diff.", .{}) },
     };
     cache.admit(allocator, status_projection);
@@ -1670,7 +1670,7 @@ test "projection cache rejects status body and cleans metadata allocation failur
     var state: State = .{};
     defer state.deinit(allocator);
     state.displayed = .{ .failed = .{
-        .request = try testing.cloneRequest(allocator, page.RequestIdentity.review(0, 1), 3, "/repo", "failed", .cached_diff, .unstaged, 10, 20),
+        .request = try testing.cloneRequest(allocator, page.RequestIdentity.changes(0, 1), 3, "/repo", "failed", .cached_diff, .unstaged, 10, 20),
         .body = try statusBodyAlloc(allocator, "failed", "load failed", .{}),
     } };
     state.cacheOrClearDisplayed(allocator, .{}, "/repo", .unstaged, 10, 20);
@@ -1685,7 +1685,7 @@ test "projection cache retained bytes include every cacheable arena" {
     _ = try cached_arena.allocator().alloc(u8, 1024);
     const cached_capacity = cached_arena.queryCapacity();
     var cached = ReadyDisplay{
-        .request = try testing.cloneRequest(allocator, page.RequestIdentity.review(0, 1), 1, "/repo", "cached", .cached_diff, .unstaged, 1, 2),
+        .request = try testing.cloneRequest(allocator, page.RequestIdentity.changes(0, 1), 1, "/repo", "cached", .cached_diff, .unstaged, 1, 2),
         .value = .{ .cached_diff = .{ .arena = cached_arena, .loaded = undefined } },
     };
     cached_arena = undefined;
@@ -1713,7 +1713,7 @@ test "projection cache retained bytes include every cacheable arena" {
         authority_unstaged_arena.queryCapacity(),
     });
     var combined = ReadyDisplay{
-        .request = try testing.cloneRequest(allocator, page.RequestIdentity.review(0, 1), 2, "/repo", "combined", .combined_hunks, .unstaged, 1, 2),
+        .request = try testing.cloneRequest(allocator, page.RequestIdentity.changes(0, 1), 2, "/repo", "combined", .combined_hunks, .unstaged, 1, 2),
         .value = .{ .combined_hunks = .{
             .presentation = .{
                 .arena = presentation_arena,
@@ -1751,7 +1751,7 @@ fn testGeneratedProjection(
 ) !ReadyDisplay {
     var request = try testing.cloneRequest(
         allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         id,
         "/repo",
         path,

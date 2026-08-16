@@ -15,10 +15,10 @@ const load = @import("load.zig");
 const page = @import("page.zig");
 const prompt = @import("prompt.zig");
 const repo_picker = @import("repo_picker.zig");
-const review_repository_session = @import("pages/review/repository_session.zig");
-const review_navigation = if (builtin.is_test) @import("pages/review/navigation.zig") else struct {};
-const review_page = if (builtin.is_test) @import("pages/review.zig") else struct {};
-const review_reload = if (builtin.is_test) @import("pages/review/reload.zig") else struct {};
+const changes_repository_session = @import("pages/changes/repository_session.zig");
+const changes_navigation = if (builtin.is_test) @import("pages/changes/navigation.zig") else struct {};
+const changes_page = if (builtin.is_test) @import("pages/changes.zig") else struct {};
+const changes_reload = if (builtin.is_test) @import("pages/changes/reload.zig") else struct {};
 const compare_page = @import("pages/compare.zig");
 const repository_page = @import("pages/repository.zig");
 const discovery = @import("../repo/discovery.zig");
@@ -213,7 +213,7 @@ pub const Controller = struct {
     home: ?[]const u8,
     env_map: ?*const std.process.Environ.Map = null,
     action_pending: bool,
-    review: review_repository_session.Controller,
+    changes: changes_repository_session.Controller,
     repository: RepositoryInvalidationPort,
     compare: CompareInvalidationPort,
     shell: remote_state.RepositoryInvalidationPort,
@@ -294,15 +294,15 @@ pub const Controller = struct {
     ) CommitOutcome {
         const changed = prepared.changed;
         const origin = prepared.origin;
-        if (changed) self.review.supersedeReads(allocator);
+        if (changed) self.changes.supersedeReads(allocator);
         if (!changed and origin == .external_selection) {
-            self.review.supersedeRepositoryDiscovery();
+            self.changes.supersedeRepositoryDiscovery();
             self.finishUnchangedExplicitSelection(allocator);
         }
         if (changed) {
             const next_epoch = nextEpoch(self.state.repo_epoch);
             self.shell.invalidateBeforeRepositoryReplacement(allocator);
-            self.review.invalidateBeforeReplacement(allocator);
+            self.changes.invalidateBeforeReplacement(allocator);
             self.compare.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(
                 allocator,
@@ -322,10 +322,10 @@ pub const Controller = struct {
             prepared.candidate = null;
             self.state.repo_state.replaceDiscoveryKeepingRoot(allocator, result, prepared.active_index);
         }
-        if (changed) self.review.commitIdentity(
+        if (changed) self.changes.commitIdentity(
             self.source,
             self.state.repo_epoch,
-            self.active_page == .review,
+            self.active_page == .changes,
             self.view().activeRoot() != null,
         );
         return if (changed) .changed else .unchanged;
@@ -376,25 +376,25 @@ pub const Controller = struct {
         prepared: *PreparedWorkspace,
     ) CommitOutcome {
         const changed = prepared.changed;
-        if (changed) self.review.supersedeReads(allocator);
+        if (changed) self.changes.supersedeReads(allocator);
         if (!changed) {
-            self.review.supersedeRepositoryDiscovery();
+            self.changes.supersedeRepositoryDiscovery();
             self.finishUnchangedExplicitSelection(allocator);
         }
         if (changed) {
             const next_epoch = nextEpoch(self.state.repo_epoch);
             self.shell.invalidateBeforeRepositoryReplacement(allocator);
-            self.review.invalidateBeforeReplacement(allocator);
+            self.changes.invalidateBeforeReplacement(allocator);
             self.compare.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(allocator, next_epoch, prepared.candidate.?.identity);
             self.state.repo_epoch = next_epoch;
             const committed = prepared.candidate.?;
             prepared.candidate = null;
             self.state.repo_state.selectWorkspaceRoot(prepared.active_index, committed);
-            self.review.commitIdentity(
+            self.changes.commitIdentity(
                 self.source,
                 self.state.repo_epoch,
-                self.active_page == .review,
+                self.active_page == .changes,
                 self.view().activeRoot() != null,
             );
         } else {
@@ -411,7 +411,7 @@ pub const Controller = struct {
             return;
         }
         self.shell.clearBranchSwitch(allocator);
-        if (self.active_page == .review) self.review.clearDiffSelection();
+        if (self.active_page == .changes) self.changes.clearDiffSelection();
         try self.refreshPickerFilterWith(allocator, null, &self.state.recent_repos, "");
         self.state.repo_picker.mode = true;
         self.state.repo_picker.input_mode = .list;
@@ -869,7 +869,7 @@ pub const Controller = struct {
     }
 
     fn finishUnchangedExplicitSelection(self: Controller, allocator: std.mem.Allocator) void {
-        self.review.finishUnchangedExplicitSelection(allocator);
+        self.changes.finishUnchangedExplicitSelection(allocator);
         self.shell.clearBranchSwitch(allocator);
     }
 
@@ -918,7 +918,7 @@ fn expandUserPath(allocator: std.mem.Allocator, path: []const u8, home: ?[]const
 }
 
 const RepoSessionTestPages = struct {
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
 };
@@ -930,7 +930,7 @@ const RepoSessionTestApp = struct {
     env_map: ?*const std.process.Environ.Map = null,
     repo_session: State = .{},
     status: app_state.StatusMessage = .{},
-    active_page: page.Id = .review,
+    active_page: page.Id = .changes,
     source: diff_source.SourceMode = .unstaged,
     pages: RepoSessionTestPages = .{},
     remote: remote_state.State = .{},
@@ -940,8 +940,8 @@ const RepoSessionTestApp = struct {
         return self.repo_session.view();
     }
 
-    fn activateReview(self: *RepoSessionTestApp) u64 {
-        return self.pages.review.activation.activate(
+    fn activateChanges(self: *RepoSessionTestApp) u64 {
+        return self.pages.changes.activation.activate(
             self.repoSessionView().epoch(),
             .pending,
             .pending,
@@ -949,24 +949,24 @@ const RepoSessionTestApp = struct {
         );
     }
 
-    fn reviewNavigation(self: *RepoSessionTestApp) review_navigation.Controller {
+    fn changesNavigation(self: *RepoSessionTestApp) changes_navigation.Controller {
         const view = self.repoSessionView();
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = view.activeRoot(),
             .repo_epoch = view.epoch(),
             .root_identity = view.activeIdentity(),
             .source = self.source,
             .layout = .{ .width = 80, .height = 20 },
-            .diagnostics = .{ .target = &self.pages.review.status },
+            .diagnostics = .{ .target = &self.pages.changes.status },
         };
     }
 
-    fn reviewReload(self: *RepoSessionTestApp) review_reload.Controller {
+    fn changesReload(self: *RepoSessionTestApp) changes_reload.Controller {
         const view = self.repoSessionView();
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigation(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigation(),
             .source = self.source,
             .repo_root = view.activeRoot(),
             .repo_epoch = view.epoch(),
@@ -983,10 +983,10 @@ const RepoSessionTestApp = struct {
             .home = null,
             .env_map = self.env_map,
             .action_pending = false,
-            .review = .{
-                .page = &self.pages.review,
-                .navigation = self.reviewNavigation(),
-                .reload = self.reviewReload(),
+            .changes = .{
+                .page = &self.pages.changes,
+                .navigation = self.changesNavigation(),
+                .reload = self.changesReload(),
             },
             .repository = .{ .page = &self.pages.repository },
             .compare = .{ .page = &self.pages.compare },
@@ -1030,19 +1030,19 @@ const RepoSessionTestRepoPair = struct {
 fn installRepoSessionTestActionCursor(
     app: *RepoSessionTestApp,
     allocator: std.mem.Allocator,
-    kind: review_page.action_cursor.TargetKind,
+    kind: changes_page.action_cursor.TargetKind,
     path_key: []const u8,
     action_generation: u64,
 ) !void {
     const identity = app.repoSessionView().activeIdentity() orelse return error.ExpectedRepositoryIdentity;
-    var prepared = try app.reviewNavigation().prepareActionCursor(
+    var prepared = try app.changesNavigation().prepareActionCursor(
         allocator,
         app.repoSessionView().epoch(),
         identity,
         kind,
         path_key,
     );
-    app.reviewNavigation().installActionCursor(allocator, &prepared, action_generation);
+    app.changesNavigation().installActionCursor(allocator, &prepared, action_generation);
 }
 
 test "workspace repository commitments advance one authoritative epoch" {
@@ -1070,11 +1070,11 @@ test "workspace repository commitments advance one authoritative epoch" {
     };
     app.repo_session.repo_state.root = try root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.deinit(allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.remote.deinit(allocator);
-    _ = app.activateReview();
+    _ = app.activateChanges();
 
-    app.pages.review.pending_reload = .{ .generation = 17, .kind = .manual };
+    app.pages.changes.pending_reload = .{ .generation = 17, .kind = .manual };
     try installRepoSessionTestActionCursor(&app, allocator, .file, "src/app.zig", 18);
     app.remote.branch_switch = .{
         .repo_root = try allocator.dupe(u8, roots.a),
@@ -1085,16 +1085,16 @@ test "workspace repository commitments advance one authoritative epoch" {
     app.overlay.openSwitchBranch();
     try std.testing.expectEqual(CommitOutcome.unchanged, app.repoSession().commitWorkspaceIndex(allocator, 0));
     try std.testing.expectEqual(@as(u64, 0), app.repoSessionView().epoch());
-    try std.testing.expect(app.pages.review.pending_reload == null);
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(app.pages.changes.pending_reload == null);
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
     try std.testing.expect(!app.remote.branch_switch.hasState());
     try std.testing.expect(app.remote.branch_switch_load_pending == null);
     try std.testing.expect(!app.overlay.isSwitchBranch());
 
     app.remote.push_error_message = try allocator.dupe(u8, "old repository push failure");
     app.overlay.openPushError();
-    const deferred_identity = app.pages.review.activation.currentIdentity().?;
-    app.pages.review.deferred_source_apply = .{
+    const deferred_identity = app.pages.changes.activation.currentIdentity().?;
+    app.pages.changes.deferred_source_apply = .{
         .finished = .{
             .identity = deferred_identity,
             .generation = 51,
@@ -1102,7 +1102,7 @@ test "workspace repository commitments advance one authoritative epoch" {
         },
         .cycle_id = 0,
     };
-    app.pages.review.deferred_projection_apply = .{ .finished = .{
+    app.pages.changes.deferred_projection_apply = .{ .finished = .{
         .request = .{
             .identity = deferred_identity,
             .id = 52,
@@ -1121,22 +1121,22 @@ test "workspace repository commitments advance one authoritative epoch" {
     try std.testing.expectEqualStrings(roots.b, app.repoSessionView().activeRoot().?);
     try std.testing.expect(app.remote.push_error_message == null);
     try std.testing.expect(!app.overlay.isPushError());
-    try std.testing.expect(app.pages.review.deferred_source_apply == null);
-    try std.testing.expect(app.pages.review.deferred_projection_apply == null);
+    try std.testing.expect(app.pages.changes.deferred_source_apply == null);
+    try std.testing.expect(app.pages.changes.deferred_projection_apply == null);
 
-    app.pages.review.load.generation = 23;
-    app.pages.review.load.pending = .{ .diff_load = 23 };
-    app.pages.review.load.state = .loading;
-    app.pages.review.pending_reload = .{ .generation = 23, .kind = .manual };
+    app.pages.changes.load.generation = 23;
+    app.pages.changes.load.pending = .{ .diff_load = 23 };
+    app.pages.changes.load.state = .loading;
+    app.pages.changes.pending_reload = .{ .generation = 23, .kind = .manual };
     try std.testing.expectEqual(CommitOutcome.unchanged, app.repoSession().commitWorkspaceIndex(allocator, 1));
-    try std.testing.expect(app.pages.review.load.pending.? == .diff_load);
-    try std.testing.expectEqual(@as(u64, 23), app.pages.review.load.pending.?.generation());
-    try std.testing.expectEqual(@as(u64, 23), app.pages.review.pending_reload.?.generation);
+    try std.testing.expect(app.pages.changes.load.pending.? == .diff_load);
+    try std.testing.expectEqual(@as(u64, 23), app.pages.changes.load.pending.?.generation());
+    try std.testing.expectEqual(@as(u64, 23), app.pages.changes.pending_reload.?.generation);
 
     try std.testing.expectEqual(CommitOutcome.changed, app.repoSession().commitWorkspaceIndex(allocator, 0));
     try std.testing.expectEqual(@as(u64, 2), app.repoSessionView().epoch());
     try std.testing.expectEqualStrings(roots.a, app.repoSessionView().activeRoot().?);
-    try std.testing.expectEqual(@as(u64, 2), app.pages.review.activation.state.active.repo_epoch);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.changes.activation.state.active.repo_epoch);
 }
 
 test "same repository path with a new filesystem object advances epoch" {
@@ -1653,7 +1653,7 @@ test "repo picker path cancel rejects stale discovery result" {
     try std.testing.expectEqualStrings("/current/repo", app.repo_session.repo_state.activeRoot().?);
 }
 
-test "repository switch clears the Review action cursor owner" {
+test "repository switch clears the Changes action cursor owner" {
     const allocator = std.testing.allocator;
     var roots = try RepoSessionTestRepoPair.init();
     defer roots.deinit();
@@ -1683,7 +1683,7 @@ test "repository switch clears the Review action cursor owner" {
     };
     app.repo_session.repo_state.root = try root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.deinit(allocator);
-    defer app.reviewNavigation().clearActionCursor(allocator);
+    defer app.changesNavigation().clearActionCursor(allocator);
 
     try installRepoSessionTestActionCursor(&app, allocator, .file, "src/main.zig", 9);
     try std.testing.expectEqual(
@@ -1691,7 +1691,7 @@ test "repository switch clears the Review action cursor owner" {
         app.repoSession().commitWorkspaceIndex(allocator, 1),
     );
 
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 }
 
 test "expandUserPath expands current user's home shorthand" {

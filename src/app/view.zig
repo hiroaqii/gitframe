@@ -10,7 +10,7 @@ const action_lifecycle = @import("workflow/action_lifecycle.zig");
 const app_state = @import("state.zig");
 const shell_layout = @import("shell_layout.zig");
 const view_primitives = @import("view_primitives.zig");
-const review_view = @import("pages/review/view.zig");
+const changes_view = @import("pages/changes/view.zig");
 const compare_view = @import("pages/compare/view.zig");
 const repository_view = @import("pages/repository/view.zig");
 const app_prompt = @import("prompt.zig");
@@ -20,7 +20,7 @@ const draw = @import("draw");
 const keymap = @import("keymap");
 const repo_state = @import("../repo/state.zig");
 const theme = @import("theme");
-const review_page = if (builtin.is_test) @import("pages/review.zig") else struct {};
+const changes_page = if (builtin.is_test) @import("pages/changes.zig") else struct {};
 const compare_page = if (builtin.is_test) @import("pages/compare.zig") else struct {};
 const repository_page = if (builtin.is_test) @import("pages/repository.zig") else struct {};
 const repository_source = if (builtin.is_test) @import("../repository/source.zig") else struct {};
@@ -66,7 +66,7 @@ const StateMessage = struct {
 };
 
 pub const Context = struct {
-    review: review_view.Context,
+    changes: changes_view.Context,
     compare: compare_view.Context,
     repository: repository_view.ViewContext,
     active_page: page.Id,
@@ -185,7 +185,7 @@ fn shellFrameOptions(palette: theme.Palette) ui.Panel.ViewOptions {
 
 fn viewBody(app: Context, surface: *chasen.Surface) !void {
     return switch (app.active_page) {
-        .review => review_view.view(app.review, surface),
+        .changes => changes_view.view(app.changes, surface),
         .repository => repository_view.view(app.repository, surface),
         .compare => compare_view.view(app.compare, surface),
         .config => viewPlaceholderPage(app.active_page, app.has_active_repo, app.theme, surface),
@@ -194,7 +194,7 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
 
 fn activePageHeaderPresentation(app: Context) ?page_header.Presentation {
     return switch (app.active_page) {
-        .review => review_view.pageHeaderPresentation(app.review),
+        .changes => changes_view.pageHeaderPresentation(app.changes),
         .repository => repository_view.pageHeaderPresentation(app.repository),
         .compare => compare_view.pageHeaderPresentation(app.compare),
         .config => null,
@@ -414,19 +414,19 @@ fn projectFooter(
         .style = app.theme.style(.muted),
         .drop_priority = .terminal,
     });
-    if (app.active_page == .review) {
-        const review_footer = app.review.footer();
-        if (review_footer.source_label) |label| footer_segments.append(.{
+    if (app.active_page == .changes) {
+        const changes_footer = app.changes.footer();
+        if (changes_footer.source_label) |label| footer_segments.append(.{
             .text = label,
             .style = app.theme.style(.prompt),
             .drop_priority = .source,
         });
-        if (review_footer.auto_reload_enabled) footer_segments.append(.{
+        if (changes_footer.auto_reload_enabled) footer_segments.append(.{
             .text = "auto",
             .style = app.theme.style(.staged),
             .drop_priority = .auto,
         });
-        if (review_footer.activation) |activation| footer_segments.append(.{
+        if (changes_footer.activation) |activation| footer_segments.append(.{
             .text = switch (activation) {
                 .validating => "validating",
                 .stale => "stale",
@@ -1520,8 +1520,8 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
     if (!shellNormalActionHintsEnabled(app)) return result;
 
     switch (app.active_page) {
-        .review => {
-            const footer = app.review.footer();
+        .changes => {
+            const footer = app.changes.footer();
             if (!footer.normal_action_hints_enabled) return result;
             if (footer.sidebar_hidden) {
                 appendFooterAction(app, &result, key_buffers, .toggle_sidebar, "sidebar", .focus);
@@ -1743,12 +1743,12 @@ pub fn helpRenderedRows(size: chasen.Size, help_page: page.Id) usize {
 }
 
 fn helpUsesTwoColumns(size: chasen.Size, help_page: page.Id) bool {
-    return help_page == .review and size.width >= help_two_column_min_width;
+    return help_page == .changes and size.width >= help_two_column_min_width;
 }
 
 fn helpSectionsForPage(help_page: page.Id) []const HelpSection {
     return switch (help_page) {
-        .review => &help_all_sections,
+        .changes => &help_all_sections,
         .repository => &help_repository_sections,
         .compare => &help_compare_sections,
         .config => &help_placeholder_sections,
@@ -1820,7 +1820,7 @@ fn drawHelpLine(
 fn drawHelpItem(app: Context, surface: *chasen.Surface, row: u16, item: HelpItem) !void {
     if (surface.size().width == 0) return;
     const desired_key_width: u16 = switch (app.active_page) {
-        .review, .repository, .compare => 18,
+        .changes, .repository, .compare => 18,
         .config => 12,
     };
     const key_width: u16 = @min(desired_key_width, surface.size().width);
@@ -1948,7 +1948,7 @@ test "remote cancel spinner replaces the action label with canceling guidance" {
     action_lifecycle.testing.clear(&app.action_runtime);
     app.terminal_size = .{ .width = 120, .height = 36 };
     app.status.clear();
-    app.review.status.set(
+    app.changes.status.set(
         "pull failed: remote operation canceled; outcome is unknown; repository reload required; warning: credential.helper may store credentials in plaintext",
         .{},
     );
@@ -1982,7 +1982,7 @@ test "footer falls back to pending kind when status is empty" {
 
 test "footer labels enabled automatic reload as auto" {
     var app: ShellViewTestHarness = .{};
-    app.review.auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s };
+    app.changes.auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s };
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 1);
@@ -1995,10 +1995,10 @@ test "footer labels enabled automatic reload as auto" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "auto") != null);
 }
 
-test "review file search keeps footer status but suppresses unreachable action hints" {
+test "changes file search keeps footer status but suppresses unreachable action hints" {
     var app: ShellViewTestHarness = .{};
-    app.review.file_search.mode = true;
-    try app.review.file_search.input.insertSlice("src/main.zig");
+    app.changes.file_search.mode = true;
+    try app.changes.file_search.input.insertSlice("src/main.zig");
     app.status.set("search active", .{});
 
     var ts: chasen.testing.TestSurface = undefined;
@@ -2021,7 +2021,7 @@ test "review file search keeps footer status but suppresses unreachable action h
 }
 
 const ShellViewTestHarness = struct {
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
     compare: compare_page.ComparePageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     keymap: keymap.Effective = .{},
@@ -2041,15 +2041,15 @@ const ShellViewTestHarness = struct {
     review_mode: bool = false,
 
     fn context(self: *const ShellViewTestHarness) Context {
-        const navigation: @import("pages/review/navigation.zig").View = .{
-            .page = &self.review,
+        const navigation: @import("pages/changes/navigation.zig").View = .{
+            .page = &self.changes,
             .repo_root = null,
             .source = .unstaged,
             .layout = .{ .width = self.terminal_size.width, .height = self.terminal_size.height },
         };
-        const review = review_view.Context.init(&self.review, navigation, self.theme, self.keymap, "working tree", .unstaged, null, .{});
+        const changes = changes_view.Context.init(&self.changes, navigation, self.theme, self.keymap, "working tree", .unstaged, null, .{});
         return .{
-            .review = review,
+            .changes = changes,
             .compare = .{
                 .page = &self.compare,
                 .palette = self.theme,
@@ -2065,7 +2065,7 @@ const ShellViewTestHarness = struct {
                 .keymap = self.keymap,
                 .repo_root = self.repo_state.activeRoot(),
             },
-            .active_page = .review,
+            .active_page = .changes,
             .page_bar_visible = false,
             .review_mode = self.review_mode,
             .theme = self.theme,
@@ -2074,7 +2074,7 @@ const ShellViewTestHarness = struct {
             .action = self.action_runtime.view(),
             .remote_cancelable = self.remote_cancelable,
             .status = &self.status,
-            .page_status = &self.review.status,
+            .page_status = &self.changes.status,
             .commit_panel = &self.commit_panel,
             .repo_picker = &self.repo_picker,
             .repo_picker_pending_workspace_root = null,
@@ -2190,12 +2190,12 @@ test "footer normal-mode hints follow state and local key ownership" {
     var harness: ShellViewTestHarness = .{};
     var key_buffers: [footer_hint_capacity][16]u8 = undefined;
 
-    harness.review.viewer.sidebar_hidden = true;
+    harness.changes.viewer.sidebar_hidden = true;
     var hints = footerHints(harness.context(), &key_buffers);
     try std.testing.expectEqualStrings("B", hints.items[0].keys);
     try std.testing.expectEqualStrings("sidebar", hints.items[0].action);
 
-    harness.review.viewer.sidebar_hidden = false;
+    harness.changes.viewer.sidebar_hidden = false;
     harness.review_mode = true;
     hints = footerHints(harness.context(), &key_buffers);
     try expectFooterHintItems(&hints, &.{
@@ -2241,9 +2241,9 @@ test "footer normal-mode hints follow state and local key ownership" {
     try std.testing.expectEqualStrings("tree", hints.items[0].action);
 
     harness.repository.viewer.tree_hidden = false;
-    harness.review.search.mode = true;
+    harness.changes.search.mode = true;
     try std.testing.expectEqual(@as(usize, 0), footerHints(harness.context(), &key_buffers).len);
-    harness.review.search.mode = false;
+    harness.changes.search.mode = false;
     harness.repo_picker.mode = true;
     try std.testing.expectEqual(@as(usize, 0), footerHints(harness.context(), &key_buffers).len);
 }
@@ -2291,11 +2291,11 @@ test "narrow footer keeps repository switch and primary page action" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "q: quit") == null);
 }
 
-test "shell notification temporarily wins over Review diagnostic" {
+test "shell notification temporarily wins over Changes diagnostic" {
     var harness: ShellViewTestHarness = .{};
-    harness.review.status.set("review diagnostic", .{});
+    harness.changes.status.set("changes diagnostic", .{});
     var context = harness.context();
-    try std.testing.expectEqualStrings("review diagnostic", visibleStatus(context));
+    try std.testing.expectEqualStrings("changes diagnostic", visibleStatus(context));
 
     harness.status.set("shell notification", .{});
     context = harness.context();
@@ -2303,7 +2303,7 @@ test "shell notification temporarily wins over Review diagnostic" {
 
     harness.status.clear();
     context = harness.context();
-    try std.testing.expectEqualStrings("review diagnostic", visibleStatus(context));
+    try std.testing.expectEqualStrings("changes diagnostic", visibleStatus(context));
 }
 
 test "page bar dispatch shows repository requirement for unavailable placeholders" {
@@ -2320,7 +2320,7 @@ test "page bar dispatch shows repository requirement for unavailable placeholder
     try viewContent(context, &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Changes ") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository required") != null);
 }
 
@@ -2345,7 +2345,7 @@ test "page bar renders labels above a full muted rule" {
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Changes ") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Repository ") != null);
     try expectFullPageBarRule(&ts.surface, palette);
 }
@@ -2357,11 +2357,11 @@ test "normal narrow page bar keeps its full rule after clipping later tabs" {
     try ts.init(width, shell_layout.page_bar_rows);
     defer ts.deinit();
 
-    viewPageBar(.review, false, null, palette, &ts.surface);
+    viewPageBar(.changes, false, null, palette, &ts.surface);
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Changes ") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Repository ") == null);
     try expectFullPageBarRule(&ts.surface, palette);
 }
@@ -2375,7 +2375,7 @@ test "compact page bar keeps only the active label and draws a rule when availab
     const snapshot = try two_rows.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Compare ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Changes ") == null);
     try two_rows.expectCellText(0, shell_layout.page_bar_rule_row, "─");
 
     var one_row: chasen.testing.TestSurface = undefined;
@@ -2395,7 +2395,7 @@ test "page bar renders repository context after tabs and omits it in compact mod
     var wide: chasen.testing.TestSurface = undefined;
     try wide.init(96, shell_layout.page_bar_rows);
     defer wide.deinit();
-    viewPageBar(.review, false, presentation, .default(), &wide.surface);
+    viewPageBar(.changes, false, presentation, .default(), &wide.surface);
 
     const snapshot = try wide.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -2406,7 +2406,7 @@ test "page bar renders repository context after tabs and omits it in compact mod
     var compact: chasen.testing.TestSurface = undefined;
     try compact.init(96, shell_layout.page_bar_rows);
     defer compact.deinit();
-    viewPageBar(.review, true, presentation, .default(), &compact.surface);
+    viewPageBar(.changes, true, presentation, .default(), &compact.surface);
     const compact_snapshot = try compact.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(compact_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "HEAD ") == null);
@@ -2471,7 +2471,7 @@ test "help popup uses one column on narrow content" {
     const content = helpContentSize(size);
 
     try std.testing.expect(content.width < help_two_column_min_width);
-    try std.testing.expectEqual(rowsForSections(helpSectionsForPage(.review)), helpRenderedRows(content, .review));
+    try std.testing.expectEqual(rowsForSections(helpSectionsForPage(.changes)), helpRenderedRows(content, .changes));
 }
 
 test "help content size uses Modal overlay sizing" {
@@ -2487,23 +2487,23 @@ test "help popup uses two columns on wide content" {
     const content = helpContentSize(size);
 
     try std.testing.expect(content.width >= help_two_column_min_width);
-    try std.testing.expectEqual(@max(rowsForSections(&help_left_sections), rowsForSections(&help_right_sections)), helpRenderedRows(content, .review));
+    try std.testing.expectEqual(@max(rowsForSections(&help_left_sections), rowsForSections(&help_right_sections)), helpRenderedRows(content, .changes));
 }
 
 test "help popup reserves indicator row only when content overflows" {
     const roomy = chasen.Size{ .width = 140, .height = 48 };
     const cramped = chasen.Size{ .width = 140, .height = 10 };
 
-    try std.testing.expectEqual(@as(usize, 0), helpMaxScroll(roomy, .review));
-    try std.testing.expect(helpMaxScroll(cramped, .review) > 0);
-    try std.testing.expect(helpVisibleRows(cramped, .review) < helpContentSize(cramped).height - help_header_rows);
+    try std.testing.expectEqual(@as(usize, 0), helpMaxScroll(roomy, .changes));
+    try std.testing.expect(helpMaxScroll(cramped, .changes) > 0);
+    try std.testing.expect(helpVisibleRows(cramped, .changes) < helpContentSize(cramped).height - help_header_rows);
 }
 
 test "help popup max scroll helper separates outer and content sizes" {
     const outer = chasen.Size{ .width = 140, .height = 10 };
     const content = helpContentSize(outer);
 
-    try std.testing.expectEqual(helpMaxScrollForContentSize(content, .review), helpMaxScroll(outer, .review));
+    try std.testing.expectEqual(helpMaxScrollForContentSize(content, .changes), helpMaxScroll(outer, .changes));
 }
 
 test "help popup uses effective document navigation labels and reaches its tail at 80x12" {
@@ -2548,10 +2548,10 @@ test "help popup uses effective document navigation labels and reaches its tail 
     try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "Mouse") != null);
     try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "wheel") != null);
 
-    for ([_]page.Id{ .review, .compare }) |help_page| {
+    for ([_]page.Id{ .changes, .compare }) |help_page| {
         harness.overlay.openHelpForPage(help_page);
         const sections = helpSectionsForPage(help_page);
-        const shared_section_index: usize = if (help_page == .review) 2 else 1;
+        const shared_section_index: usize = if (help_page == .changes) 2 else 1;
         harness.overlay.help_scroll = rowsForSections(sections[0..shared_section_index]) + 1;
         context = harness.context();
         context.active_page = help_page;
@@ -2579,7 +2579,7 @@ test "help popup uses effective document navigation labels and reaches its tail 
         try viewHelpPopup(context, &page_tail.surface);
         const page_tail_snapshot = try page_tail.snapshot(std.testing.allocator);
         defer std.testing.allocator.free(page_tail_snapshot);
-        if (help_page == .review) {
+        if (help_page == .changes) {
             try std.testing.expect(std.mem.indexOf(u8, page_tail_snapshot, "Mouse") != null);
         } else {
             try std.testing.expect(std.mem.indexOf(u8, page_tail_snapshot, "previous search match") != null);
@@ -2771,7 +2771,7 @@ const HelpSection = struct {
 };
 
 const help_global_items = [_]HelpItem{
-    .{ .key = .{ .action = .page_review }, .description = "Review page" },
+    .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
     .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
@@ -2793,7 +2793,7 @@ const help_global_items = [_]HelpItem{
 };
 
 const help_placeholder_items = [_]HelpItem{
-    .{ .key = .{ .action = .page_review }, .description = "Review page" },
+    .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
     .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
@@ -2823,7 +2823,7 @@ const help_compare_sections = [_]HelpSection{
 };
 
 const help_repository_global_items = [_]HelpItem{
-    .{ .key = .{ .action = .page_review }, .description = "Review page" },
+    .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
     .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
@@ -2896,7 +2896,7 @@ const help_diff_navigation_items = [_]HelpItem{
     .{ .key = .{ .text = "N" }, .description = "previous search match when query is active" },
 };
 
-const help_review_diff_items = [_]HelpItem{
+const help_changes_diff_items = [_]HelpItem{
     .{ .key = .{ .text = "Space" }, .description = "stage / unstage hunk" },
 };
 
@@ -2912,7 +2912,7 @@ const help_left_sections = [_]HelpSection{
 
 const help_right_sections = [_]HelpSection{
     .{ .title = "Diff", .items = &help_diff_navigation_items },
-    .{ .title = "Review diff", .items = &help_review_diff_items },
+    .{ .title = "Changes diff", .items = &help_changes_diff_items },
     .{ .title = "Mouse", .items = &help_mouse_items },
 };
 
@@ -2920,6 +2920,6 @@ const help_all_sections = [_]HelpSection{
     .{ .title = "Global", .items = &help_global_items },
     .{ .title = "Sidebar", .items = &help_sidebar_items },
     .{ .title = "Diff", .items = &help_diff_navigation_items },
-    .{ .title = "Review diff", .items = &help_review_diff_items },
+    .{ .title = "Changes diff", .items = &help_changes_diff_items },
     .{ .title = "Mouse", .items = &help_mouse_items },
 };

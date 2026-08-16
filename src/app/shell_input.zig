@@ -23,8 +23,8 @@ const page = @import("page.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_input = @import("pages/repository/input.zig");
 const repository_layout = @import("pages/repository/layout.zig");
-const review_layout = @import("pages/review/layout.zig");
-const review_message = @import("pages/review/message.zig");
+const changes_layout = @import("pages/changes/layout.zig");
+const changes_message = @import("pages/changes/message.zig");
 
 const MousePane = enum {
     sidebar,
@@ -32,21 +32,21 @@ const MousePane = enum {
 };
 
 const ActiveDiffSelectionOwner = union(enum) {
-    review: *const diff_selection.Owner,
+    changes: *const diff_selection.Owner,
     compare: *const diff_selection.Owner,
 
     fn active(self: ActiveDiffSelectionOwner) bool {
         return switch (self) {
-            inline .review, .compare => |owner| owner.activeMouseSelection(),
+            inline .changes, .compare => |owner| owner.activeMouseSelection(),
         };
     }
 };
 
 const MousePoint = diff_surface.MousePoint;
-const sidebar_header_rows: u16 = review_layout.sidebar_header_rows;
+const sidebar_header_rows: u16 = changes_layout.sidebar_header_rows;
 
-pub const ReviewContext = struct {
-    key: app_input.ReviewContext,
+pub const ChangesContext = struct {
+    key: app_input.ChangesContext,
     selection_owner: *const diff_selection.Owner,
     loaded: ?*const loaded_diff.LoadedDiff,
     selected_node: usize,
@@ -70,7 +70,7 @@ pub const RepositoryContext = struct {
 
 pub const View = struct {
     active_page: page.Id,
-    review: ReviewContext,
+    changes: ChangesContext,
     compare: CompareContext,
     repository: RepositoryContext,
     commit_panel_mode: bool,
@@ -93,7 +93,7 @@ pub const View = struct {
     fn keyContext(self: View) app_input.KeyContext {
         return .{
             .active_page = self.active_page,
-            .review = self.review.key,
+            .changes = self.changes.key,
             .compare = self.compare.key,
             .repository = self.repository.key,
             .commit_panel_mode = self.commit_panel_mode,
@@ -114,14 +114,14 @@ pub const View = struct {
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
         if (self.activeDiffSelectionOwner()) |selection| {
             if (selection.active()) switch (selection) {
-                .review => switch (mouse.type) {
+                .changes => switch (mouse.type) {
                     .drag => return .{ .mouse_selection_drag = .{
                         .pointer = self.bodyPointerSample(mouse),
-                        .target = .{ .review = self.bodyMousePoint(mouse) },
+                        .target = .{ .changes = self.bodyMousePoint(mouse) },
                     } },
                     .release => return .{ .mouse_selection_release = .{
                         .pointer = self.bodyPointerSample(mouse),
-                        .target = .{ .review = self.bodyMousePoint(mouse) },
+                        .target = .{ .changes = self.bodyMousePoint(mouse) },
                     } },
                     else => {},
                 },
@@ -163,7 +163,7 @@ pub const View = struct {
             }
         }
 
-        if ((self.active_page == .review and (self.review.key.search_mode or self.review.key.file_search_mode)) or
+        if ((self.active_page == .changes and (self.changes.key.search_mode or self.changes.key.file_search_mode)) or
             (self.active_page == .compare and (self.compare.key.search_mode or self.compare.key.file_search_mode or self.compare.key.base_picker_open)) or
             (self.active_page == .repository and (self.repository.key.source_search_mode or self.repository.key.file_search_mode)) or
             self.commit_panel_mode or self.repo_picker_mode) return null;
@@ -239,25 +239,25 @@ pub const View = struct {
                 else => null,
             };
         }
-        if (self.active_page != .review) return null;
+        if (self.active_page != .changes) return null;
 
-        const pane = self.reviewMousePane(mouse) orelse return null;
+        const pane = self.changesMousePane(mouse) orelse return null;
         return switch (mouse.button) {
             .left => switch (pane) {
-                .sidebar => .{ .review = self.reviewSidebarClickToMsg(mouse) },
-                .diff => .{ .review = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } },
+                .sidebar => .{ .changes = self.changesSidebarClickToMsg(mouse) },
+                .diff => .{ .changes = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } },
             },
-            .wheel_up => .{ .review = if (pane == .sidebar) .mouse_sidebar_wheel_up else .mouse_diff_wheel_up },
-            .wheel_down => .{ .review = if (pane == .sidebar) .mouse_sidebar_wheel_down else .mouse_diff_wheel_down },
-            .wheel_left => if (pane == .diff) .{ .review = .mouse_diff_wheel_left } else null,
-            .wheel_right => if (pane == .diff) .{ .review = .mouse_diff_wheel_right } else null,
+            .wheel_up => .{ .changes = if (pane == .sidebar) .mouse_sidebar_wheel_up else .mouse_diff_wheel_up },
+            .wheel_down => .{ .changes = if (pane == .sidebar) .mouse_sidebar_wheel_down else .mouse_diff_wheel_down },
+            .wheel_left => if (pane == .diff) .{ .changes = .mouse_diff_wheel_left } else null,
+            .wheel_right => if (pane == .diff) .{ .changes = .mouse_diff_wheel_right } else null,
             else => null,
         };
     }
 
     fn activeDiffSelectionOwner(self: View) ?ActiveDiffSelectionOwner {
         return switch (self.active_page) {
-            .review => .{ .review = self.review.selection_owner },
+            .changes => .{ .changes = self.changes.selection_owner },
             .compare => .{ .compare = self.compare.selection_owner },
             .repository, .config => null,
         };
@@ -267,7 +267,7 @@ pub const View = struct {
         _ = self.compare.loaded orelse return null;
         const point = self.bodyMousePoint(mouse) orelse return null;
         if (self.compare.sidebar_hidden) return .diff;
-        const sidebar_width = review_layout.sidebarWidth(
+        const sidebar_width = changes_layout.sidebarWidth(
             self.layout.content.width,
             self.compare.sidebar_width,
         );
@@ -291,28 +291,28 @@ pub const View = struct {
         return .{ .sidebar_click_node = node_index };
     }
 
-    fn reviewMousePane(self: View, mouse: anytype) ?MousePane {
-        _ = self.review.loaded orelse return null;
+    fn changesMousePane(self: View, mouse: anytype) ?MousePane {
+        _ = self.changes.loaded orelse return null;
         const point = self.bodyMousePoint(mouse) orelse return null;
-        if (self.review.sidebar_hidden) return .diff;
-        const sidebar_width = review_layout.sidebarWidth(
+        if (self.changes.sidebar_hidden) return .diff;
+        const sidebar_width = changes_layout.sidebarWidth(
             self.layout.content.width,
-            self.review.sidebar_width,
+            self.changes.sidebar_width,
         );
         if (point.col < sidebar_width) return .sidebar;
         if (point.col == sidebar_width) return null;
         return .diff;
     }
 
-    fn reviewSidebarClickToMsg(self: View, mouse: anytype) review_message.Msg {
+    fn changesSidebarClickToMsg(self: View, mouse: anytype) changes_message.Msg {
         const point = self.bodyMousePoint(mouse) orelse return .focus_sidebar;
         const body_height = self.layout.body.height;
         if (point.row < sidebar_header_rows or body_height <= sidebar_header_rows) return .focus_sidebar;
-        const loaded = self.review.loaded orelse return .focus_sidebar;
+        const loaded = self.changes.loaded orelse return .focus_sidebar;
         const visible_rows: usize = body_height - sidebar_header_rows;
         const body_row: usize = point.row - sidebar_header_rows;
         const node_index = loaded.sidebarNodeAtBodyRow(
-            self.review.selected_node,
+            self.changes.selected_node,
             visible_rows,
             body_row,
         ) orelse return .focus_sidebar;

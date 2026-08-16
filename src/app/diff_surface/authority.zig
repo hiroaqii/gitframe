@@ -1,7 +1,7 @@
 //! Shared diff-page action authority vocabulary.
 //!
 //! Requirements are evaluated against the current page activation and member
-//! freshness vector. Review and Compare retain independent lifecycle state.
+//! freshness vector. Changes and Compare retain independent lifecycle state.
 
 const std = @import("std");
 const auto_reload = @import("../auto_reload.zig");
@@ -35,10 +35,10 @@ pub const Requirements = struct {
     branch: Requirement = .unused,
 };
 
-/// Review operations name the members they actually consume. Keeping this
+/// Changes operations name the members they actually consume. Keeping this
 /// table separate from target construction prevents a later page activation
 /// change from accidentally turning an unrelated member failure into a global
-/// Review lockout.
+/// Changes lockout.
 pub const Action = enum {
     read_diff,
     stage_file,
@@ -111,25 +111,25 @@ pub const Member = enum {
 /// Keeping this narrower than `page.Id` prevents Repository or Config request
 /// identities from being admitted accidentally.
 pub const Owner = enum {
-    review,
+    changes,
     compare,
 
     fn identity(self: Owner, repo_epoch: u64, activation_id: u64) page.RequestIdentity {
         return switch (self) {
-            .review => page.RequestIdentity.review(repo_epoch, activation_id),
+            .changes => page.RequestIdentity.changes(repo_epoch, activation_id),
             .compare => page.RequestIdentity.compare(repo_epoch, activation_id),
         };
     }
 
     fn matches(self: Owner, origin: page.Id) bool {
         return switch (self) {
-            .review => origin == .review,
+            .changes => origin == .changes,
             .compare => origin == .compare,
         };
     }
 };
 
-/// Persistent Review or Compare activation owner.
+/// Persistent Changes or Compare activation owner.
 ///
 /// Retained documents and reload fingerprints live outside this value. Leaving
 /// the owning page therefore revokes action authority without destroying last-good
@@ -322,40 +322,40 @@ test "action requirements do not globally couple auxiliary members" {
 }
 
 test "lifecycle rejects completion from an older activation" {
-    var lifecycle = Lifecycle.init(.review);
+    var lifecycle = Lifecycle.init(.changes);
     const first = lifecycle.activate(4, .pending, .pending, .pending);
     lifecycle.deactivate();
     const second = lifecycle.activate(4, .pending, .pending, .pending);
     try std.testing.expect(first != second);
-    try std.testing.expect(!lifecycle.finishMember(page.RequestIdentity.review(4, first), .source, .fresh));
-    try std.testing.expect(lifecycle.finishMember(page.RequestIdentity.review(4, second), .source, .fresh));
+    try std.testing.expect(!lifecycle.finishMember(page.RequestIdentity.changes(4, first), .source, .fresh));
+    try std.testing.expect(lifecycle.finishMember(page.RequestIdentity.changes(4, second), .source, .fresh));
     try std.testing.expect(lifecycle.state.satisfiesAction(.read_diff));
 }
 
 test "lifecycle identity authority is isolated by diff page owner" {
-    var review = Lifecycle.init(.review);
-    const review_activation = review.activate(4, .pending, .pending, .pending);
-    const review_identity = review.currentIdentity().?;
-    const compare_for_review = page.RequestIdentity.compare(4, review_activation);
-    try std.testing.expectEqual(page.Id.review, review_identity.origin);
-    try std.testing.expect(review.finishMember(review_identity, .source, .fresh));
-    try std.testing.expect(!review.finishMember(compare_for_review, .source, .failed));
-    try std.testing.expect(review.acceptsRepoEpoch(review_identity, 4));
-    try std.testing.expect(!review.acceptsRepoEpoch(compare_for_review, 4));
+    var changes = Lifecycle.init(.changes);
+    const changes_activation = changes.activate(4, .pending, .pending, .pending);
+    const changes_identity = changes.currentIdentity().?;
+    const compare_for_changes = page.RequestIdentity.compare(4, changes_activation);
+    try std.testing.expectEqual(page.Id.changes, changes_identity.origin);
+    try std.testing.expect(changes.finishMember(changes_identity, .source, .fresh));
+    try std.testing.expect(!changes.finishMember(compare_for_changes, .source, .failed));
+    try std.testing.expect(changes.acceptsRepoEpoch(changes_identity, 4));
+    try std.testing.expect(!changes.acceptsRepoEpoch(compare_for_changes, 4));
 
     var compare = Lifecycle.init(.compare);
     const compare_activation = compare.activate(4, .pending, .unavailable, .unavailable);
     const compare_identity = compare.currentIdentity().?;
-    const review_for_compare = page.RequestIdentity.review(4, compare_activation);
+    const changes_for_compare = page.RequestIdentity.changes(4, compare_activation);
     try std.testing.expectEqual(page.Id.compare, compare_identity.origin);
     try std.testing.expect(compare.finishMember(compare_identity, .source, .immutable));
-    try std.testing.expect(!compare.finishMember(review_for_compare, .source, .failed));
+    try std.testing.expect(!compare.finishMember(changes_for_compare, .source, .failed));
     try std.testing.expect(compare.acceptsRepoEpoch(compare_identity, 4));
-    try std.testing.expect(!compare.acceptsRepoEpoch(review_for_compare, 4));
+    try std.testing.expect(!compare.acceptsRepoEpoch(changes_for_compare, 4));
 }
 
 test "queued revalidation belongs to the current activation" {
-    var lifecycle = Lifecycle.init(.review);
+    var lifecycle = Lifecycle.init(.changes);
     _ = lifecycle.activate(2, .pending, .pending, .pending);
     lifecycle.queueRevalidation();
     try std.testing.expect(lifecycle.hasQueuedFullRevalidation());
@@ -372,7 +372,7 @@ test "queued revalidation belongs to the current activation" {
 }
 
 test "full and terminal revalidation consumption remain distinct" {
-    var lifecycle = Lifecycle.init(.review);
+    var lifecycle = Lifecycle.init(.changes);
     const activation_id = lifecycle.activate(3, .fresh, .fresh, .fresh);
     lifecycle.queueRevalidation();
     lifecycle.queueActionTerminalRevalidation();

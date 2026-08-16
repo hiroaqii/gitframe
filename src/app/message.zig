@@ -13,7 +13,7 @@ const diff_surface = @import("diff_surface.zig");
 const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_layout = @import("pages/repository/layout.zig");
-const review_message = @import("pages/review/message.zig");
+const changes_message = @import("pages/changes/message.zig");
 
 pub const LoadFinished = load.ReadFinished;
 
@@ -58,7 +58,7 @@ pub const ShellEffectFinished = union(enum) {
 };
 
 pub const MouseSelectionTarget = union(enum) {
-    review: ?review_message.MousePoint,
+    changes: ?changes_message.MousePoint,
     compare: ?diff_surface.MousePoint,
     repository: ?repository_layout.BodyPoint,
 };
@@ -78,7 +78,7 @@ pub const Msg = union(enum) {
     push_inspection_finished: push_retry.Finished,
     push_upstream_finalize_finished: push_retry.FinalizeFinished,
     shell_effect_finished: ShellEffectFinished,
-    review: review_message.Msg,
+    changes: changes_message.Msg,
     compare: compare_input.Msg,
     repository: repository_page.Msg,
     mouse_selection_drag: MouseSelectionContinuation,
@@ -249,15 +249,15 @@ test "undelivered action result releases owned payloads" {
 test "undelivered diff and status loads release owned payloads" {
     const test_support = @import("test_support.zig");
 
-    var diff_msg = Msg.loadFinished(.{ .review = .{ .source = .{
-        .identity = page.RequestIdentity.review(0, 1),
+    var diff_msg = Msg.loadFinished(.{ .changes = .{ .source = .{
+        .identity = page.RequestIdentity.changes(0, 1),
         .generation = 1,
         .result = .{ .loaded = try load.buildLoadedBundle(std.testing.allocator, test_support.diff_one) },
     } } });
     diff_msg.deinitUndelivered(std.testing.allocator);
 
-    var status_msg = Msg.loadFinished(.{ .review = .{ .status = .{
-        .identity = page.RequestIdentity.review(0, 1),
+    var status_msg = Msg.loadFinished(.{ .changes = .{ .status = .{
+        .identity = page.RequestIdentity.changes(0, 1),
         .generation = 2,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .failed = try std.testing.allocator.dupe(u8, "status failed") },
@@ -266,18 +266,18 @@ test "undelivered diff and status loads release owned payloads" {
 }
 
 test "undelivered repo and projection loads release owned payloads" {
-    const review_projection = @import("review_projection.zig");
+    const changes_projection = @import("changes_projection.zig");
 
     var repo_msg = Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = .{
-        .identity = page.RequestIdentity.review(0, 1),
+        .identity = page.RequestIdentity.changes(0, 1),
         .generation = 1,
         .result = .{ .failed = try std.testing.allocator.dupe(u8, "discovery failed") },
     } } });
     repo_msg.deinitUndelivered(std.testing.allocator);
 
-    const request = try review_projection.testing.cloneRequest(
+    const request = try changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         7,
         "/repo",
         "src/app.zig",
@@ -286,9 +286,9 @@ test "undelivered repo and projection loads release owned payloads" {
         3,
         4,
     );
-    var projection_msg = Msg.loadFinished(.{ .review = .{ .projection = .{
+    var projection_msg = Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = request,
-        .result = .{ .failed = try review_projection.statusBodyAlloc(
+        .result = .{ .failed = try changes_projection.statusBodyAlloc(
             std.testing.allocator,
             "src/app.zig",
             "{s}",
@@ -301,8 +301,8 @@ test "undelivered repo and projection loads release owned payloads" {
 test "undelivered remaining read routes release owned payloads" {
     const allocator = std.testing.allocator;
 
-    var branch_status_msg = Msg.loadFinished(.{ .review = .{ .branch_status = .{
-        .identity = page.RequestIdentity.review(0, 1),
+    var branch_status_msg = Msg.loadFinished(.{ .changes = .{ .branch_status = .{
+        .identity = page.RequestIdentity.changes(0, 1),
         .generation = 1,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .result = .{ .failed = try allocator.dupe(u8, "branch status failed") },
@@ -317,7 +317,7 @@ test "undelivered remaining read routes release owned payloads" {
     repo_path_msg.deinitUndelivered(allocator);
 
     var branch_list_msg = Msg.loadFinished(.{ .shell = .{ .branch_list = .{
-        .origin = .review,
+        .origin = .changes,
         .repo_epoch = 3,
         .activation_id = 5,
         .generation = 4,

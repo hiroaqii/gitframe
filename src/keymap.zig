@@ -2,7 +2,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 
 pub const PublicAction = enum {
-    page_review,
+    page_changes,
     page_repository,
     page_compare,
     page_config,
@@ -238,7 +238,7 @@ fn buildDefaultSpecs() [action_count]?KeySpec {
 
 fn defaultSpec(action: PublicAction) ?KeySpec {
     return switch (action) {
-        .page_review => .{ .plain_codepoint = '1' },
+        .page_changes => .{ .plain_codepoint = '1' },
         .page_repository => .{ .plain_codepoint = '2' },
         .page_compare => .{ .plain_codepoint = '3' },
         .page_config => .{ .plain_codepoint = '4' },

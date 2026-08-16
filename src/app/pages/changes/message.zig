@@ -1,4 +1,4 @@
-//! Review page semantic message vocabulary shared by keyboard, mouse, and
+//! Changes page semantic message vocabulary shared by keyboard, mouse, and
 //! direct update-loop producers.
 //!
 //! Shell/global commands are intentionally absent. A producer must pass shell
@@ -98,7 +98,7 @@ pub const Msg = union(enum) {
     finish_review_needs_changes,
     finish_review_canceled,
 
-    /// Narrows the flat Review-compatible vocabulary to shared read-only
+    /// Narrows the flat Changes-compatible vocabulary to shared read-only
     /// authority. Page-only commands return null.
     pub fn shared(self: Msg) ?shared_message.Msg {
         return switch (self) {

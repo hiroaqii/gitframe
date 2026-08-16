@@ -4,13 +4,13 @@ const load = @import("../load.zig");
 const load_state = @import("../load_state.zig");
 const page = @import("../page.zig");
 const prompt = @import("../prompt.zig");
-const review_projection = @import("../review_projection.zig");
+const changes_projection = @import("../changes_projection.zig");
 const app_state = @import("../state.zig");
-pub const action_cursor = @import("review/action_cursor.zig");
+pub const action_cursor = @import("changes/action_cursor.zig");
 const authority = @import("../diff_surface/authority.zig");
-pub const repository_read_authority = @import("review/repository_read_authority.zig");
+pub const repository_read_authority = @import("changes/repository_read_authority.zig");
 pub const file_search = @import("../diff_surface/file_search.zig");
-const review_selection = @import("../diff_surface/selection.zig");
+const content_selection = @import("../diff_surface/selection.zig");
 const config = @import("../../config.zig");
 const context = @import("../../context.zig");
 const diff_render = @import("../../diff/render.zig");
@@ -40,14 +40,14 @@ pub const ReloadKind = enum {
 
 pub const PendingReload = struct {
     generation: u64,
-    read_epoch: repository_read_authority.ReviewRepositoryReadEpoch = .{},
+    read_epoch: repository_read_authority.ChangesRepositoryReadEpoch = .{},
     kind: ReloadKind,
     anchor: ?ReloadAnchor = null,
 
     pub fn matchesTerminal(
         self: PendingReload,
         generation: u64,
-        read_epoch: repository_read_authority.ReviewRepositoryReadEpoch,
+        read_epoch: repository_read_authority.ChangesRepositoryReadEpoch,
     ) bool {
         return self.generation == generation and self.read_epoch.eql(read_epoch);
     }
@@ -72,7 +72,7 @@ test "pending reload matches only its exact read terminal" {
 
 pub const PendingDisplayNavigationRestore = struct {
     repo_root: []u8,
-    source_kind: review_projection.SourceKind,
+    source_kind: changes_projection.SourceKind,
     source_session_revision: u64,
     original: ReloadAnchor,
     override: ?ReloadAnchor = null,
@@ -136,20 +136,20 @@ const CanonicalStatusCandidate = union(enum) {
 };
 
 /// Private transaction metadata for a refresh which must retain the current
-/// canonical Review body until source, status, and projection agree.
+/// canonical Changes body until source, status, and projection agree.
 ///
 /// The source task payload remains single-owned by `deferred_source_apply`;
 /// this gate owns only its exact identity plus the accepted status candidate.
 const CanonicalPublicationGate = struct {
     identity: page.RequestIdentity,
-    read_epoch: repository_read_authority.ReviewRepositoryReadEpoch,
+    read_epoch: repository_read_authority.ChangesRepositoryReadEpoch,
     source_generation: u64,
     kind: ReloadKind,
     repo_root: []u8,
     path_key: []u8,
     phase: CanonicalPublicationPhase = .waiting_members,
     status_generation: ?u64 = null,
-    status_read_epoch: repository_read_authority.ReviewRepositoryReadEpoch = .{},
+    status_read_epoch: repository_read_authority.ChangesRepositoryReadEpoch = .{},
     status_background_cycle_id: ?u64 = null,
     status: CanonicalStatusCandidate = .pending,
     projection_request_id: ?u64 = null,
@@ -184,7 +184,7 @@ pub const DeferredSourceApply = struct {
 /// request remains the single read-epoch owner while deferred; do not mirror a
 /// second scalar here which could diverge from the task result provenance.
 pub const DeferredProjectionApply = struct {
-    finished: load.ReviewProjectionFinished,
+    finished: load.ChangesProjectionFinished,
 
     pub fn deinit(self: *DeferredProjectionApply, allocator: std.mem.Allocator) void {
         self.finished.deinit(allocator);
@@ -192,9 +192,9 @@ pub const DeferredProjectionApply = struct {
     }
 };
 
-pub const ReviewPageState = struct {
-    activation: authority.Lifecycle = .init(.review),
-    repository_read_authority: repository_read_authority.ReviewRepositoryReadAuthority = .{},
+pub const ChangesPageState = struct {
+    activation: authority.Lifecycle = .init(.changes),
+    repository_read_authority: repository_read_authority.ChangesRepositoryReadAuthority = .{},
     status: app_state.StatusMessage = .{},
     load: load_state.LoadRuntimeState = .{},
     auto_reload: auto_reload.State = .{},
@@ -208,8 +208,8 @@ pub const ReviewPageState = struct {
     file_search_return_focus: Focus = .sidebar,
     review_display: app_state.ReviewDisplayState = .{},
     staged_hunks: app_state.StagedHunkMarks = .{},
-    review_projection: review_projection.State = .{},
-    review_projection_next_id: u64 = 0,
+    changes_projection: changes_projection.State = .{},
+    changes_projection_next_id: u64 = 0,
     source_session_revision: u64 = 0,
     /// Semantic generation of accepted sidebar rows. Zero is reserved as an
     /// invalid candidate basis, so the first accepted namespace starts at one.
@@ -228,12 +228,12 @@ pub const ReviewPageState = struct {
     action_cursor: action_cursor.State = .{},
     reviewed_store: review_session_state.Store = .{},
     selection_owner: diff_selection.Owner = .none,
-    completed_selection: ?review_selection.CompletedSelection = null,
+    completed_selection: ?content_selection.CompletedSelection = null,
     /// Non-zero semantic generation of the selected body's source-row map.
     selection_layout_revision: u64 = 1,
 
     pub fn init(
-        self: *ReviewPageState,
+        self: *ChangesPageState,
         cli: diff_source.AutoReloadOverride,
         user: config.ReloadConfig,
         source: diff_source.SourceMode,
@@ -241,16 +241,16 @@ pub const ReviewPageState = struct {
         self.auto_reload = .init(cli, user, source);
     }
 
-    pub fn advanceSelectionLayoutRevision(self: *ReviewPageState) void {
+    pub fn advanceSelectionLayoutRevision(self: *ChangesPageState) void {
         self.selection_layout_revision +%= 1;
         if (self.selection_layout_revision == 0) self.selection_layout_revision = 1;
     }
 
     /// Only an ordinary source completion deferred behind a live drag borrows
     /// display state strongly enough to block a page transition. Canonical
-    /// publication owns no live pointer borrow and is retired by the Review
+    /// publication owns no live pointer borrow and is retired by the Changes
     /// owner when an allowed page exit commits.
-    pub fn deferredSourceBlocksPageTransition(self: *const ReviewPageState) bool {
+    pub fn deferredSourceBlocksPageTransition(self: *const ChangesPageState) bool {
         const deferred = self.deferred_source_apply orelse return false;
         return deferred.mode == .live_drag;
     }
@@ -259,7 +259,7 @@ pub const ReviewPageState = struct {
     /// replaced, then open a new semantic namespace for later publication.
     /// Prompt mode and input intentionally survive so the replacement path can
     /// rebuild the same query after its primary model has committed.
-    pub fn advanceAcceptedSidebarRevision(self: *ReviewPageState, allocator: ?std.mem.Allocator) void {
+    pub fn advanceAcceptedSidebarRevision(self: *ChangesPageState, allocator: ?std.mem.Allocator) void {
         file_search.advanceAcceptedSidebarRevision(
             &self.file_search,
             &self.accepted_sidebar_revision,
@@ -267,7 +267,7 @@ pub const ReviewPageState = struct {
         );
     }
 
-    pub fn deinit(self: *ReviewPageState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ChangesPageState, allocator: std.mem.Allocator) void {
         self.selection_owner = .none;
         if (self.completed_selection) |*selection| selection.deinit(allocator);
         if (self.deferred_source_apply) |*deferred| deferred.deinit(allocator);
@@ -281,7 +281,7 @@ pub const ReviewPageState = struct {
         self.branch_status.deinit();
         self.reviewed_store.deinit(allocator);
         self.staged_hunks.deinit(allocator);
-        self.review_projection.deinit(allocator);
+        self.changes_projection.deinit(allocator);
         self.tree_order.deinit(allocator);
         if (self.tree_order_scope) |scope| allocator.free(scope);
         self.action_cursor.deinit(allocator);
@@ -294,7 +294,7 @@ pub const ReviewPageState = struct {
     /// shared fields. The bundle is a short-lived borrow for the current
     /// update/render call; nothing may retain it across a state mutation.
     pub fn diffSurface(
-        self: *ReviewPageState,
+        self: *ChangesPageState,
         source: diff_source.SourceMode,
         layout: diff_surface.Layout,
     ) diff_surface.DiffSurface {
@@ -329,7 +329,7 @@ pub const ReviewPageState = struct {
 
     /// Builds the const-qualified projection used by shared read-only views.
     pub fn readSurface(
-        self: *const ReviewPageState,
+        self: *const ChangesPageState,
         source: diff_source.SourceMode,
         layout: diff_surface.Layout,
     ) diff_surface.ReadSurface {
@@ -365,7 +365,7 @@ pub const ReviewPageState = struct {
 
 test "diffSurface adapter exposes shared field pointers without copying" {
     const allocator = std.testing.allocator;
-    var state: ReviewPageState = .{};
+    var state: ChangesPageState = .{};
     defer state.deinit(allocator);
 
     var surface = state.diffSurface(.unstaged, .{ .width = 80, .height = 24 });
@@ -390,7 +390,7 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     try std.testing.expectEqual(diff_source.SourceMode.unstaged, surface.source);
     try std.testing.expectEqual(diff_surface.Layout{ .width = 80, .height = 24 }, surface.layout);
 
-    const const_state: *const ReviewPageState = &state;
+    const const_state: *const ChangesPageState = &state;
     const read_surface = const_state.readSurface(.cached, .{ .width = 96, .height = 31 });
     try std.testing.expectEqual(&state.activation, read_surface.activation);
     try std.testing.expectEqual(&state.status, read_surface.status);
@@ -456,7 +456,7 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     };
     state.deferred_source_apply = .{
         .finished = .{
-            .identity = page.RequestIdentity.review(0, 1),
+            .identity = page.RequestIdentity.changes(0, 1),
             .generation = 2,
             .result = .{ .failed_static = "surface test terminal" },
         },
@@ -470,16 +470,16 @@ test "diffSurface adapter exposes shared field pointers without copying" {
 }
 
 test "selection layout revision is non-zero and skips zero on wrap" {
-    var state: ReviewPageState = .{ .selection_layout_revision = std.math.maxInt(u64) };
+    var state: ChangesPageState = .{ .selection_layout_revision = std.math.maxInt(u64) };
     state.advanceSelectionLayoutRevision();
     try std.testing.expectEqual(@as(u64, 1), state.selection_layout_revision);
     state.advanceSelectionLayoutRevision();
     try std.testing.expectEqual(@as(u64, 2), state.selection_layout_revision);
 }
 
-test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
+test "ChangesPageState initializes reload policy and owns lifecycle cleanup" {
     const allocator = std.testing.allocator;
-    var state: ReviewPageState = .{};
+    var state: ChangesPageState = .{};
     errdefer state.deinit(allocator);
     state.init(.inherit, .{}, .unstaged);
     try std.testing.expect(state.auto_reload.enabled());
@@ -487,7 +487,7 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
 
     state.deferred_source_apply = .{
         .finished = .{
-            .identity = page.RequestIdentity.review(0, 1),
+            .identity = page.RequestIdentity.changes(0, 1),
             .generation = 5,
             .result = .{ .failed = try allocator.dupe(u8, "deferred failure") },
         },
@@ -561,13 +561,13 @@ test "ReviewPageState initializes reload policy and owns lifecycle cleanup" {
     try std.testing.expect(state.pending_display_navigation_restore == null);
 }
 
-test "Review canonical publication page transition distinguishes live drag from canonical deferred source" {
+test "Changes canonical publication page transition distinguishes live drag from canonical deferred source" {
     const allocator = std.testing.allocator;
-    var state: ReviewPageState = .{};
+    var state: ChangesPageState = .{};
     defer state.deinit(allocator);
     state.deferred_source_apply = .{
         .finished = .{
-            .identity = page.RequestIdentity.review(0, 1),
+            .identity = page.RequestIdentity.changes(0, 1),
             .generation = 5,
             .result = .{ .failed_static = "test terminal" },
         },
@@ -579,9 +579,9 @@ test "Review canonical publication page transition distinguishes live drag from 
     try std.testing.expect(!state.deferredSourceBlocksPageTransition());
 }
 
-test "ReviewPageState deinit releases loaded snapshots and file filter" {
+test "ChangesPageState deinit releases loaded snapshots and file filter" {
     const allocator = std.testing.allocator;
-    var state: ReviewPageState = .{};
+    var state: ChangesPageState = .{};
     errdefer state.deinit(allocator);
 
     try state.load.replaceFailed(allocator, "load failure");
@@ -611,9 +611,9 @@ test "ReviewPageState deinit releases loaded snapshots and file filter" {
     try std.testing.expectEqual(@as(usize, 0), state.file_search.filter.labels.len);
 }
 
-test "ReviewPageState deinit releases stores projection and stable order" {
+test "ChangesPageState deinit releases stores projection and stable order" {
     const allocator = std.testing.allocator;
-    var state: ReviewPageState = .{};
+    var state: ChangesPageState = .{};
     errdefer state.deinit(allocator);
 
     const reviewed_key = try allocator.dupe(u8, "/repo\x00src/main.zig");
@@ -626,7 +626,7 @@ test "ReviewPageState deinit releases stores projection and stable order" {
         .content = .{
             .repo_epoch = 1,
             .root_identity = null,
-            .source = review_selection.SourceBasis.init(.unstaged),
+            .source = content_selection.SourceBasis.init(.unstaged),
             .source_session_revision = 1,
             .display = .{ .loaded = .init("diff") },
         },
@@ -639,9 +639,9 @@ test "ReviewPageState deinit releases stores projection and stable order" {
         return err;
     };
 
-    state.review_projection.pending = try review_projection.testing.cloneRequest(
+    state.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "src/pending.zig",
@@ -650,9 +650,9 @@ test "ReviewPageState deinit releases stores projection and stable order" {
         3,
         4,
     );
-    var displayed_request = try review_projection.testing.cloneRequest(
+    var displayed_request = try changes_projection.testing.cloneRequest(
         allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         2,
         "/repo",
         "src/displayed.zig",
@@ -663,7 +663,7 @@ test "ReviewPageState deinit releases stores projection and stable order" {
     );
     var displayed_request_owned = true;
     errdefer if (displayed_request_owned) displayed_request.deinit(allocator);
-    var displayed_body = try review_projection.statusBodyAlloc(
+    var displayed_body = try changes_projection.statusBodyAlloc(
         allocator,
         "src/displayed.zig",
         "projection failed",
@@ -671,7 +671,7 @@ test "ReviewPageState deinit releases stores projection and stable order" {
     );
     var displayed_body_owned = true;
     errdefer if (displayed_body_owned) displayed_body.deinit(allocator);
-    state.review_projection.displayed = .{ .failed = .{
+    state.changes_projection.displayed = .{ .failed = .{
         .request = displayed_request,
         .body = displayed_body,
     } };
@@ -683,7 +683,7 @@ test "ReviewPageState deinit releases stores projection and stable order" {
 
     try std.testing.expectEqual(@as(usize, 0), state.reviewed_store.entries.count());
     try std.testing.expectEqual(@as(usize, 0), state.staged_hunks.items.items.len);
-    try std.testing.expect(!state.review_projection.hasPending());
-    try std.testing.expect(!state.review_projection.hasDisplayed());
+    try std.testing.expect(!state.changes_projection.hasPending());
+    try std.testing.expect(!state.changes_projection.hasDisplayed());
     try std.testing.expectEqual(@as(usize, 0), state.tree_order.keys.items.len);
 }

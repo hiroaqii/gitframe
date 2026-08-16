@@ -1,7 +1,7 @@
-//! Review remote-operation workflow and foreground push ownership.
+//! Changes remote-operation workflow and foreground push ownership.
 //!
 //! This controller owns push, pull, fetch, branch-switch, retry inspection,
-//! interactive-push, and upstream-finalization state. Review supplies synchronous target
+//! interactive-push, and upstream-finalization state. Changes supplies synchronous target
 //! and outcome ports; the root shell consumes typed reload intent. The module
 //! never imports the root App, local workflow, read coordinator, or shell
 //! effects.
@@ -23,8 +23,8 @@ const app_push_retry = @import("../push_retry.zig");
 const remote_request = @import("../remote_request.zig");
 const repo_session = @import("../repo_session.zig");
 const app_state = @import("../state.zig");
-const review_action_fence = @import("../pages/review/action_fence.zig");
-const review_operations = @import("../pages/review/operations.zig");
+const changes_action_fence = @import("../pages/changes/action_fence.zig");
+const changes_operations = @import("../pages/changes/operations.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 const remote_state = @import("remote_state.zig");
 const git_remote = @import("../../git/remote.zig");
@@ -91,7 +91,7 @@ pub const RedrawSink = struct {
 };
 
 pub const Outcome = struct {
-    reload: review_action_fence.ReloadIntent = .none,
+    reload: changes_action_fence.ReloadIntent = .none,
     cancel_local_confirmations: bool = false,
     quit_after_terminal: bool = false,
 };
@@ -99,12 +99,12 @@ pub const Outcome = struct {
 pub const Controller = struct {
     state: *State,
     lifecycle: action_lifecycle.Controller,
-    operations: review_operations.Controller,
+    operations: changes_operations.Controller,
     repo: repo_session.View,
-    current_review_root: ?[]const u8,
+    current_changes_root: ?[]const u8,
     env_map: ?*std.process.Environ.Map,
     active_page: page.Id,
-    review_origin: effect_origin.PageOrigin,
+    changes_origin: effect_origin.PageOrigin,
     effect_snapshot: effect_origin.Snapshot,
     status: *app_state.StatusMessage,
     overlay: *app_state.OverlayState,
@@ -485,9 +485,9 @@ pub const Controller = struct {
         errdefer if (!repo_root_consumed) ctx.allocator().free(owned_repo_root);
         const task = try ctx.allocator().create(BranchListLoadTask);
         task.* = .{
-            .origin = .review,
+            .origin = .changes,
             .repo_epoch = self.repo.epoch(),
-            .activation_id = self.review_origin.activation_id,
+            .activation_id = self.changes_origin.activation_id,
             .repo_root = owned_repo_root,
             .root = root,
             .environment = environment,
@@ -577,7 +577,7 @@ pub const Controller = struct {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
-        const active_matches = terminal.target == .current_review;
+        const active_matches = terminal.target == .current_changes;
         const quit_after_terminal = self.finishRemoteControl(result.pending);
         if (!self.remoteRequestMatches(result.identity) or
             result.identity.operation_generation != result.pending.generation)
@@ -618,7 +618,7 @@ pub const Controller = struct {
         if (!self.remoteRequestMatches(result.identity) or
             result.identity.operation_generation != result.pending.generation)
             return .{ .quit_after_terminal = quit_after_terminal };
-        const active_matches = terminal.target == .current_review;
+        const active_matches = terminal.target == .current_changes;
         switch (result.result.outcome) {
             .ok => |success| switch (success) {
                 .completed => if (active_matches) {
@@ -644,7 +644,7 @@ pub const Controller = struct {
         if (!self.remoteRequestMatches(result.identity) or
             result.identity.operation_generation != result.pending.generation)
             return .{ .quit_after_terminal = quit_after_terminal };
-        const active_matches = terminal.target == .current_review;
+        const active_matches = terminal.target == .current_changes;
         switch (result.result.outcome) {
             .ok => if (active_matches) {
                 self.setRemoteStatus(result.result.warnings, "fetched: {s}", .{result.remote});
@@ -663,7 +663,7 @@ pub const Controller = struct {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
-        const active_matches = terminal.target == .current_review;
+        const active_matches = terminal.target == .current_changes;
         switch (result.result) {
             .ok => {
                 const applied = self.operations.applyAcceptedOutcome(allocator, .{ .switch_branch = .{ .repo_root = result.repo_root } }, active_matches);
@@ -863,7 +863,7 @@ pub const Controller = struct {
         defer foreground.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, foreground.pending, foreground.target.repo_root) orelse return .{};
         if (!self.remoteRequestMatches(foreground.identity)) return .{};
-        const active_matches = terminal.target == .current_review;
+        const active_matches = terminal.target == .current_changes;
         if (liveness == .stale) {
             self.redraw.requestSkip();
             return .{};
@@ -894,7 +894,7 @@ pub const Controller = struct {
         const terminal = self.acceptTerminal(
             allocator,
             finalizing.pending,
-            if (request_matches) self.current_review_root orelse "" else "",
+            if (request_matches) self.current_changes_root orelse "" else "",
         ) orelse return .{};
         const quit_after_terminal = self.takeDeferredQuit();
         if (!request_matches) {
@@ -921,7 +921,7 @@ pub const Controller = struct {
         }
         if (liveness == .live_inactive) self.redraw.requestSkip();
         return .{
-            .reload = if (terminal.target == .current_review) .source_and_aux else .none,
+            .reload = if (terminal.target == .current_changes) .source_and_aux else .none,
             .quit_after_terminal = quit_after_terminal,
         };
     }
@@ -948,7 +948,7 @@ pub const Controller = struct {
             .inspection,
         );
         defer if (environment) |*owned| owned.deinit();
-        var started = self.state.push_retry.beginInspection(self.review_origin) orelse return self.rejectVoid(unavailable_message);
+        var started = self.state.push_retry.beginInspection(self.changes_origin) orelse return self.rejectVoid(unavailable_message);
         app_push_retry.startInspection(app_message.Msg, ctx, started.metadata, &root, &environment, &started.target) catch |err| {
             self.restorePushRetryTarget(ctx.allocator(), started.target.take());
             self.setStatus("could not start push retry inspection", .{});
@@ -1068,7 +1068,7 @@ pub const Controller = struct {
         }
         if (liveness != .live_active) self.redraw.requestSkip();
         return .{
-            .reload = if (liveness != .stale and terminal.target == .current_review and self.remoteRequestMatches(identity)) .source_and_aux else .none,
+            .reload = if (liveness != .stale and terminal.target == .current_changes and self.remoteRequestMatches(identity)) .source_and_aux else .none,
             .quit_after_terminal = quit_after_terminal,
         };
     }
@@ -1124,7 +1124,7 @@ pub const Controller = struct {
     }
 
     fn acceptTerminal(self: Controller, allocator: std.mem.Allocator, pending: app_actions.PendingAction, repo_root: []const u8) ?action_lifecycle.AcceptedTerminal {
-        return switch (self.lifecycle.finishExact(allocator, pending, repo_root, self.current_review_root)) {
+        return switch (self.lifecycle.finishExact(allocator, pending, repo_root, self.current_changes_root)) {
             .rejected => null,
             .accepted => |accepted| accepted,
         };

@@ -2,7 +2,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const diff_source = @import("../diff/source.zig");
-const review_read_epoch = @import("review_read_epoch.zig");
+const changes_read_epoch = @import("changes_read_epoch.zig");
 
 pub const Activation = enum {
     disabled,
@@ -97,7 +97,7 @@ pub const LoadOrigin = enum {
 
 pub const AuxiliaryPending = struct {
     generation: u64,
-    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
+    read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch = .{},
     origin: LoadOrigin = .foreground,
     background_cycle_id: ?u64 = null,
     publication_allowed: bool = true,
@@ -114,7 +114,7 @@ pub const AuxiliaryPending = struct {
 /// only proves which pending owner a completion is allowed to retire.
 pub const AuxiliaryTerminal = struct {
     generation: u64,
-    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+    read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
     background_cycle_id: ?u64,
 };
 
@@ -133,7 +133,7 @@ pub const AuxiliaryTracker = struct {
     pub fn begin(
         self: *AuxiliaryTracker,
         background_cycle_id: ?u64,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
     ) void {
         self.pending = .{
             .generation = self.generation,

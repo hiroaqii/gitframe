@@ -5,13 +5,13 @@ const draw = @import("draw");
 const branch_chrome = @import("../../branch_chrome.zig");
 const app_page = @import("../../page.zig");
 const page_header = @import("../../page_header.zig");
-const review_projection = @import("../../review_projection.zig");
+const changes_projection = @import("../../changes_projection.zig");
 const diff_surface_view = @import("../../diff_surface/view.zig");
-const review_page = @import("../review.zig");
-const review_file_search = @import("../../diff_surface/file_search.zig");
-const review_body_render = @import("body_render.zig");
-const review_layout = @import("layout.zig");
-const review_navigation = @import("navigation.zig");
+const changes_page = @import("../changes.zig");
+const changes_file_search = @import("../../diff_surface/file_search.zig");
+const changes_body_render = @import("body_render.zig");
+const changes_layout = @import("layout.zig");
+const changes_navigation = @import("navigation.zig");
 const diff_render = @import("../../../diff/render.zig");
 const diff_source = @import("../../../diff/source.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
@@ -32,8 +32,8 @@ pub const FooterView = diff_surface_view.FooterView;
 pub const ActivationPresentation = diff_surface_view.ActivationPresentation;
 
 pub const Context = struct {
-    page: *const review_page.ReviewPageState,
-    navigation: review_navigation.View,
+    page: *const changes_page.ChangesPageState,
+    navigation: changes_navigation.View,
     theme: theme.Palette,
     keymap: keymap.Effective,
     source_label: []const u8,
@@ -42,8 +42,8 @@ pub const Context = struct {
     empty_remote_hints: EmptyRemoteActionHints,
 
     pub fn init(
-        review: *const review_page.ReviewPageState,
-        navigation: review_navigation.View,
+        changes: *const changes_page.ChangesPageState,
+        navigation: changes_navigation.View,
         palette: theme.Palette,
         effective_keymap: keymap.Effective,
         source_label: []const u8,
@@ -52,7 +52,7 @@ pub const Context = struct {
         empty_remote_hints: EmptyRemoteActionHints,
     ) Context {
         return .{
-            .page = review,
+            .page = changes,
             .navigation = navigation,
             .theme = palette,
             .keymap = effective_keymap,
@@ -79,8 +79,8 @@ pub const Context = struct {
         return self.navigation.selectedStatusLineStats();
     }
 
-    pub fn displayedReviewBody(self: Context) review_navigation.DisplayedReviewBody {
-        return self.navigation.displayedReviewBody();
+    pub fn displayedChangesBody(self: Context) changes_navigation.DisplayedChangesBody {
+        return self.navigation.displayedChangesBody();
     }
 
     pub fn selectedHunkIndex(self: Context) ?usize {
@@ -100,7 +100,7 @@ pub const Context = struct {
     }
 };
 
-/// Project Review's exact current-root branch snapshot into display-only page
+/// Project Changes's exact current-root branch snapshot into display-only page
 /// chrome. Foreground replacement never reuses the retained label; only an
 /// exact same-root background refresh may expose refreshing/stale state.
 pub fn pageHeaderPresentation(app: Context) ?page_header.Presentation {
@@ -146,24 +146,24 @@ fn headPresentation(
     } };
 }
 
-fn activationPresentation(review: *const review_page.ReviewPageState, source: diff_source.SourceMode) ?ActivationPresentation {
-    return diff_surface_view.activationPresentation(&review.activation, source);
+fn activationPresentation(changes: *const changes_page.ChangesPageState, source: diff_source.SourceMode) ?ActivationPresentation {
+    return diff_surface_view.activationPresentation(&changes.activation, source);
 }
 
 test "reloadable activation reports validating and stale while one-shot input stays immutable" {
-    var review: review_page.ReviewPageState = .{};
-    _ = review.activation.activate(1, .pending, .pending, .pending);
-    try std.testing.expectEqual(ActivationPresentation.validating, activationPresentation(&review, .unstaged).?);
+    var changes: changes_page.ChangesPageState = .{};
+    _ = changes.activation.activate(1, .pending, .pending, .pending);
+    try std.testing.expectEqual(ActivationPresentation.validating, activationPresentation(&changes, .unstaged).?);
 
-    review.activation.state.active.members = .{ .source = .fresh, .status = .failed, .branch = .fresh };
-    try std.testing.expectEqual(ActivationPresentation.stale, activationPresentation(&review, .unstaged).?);
+    changes.activation.state.active.members = .{ .source = .fresh, .status = .failed, .branch = .fresh };
+    try std.testing.expectEqual(ActivationPresentation.stale, activationPresentation(&changes, .unstaged).?);
 
-    try std.testing.expect(activationPresentation(&review, .stdin) == null);
-    try std.testing.expect(activationPresentation(&review, .{ .pager = "" }) == null);
+    try std.testing.expect(activationPresentation(&changes, .stdin) == null);
+    try std.testing.expect(activationPresentation(&changes, .{ .pager = "" }) == null);
 }
 
 pub fn view(app: Context, surface: *chasen.Surface) !void {
-    var diff_pane_adapter: ReviewDiffPaneRenderer = .{ .app = app };
+    var diff_pane_adapter: ChangesDiffPaneRenderer = .{ .app = app };
     var branch_scratch: SidebarBranchScratch = undefined;
     var fetch_key_buffer: [16]u8 = undefined;
     return diff_surface_view.view(surface, .{
@@ -178,15 +178,15 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
     });
 }
 
-const ReviewDiffPaneRenderer = struct {
+const ChangesDiffPaneRenderer = struct {
     app: Context,
 
-    fn interface(self: *ReviewDiffPaneRenderer) diff_surface_view.DiffPaneRenderer {
+    fn interface(self: *ChangesDiffPaneRenderer) diff_surface_view.DiffPaneRenderer {
         return .{ .ctx = self, .render_fn = render };
     }
 
     fn render(ctx: *anyopaque, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
-        const self: *ReviewDiffPaneRenderer = @ptrCast(@alignCast(ctx));
+        const self: *ChangesDiffPaneRenderer = @ptrCast(@alignCast(ctx));
         return viewDiffPane(self.app, surface, loaded);
     }
 };
@@ -205,7 +205,7 @@ fn viewBranchRowPresentation(app: Context, surface: *chasen.Surface, scratch: *S
     const size = surface.size();
     if (size.width == 0 or size.height == 0 or app.page.viewer.sidebar_hidden) return null;
 
-    const sidebar_width = review_layout.sidebarWidth(size.width, app.page.viewer.sidebar_width);
+    const sidebar_width = changes_layout.sidebarWidth(size.width, app.page.viewer.sidebar_width);
     switch (app.page.load.state) {
         .loaded => {
             const search_pane_width = size.width -| (sidebar_width +| 1);
@@ -257,10 +257,10 @@ fn sidebarBranchRowPresentation(app: Context, surface: *chasen.Surface, scratch:
     if (branchStatusSidebarPresentation(app.page, app.repo_root, surface.frameAllocator(), available_width)) |presentation| {
         var result: diff_surface_view.SidebarBranchPresentation = .{ .text = presentation.text };
 
-        if (reviewBranchActionHintInputReachable(app.page)) {
+        if (changesBranchActionHintInputReachable(app.page)) {
             const push_key = app.keymap.display(.push, scratch.push_key[0..]);
             const pull_key = app.keymap.display(.pull, scratch.pull_key[0..]);
-            if (reviewBranchActionHintForKeys(presentation, available_width, push_key, pull_key, scratch.hint[0..])) |hint| {
+            if (changesBranchActionHintForKeys(presentation, available_width, push_key, pull_key, scratch.hint[0..])) |hint| {
                 result.hint = .{
                     .text = hint.text,
                     .col = 1 + hint.base_display_width,
@@ -286,7 +286,7 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
     var mode_key_buffer: [16]u8 = undefined;
     const mode_toggle_key = displayModeToggleKey(app, mode_key_buffer[0..]);
     var resolver_adapter = app.navigation.contentResolverAdapter();
-    var status_adapter: ReviewStatusOnlyRenderer = undefined;
+    var status_adapter: ChangesStatusOnlyRenderer = undefined;
     const status_renderer: ?diff_surface_view.StatusOnlyRenderer = if (app.selectedStatusEntry()) |entry| blk: {
         status_adapter = .{ .app = app, .entry = entry };
         break :blk status_adapter.interface();
@@ -301,16 +301,16 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
     );
 }
 
-const ReviewStatusOnlyRenderer = struct {
+const ChangesStatusOnlyRenderer = struct {
     app: Context,
     entry: git_status.StatusEntry,
 
-    fn interface(self: *ReviewStatusOnlyRenderer) diff_surface_view.StatusOnlyRenderer {
+    fn interface(self: *ChangesStatusOnlyRenderer) diff_surface_view.StatusOnlyRenderer {
         return .{ .ctx = self, .render_fn = render };
     }
 
     fn render(ctx: *anyopaque, surface: *chasen.Surface) !void {
-        const self: *ReviewStatusOnlyRenderer = @ptrCast(@alignCast(ctx));
+        const self: *ChangesStatusOnlyRenderer = @ptrCast(@alignCast(ctx));
         return viewStatusOnlyPane(self.app, surface, self.entry);
     }
 };
@@ -323,9 +323,9 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
     var content = diffContentSurface(surface);
     const path = entry.canonicalPathKey() orelse entry.path;
 
-    switch (app.displayedReviewBody()) {
+    switch (app.displayedChangesBody()) {
         .cached => |bundle| {
-            try review_body_render.renderParsed(.{
+            try changes_body_render.renderParsed(.{
                 .file = bundle.loaded.document.files[0],
                 .line_index = bundle.loaded.cachedRenderedLineIndex(0, diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
                 .folded_hunks = &.{},
@@ -336,18 +336,18 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
             return;
         },
         .combined => |bundle| {
-            try review_body_render.renderParsed(.{
+            try changes_body_render.renderParsed(.{
                 .file = bundle.displayFile(),
                 .line_index = bundle.displayLineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
                 .folded_hunks = &.{},
-                .hunk_stages = try review_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.hunkStageStates()),
+                .hunk_stages = try changes_navigation.projectedHunkStagePresentation(surface.frameAllocator(), bundle.hunkStageStates()),
                 .syntax = bundle.syntaxView(),
             }, projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             try finishProjectedBody(app, surface, &content, active);
             return;
         },
         .retained_staged_only => |bundle| {
-            try review_body_render.renderParsed(.{
+            try changes_body_render.renderParsed(.{
                 .file = bundle.displayFile(),
                 .line_index = bundle.displayLineIndex(diff_render.effectiveMode(diff_render.bodyWidth(content.size().width), app.page.viewer.display_mode)),
                 .folded_hunks = &.{},
@@ -358,29 +358,29 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
             return;
         },
         .generated => |bundle| {
-            try review_body_render.renderGenerated(bundle, projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
+            try changes_body_render.renderGenerated(bundle, projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             try finishProjectedBody(app, surface, &content, active);
             return;
         },
         .inert_invalid_utf8 => |inert| {
-            try review_body_render.renderStatus(inert.display_path, review_navigation.invalid_utf8_body_message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
+            try changes_body_render.renderStatus(inert.display_path, changes_navigation.invalid_utf8_body_message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .status => |status| {
-            try review_body_render.renderStatus(status.path, status.message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
+            try changes_body_render.renderStatus(status.path, status.message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .pending => {
-            try review_body_render.renderStatus(path, "Loading review projection...", app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
+            try changes_body_render.renderStatus(path, "Loading changes projection...", app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
             drawPaneHeaderRule(surface, active, app.theme);
             return;
         },
         .none, .primary => {},
     }
 
-    try review_body_render.renderStatusOnlyFallback(&content, entry, app.selectedStatusLineStats(), active, app.theme);
+    try changes_body_render.renderStatusOnlyFallback(&content, entry, app.selectedStatusLineStats(), active, app.theme);
 }
 
 fn projectedBodyRenderArgs(
@@ -428,7 +428,7 @@ fn finishProjectedBody(app: Context, pane: *chasen.Surface, content: *chasen.Sur
 const drawPaneHeaderRule = diff_surface_view.drawPaneHeaderRule;
 
 fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, stats: ?file_tree.Stats, active: bool, palette: theme.Palette) !void {
-    try review_body_render.renderStatus(path, message, stats, .{
+    try changes_body_render.renderStatus(path, message, stats, .{
         .surface = surface,
         .requested_mode = .unified,
         .scroll = 0,
@@ -453,7 +453,7 @@ fn noChangesActionPresentation(hints: EmptyRemoteActionHints, fetch_key: ?[]cons
 
 const drawFileSearch = diff_surface_view.drawFileSearch;
 
-test "review no-changes adapter normalizes fetch capability and key" {
+test "changes no-changes adapter normalizes fetch capability and key" {
     const denied = noChangesActionPresentation(.{ .show_fetch = false }, "Ctrl+f");
     try std.testing.expect(denied.fetch_key == null);
 
@@ -473,12 +473,12 @@ const SidebarBranchPresentation = struct {
     };
 };
 
-const ReviewBranchActionHint = struct {
+const ChangesBranchActionHint = struct {
     text: []const u8,
     base_display_width: u16,
 };
 
-fn branchStatusSidebarPresentation(page: *const review_page.ReviewPageState, repo_root: ?[]const u8, allocator: std.mem.Allocator, available_width: u16) ?SidebarBranchPresentation {
+fn branchStatusSidebarPresentation(page: *const changes_page.ChangesPageState, repo_root: ?[]const u8, allocator: std.mem.Allocator, available_width: u16) ?SidebarBranchPresentation {
     const root = repo_root orelse return null;
     if (page.branch_status_load.pending) |pending| {
         const has_retained_snapshot = if (page.branch_status.repo_root) |snapshot_root|
@@ -512,23 +512,23 @@ fn branchStatusActionHints(status: git_branch_status.BranchStatus) SidebarBranch
     };
 }
 
-/// Text-input modes consume keys before Review's normal action route. Keep the
+/// Text-input modes consume keys before Changes's normal action route. Keep the
 /// branch fact visible, but do not advertise a shortcut that cannot currently
 /// reach the existing push or pull command.
-fn reviewBranchActionHintInputReachable(page: *const review_page.ReviewPageState) bool {
+fn changesBranchActionHintInputReachable(page: *const changes_page.ChangesPageState) bool {
     return !page.search.mode and !page.file_search.mode;
 }
 
 /// Compose discoverability chrome only when it fits after an unclipped base.
-/// The existing key/input and Review operation paths remain the sole action
+/// The existing key/input and Changes operation paths remain the sole action
 /// authority; this helper uses only stable branch topology and bound keys.
-fn reviewBranchActionHintForKeys(
+fn changesBranchActionHintForKeys(
     presentation: SidebarBranchPresentation,
     available_width: u16,
     push_key: ?[]const u8,
     pull_key: ?[]const u8,
     buffer: []u8,
-) ?ReviewBranchActionHint {
+) ?ChangesBranchActionHint {
     if (presentation.was_clipped) return null;
     const base_width = presentation.full_display_width orelse return null;
     if (base_width > available_width) return null;
@@ -538,7 +538,7 @@ fn reviewBranchActionHintForKeys(
 
     if (push) |push_label| {
         if (pull) |pull_label| {
-            if (reviewBranchActionHintCandidate(
+            if (changesBranchActionHintCandidate(
                 base_width,
                 available_width,
                 buffer,
@@ -546,7 +546,7 @@ fn reviewBranchActionHintForKeys(
                 .{ push_label, pull_label },
             )) |hint| return hint;
         }
-        return reviewBranchActionHintCandidate(
+        return changesBranchActionHintCandidate(
             base_width,
             available_width,
             buffer,
@@ -555,7 +555,7 @@ fn reviewBranchActionHintForKeys(
         );
     }
     if (pull) |pull_label| {
-        return reviewBranchActionHintCandidate(
+        return changesBranchActionHintCandidate(
             base_width,
             available_width,
             buffer,
@@ -573,13 +573,13 @@ fn eligibleActionKey(eligible: bool, key: ?[]const u8) ?[]const u8 {
     return bound_key;
 }
 
-fn reviewBranchActionHintCandidate(
+fn changesBranchActionHintCandidate(
     base_width: u16,
     available_width: u16,
     buffer: []u8,
     comptime format: []const u8,
     args: anytype,
-) ?ReviewBranchActionHint {
+) ?ChangesBranchActionHint {
     const hint = std.fmt.bufPrint(buffer, format, args) catch return null;
     if (chasen.text.displayWidth(hint) > available_width - base_width) return null;
     return .{ .text = hint, .base_display_width = base_width };
@@ -593,7 +593,7 @@ test "branch sidebar retains background snapshot but shows foreground loading" {
     var branch_status: git_branch_status.State = .{};
     try branch_status.replace("/repo", &bundle);
 
-    var page_state: review_page.ReviewPageState = .{
+    var page_state: changes_page.ChangesPageState = .{
         .branch_status = branch_status,
         .branch_status_load = .{
             .generation = 1,
@@ -616,7 +616,7 @@ test "branch sidebar retains background snapshot but shows foreground loading" {
     try std.testing.expect(!loading.action_hints.pull);
 }
 
-test "Review page header admits only exact-root branch snapshots" {
+test "Changes page header admits only exact-root branch snapshots" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("feature/header");
@@ -626,7 +626,7 @@ test "Review page header admits only exact-root branch snapshots" {
     var branch_status: git_branch_status.State = .{};
     try branch_status.replace("/repo", &bundle);
 
-    var page_state: review_page.ReviewPageState = .{
+    var page_state: changes_page.ChangesPageState = .{
         .branch_status = branch_status,
         .branch_status_load = .{
             .generation = 1,
@@ -663,7 +663,7 @@ test "Review page header admits only exact-root branch snapshots" {
     try std.testing.expect(pageHeaderPresentation(context) == null);
 }
 
-test "review branch action hint renders effective keys with muted hint style" {
+test "changes branch action hint renders effective keys with muted hint style" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("main");
@@ -673,7 +673,7 @@ test "review branch action hint renders effective keys with muted hint style" {
     var branch_status: git_branch_status.State = .{};
     try branch_status.replace("/repo", &bundle);
 
-    var page_state: review_page.ReviewPageState = .{ .branch_status = branch_status };
+    var page_state: changes_page.ChangesPageState = .{ .branch_status = branch_status };
     defer page_state.branch_status.deinit();
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 1, 2, 3 } };
@@ -738,7 +738,7 @@ test "review branch action hint renders effective keys with muted hint style" {
     try std.testing.expect(std.mem.indexOf(u8, both_unbound_snapshot, ": pull") == null);
 }
 
-test "review branch action hint follows text input authority" {
+test "changes branch action hint follows text input authority" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("main");
@@ -748,7 +748,7 @@ test "review branch action hint follows text input authority" {
     var branch_status: git_branch_status.State = .{};
     try branch_status.replace("/repo", &bundle);
 
-    var page_state: review_page.ReviewPageState = .{ .branch_status = branch_status };
+    var page_state: changes_page.ChangesPageState = .{ .branch_status = branch_status };
     defer page_state.branch_status.deinit();
     var context = testContext(&page_state, .default(), 48, 4);
     context.repo_root = "/repo";
@@ -788,7 +788,7 @@ test "review branch action hint follows text input authority" {
     try std.testing.expect(std.mem.indexOf(u8, normal_after, "main ↑0  (P: push / U: pull)") != null);
 }
 
-test "review branch action hint follows topology and width fallback" {
+test "changes branch action hint follows topology and width fallback" {
     const upstream_status: git_branch_status.BranchStatus = .{
         .head = .{ .branch = "main" },
         .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
@@ -814,26 +814,26 @@ test "review branch action hint follows topology and width fallback" {
     var hint_buffer: [64]u8 = undefined;
     try std.testing.expectEqualStrings(
         "  (P: push / U: pull)",
-        reviewBranchActionHintForKeys(presentation, full_exact_width, "P", "U", hint_buffer[0..]).?.text,
+        changesBranchActionHintForKeys(presentation, full_exact_width, "P", "U", hint_buffer[0..]).?.text,
     );
     try std.testing.expectEqualStrings(
         "  (P: push)",
-        reviewBranchActionHintForKeys(presentation, full_exact_width - 1, "P", "U", hint_buffer[0..]).?.text,
+        changesBranchActionHintForKeys(presentation, full_exact_width - 1, "P", "U", hint_buffer[0..]).?.text,
     );
     try std.testing.expectEqualStrings(
         "  (P: push)",
-        reviewBranchActionHintForKeys(presentation, push_exact_width, "P", "U", hint_buffer[0..]).?.text,
+        changesBranchActionHintForKeys(presentation, push_exact_width, "P", "U", hint_buffer[0..]).?.text,
     );
-    try std.testing.expect(reviewBranchActionHintForKeys(presentation, push_exact_width - 1, "P", "U", hint_buffer[0..]) == null);
+    try std.testing.expect(changesBranchActionHintForKeys(presentation, push_exact_width - 1, "P", "U", hint_buffer[0..]) == null);
     try std.testing.expectEqualStrings(
         "  (U: pull)",
-        reviewBranchActionHintForKeys(presentation, pull_exact_width, null, "U", hint_buffer[0..]).?.text,
+        changesBranchActionHintForKeys(presentation, pull_exact_width, null, "U", hint_buffer[0..]).?.text,
     );
     try std.testing.expectEqualStrings(
         "  (P: push)",
-        reviewBranchActionHintForKeys(presentation, push_exact_width, "P", null, hint_buffer[0..]).?.text,
+        changesBranchActionHintForKeys(presentation, push_exact_width, "P", null, hint_buffer[0..]).?.text,
     );
-    try std.testing.expect(reviewBranchActionHintForKeys(presentation, full_exact_width, null, null, hint_buffer[0..]) == null);
+    try std.testing.expect(changesBranchActionHintForKeys(presentation, full_exact_width, null, null, hint_buffer[0..]) == null);
 
     const no_upstream_status: git_branch_status.BranchStatus = .{ .head = .{ .branch = "main" } };
     const no_upstream_hints = branchStatusActionHints(no_upstream_status);
@@ -850,7 +850,7 @@ test "review branch action hint follows topology and width fallback" {
     };
     try std.testing.expectEqualStrings(
         "  (P: push)",
-        reviewBranchActionHintForKeys(no_upstream_presentation, 80, "P", "U", hint_buffer[0..]).?.text,
+        changesBranchActionHintForKeys(no_upstream_presentation, 80, "P", "U", hint_buffer[0..]).?.text,
     );
 
     const malformed_upstream_status: git_branch_status.BranchStatus = .{
@@ -871,11 +871,11 @@ test "review branch action hint follows topology and width fallback" {
     };
     try std.testing.expectEqualStrings(
         "  (P: push)",
-        reviewBranchActionHintForKeys(malformed_upstream_presentation, 80, "P", "U", hint_buffer[0..]).?.text,
+        changesBranchActionHintForKeys(malformed_upstream_presentation, 80, "P", "U", hint_buffer[0..]).?.text,
     );
 }
 
-test "review branch action hint drops before base clipping and omits non-branch terminals" {
+test "changes branch action hint drops before base clipping and omits non-branch terminals" {
     const upstream_status: git_branch_status.BranchStatus = .{
         .head = .{ .branch = "main" },
         .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
@@ -893,7 +893,7 @@ test "review branch action hint drops before base clipping and omits non-branch 
     };
     try std.testing.expect(clipped_presentation.was_clipped);
     var hint_buffer: [64]u8 = undefined;
-    try std.testing.expect(reviewBranchActionHintForKeys(
+    try std.testing.expect(changesBranchActionHintForKeys(
         clipped_presentation,
         formatted.full_display_width - 1,
         "P",
@@ -916,12 +916,12 @@ test "review branch action hint drops before base clipping and omits non-branch 
     try std.testing.expect(!detached.action_hints.pull);
     try std.testing.expect(!unknown.action_hints.push);
     try std.testing.expect(!unknown.action_hints.pull);
-    try std.testing.expect(reviewBranchActionHintForKeys(loading, 80, "P", "U", hint_buffer[0..]) == null);
-    try std.testing.expect(reviewBranchActionHintForKeys(detached, 80, "P", "U", hint_buffer[0..]) == null);
-    try std.testing.expect(reviewBranchActionHintForKeys(unknown, 80, "P", "U", hint_buffer[0..]) == null);
+    try std.testing.expect(changesBranchActionHintForKeys(loading, 80, "P", "U", hint_buffer[0..]) == null);
+    try std.testing.expect(changesBranchActionHintForKeys(detached, 80, "P", "U", hint_buffer[0..]) == null);
+    try std.testing.expect(changesBranchActionHintForKeys(unknown, 80, "P", "U", hint_buffer[0..]) == null);
 }
 
-test "review filter summary owns sidebar detail row over branch action hint" {
+test "changes filter summary owns sidebar detail row over branch action hint" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("main");
@@ -931,7 +931,7 @@ test "review filter summary owns sidebar detail row over branch action hint" {
     var branch_status: git_branch_status.State = .{};
     try branch_status.replace("/repo", &bundle);
 
-    var page_state: review_page.ReviewPageState = .{
+    var page_state: changes_page.ChangesPageState = .{
         .branch_status = branch_status,
         .review_display = .{ .changed_file_filter = .modified },
     };
@@ -981,8 +981,8 @@ fn paneTitleStyle(palette: theme.Palette) chasen.TextStyle {
 const paneSearchStyle = diff_surface_view.paneSearchStyle;
 const paneHeaderRuleStyle = diff_surface_view.paneHeaderRuleStyle;
 
-fn testContext(page: *const review_page.ReviewPageState, palette: theme.Palette, width: u16, height: u16) Context {
-    const navigation: review_navigation.View = .{
+fn testContext(page: *const changes_page.ChangesPageState, palette: theme.Palette, width: u16, height: u16) Context {
+    const navigation: changes_navigation.View = .{
         .page = page,
         .repo_root = null,
         .source = .unstaged,
@@ -1004,7 +1004,7 @@ fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette 
     return theme.Palette.fromConfig(FakeConfig{ .role = role, .color = color });
 }
 
-test "review pane title and white rule stay stable while search keeps focus treatment" {
+test "changes pane title and white rule stay stable while search keeps focus treatment" {
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 4, 5, 6 } };
@@ -1036,9 +1036,9 @@ test "review pane title and white rule stay stable while search keeps focus trea
     try std.testing.expect(!inactive_search.bold);
 }
 
-test "review file search renders a bounded typed candidate window" {
+test "changes file search renders a bounded typed candidate window" {
     const allocator = std.testing.allocator;
-    const basis: review_file_search.Basis = .{
+    const basis: changes_file_search.Basis = .{
         .repo_epoch = 1,
         .source_session_revision = 2,
         .accepted_sidebar_revision = 3,
@@ -1057,10 +1057,10 @@ test "review file search renders a bounded typed candidate window" {
         .lines = 0,
     };
 
-    var state: review_file_search.State = .{ .mode = true };
+    var state: changes_file_search.State = .{ .mode = true };
     defer state.deinit(allocator);
     try state.input.insertSlice("src/");
-    var projection = try review_file_search.buildProjection(allocator, &loaded, "src/", .{ .basis = basis });
+    var projection = try changes_file_search.buildProjection(allocator, &loaded, "src/", .{ .basis = basis });
     var projection_live = true;
     defer if (projection_live) projection.deinit(allocator);
     state.publish(allocator, &projection);
@@ -1088,19 +1088,19 @@ test "review file search renders a bounded typed candidate window" {
     try std.testing.expect(focused.style.bold);
 }
 
-test "review file search renders unavailable and no-match terminals" {
+test "changes file search renders unavailable and no-match terminals" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(48, 3);
     defer ts.deinit();
 
-    const unavailable: review_file_search.State = .{ .mode = true };
+    const unavailable: changes_file_search.State = .{ .mode = true };
     try drawFileSearch(&ts.surface, &unavailable, .default());
     var snapshot = try ts.snapshot(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "File list unavailable; wait or press Esc") != null);
     std.testing.allocator.free(snapshot);
 
     ts.surface.clearAll();
-    const no_match: review_file_search.State = .{
+    const no_match: changes_file_search.State = .{
         .mode = true,
         .basis = .{ .repo_epoch = 1, .source_session_revision = 1, .accepted_sidebar_revision = 1 },
         .projection_available = true,
@@ -1112,8 +1112,8 @@ test "review file search renders unavailable and no-match terminals" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "No matching files") != null);
 }
 
-test "review file search keeps long ASCII and Unicode input cursor visible" {
-    var state: review_file_search.State = .{ .mode = true };
+test "changes file search keeps long ASCII and Unicode input cursor visible" {
+    var state: changes_file_search.State = .{ .mode = true };
     try state.input.insertSlice("abcdefghijklmnopqrstuvwxyz");
 
     var ts: chasen.testing.TestSurface = undefined;
@@ -1141,8 +1141,8 @@ test "review file search keeps long ASCII and Unicode input cursor visible" {
     try std.testing.expect(ts.screen.cursor.col < ts.surface.size().width);
 }
 
-test "review file search unavailable terminal replaces no-changes body" {
-    const page: review_page.ReviewPageState = .{
+test "changes file search unavailable terminal replaces no-changes body" {
+    const page: changes_page.ChangesPageState = .{
         .load = .{ .state = .{ .empty = .no_changes } },
         .file_search = .{ .mode = true },
     };
@@ -1159,8 +1159,8 @@ test "review file search unavailable terminal replaces no-changes body" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "No changes") == null);
 }
 
-test "review file search uses full body when compact sidebar leaves no prompt pane" {
-    var page: review_page.ReviewPageState = .{
+test "changes file search uses full body when compact sidebar leaves no prompt pane" {
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwo()),
         .file_search = .{ .mode = true },
     };
@@ -1182,7 +1182,7 @@ test "review file search uses full body when compact sidebar leaves no prompt pa
 }
 
 test "sidebar renderer owns badges summaries selection styles and horizontal scroll" {
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{ .focus = .sidebar },
     };
@@ -1194,10 +1194,10 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     try ts.init(34, 8);
     defer ts.deinit();
 
-    const selected_row = review_layout.sidebar_header_rows;
+    const selected_row = changes_layout.sidebar_header_rows;
     try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
-    try ts.expectCellText(2, review_layout.sidebar_header_rows, "A");
-    try ts.expectCellText(2, review_layout.sidebar_header_rows + 1, "D");
+    try ts.expectCellText(2, changes_layout.sidebar_header_rows, "A");
+    try ts.expectCellText(2, changes_layout.sidebar_header_rows + 1, "D");
     try ts.expectCellText(1, 2, "2");
     const active_badge = ts.surface.readCell(2, selected_row) orelse return error.ExpectedActiveBadge;
     const active_path = ts.surface.readCell(6, selected_row) orelse return error.ExpectedActivePath;
@@ -1242,7 +1242,7 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     try search_full.init(80, 9);
     defer search_full.deinit();
     try view(testContext(&page, palette, 80, 9), &search_full.surface);
-    const search_separator_col = review_layout.sidebarWidth(80, page.viewer.sidebar_width);
+    const search_separator_col = changes_layout.sidebarWidth(80, page.viewer.sidebar_width);
     try search_full.expectCellText(search_separator_col + 2, 0, "F");
     const search_snapshot = try search_full.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(search_snapshot);
@@ -1260,7 +1260,7 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     try full.init(80, 9);
     defer full.deinit();
     try view(testContext(&page, palette, 80, 9), &full.surface);
-    const separator_col = review_layout.sidebarWidth(80, page.viewer.sidebar_width);
+    const separator_col = changes_layout.sidebarWidth(80, page.viewer.sidebar_width);
     const separator = full.surface.readCell(separator_col, selected_row) orelse return error.ExpectedSidebarSeparator;
     try std.testing.expect(separator.style.fg.eql(.default));
     try std.testing.expect(separator.style.dim);
@@ -1268,7 +1268,7 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     try std.testing.expect(!separator.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     var short: chasen.testing.TestSurface = undefined;
-    try short.init(12, review_layout.sidebar_header_rows);
+    try short.init(12, changes_layout.sidebar_header_rows);
     defer short.deinit();
     try viewSidebar(testContext(&page, palette, 80, 9), &short.surface, page.load.state.loaded.loaded);
     try short.expectCellText(1, 2, "2");
@@ -1296,16 +1296,16 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     try narrow.init(24, 8);
     defer narrow.deinit();
     try viewSidebar(testContext(&page, palette, 80, 9), &narrow.surface, page.load.state.loaded.loaded);
-    try narrow.expectCellText(2, review_layout.sidebar_header_rows, "M");
-    try narrow.expectCellText(4, review_layout.sidebar_header_rows, "m");
-    try std.testing.expect(narrow.surface.readCell(4, review_layout.sidebar_header_rows).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(narrow.surface.readCell(23, review_layout.sidebar_header_rows).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try narrow.expectCellText(2, changes_layout.sidebar_header_rows, "M");
+    try narrow.expectCellText(4, changes_layout.sidebar_header_rows, "m");
+    try std.testing.expect(narrow.surface.readCell(4, changes_layout.sidebar_header_rows).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(narrow.surface.readCell(23, changes_layout.sidebar_header_rows).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     const snapshot = try narrow.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
 }
 
-test "review markerless root renderer keeps hierarchy stats and selection styling" {
+test "changes markerless root renderer keeps hierarchy stats and selection styling" {
     const nodes = [_]file_tree.Node{
         .{
             .kind = .repo_root,
@@ -1366,7 +1366,7 @@ test "review markerless root renderer keeps hierarchy stats and selection stylin
     try std.testing.expect(!retained_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
-test "review markerless root renderer has exact scroll and narrow clipping" {
+test "changes markerless root renderer has exact scroll and narrow clipping" {
     const nodes = [_]file_tree.Node{.{
         .kind = .repo_root,
         .name = "0123456789abcdefghijklmnopqrstuv",
@@ -1521,7 +1521,7 @@ test "sidebar row stage matrix keeps semantic foreground independent of cursor c
 test "diff renderer owns header search marker gutter and input presentation" {
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .focus = .diff, .diff_cursor = .{ .hunk_header = 0 } },
     };
@@ -1538,20 +1538,20 @@ test "diff renderer owns header search marker gutter and input presentation" {
     ts.surface.clear(.{ .col = 0, .row = 0, .width = 90, .height = 10 });
     try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
     try std.testing.expect(ts.surface.readCell(0, 1).?.style.fg.eql(.default));
-    try std.testing.expect(!ts.surface.readCell(1, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(!ts.surface.readCell(89, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!ts.surface.readCell(1, changes_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(!ts.surface.readCell(89, changes_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     page.viewer.focus = .diff;
     page.search.match_offset = 0;
     ts.surface.clear(.{ .col = 0, .row = 0, .width = 90, .height = 10 });
     try viewDiffPane(testContext(&page, palette, 90, 11), &ts.surface, page.load.state.loaded.loaded);
-    try ts.expectCellText(0, review_layout.diff_body_start_row, "»");
-    try ts.expectCellText(1, review_layout.diff_body_start_row, "▌");
-    try ts.expectCellText(2, review_layout.diff_body_start_row, "┏");
-    try std.testing.expect(!ts.surface.readCell(0, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(ts.surface.readCell(1, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(ts.surface.readCell(2, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(ts.surface.readCell(89, review_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try ts.expectCellText(0, changes_layout.diff_body_start_row, "»");
+    try ts.expectCellText(1, changes_layout.diff_body_start_row, "▌");
+    try ts.expectCellText(2, changes_layout.diff_body_start_row, "┏");
+    try std.testing.expect(!ts.surface.readCell(0, changes_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(1, changes_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(2, changes_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(ts.surface.readCell(89, changes_layout.diff_body_start_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
     page.search.match_offset = null;
     page.viewer.display_mode = .side_by_side;
@@ -1575,8 +1575,8 @@ test "diff renderer owns header search marker gutter and input presentation" {
     try std.testing.expect(std.mem.indexOf(u8, search_snapshot, "(u: toggle)") == null);
 }
 
-test "review display mode header key follows the effective keymap and input owner" {
-    var page: review_page.ReviewPageState = .{};
+test "changes display mode header key follows the effective keymap and input owner" {
+    var page: changes_page.ChangesPageState = .{};
     var config: keymap.Config = .{};
     config.set(.toggle_display_mode, .{ .plain_codepoint = 'z' });
     var context = testContext(&page, .default(), 90, 10);
@@ -1641,7 +1641,7 @@ test "status-only header keeps semantic statistics and metadata when inactive" {
 }
 
 test "status-only fallback preserves conflict suffix outside resolver rendering" {
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .status_only = 0 } },
     };
@@ -1658,7 +1658,7 @@ test "status-only fallback preserves conflict suffix outside resolver rendering"
 
 test "inactive status-only pending and inert diff path headers keep semantic intensity" {
     const palette = theme.Palette.default();
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .selected_target = .{ .status_only = 0 },
@@ -1681,9 +1681,9 @@ test "inactive status-only pending and inert diff path headers keep semantic int
     try std.testing.expect(status_path.style.bold);
     try std.testing.expect(!status_path.style.dim);
 
-    page.review_projection.pending = try review_projection.testing.cloneRequest(
+    page.changes_projection.pending = try changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "new.zig",
@@ -1692,7 +1692,7 @@ test "inactive status-only pending and inert diff path headers keep semantic int
         0,
         0,
     );
-    defer page.review_projection.clearPending(std.testing.allocator);
+    defer page.changes_projection.clearPending(std.testing.allocator);
     var pending: chasen.testing.TestSurface = undefined;
     try pending.init(40, 6);
     defer pending.deinit();
@@ -1701,7 +1701,7 @@ test "inactive status-only pending and inert diff path headers keep semantic int
     try std.testing.expect(pending_path.style.fg.eql(palette.color(.accent)));
     try std.testing.expect(pending_path.style.bold);
     try std.testing.expect(!pending_path.style.dim);
-    page.review_projection.clearPending(std.testing.allocator);
+    page.changes_projection.clearPending(std.testing.allocator);
 
     const inert_eligibility = [_]loaded_diff.FileTextEligibility{.inert_invalid_utf8};
     var inert_loaded = test_support.loadedDiffOne();
@@ -1719,9 +1719,9 @@ test "inactive status-only pending and inert diff path headers keep semantic int
     try std.testing.expect(!inert_path.style.dim);
 }
 
-test "reviewed sidebar marker and visible search marker are Review view concerns" {
+test "reviewed sidebar marker and visible search marker are Changes view concerns" {
     var reviewed = [_]bool{ true, false };
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(.{
             .text = "",
             .document = .{ .files = &test_support.files_two_statuses },
@@ -1740,7 +1740,7 @@ test "reviewed sidebar marker and visible search marker are Review view concerns
     defer ts.deinit();
     const ctx = testContext(&page, .default(), 80, 9);
     try viewSidebar(ctx, &ts.surface, page.load.state.loaded.loaded);
-    try ts.expectCellText(1, review_layout.sidebar_header_rows, "✓");
+    try ts.expectCellText(1, changes_layout.sidebar_header_rows, "✓");
     drawSearchMatchMarker(ctx, &ts.surface);
-    try ts.expectCellText(0, review_layout.diff_body_start_row + 1, "»");
+    try ts.expectCellText(0, changes_layout.diff_body_start_row + 1, "»");
 }

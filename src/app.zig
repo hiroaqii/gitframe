@@ -20,15 +20,15 @@ const compare_page = @import("app/pages/compare.zig");
 const compare_coordinator = @import("app/pages/compare/coordinator.zig");
 const compare_input = @import("app/pages/compare/input.zig");
 const compare_navigation = @import("app/pages/compare/navigation.zig");
-const review_page = @import("app/pages/review.zig");
-const review_content = @import("app/pages/review/content.zig");
-const review_action_fence = @import("app/pages/review/action_fence.zig");
-const review_message = @import("app/pages/review/message.zig");
-const review_navigation = @import("app/pages/review/navigation.zig");
-const review_operations = @import("app/pages/review/operations.zig");
-const review_read = @import("app/pages/review/read_coordinator.zig");
-const review_page_update = @import("app/pages/review/update.zig");
-const review_view = @import("app/pages/review/view.zig");
+const changes_page = @import("app/pages/changes.zig");
+const changes_content = @import("app/pages/changes/content.zig");
+const changes_action_fence = @import("app/pages/changes/action_fence.zig");
+const changes_message = @import("app/pages/changes/message.zig");
+const changes_navigation = @import("app/pages/changes/navigation.zig");
+const changes_operations = @import("app/pages/changes/operations.zig");
+const changes_read = @import("app/pages/changes/read_coordinator.zig");
+const changes_page_update = @import("app/pages/changes/update.zig");
+const changes_view = @import("app/pages/changes/view.zig");
 const repository_page = @import("app/pages/repository.zig");
 const repository_coordinator = @import("app/pages/repository/coordinator.zig");
 const repository_layout = @import("app/pages/repository/layout.zig");
@@ -58,7 +58,7 @@ const ActionFinishedMsg = app_message.ActionFinished;
 const ShellEffectFinishedMsg = app_message.ShellEffectFinished;
 
 const PageStates = struct {
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
     config: page.LazyPlaceholder = .{},
@@ -85,7 +85,7 @@ pub const RedrawPlan = struct {
 };
 
 pub const App = struct {
-    active_page: page.Id = .review,
+    active_page: page.Id = .changes,
     repo_session: repo_session.State = .{},
     pages: PageStates = .{},
     config: CliConfig = .{},
@@ -122,21 +122,21 @@ pub const App = struct {
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
         self.local_workflow = workflow_local.LocalState.init(ctx.allocator());
-        self.pages.review.init(self.config.auto_reload, self.user_config.reload, self.config.source);
-        _ = self.pageCoordinator().activateReview();
-        if (self.pages.review.auto_reload.enabled()) {
-            try ctx.timer().every(auto_reload_timer_id, self.pages.review.auto_reload.interval_ns, .auto_reload_tick);
+        self.pages.changes.init(self.config.auto_reload, self.user_config.reload, self.config.source);
+        _ = self.pageCoordinator().activateChanges();
+        if (self.pages.changes.auto_reload.enabled()) {
+            try ctx.timer().every(auto_reload_timer_id, self.pages.changes.auto_reload.interval_ns, .auto_reload_tick);
         }
         if (diff_source.sourceRequiresRepo(self.config.source)) {
-            try self.reviewRead().startRepoDiscovery(ctx, null);
+            try self.changesRead().startRepoDiscovery(ctx, null);
         } else {
-            try self.reviewRead().startDiffLoad(ctx, .initial);
+            try self.changesRead().startDiffLoad(ctx, .initial);
         }
     }
 
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
-        self.pages.review.deinit(deinit_ctx.allocator);
+        self.pages.changes.deinit(deinit_ctx.allocator);
         self.pages.repository.deinit(deinit_ctx.allocator);
         self.pages.compare.deinit(deinit_ctx.allocator);
         self.repo_session.deinit(deinit_ctx.allocator);
@@ -162,7 +162,7 @@ pub const App = struct {
             .home = home,
             .env_map = self.env_map,
             .action_pending = self.actionLifecycleView().hasPending(),
-            .review = self.reviewRead().repositorySessionPort(),
+            .changes = self.changesRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
             .compare = .{ .page = &self.pages.compare },
             .shell = self.remote_workflow.repositoryInvalidationPort(&self.overlay),
@@ -193,7 +193,7 @@ pub const App = struct {
     fn pageCoordinator(self: *App) page_coordinator.Controller {
         return .{
             .active_page = &self.active_page,
-            .review = &self.pages.review,
+            .changes = &self.pages.changes,
             .repository = &self.pages.repository,
             .compare = &self.pages.compare,
             .config_page = &self.pages.config,
@@ -223,45 +223,45 @@ pub const App = struct {
     ) !void {
         switch (intent) {
             .none => {},
-            .review_revalidation => try self.reviewRead().requestRevalidation(ctx),
-            .review_repository_changed => try self.reviewRead().startDiffLoad(ctx, .repo_switch),
+            .changes_revalidation => try self.changesRead().requestRevalidation(ctx),
+            .changes_repository_changed => try self.changesRead().startDiffLoad(ctx, .repo_switch),
             .compare_refresh => try self.compareCoordinator().refresh(ctx),
         }
     }
 
-    /// Builds the concrete Review navigation owner with only the shell inputs
-    /// needed by Review-local cursor/search/selection logic. The controller
+    /// Builds the concrete Changes navigation owner with only the shell inputs
+    /// needed by Changes-local cursor/search/selection logic. The controller
     /// deliberately cannot reach App, overlays, processes, or async effects.
-    fn reviewNavigation(self: *App) review_navigation.Controller {
+    fn changesNavigation(self: *App) changes_navigation.Controller {
         const size = self.shellLayout().bodySize();
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = self.repoSessionView().activeRoot(),
             .repo_epoch = self.repoSessionView().epoch(),
             .root_identity = self.repoSessionView().activeIdentity(),
             .source = self.config.source,
             .layout = .{ .width = size.width, .height = size.height },
-            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
-            .diagnostics = .{ .target = &self.pages.review.status },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.changes),
+            .diagnostics = .{ .target = &self.pages.changes.status },
         };
     }
 
-    fn reviewNavigationView(self: *const App) review_navigation.View {
+    fn changesNavigationView(self: *const App) changes_navigation.View {
         const size = self.shellLayout().bodySize();
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = self.repoSessionView().activeRoot(),
             .repo_epoch = self.repoSessionView().epoch(),
             .root_identity = self.repoSessionView().activeIdentity(),
             .source = self.config.source,
             .layout = .{ .width = size.width, .height = size.height },
-            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.changes),
         };
     }
 
     fn displayModeToggleHintWidth(self: *const App, target: page.Id) u16 {
         const reachable = switch (target) {
-            .review => !self.pages.review.search.mode and !self.pages.review.file_search.mode,
+            .changes => !self.pages.changes.search.mode and !self.pages.changes.file_search.mode,
             .compare => !self.pages.compare.search.mode and
                 !self.pages.compare.file_search.mode and
                 !self.pages.compare.base_picker.open,
@@ -275,41 +275,41 @@ pub const App = struct {
         );
     }
 
-    fn reviewOperations(self: *const App) review_operations.View {
+    fn changesOperations(self: *const App) changes_operations.View {
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigationView(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigationView(),
             .source = self.config.source,
             .repo_root = self.repoSessionView().activeRoot(),
-            .activation_state = self.pages.review.activation.state,
+            .activation_state = self.pages.changes.activation.state,
         };
     }
 
-    fn reviewContent(self: *const App) review_content.View {
+    fn changesContent(self: *const App) changes_content.View {
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigationView(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigationView(),
             .source = self.config.source,
             .repo_root = self.repoSessionView().activeRoot(),
         };
     }
 
-    fn reviewOperationController(self: *App) review_operations.Controller {
+    fn changesOperationController(self: *App) changes_operations.Controller {
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigation(),
-            .view_state = self.reviewOperations(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigation(),
+            .view_state = self.changesOperations(),
         };
     }
 
-    fn reviewActionFence(self: *App) review_action_fence.Controller {
+    fn changesActionFence(self: *App) changes_action_fence.Controller {
         return .{
-            .read_authority = &self.pages.review.repository_read_authority,
-            .activation = &self.pages.review.activation,
-            .action_cursor = &self.pages.review.action_cursor,
-            .auto_reload = &self.pages.review.auto_reload,
-            .review_projection = &self.pages.review.review_projection,
-            .deferred_projection_apply = &self.pages.review.deferred_projection_apply,
+            .read_authority = &self.pages.changes.repository_read_authority,
+            .activation = &self.pages.changes.activation,
+            .action_cursor = &self.pages.changes.action_cursor,
+            .auto_reload = &self.pages.changes.auto_reload,
+            .changes_projection = &self.pages.changes.changes_projection,
+            .deferred_projection_apply = &self.pages.changes.deferred_projection_apply,
         };
     }
 
@@ -320,7 +320,7 @@ pub const App = struct {
     fn actionLifecycle(self: *App) action_lifecycle.Controller {
         return .{
             .runtime = &self.action_runtime,
-            .fence = self.reviewActionFence(),
+            .fence = self.changesActionFence(),
         };
     }
 
@@ -332,12 +332,12 @@ pub const App = struct {
         return .{
             .state = &self.local_workflow,
             .lifecycle = self.actionLifecycle(),
-            .operations = self.reviewOperationController(),
+            .operations = self.changesOperationController(),
             .repo = self.repoSessionView(),
-            .current_review_root = self.currentReviewActionRoot(),
+            .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
             .user_config = &self.user_config,
-            .status = &self.pages.review.status,
+            .status = &self.pages.changes.status,
             .overlay = &self.overlay,
         };
     }
@@ -351,14 +351,14 @@ pub const App = struct {
         return .{
             .state = &self.remote_workflow,
             .lifecycle = self.actionLifecycle(),
-            .operations = self.reviewOperationController(),
+            .operations = self.changesOperationController(),
             .repo = self.repoSessionView(),
-            .current_review_root = self.currentReviewActionRoot(),
+            .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
             .active_page = self.active_page,
-            .review_origin = origins.review(),
+            .changes_origin = origins.changes(),
             .effect_snapshot = origins.snapshot,
-            .status = &self.pages.review.status,
+            .status = &self.pages.changes.status,
             .overlay = &self.overlay,
             .redraw = .{ .skip_requested = &self.redraw_plan.skip_requested },
         };
@@ -370,19 +370,19 @@ pub const App = struct {
 
     fn shellEffectOrigins(self: *const App) shell_effects.OriginContext {
         const repo_epoch = self.repoSessionView().epoch();
-        const review_identity = self.pages.review.activation.currentIdentity();
+        const changes_identity = self.pages.changes.activation.currentIdentity();
         const compare_identity = self.pages.compare.activation.currentIdentity();
         return .{
             .snapshot = .{
                 .active_page = self.active_page,
                 .repo_epoch = repo_epoch,
-                .review_activation_id = self.pages.review.activation.next_activation_id,
+                .changes_activation_id = self.pages.changes.activation.next_activation_id,
                 .repository_activation_id = self.pages.repository.activation_id,
                 .compare_activation_id = self.pages.compare.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = self.localWorkflowView().commitPanelInstanceId(),
             },
-            .review_repo_epoch = if (review_identity) |identity| identity.repo_epoch else repo_epoch,
+            .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
             .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
         };
@@ -396,7 +396,7 @@ pub const App = struct {
             .origins = self.shellEffectOrigins(),
             .diagnostics = .{
                 .shell = &self.status,
-                .review = &self.pages.review.status,
+                .changes = &self.pages.changes.status,
                 .repository = &self.pages.repository.status,
                 .compare = &self.pages.compare.status,
             },
@@ -404,18 +404,18 @@ pub const App = struct {
         };
     }
 
-    fn currentReviewActionRoot(self: *const App) ?[]const u8 {
-        if (self.active_page != .review or
-            self.pages.review.activation.currentIdentity() == null or
+    fn currentChangesActionRoot(self: *const App) ?[]const u8 {
+        if (self.active_page != .changes or
+            self.pages.changes.activation.currentIdentity() == null or
             diff_source.sourceIsOneShotInput(self.config.source)) return null;
         return self.repoSessionView().activeRoot();
     }
 
-    fn reviewRead(self: *App) review_read.Controller {
+    fn changesRead(self: *App) changes_read.Controller {
         const body_size = self.shellLayout().bodySize();
         return .{
-            .page_state = &self.pages.review,
-            .fence = self.reviewActionFence().view(),
+            .page_state = &self.pages.changes,
+            .fence = self.changesActionFence().view(),
             .active_page = self.active_page,
             .repo = self.repoSessionView(),
             .source = self.config.source,
@@ -452,8 +452,8 @@ pub const App = struct {
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
                 self.drag_auto_scroll.clear();
-                const review_selection_anchor = self.reviewNavigation().captureSelectionViewportAnchor();
-                self.reviewNavigation().clearMouseDiffSelection();
+                const changes_selection_anchor = self.changesNavigation().captureSelectionViewportAnchor();
+                self.changesNavigation().clearMouseDiffSelection();
                 const previous_compare_view = self.compareCoordinator().navigationView();
                 var previous_compare_adapter = previous_compare_view.resolver();
                 const previous_compare_body = previous_compare_view.bodyView(&previous_compare_adapter);
@@ -463,22 +463,22 @@ pub const App = struct {
                 }
                 const repository_selection_anchor = self.pages.repository.captureSelectionViewportAnchor();
                 self.pages.repository.cancelMouseOwner();
-                const previous_width = self.reviewNavigationView().diffPaneWidth();
-                const previous_mode = self.reviewNavigationView().effectiveDisplayMode();
+                const previous_width = self.changesNavigationView().diffPaneWidth();
+                const previous_mode = self.changesNavigationView().effectiveDisplayMode();
                 const previous_compare_width = previous_compare_body.view.diffPaneWidth();
                 const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
                 self.terminal_size = size;
-                self.reviewNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-                if (previous_mode != self.reviewNavigationView().effectiveDisplayMode()) {
-                    self.reviewNavigation().clearMouseDiffSelection();
-                    self.pages.review.advanceSelectionLayoutRevision();
+                self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+                if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
+                    self.changesNavigation().clearMouseDiffSelection();
+                    self.pages.changes.advanceSelectionLayoutRevision();
                 }
-                if (review_selection_anchor) |anchor| self.reviewNavigation().restoreSelectionViewportAnchor(anchor);
-                self.reviewNavigation().clampSidebarHorizontalScroll();
-                self.reviewNavigation().clampDiffNavigationKeepingHunkVisible();
-                self.reviewNavigation().updateSearchMatchOffset();
-                self.reviewNavigation().scrollSearchMatchIntoView();
-                self.reviewNavigation().clampDiffNavigation();
+                if (changes_selection_anchor) |anchor| self.changesNavigation().restoreSelectionViewportAnchor(anchor);
+                self.changesNavigation().clampSidebarHorizontalScroll();
+                self.changesNavigation().clampDiffNavigationKeepingHunkVisible();
+                self.changesNavigation().updateSearchMatchOffset();
+                self.changesNavigation().scrollSearchMatchIntoView();
+                self.changesNavigation().clampDiffNavigation();
                 const compare_controller = self.compareCoordinator().navigation();
                 var compare_adapter = compare_controller.updateAdapter();
                 var compare_body = compare_adapter.bodyController();
@@ -509,7 +509,7 @@ pub const App = struct {
                 self.remoteWorkflow().finishPushUpstreamFinalize(ctx.allocator(), finished),
             ),
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
-            .review => |review_msg| _ = try self.updateReview(ctx, review_msg),
+            .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
             .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
             .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
@@ -567,7 +567,7 @@ pub const App = struct {
             .repo_picker_move_right => self.repoSession().movePickerCursorRight(),
             .open_help => {
                 self.drag_auto_scroll.clear();
-                if (self.active_page == .review) self.reviewNavigation().clearMouseDiffSelection();
+                if (self.active_page == .changes) self.changesNavigation().clearMouseDiffSelection();
                 if (self.active_page == .compare and self.pages.compare.selection_owner.activeMouseSelection()) {
                     self.pages.compare.selection_owner = .none;
                 }
@@ -602,12 +602,12 @@ pub const App = struct {
             .close_push_error => self.remoteWorkflow().clearPushError(ctx.allocator()),
             .run_interactive_push => try self.remoteWorkflow().runInteractivePush(ctx),
             .reload => switch (self.active_page) {
-                .review => {
-                    switch (self.reviewRead().prepareManualReload()) {
+                .changes => {
+                    switch (self.changesRead().prepareManualReload()) {
                         .blocked => {},
                         .ready => {
                             self.remoteWorkflow().clearBranchSwitch(ctx.allocator());
-                            try self.reviewRead().startPreparedManualReload(ctx);
+                            try self.changesRead().startPreparedManualReload(ctx);
                         },
                     }
                 },
@@ -615,11 +615,11 @@ pub const App = struct {
                 .compare => try self.compareCoordinator().refresh(ctx),
                 .config => self.status.set("reload is not available on this page yet", .{}),
             },
-            .auto_reload_tick => try self.reviewRead().autoReloadTick(ctx),
+            .auto_reload_tick => try self.changesRead().autoReloadTick(ctx),
             .focus_lost => {
                 self.drag_auto_scroll.clear();
                 switch (self.active_page) {
-                    .review => self.reviewNavigation().clearDiffSelection(),
+                    .changes => self.changesNavigation().clearDiffSelection(),
                     .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
                     .compare => self.pages.compare.selection_owner = .none,
                     .config => {},
@@ -632,23 +632,23 @@ pub const App = struct {
                 self.requestQuit(ctx);
             },
         }
-        self.reviewRead().retireSupersededActionCursor(ctx, self.actionLifecycleView().generation());
-        try self.reviewRead().applyDeferredSourceIfReady(ctx);
-        try self.reviewRead().applyDeferredProjectionIfReady(ctx);
+        self.changesRead().retireSupersededActionCursor(ctx, self.actionLifecycleView().generation());
+        try self.changesRead().applyDeferredSourceIfReady(ctx);
+        try self.changesRead().applyDeferredProjectionIfReady(ctx);
         if (try self.compareCoordinator().applyDeferred(ctx) == .skip) self.redraw_plan.requestSkip();
-        try self.reviewRead().maybeStartQueuedRevalidation(ctx);
+        try self.changesRead().maybeStartQueuedRevalidation(ctx);
         try self.repositoryCoordinator().startPending(ctx);
-        const revalidation_queued_before_projection = self.reviewRead().hasQueuedFullRevalidation();
-        if (self.active_page == .review) try self.reviewRead().ensureProjection(ctx);
+        const revalidation_queued_before_projection = self.changesRead().hasQueuedFullRevalidation();
+        if (self.active_page == .changes) try self.changesRead().ensureProjection(ctx);
         // Boundary inert retention queues its repair revalidation inside
-        // ensureReviewProjection, after the consumption point above already
+        // ensureChangesProjection, after the consumption point above already
         // ran. Consume a queue born in this tail so the repair starts in the
         // same cycle even with watch off and no further input. Pre-existing
         // queued intent keeps its single consumption point above.
         if (!revalidation_queued_before_projection and
-            self.reviewRead().hasQueuedFullRevalidation())
+            self.changesRead().hasQueuedFullRevalidation())
         {
-            try self.reviewRead().maybeStartQueuedRevalidation(ctx);
+            try self.changesRead().maybeStartQueuedRevalidation(ctx);
         }
         self.actionLifecycle().reconcileSpinner(ctx);
         if (!self.redraw_plan.resolvesToSkip() and
@@ -678,10 +678,10 @@ pub const App = struct {
         continuation: app_message.MouseSelectionContinuation,
     ) !void {
         const target: drag_auto_scroll.Target = switch (continuation.target) {
-            .review => |point| blk: {
-                if (self.active_page != .review) break :blk .review;
-                _ = try self.updateReview(ctx, .{ .mouse_diff_drag = point });
-                break :blk .review;
+            .changes => |point| blk: {
+                if (self.active_page != .changes) break :blk .changes;
+                _ = try self.updateChanges(ctx, .{ .mouse_diff_drag = point });
+                break :blk .changes;
             },
             .compare => |point| blk: {
                 if (self.active_page != .compare) break :blk .compare;
@@ -710,8 +710,8 @@ pub const App = struct {
         // or drain a deferred replacement source.
         self.drag_auto_scroll.clear();
         switch (continuation.target) {
-            .review => |point| {
-                if (self.active_page == .review) _ = try self.updateReview(ctx, .{ .mouse_diff_release = point });
+            .changes => |point| {
+                if (self.active_page == .changes) _ = try self.updateChanges(ctx, .{ .mouse_diff_release = point });
             },
             .compare => |point| {
                 if (self.active_page == .compare) _ = try self.updateCompare(ctx, .{ .shared = .{ .mouse_diff_release = point } });
@@ -738,7 +738,7 @@ pub const App = struct {
         };
 
         const outcome: ?drag_auto_scroll.StepOutcome = switch (active.target) {
-            .review => try self.updateReview(ctx, .{ .mouse_diff_auto_scroll_step = active.intent }),
+            .changes => try self.updateChanges(ctx, .{ .mouse_diff_auto_scroll_step = active.intent }),
             .compare => try self.updateCompare(ctx, .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } }),
             .repository => blk: {
                 const body_size = self.shellLayout().bodySize();
@@ -766,14 +766,14 @@ pub const App = struct {
         target: drag_auto_scroll.Target,
     ) ?drag_auto_scroll.Viewport {
         if (self.active_page != switch (target) {
-            .review => page.Id.review,
+            .changes => page.Id.changes,
             .compare => page.Id.compare,
             .repository => page.Id.repository,
         }) return null;
 
         return switch (target) {
-            .review => blk: {
-                var adapter = self.reviewNavigation().updateAdapter();
+            .changes => blk: {
+                var adapter = self.changesNavigation().updateAdapter();
                 break :blk diffAutoScrollViewport(adapter.shared().navigation);
             },
             .compare => blk: {
@@ -811,19 +811,19 @@ pub const App = struct {
         self.drag_auto_scroll.scheduled_generation = active.generation;
     }
 
-    fn updateReview(
+    fn updateChanges(
         self: *App,
         ctx: *chasen.Ctx(Msg),
-        msg: review_message.Msg,
+        msg: changes_message.Msg,
     ) !?drag_auto_scroll.StepOutcome {
-        var page_update = try (review_page_update.Controller{
-            .navigation = self.reviewNavigation(),
+        var page_update = try (changes_page_update.Controller{
+            .navigation = self.changesNavigation(),
         }).apply(self.allocator, msg);
         defer page_update.deinit(self.allocator);
         const auto_scroll = page_update.auto_scroll;
 
         if (page_update.capture_display_override) {
-            try self.reviewRead().captureDisplayOverride(ctx.allocator());
+            try self.changesRead().captureDisplayOverride(ctx.allocator());
         }
 
         var command = page_update.takeCommand() orelse return auto_scroll;
@@ -904,12 +904,12 @@ pub const App = struct {
 
     fn finishLoadResult(self: *App, ctx: *chasen.Ctx(Msg), finished: LoadFinishedMsg) !void {
         switch (finished) {
-            .review => |review_result| switch (review_result) {
-                .source => |result| try self.reviewRead().finishDiffLoad(ctx.allocator(), result),
-                .status => |result| try self.reviewRead().finishStatusLoad(ctx.allocator(), result),
-                .branch_status => |result| self.reviewRead().finishBranchStatusLoad(ctx.allocator(), result),
-                .projection => |result| try self.reviewRead().finishProjectionLoad(ctx.allocator(), result),
-                .projection_syntax => |result| self.reviewRead().finishGeneratedProjectionSyntax(ctx.allocator(), result),
+            .changes => |changes_result| switch (changes_result) {
+                .source => |result| try self.changesRead().finishDiffLoad(ctx.allocator(), result),
+                .status => |result| try self.changesRead().finishStatusLoad(ctx.allocator(), result),
+                .branch_status => |result| self.changesRead().finishBranchStatusLoad(ctx.allocator(), result),
+                .projection => |result| try self.changesRead().finishProjectionLoad(ctx.allocator(), result),
+                .projection_syntax => |result| self.changesRead().finishGeneratedProjectionSyntax(ctx.allocator(), result),
             },
             .compare => |compare_result| switch (compare_result) {
                 .source => |result| {
@@ -932,7 +932,7 @@ pub const App = struct {
                 .branch_list => |result| try self.remoteWorkflow().finishBranchListLoad(ctx.allocator(), result),
             },
             .coordinator => |coordinator_result| switch (coordinator_result) {
-                .repo_discovery => |result| try self.finishReviewRepoDiscovery(ctx, result),
+                .repo_discovery => |result| try self.finishChangesRepoDiscovery(ctx, result),
             },
         }
     }
@@ -961,8 +961,8 @@ pub const App = struct {
         finished: ShellEffectFinishedMsg,
     ) !void {
         switch (finished) {
-            .editor => |result| if (self.shellEffects().finishEditor(result) == .reload_review) {
-                try self.reviewRead().reloadAfterEditor(ctx);
+            .editor => |result| if (self.shellEffects().finishEditor(result) == .reload_changes) {
+                try self.changesRead().reloadAfterEditor(ctx);
             },
             .clipboard => |result| self.shellEffects().finishClipboard(result),
         }
@@ -977,7 +977,7 @@ pub const App = struct {
             self.localWorkflow().cancelConfirmations(ctx.allocator());
         }
         if (outcome.reload != .none) {
-            try self.reviewRead().applyEffectReload(ctx, outcome.reload);
+            try self.changesRead().applyEffectReload(ctx, outcome.reload);
         }
         if (outcome.quit_after_terminal) {
             self.teardown_requested = true;
@@ -1018,7 +1018,7 @@ pub const App = struct {
         maybe_intent: ?workflow_local.ActionReloadIntent,
     ) !void {
         const intent = maybe_intent orelse return;
-        try self.reviewRead().applyActionOutcome(
+        try self.changesRead().applyActionOutcome(
             ctx,
             intent.pending,
             intent.active_matches,
@@ -1029,7 +1029,7 @@ pub const App = struct {
     fn clearEphemeralStatusForUserAction(self: *App, msg: Msg) void {
         if (app_message.keepsEphemeralStatus(msg)) return;
         self.status.clearIfEphemeral();
-        if (self.active_page == .review) self.pages.review.status.clearIfEphemeral();
+        if (self.active_page == .changes) self.pages.changes.status.clearIfEphemeral();
         if (self.active_page == .compare) self.pages.compare.status.clearIfEphemeral();
         if (self.active_page == .repository) self.pages.repository.status.clearIfEphemeral();
     }
@@ -1045,7 +1045,7 @@ pub const App = struct {
         const local = self.localWorkflowView();
         const remote = self.remoteWorkflowView();
         return .{
-            .review = self.reviewViewContext(),
+            .changes = self.changesViewContext(),
             .compare = .{
                 .page = &self.pages.compare,
                 .palette = self.theme,
@@ -1089,7 +1089,7 @@ pub const App = struct {
             .push_retry_target = remote.pushRetryTarget(),
             .push_retry_inspecting = remote.pushRetryInspecting(),
             .branch_switch = remote.branchSwitch(),
-            .staged_summary = switch (self.reviewOperations().commitSummary()) {
+            .staged_summary = switch (self.changesOperations().commitSummary()) {
                 .unavailable => .unavailable,
                 .loading_or_stale => .loading_or_stale,
                 .ready => |ready| .{ .ready = .{ .count = ready.count } },
@@ -1097,31 +1097,31 @@ pub const App = struct {
         };
     }
 
-    fn reviewEmptyRemoteActionHints(self: *const App) review_view.EmptyRemoteActionHints {
-        var hints: review_view.EmptyRemoteActionHints = .{
+    fn changesEmptyRemoteActionHints(self: *const App) changes_view.EmptyRemoteActionHints {
+        var hints: changes_view.EmptyRemoteActionHints = .{
             .show_repo_picker = self.repoSessionView().hasWorkspace(),
         };
         // The empty-state hint is only a display projection, but `U` is still a
         // mutating operation. Keep it tied to the same target gate as the real
         // request path so stale or missing clean-status snapshots cannot be
         // advertised as safe pull capability.
-        if (self.reviewOperations().pullTarget() == .ready) hints.show_pull = true;
-        if (self.reviewOperations().fetchTarget() == .ready) {
+        if (self.changesOperations().pullTarget() == .ready) hints.show_pull = true;
+        if (self.changesOperations().fetchTarget() == .ready) {
             hints.show_fetch = true;
         }
         return hints;
     }
 
-    fn reviewViewContext(self: *const App) review_view.Context {
-        return review_view.Context.init(
-            &self.pages.review,
-            self.reviewNavigationView(),
+    fn changesViewContext(self: *const App) changes_view.Context {
+        return changes_view.Context.init(
+            &self.pages.changes,
+            self.changesNavigationView(),
             self.theme,
             self.keymap,
             self.config.sourceLabel(),
             self.config.source,
             self.repoSessionView().activeRoot(),
-            self.reviewEmptyRemoteActionHints(),
+            self.changesEmptyRemoteActionHints(),
         );
     }
 
@@ -1144,27 +1144,27 @@ pub const App = struct {
         };
         var compare_body_adapter = compare_navigation_view.resolver();
         const compare_body_view = compare_navigation_view.bodyView(&compare_body_adapter);
-        const review_navigation_view = self.reviewNavigationView();
+        const changes_navigation_view = self.changesNavigationView();
         return .{
             .active_page = self.active_page,
-            .review = .{
+            .changes = .{
                 .key = .{
-                    .search_mode = self.pages.review.search.mode,
-                    .file_search_mode = self.pages.review.file_search.mode,
-                    .search_query_len = self.pages.review.search.query.len,
-                    .focus = self.pages.review.viewer.focus,
-                    .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
-                    .side_by_side = review_navigation_view.effectiveDisplayMode() == .side_by_side,
+                    .search_mode = self.pages.changes.search.mode,
+                    .file_search_mode = self.pages.changes.file_search.mode,
+                    .search_query_len = self.pages.changes.search.query.len,
+                    .focus = self.pages.changes.viewer.focus,
+                    .sidebar_hidden = self.pages.changes.viewer.sidebar_hidden,
+                    .side_by_side = changes_navigation_view.effectiveDisplayMode() == .side_by_side,
                     .review_mode = self.config.review_mode,
-                    .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.review.selection_owner),
-                    .retained_selection_action_available = review_navigation_view.retainedSelectionActionAvailable(),
+                    .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.changes.selection_owner),
+                    .retained_selection_action_available = changes_navigation_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,
                 },
-                .selection_owner = &self.pages.review.selection_owner,
-                .loaded = review_navigation_view.activeLoadedDiffConst(),
-                .selected_node = self.pages.review.viewer.selected_node,
-                .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
-                .sidebar_width = self.pages.review.viewer.sidebar_width,
+                .selection_owner = &self.pages.changes.selection_owner,
+                .loaded = changes_navigation_view.activeLoadedDiffConst(),
+                .selected_node = self.pages.changes.viewer.selected_node,
+                .sidebar_hidden = self.pages.changes.viewer.sidebar_hidden,
+                .sidebar_width = self.pages.changes.viewer.sidebar_width,
             },
             .compare = .{
                 .key = .{
@@ -1208,7 +1208,7 @@ pub const App = struct {
 
     fn activePageStatus(self: *const App) ?*const app_state.StatusMessage {
         return switch (self.active_page) {
-            .review => &self.pages.review.status,
+            .changes => &self.pages.changes.status,
             .repository => &self.pages.repository.status,
             .compare => &self.pages.compare.status,
             .config => null,
@@ -1217,7 +1217,7 @@ pub const App = struct {
 
     fn activePageStatusMut(self: *App) ?*app_state.StatusMessage {
         return switch (self.active_page) {
-            .review => &self.pages.review.status,
+            .changes => &self.pages.changes.status,
             .repository => &self.pages.repository.status,
             .compare => &self.pages.compare.status,
             .config => null,
@@ -1236,41 +1236,41 @@ pub const App = struct {
     fn openSelectedFileInEditor(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         try self.shellEffects().requestEditor(
             ctx,
-            self.reviewContent().editorTarget(),
+            self.changesContent().editorTarget(),
             self.actionLifecycleView().hasPending(),
-            self.shellEffects().reviewOrigin(),
+            self.shellEffects().changesOrigin(),
         );
     }
 
     fn copyCurrentLine(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        const text = self.reviewContent().currentLineCopyText() orelse {
-            self.setReviewStatus("no diff line selected", .{});
+        const text = self.changesContent().currentLineCopyText() orelse {
+            self.setChangesStatus("no diff line selected", .{});
             return;
         };
         self.shellEffects().queueClipboard(ctx, .{
-            .origin = .{ .page = self.shellEffects().reviewOrigin() },
+            .origin = .{ .page = self.shellEffects().changesOrigin() },
             .label = "current line",
             .text = text,
         });
     }
 
     fn copyCurrentHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
-        var content = try self.reviewContent().selectedHunkCopyText(ctx.allocator());
+        var content = try self.changesContent().selectedHunkCopyText(ctx.allocator());
         defer content.deinit(ctx.allocator());
         switch (content) {
             .ready => |text| self.shellEffects().queueClipboard(ctx, .{
-                .origin = .{ .page = self.shellEffects().reviewOrigin() },
+                .origin = .{ .page = self.shellEffects().changesOrigin() },
                 .label = "current hunk",
                 .text = text,
             }),
-            .no_hunk => self.setReviewStatus("no hunk selected", .{}),
-            .no_new_side => self.setReviewStatus("no new-side text in selected hunk", .{}),
+            .no_hunk => self.setChangesStatus("no hunk selected", .{}),
+            .no_new_side => self.setChangesStatus("no new-side text in selected hunk", .{}),
         }
     }
 
     fn copyDiffSelection(self: *App, ctx: *chasen.Ctx(Msg), text: []const u8) void {
         self.shellEffects().queueClipboard(ctx, .{
-            .origin = .{ .page = self.shellEffects().reviewOrigin() },
+            .origin = .{ .page = self.shellEffects().changesOrigin() },
             .label = "diff selection",
             .text = text,
         });
@@ -1293,9 +1293,9 @@ pub const App = struct {
     }
 
     fn copyDiffHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), selection: diff_selection.HeaderPathSelection) void {
-        const path = self.reviewContent().diffHeaderPath(selection) orelse return;
+        const path = self.changesContent().diffHeaderPath(selection) orelse return;
         self.shellEffects().queueClipboard(ctx, .{
-            .origin = .{ .page = self.shellEffects().reviewOrigin() },
+            .origin = .{ .page = self.shellEffects().changesOrigin() },
             .label = "file path",
             .text = path,
         });
@@ -1326,7 +1326,7 @@ pub const App = struct {
 
         const effects = self.shellEffects();
         const origin = switch (self.active_page) {
-            .review => effects.reviewOrigin(),
+            .changes => effects.changesOrigin(),
             .repository => effects.repositoryOrigin(),
             .compare => effects.compareOrigin(),
             .config => return,
@@ -1381,8 +1381,8 @@ pub const App = struct {
         self.status.set(fmt, args);
     }
 
-    fn setReviewStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
-        self.pages.review.status.set(fmt, args);
+    fn setChangesStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
+        self.pages.changes.status.set(fmt, args);
     }
 
     pub fn exportInitialSelectionContextJson(
@@ -1397,13 +1397,13 @@ pub const App = struct {
 
     /// Applies only the shell effects authorized by a completed repository
     /// commitment. A rejected capability open must not reload or reset the
-    /// still-authoritative Review or Compare page.
-    fn finishReviewRepoDiscovery(
+    /// still-authoritative Changes or Compare page.
+    fn finishChangesRepoDiscovery(
         self: *App,
         ctx: *chasen.Ctx(Msg),
         finished: RepoDiscoveryFinished,
     ) !void {
-        var pending = try self.reviewRead().finishRepoDiscovery(ctx.allocator(), finished) orelse return;
+        var pending = try self.changesRead().finishRepoDiscovery(ctx.allocator(), finished) orelse return;
         defer pending.deinit(ctx.allocator());
         const identity = pending.identity;
         const generation = pending.generation;
@@ -1413,16 +1413,16 @@ pub const App = struct {
             0,
             .discovery_completion,
         ) catch |err| {
-            self.reviewRead().rejectAppliedRepoDiscovery(identity, generation);
+            self.changesRead().rejectAppliedRepoDiscovery(identity, generation);
             return err;
         };
         if (outcome == .rejected) {
-            self.reviewRead().rejectAppliedRepoDiscovery(identity, generation);
+            self.changesRead().rejectAppliedRepoDiscovery(identity, generation);
             try self.applyRepoSessionCommit(ctx, outcome);
             return;
         }
 
-        try self.reviewRead().acceptRepoDiscoveryCommit(ctx);
+        try self.changesRead().acceptRepoDiscoveryCommit(ctx);
         if (outcome == .changed and self.active_page == .compare) {
             try self.applyRepoSessionCommit(ctx, outcome);
         }
@@ -1441,26 +1441,26 @@ pub const App = struct {
 
     fn finishReview(self: *App, ctx: *chasen.Ctx(Msg), decision: review_session.Decision) !void {
         if (self.actionLifecycleView().hasPending()) {
-            self.setReviewStatus("finish current git action before finishing review", .{});
+            self.setChangesStatus("finish current git action before finishing review", .{});
             return;
         }
 
         if (decision != .canceled and
-            (self.active_page != .review or !self.pages.review.activation.state.satisfiesAction(.read_diff)))
+            (self.active_page != .changes or !self.pages.changes.activation.state.satisfiesAction(.read_diff)))
         {
-            self.setReviewStatus("review source is still being validated", .{});
+            self.setChangesStatus("review source is still being validated", .{});
             return;
         }
 
         const output = self.review_output orelse {
-            self.setReviewStatus("review output is not configured", .{});
+            self.setChangesStatus("review output is not configured", .{});
             return;
         };
 
         var reviewed_paths: std.ArrayList([]const u8) = .empty;
         defer reviewed_paths.deinit(ctx.allocator());
-        self.pages.review.reviewed_store.appendPathKeysForRepo(ctx.allocator(), self.repoSessionView().activeRoot(), &reviewed_paths) catch {
-            self.setReviewStatus("could not finalize review result", .{});
+        self.pages.changes.reviewed_store.appendPathKeysForRepo(ctx.allocator(), self.repoSessionView().activeRoot(), &reviewed_paths) catch {
+            self.setChangesStatus("could not finalize review result", .{});
             return;
         };
         std.mem.sort([]const u8, reviewed_paths.items, {}, pathLessThan);
@@ -1468,7 +1468,7 @@ pub const App = struct {
         // Quit only after serialization succeeds; otherwise the TUI remains
         // open and stdout never receives a partial machine-readable result.
         output.set(ctx.allocator(), decision, self.selectionContext(), reviewed_paths.items) catch {
-            self.setReviewStatus("could not finalize review result", .{});
+            self.setChangesStatus("could not finalize review result", .{});
             return;
         };
         self.teardown_requested = true;
@@ -1479,7 +1479,7 @@ pub const App = struct {
         return initial_selection.contextForSelection(
             self.config.source,
             self.repoSessionView().activeRoot(),
-            self.reviewNavigationView().currentSelection(),
+            self.changesNavigationView().currentSelection(),
         );
     }
 };

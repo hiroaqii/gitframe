@@ -14,10 +14,10 @@ const compare_page = @import("pages/compare.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_selection = @import("pages/repository/selection.zig");
 const repository_tasks = @import("pages/repository/tasks.zig");
-const review_page = @import("pages/review.zig");
-const review_content = @import("pages/review/content.zig");
-const review_navigation = @import("pages/review/navigation.zig");
-const review_authority = @import("diff_surface/authority.zig");
+const changes_page = @import("pages/changes.zig");
+const changes_content = @import("pages/changes/content.zig");
+const changes_navigation = @import("pages/changes/navigation.zig");
+const changes_authority = @import("diff_surface/authority.zig");
 const context = @import("../context.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const diff_source = @import("../diff/source.zig");
@@ -29,7 +29,7 @@ const repository_source_document = @import("../repository/source.zig");
 const repository_tree_model = @import("../repository/tree.zig");
 
 const PageStates = struct {
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
     config: page.LazyPlaceholder = .{},
@@ -37,7 +37,7 @@ const PageStates = struct {
 
 const TestApp = struct {
     allocator: ?std.mem.Allocator = null,
-    active_page: page.Id = .review,
+    active_page: page.Id = .changes,
     repo_session: repo_session.State = .{},
     pages: PageStates = .{},
     config: diff_source.CliConfig = .{},
@@ -50,7 +50,7 @@ const TestApp = struct {
     fn controller(self: *TestApp) page_coordinator.Controller {
         return .{
             .active_page = &self.active_page,
-            .review = &self.pages.review,
+            .changes = &self.pages.changes,
             .repository = &self.pages.repository,
             .compare = &self.pages.compare,
             .config_page = &self.pages.config,
@@ -79,28 +79,28 @@ const app_testing = struct {
         _ = app.controller().requestSwitch(app.allocator orelse std.testing.allocator, target);
     }
 
-    fn prepareReviewRepositoryHandoff(
+    fn prepareChangesRepositoryHandoff(
         app: *TestApp,
         allocator: std.mem.Allocator,
     ) !page_link.RepositoryIncoming {
-        return page_coordinator.testing.prepareReviewRepositoryHandoff(app.controller(), allocator);
+        return page_coordinator.testing.prepareChangesRepositoryHandoff(app.controller(), allocator);
     }
 
-    fn commitReviewRepositoryHandoff(
+    fn commitChangesRepositoryHandoff(
         app: *TestApp,
         allocator: std.mem.Allocator,
         incoming: *page_link.RepositoryIncoming,
     ) void {
-        page_coordinator.testing.commitReviewRepositoryHandoff(app.controller(), allocator, incoming);
+        page_coordinator.testing.commitChangesRepositoryHandoff(app.controller(), allocator, incoming);
     }
 
-    fn commitRepositoryReviewHandoff(app: *TestApp, allocator: std.mem.Allocator) void {
-        page_coordinator.testing.commitRepositoryReviewHandoff(app.controller(), allocator);
+    fn commitRepositoryChangesHandoff(app: *TestApp, allocator: std.mem.Allocator) void {
+        page_coordinator.testing.commitRepositoryChangesHandoff(app.controller(), allocator);
     }
 
-    fn reviewNavigationView(app: *const TestApp) review_navigation.View {
+    fn changesNavigationView(app: *const TestApp) changes_navigation.View {
         return .{
-            .page = &app.pages.review,
+            .page = &app.pages.changes,
             .repo_root = app.repo_session.view().activeRoot(),
             .repo_epoch = app.repo_session.view().epoch(),
             .root_identity = app.repo_session.view().activeIdentity(),
@@ -109,10 +109,10 @@ const app_testing = struct {
         };
     }
 
-    fn reviewContent(app: *const TestApp) review_content.View {
+    fn changesContent(app: *const TestApp) changes_content.View {
         return .{
-            .page = &app.pages.review,
-            .navigation = reviewNavigationView(app),
+            .page = &app.pages.changes,
+            .navigation = changesNavigationView(app),
             .source = app.config.source,
             .repo_root = app.repo_session.view().activeRoot(),
         };
@@ -164,7 +164,7 @@ test "repository source header page switch cancels header owner without weakenin
 
 test "repository keyboard line selection page exits preserve semantic viewport" {
     const allocator = std.testing.allocator;
-    const targets = [_]page.Id{ .compare, .review };
+    const targets = [_]page.Id{ .compare, .changes };
 
     inline for (targets) |target| inline for (.{ false, true }) |retain_prior| {
         var app: TestApp = .{
@@ -201,17 +201,17 @@ test "repository keyboard line selection page exits preserve semantic viewport" 
     };
 }
 
-test "page transition blocker leaves page and Review state unchanged" {
+test "page transition blocker leaves page and Changes state unchanged" {
     var app: TestApp = .{};
-    app.pages.review.search.mode = true;
-    const activation_id = app_testing.pageCoordinator(&app).activateReview();
+    app.pages.changes.search.mode = true;
+    const activation_id = app_testing.pageCoordinator(&app).activateChanges();
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.update(.{ .switch_page = .compare }, &ctx);
 
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expect(app.pages.review.search.mode);
-    try std.testing.expectEqual(activation_id, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try std.testing.expect(app.pages.changes.search.mode);
+    try std.testing.expectEqual(activation_id, app.pages.changes.activation.state.active.activation_id);
     try std.testing.expectEqualStrings("finish search before switching pages", app.status.text());
     try std.testing.expect(app.pages.compare.activation.state == .inactive);
 }
@@ -306,7 +306,7 @@ test "Compare retained selection survives page transitions and clears on reposit
     try std.testing.expectEqual(@as(usize, 0), app.pages.compare.viewer.diff_scroll);
 }
 
-test "review repository transition commit selects exact retained Review path" {
+test "changes repository transition commit selects exact retained Changes path" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -319,7 +319,7 @@ test "review repository transition commit selects exact retained Review path" {
         },
         .config = .{ .source = .unstaged },
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
@@ -333,24 +333,24 @@ test "review repository transition commit selects exact retained Review path" {
             },
         },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     app.pages.repository.root_identity = app.repo_session.view().activeIdentity();
 
-    app_testing.commitRepositoryReviewHandoff(&app, allocator);
+    app_testing.commitRepositoryChangesHandoff(&app, allocator);
 
-    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expect(app.pages.repository.incoming == .none);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 0), app.status.text().len);
-    try std.testing.expectEqual(@as(u64, 7), app.pages.review.activation.state.active.repo_epoch);
+    try std.testing.expectEqual(@as(u64, 7), app.pages.changes.activation.state.active.repo_epoch);
 }
 
-test "review repository transition commit maps unchanged and unavailable outcomes" {
+test "changes repository transition commit maps unchanged and unavailable outcomes" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -358,8 +358,8 @@ test "review repository transition commit maps unchanged and unavailable outcome
         path: []const u8,
         status: []const u8,
     }{
-        .{ .path = "b", .status = "Repository file is already selected in Review" },
-        .{ .path = "missing.zig", .status = "Repository file is not part of the current Review" },
+        .{ .path = "b", .status = "Repository file is already selected in Changes" },
+        .{ .path = "missing.zig", .status = "Repository file is not part of the current Changes" },
     };
 
     for (cases) |case| {
@@ -372,7 +372,7 @@ test "review repository transition commit maps unchanged and unavailable outcome
             },
             .config = .{ .source = .unstaged },
             .pages = .{
-                .review = .{
+                .changes = .{
                     .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
                     .viewer = .{
                         .selected_target = .{ .diff_file = 1 },
@@ -387,24 +387,24 @@ test "review repository transition commit maps unchanged and unavailable outcome
                 },
             },
         };
-        defer app.pages.review.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
         app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
         app.pages.repository.root_identity = app.repo_session.view().activeIdentity();
 
-        app_testing.commitRepositoryReviewHandoff(&app, allocator);
+        app_testing.commitRepositoryChangesHandoff(&app, allocator);
 
-        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expectEqual(page.Id.changes, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
-        try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-        try std.testing.expectEqual(@as(usize, 9), app.pages.review.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+        try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll);
         try std.testing.expectEqualStrings(case.status, app.status.text());
     }
 }
 
-test "review repository transition no context dismisses pending and unavailable owners" {
+test "changes repository transition no context dismisses pending and unavailable owners" {
     const allocator = std.testing.allocator;
     const identity: repo_root_capability.Identity = .{ .device = 5, .inode = 8 };
     const cases = [_]enum { pending, unavailable }{ .pending, .unavailable };
@@ -418,7 +418,7 @@ test "review repository transition no context dismisses pending and unavailable 
             },
             .config = .{ .source = .unstaged },
             .pages = .{
-                .review = .{
+                .changes = .{
                     .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
                     .viewer = .{
                         .selected_target = .{ .diff_file = 0 },
@@ -434,7 +434,7 @@ test "review repository transition no context dismisses pending and unavailable 
                 },
             },
         };
-        defer app.pages.review.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
         var incoming = try page_link.RepositoryIncoming.initOwned(
             allocator,
@@ -450,18 +450,18 @@ test "review repository transition no context dismisses pending and unavailable 
         );
         app.pages.repository.acceptIncoming(allocator, &incoming);
 
-        app_testing.commitRepositoryReviewHandoff(&app, allocator);
+        app_testing.commitRepositoryChangesHandoff(&app, allocator);
 
-        try std.testing.expectEqual(page.Id.review, app.active_page);
+        try std.testing.expectEqual(page.Id.changes, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
         try std.testing.expect(app.pages.repository.incoming == .none);
-        try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-        try std.testing.expectEqual(@as(usize, 6), app.pages.review.viewer.diff_scroll);
-        try std.testing.expectEqualStrings("Repository has no resolved file to open in Review", app.status.text());
+        try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+        try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqualStrings("Repository has no resolved file to open in Changes", app.status.text());
     }
 }
 
-test "review repository transition prepare failures leave both pages unchanged" {
+test "changes repository transition prepare failures leave both pages unchanged" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -472,28 +472,28 @@ test "review repository transition prepare failures leave both pages unchanged" 
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
         .config = .{ .source = .unstaged },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
         } },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     acceptTestSource(&app);
 
-    const review_activation = app.pages.review.activation.state.active.activation_id;
+    const changes_activation = app.pages.changes.activation.state.active.activation_id;
     const repository_activation = app.pages.repository.activation_id;
-    try std.testing.expect(app_testing.reviewContent(&app).repositoryTarget() == .location);
+    try std.testing.expect(app_testing.changesContent(&app).repositoryTarget() == .location);
 
     // Discovery path without its committed root capability cannot authorize
-    // an owned cross-page path, even when Review can derive one.
+    // an owned cross-page path, even when Changes can derive one.
     try std.testing.expectError(
         error.MissingRepositoryIdentity,
-        app_testing.prepareReviewRepositoryHandoff(&app, allocator),
+        app_testing.prepareChangesRepositoryHandoff(&app, allocator),
     );
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try std.testing.expectEqual(changes_activation, app.pages.changes.activation.state.active.activation_id);
     try std.testing.expectEqual(repository_activation, app.pages.repository.activation_id);
     try std.testing.expect(app.pages.repository.incoming == .none);
 
@@ -501,19 +501,19 @@ test "review repository transition prepare failures leave both pages unchanged" 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expectError(
         error.OutOfMemory,
-        app_testing.prepareReviewRepositoryHandoff(&app, failing.allocator()),
+        app_testing.prepareChangesRepositoryHandoff(&app, failing.allocator()),
     );
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try std.testing.expectEqual(changes_activation, app.pages.changes.activation.state.active.activation_id);
     try std.testing.expectEqual(repository_activation, app.pages.repository.activation_id);
     try std.testing.expect(app.pages.repository.incoming == .none);
     try std.testing.expect(std.meta.eql(
         diff_view_model.BodyCoordinate{ .hunk_header = 0 },
-        app.pages.review.viewer.diff_cursor,
+        app.pages.changes.viewer.diff_cursor,
     ));
 }
 
-test "review repository transition commit moves location and replaces old owner" {
+test "changes repository transition commit moves location and replaces old owner" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -525,19 +525,19 @@ test "review repository transition commit moves location and replaces old owner"
         },
         .config = .{ .source = .unstaged },
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
                 .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
             },
             .repository = .{ .activation_id = 4 },
         },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     acceptTestSource(&app);
-    const review_activation = app.pages.review.activation.state.active.activation_id;
+    const changes_activation = app.pages.changes.activation.state.active.activation_id;
     const identity = app.repo_session.view().activeIdentity().?;
 
     var old = try page_link.RepositoryIncoming.initOwned(
@@ -548,18 +548,18 @@ test "review repository transition commit moves location and replaces old owner"
     );
     app.pages.repository.acceptIncoming(allocator, &old);
 
-    var incoming = try app_testing.prepareReviewRepositoryHandoff(&app, allocator);
+    var incoming = try app_testing.prepareChangesRepositoryHandoff(&app, allocator);
     var incoming_owned = true;
     defer if (incoming_owned) incoming.deinit(allocator);
     try std.testing.expect(incoming == .location);
     const moved_address = @intFromPtr(incoming.location.path.ptr);
     try std.testing.expectEqualStrings("a", incoming.location.path);
 
-    app_testing.commitReviewRepositoryHandoff(&app, allocator, &incoming);
+    app_testing.commitChangesRepositoryHandoff(&app, allocator, &incoming);
     incoming_owned = false;
     try std.testing.expectEqual(page.Id.repository, app.active_page);
-    try std.testing.expect(app.pages.review.activation.state == .inactive);
-    try std.testing.expectEqual(review_activation, app.pages.review.activation.next_activation_id);
+    try std.testing.expect(app.pages.changes.activation.state == .inactive);
+    try std.testing.expectEqual(changes_activation, app.pages.changes.activation.next_activation_id);
     try std.testing.expect(app.pages.repository.active);
     try std.testing.expectEqual(@as(u64, 5), app.pages.repository.activation_id);
     try std.testing.expect(app.pages.repository.incoming == .awaiting_manifest);
@@ -568,11 +568,11 @@ test "review repository transition commit moves location and replaces old owner"
     try std.testing.expectEqualStrings("a", accepted.path);
     try std.testing.expect(std.meta.eql(
         diff_view_model.BodyCoordinate{ .hunk_header = 0 },
-        app.pages.review.viewer.diff_cursor,
+        app.pages.changes.viewer.diff_cursor,
     ));
 }
 
-test "review repository transition direct unavailable uses the same commit boundary" {
+test "changes repository transition direct unavailable uses the same commit boundary" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -583,7 +583,7 @@ test "review repository transition direct unavailable uses the same commit bound
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
         .config = .{ .source = .unstaged },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
             .viewer = .{
                 .selected_node = 1,
@@ -591,24 +591,24 @@ test "review repository transition direct unavailable uses the same commit bound
             },
         } },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     acceptTestSource(&app);
 
-    const review_activation = app.pages.review.activation.state.active.activation_id;
+    const changes_activation = app.pages.changes.activation.state.active.activation_id;
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expectError(
         error.OutOfMemory,
-        app_testing.prepareReviewRepositoryHandoff(&app, failing.allocator()),
+        app_testing.prepareChangesRepositoryHandoff(&app, failing.allocator()),
     );
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try std.testing.expectEqual(changes_activation, app.pages.changes.activation.state.active.activation_id);
     try std.testing.expectEqual(@as(u64, 0), app.pages.repository.activation_id);
     try std.testing.expect(app.pages.repository.incoming == .none);
 
-    var incoming = try app_testing.prepareReviewRepositoryHandoff(&app, allocator);
+    var incoming = try app_testing.prepareChangesRepositoryHandoff(&app, allocator);
     var incoming_owned = true;
     defer if (incoming_owned) incoming.deinit(allocator);
     try std.testing.expect(incoming == .unavailable);
@@ -616,7 +616,7 @@ test "review repository transition direct unavailable uses the same commit bound
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.no_current_path, incoming.unavailable.reason);
     try std.testing.expectEqualStrings("src/deleted.zig", incoming.unavailable.path);
 
-    app_testing.commitReviewRepositoryHandoff(&app, allocator, &incoming);
+    app_testing.commitChangesRepositoryHandoff(&app, allocator, &incoming);
     incoming_owned = false;
     const unavailable = app.pages.repository.incomingUnavailable().?;
     try std.testing.expectEqual(moved_address, @intFromPtr(unavailable.path.ptr));
@@ -625,7 +625,7 @@ test "review repository transition direct unavailable uses the same commit bound
     try std.testing.expectEqual(page.Id.repository, app.active_page);
 }
 
-test "review repository transition no context bypasses identity and retains browser location" {
+test "changes repository transition no context bypasses identity and retains browser location" {
     const allocator = std.testing.allocator;
     const repository_manifest = @import("../repository/manifest.zig");
     const repository_tree = @import("../repository/tree.zig");
@@ -641,7 +641,7 @@ test "review repository transition no context bypasses identity and retains brow
         .allocator = allocator,
         .config = .{ .source = .stdin },
         .pages = .{
-            .review = .{ .load = app_test_support.loadState(app_test_support.loadedDiffOne()) },
+            .changes = .{ .load = app_test_support.loadState(app_test_support.loadedDiffOne()) },
             .repository = .{
                 .activation_id = 4,
                 .bundle = .{ .document = document, .tree = tree },
@@ -654,12 +654,12 @@ test "review repository transition no context bypasses identity and retains brow
     // the pre-transfer errdefer only for Tree.build failure; otherwise a later
     // assertion failure would make both cleanup paths release the same bytes.
     document_owned = false;
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     acceptTestSource(&app);
     app.pages.repository.selected_path = app.pages.repository.bundle.?.tree.filePath("retained.zig", .all).?;
     const retained_address = @intFromPtr(app.pages.repository.selected_path.?.ptr);
-    const review_activation = app.pages.review.activation.state.active.activation_id;
+    const changes_activation = app.pages.changes.activation.state.active.activation_id;
 
     var old = try page_link.RepositoryIncoming.initOwned(
         allocator,
@@ -672,21 +672,21 @@ test "review repository transition no context bypasses identity and retains brow
     // No-context claims no repository path authority, so even a fail-first
     // allocator and absent root capability cannot reject its prepare phase.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    var incoming = try app_testing.prepareReviewRepositoryHandoff(&app, failing.allocator());
+    var incoming = try app_testing.prepareChangesRepositoryHandoff(&app, failing.allocator());
     var incoming_owned = true;
     defer if (incoming_owned) incoming.deinit(failing.allocator());
     try std.testing.expect(incoming == .no_context);
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try std.testing.expectEqual(changes_activation, app.pages.changes.activation.state.active.activation_id);
     try std.testing.expectEqual(@as(u64, 4), app.pages.repository.activation_id);
     try std.testing.expect(app.pages.repository.incoming == .unavailable);
     try std.testing.expectEqual(retained_address, @intFromPtr(app.pages.repository.selected_path.?.ptr));
     try std.testing.expectEqual(@as(usize, 1), app.pages.repository.viewer.tree_cursor);
 
-    app_testing.commitReviewRepositoryHandoff(&app, allocator, &incoming);
+    app_testing.commitChangesRepositoryHandoff(&app, allocator, &incoming);
     incoming_owned = false;
     try std.testing.expectEqual(page.Id.repository, app.active_page);
-    try std.testing.expect(app.pages.review.activation.state == .inactive);
+    try std.testing.expect(app.pages.changes.activation.state == .inactive);
     try std.testing.expect(app.pages.repository.active);
     try std.testing.expectEqual(@as(u64, 5), app.pages.repository.activation_id);
     try std.testing.expect(app.pages.repository.incoming == .none);
@@ -695,7 +695,7 @@ test "review repository transition no context bypasses identity and retains brow
     try std.testing.expectEqual(@as(usize, 1), app.pages.repository.viewer.tree_cursor);
 }
 
-test "review repository transition blocker precedes contextual handoff preparation" {
+test "changes repository transition blocker precedes contextual handoff preparation" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -707,30 +707,30 @@ test "review repository transition blocker precedes contextual handoff preparati
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
         .config = .{ .source = .unstaged },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
         } },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     acceptTestSource(&app);
-    app.pages.review.search.mode = true;
-    const review_activation = app.pages.review.activation.state.active.activation_id;
+    app.pages.changes.search.mode = true;
+    const changes_activation = app.pages.changes.activation.state.active.activation_id;
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
     try requestPageSwitchForTest(&app, &ctx, .repository);
 
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expect(app.pages.review.search.mode);
-    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try std.testing.expect(app.pages.changes.search.mode);
+    try std.testing.expectEqual(changes_activation, app.pages.changes.activation.state.active.activation_id);
     try std.testing.expectEqualStrings("finish search before switching pages", app.status.text());
     try std.testing.expect(app.pages.repository.incoming == .none);
 }
 
-test "review repository transition prepare failure stays on Review with bounded diagnostic" {
+test "changes repository transition prepare failure stays on Changes with bounded diagnostic" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -742,24 +742,24 @@ test "review repository transition prepare failure stays on Review with bounded 
         },
         .config = .{ .source = .unstaged },
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
                 .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
             },
             .repository = .{ .activation_id = 4 },
         },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     acceptTestSource(&app);
-    const review_activation = app.pages.review.activation.state.active.activation_id;
+    const changes_activation = app.pages.changes.activation.state.active.activation_id;
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
     try requestPageSwitchForTest(&app, &ctx, .repository);
 
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expectEqual(review_activation, app.pages.review.activation.state.active.activation_id);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try std.testing.expectEqual(changes_activation, app.pages.changes.activation.state.active.activation_id);
     try std.testing.expectEqual(@as(u64, 4), app.pages.repository.activation_id);
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expect(app.pages.repository.incoming == .none);
@@ -915,23 +915,23 @@ fn testNamedSingleRepoDiscovery(allocator: std.mem.Allocator, label: []const u8,
 }
 
 fn acceptTestSource(app: *TestApp) void {
-    app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
+    app.pages.changes.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
     syncTestActivation(app);
 }
 
 fn syncTestActivation(app: *TestApp) void {
-    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
         .immutable
-    else if (app.pages.review.auto_reload.sourceIsActionable())
+    else if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
-    else if (app.pages.review.load.hasPending())
+    else if (app.pages.changes.load.hasPending())
         .pending
     else
         .unavailable;
-    _ = app.pages.review.activation.activate(
+    _ = app.pages.changes.activation.activate(
         app.repo_session.repo_epoch,
         source,
-        review_authority.auxiliaryMember(app.pages.review.status_load),
-        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.branch_status_load),
     );
 }

@@ -1,6 +1,6 @@
-//! Review-local selected-content and editor-target policy.
+//! Changes-local selected-content and editor-target policy.
 //!
-//! This module derives borrowed targets or short-lived owned text from Review
+//! This module derives borrowed targets or short-lived owned text from Changes
 //! state. It never starts foreground processes or clipboard effects; App owns
 //! those physical lifecycles and consumes these typed results.
 
@@ -9,11 +9,11 @@ const builtin = @import("builtin");
 const app_page = if (builtin.is_test) @import("../../page.zig") else struct {};
 const app_state = if (builtin.is_test) @import("../../state.zig") else struct {};
 const page_link = @import("../../page_link.zig");
-const review_projection = if (builtin.is_test) @import("../../review_projection.zig") else struct {};
+const changes_projection = if (builtin.is_test) @import("../../changes_projection.zig") else struct {};
 const diff_surface = @import("../../diff_surface.zig");
-const review_page = @import("../review.zig");
+const changes_page = @import("../changes.zig");
 const navigation = @import("navigation.zig");
-const review_reload = @import("reload.zig");
+const changes_reload = @import("reload.zig");
 const diff_file = @import("../../../diff/file.zig");
 const diff_parser = @import("../../../diff/parser.zig");
 const diff_selection = @import("../../../diff/selection.zig");
@@ -41,7 +41,7 @@ pub const EditorTargetResult = union(enum) {
 pub const HunkCopyResult = diff_surface.content.HunkCopyResult;
 
 pub const View = struct {
-    page: *const review_page.ReviewPageState,
+    page: *const changes_page.ChangesPageState,
     navigation: navigation.View,
     source: diff_source.SourceMode,
     repo_root: ?[]const u8,
@@ -68,17 +68,17 @@ pub const View = struct {
     }
 
     /// Derive an allocation-free Repository destination from the exact body
-    /// currently promised by Review.
+    /// currently promised by Changes.
     ///
     /// This is deliberately stricter than `editorTarget`: removed rows never
     /// scan to a nearby current line, and sources without current-repository
     /// authority return `no_context` rather than reusing coincidental paths.
-    pub fn repositoryTarget(self: View) page_link.ReviewRepositoryTarget {
+    pub fn repositoryTarget(self: View) page_link.ChangesRepositoryTarget {
         if (!diff_source.sourceAllowsRepositoryLink(self.source)) return .no_context;
         if (!self.page.activation.state.satisfiesAction(.read_diff)) return .no_context;
         const repo_root = self.repo_root orelse return .no_context;
 
-        const displayed_body = self.navigation.displayedReviewBody();
+        const displayed_body = self.navigation.displayedChangesBody();
         if (!self.displayedProjectionHasCurrentAuthority()) return .no_context;
         return switch (displayed_body) {
             .primary => |primary| self.parsedRepositoryTarget(
@@ -116,9 +116,9 @@ pub const View = struct {
     /// equal. Require the complete current projection identity before using
     /// any displayed projection as Repository authority.
     fn displayedProjectionHasCurrentAuthority(self: View) bool {
-        const request = self.page.review_projection.displayed.request() orelse return true;
+        const request = self.page.changes_projection.displayed.request() orelse return true;
         if (!self.navigation.displayedProjectionRequestIsActive(request.*)) return true;
-        const target = (review_reload.View{
+        const target = (changes_reload.View{
             .page = self.page,
             .navigation = self.navigation,
             .source = self.source,
@@ -182,7 +182,7 @@ pub const View = struct {
         };
     }
 
-    fn parsedRepositoryTarget(self: View, file: diff_parser.FileDiff, basis: ParsedBasis, repo_root: []const u8) page_link.ReviewRepositoryTarget {
+    fn parsedRepositoryTarget(self: View, file: diff_parser.FileDiff, basis: ParsedBasis, repo_root: []const u8) page_link.ChangesRepositoryTarget {
         const current_path = diff_file.currentPathKey(file);
         const cached_line_safe = if (basis == .cached and current_path != null)
             self.cachedLineIsCurrent(repo_root, current_path.?)
@@ -202,7 +202,7 @@ pub const View = struct {
         return cachedStatusAllowsCurrentLine(entry);
     }
 
-    fn opaqueRepositoryTarget(self: View, repo_root: []const u8, path: []const u8) page_link.ReviewRepositoryTarget {
+    fn opaqueRepositoryTarget(self: View, repo_root: []const u8, path: []const u8) page_link.ChangesRepositoryTarget {
         const selected_target = self.page.viewer.selected_target orelse return .no_context;
         return switch (selected_target) {
             .status_only => self.selectedStatusRepositoryTarget(repo_root, path),
@@ -210,7 +210,7 @@ pub const View = struct {
         };
     }
 
-    fn selectedStatusRepositoryTarget(self: View, repo_root: []const u8, path: []const u8) page_link.ReviewRepositoryTarget {
+    fn selectedStatusRepositoryTarget(self: View, repo_root: []const u8, path: []const u8) page_link.ChangesRepositoryTarget {
         if (!self.page.status_load.isFresh()) return .no_context;
         const snapshot_root = self.page.git_status.repo_root orelse return .no_context;
         if (!std.mem.eql(u8, snapshot_root, repo_root)) return .no_context;
@@ -221,7 +221,7 @@ pub const View = struct {
         return .{ .unavailable = .{ .path = selected_path, .reason = .no_current_path } };
     }
 
-    fn selectedDiffRepositoryTarget(self: View, path: []const u8) page_link.ReviewRepositoryTarget {
+    fn selectedDiffRepositoryTarget(self: View, path: []const u8) page_link.ChangesRepositoryTarget {
         const selected = self.navigation.selectedFile() orelse return .no_context;
         if (diff_file.currentPathKey(selected)) |current_path| {
             if (std.mem.eql(u8, current_path, path)) return .{ .location = .{ .path = current_path } };
@@ -244,7 +244,7 @@ fn repositoryTargetForParsedFile(
     mode: diff_view_model.DisplayMode,
     basis: ParsedBasis,
     cached_line_safe: bool,
-) page_link.ReviewRepositoryTarget {
+) page_link.ChangesRepositoryTarget {
     const current_path = diff_file.currentPathKey(file) orelse return .{ .unavailable = .{
         .path = diff_file.canonicalPathKey(file) orelse diff_file.displayPath(file),
         .reason = .no_current_path,
@@ -262,7 +262,7 @@ fn generatedRepositoryTarget(
     path: []const u8,
     content_line_count: usize,
     cursor: diff_view_model.BodyCoordinate,
-) page_link.ReviewRepositoryTarget {
+) page_link.ChangesRepositoryTarget {
     const line: ?u32 = switch (cursor) {
         .metadata => |row| if (row < content_line_count) @intCast(row + 1) else null,
         .binary_marker, .hunk_header, .hunk_line => null,
@@ -372,14 +372,14 @@ test "worktree editor line falls forward then backward across removed lines" {
     try std.testing.expectEqual(@as(?u32, 2), worktreeLineForHunkLine(file, 0, 99));
 }
 
-fn expectRepositoryLocation(target: page_link.ReviewRepositoryTarget, expected_path: []const u8, expected_line: ?u32) !void {
+fn expectRepositoryLocation(target: page_link.ChangesRepositoryTarget, expected_path: []const u8, expected_line: ?u32) !void {
     try std.testing.expect(target == .location);
     try std.testing.expectEqualStrings(expected_path, target.location.path);
     try std.testing.expectEqual(expected_line, target.location.line);
 }
 
-fn reviewContentTestView(page: *const review_page.ReviewPageState, source: diff_source.SourceMode) View {
-    const review_navigation: navigation.View = .{
+fn changesContentTestView(page: *const changes_page.ChangesPageState, source: diff_source.SourceMode) View {
+    const changes_navigation: navigation.View = .{
         .page = page,
         .repo_root = "/repo",
         .source = source,
@@ -387,7 +387,7 @@ fn reviewContentTestView(page: *const review_page.ReviewPageState, source: diff_
     };
     return .{
         .page = page,
-        .navigation = review_navigation,
+        .navigation = changes_navigation,
         .source = source,
         .repo_root = "/repo",
     };
@@ -615,9 +615,9 @@ test "opaque status target distinguishes current path from deletion" {
     }));
 }
 
-test "Review repository target reads accepted primary body without editor fallback" {
+test "Changes repository target reads accepted primary body without editor fallback" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -628,7 +628,7 @@ test "Review repository target reads accepted primary body without editor fallba
     defer page.deinit(allocator);
     _ = page.activation.activate(4, .fresh, .fresh, .fresh);
 
-    var view = reviewContentTestView(&page, .unstaged);
+    var view = changesContentTestView(&page, .unstaged);
     try expectRepositoryLocation(view.repositoryTarget(), "a", 1);
 
     page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
@@ -642,9 +642,9 @@ test "Review repository target reads accepted primary body without editor fallba
     try std.testing.expect(view.repositoryTarget() == .no_context);
 }
 
-test "Review cached target requires fresh exact status with no worktree change" {
+test "Changes cached target requires fresh exact status with no worktree change" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -657,7 +657,7 @@ test "Review cached target requires fresh exact status with no worktree change" 
 
     var clean_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
     try page.git_status.replace("/repo", &clean_status);
-    const view = reviewContentTestView(&page, .cached);
+    const view = changesContentTestView(&page, .cached);
     try expectRepositoryLocation(view.repositoryTarget(), "a", 1);
 
     var changed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
@@ -668,9 +668,9 @@ test "Review cached target requires fresh exact status with no worktree change" 
     try expectRepositoryLocation(view.repositoryTarget(), "a", null);
 }
 
-test "Review repository target keeps authority for retained staged-only owner" {
+test "Changes repository target keeps authority for retained staged-only owner" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -684,8 +684,8 @@ test "Review repository target keeps authority for retained staged-only owner" {
     var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
     try page.git_status.replace("/repo", &staged_status);
     var status: app_state.StatusMessage = .{};
-    const controller = reviewReloadTestController(&page, &status);
-    try review_reload.testing.installRetainedStagedOnly(
+    const controller = changesReloadTestController(&page, &status);
+    try changes_reload.testing.installRetainedStagedOnly(
         controller,
         allocator,
         1,
@@ -693,14 +693,14 @@ test "Review repository target keeps authority for retained staged-only owner" {
         page.status_snapshot_revision,
     );
 
-    const target = reviewContentTestView(&page, .unstaged).repositoryTarget();
+    const target = changesContentTestView(&page, .unstaged).repositoryTarget();
     try std.testing.expect(target == .location);
     try std.testing.expectEqualStrings("a", target.location.path);
 }
 
-test "Review repository target reports accepted deleted file as unavailable" {
+test "Changes repository target reports accepted deleted file as unavailable" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{
             .selected_target = .{ .diff_file = 1 },
@@ -712,20 +712,20 @@ test "Review repository target reports accepted deleted file as unavailable" {
     defer page.deinit(allocator);
     _ = page.activation.activate(4, .fresh, .fresh, .fresh);
 
-    const target = reviewContentTestView(&page, .unstaged).repositoryTarget();
+    const target = changesContentTestView(&page, .unstaged).repositoryTarget();
     try std.testing.expect(target == .unavailable);
     try std.testing.expectEqualStrings("src/deleted.zig", target.unavailable.path);
 }
 
 fn installStatusBody(
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
     allocator: std.mem.Allocator,
     path: []const u8,
-    kind: review_projection.Kind,
+    kind: changes_projection.Kind,
 ) !void {
-    const request = try review_projection.testing.cloneRequest(
+    const request = try changes_projection.testing.cloneRequest(
         allocator,
-        app_page.RequestIdentity.review(4, 1),
+        app_page.RequestIdentity.changes(4, 1),
         1,
         "/repo",
         path,
@@ -738,16 +738,16 @@ fn installStatusBody(
         var owned_request = request;
         owned_request.deinit(allocator);
     }
-    page.review_projection.displayed = .{ .ready = .{
+    page.changes_projection.displayed = .{ .ready = .{
         .request = request,
-        .value = .{ .status_body = try review_projection.statusBodyAlloc(allocator, path, "Preview unavailable", .{}) },
+        .value = .{ .status_body = try changes_projection.statusBodyAlloc(allocator, path, "Preview unavailable", .{}) },
     } };
 }
 
-fn reviewReloadTestController(
-    page: *review_page.ReviewPageState,
+fn changesReloadTestController(
+    page: *changes_page.ChangesPageState,
     status: *app_state.StatusMessage,
-) review_reload.Controller {
+) changes_reload.Controller {
     return .{
         .page = page,
         .navigation = .{
@@ -763,9 +763,9 @@ fn reviewReloadTestController(
     };
 }
 
-test "Review opaque status target preserves selected duplicate-path entry identity" {
+test "Changes opaque status target preserves selected duplicate-path entry identity" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 1 } },
     };
     defer page.deinit(allocator);
@@ -774,38 +774,38 @@ test "Review opaque status target preserves selected duplicate-path entry identi
 
     var deleted_then_untracked = try git_status.StatusBundle.parseOwned(allocator, "D  f\x00?? f\x00");
     try page.git_status.replace("/repo", &deleted_then_untracked);
-    try expectRepositoryLocation(reviewContentTestView(&page, .unstaged).repositoryTarget(), "f", null);
+    try expectRepositoryLocation(changesContentTestView(&page, .unstaged).repositoryTarget(), "f", null);
 
     var untracked_then_deleted = try git_status.StatusBundle.parseOwned(allocator, "?? f\x00D  f\x00");
     try page.git_status.replace("/repo", &untracked_then_deleted);
     page.viewer.selected_target = .{ .status_only = 0 };
-    try expectRepositoryLocation(reviewContentTestView(&page, .unstaged).repositoryTarget(), "f", null);
+    try expectRepositoryLocation(changesContentTestView(&page, .unstaged).repositoryTarget(), "f", null);
 
     page.viewer.selected_target = .{ .status_only = 1 };
-    try std.testing.expect(reviewContentTestView(&page, .unstaged).repositoryTarget() == .no_context);
+    try std.testing.expect(changesContentTestView(&page, .unstaged).repositoryTarget() == .no_context);
 
     var status: app_state.StatusMessage = .{};
-    const reload = reviewReloadTestController(&page, &status);
+    const reload = changesReloadTestController(&page, &status);
     var update = try reload.prepareProjection(allocator);
     defer update.deinit(allocator);
-    try std.testing.expect(page.review_projection.pending != null);
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, page.review_projection.pending.?.kind);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .status_body);
-    try std.testing.expect(reviewContentTestView(&page, .unstaged).repositoryTarget() == .no_context);
+    try std.testing.expect(page.changes_projection.pending != null);
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, page.changes_projection.pending.?.kind);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .status_body);
+    try std.testing.expect(changesContentTestView(&page, .unstaged).repositoryTarget() == .no_context);
 
     var command = update.takeCommand() orelse return error.TestExpectedEqual;
     var command_owned = true;
     defer if (command_owned) command.deinit(allocator);
     var task_request = switch (command) {
-        .review_projection => |request| request,
+        .changes_projection => |request| request,
         else => return error.TestExpectedEqual,
     };
     command_owned = false;
     var request_owned = true;
     defer if (request_owned) task_request.deinit(allocator);
-    var failed_body = try review_projection.statusBodyAlloc(allocator, "f", "Cached preview unavailable", .{});
-    var finished: review_projection.Finished = .{
+    var failed_body = try changes_projection.statusBodyAlloc(allocator, "f", "Cached preview unavailable", .{});
+    var finished: changes_projection.Finished = .{
         .request = task_request,
         .result = .{ .failed = failed_body },
     };
@@ -817,15 +817,15 @@ test "Review opaque status target preserves selected duplicate-path entry identi
     result_transferred = (try reload.applyProjectionFinished(allocator, &finished)).result_transferred;
     try std.testing.expect(result_transferred);
 
-    const deleted_target = reviewContentTestView(&page, .unstaged).repositoryTarget();
+    const deleted_target = changesContentTestView(&page, .unstaged).repositoryTarget();
     try std.testing.expect(deleted_target == .unavailable);
     try std.testing.expectEqualStrings("f", deleted_target.unavailable.path);
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.no_current_path, deleted_target.unavailable.reason);
 }
 
-test "Review projection target rejects retained ready body while same path successor is pending" {
+test "Changes projection target rejects retained ready body while same path successor is pending" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{ .selected_target = .{ .status_only = 1 } },
     };
     defer page.deinit(allocator);
@@ -833,9 +833,9 @@ test "Review projection target rejects retained ready body while same path succe
 
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "D  f\x00?? f\x00");
     try page.git_status.replace("/repo", &status_bundle);
-    const request = try review_projection.testing.cloneRequest(
+    const request = try changes_projection.testing.cloneRequest(
         allocator,
-        app_page.RequestIdentity.review(4, 1),
+        app_page.RequestIdentity.changes(4, 1),
         1,
         "/repo",
         "f",
@@ -848,20 +848,20 @@ test "Review projection target rejects retained ready body while same path succe
         var owned_request = request;
         owned_request.deinit(allocator);
     }
-    page.review_projection.displayed = .{ .ready = .{
+    page.changes_projection.displayed = .{ .ready = .{
         .request = request,
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "f", "current\n") },
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "f", "current\n") },
     } };
-    try expectRepositoryLocation(reviewContentTestView(&page, .unstaged).repositoryTarget(), "f", 1);
+    try expectRepositoryLocation(changesContentTestView(&page, .unstaged).repositoryTarget(), "f", 1);
 
     page.viewer.selected_target = .{ .status_only = 0 };
     var status: app_state.StatusMessage = .{};
-    var update = try reviewReloadTestController(&page, &status).prepareProjection(allocator);
+    var update = try changesReloadTestController(&page, &status).prepareProjection(allocator);
     defer update.deinit(allocator);
 
-    try std.testing.expect(page.review_projection.pending != null);
-    try std.testing.expectEqual(review_projection.Kind.cached_diff, page.review_projection.pending.?.kind);
-    try std.testing.expect(page.review_projection.displayed == .ready);
-    try std.testing.expect(page.review_projection.displayed.ready.value == .generated_added_file);
-    try std.testing.expect(reviewContentTestView(&page, .unstaged).repositoryTarget() == .no_context);
+    try std.testing.expect(page.changes_projection.pending != null);
+    try std.testing.expectEqual(changes_projection.Kind.cached_diff, page.changes_projection.pending.?.kind);
+    try std.testing.expect(page.changes_projection.displayed == .ready);
+    try std.testing.expect(page.changes_projection.displayed.ready.value == .generated_added_file);
+    try std.testing.expect(changesContentTestView(&page, .unstaged).repositoryTarget() == .no_context);
 }

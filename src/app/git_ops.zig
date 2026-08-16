@@ -4,7 +4,7 @@ const file_tree = @import("../file_tree.zig");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_push = @import("../git/push.zig");
 const git_status = @import("../git/status.zig");
-const session_hunk_mark = @import("pages/review/session_hunk_mark.zig");
+const session_hunk_mark = @import("pages/changes/session_hunk_mark.zig");
 
 /// App-local Git operation target classification.
 ///

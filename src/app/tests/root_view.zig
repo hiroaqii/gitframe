@@ -8,9 +8,9 @@ const app_commit_panel = @import("../commit_panel.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const app_test_support = @import("../test_support.zig");
 const compare_navigation = @import("../pages/compare/navigation.zig");
-const review_navigation = @import("../pages/review/navigation.zig");
-const review_reload = @import("../pages/review/reload.zig");
-const review_authority = @import("../diff_surface/authority.zig");
+const changes_navigation = @import("../pages/changes/navigation.zig");
+const changes_reload = @import("../pages/changes/reload.zig");
+const changes_authority = @import("../diff_surface/authority.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_render = @import("../../diff/render.zig");
 const diff_selection = @import("../../diff/selection.zig");
@@ -52,25 +52,25 @@ fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette 
     return theme.Palette.fromConfig(FakeConfig{ .role = role, .color = color });
 }
 
-fn reviewNavigation(app: *App) review_navigation.Controller {
+fn changesNavigation(app: *App) changes_navigation.Controller {
     const size = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true }).bodySize();
     const repo = app.repo_session.view();
     return .{
-        .page = &app.pages.review,
+        .page = &app.pages.changes,
         .repo_root = repo.activeRoot(),
         .repo_epoch = repo.epoch(),
         .root_identity = repo.activeIdentity(),
         .source = app.config.source,
         .layout = .{ .width = size.width, .height = size.height },
-        .diagnostics = .{ .target = &app.pages.review.status },
+        .diagnostics = .{ .target = &app.pages.changes.status },
     };
 }
 
-fn reviewReload(app: *App) review_reload.Controller {
+fn changesReload(app: *App) changes_reload.Controller {
     const repo = app.repo_session.view();
     return .{
-        .page = &app.pages.review,
-        .navigation = reviewNavigation(app),
+        .page = &app.pages.changes,
+        .navigation = changesNavigation(app),
         .source = app.config.source,
         .repo_root = repo.activeRoot(),
         .repo_epoch = repo.epoch(),
@@ -139,19 +139,19 @@ fn retainedCompareAppForViewTest(
 }
 
 fn syncTestActivation(app: *App) void {
-    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
         .immutable
-    else if (app.pages.review.auto_reload.sourceIsActionable())
+    else if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
-    else if (app.pages.review.load.hasPending())
+    else if (app.pages.changes.load.hasPending())
         .pending
     else
         .unavailable;
-    _ = app.pages.review.activation.activate(
+    _ = app.pages.changes.activation.activate(
         app.repo_session.repo_epoch,
         source,
-        review_authority.auxiliaryMember(app.pages.review.status_load),
-        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.branch_status_load),
     );
 }
 
@@ -204,7 +204,7 @@ test "load empty state shows actionable no changes message" {
     defer ts.deinit();
 
     const app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
         .terminal_size = .{ .width = 82, .height = 18 },
@@ -264,7 +264,7 @@ test "clean empty state shows branch status chrome" {
     defer ts.deinit();
 
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
         .terminal_size = .{ .width = 100, .height = 18 },
@@ -276,7 +276,7 @@ test "clean empty state shows branch status chrome" {
             } } },
         },
     };
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -285,7 +285,7 @@ test "clean empty state shows branch status chrome" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace("/repo", &bundle);
+    try app.pages.changes.branch_status.replace("/repo", &bundle);
     syncTestActivation(&app);
 
     try app.view(&ts.surface);
@@ -300,7 +300,7 @@ test "clean empty state hides stale branch status chrome" {
     defer ts.deinit();
 
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
         .terminal_size = .{ .width = 100, .height = 18 },
@@ -312,7 +312,7 @@ test "clean empty state hides stale branch status chrome" {
             } } },
         },
     };
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -321,7 +321,7 @@ test "clean empty state hides stale branch status chrome" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace("/other", &bundle);
+    try app.pages.changes.branch_status.replace("/other", &bundle);
 
     try app.view(&ts.surface);
 
@@ -335,7 +335,7 @@ test "clean empty state advertises pull only when clean status snapshot is fresh
     defer ts.deinit();
 
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
         .terminal_size = .{ .width = 110, .height = 18 },
@@ -347,8 +347,8 @@ test "clean empty state advertises pull only when clean status snapshot is fresh
             } } },
         },
     };
-    defer app.pages.review.branch_status.deinit();
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
+    defer app.pages.changes.git_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -357,14 +357,14 @@ test "clean empty state advertises pull only when clean status snapshot is fresh
         .ahead = 0,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace("/repo", &bundle);
+    try app.pages.changes.branch_status.replace("/repo", &bundle);
     syncTestActivation(&app);
 
     try app.view(&ts.surface);
     try app_test_support.expectSnapshotNotContains(&ts, "U to fetch + fast-forward");
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
     var ts_ready: chasen.testing.TestSurface = undefined;
     try ts_ready.init(110, 18);
@@ -381,7 +381,7 @@ test "clean empty state shows bound fetch key from effective keymap" {
     var fetch_config: keymap.Config = .{};
     fetch_config.set(.fetch, .{ .ctrl = .s });
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
         .terminal_size = .{ .width = 120, .height = 18 },
@@ -394,7 +394,7 @@ test "clean empty state shows bound fetch key from effective keymap" {
             } } },
         },
     };
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -403,7 +403,7 @@ test "clean empty state shows bound fetch key from effective keymap" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace("/repo", &bundle);
+    try app.pages.changes.branch_status.replace("/repo", &bundle);
     syncTestActivation(&app);
 
     try app.view(&ts.surface);
@@ -417,7 +417,7 @@ test "clean empty state omits fetch hint when unbound or target is not ready" {
     defer ts.deinit();
 
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
         .terminal_size = .{ .width = 120, .height = 18 },
@@ -429,7 +429,7 @@ test "clean empty state omits fetch hint when unbound or target is not ready" {
             } } },
         },
     };
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -438,12 +438,12 @@ test "clean empty state omits fetch hint when unbound or target is not ready" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace("/repo", &bundle);
+    try app.pages.changes.branch_status.replace("/repo", &bundle);
 
     try app.view(&ts.surface);
     try app_test_support.expectSnapshotNotContains(&ts, "Ctrl+s to fetch");
 
-    app.pages.review.branch_status.clear();
+    app.pages.changes.branch_status.clear();
     var fetch_config: keymap.Config = .{};
     fetch_config.set(.fetch, .{ .ctrl = .s });
     app.keymap = keymap.Effective.fromConfig(fetch_config);
@@ -463,7 +463,7 @@ test "clean empty stdin source does not advertise remote actions" {
     var fetch_config: keymap.Config = .{};
     fetch_config.set(.fetch, .{ .ctrl = .s });
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
         .terminal_size = .{ .width = 120, .height = 18 },
@@ -477,8 +477,8 @@ test "clean empty stdin source does not advertise remote actions" {
             } } },
         },
     };
-    defer app.pages.review.branch_status.deinit();
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
+    defer app.pages.changes.git_status.deinit();
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -487,9 +487,9 @@ test "clean empty stdin source does not advertise remote actions" {
         .ahead = 0,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace("/repo", &bundle);
+    try app.pages.changes.branch_status.replace("/repo", &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
     try app.view(&ts.surface);
 
@@ -504,7 +504,7 @@ test "load empty state distinguishes missing repository" {
     defer ts.deinit();
 
     const app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_repository } },
         } },
         .terminal_size = .{ .width = 90, .height = 18 },
@@ -525,8 +525,8 @@ test "load failed state shows first error line and retry hint" {
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 90, .height = 18 },
     };
-    defer reviewReload(&app).clearLoadedDiff(app.allocator);
-    try app.pages.review.load.replaceFailed(std.testing.allocator, "git diff failed\nsecond line");
+    defer changesReload(&app).clearLoadedDiff(app.allocator);
+    try app.pages.changes.load.replaceFailed(std.testing.allocator, "git diff failed\nsecond line");
 
     try app.view(&ts.surface);
 
@@ -546,13 +546,13 @@ test "loaded diff with empty visible filter shows local empty state" {
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .binary);
 
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .review_display = .{ .changed_file_filter = .binary },
         } },
         .terminal_size = .{ .width = 100, .height = 18 },
     };
-    defer reviewReload(&app).clearLoadedDiff(app.allocator);
+    defer changesReload(&app).clearLoadedDiff(app.allocator);
 
     try app.view(&ts.surface);
 

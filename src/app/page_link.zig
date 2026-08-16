@@ -3,7 +3,7 @@
 //! Source pages derive borrowed targets from their accepted models. The shell
 //! converts a target into `RepositoryIncoming` before mutating page activation;
 //! after that fallible allocation, the value can move into the Repository page
-//! without retaining pointers into Review-owned arenas.
+//! without retaining pointers into Changes-owned arenas.
 
 const std = @import("std");
 const root_capability = @import("../repo/root_capability.zig");
@@ -16,10 +16,10 @@ pub const RepositoryUnavailableReason = enum {
 
     pub fn message(self: RepositoryUnavailableReason) []const u8 {
         return switch (self) {
-            .no_current_path => "Review target has no current working-tree path",
-            .path_not_found => "Review target is not available in Repository",
-            .source_unavailable => "Review target source is unavailable",
-            .request_failed => "Could not load Review target in Repository",
+            .no_current_path => "Changes target has no current working-tree path",
+            .path_not_found => "Changes target is not available in Repository",
+            .source_unavailable => "Changes target source is unavailable",
+            .request_failed => "Could not load Changes target in Repository",
         };
     }
 };
@@ -37,44 +37,44 @@ pub const BorrowedRepositoryUnavailable = struct {
     reason: RepositoryUnavailableReason,
 };
 
-/// Allocation-free classification derived from accepted Review state.
-pub const ReviewRepositoryTarget = union(enum) {
+/// Allocation-free classification derived from accepted Changes state.
+pub const ChangesRepositoryTarget = union(enum) {
     no_context,
     location: BorrowedRepositoryLocation,
     unavailable: BorrowedRepositoryUnavailable,
 };
 
-/// Borrowed Repository -> Review request used only for synchronous exact
+/// Borrowed Repository -> Changes request used only for synchronous exact
 /// lookup. The path remains Repository-owned until the shell finishes the
-/// transition; Review never retains this value for a later reload.
-pub const ReviewLocationIntent = struct {
+/// transition; Changes never retains this value for a later reload.
+pub const ChangesLocationIntent = struct {
     repo_epoch: u64,
     root_identity: root_capability.Identity,
     path: []const u8,
 };
 
-/// Allocation-free Repository classification for a synchronous Review link.
+/// Allocation-free Repository classification for a synchronous Changes link.
 /// `no_context` deliberately covers unresolved and unavailable incoming
 /// destinations so a retained browser selection cannot impersonate them.
-pub const RepositoryReviewTarget = union(enum) {
+pub const RepositoryChangesTarget = union(enum) {
     no_context,
-    location: ReviewLocationIntent,
+    location: ChangesLocationIntent,
 };
 
-pub const ReviewUnavailableReason = enum {
+pub const ChangesUnavailableReason = enum {
     source_unavailable,
-    no_accepted_review,
+    no_accepted_changes,
     repository_mismatch,
     path_not_found,
     hidden_by_filters,
 
-    pub fn message(self: ReviewUnavailableReason) []const u8 {
+    pub fn message(self: ChangesUnavailableReason) []const u8 {
         return switch (self) {
-            .source_unavailable => "Current Review source cannot link to Repository files",
-            .no_accepted_review => "No accepted Review is available",
-            .repository_mismatch => "Repository changed before Review navigation",
-            .path_not_found => "Repository file is not part of the current Review",
-            .hidden_by_filters => "Repository file is hidden by Review filters",
+            .source_unavailable => "Current Changes source cannot link to Repository files",
+            .no_accepted_changes => "No accepted Changes is available",
+            .repository_mismatch => "Repository changed before Changes navigation",
+            .path_not_found => "Repository file is not part of the current Changes",
+            .hidden_by_filters => "Repository file is hidden by Changes filters",
         };
     }
 };
@@ -117,7 +117,7 @@ pub const RepositoryIncoming = union(enum) {
         allocator: std.mem.Allocator,
         repo_epoch: u64,
         root_identity: root_capability.Identity,
-        target: ReviewRepositoryTarget,
+        target: ChangesRepositoryTarget,
     ) !RepositoryIncoming {
         return switch (target) {
             .no_context => .no_context,
@@ -212,8 +212,8 @@ test "Repository unavailable diagnostics are closed static messages" {
     }
 }
 
-test "Review unavailable diagnostics are closed static messages" {
-    inline for (std.meta.tags(ReviewUnavailableReason)) |reason| {
+test "Changes unavailable diagnostics are closed static messages" {
+    inline for (std.meta.tags(ChangesUnavailableReason)) |reason| {
         try std.testing.expect(reason.message().len > 0);
     }
 }

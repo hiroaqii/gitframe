@@ -16,11 +16,11 @@ const page_transition = @import("page_transition.zig");
 const repo_session = @import("repo_session.zig");
 const compare_page = @import("pages/compare.zig");
 const repository_page = @import("pages/repository.zig");
-const review_page = @import("pages/review.zig");
-const review_content = @import("pages/review/content.zig");
-const review_navigation = @import("pages/review/navigation.zig");
-const review_reload = @import("pages/review/reload.zig");
-const review_authority = @import("diff_surface/authority.zig");
+const changes_page = @import("pages/changes.zig");
+const changes_content = @import("pages/changes/content.zig");
+const changes_navigation = @import("pages/changes/navigation.zig");
+const changes_reload = @import("pages/changes/reload.zig");
+const changes_authority = @import("diff_surface/authority.zig");
 const diff_source = @import("../diff/source.zig");
 
 pub const ShellBlockers = struct {
@@ -37,14 +37,14 @@ pub const ShellBlockers = struct {
 
 pub const Intent = enum {
     none,
-    review_revalidation,
-    review_repository_changed,
+    changes_revalidation,
+    changes_repository_changed,
     compare_refresh,
 };
 
 pub const Controller = struct {
     active_page: *page.Id,
-    review: *review_page.ReviewPageState,
+    changes: *changes_page.ChangesPageState,
     repository: *repository_page.RepositoryPageState,
     compare: *compare_page.ComparePageState,
     config_page: *page.LazyPlaceholder,
@@ -54,9 +54,9 @@ pub const Controller = struct {
     status: *app_state.StatusMessage,
     shell_blockers: ShellBlockers,
 
-    pub fn activateReview(self: Controller) u64 {
-        const source_member: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(self.source))
-            switch (self.review.load.state) {
+    pub fn activateChanges(self: Controller) u64 {
+        const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(self.source))
+            switch (self.changes.load.state) {
                 .loaded, .empty => .immutable,
                 .loading => .pending,
                 .failed => .failed,
@@ -65,18 +65,18 @@ pub const Controller = struct {
         else
             .pending;
         const has_repo = self.repo.activeRoot() != null;
-        const auxiliary: review_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(self.source) and has_repo)
+        const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(self.source) and has_repo)
             .pending
         else
             .unavailable;
-        return self.review.activation.activate(self.repo.epoch(), source_member, auxiliary, auxiliary);
+        return self.changes.activation.activate(self.repo.epoch(), source_member, auxiliary, auxiliary);
     }
 
     /// Re-establishes page-local activation after an accepted repository
     /// replacement, then tells root which read owner must run.
     pub fn acceptedRepositoryChange(self: Controller) Intent {
         return switch (self.active_page.*) {
-            .review => .review_repository_changed,
+            .changes => .changes_repository_changed,
             .compare => blk: {
                 _ = self.compare.activate(self.repo.epoch());
                 break :blk .compare_refresh;
@@ -108,31 +108,31 @@ pub const Controller = struct {
         }
 
         self.status.clearIfEphemeral();
-        if (self.active_page.* == .review and target == .repository) {
-            var incoming = self.prepareReviewRepositoryHandoff(allocator) catch {
+        if (self.active_page.* == .changes and target == .repository) {
+            var incoming = self.prepareChangesRepositoryHandoff(allocator) catch {
                 self.status.set("could not prepare page navigation", .{});
                 return .none;
             };
             var incoming_owned = true;
             defer if (incoming_owned) incoming.deinit(allocator);
-            self.commitReviewRepositoryHandoff(allocator, &incoming);
+            self.commitChangesRepositoryHandoff(allocator, &incoming);
             incoming_owned = false;
             return .none;
         }
 
-        if (self.active_page.* == .repository and target == .review) {
-            self.commitRepositoryReviewHandoff(allocator);
-            return .review_revalidation;
+        if (self.active_page.* == .repository and target == .changes) {
+            self.commitRepositoryChangesHandoff(allocator);
+            return .changes_revalidation;
         }
 
-        if (self.active_page.* == .review) self.deactivateReviewForPageSwitch(allocator);
+        if (self.active_page.* == .changes) self.deactivateChangesForPageSwitch(allocator);
         if (self.active_page.* == .repository) self.deactivateRepositoryForPageSwitch();
         if (self.active_page.* == .compare) self.compare.deactivate();
         self.active_page.* = target;
         return switch (target) {
-            .review => blk: {
-                _ = self.activateReview();
-                break :blk .review_revalidation;
+            .changes => blk: {
+                _ = self.activateChanges();
+                break :blk .changes_revalidation;
             },
             .repository => blk: {
                 self.repository.activate(self.repo.epoch(), self.repo.activeIdentity());
@@ -151,13 +151,13 @@ pub const Controller = struct {
 
     fn transitionSnapshot(self: Controller) page_transition.Snapshot {
         return .{
-            .review_mouse_selection = self.review.selection_owner.activeMouseSelection(),
+            .changes_mouse_selection = self.changes.selection_owner.activeMouseSelection(),
             .compare_mouse_selection = self.compare.selection_owner.activeMouseSelection(),
             .repository_mouse_selection = self.repository.activeMouseSourceRange(),
-            .review_deferred_apply = self.review.deferredSourceBlocksPageTransition(),
+            .changes_deferred_apply = self.changes.deferredSourceBlocksPageTransition(),
             .compare_deferred_apply = self.compare.deferred_load_apply != null,
-            .review_search = self.review.search.mode,
-            .review_file_search = self.review.file_search.mode,
+            .changes_search = self.changes.search.mode,
+            .changes_file_search = self.changes.file_search.mode,
             .compare_search = self.compare.search.mode,
             .compare_file_search = self.compare.file_search.mode,
             .repository_source_search = self.repository.source_search.mode,
@@ -176,11 +176,11 @@ pub const Controller = struct {
         };
     }
 
-    fn prepareReviewRepositoryHandoff(
+    fn prepareChangesRepositoryHandoff(
         self: Controller,
         allocator: std.mem.Allocator,
     ) !page_link.RepositoryIncoming {
-        const target = self.reviewContent().repositoryTarget();
+        const target = self.changesContent().repositoryTarget();
         if (target == .no_context) return .no_context;
         const root_identity = self.repo.activeIdentity() orelse return error.MissingRepositoryIdentity;
         return page_link.RepositoryIncoming.initOwned(
@@ -191,37 +191,37 @@ pub const Controller = struct {
         );
     }
 
-    fn commitReviewRepositoryHandoff(
+    fn commitChangesRepositoryHandoff(
         self: Controller,
         allocator: std.mem.Allocator,
         incoming: *page_link.RepositoryIncoming,
     ) void {
-        std.debug.assert(self.active_page.* == .review);
+        std.debug.assert(self.active_page.* == .changes);
         self.repository.acceptIncoming(allocator, incoming);
-        self.deactivateReviewForPageSwitch(allocator);
+        self.deactivateChangesForPageSwitch(allocator);
         self.active_page.* = .repository;
         self.repository.activate(self.repo.epoch(), self.repo.activeIdentity());
         _ = self.repository.resolveIncomingAfterActivation(allocator, self.body_size);
     }
 
-    fn commitRepositoryReviewHandoff(self: Controller, allocator: std.mem.Allocator) void {
+    fn commitRepositoryChangesHandoff(self: Controller, allocator: std.mem.Allocator) void {
         std.debug.assert(self.active_page.* == .repository);
-        const target = self.repository.reviewTarget();
+        const target = self.repository.changesTarget();
         self.repository.dismissIncoming(allocator);
         self.deactivateRepositoryForPageSwitch();
-        self.active_page.* = .review;
-        _ = self.activateReview();
+        self.active_page.* = .changes;
+        _ = self.activateChanges();
 
         switch (target) {
-            .no_context => self.status.set("Repository has no resolved file to open in Review", .{}),
+            .no_context => self.status.set("Repository has no resolved file to open in Changes", .{}),
             .location => |location| {
-                const outcome = self.reviewNavigation().revealExactPath(location) catch {
+                const outcome = self.changesNavigation().revealExactPath(location) catch {
                     self.status.set("could not prepare page navigation", .{});
                     return;
                 };
                 switch (outcome) {
                     .selected => {},
-                    .unchanged => self.status.set("Repository file is already selected in Review", .{}),
+                    .unchanged => self.status.set("Repository file is already selected in Changes", .{}),
                     .unavailable => |reason| self.status.set("{s}", .{reason.message()}),
                 }
             },
@@ -233,29 +233,29 @@ pub const Controller = struct {
         self.repository.deactivate();
     }
 
-    fn deactivateReviewForPageSwitch(self: Controller, allocator: std.mem.Allocator) void {
-        std.debug.assert(self.active_page.* == .review);
-        std.debug.assert(!self.review.deferredSourceBlocksPageTransition());
-        self.reviewReload().retireCanonicalPublicationForPageExit(allocator);
-        self.review.selection_owner = .none;
-        self.review.activation.deactivate();
+    fn deactivateChangesForPageSwitch(self: Controller, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.active_page.* == .changes);
+        std.debug.assert(!self.changes.deferredSourceBlocksPageTransition());
+        self.changesReload().retireCanonicalPublicationForPageExit(allocator);
+        self.changes.selection_owner = .none;
+        self.changes.activation.deactivate();
     }
 
-    fn reviewNavigation(self: Controller) review_navigation.Controller {
+    fn changesNavigation(self: Controller) changes_navigation.Controller {
         return .{
-            .page = self.review,
+            .page = self.changes,
             .repo_root = self.repo.activeRoot(),
             .repo_epoch = self.repo.epoch(),
             .root_identity = self.repo.activeIdentity(),
             .source = self.source,
             .layout = self.diffLayout(),
-            .diagnostics = .{ .target = &self.review.status },
+            .diagnostics = .{ .target = &self.changes.status },
         };
     }
 
-    fn reviewNavigationView(self: Controller) review_navigation.View {
+    fn changesNavigationView(self: Controller) changes_navigation.View {
         return .{
-            .page = self.review,
+            .page = self.changes,
             .repo_root = self.repo.activeRoot(),
             .repo_epoch = self.repo.epoch(),
             .root_identity = self.repo.activeIdentity(),
@@ -264,19 +264,19 @@ pub const Controller = struct {
         };
     }
 
-    fn reviewContent(self: Controller) review_content.View {
+    fn changesContent(self: Controller) changes_content.View {
         return .{
-            .page = self.review,
-            .navigation = self.reviewNavigationView(),
+            .page = self.changes,
+            .navigation = self.changesNavigationView(),
             .source = self.source,
             .repo_root = self.repo.activeRoot(),
         };
     }
 
-    fn reviewReload(self: Controller) review_reload.Controller {
+    fn changesReload(self: Controller) changes_reload.Controller {
         return .{
-            .page = self.review,
-            .navigation = self.reviewNavigation(),
+            .page = self.changes,
+            .navigation = self.changesNavigation(),
             .source = self.source,
             .repo_root = self.repo.activeRoot(),
             .repo_epoch = self.repo.epoch(),
@@ -292,25 +292,25 @@ pub const Controller = struct {
 /// Narrow access to the fallible/infallible handoff boundary for owner-local
 /// contract tests. Production callers enter through `requestSwitch`.
 pub const testing = if (builtin.is_test) struct {
-    pub fn prepareReviewRepositoryHandoff(
+    pub fn prepareChangesRepositoryHandoff(
         controller: Controller,
         allocator: std.mem.Allocator,
     ) !page_link.RepositoryIncoming {
-        return controller.prepareReviewRepositoryHandoff(allocator);
+        return controller.prepareChangesRepositoryHandoff(allocator);
     }
 
-    pub fn commitReviewRepositoryHandoff(
+    pub fn commitChangesRepositoryHandoff(
         controller: Controller,
         allocator: std.mem.Allocator,
         incoming: *page_link.RepositoryIncoming,
     ) void {
-        controller.commitReviewRepositoryHandoff(allocator, incoming);
+        controller.commitChangesRepositoryHandoff(allocator, incoming);
     }
 
-    pub fn commitRepositoryReviewHandoff(
+    pub fn commitRepositoryChangesHandoff(
         controller: Controller,
         allocator: std.mem.Allocator,
     ) void {
-        controller.commitRepositoryReviewHandoff(allocator);
+        controller.commitRepositoryChangesHandoff(allocator);
     }
 } else struct {};

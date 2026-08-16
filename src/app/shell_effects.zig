@@ -3,7 +3,7 @@
 //! Page owners resolve borrowed content synchronously. This controller queues
 //! the physical terminal effect, records only immutable correlation metadata,
 //! and admits exactly one matching completion against the captured semantic
-//! origin. It never starts Review reads directly; typed outcomes return that
+//! origin. It never starts Changes reads directly; typed outcomes return that
 //! composition work to the root shell.
 
 const std = @import("std");
@@ -12,7 +12,7 @@ const chasen = @import("chasen");
 const app_message = @import("message.zig");
 const app_state = @import("state.zig");
 const effect_origin = @import("effect_origin.zig");
-const review_content = @import("pages/review/content.zig");
+const changes_content = @import("pages/changes/content.zig");
 const config_mod = @import("../config.zig");
 const editor = @import("../editor.zig");
 
@@ -57,15 +57,15 @@ pub const View = struct {
 
 pub const OriginContext = struct {
     snapshot: effect_origin.Snapshot,
-    review_repo_epoch: u64,
+    changes_repo_epoch: u64,
     repository_repo_epoch: u64,
     compare_repo_epoch: u64,
 
-    pub fn review(self: OriginContext) effect_origin.PageOrigin {
+    pub fn changes(self: OriginContext) effect_origin.PageOrigin {
         return .{
-            .page_id = .review,
-            .repo_epoch = self.review_repo_epoch,
-            .activation_id = self.snapshot.review_activation_id,
+            .page_id = .changes,
+            .repo_epoch = self.changes_repo_epoch,
+            .activation_id = self.snapshot.changes_activation_id,
         };
     }
 
@@ -88,7 +88,7 @@ pub const OriginContext = struct {
 
 pub const DiagnosticPorts = struct {
     shell: *app_state.StatusMessage,
-    review: *app_state.StatusMessage,
+    changes: *app_state.StatusMessage,
     repository: *app_state.StatusMessage,
     compare: *app_state.StatusMessage,
 };
@@ -111,7 +111,7 @@ pub const CopyRequest = struct {
 
 pub const EditorFinishOutcome = enum {
     none,
-    reload_review,
+    reload_changes,
 };
 
 pub const Controller = struct {
@@ -126,8 +126,8 @@ pub const Controller = struct {
         return self.state.view();
     }
 
-    pub fn reviewOrigin(self: Controller) effect_origin.PageOrigin {
-        return self.origins.review();
+    pub fn changesOrigin(self: Controller) effect_origin.PageOrigin {
+        return self.origins.changes();
     }
 
     pub fn repositoryOrigin(self: Controller) effect_origin.PageOrigin {
@@ -141,35 +141,35 @@ pub const Controller = struct {
     pub fn requestEditor(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        target_result: review_content.EditorTargetResult,
+        target_result: changes_content.EditorTargetResult,
         action_busy: bool,
         origin: effect_origin.PageOrigin,
     ) !void {
         if (action_busy) {
-            self.diagnostics.review.set("finish current git action before opening editor", .{});
+            self.diagnostics.changes.set("finish current git action before opening editor", .{});
             return;
         }
 
         const target = switch (target_result) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
-                self.diagnostics.review.set("editor unavailable for this source", .{});
+                self.diagnostics.changes.set("editor unavailable for this source", .{});
                 return;
             },
             .no_path => {
-                self.diagnostics.review.set("no file selected", .{});
+                self.diagnostics.changes.set("no file selected", .{});
                 return;
             },
             .stale_source => {
-                self.diagnostics.review.set("source is stale; press r to reload", .{});
+                self.diagnostics.changes.set("source is stale; press r to reload", .{});
                 return;
             },
             .directory_unsupported => {
-                self.diagnostics.review.set("directories cannot be opened in editor", .{});
+                self.diagnostics.changes.set("directories cannot be opened in editor", .{});
                 return;
             },
             .deleted_file => {
-                self.diagnostics.review.set("deleted files cannot be opened", .{});
+                self.diagnostics.changes.set("deleted files cannot be opened", .{});
                 return;
             },
         };
@@ -182,17 +182,17 @@ pub const Controller = struct {
         }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.EmptyArgv => {
-                self.diagnostics.review.set("editor command is empty", .{});
+                self.diagnostics.changes.set("editor command is empty", .{});
                 return;
             },
             error.MissingPathPlaceholder, error.UnknownPlaceholder, error.TooManyArguments => {
-                self.diagnostics.review.set("editor config invalid: {s}", .{@errorName(err)});
+                self.diagnostics.changes.set("editor config invalid: {s}", .{@errorName(err)});
                 return;
             },
         };
         defer argv.deinit(ctx.allocator());
         if (argv.argv.len == 0) {
-            self.diagnostics.review.set("editor command is empty", .{});
+            self.diagnostics.changes.set("editor command is empty", .{});
             return;
         }
 
@@ -203,11 +203,11 @@ pub const Controller = struct {
             .finished = app_message.Msg.editorFinished,
         }) catch |err| switch (err) {
             error.ForegroundCommandLimitExceeded => {
-                self.diagnostics.review.set("editor command already queued", .{});
+                self.diagnostics.changes.set("editor command already queued", .{});
                 return;
             },
             error.ForegroundCommandEmptyArgv => {
-                self.diagnostics.review.set("editor command is empty", .{});
+                self.diagnostics.changes.set("editor command is empty", .{});
                 return;
             },
             error.ForegroundCommandCwdUnsupported,
@@ -216,7 +216,7 @@ pub const Controller = struct {
             error.ForegroundCommandSystemFdQuotaExceeded,
             error.ForegroundCommandDuplicateCwdFailed,
             => {
-                self.diagnostics.review.set("editor command could not be queued", .{});
+                self.diagnostics.changes.set("editor command could not be queued", .{});
                 return;
             },
             error.OutOfMemory => return err,
@@ -225,7 +225,7 @@ pub const Controller = struct {
             .request_id = request_id,
             .origin = origin,
         };
-        self.diagnostics.review.set("opening editor: {s}", .{target.path});
+        self.diagnostics.changes.set("opening editor: {s}", .{target.path});
     }
 
     pub fn finishEditor(
@@ -259,7 +259,7 @@ pub const Controller = struct {
             self.redraw.requestSkip();
             return .none;
         }
-        return if (foreground.origin.page_id == .review) .reload_review else .none;
+        return if (foreground.origin.page_id == .changes) .reload_changes else .none;
     }
 
     pub fn queueClipboard(
@@ -335,7 +335,7 @@ pub const Controller = struct {
     ) void {
         switch (origin) {
             .page => |captured| switch (captured.page_id) {
-                .review => self.diagnostics.review.set(fmt, args),
+                .changes => self.diagnostics.changes.set(fmt, args),
                 .repository => self.diagnostics.repository.set(fmt, args),
                 .compare => self.diagnostics.compare.set(fmt, args),
                 .config => self.diagnostics.shell.set(fmt, args),

@@ -394,7 +394,7 @@ test "push retry model moves one target owner through inspection" {
         .oid = try allocator.dupe(u8, "abc"),
     } } };
 
-    var started = model.beginInspection(.{ .page_id = .review, .repo_epoch = 4, .activation_id = 7 }).?;
+    var started = model.beginInspection(.{ .page_id = .changes, .repo_epoch = 4, .activation_id = 7 }).?;
     defer started.target.deinit(allocator);
     try std.testing.expect(model.state == .inspecting);
     try std.testing.expectEqual(@as(u64, 1), started.metadata.identity.operation_generation);

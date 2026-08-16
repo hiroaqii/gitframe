@@ -24,8 +24,8 @@ const git_status = @import("../git/status.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const path_key_mod = @import("../path_key.zig");
 const projection_component = @import("projection_component.zig");
-const review_projection = @import("review_projection.zig");
-const review_read_epoch = @import("review_read_epoch.zig");
+const changes_projection = @import("changes_projection.zig");
+const changes_read_epoch = @import("changes_read_epoch.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const selected_document = @import("../repository/document.zig");
@@ -102,7 +102,7 @@ pub const LoadAuthority = union(enum) {
 /// Result payload sent from the asynchronous diff load task back to App.
 pub const DiffLoadFinished = struct {
     identity: page.RequestIdentity,
-    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
+    read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch = .{},
     generation: u64,
     background_cycle_id: ?u64 = null,
     result: DiffLoadTaskResult,
@@ -142,7 +142,7 @@ pub const RepoPathDiscoveryFinished = struct {
 /// Result payload sent from the asynchronous status load task.
 pub const StatusLoadFinished = struct {
     identity: page.RequestIdentity,
-    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
+    read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch = .{},
     generation: u64,
     background_cycle_id: ?u64 = null,
     repo_root: []u8,
@@ -157,7 +157,7 @@ pub const StatusLoadFinished = struct {
 /// Result payload sent from the asynchronous branch status load task.
 pub const BranchStatusLoadFinished = struct {
     identity: page.RequestIdentity,
-    read_epoch: review_read_epoch.ReviewRepositoryReadEpoch = .{},
+    read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch = .{},
     generation: u64,
     background_cycle_id: ?u64 = null,
     repo_root: []u8,
@@ -207,19 +207,19 @@ pub const CompareBranchListFinished = struct {
     }
 };
 
-pub const ReviewProjectionFinished = review_projection.Finished;
+pub const ChangesProjectionFinished = changes_projection.Finished;
 
-/// Read results whose acceptance and retained state belong to the Review page.
+/// Read results whose acceptance and retained state belong to the Changes page.
 /// The shell still transports these messages and starts any follow-up effects,
 /// but it must not flatten their vocabulary back into root App messages.
-pub const ReviewReadFinished = union(enum) {
+pub const ChangesReadFinished = union(enum) {
     source: DiffLoadFinished,
     status: StatusLoadFinished,
     branch_status: BranchStatusLoadFinished,
-    projection: ReviewProjectionFinished,
-    projection_syntax: review_projection.GeneratedSyntaxFinished,
+    projection: ChangesProjectionFinished,
+    projection_syntax: changes_projection.GeneratedSyntaxFinished,
 
-    pub fn deinit(self: *ReviewReadFinished, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ChangesReadFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
             inline else => |*finished| finished.deinit(allocator),
         }
@@ -254,7 +254,7 @@ pub const ShellReadFinished = union(enum) {
 };
 
 /// Results whose acceptance starts in one owner and commits state in another.
-/// Repository discovery is validated by Review, then transferred to the App
+/// Repository discovery is validated by Changes, then transferred to the App
 /// repository-identity coordinator as one owned command.
 pub const CoordinatorReadFinished = union(enum) {
     repo_discovery: RepoDiscoveryFinished,
@@ -269,9 +269,9 @@ pub const CoordinatorReadFinished = union(enum) {
 
 /// Exhaustive owner routing for every asynchronous read completion.
 /// Adding a Repository page extends this union with a page-owned branch rather
-/// than adding Repository-shaped tags beside Review tags in App.Msg.
+/// than adding Repository-shaped tags beside Changes tags in App.Msg.
 pub const ReadFinished = union(enum) {
-    review: ReviewReadFinished,
+    changes: ChangesReadFinished,
     compare: CompareReadFinished,
     shell: ShellReadFinished,
     coordinator: CoordinatorReadFinished,
@@ -585,7 +585,7 @@ pub fn runPathDiscovery(
 pub fn DiffLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         request: LoadRequest,
         authority: LoadAuthority,
         generation: u64,
@@ -624,7 +624,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
                 task.authority.deinit();
                 allocator.destroy(task);
             }
-            return Msg.loadFinished(.{ .review = .{ .source = DiffLoadFinished{
+            return Msg.loadFinished(.{ .changes = .{ .source = DiffLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
                 .generation = task.generation,
@@ -638,7 +638,7 @@ pub fn DiffLoadTask(comptime Msg: type) type {
 pub fn StatusLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         repo_root: []u8,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
@@ -688,7 +688,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
                 .result = result,
             };
             task.repo_root = &.{};
-            return Msg.loadFinished(.{ .review = .{ .status = finished } });
+            return Msg.loadFinished(.{ .changes = .{ .status = finished } });
         }
     };
 }
@@ -696,7 +696,7 @@ pub fn StatusLoadTask(comptime Msg: type) type {
 pub fn BranchStatusLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
-        read_epoch: review_read_epoch.ReviewRepositoryReadEpoch,
+        read_epoch: changes_read_epoch.ChangesRepositoryReadEpoch,
         repo_root: []u8,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
@@ -743,7 +743,7 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
                 .result = result,
             };
             task.repo_root = &.{};
-            return Msg.loadFinished(.{ .review = .{ .branch_status = finished } });
+            return Msg.loadFinished(.{ .changes = .{ .branch_status = finished } });
         }
     };
 }
@@ -933,15 +933,15 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
     };
 }
 
-pub fn ReviewProjectionTask(comptime Msg: type) type {
+pub fn ChangesProjectionTask(comptime Msg: type) type {
     return struct {
-        request: review_projection.Request,
+        request: changes_projection.Request,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runReviewProjectionLoad(task.request, task.root, &task.environment, allocator, io));
+            return task.finish(allocator, runChangesProjectionLoad(task.request, task.root, &task.environment, allocator, io));
         }
 
         pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
@@ -960,13 +960,13 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
 
         /// Terminal epilogue shared by run and failed; owned-field release,
         /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: review_projection.TaskResult) Msg {
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: changes_projection.TaskResult) Msg {
             defer allocator.destroy(task);
             defer task.environment.deinit();
             defer task.root.deinit();
             const request = task.request;
             task.request = undefined;
-            return Msg.loadFinished(.{ .review = .{ .projection = ReviewProjectionFinished{
+            return Msg.loadFinished(.{ .changes = .{ .projection = ChangesProjectionFinished{
                 .request = request,
                 .result = result,
             } } });
@@ -979,7 +979,7 @@ pub fn ReviewProjectionTask(comptime Msg: type) type {
 /// (plain display) instead of a failure-string variant of the success result.
 pub fn GeneratedSyntaxTask(comptime Msg: type) type {
     return struct {
-        request: review_projection.GeneratedSyntaxRequest,
+        request: changes_projection.GeneratedSyntaxRequest,
         root: root_capability.RootCapability,
 
         /// Spawn-failure counterpart of the terminal epilogue: releases the
@@ -998,7 +998,7 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
             const request = task.request;
             task.request = undefined;
             var snapshot_fingerprint: ?content_fingerprint.Fingerprint = null;
-            var result: review_projection.GeneratedSyntaxResult = .{ .terminal_plain = .provider_unavailable };
+            var result: changes_projection.GeneratedSyntaxResult = .{ .terminal_plain = .provider_unavailable };
 
             if (!task.root.identity.eql(request.root_identity)) {
                 result = .stale;
@@ -1024,7 +1024,7 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
                 }
             }
 
-            return Msg.loadFinished(.{ .review = .{ .projection_syntax = .{
+            return Msg.loadFinished(.{ .changes = .{ .projection_syntax = .{
                 .request = request,
                 .snapshot_fingerprint = snapshot_fingerprint,
                 .result = result,
@@ -1038,7 +1038,7 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
 
             const request = task.request;
             task.request = undefined;
-            return Msg.loadFinished(.{ .review = .{ .projection_syntax = .{
+            return Msg.loadFinished(.{ .changes = .{ .projection_syntax = .{
                 .request = request,
                 .snapshot_fingerprint = null,
                 .result = .{ .terminal_plain = .provider_unavailable },
@@ -1592,13 +1592,13 @@ fn runLoadExpectedWithContext(
     }
 }
 
-pub fn runReviewProjectionLoad(
-    request: review_projection.Request,
+pub fn runChangesProjectionLoad(
+    request: changes_projection.Request,
     root: root_capability.RootCapability,
     environment: ?*const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
-) review_projection.TaskResult {
+) changes_projection.TaskResult {
     return switch (request.kind) {
         .cached_diff => loadCachedFileDiff(request, root, environment orelse return .{ .failed_static = "Repository authority unavailable" }, allocator, io),
         .generated_added_file => loadGeneratedAddedFile(request, root, allocator, io),
@@ -1607,17 +1607,17 @@ pub fn runReviewProjectionLoad(
 }
 
 fn loadCachedFileDiff(
-    request: review_projection.Request,
+    request: changes_projection.Request,
     root: root_capability.RootCapability,
     environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
-) review_projection.TaskResult {
+) changes_projection.TaskResult {
     var component = loadFileProjectionComponent(request, root, environment, allocator, io, .cached) catch |err| {
-        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Cached diff load failed: {s}", .{@errorName(err)}) catch
+        return .{ .failed = changes_projection.statusBodyAlloc(allocator, request.path_key, "Cached diff load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Cached diff load failed: OutOfMemory" } };
     } orelse {
-        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged diff for this file.", .{}) catch
+        return .{ .ready = .{ .status_body = changes_projection.statusBodyAlloc(allocator, request.path_key, "No staged diff for this file.", .{}) catch
             return .{ .failed_static = "Projection allocation failed" } } };
     };
     defer component.deinit();
@@ -1628,11 +1628,11 @@ fn loadCachedFileDiff(
 /// same canonical presentation. A miss promotes the already parsed component
 /// into the established eager cached projection in this same completion.
 fn buildCachedFileTaskResult(
-    request: review_projection.Request,
+    request: changes_projection.Request,
     allocator: std.mem.Allocator,
     io: std.Io,
     component: *projection_component.ParsedComponent,
-) review_projection.TaskResult {
+) changes_projection.TaskResult {
     if (request.expected_presentation) |expected| {
         if (component.document.files.len == 1 and component.fileTextSelectable(0)) {
             const fingerprint = diff_presentation_identity.fingerprint(component.document.files[0]);
@@ -1646,7 +1646,7 @@ fn buildCachedFileTaskResult(
                     return buildCachedFileEagerResult(request.path_key, allocator, io, component);
                 for (action_origins, 0..) |*origin, hunk_index| origin.* = .{ .cached = hunk_index };
 
-                const candidate: review_projection.StagedOnlyReuseCandidate = .{
+                const candidate: changes_projection.StagedOnlyReuseCandidate = .{
                     .fingerprint = fingerprint,
                     .fresh_authority = .{
                         .projection = .{
@@ -1670,9 +1670,9 @@ fn buildCachedFileEagerResult(
     allocator: std.mem.Allocator,
     io: std.Io,
     component: *projection_component.ParsedComponent,
-) review_projection.TaskResult {
+) changes_projection.TaskResult {
     const bundle = decorateProjectionComponent(component, io) catch |err| {
-        return .{ .failed = review_projection.statusBodyAlloc(
+        return .{ .failed = changes_projection.statusBodyAlloc(
             allocator,
             path_key,
             "Cached diff load failed: {s}",
@@ -1683,7 +1683,7 @@ fn buildCachedFileEagerResult(
 }
 
 fn loadFileProjectionComponent(
-    request: review_projection.Request,
+    request: changes_projection.Request,
     root: root_capability.RootCapability,
     environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
@@ -1696,7 +1696,7 @@ fn loadFileProjectionComponent(
 }
 
 fn loadFileDiffBytes(
-    request: review_projection.Request,
+    request: changes_projection.Request,
     root: root_capability.RootCapability,
     environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
@@ -1725,23 +1725,23 @@ fn loadFileDiffBytes(
 }
 
 fn loadCombinedHunks(
-    request: review_projection.Request,
+    request: changes_projection.Request,
     root: root_capability.RootCapability,
     environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
-) review_projection.TaskResult {
+) changes_projection.TaskResult {
     var cached_component = loadFileProjectionComponent(request, root, environment, allocator, io, .cached) catch |err| {
-        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Staged hunk projection load failed: {s}", .{@errorName(err)}) catch
+        return .{ .failed = changes_projection.statusBodyAlloc(allocator, request.path_key, "Staged hunk projection load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Projection load failed: OutOfMemory" } };
-    } orelse return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No staged hunks for this file.", .{}) catch
+    } orelse return .{ .ready = .{ .status_body = changes_projection.statusBodyAlloc(allocator, request.path_key, "No staged hunks for this file.", .{}) catch
         return .{ .failed_static = "Projection allocation failed" } } };
     defer cached_component.deinit();
 
     var unstaged_component = loadFileProjectionComponent(request, root, environment, allocator, io, .unstaged) catch |err| {
-        return .{ .failed = review_projection.statusBodyAlloc(allocator, request.path_key, "Unstaged hunk projection load failed: {s}", .{@errorName(err)}) catch
+        return .{ .failed = changes_projection.statusBodyAlloc(allocator, request.path_key, "Unstaged hunk projection load failed: {s}", .{@errorName(err)}) catch
             return .{ .failed_static = "Projection load failed: OutOfMemory" } };
-    } orelse return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, request.path_key, "No unstaged hunks for this file.", .{}) catch
+    } orelse return .{ .ready = .{ .status_body = changes_projection.statusBodyAlloc(allocator, request.path_key, "No unstaged hunks for this file.", .{}) catch
         return .{ .failed_static = "Projection allocation failed" } } };
     defer unstaged_component.deinit();
 
@@ -1754,12 +1754,12 @@ fn loadCombinedHunks(
 /// both finish in this same worker completion with the established eager
 /// decoration path.
 fn buildCombinedHunkTaskResult(
-    request: review_projection.Request,
+    request: changes_projection.Request,
     allocator: std.mem.Allocator,
     io: std.Io,
     cached_component: *projection_component.ParsedComponent,
     unstaged_component: *projection_component.ParsedComponent,
-) review_projection.TaskResult {
+) changes_projection.TaskResult {
     if (request.expected_presentation) |expected| {
         var prepared = prepareCombinedReuse(
             allocator,
@@ -1809,9 +1809,9 @@ fn buildCombinedHunkResult(
     io: std.Io,
     cached_component: *projection_component.ParsedComponent,
     unstaged_component: *projection_component.ParsedComponent,
-) review_projection.TaskResult {
+) changes_projection.TaskResult {
     if (cached_component.document.files.len != 1 or unstaged_component.document.files.len != 1) {
-        return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, path_key, "Cannot combine staged and unstaged hunks for this file.", .{}) catch
+        return .{ .ready = .{ .status_body = changes_projection.statusBodyAlloc(allocator, path_key, "Cannot combine staged and unstaged hunks for this file.", .{}) catch
             return .{ .failed_static = "Projection allocation failed" } } };
     }
 
@@ -1821,7 +1821,7 @@ fn buildCombinedHunkResult(
             return projectionDecorationFailureResult(allocator, path_key, err);
         };
         defer decorated.deinit();
-        const bundle = review_projection.InertCombinedBundle{
+        const bundle = changes_projection.InertCombinedBundle{
             .cached_bundle = decorated.cached,
             .unstaged_bundle = decorated.unstaged,
         };
@@ -1857,13 +1857,13 @@ fn buildCombinedHunkResult(
         // Unlike invalid text, unsafe coordinates cannot retain an inert
         // projection because that would expose fabricated action targets.
         const body = switch (err) {
-            error.UnmappableCoordinate => review_projection.statusBodyAlloc(
+            error.UnmappableCoordinate => changes_projection.statusBodyAlloc(
                 allocator,
                 path_key,
                 "Cannot combine staged and unstaged hunks: line coordinates cannot be normalized safely.",
                 .{},
             ),
-            else => review_projection.statusBodyAlloc(
+            else => changes_projection.statusBodyAlloc(
                 allocator,
                 path_key,
                 "Cannot combine staged and unstaged hunks: {s}",
@@ -1917,8 +1917,8 @@ const PreparedCombinedReuse = struct {
         status_snapshot_revision: u64,
         cached_component: *projection_component.ParsedComponent,
         unstaged_component: *projection_component.ParsedComponent,
-    ) review_projection.CombinedReuseCandidate {
-        const candidate: review_projection.CombinedReuseCandidate = .{
+    ) changes_projection.CombinedReuseCandidate {
+        const candidate: changes_projection.CombinedReuseCandidate = .{
             .candidate_arena = self.candidate_arena,
             .projection = self.projection.presentation,
             .fingerprint = self.fingerprint,
@@ -1976,7 +1976,7 @@ fn buildCombinedReuseCandidate(
     allocator: std.mem.Allocator,
     cached_component: *projection_component.ParsedComponent,
     unstaged_component: *projection_component.ParsedComponent,
-) diff_hunk_projection.BuildError!review_projection.CombinedReuseCandidate {
+) diff_hunk_projection.BuildError!changes_projection.CombinedReuseCandidate {
     var prepared = try prepareCombinedReuse(allocator, cached_component, unstaged_component);
     errdefer prepared.deinit();
     return prepared.takeCandidate(status_snapshot_revision, cached_component, unstaged_component);
@@ -1986,8 +1986,8 @@ fn projectionDecorationFailureResult(
     allocator: std.mem.Allocator,
     path_key: []const u8,
     err: anyerror,
-) review_projection.TaskResult {
-    const body = review_projection.statusBodyAlloc(
+) changes_projection.TaskResult {
+    const body = changes_projection.statusBodyAlloc(
         allocator,
         path_key,
         "Projection decoration failed: {s}",
@@ -2034,7 +2034,7 @@ fn decorateCombinedProjection(
     cached_authority_component: *projection_component.ParsedComponent,
     unstaged_authority_component: *projection_component.ParsedComponent,
     io: std.Io,
-) !review_projection.CombinedHunkBundle {
+) !changes_projection.CombinedHunkBundle {
     var presentation_arena = presentation_arena_owner;
     errdefer presentation_arena.deinit();
     var authority_arena = authority_arena_owner;
@@ -2042,7 +2042,7 @@ fn decorateCombinedProjection(
     var decorated = try decorateProjectionComponents(cached_presentation_component, unstaged_presentation_component, io);
     errdefer decorated.deinit();
 
-    const bundle = review_projection.CombinedHunkBundle{
+    const bundle = changes_projection.CombinedHunkBundle{
         .presentation = .{
             .arena = presentation_arena,
             .projection = projection.presentation,
@@ -2067,11 +2067,11 @@ fn decorateCombinedProjection(
 }
 
 fn loadGeneratedAddedFile(
-    request: review_projection.Request,
+    request: changes_projection.Request,
     root: ?root_capability.RootCapability,
     allocator: std.mem.Allocator,
     io: std.Io,
-) review_projection.TaskResult {
+) changes_projection.TaskResult {
     const capability = root orelse return .{ .failed_static = "Repository root is unavailable" };
     if (!request.matchesRootIdentity(capability.identity)) return .{ .failed_static = "Repository root changed" };
 
@@ -2082,7 +2082,7 @@ fn loadGeneratedAddedFile(
             const bytes = text.bytes;
             const fingerprint = text.fingerprint;
             snapshot.value = .unreadable;
-            const bundle = review_projection.generatedFileFromOwnedContent(
+            const bundle = changes_projection.generatedFileFromOwnedContent(
                 allocator,
                 request.path_key,
                 bytes,
@@ -2103,13 +2103,13 @@ fn loadGeneratedAddedFile(
     }
 }
 
-fn generatedStatusBody(allocator: std.mem.Allocator, path: []const u8, message: []const u8) review_projection.TaskResult {
-    return .{ .ready = .{ .status_body = review_projection.statusBodyAlloc(allocator, path, "{s}", .{message}) catch
+fn generatedStatusBody(allocator: std.mem.Allocator, path: []const u8, message: []const u8) changes_projection.TaskResult {
+    return .{ .ready = .{ .status_body = changes_projection.statusBodyAlloc(allocator, path, "{s}", .{message}) catch
         return .{ .failed_static = "Projection allocation failed" } } };
 }
 
 /// Best-effort untracked line-count read rooted at the task-owned repository
-/// descriptor. Review preview bytes use `repository/document.zig` instead.
+/// descriptor. Changes preview bytes use `repository/document.zig` instead.
 fn readRepoFileLimited(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, path_key: []const u8, limit: usize) ![]u8 {
     try validateRepoRelativePath(path_key);
 
@@ -2202,7 +2202,7 @@ fn buildLoadedBundleWithOptions(
 }
 
 /// Promote one parse-only projection component into the ordinary, fully
-/// decorated bundle used by the current Review renderer. Failure leaves the
+/// decorated bundle used by the current Changes renderer. Failure leaves the
 /// component owner intact; success transfers its arena exactly once.
 fn decorateProjectionComponent(
     component: *projection_component.ParsedComponent,
@@ -2293,11 +2293,11 @@ fn testCombinedProjectionRequest(
     allocator: std.mem.Allocator,
     id: u64,
     status_snapshot_revision: u64,
-    expected_presentation: ?review_projection.ExpectedPresentation,
-) !review_projection.Request {
-    return review_projection.cloneRequestWithOptions(
+    expected_presentation: ?changes_projection.ExpectedPresentation,
+) !changes_projection.Request {
+    return changes_projection.cloneRequestWithOptions(
         allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         id,
         "/repo",
         "a.zig",
@@ -2316,11 +2316,11 @@ fn testCachedProjectionRequest(
     allocator: std.mem.Allocator,
     id: u64,
     status_snapshot_revision: u64,
-    expected_presentation: ?review_projection.ExpectedPresentation,
-) !review_projection.Request {
-    return review_projection.cloneRequestWithOptions(
+    expected_presentation: ?changes_projection.ExpectedPresentation,
+) !changes_projection.Request {
+    return changes_projection.cloneRequestWithOptions(
         allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         id,
         "/repo",
         "a.zig",
@@ -2401,8 +2401,8 @@ test "combined worker publishes provider-independent candidate only for matching
     try std.testing.expect(unstaged.arena == null);
     try std.testing.expect(result.reuse_candidate.fingerprint.eql(expected_fingerprint));
     try std.testing.expectEqual(@as(u64, 8), result.reuse_candidate.fresh_authority.?.status_snapshot_revision);
-    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "syntax_spans"));
-    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "cached_bundle"));
+    try std.testing.expect(!@hasField(changes_projection.CombinedReuseCandidate, "syntax_spans"));
+    try std.testing.expect(!@hasField(changes_projection.CombinedReuseCandidate, "cached_bundle"));
 }
 
 test "combined worker publishes provider-independent candidate for exact primary hint" {
@@ -2571,9 +2571,9 @@ test "combined reuse candidate separates comparison storage from fresh authority
     try std.testing.expectEqual(@as(usize, 2), candidate.displayFile().hunks.len);
     try std.testing.expect(candidate.fingerprint.eql(diff_presentation_identity.fingerprint(candidate.displayFile())));
     try std.testing.expect(candidate.retainedBytes() > 0);
-    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "cached_bundle"));
-    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "unstaged_bundle"));
-    try std.testing.expect(!@hasField(review_projection.CombinedReuseCandidate, "syntax_spans"));
+    try std.testing.expect(!@hasField(changes_projection.CombinedReuseCandidate, "cached_bundle"));
+    try std.testing.expect(!@hasField(changes_projection.CombinedReuseCandidate, "unstaged_bundle"));
+    try std.testing.expect(!@hasField(changes_projection.CombinedReuseCandidate, "syntax_spans"));
 
     const authority = &candidate.fresh_authority.?;
     try std.testing.expectEqual(@as(u64, 8), authority.status_snapshot_revision);
@@ -2899,9 +2899,9 @@ test "generated projection uses pinned safe source snapshot" {
     defer allocator.free(root_path);
     var root = try root_capability.RootCapability.openCanonical(root_path);
     defer root.deinit();
-    var request = try review_projection.testing.cloneRequestWithRootIdentity(
+    var request = try changes_projection.testing.cloneRequestWithRootIdentity(
         allocator,
-        page.RequestIdentity.review(1, 2),
+        page.RequestIdentity.changes(1, 2),
         3,
         root_path,
         "new.zig",
@@ -2913,7 +2913,7 @@ test "generated projection uses pinned safe source snapshot" {
     );
     defer request.deinit(allocator);
 
-    var result = runReviewProjectionLoad(request, root, null, allocator, io);
+    var result = runChangesProjectionLoad(request, root, null, allocator, io);
     defer result.deinit(allocator);
     switch (result) {
         .ready => |ready| switch (ready) {
@@ -2944,9 +2944,9 @@ test "text limit contract generated projection shared loader" {
     defer first_root.deinit();
     var second_root = try root_capability.RootCapability.openCanonical(second_path);
     defer second_root.deinit();
-    var request = try review_projection.testing.cloneRequestWithRootIdentity(
+    var request = try changes_projection.testing.cloneRequestWithRootIdentity(
         allocator,
-        page.RequestIdentity.review(1, 2),
+        page.RequestIdentity.changes(1, 2),
         3,
         first_path,
         "unsafe.zig",
@@ -2958,14 +2958,14 @@ test "text limit contract generated projection shared loader" {
     );
     defer request.deinit(allocator);
 
-    var unsafe = runReviewProjectionLoad(request, first_root, null, allocator, io);
+    var unsafe = runChangesProjectionLoad(request, first_root, null, allocator, io);
     defer unsafe.deinit(allocator);
     try std.testing.expect(switch (unsafe) {
         .ready => |ready| ready == .status_body,
         else => false,
     });
 
-    var wrong_root = runReviewProjectionLoad(request, second_root, null, allocator, io);
+    var wrong_root = runChangesProjectionLoad(request, second_root, null, allocator, io);
     defer wrong_root.deinit(allocator);
     try std.testing.expect(switch (wrong_root) {
         .failed_static => |message| std.mem.eql(u8, message, "Repository root changed"),
@@ -2976,9 +2976,9 @@ test "text limit contract generated projection shared loader" {
     defer allocator.free(boundary_bytes);
     @memset(boundary_bytes, 'x');
     try first.dir.writeFile(io, .{ .sub_path = "boundary.zig", .data = boundary_bytes });
-    var boundary_request = try review_projection.testing.cloneRequestWithRootIdentity(
+    var boundary_request = try changes_projection.testing.cloneRequestWithRootIdentity(
         allocator,
-        page.RequestIdentity.review(1, 2),
+        page.RequestIdentity.changes(1, 2),
         4,
         first_path,
         "boundary.zig",
@@ -2989,7 +2989,7 @@ test "text limit contract generated projection shared loader" {
         first_root.identity,
     );
     defer boundary_request.deinit(allocator);
-    var boundary = runReviewProjectionLoad(boundary_request, first_root, null, allocator, io);
+    var boundary = runChangesProjectionLoad(boundary_request, first_root, null, allocator, io);
     defer boundary.deinit(allocator);
     switch (boundary) {
         .ready => |ready| switch (ready) {
@@ -3006,9 +3006,9 @@ test "text limit contract generated projection shared loader" {
     defer allocator.free(oversized_bytes);
     @memset(oversized_bytes, 'x');
     try first.dir.writeFile(io, .{ .sub_path = "oversized.zig", .data = oversized_bytes });
-    var oversized_request = try review_projection.testing.cloneRequestWithRootIdentity(
+    var oversized_request = try changes_projection.testing.cloneRequestWithRootIdentity(
         allocator,
-        page.RequestIdentity.review(1, 2),
+        page.RequestIdentity.changes(1, 2),
         5,
         first_path,
         "oversized.zig",
@@ -3019,7 +3019,7 @@ test "text limit contract generated projection shared loader" {
         first_root.identity,
     );
     defer oversized_request.deinit(allocator);
-    var oversized = runReviewProjectionLoad(oversized_request, first_root, null, allocator, io);
+    var oversized = runChangesProjectionLoad(oversized_request, first_root, null, allocator, io);
     defer oversized.deinit(allocator);
     switch (oversized) {
         .ready => |ready| switch (ready) {
@@ -3030,7 +3030,7 @@ test "text limit contract generated projection shared loader" {
     }
 }
 
-test "text limit contract review generated oversized diagnostic" {
+test "text limit contract changes generated oversized diagnostic" {
     try std.testing.expectEqualStrings("File exceeds the 2 MiB preview limit.", generated_oversized_message);
 }
 
@@ -3603,7 +3603,7 @@ test "StatusLoadTask failed preserves read epoch generation and moves repo root"
 
     const task = try allocator.create(Task);
     task.* = .{
-        .identity = page.RequestIdentity.review(7, 11),
+        .identity = page.RequestIdentity.changes(7, 11),
         .read_epoch = .{ .value = 19 },
         .repo_root = try allocator.dupe(u8, "/repo"),
         .root = try root_capability.RootCapability.openCanonical(root_path),
@@ -3614,7 +3614,7 @@ test "StatusLoadTask failed preserves read epoch generation and moves repo root"
     const msg = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
-            .review => |review| switch (review) {
+            .changes => |changes| switch (changes) {
                 .status => |payload| payload,
                 else => return error.UnexpectedReadRoute,
             },
@@ -3624,7 +3624,7 @@ test "StatusLoadTask failed preserves read epoch generation and moves repo root"
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 42), finished.generation);
-    try std.testing.expectEqual(page.RequestIdentity.review(7, 11), finished.identity);
+    try std.testing.expectEqual(page.RequestIdentity.changes(7, 11), finished.identity);
     try std.testing.expect(finished.read_epoch.eql(.{ .value = 19 }));
     try std.testing.expectEqualStrings("/repo", finished.repo_root);
     try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
@@ -3661,7 +3661,7 @@ test "DiffLoadTask failed frees request and preserves read epoch generation" {
 
     const task = try allocator.create(Task);
     task.* = .{
-        .identity = page.RequestIdentity.review(3, 5),
+        .identity = page.RequestIdentity.changes(3, 5),
         .read_epoch = .{ .value = 23 },
         .request = .{
             .source = .{ .range = try allocator.dupe(u8, "HEAD~1..HEAD") },
@@ -3675,7 +3675,7 @@ test "DiffLoadTask failed frees request and preserves read epoch generation" {
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
-            .review => |review| switch (review) {
+            .changes => |changes| switch (changes) {
                 .source => |payload| payload,
                 else => return error.UnexpectedReadRoute,
             },
@@ -3685,7 +3685,7 @@ test "DiffLoadTask failed frees request and preserves read epoch generation" {
     defer finished.result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 9), finished.generation);
-    try std.testing.expectEqual(page.RequestIdentity.review(3, 5), finished.identity);
+    try std.testing.expectEqual(page.RequestIdentity.changes(3, 5), finished.identity);
     try std.testing.expect(finished.read_epoch.eql(.{ .value = 23 }));
     try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
         .failed_static => |message| message,
@@ -3714,7 +3714,7 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
 
     const task = try allocator.create(Task);
     task.* = .{
-        .identity = page.RequestIdentity.review(5, 13),
+        .identity = page.RequestIdentity.changes(5, 13),
         .read_epoch = .{ .value = 29 },
         .repo_root = try allocator.dupe(u8, "/repo"),
         .root = root,
@@ -3728,7 +3728,7 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
     const msg = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
-            .review => |review| switch (review) {
+            .changes => |changes| switch (changes) {
                 .branch_status => |payload| payload,
                 else => return error.UnexpectedReadRoute,
             },
@@ -3738,7 +3738,7 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 47), finished.generation);
-    try std.testing.expectEqual(page.RequestIdentity.review(5, 13), finished.identity);
+    try std.testing.expectEqual(page.RequestIdentity.changes(5, 13), finished.identity);
     try std.testing.expect(finished.read_epoch.eql(.{ .value = 29 }));
     try std.testing.expectEqualStrings("/repo", finished.repo_root);
     try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
@@ -3752,7 +3752,7 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
     } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 }
 
-test "ReviewProjectionTask failed preserves request identity and read epoch" {
+test "ChangesProjectionTask failed preserves request identity and read epoch" {
     const TestLoadMsg = ReadFinished;
     const TestMsg = union(enum) {
         load: TestLoadMsg,
@@ -3761,7 +3761,7 @@ test "ReviewProjectionTask failed preserves request identity and read epoch" {
             return .{ .load = msg };
         }
     };
-    const Task = ReviewProjectionTask(TestMsg);
+    const Task = ChangesProjectionTask(TestMsg);
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3771,7 +3771,7 @@ test "ReviewProjectionTask failed preserves request identity and read epoch" {
     const task = try allocator.create(Task);
     task.* = .{
         .request = .{
-            .identity = page.RequestIdentity.review(0, 1),
+            .identity = page.RequestIdentity.changes(0, 1),
             .id = 11,
             .read_epoch = .{ .value = 53 },
             .repo_root = try allocator.dupe(u8, "/repo"),
@@ -3788,7 +3788,7 @@ test "ReviewProjectionTask failed preserves request identity and read epoch" {
     const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
-            .review => |review| switch (review) {
+            .changes => |changes| switch (changes) {
                 .projection => |payload| payload,
                 else => return error.UnexpectedReadRoute,
             },
@@ -3835,7 +3835,7 @@ test "GeneratedSyntaxTask rereads pinned matching source and retains read epoch"
     const task = try allocator.create(Task);
     task.* = .{
         .request = .{
-            .identity = page.RequestIdentity.review(2, 3),
+            .identity = page.RequestIdentity.changes(2, 3),
             .id = 4,
             .projection_id = 5,
             .read_epoch = .{ .value = 59 },
@@ -3852,7 +3852,7 @@ test "GeneratedSyntaxTask rereads pinned matching source and retains read epoch"
     const msg = Task.run(task, allocator, io);
     var finished = switch (msg) {
         .load => |load| switch (load) {
-            .review => |review| switch (review) {
+            .changes => |changes| switch (changes) {
                 .projection_syntax => |payload| payload,
                 else => return error.UnexpectedReadRoute,
             },

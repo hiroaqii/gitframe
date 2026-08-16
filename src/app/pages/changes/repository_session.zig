@@ -1,18 +1,18 @@
-//! Review-owned boundary for repository-session invalidation.
+//! Changes-owned boundary for repository-session invalidation.
 //!
-//! The root assembles this short-lived adapter from Review's navigation and
+//! The root assembles this short-lived adapter from Changes's navigation and
 //! reload controllers. Repository-session coordination can then request only
 //! the exact invalidations associated with an accepted repository identity.
 
 const std = @import("std");
 const diff_source = @import("../../../diff/source.zig");
 const authority = @import("../../diff_surface/authority.zig");
-const review_page = @import("../review.zig");
+const changes_page = @import("../changes.zig");
 const navigation = @import("navigation.zig");
 const reload = @import("reload.zig");
 
 pub const Controller = struct {
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
     navigation: navigation.Controller,
     reload: reload.Controller,
 
@@ -23,8 +23,8 @@ pub const Controller = struct {
         _ = self.page.status_load.prepare(false);
         _ = self.page.branch_status_load.prepare(false);
         self.page.auto_reload.supersedeCycle();
-        self.page.review_projection.clearPending(allocator);
-        self.page.review_projection.clearSyntaxPending(allocator);
+        self.page.changes_projection.clearPending(allocator);
+        self.page.changes_projection.clearSyntaxPending(allocator);
     }
 
     pub fn invalidateBeforeReplacement(self: Controller, allocator: std.mem.Allocator) void {

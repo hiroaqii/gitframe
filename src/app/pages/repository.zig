@@ -244,7 +244,7 @@ pub const RepositoryPageState = struct {
     activation_id: u64 = 0,
     repo_epoch: u64 = 0,
     root_identity: ?root_capability.Identity = null,
-    /// Independent read-only branch owner. It shares neither Review's
+    /// Independent read-only branch owner. It shares neither Changes's
     /// freshness nor Repository's primary manifest/status diagnostic slot.
     branch: repository_branch.State = .{},
     /// Independent current-selection Git-history owner. It never borrows the
@@ -477,10 +477,10 @@ pub const RepositoryPageState = struct {
         return self.incoming.unavailableValue();
     }
 
-    /// Export only a resolved, page-owned exact path for synchronous Review
+    /// Export only a resolved, page-owned exact path for synchronous Changes
     /// lookup. A pending or unavailable contextual destination wins over any
     /// older retained selection and therefore exports no context.
-    pub fn reviewTarget(self: *const RepositoryPageState) page_link.RepositoryReviewTarget {
+    pub fn changesTarget(self: *const RepositoryPageState) page_link.RepositoryChangesTarget {
         if (self.incoming != .none) return .no_context;
         const path = self.selected_path orelse return .no_context;
         const identity = self.root_identity orelse return .no_context;
@@ -541,7 +541,7 @@ pub const RepositoryPageState = struct {
             if (self.file_search.mode) {
                 self.refreshFileSearch();
             }
-            self.status.set("Review target opened in All files", .{});
+            self.status.set("Changes target opened in All files", .{});
         }
 
         const visible_index = self.tree_projection.revealManifestNode(
@@ -3266,7 +3266,7 @@ test "repository page zero state deinitializes and activation is lazy" {
     try std.testing.expectEqual(@as(u64, 3), state.repo_epoch);
 }
 
-test "repository transition exports only resolved exact Review context" {
+test "repository transition exports only resolved exact Changes context" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 5, .inode = 8 };
     const exact_path = "src/\xff.zig";
@@ -3277,8 +3277,8 @@ test "repository transition exports only resolved exact Review context" {
     };
     defer state.deinit(allocator);
 
-    switch (state.reviewTarget()) {
-        .no_context => return error.ExpectedReviewLocation,
+    switch (state.changesTarget()) {
+        .no_context => return error.ExpectedChangesLocation,
         .location => |location| {
             try std.testing.expectEqual(@as(u64, 13), location.repo_epoch);
             try std.testing.expect(location.root_identity.eql(identity));
@@ -3288,10 +3288,10 @@ test "repository transition exports only resolved exact Review context" {
     }
 
     state.selected_path = null;
-    try std.testing.expect(state.reviewTarget() == .no_context);
+    try std.testing.expect(state.changesTarget() == .no_context);
     state.selected_path = exact_path;
     state.root_identity = null;
-    try std.testing.expect(state.reviewTarget() == .no_context);
+    try std.testing.expect(state.changesTarget() == .no_context);
 }
 
 test "repository transition pending and unavailable destinations suppress retained context" {
@@ -3311,17 +3311,17 @@ test "repository transition pending and unavailable destinations suppress retain
         .{ .location = .{ .path = "requested.zig" } },
     );
     state.acceptIncoming(allocator, &pending);
-    try std.testing.expect(state.reviewTarget() == .no_context);
+    try std.testing.expect(state.changesTarget() == .no_context);
 
     try std.testing.expect(state.incoming.advanceToDocument(21));
-    try std.testing.expect(state.reviewTarget() == .no_context);
+    try std.testing.expect(state.changesTarget() == .no_context);
 
     try std.testing.expect(state.terminalizeIncoming(.path_not_found));
-    try std.testing.expect(state.reviewTarget() == .no_context);
+    try std.testing.expect(state.changesTarget() == .no_context);
 
     state.dismissIncoming(allocator);
-    switch (state.reviewTarget()) {
-        .no_context => return error.ExpectedRetainedReviewLocation,
+    switch (state.changesTarget()) {
+        .no_context => return error.ExpectedRetainedChangesLocation,
         .location => |location| try std.testing.expectEqualStrings("retained.zig", location.path),
     }
 }
@@ -7289,7 +7289,7 @@ test "repository incoming viewport scroll applies deferred manifest with the sam
     try expectProjectedPathForTest(&state, 4, "src/app/pages/repository.zig");
 }
 
-test "repository minimum tree disclosure repository filter discoverability Review incoming expands only exact ancestors" {
+test "repository minimum tree disclosure repository filter discoverability Changes incoming expands only exact ancestors" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{
@@ -7339,10 +7339,10 @@ test "repository minimum tree disclosure repository filter discoverability Revie
         ),
     }
     try std.testing.expect(state.needs_document_revalidation);
-    try std.testing.expectEqualStrings("Review target opened in All files", state.status.text());
+    try std.testing.expectEqualStrings("Changes target opened in All files", state.status.text());
 }
 
-test "repository minimum tree disclosure Review incoming root file opens no directory" {
+test "repository minimum tree disclosure Changes incoming root file opens no directory" {
     const allocator = std.testing.allocator;
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var state: RepositoryPageState = .{

@@ -13,12 +13,12 @@ const app_test_support = @import("../test_support.zig");
 const effect_origin = @import("../effect_origin.zig");
 const page = @import("../page.zig");
 const repo_session = @import("../repo_session.zig");
-const review_action_fence = @import("../pages/review/action_fence.zig");
-const review_authority = @import("../diff_surface/authority.zig");
-const review_selection_model = @import("../diff_surface/selection.zig");
-const review_navigation = @import("../pages/review/navigation.zig");
-const review_operations = @import("../pages/review/operations.zig");
-const review_page = @import("../pages/review.zig");
+const changes_action_fence = @import("../pages/changes/action_fence.zig");
+const changes_authority = @import("../diff_surface/authority.zig");
+const content_selection = @import("../diff_surface/selection.zig");
+const changes_navigation = @import("../pages/changes/navigation.zig");
+const changes_operations = @import("../pages/changes/operations.zig");
+const changes_page = @import("../pages/changes.zig");
 const workflow_remote = @import("remote.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
@@ -35,7 +35,7 @@ const remote_request = @import("../remote_request.zig");
 const BranchListLoadTask = app_load.BranchListLoadTask(app_message.Msg);
 
 const RemotePages = struct {
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
 };
 
 const RedrawPlan = struct {
@@ -51,7 +51,7 @@ const RemoteHarness = struct {
     pub const Msg = app_message.Msg;
 
     allocator: ?std.mem.Allocator = std.testing.allocator,
-    active_page: page.Id = .review,
+    active_page: page.Id = .changes,
     repo_session: repo_session.State = .{},
     pages: RemotePages = .{},
     config: struct { source: diff_source.SourceMode = .unstaged } = .{},
@@ -65,10 +65,10 @@ const RemoteHarness = struct {
         return self.repo_session.view();
     }
 
-    fn reviewNavigationView(self: *const RemoteHarness) review_navigation.View {
+    fn changesNavigationView(self: *const RemoteHarness) changes_navigation.View {
         const body = app_shell_layout.compute(.{ .width = 100, .height = 20 }, .{ .page_bar_visible = true }).bodySize();
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = self.repoSessionView().activeRoot(),
             .repo_epoch = self.repoSessionView().epoch(),
             .root_identity = self.repoSessionView().activeIdentity(),
@@ -77,45 +77,45 @@ const RemoteHarness = struct {
         };
     }
 
-    fn reviewNavigation(self: *RemoteHarness) review_navigation.Controller {
-        const view = self.reviewNavigationView();
+    fn changesNavigation(self: *RemoteHarness) changes_navigation.Controller {
+        const view = self.changesNavigationView();
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = view.repo_root,
             .repo_epoch = view.repo_epoch,
             .root_identity = view.root_identity,
             .source = view.source,
             .layout = view.layout,
-            .diagnostics = .{ .target = &self.pages.review.status },
+            .diagnostics = .{ .target = &self.pages.changes.status },
         };
     }
 
-    fn reviewOperations(self: *const RemoteHarness) review_operations.View {
+    fn changesOperations(self: *const RemoteHarness) changes_operations.View {
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigationView(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigationView(),
             .source = self.config.source,
             .repo_root = self.repoSessionView().activeRoot(),
-            .activation_state = self.pages.review.activation.state,
+            .activation_state = self.pages.changes.activation.state,
         };
     }
 
-    fn reviewOperationController(self: *RemoteHarness) review_operations.Controller {
+    fn changesOperationController(self: *RemoteHarness) changes_operations.Controller {
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigation(),
-            .view_state = self.reviewOperations(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigation(),
+            .view_state = self.changesOperations(),
         };
     }
 
-    fn actionFence(self: *RemoteHarness) review_action_fence.Controller {
+    fn actionFence(self: *RemoteHarness) changes_action_fence.Controller {
         return .{
-            .read_authority = &self.pages.review.repository_read_authority,
-            .activation = &self.pages.review.activation,
-            .action_cursor = &self.pages.review.action_cursor,
-            .auto_reload = &self.pages.review.auto_reload,
-            .review_projection = &self.pages.review.review_projection,
-            .deferred_projection_apply = &self.pages.review.deferred_projection_apply,
+            .read_authority = &self.pages.changes.repository_read_authority,
+            .activation = &self.pages.changes.activation,
+            .action_cursor = &self.pages.changes.action_cursor,
+            .auto_reload = &self.pages.changes.auto_reload,
+            .changes_projection = &self.pages.changes.changes_projection,
+            .deferred_projection_apply = &self.pages.changes.deferred_projection_apply,
         };
     }
 
@@ -127,9 +127,9 @@ const RemoteHarness = struct {
         return self.action_runtime.view();
     }
 
-    fn currentReviewActionRoot(self: *const RemoteHarness) ?[]const u8 {
-        if (self.active_page != .review or
-            self.pages.review.activation.currentIdentity() == null or
+    fn currentChangesActionRoot(self: *const RemoteHarness) ?[]const u8 {
+        if (self.active_page != .changes or
+            self.pages.changes.activation.currentIdentity() == null or
             diff_source.sourceIsOneShotInput(self.config.source)) return null;
         return self.repoSessionView().activeRoot();
     }
@@ -138,7 +138,7 @@ const RemoteHarness = struct {
         return .{
             .active_page = self.active_page,
             .repo_epoch = self.repoSessionView().epoch(),
-            .review_activation_id = self.pages.review.activation.next_activation_id,
+            .changes_activation_id = self.pages.changes.activation.next_activation_id,
             .repository_activation_id = 0,
             .compare_activation_id = 0,
             .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
@@ -151,18 +151,18 @@ const RemoteHarness = struct {
         return .{
             .state = &self.remote_workflow,
             .lifecycle = self.actionLifecycle(),
-            .operations = self.reviewOperationController(),
+            .operations = self.changesOperationController(),
             .repo = self.repoSessionView(),
-            .current_review_root = self.currentReviewActionRoot(),
+            .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
             .active_page = self.active_page,
-            .review_origin = .{
-                .page_id = .review,
+            .changes_origin = .{
+                .page_id = .changes,
                 .repo_epoch = self.repoSessionView().epoch(),
-                .activation_id = snapshot.review_activation_id,
+                .activation_id = snapshot.changes_activation_id,
             },
             .effect_snapshot = snapshot,
-            .status = &self.pages.review.status,
+            .status = &self.pages.changes.status,
             .overlay = &self.overlay,
             .redraw = .{ .skip_requested = &self.redraw_plan.skip_requested },
         };
@@ -250,8 +250,8 @@ const RemoteHarness = struct {
         try self.remoteWorkflow().runInteractivePush(ctx);
     }
 
-    fn setReviewStatus(self: *RemoteHarness, comptime fmt: []const u8, args: anytype) void {
-        self.pages.review.status.set(fmt, args);
+    fn setChangesStatus(self: *RemoteHarness, comptime fmt: []const u8, args: anytype) void {
+        self.pages.changes.status.set(fmt, args);
     }
 
     fn update(self: *RemoteHarness, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
@@ -313,7 +313,7 @@ fn finishTestAction(
         app.allocator orelse std.testing.allocator,
         pending,
         repo_root,
-        app.currentReviewActionRoot(),
+        app.currentChangesActionRoot(),
     )) {
         .rejected => false,
         .accepted => true,
@@ -321,24 +321,24 @@ fn finishTestAction(
 }
 
 fn syncTestActivation(app: *RemoteHarness) void {
-    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
         .immutable
-    else if (app.pages.review.auto_reload.sourceIsActionable())
+    else if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
-    else if (app.pages.review.load.hasPending())
+    else if (app.pages.changes.load.hasPending())
         .pending
     else
         .unavailable;
-    _ = app.pages.review.activation.activate(
+    _ = app.pages.changes.activation.activate(
         app.repo_session.repo_epoch,
         source,
-        review_authority.auxiliaryMember(app.pages.review.status_load),
-        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.branch_status_load),
     );
 }
 
-fn activateReview(app: *RemoteHarness) void {
-    _ = app.pages.review.activation.activate(
+fn activateChanges(app: *RemoteHarness) void {
+    _ = app.pages.changes.activation.activate(
         app.repo_session.repo_epoch,
         .pending,
         .pending,
@@ -354,7 +354,7 @@ fn testSessionHunkMarkKey(
         .content = .{
             .repo_epoch = 0,
             .root_identity = null,
-            .source = review_selection_model.SourceBasis.init(.unstaged),
+            .source = content_selection.SourceBasis.init(.unstaged),
             .source_session_revision = source_session_revision,
             .display = .{ .loaded = .init("test diff") },
         },
@@ -507,7 +507,7 @@ fn installFetchTargetForTest(
         .ahead = 0,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &bundle);
     syncTestActivation(app);
     return repo_root;
 }
@@ -562,9 +562,9 @@ fn installForegroundForTest(
             .operation_generation = 1,
         },
         .origin = .{
-            .page_id = .review,
+            .page_id = .changes,
             .repo_epoch = app.repo_session.repo_epoch,
-            .activation_id = app.pages.review.activation.next_activation_id,
+            .activation_id = app.pages.changes.activation.next_activation_id,
         },
         .root = root,
         .target = owned_target.take(),
@@ -678,7 +678,7 @@ test "requestPush snapshots the active branch target" {
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
     const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
     defer app.cancelPushConfirmation(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
@@ -688,7 +688,7 @@ test "requestPush snapshots the active branch target" {
         .ahead = 2,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &bundle);
     syncTestActivation(&app);
 
     try app.requestPush(std.testing.allocator);
@@ -710,14 +710,14 @@ test "requestPush snapshots set-upstream target for branch without upstream" {
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
     const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
     defer app.cancelPushConfirmation(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "feature/topic",
     });
-    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &bundle);
     syncTestActivation(&app);
 
     try app.requestPush(std.testing.allocator);
@@ -737,8 +737,8 @@ test "requestPull snapshots the active branch target" {
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
     const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
-    defer app.pages.review.branch_status.deinit();
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     defer app.cancelPullConfirmation(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
@@ -748,9 +748,9 @@ test "requestPull snapshots the active branch target" {
         .ahead = 0,
         .behind = 2,
     });
-    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.pages.review.git_status.replace(repo_root, &status_bundle);
+    try app.pages.changes.git_status.replace(repo_root, &status_bundle);
     syncTestActivation(&app);
 
     try app.requestPull(std.testing.allocator);
@@ -770,8 +770,8 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
     const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
-    defer app.pages.review.branch_status.deinit();
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     defer app.cancelPullConfirmation(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
@@ -781,9 +781,9 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
         .ahead = 1,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.pages.review.git_status.replace(repo_root, &status_bundle);
+    try app.pages.changes.git_status.replace(repo_root, &status_bundle);
     syncTestActivation(&app);
 
     try app.requestPull(std.testing.allocator);
@@ -831,17 +831,17 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     };
     try installActiveRepoForTest(&app, allocator, slot_path);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.branch_status.deinit();
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     defer app.clearBranchSwitch(allocator);
 
     var branch_bundle = try branchStatusBundleForTest(allocator, .{
         .oid = "abc123",
         .branch = "main",
     });
-    try app.pages.review.branch_status.replace(slot_path, &branch_bundle);
+    try app.pages.changes.branch_status.replace(slot_path, &branch_bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "");
-    try app.pages.review.git_status.replace(slot_path, &status_bundle);
+    try app.pages.changes.git_status.replace(slot_path, &status_bundle);
     syncTestActivation(&app);
 
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
@@ -853,9 +853,9 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try std.testing.expect(app.remote_workflow.branch_switch.loading);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
     const task: *BranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0..ctx._pending_tasks_with_len][0].ctx));
-    try std.testing.expectEqual(page.Id.review, task.origin);
+    try std.testing.expectEqual(page.Id.changes, task.origin);
     try std.testing.expectEqual(app.repo_session.repo_epoch, task.repo_epoch);
-    try std.testing.expectEqual(app.pages.review.activation.next_activation_id, task.activation_id);
+    try std.testing.expectEqual(app.pages.changes.activation.next_activation_id, task.activation_id);
     try std.testing.expectEqualStrings(slot_path, task.repo_root);
     try std.testing.expectEqual(app.remote_workflow.branch_switch.generation, task.generation);
     try std.testing.expect(task.environment.borrow().get("GIT_DIR") == null);
@@ -922,16 +922,16 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     var rejected: RemoteHarness = .{ .allocator = allocator };
     try installActiveRepoForTest(&rejected, allocator, slot_path);
     defer rejected.repo_session.repo_state.deinit(allocator);
-    defer rejected.pages.review.branch_status.deinit();
-    defer rejected.pages.review.git_status.deinit();
+    defer rejected.pages.changes.branch_status.deinit();
+    defer rejected.pages.changes.git_status.deinit();
     defer rejected.clearBranchSwitch(allocator);
     var rejected_branch = try branchStatusBundleForTest(allocator, .{
         .oid = "abc123",
         .branch = "replacement",
     });
-    try rejected.pages.review.branch_status.replace(slot_path, &rejected_branch);
+    try rejected.pages.changes.branch_status.replace(slot_path, &rejected_branch);
     var rejected_status = try git_status.StatusBundle.parseOwned(allocator, "");
-    try rejected.pages.review.git_status.replace(slot_path, &rejected_status);
+    try rejected.pages.changes.git_status.replace(slot_path, &rejected_status);
     syncTestActivation(&rejected);
 
     const DummyTask = struct {
@@ -964,23 +964,23 @@ test "requestBranchSwitch rejects untracked-only status distinctly" {
             } } },
         },
     };
-    defer app.pages.review.branch_status.deinit();
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
+    defer app.pages.changes.git_status.deinit();
 
     var branch_bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "main",
     });
-    try app.pages.review.branch_status.replace("/repo", &branch_bundle);
+    try app.pages.changes.branch_status.replace("/repo", &branch_bundle);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.txt\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
     syncTestActivation(&app);
 
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
     try app.requestBranchSwitch(&ctx);
 
     try std.testing.expect(!app.overlay.isSwitchBranch());
-    try std.testing.expectEqualStrings("branch switch blocked: untracked files present", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("branch switch blocked: untracked files present", app.pages.changes.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
@@ -1004,7 +1004,7 @@ test "finishBranchListLoad ignores stale result and accepts matching generation"
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
 
     try app.finishBranchListLoad(&ctx, .{
-        .origin = .review,
+        .origin = .changes,
         .repo_epoch = 0,
         .activation_id = 0,
         .generation = 2,
@@ -1017,7 +1017,7 @@ test "finishBranchListLoad ignores stale result and accepts matching generation"
     try std.testing.expectEqual(@as(usize, 0), app.remote_workflow.branch_switch.branches.len);
 
     try app.finishBranchListLoad(&ctx, .{
-        .origin = .review,
+        .origin = .changes,
         .repo_epoch = 0,
         .activation_id = 0,
         .generation = 3,
@@ -1062,11 +1062,11 @@ test "finishBranchListLoad rejects matching operation from stale repo epoch" {
         .overlay = .{ .kind = .switch_branch },
     };
     defer app.clearBranchSwitch(allocator);
-    app.pages.review.status.set("retained", .{});
+    app.pages.changes.status.set("retained", .{});
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
 
     try app.finishBranchListLoad(&ctx, .{
-        .origin = .review,
+        .origin = .changes,
         .repo_epoch = 3,
         .activation_id = 1,
         .generation = 3,
@@ -1077,10 +1077,10 @@ test "finishBranchListLoad rejects matching operation from stale repo epoch" {
     try std.testing.expectEqual(@as(?u64, 3), app.remote_workflow.branch_switch_load_pending);
     try std.testing.expect(app.remote_workflow.branch_switch.loading);
     try std.testing.expectEqual(@as(usize, 0), app.remote_workflow.branch_switch.branches.len);
-    try std.testing.expectEqualStrings("retained", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("retained", app.pages.changes.status.text());
 }
 
-test "stale branch-list diagnostic does not overwrite reactivated Review" {
+test "stale branch-list diagnostic does not overwrite reactivated Changes" {
     const allocator = std.testing.allocator;
     var app: RemoteHarness = .{
         .allocator = allocator,
@@ -1097,14 +1097,14 @@ test "stale branch-list diagnostic does not overwrite reactivated Review" {
         .overlay = .{ .kind = .switch_branch },
     };
     defer app.clearBranchSwitch(allocator);
-    const old_activation = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
-    const new_activation = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    const old_activation = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
+    const new_activation = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
     try std.testing.expect(old_activation != new_activation);
-    app.pages.review.status.set("new Review diagnostic", .{});
+    app.pages.changes.status.set("new Changes diagnostic", .{});
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
 
     try app.finishBranchListLoad(&ctx, .{
-        .origin = .review,
+        .origin = .changes,
         .repo_epoch = 0,
         .activation_id = old_activation,
         .generation = 3,
@@ -1115,7 +1115,7 @@ test "stale branch-list diagnostic does not overwrite reactivated Review" {
     try std.testing.expect(app.remote_workflow.branch_switch_load_pending == null);
     try std.testing.expect(!app.remote_workflow.branch_switch.hasState());
     try std.testing.expect(!app.overlay.isSwitchBranch());
-    try std.testing.expectEqualStrings("new Review diagnostic", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("new Changes diagnostic", app.pages.changes.status.text());
     try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
@@ -1136,18 +1136,18 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
         .overlay = .{ .kind = .switch_branch },
     };
     defer app.clearBranchSwitch(std.testing.allocator);
-    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
 
     const mark_key = testSessionHunkMarkKey(1, 0);
-    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
+    try app.pages.changes.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
 
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
     try app.confirmBranchSwitch(&ctx);
 
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expect(app.remote_workflow.branch_switch.branches.len == 0);
-    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
-    try std.testing.expectEqualStrings("already on branch: main", app.pages.review.status.text());
+    try std.testing.expect(app.pages.changes.staged_hunks.containsExact("/repo", "a", mark_key));
+    try std.testing.expectEqualStrings("already on branch: main", app.pages.changes.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
 
@@ -1170,7 +1170,7 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
 
     try missing_authority.confirmBranchSwitch(&missing_ctx);
 
-    try std.testing.expectEqualStrings("branch switch unavailable: repository authority changed", missing_authority.pages.review.status.text());
+    try std.testing.expectEqualStrings("branch switch unavailable: repository authority changed", missing_authority.pages.changes.status.text());
     try std.testing.expect(missing_authority.remote_workflow.branch_switch.hasState());
     try std.testing.expectEqual(@as(u8, 0), missing_ctx._pending_tasks_with_len);
     try std.testing.expect(!missing_authority.actionLifecycleView().hasPending());
@@ -1180,7 +1180,7 @@ test "requestPush clears previous push error details" {
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
     const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
     defer app.cancelPushConfirmation(std.testing.allocator);
     defer app.clearPushError(std.testing.allocator);
 
@@ -1191,7 +1191,7 @@ test "requestPush clears previous push error details" {
         .ahead = 2,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &bundle);
     syncTestActivation(&app);
     try app.setPushError(std.testing.allocator, "old push failure");
 
@@ -1228,7 +1228,7 @@ test "requestPush rejects while another action is pending" {
     try std.testing.expectEqualStrings("old-feature", confirmation.branch);
     try std.testing.expect(app.overlay.isPushBranch());
     try std.testing.expect(app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.changes.status.text());
 }
 
 test "requestPull rejects while another action is pending" {
@@ -1256,7 +1256,7 @@ test "requestPull rejects while another action is pending" {
     try std.testing.expectEqualStrings("old-feature", confirmation.branch);
     try std.testing.expect(app.overlay.isPullBranch());
     try std.testing.expect(app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.changes.status.text());
 }
 
 test "requestFetch rejects while another action is pending" {
@@ -1268,7 +1268,7 @@ test "requestFetch rejects while another action is pending" {
     try app.requestFetch(&ctx);
 
     try std.testing.expect(app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.changes.status.text());
 }
 
 test "remote authentication fetch preparation and task terminals release request ownership" {
@@ -1289,7 +1289,7 @@ test "remote authentication fetch preparation and task terminals release request
         var app: RemoteHarness = .{ .allocator = backing };
         _ = try installFetchTargetForTest(&app, backing);
         defer app.repo_session.repo_state.deinit(backing);
-        defer app.pages.review.branch_status.deinit();
+        defer app.pages.changes.branch_status.deinit();
 
         const original_handle = app.repo_session.repo_state.root.?.handle;
         app.repo_session.repo_state.root.?.handle = -1;
@@ -1302,7 +1302,7 @@ test "remote authentication fetch preparation and task terminals release request
         try std.testing.expect(!app.actionLifecycleView().hasPending());
         try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-        try std.testing.expectEqualStrings("fetch unavailable: repository authority could not be retained", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("fetch unavailable: repository authority could not be retained", app.pages.changes.status.text());
     }
 
     // Two proposal clones precede the environment map. Failing allocation 4
@@ -1312,7 +1312,7 @@ test "remote authentication fetch preparation and task terminals release request
         var app: RemoteHarness = .{ .allocator = backing };
         _ = try installFetchTargetForTest(&app, backing);
         defer app.repo_session.repo_state.deinit(backing);
-        defer app.pages.review.branch_status.deinit();
+        defer app.pages.changes.branch_status.deinit();
 
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 4 });
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = failing.allocator() };
@@ -1323,7 +1323,7 @@ test "remote authentication fetch preparation and task terminals release request
         try std.testing.expect(!app.actionLifecycleView().hasPending());
         try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-        try std.testing.expectEqualStrings("could not prepare background fetch", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("could not prepare background fetch", app.pages.changes.status.text());
     }
 
     // startFetch is the transfer boundary. Queue rejection consumes the
@@ -1332,7 +1332,7 @@ test "remote authentication fetch preparation and task terminals release request
         var app: RemoteHarness = .{ .allocator = backing };
         _ = try installFetchTargetForTest(&app, backing);
         defer app.repo_session.repo_state.deinit(backing);
-        defer app.pages.review.branch_status.deinit();
+        defer app.pages.changes.branch_status.deinit();
 
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = backing };
         for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
@@ -1341,7 +1341,7 @@ test "remote authentication fetch preparation and task terminals release request
         try std.testing.expect(!app.actionLifecycleView().hasPending());
         try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
         try std.testing.expectEqual(@as(usize, 16), ctx.takePendingTasks().len);
-        try std.testing.expectEqualStrings("could not start fetch task", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("could not start fetch task", app.pages.changes.status.text());
     }
 
     // Accepted ownership closes through the same task epilogue when Chasen
@@ -1350,7 +1350,7 @@ test "remote authentication fetch preparation and task terminals release request
         var app: RemoteHarness = .{ .allocator = backing };
         const repo_root = try installFetchTargetForTest(&app, backing);
         defer app.repo_session.repo_state.deinit(backing);
-        defer app.pages.review.branch_status.deinit();
+        defer app.pages.changes.branch_status.deinit();
 
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = backing };
         try app.requestFetch(&ctx);
@@ -1403,7 +1403,7 @@ test "confirmPush keeps confirmation when another action is pending" {
     try std.testing.expect(app.remote_workflow.push_confirmation != null);
     try std.testing.expect(app.overlay.isPushBranch());
     try std.testing.expect(app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.changes.status.text());
 }
 
 test "confirmPush rejects a proposal after repository authority changes" {
@@ -1411,7 +1411,7 @@ test "confirmPush rejects a proposal after repository authority changes" {
     var app: RemoteHarness = .{ .allocator = allocator };
     const repo_root = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
     defer app.cancelPushConfirmation(allocator);
 
     var bundle = try branchStatusBundleForTest(allocator, .{
@@ -1421,7 +1421,7 @@ test "confirmPush rejects a proposal after repository authority changes" {
         .ahead = 1,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &bundle);
     syncTestActivation(&app);
     try app.requestPush(allocator);
     app.repo_session.repo_epoch +%= 1;
@@ -1433,7 +1433,7 @@ test "confirmPush rejects a proposal after repository authority changes" {
     try std.testing.expect(!app.overlay.isPushBranch());
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-    try std.testing.expectEqualStrings("push unavailable: repository authority changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("push unavailable: repository authority changed", app.pages.changes.status.text());
 }
 
 test "confirmPush rejects a proposal with a stale root identity" {
@@ -1441,7 +1441,7 @@ test "confirmPush rejects a proposal with a stale root identity" {
     var app: RemoteHarness = .{ .allocator = allocator };
     const repo_root = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.branch_status.deinit();
+    defer app.pages.changes.branch_status.deinit();
     defer app.cancelPushConfirmation(allocator);
 
     var bundle = try branchStatusBundleForTest(allocator, .{
@@ -1451,7 +1451,7 @@ test "confirmPush rejects a proposal with a stale root identity" {
         .ahead = 1,
         .behind = 0,
     });
-    try app.pages.review.branch_status.replace(repo_root, &bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &bundle);
     syncTestActivation(&app);
     try app.requestPush(allocator);
     app.remote_workflow.push_confirmation.?.repository_identity.root_identity.inode +%= 1;
@@ -1463,7 +1463,7 @@ test "confirmPush rejects a proposal with a stale root identity" {
     try std.testing.expect(!app.overlay.isPushBranch());
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-    try std.testing.expectEqualStrings("push unavailable: repository authority changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("push unavailable: repository authority changed", app.pages.changes.status.text());
 }
 
 test "background remote task rejection and abandonment release owned authorities" {
@@ -1541,7 +1541,7 @@ test "confirmPull keeps confirmation when another action is pending" {
     try std.testing.expect(app.remote_workflow.pull_confirmation != null);
     try std.testing.expect(app.overlay.isPullBranch());
     try std.testing.expect(app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.changes.status.text());
 }
 
 test "finishPush failed preserves retry target oid for interactive push" {
@@ -1580,7 +1580,7 @@ test "finishPush retires an exact action before dropping a mismatched operation 
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.clearPushError(allocator);
     const pending = beginAcceptedTestAction(&app, .push);
-    app.pages.review.status.set("unchanged", .{});
+    app.pages.changes.status.set("unchanged", .{});
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
 
     try app.finishPush(&ctx, .{
@@ -1601,7 +1601,7 @@ test "finishPush retires an exact action before dropping a mismatched operation 
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expectEqualStrings("unchanged", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("unchanged", app.pages.changes.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
@@ -1611,14 +1611,14 @@ test "remote cancel terminal drops retry authority and requires reload before de
     const repo_root = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.clearPushError(allocator);
-    activateReview(&app);
+    activateChanges(&app);
 
     const pending = beginAcceptedTestAction(&app, .push);
     app.remote_workflow.action_control.begin(pending.generation);
     const controller = app.remoteWorkflow();
     try std.testing.expect(controller.cancelActiveRemote(true));
     try std.testing.expect(controller.view().canceling());
-    try std.testing.expectEqualStrings("canceling...", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("canceling...", app.pages.changes.status.text());
     try std.testing.expect(controller.cancelActiveRemote(true));
 
     const outcome = try controller.finishPush(allocator, .{
@@ -1639,7 +1639,7 @@ test "remote cancel terminal drops retry authority and requires reload before de
         },
     });
 
-    try std.testing.expectEqual(review_action_fence.ReloadIntent.source_and_aux, outcome.reload);
+    try std.testing.expectEqual(changes_action_fence.ReloadIntent.source_and_aux, outcome.reload);
     try std.testing.expect(outcome.quit_after_terminal);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(!controller.view().canceling());
@@ -1653,7 +1653,7 @@ test "remote timeout terminal drops retry authority and requires reload" {
     const repo_root = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.clearPushError(allocator);
-    activateReview(&app);
+    activateChanges(&app);
 
     const pending = beginAcceptedTestAction(&app, .push);
     app.remote_workflow.action_control.begin(pending.generation);
@@ -1675,7 +1675,7 @@ test "remote timeout terminal drops retry authority and requires reload" {
         },
     });
 
-    try std.testing.expectEqual(review_action_fence.ReloadIntent.source_and_aux, outcome.reload);
+    try std.testing.expectEqual(changes_action_fence.ReloadIntent.source_and_aux, outcome.reload);
     try std.testing.expect(!outcome.quit_after_terminal);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
@@ -1725,7 +1725,7 @@ test "runInteractivePush rejects while another action is pending" {
     try std.testing.expectEqual(app_actions.ActionKind.stage_file, pending.kind);
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
-    try std.testing.expectEqualStrings("another git action is running", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("another git action is running", app.pages.changes.status.text());
 }
 
 test "push retry inspection rejects duplicate requests without losing task ownership" {
@@ -1742,7 +1742,7 @@ test "push retry inspection rejects duplicate requests without losing task owner
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .inspecting);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    try std.testing.expectEqualStrings("push retry inspection already running", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("push retry inspection already running", app.pages.changes.status.text());
 
     app.clearPushError(allocator);
     _ = try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
@@ -1766,7 +1766,7 @@ test "push retry inspection spawn rollback restores the sole target" {
 
     const restored = app.remote_workflow.push_retry.state.availableTarget() orelse return error.ExpectedPushRetryTarget;
     try std.testing.expectEqualStrings("abc123", restored.oid);
-    try std.testing.expectEqualStrings("could not start push retry inspection", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("could not start push retry inspection", app.pages.changes.status.text());
 }
 
 test "push retry rejects a stale root identity before inspection admission" {
@@ -1786,7 +1786,7 @@ test "push retry rejects a stale root identity before inspection admission" {
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("push retry unavailable: repository authority changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("push retry unavailable: repository authority changed", app.pages.changes.status.text());
 
     app.clearPushError(allocator);
     var stale_epoch = try retryTargetForTest(&app, allocator, .{});
@@ -1798,7 +1798,7 @@ test "push retry rejects a stale root identity before inspection admission" {
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("push retry unavailable: repository authority changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("push retry unavailable: repository authority changed", app.pages.changes.status.text());
 }
 
 test "closing push error invalidates an in-flight inspection result" {
@@ -1839,28 +1839,28 @@ test "undelivered push inspection completion releases its returned target" {
     try std.testing.expect(app.remote_workflow.push_retry.state == .inspecting);
     try expectRootCapabilityClosed(inspection_root);
     try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
-    try std.testing.expect(std.mem.indexOf(u8, app.pages.review.status.text(), "warning: credential-bearing proxy was omitted") == null);
-    try std.testing.expect(std.mem.indexOf(u8, app.pages.review.status.text(), "PROXY-CANARY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), "warning: credential-bearing proxy was omitted") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), "PROXY-CANARY") == null);
 }
 
-test "Review reactivation discards an old push inspection completion" {
+test "Changes reactivation discards an old push inspection completion" {
     const allocator = std.testing.allocator;
     var app: RemoteHarness = .{ .allocator = allocator };
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.clearPushError(allocator);
-    activateReview(&app);
+    activateChanges(&app);
     try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.runInteractivePush(&ctx);
-    app.pages.review.activation.deactivate();
-    activateReview(&app);
-    app.setReviewStatus("new Review activation", .{});
+    app.pages.changes.activation.deactivate();
+    activateChanges(&app);
+    app.setChangesStatus("new Changes activation", .{});
     try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expectEqualStrings("new Review activation", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("new Changes activation", app.pages.changes.status.text());
     try std.testing.expect(app.remote_workflow.push_error_message == null);
     try std.testing.expect(!app.overlay.isPushError());
 }
@@ -1904,7 +1904,7 @@ test "push inspection completion requires exact generation origin target and rep
         try std.testing.expectEqual(inspecting.identity.operation_generation, app.remote_workflow.push_retry.state.inspecting.identity.operation_generation);
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
         try std.testing.expect(!app.actionLifecycleView().hasPending());
-        try std.testing.expect(std.mem.indexOf(u8, app.pages.review.status.text(), "warning: credential-bearing proxy was omitted") == null);
+        try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), "warning: credential-bearing proxy was omitted") == null);
     }
 
     const task_root = try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
@@ -1935,7 +1935,7 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     try installActiveRepoForTest(&app, allocator, repo.repo_root);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.clearPushForeground(allocator);
-    activateReview(&app);
+    activateChanges(&app);
     try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{
         .mode = .set_upstream,
         .oid = repo.oid,
@@ -1961,7 +1961,7 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
 
     try std.testing.expect(app.remote_workflow.push_error_message == null);
     try std.testing.expect(app.remote_workflow.push_retry.state == .foreground);
-    try std.testing.expectEqual(page.Id.review, app.remote_workflow.push_retry.state.foreground.origin.page_id);
+    try std.testing.expectEqual(page.Id.changes, app.remote_workflow.push_retry.state.foreground.origin.page_id);
     try std.testing.expectEqual(app.repo_session.repo_epoch, app.remote_workflow.push_retry.state.foreground.origin.repo_epoch);
     const action_owner = app.actionLifecycleView().acceptedPending() orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(app_actions.ActionKind.push, action_owner.kind);
@@ -2022,12 +2022,12 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
         .outcome = .{ .exited = 0 },
     });
     try std.testing.expect(app.remote_workflow.push_retry.state == .finalizing);
-    try std.testing.expectEqualStrings("finalizing upstream...", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("finalizing upstream...", app.pages.changes.status.text());
     const pending_finalizer = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), pending_finalizer.len);
     const finalizer_message = pending_finalizer[0].run(pending_finalizer[0].ctx, allocator, io);
     try app.update(finalizer_message, &ctx);
-    const status = app.pages.review.status.text();
+    const status = app.pages.changes.status.text();
     try std.testing.expectEqualStrings(
         "warning: credential-bearing proxy was omitted; push completed; local upstream configured",
         status,
@@ -2045,7 +2045,7 @@ test "upstream finalization queue rejection publishes partial success once witho
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.remote_workflow.deinit(allocator);
-    activateReview(&app);
+    activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .push);
     try installForegroundForTest(&app, allocator, 71, pending, try retryTargetForTest(&app, allocator, .{ .mode = .set_upstream }));
     app.remote_workflow.push_retry.state.foreground.warnings.proxy_credentials_omitted = true;
@@ -2061,8 +2061,8 @@ test "upstream finalization queue rejection publishes partial success once witho
     });
     ctx._pending_tasks_with_len = 0;
 
-    const status = app.pages.review.status.text();
-    try std.testing.expectEqual(review_action_fence.ReloadIntent.source_and_aux, outcome.reload);
+    const status = app.pages.changes.status.text();
+    try std.testing.expectEqual(changes_action_fence.ReloadIntent.source_and_aux, outcome.reload);
     try std.testing.expect(!outcome.quit_after_terminal);
     try std.testing.expectEqualStrings(
         "warning: credential-bearing proxy was omitted; push succeeded; local upstream was not configured; repository reload required",
@@ -2081,7 +2081,7 @@ test "upstream finalization runtime abandonment defers quit and discards retry a
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.remote_workflow.deinit(allocator);
-    activateReview(&app);
+    activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .push);
     try installForegroundForTest(&app, allocator, 72, pending, try retryTargetForTest(&app, allocator, .{ .mode = .set_upstream }));
     app.remote_workflow.push_retry.state.foreground.warnings.proxy_credentials_omitted = true;
@@ -2103,8 +2103,8 @@ test "upstream finalization runtime abandonment defers quit and discards retry a
     };
     const outcome = app.remoteWorkflow().finishPushUpstreamFinalize(allocator, finished);
 
-    const status = app.pages.review.status.text();
-    try std.testing.expectEqual(review_action_fence.ReloadIntent.source_and_aux, outcome.reload);
+    const status = app.pages.changes.status.text();
+    try std.testing.expectEqual(changes_action_fence.ReloadIntent.source_and_aux, outcome.reload);
     try std.testing.expect(outcome.quit_after_terminal);
     try std.testing.expectEqualStrings(
         "warning: credential-bearing proxy was omitted; push succeeded; local upstream was not configured; repository reload required",
@@ -2123,7 +2123,7 @@ test "upstream finalization shutdown drops an undelivered terminal after releasi
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     defer action_lifecycle.testing.clear(&app.action_runtime);
-    activateReview(&app);
+    activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .push);
     try installForegroundForTest(&app, allocator, 74, pending, try retryTargetForTest(&app, allocator, .{ .mode = .set_upstream }));
     app.remote_workflow.push_retry.state.foreground.warnings.proxy_credentials_omitted = true;
@@ -2140,8 +2140,8 @@ test "upstream finalization shutdown drops an undelivered terminal after releasi
     var message = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
     message.deinitUndelivered(allocator);
 
-    try std.testing.expectEqualStrings("finalizing upstream...", app.pages.review.status.text());
-    try std.testing.expect(std.mem.indexOf(u8, app.pages.review.status.text(), "warning:") == null);
+    try std.testing.expectEqualStrings("finalizing upstream...", app.pages.changes.status.text());
+    try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), "warning:") == null);
     try expectRootCapabilityClosed(root_observer);
     app.remote_workflow.deinit(allocator);
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
@@ -2163,7 +2163,7 @@ test "upstream finalization stale completion closes ownership without current pu
     try installActiveRepoForTest(&app, allocator, repo_a);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.remote_workflow.deinit(allocator);
-    activateReview(&app);
+    activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .push);
     try installForegroundForTest(&app, allocator, 73, pending, try retryTargetForTest(&app, allocator, .{ .mode = .set_upstream }));
     app.remote_workflow.push_retry.state.foreground.warnings.proxy_credentials_omitted = true;
@@ -2177,7 +2177,7 @@ test "upstream finalization stale completion closes ownership without current pu
     const queued = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
     try installActiveRepoForTest(&app, allocator, repo_b);
-    app.pages.review.status.set("replacement status", .{});
+    app.pages.changes.status.set("replacement status", .{});
     const message = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
     const finished = switch (message) {
         .push_upstream_finalize_finished => |result| result,
@@ -2185,9 +2185,9 @@ test "upstream finalization stale completion closes ownership without current pu
     };
     const outcome = app.remoteWorkflow().finishPushUpstreamFinalize(allocator, finished);
 
-    try std.testing.expectEqual(review_action_fence.ReloadIntent.none, outcome.reload);
+    try std.testing.expectEqual(changes_action_fence.ReloadIntent.none, outcome.reload);
     try std.testing.expect(!outcome.quit_after_terminal);
-    try std.testing.expectEqualStrings("replacement status", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("replacement status", app.pages.changes.status.text());
     try std.testing.expect(app.redraw_plan.skip_requested);
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
@@ -2239,7 +2239,7 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
     try std.testing.expect(app.overlay.isPushError());
-    const status = app.pages.review.status.text();
+    const status = app.pages.changes.status.text();
     try std.testing.expectEqualStrings("warning: credential-bearing proxy was omitted; interactive push already queued", status);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
     try std.testing.expect(std.mem.indexOf(u8, status, "alice") == null);
@@ -2282,7 +2282,7 @@ test "interactive push maps an invalid descriptor queue rejection without fallba
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
-    const status = app.pages.review.status.text();
+    const status = app.pages.changes.status.text();
     try std.testing.expectEqualStrings("warning: credential-bearing proxy was omitted; interactive push repository authority is invalid", status);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
     try std.testing.expect(std.mem.indexOf(u8, status, "alice") == null);
@@ -2326,7 +2326,7 @@ test "interactive push inspection warning survives a concurrent action admission
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
     try std.testing.expect(app.actionLifecycleView().hasPending());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
-    const status = app.pages.review.status.text();
+    const status = app.pages.changes.status.text();
     try std.testing.expectEqualStrings("warning: credential-bearing proxy was omitted; another git action is running", status);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
     try std.testing.expect(std.mem.indexOf(u8, status, "alice") == null);
@@ -2357,7 +2357,7 @@ test "runInteractivePush stale snapshot does not queue foreground command" {
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
-    try std.testing.expectEqualStrings("push retry unavailable: commit changed; reload and try again", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("push retry unavailable: commit changed; reload and try again", app.pages.changes.status.text());
 }
 
 test "finishPushForeground ignores stale request id" {
@@ -2389,7 +2389,7 @@ test "finishPushForeground stale and duplicate terminals preserve newer action o
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.clearPushForeground(allocator);
     defer action_lifecycle.testing.clear(&app.action_runtime);
-    app.pages.review.status.set("unchanged", .{});
+    app.pages.changes.status.set("unchanged", .{});
 
     const stale = beginAcceptedTestAction(&app, .push);
     try installForegroundForTest(&app, allocator, 7, stale, try retryTargetForTest(&app, allocator, .{}));
@@ -2405,7 +2405,7 @@ test "finishPushForeground stale and duplicate terminals preserve newer action o
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expect(app.actionLifecycleView().isAccepted(current));
-    try std.testing.expectEqualStrings("unchanged", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("unchanged", app.pages.changes.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 
     try app.finishPushForeground(&ctx, .{
@@ -2414,7 +2414,7 @@ test "finishPushForeground stale and duplicate terminals preserve newer action o
     });
 
     try std.testing.expect(app.actionLifecycleView().isAccepted(current));
-    try std.testing.expectEqualStrings("unchanged", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("unchanged", app.pages.changes.status.text());
     try std.testing.expect(finishTestAction(&app, current, ""));
 }
 
@@ -2438,7 +2438,7 @@ test "interactive push foreground terminals publish proxy warning once for both 
         defer app.repo_session.repo_state.deinit(allocator);
         defer app.clearPushForeground(allocator);
         defer action_lifecycle.testing.clear(&app.action_runtime);
-        activateReview(&app);
+        activateChanges(&app);
         const pending = beginAcceptedTestAction(&app, .push);
         try installForegroundForTest(&app, allocator, index + 1, pending, try retryTargetForTest(&app, allocator, .{ .mode = case.mode }));
         app.remote_workflow.push_retry.state.foreground.warnings.proxy_credentials_omitted = true;
@@ -2450,7 +2450,7 @@ test "interactive push foreground terminals publish proxy warning once for both 
             .outcome = case.outcome,
         });
 
-        const status = app.pages.review.status.text();
+        const status = app.pages.changes.status.text();
         try std.testing.expectEqualStrings(case.expected, status);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
         try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
@@ -2478,11 +2478,11 @@ test "interactive push foreground root survives repository replacement and close
         defer app.repo_session.repo_state.deinit(allocator);
         defer app.clearPushForeground(allocator);
         defer action_lifecycle.testing.clear(&app.action_runtime);
-        activateReview(&app);
+        activateChanges(&app);
         const pending = beginAcceptedTestAction(&app, .push);
         try installForegroundForTest(&app, allocator, 41, pending, try retryTargetForTest(&app, allocator, .{}));
         const foreground_root_observer = app.remote_workflow.push_retry.state.foreground.root;
-        app.pages.review.status.set("replacement status", .{});
+        app.pages.changes.status.set("replacement status", .{});
 
         app.remote_workflow.repositoryInvalidationPort(&app.overlay).invalidateBeforeRepositoryReplacement(allocator);
         try std.testing.expect(app.remote_workflow.push_retry.state == .foreground);
@@ -2497,7 +2497,7 @@ test "interactive push foreground root survives repository replacement and close
 
         try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
         try std.testing.expect(!app.actionLifecycleView().hasPending());
-        try std.testing.expectEqualStrings("replacement status", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("replacement status", app.pages.changes.status.text());
         try expectRootCapabilityClosed(foreground_root_observer);
         try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
     }

@@ -397,7 +397,7 @@ test "Repository path history stale completions preserve the exact current pendi
         };
         defer stale.deinit(allocator);
         switch (mismatch) {
-            0 => stale.identity.origin = .review,
+            0 => stale.identity.origin = .changes,
             1 => stale.identity.repo_epoch +%= 1,
             2 => stale.identity.activation_id +%= 1,
             3 => stale.root_identity.inode +%= 1,

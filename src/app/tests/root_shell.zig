@@ -11,14 +11,14 @@ const app_state = @import("../state.zig");
 const app_view = @import("../view.zig");
 const action_lifecycle = @import("../workflow/action_lifecycle.zig");
 const page = @import("../page.zig");
-const review_page = @import("../pages/review.zig");
-const review_navigation = @import("../pages/review/navigation.zig");
-const review_reload = @import("../pages/review/reload.zig");
+const changes_page = @import("../pages/changes.zig");
+const changes_navigation = @import("../pages/changes/navigation.zig");
+const changes_reload = @import("../pages/changes/reload.zig");
 const compare_page = @import("../pages/compare.zig");
 const compare_navigation = @import("../pages/compare/navigation.zig");
 const repository_selection = @import("../pages/repository/selection.zig");
 const diff_surface = @import("../diff_surface.zig");
-const review_authority = @import("../diff_surface/authority.zig");
+const changes_authority = @import("../diff_surface/authority.zig");
 const context = @import("../../context.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_render = @import("../../diff/render.zig");
@@ -32,7 +32,7 @@ const review_session = @import("../../review_session/session.zig");
 const App = app_mod.App;
 const OverlayKind = app_state.OverlayKind;
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
-const sidebar_header_rows: u16 = @import("../pages/review/layout.zig").sidebar_header_rows;
+const sidebar_header_rows: u16 = @import("../pages/changes/layout.zig").sidebar_header_rows;
 
 fn shellLayout(app: *const App) app_shell_layout.Layout {
     return app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
@@ -43,7 +43,7 @@ fn layoutSize(app: *const App) chasen.Size {
 }
 
 fn sidebarWidth(total_width: u16, preferred_width: ?u16) u16 {
-    return @import("../pages/review/layout.zig").sidebarWidth(total_width, preferred_width);
+    return @import("../pages/changes/layout.zig").sidebarWidth(total_width, preferred_width);
 }
 
 fn terminalBodyHeight(terminal_height: u16) u16 {
@@ -67,25 +67,25 @@ fn footerStatusPress(app: *const App) ?App.Msg {
     return null;
 }
 
-fn reviewNavigation(app: *App) review_navigation.Controller {
+fn changesNavigation(app: *App) changes_navigation.Controller {
     const size = shellLayout(app).bodySize();
     const repo = app.repo_session.view();
     return .{
-        .page = &app.pages.review,
+        .page = &app.pages.changes,
         .repo_root = repo.activeRoot(),
         .repo_epoch = repo.epoch(),
         .root_identity = repo.activeIdentity(),
         .source = app.config.source,
         .layout = .{ .width = size.width, .height = size.height },
-        .diagnostics = .{ .target = &app.pages.review.status },
+        .diagnostics = .{ .target = &app.pages.changes.status },
     };
 }
 
-fn reviewReload(app: *App) review_reload.Controller {
+fn changesReload(app: *App) changes_reload.Controller {
     const repo = app.repo_session.view();
     return .{
-        .page = &app.pages.review,
-        .navigation = reviewNavigation(app),
+        .page = &app.pages.changes,
+        .navigation = changesNavigation(app),
         .source = app.config.source,
         .repo_root = repo.activeRoot(),
         .repo_epoch = repo.epoch(),
@@ -93,9 +93,9 @@ fn reviewReload(app: *App) review_reload.Controller {
     };
 }
 
-fn activateReview(app: *App) u64 {
-    const source_member: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        switch (app.pages.review.load.state) {
+fn activateChanges(app: *App) u64 {
+    const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+        switch (app.pages.changes.load.state) {
             .loaded, .empty => .immutable,
             .loading => .pending,
             .failed => .failed,
@@ -103,8 +103,8 @@ fn activateReview(app: *App) u64 {
         }
     else
         .pending;
-    const auxiliary: review_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
-    return app.pages.review.activation.activate(app.repo_session.view().epoch(), source_member, auxiliary, auxiliary);
+    const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
+    return app.pages.changes.activation.activate(app.repo_session.view().epoch(), source_member, auxiliary, auxiliary);
 }
 
 fn compareNavigation(app: *App) compare_navigation.Controller {
@@ -175,17 +175,17 @@ fn compareActionMouseEvent(app: *App, target: diff_render.SelectionActionTarget)
 
 test "diff mouse selection owner is resolved from the active page surface" {
     var app: App = .{ .terminal_size = .{ .width = 80, .height = 20 } };
-    app.pages.review.selection_owner = .{ .diff_header = .{
+    app.pages.changes.selection_owner = .{ .diff_header = .{
         .identity = .{ .kind = .loaded_file, .path_key = "a" },
     } };
 
     const drag = app.handleEvent(app_test_support.mouseEventTyped(4, 4, .left, .drag)) orelse return error.ExpectedDiffSelectionOwner;
     switch (drag) {
         .mouse_selection_drag => |continuation| switch (continuation.target) {
-            .review => {},
-            else => return error.ExpectedReviewDiffDrag,
+            .changes => {},
+            else => return error.ExpectedChangesDiffDrag,
         },
-        else => return error.ExpectedReviewDiffDrag,
+        else => return error.ExpectedChangesDiffDrag,
     }
 
     app.active_page = .repository;
@@ -197,7 +197,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     var app: App = .{
         .allocator = allocator,
         .terminal_size = .{ .width = 80, .height = 13 },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .sidebar_hidden = true,
@@ -206,9 +206,9 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
             },
         } },
     };
-    defer reviewReload(&app).clearLoadedDiff(allocator);
+    defer changesReload(&app).clearLoadedDiff(allocator);
     defer app.shell_effects_state.deinit(allocator);
-    app.pages.review.selection_owner = .{ .diff = .{
+    app.pages.changes.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .side = .new,
         .mode = .line,
@@ -224,10 +224,10 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
 
     try app.update(.{ .mouse_selection_drag = .{
         .pointer = .{ .col = 12, .row = last_row },
-        .target = .{ .review = .{ .col = 12, .row = last_row } },
+        .target = .{ .changes = .{ .col = 12, .row = last_row } },
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff().?.moved);
+    try std.testing.expect(app.pages.changes.selection_owner.activeDiff().?.moved);
     const first_generation = switch (tc.ctx._pending_everys[0].msg) {
         .drag_auto_scroll_tick => |generation| generation,
         else => return error.ExpectedDragAutoScrollTimer,
@@ -237,7 +237,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     tc.resetTransient();
     try app.update(.{ .mouse_selection_drag = .{
         .pointer = .{ .col = 13, .row = last_row },
-        .target = .{ .review = .{ .col = 13, .row = last_row } },
+        .target = .{ .changes = .{ .col = 13, .row = last_row } },
     } }, &tc.ctx);
     try std.testing.expectEqual(first_generation, app.drag_auto_scroll.active.?.generation);
     try std.testing.expectEqual(@as(usize, 0), tc.pendingCancelCount());
@@ -248,7 +248,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     tc.resetTransient();
     try app.update(.{ .mouse_selection_drag = .{
         .pointer = .{ .col = 12, .row = diff_render.body_start_row },
-        .target = .{ .review = .{ .col = 12, .row = diff_render.body_start_row } },
+        .target = .{ .changes = .{ .col = 12, .row = diff_render.body_start_row } },
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
@@ -261,20 +261,20 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     // A queued firing from the canceled timer is inert. B performs exactly
     // one row of semantic scroll and remains the repeating owner.
     tc.resetTransient();
-    app.pages.review.viewer.diff_scroll = 1;
+    app.pages.changes.viewer.diff_scroll = 1;
     app.status.set("root diagnostic", .{});
-    app.pages.review.status.set("review diagnostic", .{});
-    const selection_before_stale = app.pages.review.selection_owner;
+    app.pages.changes.status.set("changes diagnostic", .{});
+    const selection_before_stale = app.pages.changes.selection_owner;
     try app.update(.{ .drag_auto_scroll_tick = first_generation }, &tc.ctx);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.diff_scroll);
-    try std.testing.expect(std.meta.eql(selection_before_stale, app.pages.review.selection_owner));
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expect(std.meta.eql(selection_before_stale, app.pages.changes.selection_owner));
     try std.testing.expectEqualStrings("root diagnostic", app.status.text());
-    try std.testing.expectEqualStrings("review diagnostic", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("changes diagnostic", app.pages.changes.status.text());
     try std.testing.expect(tc.redrawSuppressed());
 
     tc.resetTransient();
     try app.update(.{ .drag_auto_scroll_tick = second_generation }, &tc.ctx);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
     try std.testing.expect(app.drag_auto_scroll.active != null);
 
     // Reversing once more admits C. Repeated firings from that one accepted
@@ -283,7 +283,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     tc.resetTransient();
     try app.update(.{ .mouse_selection_drag = .{
         .pointer = .{ .col = 12, .row = last_row },
-        .target = .{ .review = .{ .col = 12, .row = last_row } },
+        .target = .{ .changes = .{ .col = 12, .row = last_row } },
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
@@ -295,15 +295,15 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
 
     var repeated_ticks: usize = 0;
     var crossed_presentation_only_row = false;
-    while (app.pages.review.selection_owner.activeDiff().?.focus.hunk_index == 0 and repeated_ticks < 8) {
-        const focus_before = app.pages.review.selection_owner.activeDiff().?.focus;
+    while (app.pages.changes.selection_owner.activeDiff().?.focus.hunk_index == 0 and repeated_ticks < 8) {
+        const focus_before = app.pages.changes.selection_owner.activeDiff().?.focus;
         tc.resetTransient();
         try app.update(.{ .drag_auto_scroll_tick = third_generation }, &tc.ctx);
-        const focus_after = app.pages.review.selection_owner.activeDiff().?.focus;
+        const focus_after = app.pages.changes.selection_owner.activeDiff().?.focus;
         crossed_presentation_only_row = crossed_presentation_only_row or std.meta.eql(focus_before, focus_after);
         repeated_ticks += 1;
     }
-    const completed_focus = app.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const completed_focus = app.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expect(repeated_ticks >= 2);
     try std.testing.expect(crossed_presentation_only_row);
     try std.testing.expectEqual(@as(usize, 1), completed_focus.focus.hunk_index);
@@ -316,13 +316,13 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     tc.resetTransient();
     try app.update(.{ .mouse_selection_release = .{
         .pointer = .{ .col = 12, .row = last_row },
-        .target = .{ .review = .{ .col = 12, .row = last_row } },
+        .target = .{ .changes = .{ .col = 12, .row = last_row } },
     } }, &tc.ctx);
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
-    try std.testing.expect(app.pages.review.completed_selection != null);
-    try app.update(.{ .review = .{ .selection_action = .copy } }, &tc.ctx);
+    try std.testing.expect(app.pages.changes.completed_selection != null);
+    try app.update(.{ .changes = .{ .selection_action = .copy } }, &tc.ctx);
     try std.testing.expectEqual(@as(u8, 1), tc.ctx._pending_clipboard_copies_len);
     try std.testing.expectEqualStrings("one\ntwo\nnew\nfour\nlate one\n", tc.ctx._pending_clipboard_copies[0].text);
 
@@ -331,10 +331,10 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     // semantic selection endpoint.
     tc.resetTransient();
     try app.update(.{ .terminal_resized = .{ .width = 80, .height = 10 } }, &tc.ctx);
-    var action_adapter = reviewNavigation(&app).updateAdapter();
+    var action_adapter = changesNavigation(&app).updateAdapter();
     const action_body = action_adapter.shared().navigation.view();
     const action_projection = action_body.selectionActionProjection() orelse return error.ExpectedSelectionActionProjection;
-    app.pages.review.selection_owner = .{ .diff = .{
+    app.pages.changes.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .side = .new,
         .mode = .line,
@@ -342,15 +342,15 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
         .focus = .{ .hunk_index = 0, .line_index = 0 },
         .anchor_cell = .{ .col = 12, .row = diff_render.body_start_row },
     } };
-    const focus_before_action = app.pages.review.selection_owner.activeDiff().?.focus;
+    const focus_before_action = app.pages.changes.selection_owner.activeDiff().?.focus;
     const action_row = action_projection.actionPresentationRow(.summary);
-    app.pages.review.viewer.diff_scroll = action_row + 1;
-    try app.update(.{ .review = .{ .mouse_diff_auto_scroll_step = .{
+    app.pages.changes.viewer.diff_scroll = action_row + 1;
+    try app.update(.{ .changes = .{ .mouse_diff_auto_scroll_step = .{
         .direction = .up,
         .endpoint = .{ .col = 12, .row = diff_render.body_start_row },
     } } }, &tc.ctx);
-    try std.testing.expectEqual(action_row, app.pages.review.viewer.diff_scroll);
-    try std.testing.expect(std.meta.eql(focus_before_action, app.pages.review.selection_owner.activeDiff().?.focus));
+    try std.testing.expectEqual(action_row, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expect(std.meta.eql(focus_before_action, app.pages.changes.selection_owner.activeDiff().?.focus));
 }
 
 test "root drag auto-scroll timer failures retain only retryable authority" {
@@ -358,7 +358,7 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
     var app: App = .{
         .allocator = allocator,
         .terminal_size = .{ .width = 80, .height = 12 },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .sidebar_hidden = true, .focus = .diff, .display_mode = .unified },
             .selection_owner = .{ .diff = .{
@@ -371,7 +371,7 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
             } },
         } },
     };
-    defer reviewReload(&app).clearLoadedDiff(allocator);
+    defer changesReload(&app).clearLoadedDiff(allocator);
     var tc: chasen.testing.TestCtx(App.Msg) = .{};
     defer tc.resetTransient();
     const ids = [_][]const u8{ "full-0", "full-1", "full-2", "full-3", "full-4", "full-5", "full-6", "full-7" };
@@ -380,7 +380,7 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
     const last_row = shellLayout(&app).body.height - 1;
     try app.update(.{ .mouse_selection_drag = .{
         .pointer = .{ .col = 12, .row = last_row },
-        .target = .{ .review = .{ .col = 12, .row = last_row } },
+        .target = .{ .changes = .{ .col = 12, .row = last_row } },
     } }, &tc.ctx);
     // An intent whose repeating timer was not admitted cannot claim runtime
     // ownership and fails closed.
@@ -390,7 +390,7 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
     tc.resetTransient();
     app.drag_auto_scroll.active = .{
         .generation = 12,
-        .target = .review,
+        .target = .changes,
         .intent = .{ .direction = .down, .endpoint = .{ .col = 12, .row = last_row } },
     };
     app.drag_auto_scroll.scheduled_generation = 11;
@@ -408,9 +408,9 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
     try std.testing.expectEqual(@as(?u64, 12), app.drag_auto_scroll.scheduled_generation);
 
     tc.resetTransient();
-    var adapter = reviewNavigation(&app).updateAdapter();
+    var adapter = changesNavigation(&app).updateAdapter();
     const body_view = adapter.shared().navigation.view();
-    app.pages.review.viewer.diff_scroll = body_view.presentationDiffLineCount() -| body_view.view.diffVisibleRows();
+    app.pages.changes.viewer.diff_scroll = body_view.presentationDiffLineCount() -| body_view.view.diffVisibleRows();
     try app.update(.{ .drag_auto_scroll_tick = 12 }, &tc.ctx);
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
@@ -419,10 +419,10 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
 
 test "terminal resize cancels live drag before geometry and retains completed selection" {
     const allocator = std.testing.allocator;
-    const review_selection = @import("../diff_surface/selection.zig");
+    const content_selection = @import("../diff_surface/selection.zig");
     var app: App = .{
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             },
             .compare = .{
@@ -444,7 +444,7 @@ test "terminal resize cancels live drag before geometry and retains completed se
         .allocator = allocator,
         .terminal_size = .{ .width = 80, .height = 20 },
     };
-    defer reviewReload(&app).clearLoadedDiff(allocator);
+    defer changesReload(&app).clearLoadedDiff(allocator);
     defer app.pages.compare.deinit(allocator);
 
     const selection: diff_selection.DragSelection = .{
@@ -455,29 +455,29 @@ test "terminal resize cancels live drag before geometry and retains completed se
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
     };
-    app.pages.review.completed_selection = try review_selection.buildParsed(allocator, .{
+    app.pages.changes.completed_selection = try content_selection.buildParsed(allocator, .{
         .repo_epoch = 0,
         .root_identity = null,
-        .source = review_selection.SourceBasis.init(.unstaged),
-        .source_session_revision = app.pages.review.source_session_revision,
+        .source = content_selection.SourceBasis.init(.unstaged),
+        .source_session_revision = app.pages.changes.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
     }, app_test_support.loadedDiffOne().document.files[0], selection);
-    const retained_token = app.pages.review.completed_selection.?.token;
-    app.pages.compare.completed_selection = try review_selection.buildParsed(allocator, .{
+    const retained_token = app.pages.changes.completed_selection.?.token;
+    app.pages.compare.completed_selection = try content_selection.buildParsed(allocator, .{
         .repo_epoch = 0,
         .root_identity = null,
-        .source = review_selection.SourceBasis.init(.{ .range = "compare" }),
+        .source = content_selection.SourceBasis.init(.{ .range = "compare" }),
         .source_session_revision = app.pages.compare.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
     }, app_test_support.loadedDiffOne().document.files[0], selection);
     try std.testing.expect(app.pages.compare.installPinnedSelectionBasis());
     const compare_retained_token = app.pages.compare.completed_selection.?.token;
     const compare_retained_pin = app.pages.compare.pinned_selection_basis.?;
-    app.pages.review.selection_owner = .{ .diff = selection };
+    app.pages.changes.selection_owner = .{ .diff = selection };
     app.pages.compare.selection_owner = .{ .diff = selection };
     app.drag_auto_scroll.active = .{
         .generation = 9,
-        .target = .review,
+        .target = .changes,
         .intent = .{ .direction = .down, .endpoint = .{ .col = 20, .row = 10 } },
     };
     app.drag_auto_scroll.scheduled_generation = 9;
@@ -486,10 +486,10 @@ test "terminal resize cancels live drag before geometry and retains completed se
 
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 30 } }, &tc.ctx);
 
-    try std.testing.expect(app.pages.review.selection_owner == .none);
+    try std.testing.expect(app.pages.changes.selection_owner == .none);
     try std.testing.expect(app.pages.compare.selection_owner == .none);
-    try std.testing.expect(app.pages.review.completed_selection != null);
-    try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.changes.completed_selection != null);
+    try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.completed_selection != null);
     try std.testing.expect(app.pages.compare.completed_selection.?.token.eql(compare_retained_token));
     try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(compare_retained_pin));
@@ -503,7 +503,7 @@ test "terminal resize preserves semantic keyboard line selection while focus los
     const allocator = std.testing.allocator;
     var app: App = .{
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
                 .viewer = .{ .focus = .diff, .sidebar_hidden = true },
             },
@@ -515,7 +515,7 @@ test "terminal resize preserves semantic keyboard line selection while focus los
         .allocator = allocator,
         .terminal_size = .{ .width = 120, .height = 32 },
     };
-    defer reviewReload(&app).clearLoadedDiff(allocator);
+    defer changesReload(&app).clearLoadedDiff(allocator);
     defer app.pages.compare.deinit(allocator);
 
     var selection = diff_selection.DragSelection.initKeyboardLine(
@@ -524,7 +524,7 @@ test "terminal resize preserves semantic keyboard line selection while focus los
         .{ .hunk_index = 0, .line_index = 0 },
     );
     selection.updateKeyboardLine(.{ .hunk_index = 0, .line_index = 1 }, 2);
-    app.pages.review.selection_owner = .{ .diff = selection };
+    app.pages.changes.selection_owner = .{ .diff = selection };
     app.pages.compare.selection_owner = .{ .diff = selection };
     var tc: chasen.testing.TestCtx(App.Msg) = .{};
     defer tc.resetTransient();
@@ -538,13 +538,13 @@ test "terminal resize preserves semantic keyboard line selection while focus los
     )) == null);
 
     try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &tc.ctx);
-    try std.testing.expect(app.pages.review.selection_owner.activeKeyboardLineSelection());
+    try std.testing.expect(app.pages.changes.selection_owner.activeKeyboardLineSelection());
     try std.testing.expect(app.pages.compare.selection_owner.activeKeyboardLineSelection());
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.selection_owner.activeDiff().?.selected_line_count);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.selection_owner.activeDiff().?.selected_line_count);
     try std.testing.expectEqual(chasen.Size{ .width = 80, .height = 12 }, app.terminal_size);
 
     try app.update(.focus_lost, &tc.ctx);
-    try std.testing.expect(app.pages.review.selection_owner == .none);
+    try std.testing.expect(app.pages.changes.selection_owner == .none);
     try std.testing.expect(app.pages.compare.selection_owner.activeKeyboardLineSelection());
 
     app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(.{
@@ -765,7 +765,7 @@ test "help overlay reopen resets help scroll" {
 
 test "prompt input stays above help overlay" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .search = .{ .mode = true },
         } },
     };
@@ -774,12 +774,12 @@ test "prompt input stays above help overlay" {
     try app.update(msg, undefined);
 
     try std.testing.expectEqual(OverlayKind.none, app.overlay.kind);
-    try std.testing.expectEqualStrings("?", app.pages.review.search.input.slice());
+    try std.testing.expectEqualStrings("?", app.pages.changes.search.input.slice());
 }
 
 test "mouse click focuses sidebar and diff panes" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .focus = .diff },
         } },
@@ -790,18 +790,18 @@ test "mouse click focuses sidebar and diff panes" {
     const sidebar_event = app_test_support.mouseEvent(content.col + 1, content.row + 2, .left);
     const sidebar_msg = app.handleEvent(sidebar_event) orelse return error.ExpectedSidebarMouseMessage;
     try app.update(sidebar_msg, undefined);
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
 
-    const diff_col = content.col + sidebarWidth(layoutSize(&app).width, app.pages.review.viewer.sidebar_width) + 1;
+    const diff_col = content.col + sidebarWidth(layoutSize(&app).width, app.pages.changes.viewer.sidebar_width) + 1;
     const diff_event = app_test_support.mouseEvent(diff_col, content.row + 2, .left);
     const diff_msg = app.handleEvent(diff_event) orelse return error.ExpectedDiffMouseMessage;
     try app.update(diff_msg, undefined);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 }
 
 test "mouse click selects sidebar file rows" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{ .focus = .diff },
         } },
@@ -813,37 +813,37 @@ test "mouse click selects sidebar file rows" {
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarClickMessage;
     try app.update(msg, undefined);
 
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "mouse click toggles sidebar directory rows" {
     const arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, app_test_support.loadedDiffNested()),
             .viewer = .{ .focus = .diff, .selected_node = 1 },
         } },
         .terminal_size = .{ .width = 100, .height = 20 },
     };
-    defer reviewReload(&app).clearLoadedDiff(app.allocator);
+    defer changesReload(&app).clearLoadedDiff(app.allocator);
 
     const content = app_shell_layout.contentRect(app.terminal_size);
     const row = content.row + app_shell_layout.page_bar_rows + sidebar_header_rows;
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedSidebarDirectoryClickMessage;
     try app.update(msg, undefined);
 
-    const loaded = reviewNavigation(&app).activeLoadedDiff().?;
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    const loaded = changesNavigation(&app).activeLoadedDiff().?;
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
 }
 
 test "mouse click on sidebar header or blank body focuses only" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .focus = .diff },
         } },
@@ -853,15 +853,15 @@ test "mouse click on sidebar header or blank body focuses only" {
     const content = app_shell_layout.contentRect(app.terminal_size);
     const header_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + app_shell_layout.page_bar_rows, .left)) orelse return error.ExpectedSidebarHeaderClickMessage;
     try app.update(header_msg, undefined);
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
 
-    app.pages.review.viewer.focus = .diff;
+    app.pages.changes.viewer.focus = .diff;
     const blank_row = content.row + app_shell_layout.page_bar_rows + sidebar_header_rows + 2;
     const blank_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, blank_row, .left)) orelse return error.ExpectedSidebarBlankClickMessage;
     try app.update(blank_msg, undefined);
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
 }
 
 test "mouse click uses filtered sidebar projection" {
@@ -872,28 +872,28 @@ test "mouse click uses filtered sidebar projection" {
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .deleted);
 
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .viewer = .{ .focus = .diff, .selected_node = 0 },
             .review_display = .{ .changed_file_filter = .deleted },
         } },
         .terminal_size = .{ .width = 100, .height = 20 },
     };
-    defer reviewReload(&app).clearLoadedDiff(app.allocator);
+    defer changesReload(&app).clearLoadedDiff(app.allocator);
 
     const content = app_shell_layout.contentRect(app.terminal_size);
     const row = content.row + app_shell_layout.page_bar_rows + sidebar_header_rows;
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, row, .left)) orelse return error.ExpectedFilteredSidebarClickMessage;
     try app.update(msg, undefined);
 
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "mouse wheel scrolls the pane under the pointer" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{ .focus = .diff },
         } },
@@ -903,20 +903,20 @@ test "mouse wheel scrolls the pane under the pointer" {
     const content = app_shell_layout.contentRect(app.terminal_size);
     const sidebar_msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedSidebarWheelMessage;
     try app.update(sidebar_msg, undefined);
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 
-    reviewNavigation(&app).selectFileAbsolute(0);
-    const diff_col = content.col + sidebarWidth(layoutSize(&app).width, app.pages.review.viewer.sidebar_width) + 1;
+    changesNavigation(&app).selectFileAbsolute(0);
+    const diff_col = content.col + sidebarWidth(layoutSize(&app).width, app.pages.changes.viewer.sidebar_width) + 1;
     const diff_msg = app.handleEvent(app_test_support.mouseEvent(diff_col, content.row + 2, .wheel_down)) orelse return error.ExpectedDiffWheelMessage;
     try app.update(diff_msg, undefined);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expect(app.pages.review.viewer.diff_scroll > 0);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expect(app.pages.changes.viewer.diff_scroll > 0);
 }
 
 test "mouse uses full body as diff pane while sidebar is hidden" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .focus = .sidebar,
@@ -929,12 +929,12 @@ test "mouse uses full body as diff pane while sidebar is hidden" {
     const content = app_shell_layout.contentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) orelse return error.ExpectedHiddenSidebarMouseMessage;
     try app.update(msg, undefined);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 }
 
 test "help overlay wheel scrolls help and ignores clicks" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .terminal_size = .{ .width = 100, .height = 8 },
@@ -955,7 +955,7 @@ test "push error overlay wheel scrolls details and ignores clicks" {
         "line 1\nline 2\nline 3\nline 4\nline 5\n" ++
         "line 6\nline 7\nline 8\nline 9\nline 10\n";
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .terminal_size = .{ .width = 100, .height = 8 },
@@ -975,7 +975,7 @@ test "push error overlay wheel scrolls details and ignores clicks" {
 
 test "confirmation overlay blocks mouse clicks and wheels" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{
                 .focus = .diff,
@@ -988,8 +988,8 @@ test "confirmation overlay blocks mouse clicks and wheels" {
     const content = app_shell_layout.contentRect(app.terminal_size);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) == null);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "terminal resize clamps push error scroll" {
@@ -1013,7 +1013,7 @@ test "terminal resize clamps push error scroll" {
 
 test "mouse horizontal wheel scrolls diff pane horizontally" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
             .viewer = .{
                 .focus = .sidebar,
@@ -1024,18 +1024,18 @@ test "mouse horizontal wheel scrolls diff pane horizontally" {
     };
 
     const content = app_shell_layout.contentRect(app.terminal_size);
-    const diff_col = content.col + sidebarWidth(layoutSize(&app).width, app.pages.review.viewer.sidebar_width) + 1;
+    const diff_col = content.col + sidebarWidth(layoutSize(&app).width, app.pages.changes.viewer.sidebar_width) + 1;
     const msg = app.handleEvent(app_test_support.mouseEvent(diff_col, content.row + 2, .wheel_right)) orelse return error.ExpectedHorizontalWheelMessage;
     try app.update(msg, undefined);
 
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll > 0);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expect(app.pages.changes.viewer.diff_horizontal_scroll > 0);
 }
 
 test "footer status click copies full page diagnostic across shared screens" {
     const allocator = std.testing.allocator;
     const status_text = "警告: clipped footerでも保持しているmessage全体をcopyする";
-    const page_ids = [_]page.Id{ .review, .repository, .compare };
+    const page_ids = [_]page.Id{ .changes, .repository, .compare };
 
     for (page_ids, 0..) |page_id, index| {
         var app: App = .{
@@ -1047,7 +1047,7 @@ test "footer status click copies full page diagnostic across shared screens" {
         };
         defer app.shell_effects_state.deinit(allocator);
         const page_status = switch (page_id) {
-            .review => &app.pages.review.status,
+            .changes => &app.pages.changes.status,
             .repository => &app.pages.repository.status,
             .compare => &app.pages.compare.status,
             .config => unreachable,
@@ -1087,7 +1087,7 @@ test "footer status click copies shell priority before revealing page completion
         .terminal_size = .{ .width = 80, .height = 12 },
     };
     defer app.shell_effects_state.deinit(allocator);
-    app.pages.review.status.set("page diagnostic", .{});
+    app.pages.changes.status.set("page diagnostic", .{});
     app.status.set("shell notification", .{});
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer ctx.runtimeClearPendingEffectCopies();
@@ -1098,7 +1098,7 @@ test "footer status click copies shell priority before revealing page completion
     const entry = ctx._pending_clipboard_copies[0];
     try std.testing.expectEqualStrings("shell notification", entry.text);
     try std.testing.expectEqualStrings("", app.status.text());
-    try std.testing.expectEqualStrings("page diagnostic", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("page diagnostic", app.pages.changes.status.text());
 
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
         .request_id = entry.request_id,
@@ -1106,7 +1106,7 @@ test "footer status click copies shell priority before revealing page completion
     } } }, &ctx);
     try std.testing.expectEqualStrings(
         "clipboard copy unavailable: status message",
-        app.pages.review.status.text(),
+        app.pages.changes.status.text(),
     );
 }
 
@@ -1114,14 +1114,14 @@ test "footer status click respects text input overlay and spinner mouse blockers
     var app: App = .{
         .terminal_size = .{ .width = 80, .height = 12 },
     };
-    app.pages.review.status.set("review diagnostic", .{});
+    app.pages.changes.status.set("changes diagnostic", .{});
     try std.testing.expect(footerStatusPress(&app) != null);
 
-    app.pages.review.search.mode = true;
+    app.pages.changes.search.mode = true;
     try std.testing.expect(footerStatusPress(&app) == null);
-    app.pages.review.search.mode = false;
+    app.pages.changes.search.mode = false;
 
-    app.overlay.openHelpForPage(.review);
+    app.overlay.openHelpForPage(.changes);
     try std.testing.expect(footerStatusPress(&app) == null);
     app.overlay.close();
 
@@ -1132,7 +1132,7 @@ test "footer status click respects text input overlay and spinner mouse blockers
 
 test "mouse events are ignored outside body and prompt modes" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .terminal_size = .{ .width = 100, .height = 8 },
@@ -1144,13 +1144,13 @@ test "mouse events are ignored outside body and prompt modes" {
     const footer_row: i16 = @intCast(content.row + terminalBodyHeight(layoutSize(&app).height));
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, footer_row, .left)) == null);
 
-    app.pages.review.search.mode = true;
+    app.pages.changes.search.mode = true;
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 1, .left)) == null);
 }
 
 test "mouse release and motion events are ignored" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .terminal_size = .{ .width = 100, .height = 8 },
@@ -1163,34 +1163,34 @@ test "mouse release and motion events are ignored" {
 
 test "search overflow reports query status for insert and paste" {
     var app: App = .{
-        .pages = .{ .review = .{ .search = .{ .mode = true } } },
+        .pages = .{ .changes = .{ .search = .{ .mode = true } } },
     };
-    @memset(&app.pages.review.search.input.buffer, 'x');
-    app.pages.review.search.input.len = app.pages.review.search.input.buffer.len;
-    app.pages.review.search.input.cursor = app.pages.review.search.input.buffer.len;
+    @memset(&app.pages.changes.search.input.buffer, 'x');
+    app.pages.changes.search.input.len = app.pages.changes.search.input.buffer.len;
+    app.pages.changes.search.input.cursor = app.pages.changes.search.input.buffer.len;
 
-    try app.update(.{ .review = .{ .search_insert = 'y' } }, undefined);
-    try std.testing.expectEqualStrings("search query is too long", app.pages.review.status.text());
+    try app.update(.{ .changes = .{ .search_insert = 'y' } }, undefined);
+    try std.testing.expectEqualStrings("search query is too long", app.pages.changes.status.text());
 
     app.status.clear();
-    try app.update(.{ .review = .{ .search_paste = "y" } }, undefined);
-    try std.testing.expectEqualStrings("search query is too long", app.pages.review.status.text());
+    try app.update(.{ .changes = .{ .search_paste = "y" } }, undefined);
+    try std.testing.expectEqualStrings("search query is too long", app.pages.changes.status.text());
 }
 
 test "file search overflow reports query status for insert and paste" {
     var app: App = .{
-        .pages = .{ .review = .{ .file_search = .{ .mode = true } } },
+        .pages = .{ .changes = .{ .file_search = .{ .mode = true } } },
     };
-    @memset(&app.pages.review.file_search.input.buffer, 'x');
-    app.pages.review.file_search.input.len = app.pages.review.file_search.input.buffer.len;
-    app.pages.review.file_search.input.cursor = app.pages.review.file_search.input.buffer.len;
+    @memset(&app.pages.changes.file_search.input.buffer, 'x');
+    app.pages.changes.file_search.input.len = app.pages.changes.file_search.input.buffer.len;
+    app.pages.changes.file_search.input.cursor = app.pages.changes.file_search.input.buffer.len;
 
-    try app.update(.{ .review = .{ .file_search_insert = 'y' } }, undefined);
-    try std.testing.expectEqualStrings("file search query is too long", app.pages.review.status.text());
+    try app.update(.{ .changes = .{ .file_search_insert = 'y' } }, undefined);
+    try std.testing.expectEqualStrings("file search query is too long", app.pages.changes.status.text());
 
     app.status.clear();
-    try app.update(.{ .review = .{ .file_search_paste = "y" } }, undefined);
-    try std.testing.expectEqualStrings("file search query is too long", app.pages.review.status.text());
+    try app.update(.{ .changes = .{ .file_search_paste = "y" } }, undefined);
+    try std.testing.expectEqualStrings("file search query is too long", app.pages.changes.status.text());
 }
 
 test "repo picker filter overflow reports status for insert and paste" {
@@ -1231,7 +1231,7 @@ test "page bar rule is dead chrome in normal and compact layouts" {
     const compact = shellLayout(&app);
     const compact_bar = compact.page_bar orelse return error.ExpectedCompactPageBar;
     try std.testing.expectEqual(@as(u16, 0), compact.body.height);
-    try std.testing.expectEqual(App.Msg{ .switch_page = .review }, app.handleEvent(app_test_support.mouseEvent(
+    try std.testing.expectEqual(App.Msg{ .switch_page = .changes }, app.handleEvent(app_test_support.mouseEvent(
         compact_bar.col + 1,
         compact_bar.row + app_shell_layout.page_bar_label_row,
         .left,
@@ -1248,22 +1248,22 @@ test "page bar rule is dead chrome in normal and compact layouts" {
     )) == null);
 }
 
-test "direct nested Review message uses the same update owner as keyboard input" {
+test "direct nested Changes message uses the same update owner as keyboard input" {
     var direct: App = .{ .allocator = std.testing.allocator };
     var keyboard: App = .{ .allocator = std.testing.allocator };
     var direct_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     var keyboard_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try direct.update(.{ .review = .toggle_focus }, &direct_ctx);
-    const keyboard_msg = keyboard.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.tab } }) orelse return error.ExpectedReviewMessage;
-    try std.testing.expectEqual(App.Msg{ .review = .toggle_focus }, keyboard_msg);
+    try direct.update(.{ .changes = .toggle_focus }, &direct_ctx);
+    const keyboard_msg = keyboard.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.tab } }) orelse return error.ExpectedChangesMessage;
+    try std.testing.expectEqual(App.Msg{ .changes = .toggle_focus }, keyboard_msg);
     try keyboard.update(keyboard_msg, &keyboard_ctx);
 
-    try std.testing.expectEqual(review_page.Focus.diff, direct.pages.review.viewer.focus);
-    try std.testing.expectEqual(direct.pages.review.viewer.focus, keyboard.pages.review.viewer.focus);
+    try std.testing.expectEqual(changes_page.Focus.diff, direct.pages.changes.viewer.focus);
+    try std.testing.expectEqual(direct.pages.changes.viewer.focus, keyboard.pages.changes.viewer.focus);
 }
 
-test "normal and help commit keys use the same nested Review adapter" {
+test "normal and help commit keys use the same nested Changes adapter" {
     const repo: repo_discovery.RepoEntry = .{
         .label = "repo",
         .display_path = "/repo",
@@ -1281,13 +1281,13 @@ test "normal and help commit keys use the same nested Review adapter" {
             .repo_state = .{ .discovery = .{ .single_repo = repo } },
         },
     };
-    help.overlay.openHelpForPage(.review);
+    help.overlay.openHelpForPage(.changes);
     var normal_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     var help_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    const normal_msg = normal.handleEvent(.{ .key_press = .{ .codepoint = 'c' } }) orelse return error.ExpectedReviewMessage;
-    const help_msg = help.handleEvent(.{ .key_press = .{ .codepoint = 'c' } }) orelse return error.ExpectedReviewMessage;
-    try std.testing.expectEqual(App.Msg{ .review = .enter_commit_panel }, normal_msg);
+    const normal_msg = normal.handleEvent(.{ .key_press = .{ .codepoint = 'c' } }) orelse return error.ExpectedChangesMessage;
+    const help_msg = help.handleEvent(.{ .key_press = .{ .codepoint = 'c' } }) orelse return error.ExpectedChangesMessage;
+    try std.testing.expectEqual(App.Msg{ .changes = .enter_commit_panel }, normal_msg);
     try std.testing.expectEqual(normal_msg, help_msg);
 
     try normal.update(normal_msg, &normal_ctx);
@@ -1305,11 +1305,11 @@ test "review session q writes structured canceled output before quitting" {
         .config = .{ .review_mode = true },
         .review_output = &output,
     };
-    _ = app.pages.review.activation.activate(0, .fresh, .unavailable, .unavailable);
+    _ = app.pages.changes.activation.activate(0, .fresh, .unavailable, .unavailable);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    const msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'q' } }) orelse return error.ExpectedReviewCancel;
-    try std.testing.expectEqual(App.Msg{ .review = .finish_review_canceled }, msg);
+    const msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'q' } }) orelse return error.ExpectedChangesCancel;
+    try std.testing.expectEqual(App.Msg{ .changes = .finish_review_canceled }, msg);
     try app.update(msg, &ctx);
 
     try std.testing.expect(ctx.shouldQuit());
@@ -1320,26 +1320,26 @@ test "review session q writes structured canceled output before quitting" {
 
 test "focus loss terminates selection without a deferred result" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
         } },
         .config = .{ .source = .{ .no_index = .{ .left = "left", .right = "right" } } },
     };
-    _ = activateReview(&app);
-    app.pages.review.auto_reload = .init(.inherit, .{}, app.config.source);
+    _ = activateChanges(&app);
+    app.pages.changes.auto_reload = .init(.inherit, .{}, app.config.source);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
     app.drag_auto_scroll.active = .{
         .generation = 3,
-        .target = .review,
+        .target = .changes,
         .intent = .{ .direction = .up, .endpoint = .{ .col = 4, .row = 3 } },
     };
     app.drag_auto_scroll.scheduled_generation = 3;
 
     try std.testing.expectEqual(App.Msg.focus_lost, app.handleEvent(.focus_out).?);
     try app.update(.focus_lost, &ctx);
-    try std.testing.expect(!app.pages.review.selection_owner.activeMouseSelection());
-    try std.testing.expect(app.pages.review.deferred_source_apply == null);
+    try std.testing.expect(!app.pages.changes.selection_owner.activeMouseSelection());
+    try std.testing.expect(app.pages.changes.deferred_source_apply == null);
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_cancels_len);
@@ -1351,8 +1351,8 @@ test "focus loss terminates selection without a deferred result" {
     const cycle_id = task.background_cycle_id.?;
     const generation = task.generation;
     DiffLoadTask.destroy(task, std.testing.allocator);
-    _ = app.pages.review.load.clearPendingIfCurrent(.{ .diff_load = generation });
-    reviewReload(&app).clearPendingReloadIfGeneration(std.testing.allocator, generation);
-    app.pages.review.auto_reload.finishMember(cycle_id, .source);
-    try std.testing.expect(app.pages.review.auto_reload.background_cycle == null);
+    _ = app.pages.changes.load.clearPendingIfCurrent(.{ .diff_load = generation });
+    changesReload(&app).clearPendingReloadIfGeneration(std.testing.allocator, generation);
+    app.pages.changes.auto_reload.finishMember(cycle_id, .source);
+    try std.testing.expect(app.pages.changes.auto_reload.background_cycle == null);
 }

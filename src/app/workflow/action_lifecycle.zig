@@ -1,7 +1,7 @@
 //! Sole owner for Git action launch/terminal correlation and spinner state.
 //!
 //! Task launchers prepare owned payloads, but only this controller commits an
-//! accepted launch. Mutating launches close Review read authority in the same
+//! accepted launch. Mutating launches close Changes read authority in the same
 //! synchronous transition; exact terminals reopen it before retiring the
 //! action token. The controller owns no task payloads.
 
@@ -11,7 +11,7 @@ const chasen = @import("chasen");
 
 const app_actions = @import("../actions.zig");
 const app_message = @import("../message.zig");
-const action_fence = @import("../pages/review/action_fence.zig");
+const action_fence = @import("../pages/changes/action_fence.zig");
 
 const spinner_timer_id = "gitframe.git_action_spinner";
 const spinner_interval_ns = 120 * std.time.ns_per_ms;
@@ -88,8 +88,8 @@ const PendingOwner = struct {
 };
 
 pub const TerminalTarget = enum {
-    current_review,
-    detached_review,
+    current_changes,
+    detached_changes,
 };
 
 pub const AcceptedTerminal = struct {
@@ -146,7 +146,7 @@ pub const Controller = struct {
         owner.phase = .accepted;
         if (pending_action.kind.blocksBackgroundAcceptance()) {
             if (!self.fence.closeForAcceptedMutation(allocator, pending_action)) {
-                @panic("accepted mutating action could not close Review read authority");
+                @panic("accepted mutating action could not close Changes read authority");
             }
         }
         return .{ .pending = pending_action };
@@ -159,19 +159,19 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         pending_action: app_actions.PendingAction,
         repo_root: []const u8,
-        current_review_root: ?[]const u8,
+        current_changes_root: ?[]const u8,
     ) TerminalAdmission {
         if (!self.view().isAccepted(pending_action)) return .rejected;
         if (pending_action.kind.blocksBackgroundAcceptance() and
             !self.fence.reopenForExactTerminal(pending_action))
         {
-            @panic("exact mutating action terminal could not reopen Review read authority");
+            @panic("exact mutating action terminal could not reopen Changes read authority");
         }
-        var target: TerminalTarget = .detached_review;
-        if (current_review_root) |current_root| {
-            if (std.mem.eql(u8, current_root, repo_root)) target = .current_review;
+        var target: TerminalTarget = .detached_changes;
+        if (current_changes_root) |current_root| {
+            if (std.mem.eql(u8, current_root, repo_root)) target = .current_changes;
         }
-        if (target == .detached_review and pending_action.kind.blocksBackgroundAcceptance()) {
+        if (target == .detached_changes and pending_action.kind.blocksBackgroundAcceptance()) {
             self.fence.discardDetachedTerminal(allocator, pending_action);
         }
         self.runtime.pending = null;
@@ -257,21 +257,21 @@ pub const testing = if (builtin.is_test) struct {
 } else struct {};
 
 const UnitHarness = if (builtin.is_test) struct {
-    const review_page = @import("../pages/review.zig");
+    const changes_page = @import("../pages/changes.zig");
 
     runtime: ActionRuntime = .{},
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
 
     fn controller(self: *@This()) Controller {
         return .{
             .runtime = &self.runtime,
             .fence = .{
-                .read_authority = &self.review.repository_read_authority,
-                .activation = &self.review.activation,
-                .action_cursor = &self.review.action_cursor,
-                .auto_reload = &self.review.auto_reload,
-                .review_projection = &self.review.review_projection,
-                .deferred_projection_apply = &self.review.deferred_projection_apply,
+                .read_authority = &self.changes.repository_read_authority,
+                .activation = &self.changes.activation,
+                .action_cursor = &self.changes.action_cursor,
+                .auto_reload = &self.changes.auto_reload,
+                .changes_projection = &self.changes.changes_projection,
+                .deferred_projection_apply = &self.changes.deferred_projection_apply,
             },
         };
     }

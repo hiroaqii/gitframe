@@ -11,13 +11,13 @@ const effect_origin = @import("effect_origin.zig");
 const page = @import("page.zig");
 const compare_page = @import("pages/compare.zig");
 const repository_page = @import("pages/repository.zig");
-const review_content = @import("pages/review/content.zig");
-const review_page = @import("pages/review.zig");
+const changes_content = @import("pages/changes/content.zig");
+const changes_page = @import("pages/changes.zig");
 const shell_effects = @import("shell_effects.zig");
 const config_mod = @import("../config.zig");
 
 const ShellPages = struct {
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
 };
@@ -34,7 +34,7 @@ const RedrawPlan = struct {
 const ShellHarness = struct {
     pub const Msg = app_message.Msg;
 
-    active_page: page.Id = .review,
+    active_page: page.Id = .changes,
     repo_epoch: u64 = 0,
     pages: ShellPages = .{},
     user_config: config_mod.Config = .{},
@@ -48,13 +48,13 @@ const ShellHarness = struct {
             .snapshot = .{
                 .active_page = self.active_page,
                 .repo_epoch = self.repo_epoch,
-                .review_activation_id = self.pages.review.activation.next_activation_id,
+                .changes_activation_id = self.pages.changes.activation.next_activation_id,
                 .repository_activation_id = self.pages.repository.activation_id,
                 .compare_activation_id = self.pages.compare.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = null,
             },
-            .review_repo_epoch = self.repo_epoch,
+            .changes_repo_epoch = self.repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
             .compare_repo_epoch = self.repo_epoch,
         };
@@ -68,7 +68,7 @@ const ShellHarness = struct {
             .origins = self.origins(),
             .diagnostics = .{
                 .shell = &self.status,
-                .review = &self.pages.review.status,
+                .changes = &self.pages.changes.status,
                 .repository = &self.pages.repository.status,
                 .compare = &self.pages.compare.status,
             },
@@ -91,19 +91,19 @@ const ShellHarness = struct {
 test "clipboard copy result status uses best-effort wording" {
     var app: ShellHarness = .{};
     defer app.shell_state.clipboard_copies.deinit(std.testing.allocator);
-    const origin: effect_origin.Origin = .{ .page = app.shellEffects().reviewOrigin() };
+    const origin: effect_origin.Origin = .{ .page = app.shellEffects().changesOrigin() };
 
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 1, .{ .origin = origin, .label = "current line" });
     app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 1 }, .outcome = .sent });
-    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.changes.status.text());
 
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 2, .{ .origin = origin, .label = "current hunk" });
     app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 2 }, .outcome = .unsupported_runtime });
-    try std.testing.expectEqualStrings("clipboard copy unavailable: current hunk", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("clipboard copy unavailable: current hunk", app.pages.changes.status.text());
 
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 3, .{ .origin = origin, .label = "current line" });
     app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 3 }, .outcome = .{ .write_failed = "BrokenPipe" } });
-    try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.pages.changes.status.text());
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
 }
 
@@ -195,17 +195,17 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
     try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(retained_pin));
 }
 
-test "inactive Review clipboard completion retains diagnostic without redraw" {
+test "inactive Changes clipboard completion retains diagnostic without redraw" {
     var app: ShellHarness = .{ .active_page = .repository };
     defer app.shell_state.clipboard_copies.deinit(std.testing.allocator);
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 4, .{
-        .origin = .{ .page = app.shellEffects().reviewOrigin() },
+        .origin = .{ .page = app.shellEffects().changesOrigin() },
         .label = "current line",
     });
 
     app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 4 }, .outcome = .sent });
 
-    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.changes.status.text());
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
@@ -228,7 +228,7 @@ test "repository selection late clipboard completion cannot target a new page in
     const inactive_request_id = ctx._pending_clipboard_copies[0].request_id;
     const stale_request_id = ctx._pending_clipboard_copies[1].request_id;
     app.pages.repository.deactivate();
-    app.active_page = .review;
+    app.active_page = .changes;
 
     app.shellEffects().finishClipboard(.{ .request_id = inactive_request_id, .outcome = .sent });
 
@@ -268,7 +268,7 @@ test "closed shell surface discards clipboard completion presentation" {
     });
 
     try std.testing.expectEqualStrings("", app.status.text());
-    try std.testing.expectEqualStrings("", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.pages.changes.status.text());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.redraw_plan = .{};
@@ -298,32 +298,32 @@ test "live shell surface owns clipboard completion presentation" {
     });
 
     try std.testing.expectEqualStrings("clipboard copy sent: push error", app.status.text());
-    try std.testing.expectEqualStrings("", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.pages.changes.status.text());
 }
 
 test "clipboard completion rejects unknown id and superseded page instance" {
     var app: ShellHarness = .{};
     defer app.shell_state.clipboard_copies.deinit(std.testing.allocator);
-    const old_activation = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    const old_activation = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 8, .{
-        .origin = .{ .page = .{ .page_id = .review, .repo_epoch = 0, .activation_id = old_activation } },
+        .origin = .{ .page = .{ .page_id = .changes, .repo_epoch = 0, .activation_id = old_activation } },
         .label = "old page",
     });
-    _ = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    _ = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
 
     app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 999 }, .outcome = .sent });
     try std.testing.expectEqual(@as(usize, 1), app.shell_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings("", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.pages.changes.status.text());
 
     app.redraw_plan = .{};
     app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 8 }, .outcome = .sent });
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings("", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("", app.pages.changes.status.text());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
 test "openSelectedFileInEditor blocks while git action is pending" {
-    const ready: review_content.EditorTargetResult = .{ .ready = .{
+    const ready: changes_content.EditorTargetResult = .{ .ready = .{
         .repo_root = "/repo",
         .path = "src/main.zig",
         .line = 42,
@@ -338,19 +338,19 @@ test "openSelectedFileInEditor blocks while git action is pending" {
             &ctx,
             .no_repo,
             true,
-            app.shellEffects().reviewOrigin(),
+            app.shellEffects().changesOrigin(),
         );
 
-        try std.testing.expectEqualStrings("finish current git action before opening editor", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("finish current git action before opening editor", app.pages.changes.status.text());
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
 
         try app.shellEffects().requestEditor(
             &ctx,
             .no_repo,
             false,
-            app.shellEffects().reviewOrigin(),
+            app.shellEffects().changesOrigin(),
         );
-        try std.testing.expectEqualStrings("editor unavailable for this source", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("editor unavailable for this source", app.pages.changes.status.text());
     }
 
     // Invalid and empty configured commands retain the existing diagnostics.
@@ -360,15 +360,15 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         app.user_config.editor.argv[0] = "nvim";
         app.user_config.editor.argv[1] = "{unknown}";
         app.user_config.editor.argv_len = 2;
-        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().reviewOrigin());
-        try std.testing.expectEqualStrings("editor config invalid: UnknownPlaceholder", app.pages.review.status.text());
+        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin());
+        try std.testing.expectEqualStrings("editor config invalid: UnknownPlaceholder", app.pages.changes.status.text());
         try std.testing.expect(app.shell_state.editor_foreground == null);
 
         app.user_config.editor.argv[0] = "";
         app.user_config.editor.argv[1] = "{path}";
         app.user_config.editor.argv_len = 2;
-        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().reviewOrigin());
-        try std.testing.expectEqualStrings("editor command is empty", app.pages.review.status.text());
+        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin());
+        try std.testing.expectEqualStrings("editor command is empty", app.pages.changes.status.text());
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     }
 
@@ -384,9 +384,9 @@ test "openSelectedFileInEditor blocks while git action is pending" {
             .finished = app_message.Msg.editorFinished,
         });
 
-        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().reviewOrigin());
+        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin());
 
-        try std.testing.expectEqualStrings("editor command already queued", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("editor command already queued", app.pages.changes.status.text());
         try std.testing.expect(app.shell_state.editor_foreground == null);
         try std.testing.expectEqual(@as(u8, 1), ctx._pending_foreground_commands_len);
     }
@@ -399,7 +399,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
 
         try std.testing.expectError(
             error.OutOfMemory,
-            app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().reviewOrigin()),
+            app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin()),
         );
         try std.testing.expect(app.shell_state.editor_foreground == null);
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
@@ -413,19 +413,19 @@ test "openSelectedFileInEditor blocks while git action is pending" {
 
         try std.testing.expectError(
             error.OutOfMemory,
-            app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().reviewOrigin()),
+            app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin()),
         );
         try std.testing.expect(app.shell_state.editor_foreground == null);
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     }
 
     // Queue success commits the exact id. A mismatch is state-preserving; the
-    // exact active completion clears first and requests one Review reload.
+    // exact active completion clears first and requests one Changes reload.
     {
         var app: ShellHarness = .{};
         var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
         defer ctx.runtimeClearPendingEffectCopies();
-        const origin = app.shellEffects().reviewOrigin();
+        const origin = app.shellEffects().changesOrigin();
         try app.shellEffects().requestEditor(&ctx, ready, false, origin);
         const entry = ctx._pending_foreground_commands[0];
         const request_id = entry.request_id;
@@ -435,7 +435,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         }
         try std.testing.expect(entry.runtimeChildEnvironment() == null);
 
-        try std.testing.expectEqualStrings("opening editor: src/main.zig", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("opening editor: src/main.zig", app.pages.changes.status.text());
         try std.testing.expectEqual(request_id.id, app.shell_state.editor_foreground.?.request_id.id);
         try std.testing.expectEqual(
             shell_effects.EditorFinishOutcome.none,
@@ -447,14 +447,14 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         try std.testing.expect(app.shell_state.editor_foreground != null);
 
         try std.testing.expectEqual(
-            shell_effects.EditorFinishOutcome.reload_review,
+            shell_effects.EditorFinishOutcome.reload_changes,
             app.shellEffects().finishEditor(.{
                 .request_id = request_id,
                 .outcome = .{ .exited = 0 },
             }),
         );
         try std.testing.expect(app.shell_state.editor_foreground == null);
-        try std.testing.expectEqualStrings("editor closed", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("editor closed", app.pages.changes.status.text());
         try std.testing.expectEqual(
             shell_effects.EditorFinishOutcome.none,
             app.shellEffects().finishEditor(.{
@@ -465,12 +465,12 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     }
 
     // Same-instance inactive completion retains its origin diagnostic, while
-    // a reopened Review instance consumes the terminal silently as stale.
+    // a reopened Changes instance consumes the terminal silently as stale.
     {
         var app: ShellHarness = .{ .active_page = .repository };
         app.shell_state.editor_foreground = .{
             .request_id = .{ .id = 80 },
-            .origin = app.shellEffects().reviewOrigin(),
+            .origin = app.shellEffects().changesOrigin(),
         };
         try std.testing.expectEqual(
             shell_effects.EditorFinishOutcome.none,
@@ -479,17 +479,17 @@ test "openSelectedFileInEditor blocks while git action is pending" {
                 .outcome = .{ .exited = 7 },
             }),
         );
-        try std.testing.expectEqualStrings("editor exited: 7", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("editor exited: 7", app.pages.changes.status.text());
         try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
-        app.pages.review.status.clear();
+        app.pages.changes.status.clear();
         app.redraw_plan = .{};
-        const old_activation = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+        const old_activation = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
         app.shell_state.editor_foreground = .{
             .request_id = .{ .id = 81 },
-            .origin = .{ .page_id = .review, .repo_epoch = 0, .activation_id = old_activation },
+            .origin = .{ .page_id = .changes, .repo_epoch = 0, .activation_id = old_activation },
         };
-        _ = app.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+        _ = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
         try std.testing.expectEqual(
             shell_effects.EditorFinishOutcome.none,
             app.shellEffects().finishEditor(.{
@@ -497,7 +497,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
                 .outcome = .{ .exited = 0 },
             }),
         );
-        try std.testing.expectEqualStrings("", app.pages.review.status.text());
+        try std.testing.expectEqualStrings("", app.pages.changes.status.text());
         try std.testing.expect(app.redraw_plan.resolvesToSkip());
     }
 
@@ -506,11 +506,11 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         var state: shell_effects.State = .{
             .editor_foreground = .{
                 .request_id = .{ .id = 90 },
-                .origin = .{ .page_id = .review, .repo_epoch = 0, .activation_id = 0 },
+                .origin = .{ .page_id = .changes, .repo_epoch = 0, .activation_id = 0 },
             },
         };
         try state.clipboard_copies.put(std.testing.allocator, 91, .{
-            .origin = .{ .page = .{ .page_id = .review, .repo_epoch = 0, .activation_id = 0 } },
+            .origin = .{ .page = .{ .page_id = .changes, .repo_epoch = 0, .activation_id = 0 } },
             .label = "current line",
         });
         state.deinit(std.testing.allocator);

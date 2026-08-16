@@ -1,9 +1,9 @@
-//! Review-local Git workflow owner.
+//! Changes-local Git workflow owner.
 //!
 //! This module owns commit-panel and local confirmation state, prepares local
 //! operation tasks through the shared action lifecycle, and interprets exact
 //! local terminals. It returns typed reload requests; only the root shell
-//! bridges those requests into Review read coordination.
+//! bridges those requests into Changes read coordination.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,8 +14,8 @@ const app_commit_panel = @import("../commit_panel.zig");
 const app_git_requests = @import("../git_requests.zig");
 const app_message = @import("../message.zig");
 const app_state = @import("../state.zig");
-const review_action_fence = @import("../pages/review/action_fence.zig");
-const review_operations = @import("../pages/review/operations.zig");
+const changes_action_fence = @import("../pages/changes/action_fence.zig");
+const changes_operations = @import("../pages/changes/operations.zig");
 const repo_session = @import("../repo_session.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 const config_mod = @import("../../config.zig");
@@ -69,15 +69,15 @@ pub const View = struct {
 pub const ActionReloadIntent = struct {
     pending: app_actions.PendingAction,
     active_matches: bool,
-    reload: review_action_fence.ReloadIntent,
+    reload: changes_action_fence.ReloadIntent,
 };
 
 pub const Controller = struct {
     state: *LocalState,
     lifecycle: action_lifecycle.Controller,
-    operations: review_operations.Controller,
+    operations: changes_operations.Controller,
     repo: repo_session.View,
-    current_review_root: ?[]const u8,
+    current_changes_root: ?[]const u8,
     env_map: ?*const std.process.Environ.Map,
     user_config: *const config_mod.Config,
     status: *app_state.StatusMessage,
@@ -1222,11 +1222,11 @@ pub const Controller = struct {
             allocator,
             pending,
             repo_root,
-            self.current_review_root,
+            self.current_changes_root,
         );
         return switch (admission) {
             .rejected => null,
-            .accepted => |accepted| .{ .active_matches = accepted.target == .current_review },
+            .accepted => |accepted| .{ .active_matches = accepted.target == .current_changes },
         };
     }
 
@@ -1234,14 +1234,14 @@ pub const Controller = struct {
         self: Controller,
         pending: app_actions.PendingAction,
         active_matches: bool,
-        reload: review_action_fence.ReloadIntent,
+        reload: changes_action_fence.ReloadIntent,
     ) ActionReloadIntent {
         return .{
             .pending = pending,
             .active_matches = active_matches,
             .reload = switch (reload) {
                 .status => .{ .status = self.repo.activeRoot() orelse
-                    @panic("current Review status reload requires an active repository") },
+                    @panic("current Changes status reload requires an active repository") },
                 else => reload,
             },
         };
@@ -1307,7 +1307,7 @@ fn expandCommitActionArgv(
     return try out.toOwnedSlice();
 }
 
-fn actionCursorKind(kind: git_ops.TargetKind) @import("../pages/review/action_cursor.zig").TargetKind {
+fn actionCursorKind(kind: git_ops.TargetKind) @import("../pages/changes/action_cursor.zig").TargetKind {
     return switch (kind) {
         .repository => .repository_root,
         .directory => .directory,
@@ -1318,7 +1318,7 @@ fn actionCursorKind(kind: git_ops.TargetKind) @import("../pages/review/action_cu
 pub const testing = if (builtin.is_test) struct {
     pub fn actionCursorKindForTest(
         kind: git_ops.TargetKind,
-    ) @import("../pages/review/action_cursor.zig").TargetKind {
+    ) @import("../pages/changes/action_cursor.zig").TargetKind {
         return actionCursorKind(kind);
     }
 

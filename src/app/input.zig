@@ -11,19 +11,19 @@ const app_message = @import("message.zig");
 const key_input = @import("key_input.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
-const review_input = @import("pages/review/input.zig");
+const changes_input = @import("pages/changes/input.zig");
 const compare_input = @import("pages/compare/input.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_input = @import("pages/repository/input.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
-pub const ReviewContext = review_input.Context;
+pub const ChangesContext = changes_input.Context;
 pub const CompareContext = compare_input.Context;
 
 pub const KeyContext = struct {
-    active_page: page.Id = .review,
-    review: ReviewContext = .{},
+    active_page: page.Id = .changes,
+    changes: ChangesContext = .{},
     compare: CompareContext = .{},
     repository: repository_input.Context = .{},
     commit_panel_mode: bool = false,
@@ -108,9 +108,9 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     // if an underlying diff/file search flag is retained, so pasted bytes can
     // never leak through to that hidden input.
     if (context.active_page == .compare and context.compare.base_picker_open) return null;
-    if (context.active_page == .review and (context.review.search_mode or context.review.file_search_mode)) {
-        const review_msg = review_input.pasteToMsg(context.review, text) orelse return null;
-        return translateReviewMsg(review_msg);
+    if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
+        const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
+        return translateChangesMsg(changes_msg);
     }
     if (context.active_page == .repository and (context.repository.source_search_mode or context.repository.file_search_mode)) {
         const repository_msg = repository_input.pasteToMsg(repository_page.Msg, context.repository, text) orelse return null;
@@ -123,9 +123,9 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return .{ .commit_panel_paste = text };
-    if (context.active_page == .review) {
-        const review_msg = review_input.pasteToMsg(context.review, text) orelse return null;
-        return translateReviewMsg(review_msg);
+    if (context.active_page == .changes) {
+        const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
+        return translateChangesMsg(changes_msg);
     }
     return null;
 }
@@ -133,9 +133,9 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.remote_action_cancelable and key.matches(chasen.Key.escape, .{}))
         return app_message.Msg.cancel_remote_action;
-    if (context.active_page == .review and (context.review.search_mode or context.review.file_search_mode)) {
-        const review_msg = review_input.keyToMsg(context.review, key) orelse return null;
-        return translateReviewMsg(review_msg);
+    if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
+        const changes_msg = changes_input.keyToMsg(context.changes, key) orelse return null;
+        return translateChangesMsg(changes_msg);
     }
     if (context.active_page == .repository and (context.repository.source_search_mode or context.repository.file_search_mode)) {
         const repository_msg = repository_input.keyToMsg(repository_page.Msg, context.repository, key) orelse return null;
@@ -161,9 +161,9 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.keymap.spec(.help)) |spec| if (spec.matches(key)) return app_message.Msg.open_help;
     if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(key)) return app_message.Msg.enter_repo_picker;
     if (context.keymap.spec(.reload)) |spec| if (spec.matches(key)) return app_message.Msg.reload;
-    if (context.active_page == .review) {
-        if (review_input.keyToMsg(context.review, key)) |review_msg| {
-            return translateReviewMsg(review_msg);
+    if (context.active_page == .changes) {
+        if (changes_input.keyToMsg(context.changes, key)) |changes_msg| {
+            return translateChangesMsg(changes_msg);
         }
     }
     if (context.active_page == .repository) {
@@ -182,7 +182,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
 
 fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     return switch (context.active_page) {
-        .review => translateReviewMsg(review_input.selectionKeyToMsg(context.review, key) orelse return null),
+        .changes => translateChangesMsg(changes_input.selectionKeyToMsg(context.changes, key) orelse return null),
         .compare => .{ .compare = compare_input.selectionKeyToMsg(context.compare, key) orelse return null },
         .repository => .{ .repository = repository_input.selectionKeyToMsg(
             repository_page.Msg,
@@ -195,7 +195,7 @@ fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
 
 fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
     const bindings = [_]struct { action: keymap.PublicAction, id: page.Id }{
-        .{ .action = .page_review, .id = .review },
+        .{ .action = .page_changes, .id = .changes },
         .{ .action = .page_repository, .id = .repository },
         .{ .action = .page_compare, .id = .compare },
         .{ .action = .page_config, .id = .config },
@@ -207,8 +207,8 @@ fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
     return null;
 }
 
-fn translateReviewMsg(msg: review_input.Msg) app_message.Msg {
-    return .{ .review = msg };
+fn translateChangesMsg(msg: changes_input.Msg) app_message.Msg {
+    return .{ .changes = msg };
 }
 
 fn repoPickerKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
@@ -249,7 +249,7 @@ fn helpKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         if (spec.matches(key)) return actionToMsg(.close_help);
     }
     if (context.keymap.spec(.commit)) |spec| {
-        if (spec.matches(key)) return translateReviewMsg(.enter_commit_panel);
+        if (spec.matches(key)) return translateChangesMsg(.enter_commit_panel);
     }
     if (helpActionForKey(key)) |action| return actionToMsg(action);
     return null;
@@ -410,8 +410,8 @@ fn actionToMsg(action: Action) app_message.Msg {
     };
 }
 
-fn reviewMsg(msg: review_input.Msg) app_message.Msg {
-    return .{ .review = msg };
+fn changesMsg(msg: changes_input.Msg) app_message.Msg {
+    return .{ .changes = msg };
 }
 
 fn expectMsg(expected: app_message.Msg, actual: app_message.Msg) !void {
@@ -419,9 +419,9 @@ fn expectMsg(expected: app_message.Msg, actual: app_message.Msg) !void {
 }
 
 test "normal page keys map after text and overlay precedence" {
-    try expectMsg(.{ .switch_page = .review }, keyToMsg(.{}, .{ .codepoint = '1' }).?);
+    try expectMsg(.{ .switch_page = .changes }, keyToMsg(.{}, .{ .codepoint = '1' }).?);
     try expectMsg(.{ .switch_page = .config }, keyToMsg(.{}, .{ .codepoint = '4' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = '2' }), keyToMsg(.{ .review = .{ .search_mode = true } }, .{ .codepoint = '2' }).?);
+    try std.testing.expectEqual(changesMsg(.{ .search_insert = '2' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, .{ .codepoint = '2' }).?);
     try expectMsg(.{ .commit_panel_insert = '3' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = '3' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = '2', .mods = .{ .ctrl = true } }));
     try expectMsg(.{ .repository = .move_down }, keyToMsg(.{ .active_page = .repository }, .{ .codepoint = 'j' }).?);
@@ -441,56 +441,56 @@ test "root selection preflight preserves modal and configured V precedence" {
 
     try std.testing.expectEqual(
         app_message.Msg{ .switch_page = .repository },
-        keyToMsg(.{ .keymap = root_keymap, .review = .{ .focus = .diff } }, v).?,
+        keyToMsg(.{ .keymap = root_keymap, .changes = .{ .focus = .diff } }, v).?,
     );
     try std.testing.expectEqual(
         app_message.Msg{ .switch_page = .repository },
         keyToMsg(.{
             .keymap = root_keymap,
-            .review = .{ .focus = .diff, .retained_selection_action_available = true },
+            .changes = .{ .focus = .diff, .retained_selection_action_available = true },
         }, v).?,
     );
     try std.testing.expectEqual(
-        reviewMsg(.selection_owned_noop),
+        changesMsg(.selection_owned_noop),
         keyToMsg(.{
             .keymap = root_keymap,
-            .review = .{ .focus = .diff, .selection_owner = .keyboard_line, .retained_selection_action_available = true },
+            .changes = .{ .focus = .diff, .selection_owner = .keyboard_line, .retained_selection_action_available = true },
         }, v).?,
     );
     try std.testing.expectEqual(
-        reviewMsg(.selection_owned_noop),
-        keyToMsg(.{ .keymap = root_keymap, .review = .{ .focus = .diff, .selection_owner = .mouse } }, v).?,
+        changesMsg(.selection_owned_noop),
+        keyToMsg(.{ .keymap = root_keymap, .changes = .{ .focus = .diff, .selection_owner = .mouse } }, v).?,
     );
     try std.testing.expectEqual(
-        reviewMsg(.selection_owned_noop),
-        keyToMsg(.{ .keymap = root_keymap, .review = .{ .focus = .diff, .selection_owner = .header } }, v).?,
+        changesMsg(.selection_owned_noop),
+        keyToMsg(.{ .keymap = root_keymap, .changes = .{ .focus = .diff, .selection_owner = .header } }, v).?,
     );
     try std.testing.expectEqual(
-        reviewMsg(.begin_keyboard_line_selection),
-        keyToMsg(.{ .review = .{ .focus = .diff } }, v).?,
+        changesMsg(.begin_keyboard_line_selection),
+        keyToMsg(.{ .changes = .{ .focus = .diff } }, v).?,
     );
 
     var page_config: keymap.Config = .{};
     page_config.set(.toggle_line_numbers, .{ .plain_codepoint = 'V' });
     const page_keymap = keymap.Effective.fromConfig(page_config);
     try std.testing.expectEqual(
-        reviewMsg(.toggle_line_numbers),
+        changesMsg(.toggle_line_numbers),
         keyToMsg(.{
-            .review = .{ .focus = .diff, .retained_selection_action_available = true, .keymap = page_keymap },
+            .changes = .{ .focus = .diff, .retained_selection_action_available = true, .keymap = page_keymap },
         }, v).?,
     );
 
     const active: KeyContext = .{
-        .review = .{
+        .changes = .{
             .focus = .diff,
             .review_mode = true,
             .selection_owner = .keyboard_line,
             .retained_selection_action_available = true,
         },
     };
-    try std.testing.expectEqual(reviewMsg(.selection_action_unavailable), keyToMsg(active, .{ .codepoint = 'a' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .selection_action = .clear }), keyToMsg(active, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(reviewMsg(.scroll_diff_left), keyToMsg(active, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(changesMsg(.selection_action_unavailable), keyToMsg(active, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(changesMsg(.{ .selection_action = .clear }), keyToMsg(active, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(changesMsg(.scroll_diff_left), keyToMsg(active, .{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(
         app_message.Msg{ .compare = .{ .shared = .scroll_diff_right } },
         keyToMsg(.{
@@ -499,19 +499,19 @@ test "root selection preflight preserves modal and configured V precedence" {
         }, .{ .codepoint = chasen.Key.right }).?,
     );
     try std.testing.expectEqual(
-        reviewMsg(.expand_directory),
-        keyToMsg(.{ .review = .{ .focus = .sidebar, .selection_owner = .mouse } }, .{ .codepoint = chasen.Key.right }).?,
+        changesMsg(.expand_directory),
+        keyToMsg(.{ .changes = .{ .focus = .sidebar, .selection_owner = .mouse } }, .{ .codepoint = chasen.Key.right }).?,
     );
     try std.testing.expectEqual(
-        reviewMsg(.collapse_or_parent_directory),
-        keyToMsg(.{ .review = .{ .focus = .sidebar, .selection_owner = .header } }, .{ .codepoint = chasen.Key.left }).?,
+        changesMsg(.collapse_or_parent_directory),
+        keyToMsg(.{ .changes = .{ .focus = .sidebar, .selection_owner = .header } }, .{ .codepoint = chasen.Key.left }).?,
     );
     try std.testing.expectEqual(app_message.Msg.cancel_remote_action, keyToMsg(.{
         .remote_action_cancelable = true,
-        .review = active.review,
+        .changes = active.changes,
     }, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(reviewMsg(.cancel_search), keyToMsg(.{
-        .review = .{
+    try std.testing.expectEqual(changesMsg(.cancel_search), keyToMsg(.{
+        .changes = .{
             .search_mode = true,
             .selection_owner = .keyboard_line,
             .retained_selection_action_available = true,
@@ -519,18 +519,18 @@ test "root selection preflight preserves modal and configured V precedence" {
     }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{
         .help_mode = true,
-        .review = active.review,
+        .changes = active.changes,
     }, .{ .codepoint = chasen.Key.escape }).?);
 }
 
 test "root selection preflight routes Repository owners before configured actions" {
     const v = chasen.Key{ .codepoint = 'V' };
     var root_config: keymap.Config = .{};
-    root_config.set(.page_review, .{ .plain_codepoint = 'V' });
+    root_config.set(.page_changes, .{ .plain_codepoint = 'V' });
     const root_keymap = keymap.Effective.fromConfig(root_config);
 
     try std.testing.expectEqual(
-        app_message.Msg{ .switch_page = .review },
+        app_message.Msg{ .switch_page = .changes },
         keyToMsg(.{
             .active_page = .repository,
             .keymap = root_keymap,
@@ -645,8 +645,8 @@ test "root selection preflight consumes document navigation only for live owners
     };
     for (keys) |key| {
         try std.testing.expectEqual(
-            reviewMsg(.selection_owned_noop),
-            keyToMsg(.{ .review = .{ .selection_owner = .mouse } }, key).?,
+            changesMsg(.selection_owned_noop),
+            keyToMsg(.{ .changes = .{ .selection_owner = .mouse } }, key).?,
         );
         try std.testing.expectEqual(
             app_message.Msg{ .compare = .{ .shared = .selection_owned_noop } },
@@ -662,9 +662,9 @@ test "root selection preflight consumes document navigation only for live owners
     config.set(.document_first, .{ .plain_codepoint = 'z' });
     const custom = keymap.Effective.fromConfig(config);
     const z = chasen.Key{ .codepoint = 'z' };
-    try std.testing.expectEqual(reviewMsg(.selection_owned_noop), keyToMsg(.{
+    try std.testing.expectEqual(changesMsg(.selection_owned_noop), keyToMsg(.{
         .keymap = custom,
-        .review = .{ .selection_owner = .mouse, .keymap = custom },
+        .changes = .{ .selection_owner = .mouse, .keymap = custom },
     }, z).?);
     try std.testing.expectEqual(app_message.Msg{ .compare = .{ .shared = .selection_owned_noop } }, keyToMsg(.{
         .active_page = .compare,
@@ -677,7 +677,7 @@ test "root selection preflight consumes document navigation only for live owners
         .repository = .{ .selection_owner = .mouse, .keymap = custom },
     }, z).?);
 
-    try std.testing.expect(keyToMsg(.{ .review = .{ .retained_selection_action_available = true } }, .{ .codepoint = 'g' }) == null);
+    try std.testing.expect(keyToMsg(.{ .changes = .{ .retained_selection_action_available = true } }, .{ .codepoint = 'g' }) == null);
     try std.testing.expect(keyToMsg(.{ .active_page = .compare, .compare = .{ .retained_selection_action_available = true } }, .{ .codepoint = 'g' }) == null);
     try std.testing.expectEqual(
         app_message.Msg{ .repository = .source_first },
@@ -703,14 +703,14 @@ test "root selection preflight consumes document navigation only for live owners
     );
 }
 
-test "root keeps Review N and Repository match keys outside document ownership" {
+test "root keeps Changes N and Repository match keys outside document ownership" {
     try std.testing.expectEqual(
-        reviewMsg(.finish_review_needs_changes),
-        keyToMsg(.{ .review = .{ .review_mode = true, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
+        changesMsg(.finish_review_needs_changes),
+        keyToMsg(.{ .changes = .{ .review_mode = true, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
     );
     try std.testing.expectEqual(
-        reviewMsg(.select_previous_search_match),
-        keyToMsg(.{ .review = .{ .review_mode = true, .search_query_len = 1, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
+        changesMsg(.select_previous_search_match),
+        keyToMsg(.{ .changes = .{ .review_mode = true, .search_query_len = 1, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
     );
 
     for ([_]chasen.Key{ .{ .codepoint = 'n' }, .{ .codepoint = 'N' }, .{ .codepoint = 'p' } }) |key| {
@@ -739,11 +739,11 @@ test "eventToMsg maps winsize event" {
 }
 
 test "eventToMsg routes paste by active text input mode" {
-    const search_msg = eventToMsg(.{ .review = .{ .search_mode = true } }, .{ .paste = "render" }).?;
-    try std.testing.expectEqualStrings("render", search_msg.review.search_paste);
+    const search_msg = eventToMsg(.{ .changes = .{ .search_mode = true } }, .{ .paste = "render" }).?;
+    try std.testing.expectEqualStrings("render", search_msg.changes.search_paste);
 
-    const file_msg = eventToMsg(.{ .review = .{ .file_search_mode = true } }, .{ .paste = "app.zig" }).?;
-    try std.testing.expectEqualStrings("app.zig", file_msg.review.file_search_paste);
+    const file_msg = eventToMsg(.{ .changes = .{ .file_search_mode = true } }, .{ .paste = "app.zig" }).?;
+    try std.testing.expectEqualStrings("app.zig", file_msg.changes.file_search_paste);
 
     const source_msg = eventToMsg(.{
         .active_page = .repository,
@@ -776,28 +776,28 @@ test "eventToMsg rejects invalid paste and ignores non-input modes" {
     }, .{ .paste = "must-not-leak" }) == null);
 }
 
-test "shell nests Review void and payload messages under one route" {
-    try std.testing.expectEqual(reviewMsg(.toggle_directory), keyToMsg(.{ .review = .{ .focus = .sidebar } }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'x' }), keyToMsg(.{ .review = .{ .search_mode = true } }, .{ .codepoint = 'x' }).?);
+test "shell nests Changes void and payload messages under one route" {
+    try std.testing.expectEqual(changesMsg(.toggle_directory), keyToMsg(.{ .changes = .{ .focus = .sidebar } }, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(changesMsg(.{ .search_insert = 'x' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, .{ .codepoint = 'x' }).?);
 }
 
-test "shell routes plain q by active Review context" {
+test "shell routes plain q by active Changes context" {
     try std.testing.expectEqual(app_message.Msg.quit, keyToMsg(.{}, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(reviewMsg(.finish_review_canceled), keyToMsg(.{ .review = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'q' }), keyToMsg(.{ .review = .{ .search_mode = true, .review_mode = true } }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{ .help_mode = true, .review = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(changesMsg(.finish_review_canceled), keyToMsg(.{ .changes = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(changesMsg(.{ .search_insert = 'q' }), keyToMsg(.{ .changes = .{ .search_mode = true, .review_mode = true } }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{ .help_mode = true, .changes = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
 }
 
-test "shell owns help repo picker and reload before Review delegation" {
+test "shell owns help repo picker and reload before Changes delegation" {
     try std.testing.expectEqual(app_message.Msg.open_help, keyToMsg(.{}, .{ .codepoint = '?' }).?);
     try std.testing.expectEqual(app_message.Msg.enter_repo_picker, keyToMsg(.{}, .{ .codepoint = 'R' }).?);
     try std.testing.expectEqual(app_message.Msg.reload, keyToMsg(.{}, .{ .codepoint = 'r' }).?);
 }
 
 test "keyToMsg maps discard confirmation flow" {
-    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(.{}, .{ .codepoint = 'D' }).?);
-    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(.{}, shiftedAscii('d', 'D')).?);
-    try std.testing.expectEqual(reviewMsg(.request_discard_selected_file), keyToMsg(.{}, shiftedLowerOnly('d')).?);
+    try std.testing.expectEqual(changesMsg(.request_discard_selected_file), keyToMsg(.{}, .{ .codepoint = 'D' }).?);
+    try std.testing.expectEqual(changesMsg(.request_discard_selected_file), keyToMsg(.{}, shiftedAscii('d', 'D')).?);
+    try std.testing.expectEqual(changesMsg(.request_discard_selected_file), keyToMsg(.{}, shiftedLowerOnly('d')).?);
     try std.testing.expectEqual(app_message.Msg.confirm_discard_file, keyToMsg(.{ .discard_confirmation_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(app_message.Msg.cancel_discard_file, keyToMsg(.{ .discard_confirmation_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(app_message.Msg.cancel_discard_file, keyToMsg(.{ .discard_confirmation_mode = true }, .{ .codepoint = 'q' }).?);
@@ -805,10 +805,10 @@ test "keyToMsg maps discard confirmation flow" {
 }
 
 test "keyToMsg maps commit panel command and routes panel input" {
-    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(.{}, .{ .codepoint = 'c' }).?);
-    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(.{}, .{ .codepoint = 'A' }).?);
-    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(.{}, shiftedAscii('a', 'A')).?);
-    try std.testing.expectEqual(reviewMsg(.enter_amend_panel), keyToMsg(.{}, shiftedLowerOnly('a')).?);
+    try std.testing.expectEqual(changesMsg(.enter_commit_panel), keyToMsg(.{}, .{ .codepoint = 'c' }).?);
+    try std.testing.expectEqual(changesMsg(.enter_amend_panel), keyToMsg(.{}, .{ .codepoint = 'A' }).?);
+    try std.testing.expectEqual(changesMsg(.enter_amend_panel), keyToMsg(.{}, shiftedAscii('a', 'A')).?);
+    try std.testing.expectEqual(changesMsg(.enter_amend_panel), keyToMsg(.{}, shiftedLowerOnly('a')).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = 'a' }));
     try std.testing.expectEqual(app_message.Msg.cancel_commit_panel, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(app_message.Msg.submit_commit_panel, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter, .mods = .{ .ctrl = true } }).?);
@@ -825,7 +825,7 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try expectMsg(.{ .commit_panel_insert = 'x' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
     try expectMsg(.{ .commit_panel_insert = 'y' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'y' }).?);
     try expectMsg(.{ .commit_panel_insert = 'R' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'R' }).?);
-    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'c' }).?);
+    try std.testing.expectEqual(changesMsg(.enter_commit_panel), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'c' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
 }
@@ -840,7 +840,7 @@ test "keyToMsg uses configured keys inside help mode" {
         .keymap = effective,
     };
 
-    try std.testing.expectEqual(reviewMsg(.enter_commit_panel), keyToMsg(context, .{ .codepoint = 'm' }).?);
+    try std.testing.expectEqual(changesMsg(.enter_commit_panel), keyToMsg(context, .{ .codepoint = 'm' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(context, .{ .codepoint = 'c' }));
     try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(context, .{ .codepoint = 'z' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(context, .{ .codepoint = '?' }));
@@ -926,10 +926,10 @@ test "keyToMsg ignores special keys in text input modes" {
 
     for (common_cases) |key| {
         if (key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right) {
-            try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .review = .{ .search_mode = true } }, key));
+            try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .changes = .{ .search_mode = true } }, key));
         }
         if (!key.matches(chasen.Key.up, .{}) and !key.matches(chasen.Key.down, .{})) {
-            try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .review = .{ .file_search_mode = true } }, key));
+            try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .changes = .{ .file_search_mode = true } }, key));
         }
         if (key.codepoint != chasen.Key.tab and key.codepoint != chasen.Key.left and key.codepoint != chasen.Key.right and key.codepoint != chasen.Key.up and key.codepoint != chasen.Key.down) {
             try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .commit_panel_mode = true }, key));
@@ -976,12 +976,12 @@ test "keyToMsg ignores special keys in text input modes" {
     }
 }
 
-test "keyToMsg maps review file search candidate movement" {
-    const context: KeyContext = .{ .review = .{ .file_search_mode = true } };
-    try std.testing.expectEqual(reviewMsg(.file_search_previous), keyToMsg(context, .{ .codepoint = chasen.Key.up }).?);
-    try std.testing.expectEqual(reviewMsg(.file_search_next), keyToMsg(context, .{ .codepoint = chasen.Key.down }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'k' }), keyToMsg(context, .{ .codepoint = 'k' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'j' }), keyToMsg(context, .{ .codepoint = 'j' }).?);
+test "keyToMsg maps changes file search candidate movement" {
+    const context: KeyContext = .{ .changes = .{ .file_search_mode = true } };
+    try std.testing.expectEqual(changesMsg(.file_search_previous), keyToMsg(context, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(changesMsg(.file_search_next), keyToMsg(context, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(changesMsg(.{ .file_search_insert = 'k' }), keyToMsg(context, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(changesMsg(.{ .file_search_insert = 'j' }), keyToMsg(context, .{ .codepoint = 'j' }).?);
 }
 
 test "keyToMsg maps repo picker cursor movement" {
@@ -1008,16 +1008,16 @@ test "keyToMsg maps repo picker recent removal only in list mode" {
 test "keyToMsg ignores ctrl printable in text input modes" {
     const ctrl_c: chasen.Key = .{ .codepoint = 'c', .mods = .{ .ctrl = true } };
 
-    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .review = .{ .search_mode = true } }, ctrl_c));
-    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .review = .{ .file_search_mode = true } }, ctrl_c));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .changes = .{ .search_mode = true } }, ctrl_c));
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .changes = .{ .file_search_mode = true } }, ctrl_c));
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .commit_panel_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .repo_picker_mode = true }, ctrl_c));
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .repo_picker_mode = true }, ctrl_c));
 }
 
 test "keyToMsg keeps printable text input modes working" {
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = 'x' }), keyToMsg(.{ .review = .{ .search_mode = true } }, .{ .codepoint = 'x' }).?);
-    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = 'x' }), keyToMsg(.{ .review = .{ .file_search_mode = true } }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(changesMsg(.{ .search_insert = 'x' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(changesMsg(.{ .file_search_insert = 'x' }), keyToMsg(.{ .changes = .{ .file_search_mode = true } }, .{ .codepoint = 'x' }).?);
     try expectMsg(.{ .commit_panel_insert = 'x' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'x' }).?);
     try expectMsg(.{ .repo_picker_insert = 'x' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'x' }).?);
     try expectMsg(.{ .repo_picker_insert = 'q' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, .{ .codepoint = 'q' }).?);
@@ -1032,8 +1032,8 @@ test "keyToMsg prefers generated text for printable text input" {
         .text = "1",
     };
 
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = '1' }), keyToMsg(.{ .review = .{ .search_mode = true } }, keypad_one).?);
-    try std.testing.expectEqual(reviewMsg(.{ .file_search_insert = '1' }), keyToMsg(.{ .review = .{ .file_search_mode = true } }, keypad_one).?);
+    try std.testing.expectEqual(changesMsg(.{ .search_insert = '1' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, keypad_one).?);
+    try std.testing.expectEqual(changesMsg(.{ .file_search_insert = '1' }), keyToMsg(.{ .changes = .{ .file_search_mode = true } }, keypad_one).?);
     try expectMsg(.{ .commit_panel_insert = '1' }, keyToMsg(.{ .commit_panel_mode = true }, keypad_one).?);
     try expectMsg(.{ .repo_picker_insert = '1' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .filter }, keypad_one).?);
     try expectMsg(.{ .repo_picker_insert = '1' }, keyToMsg(.{ .repo_picker_mode = true, .repo_picker_input_mode = .path_input }, keypad_one).?);
@@ -1096,7 +1096,7 @@ test "keyToMsg opens and closes help outside prompt modes" {
         .text = "?",
         .mods = .{ .shift = true },
     }).?);
-    try std.testing.expectEqual(reviewMsg(.enter_search), keyToMsg(.{}, .{
+    try std.testing.expectEqual(changesMsg(.enter_search), keyToMsg(.{}, .{
         .codepoint = '/',
         .text = "/",
     }).?);
@@ -1123,8 +1123,8 @@ test "keyToMsg ignores command modifiers for help overlay printable shortcuts" {
 }
 
 test "keyToMsg keeps prompt modes above help overlay" {
-    const msg = keyToMsg(.{ .review = .{ .search_mode = true }, .help_mode = true }, .{ .codepoint = '?' }).?;
-    try std.testing.expectEqual(reviewMsg(.{ .search_insert = '?' }), msg);
+    const msg = keyToMsg(.{ .changes = .{ .search_mode = true }, .help_mode = true }, .{ .codepoint = '?' }).?;
+    try std.testing.expectEqual(changesMsg(.{ .search_insert = '?' }), msg);
 }
 
 fn shiftedAscii(lower: u21, upper: u21) chasen.Key {

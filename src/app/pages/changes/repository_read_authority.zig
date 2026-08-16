@@ -1,4 +1,4 @@
-//! Review repository-read publication and launch authority.
+//! Changes repository-read publication and launch authority.
 //!
 //! This owner is intentionally independent from repository identity and the
 //! accepted source-session lifetime. A mutating action can invalidate reads
@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const actions = @import("../../actions.zig");
-pub const ReviewRepositoryReadEpoch = @import("../../review_read_epoch.zig").ReviewRepositoryReadEpoch;
+pub const ChangesRepositoryReadEpoch = @import("../../changes_read_epoch.zig").ChangesRepositoryReadEpoch;
 
 pub const Phase = union(enum) {
     open,
@@ -21,23 +21,23 @@ pub const Phase = union(enum) {
 /// task or foreground command is accepted, and reopens it only for that exact
 /// action terminal. Every repository-derived read and publication gate uses
 /// the epoch plus phase together.
-pub const ReviewRepositoryReadAuthority = struct {
-    epoch: ReviewRepositoryReadEpoch = .{},
+pub const ChangesRepositoryReadAuthority = struct {
+    epoch: ChangesRepositoryReadEpoch = .{},
     phase: Phase = .open,
 
-    pub fn mayStartRepositoryRead(self: ReviewRepositoryReadAuthority) bool {
+    pub fn mayStartRepositoryRead(self: ChangesRepositoryReadAuthority) bool {
         return self.phase == .open;
     }
 
     /// Read publication requires both the exact namespace and an open phase.
-    pub fn acceptsRead(self: ReviewRepositoryReadAuthority, epoch: ReviewRepositoryReadEpoch) bool {
+    pub fn acceptsRead(self: ChangesRepositoryReadAuthority, epoch: ChangesRepositoryReadEpoch) bool {
         return epoch.isValid() and self.mayStartRepositoryRead() and self.epoch.eql(epoch);
     }
 
     /// Advance and close exactly once for a concrete mutating launch.
     /// Non-mutating assistance and an already-owned mutation are inert.
     pub fn closeForMutation(
-        self: *ReviewRepositoryReadAuthority,
+        self: *ChangesRepositoryReadAuthority,
         pending: actions.PendingAction,
     ) bool {
         if (!pending.kind.blocksBackgroundAcceptance()) return false;
@@ -48,7 +48,7 @@ pub const ReviewRepositoryReadAuthority = struct {
     }
 
     pub fn ownsMutation(
-        self: ReviewRepositoryReadAuthority,
+        self: ChangesRepositoryReadAuthority,
         pending: actions.PendingAction,
     ) bool {
         return switch (self.phase) {
@@ -60,7 +60,7 @@ pub const ReviewRepositoryReadAuthority = struct {
     /// Only the exact action generation which closed this authority may reopen
     /// it. Stale, mismatched, and duplicate terminals are no-ops.
     pub fn reopenForMutation(
-        self: *ReviewRepositoryReadAuthority,
+        self: *ChangesRepositoryReadAuthority,
         pending: actions.PendingAction,
     ) bool {
         if (!self.ownsMutation(pending)) return false;
@@ -74,18 +74,18 @@ fn exactPending(left: actions.PendingAction, right: actions.PendingAction) bool 
 }
 
 test "repository read epoch is nonzero and skips zero on wrap" {
-    const initial: ReviewRepositoryReadEpoch = .{};
+    const initial: ChangesRepositoryReadEpoch = .{};
     try std.testing.expect(initial.isValid());
     try std.testing.expect(initial.eql(.{ .value = 1 }));
     try std.testing.expect(initial.next().eql(.{ .value = 2 }));
 
-    const wrapped = (ReviewRepositoryReadEpoch{ .value = std.math.maxInt(u64) }).next();
+    const wrapped = (ChangesRepositoryReadEpoch{ .value = std.math.maxInt(u64) }).next();
     try std.testing.expect(wrapped.eql(.{ .value = 1 }));
     try std.testing.expect(wrapped.isValid());
 }
 
 test "repository read authority closes and reopens only for the exact mutation" {
-    var authority: ReviewRepositoryReadAuthority = .{};
+    var authority: ChangesRepositoryReadAuthority = .{};
     const original_epoch = authority.epoch;
     const owner: actions.PendingAction = .{ .generation = 7, .kind = .stage_hunk };
 
@@ -111,7 +111,7 @@ test "repository read authority closes and reopens only for the exact mutation" 
 }
 
 test "non-mutating assistance cannot close repository read authority" {
-    var authority: ReviewRepositoryReadAuthority = .{};
+    var authority: ChangesRepositoryReadAuthority = .{};
     const epoch = authority.epoch;
     try std.testing.expect(!authority.closeForMutation(.{
         .generation = 3,

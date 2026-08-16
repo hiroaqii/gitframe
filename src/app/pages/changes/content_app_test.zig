@@ -1,12 +1,12 @@
-//! Review selected-content and editor-target integration tests.
+//! Changes selected-content and editor-target integration tests.
 
 const std = @import("std");
 const app_mod = @import("../../../app.zig");
 const app_shell_layout = @import("../../shell_layout.zig");
 const app_test_support = @import("../../test_support.zig");
-const review_content = @import("content.zig");
-const review_navigation = @import("navigation.zig");
-const review_authority = @import("../../diff_surface/authority.zig");
+const changes_content = @import("content.zig");
+const changes_navigation = @import("navigation.zig");
+const changes_authority = @import("../../diff_surface/authority.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const diff_source = @import("../../../diff/source.zig");
 const file_tree = @import("../../../file_tree.zig");
@@ -14,11 +14,11 @@ const git_status = @import("../../../git/status.zig");
 
 const App = app_mod.App;
 
-fn reviewNavigationView(app: *const App) review_navigation.View {
+fn changesNavigationView(app: *const App) changes_navigation.View {
     const size = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true }).bodySize();
     const repo = app.repo_session.view();
     return .{
-        .page = &app.pages.review,
+        .page = &app.pages.changes,
         .repo_root = repo.activeRoot(),
         .repo_epoch = repo.epoch(),
         .root_identity = repo.activeIdentity(),
@@ -27,30 +27,30 @@ fn reviewNavigationView(app: *const App) review_navigation.View {
     };
 }
 
-fn reviewContent(app: *const App) review_content.View {
+fn changesContent(app: *const App) changes_content.View {
     return .{
-        .page = &app.pages.review,
-        .navigation = reviewNavigationView(app),
+        .page = &app.pages.changes,
+        .navigation = changesNavigationView(app),
         .source = app.config.source,
         .repo_root = app.repo_session.view().activeRoot(),
     };
 }
 
 fn acceptTestSource(app: *App) void {
-    app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
-    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+    app.pages.changes.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
+    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
         .immutable
-    else if (app.pages.review.auto_reload.sourceIsActionable())
+    else if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
-    else if (app.pages.review.load.hasPending())
+    else if (app.pages.changes.load.hasPending())
         .pending
     else
         .unavailable;
-    _ = app.pages.review.activation.activate(
+    _ = app.pages.changes.activation.activate(
         app.repo_session.repo_epoch,
         source,
-        review_authority.auxiliaryMember(app.pages.review.status_load),
-        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.branch_status_load),
     );
 }
 
@@ -66,7 +66,7 @@ test "selectedEditorTarget accepts status-only file rows" {
         },
     };
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &.{} },
@@ -90,13 +90,13 @@ test "selectedEditorTarget accepts status-only file rows" {
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/staged.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    switch (reviewContent(&app).editorTarget()) {
+    switch (changesContent(&app).editorTarget()) {
         .ready => |target| {
             try std.testing.expectEqualStrings("/repo", target.repo_root);
             try std.testing.expectEqualStrings("src/staged.zig", target.path);
@@ -107,7 +107,7 @@ test "selectedEditorTarget accepts status-only file rows" {
 
 test "selectedEditorTarget rejects deleted and historical sources" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
             .viewer = .{
                 .selected_node = 1,
@@ -125,10 +125,10 @@ test "selectedEditorTarget rejects deleted and historical sources" {
     };
     acceptTestSource(&app);
 
-    try std.testing.expectEqual(review_content.EditorTargetResult.deleted_file, reviewContent(&app).editorTarget());
+    try std.testing.expectEqual(changes_content.EditorTargetResult.deleted_file, changesContent(&app).editorTarget());
 
     app.config.source = .{ .range = "main...HEAD" };
-    try std.testing.expectEqual(review_content.EditorTargetResult.unavailable_source, reviewContent(&app).editorTarget());
+    try std.testing.expectEqual(changes_content.EditorTargetResult.unavailable_source, changesContent(&app).editorTarget());
 }
 
 test "selectedEditorTarget rejects deleted status-only file rows from fresh status" {
@@ -143,7 +143,7 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
         },
     };
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &.{} },
@@ -168,30 +168,30 @@ test "selectedEditorTarget rejects deleted status-only file rows from fresh stat
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " D src/deleted.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    try std.testing.expectEqual(review_content.EditorTargetResult.deleted_file, reviewContent(&app).editorTarget());
+    try std.testing.expectEqual(changes_content.EditorTargetResult.deleted_file, changesContent(&app).editorTarget());
 }
 
 test "selectedEditorTarget rejects live sources without active repo" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .config = .{ .source = .unstaged },
     };
     acceptTestSource(&app);
 
-    try std.testing.expectEqual(review_content.EditorTargetResult.no_repo, reviewContent(&app).editorTarget());
+    try std.testing.expectEqual(changes_content.EditorTargetResult.no_repo, changesContent(&app).editorTarget());
 }
 
 test "selectedEditorTarget rejects directory rows" {
     var app: App = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{ .selected_node = 0 },
         } },
@@ -207,5 +207,5 @@ test "selectedEditorTarget rejects directory rows" {
     };
     acceptTestSource(&app);
 
-    try std.testing.expectEqual(review_content.EditorTargetResult.directory_unsupported, reviewContent(&app).editorTarget());
+    try std.testing.expectEqual(changes_content.EditorTargetResult.directory_unsupported, changesContent(&app).editorTarget());
 }

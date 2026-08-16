@@ -1,4 +1,4 @@
-//! Review-local navigation, search, folding, and mouse-selection ownership.
+//! Changes-local navigation, search, folding, and mouse-selection ownership.
 //!
 //! App supplies committed repository/source identity plus shell-normalized content
 //! geometry. This module never receives App, terminal-frame coordinates, overlays,
@@ -15,12 +15,12 @@ const projection_component = @import("../../projection_component.zig");
 const page_link = @import("../../page_link.zig");
 const app_state = @import("../../state.zig");
 const shell_layout = if (builtin.is_test) @import("../../shell_layout.zig") else struct {};
-const review_message = @import("message.zig");
-const review_selection = @import("../../diff_surface/selection.zig");
+const changes_message = @import("message.zig");
+const content_selection = @import("../../diff_surface/selection.zig");
 const session_hunk_mark = @import("session_hunk_mark.zig");
-const review_projection = @import("../../review_projection.zig");
-const app_review_projection = review_projection;
-const review_page = @import("../review.zig");
+const changes_projection = @import("../../changes_projection.zig");
+const app_changes_projection = changes_projection;
+const changes_page = @import("../changes.zig");
 const file_search = @import("../../diff_surface/file_search.zig");
 const context = @import("../../../context.zig");
 const diff_file = @import("../../../diff/file.zig");
@@ -39,7 +39,7 @@ const loaded_diff = @import("../../../loaded_diff.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 const app_test_support = test_support;
-const review_body_render = @import("body_render.zig");
+const changes_body_render = @import("body_render.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
 const ChangedFileFilter = loaded_diff.ChangedFileFilter;
@@ -51,7 +51,7 @@ const diff_surface = @import("../../diff_surface.zig");
 
 pub const Layout = diff_surface.Layout;
 pub const DiagnosticSink = diff_surface.DiagnosticSink;
-pub const MousePoint = review_message.MousePoint;
+pub const MousePoint = changes_message.MousePoint;
 pub const DiffMouseHit = diff_surface.DiffMouseHit;
 pub const DiffHeaderTarget = diff_surface.DiffHeaderTarget;
 pub const DisplayNavigationSnapshot = diff_surface.DisplayNavigationSnapshot;
@@ -108,7 +108,7 @@ pub const ActiveDiffDisplay = union(enum) {
 };
 
 /// Converts projection-owned index membership into the renderer's explicit
-/// per-hunk contract. Both normal and status-only Review routes use this one
+/// per-hunk contract. Both normal and status-only Changes routes use this one
 /// conversion so they cannot disagree about a combined hunk's stage state.
 pub fn projectedHunkStagePresentation(
     allocator: std.mem.Allocator,
@@ -125,8 +125,8 @@ pub const HunkInteractionAvailability = diff_surface.HunkInteractionAvailability
 /// presentation. The explicit union keeps a real two-component mixed
 /// generation distinct from a one-component staged-only generation.
 pub const HunkAuthorityRef = union(enum) {
-    combined: *const review_projection.CombinedAuthority,
-    staged_only: *const review_projection.StagedOnlyAuthority,
+    combined: *const changes_projection.CombinedAuthority,
+    staged_only: *const changes_projection.StagedOnlyAuthority,
 
     pub fn hunkStageStates(self: HunkAuthorityRef) []const diff_hunk_projection.HunkStageState {
         return switch (self) {
@@ -156,7 +156,7 @@ pub const HunkAuthorityRef = union(enum) {
         };
     }
 
-    pub fn requestKind(self: HunkAuthorityRef) review_projection.Kind {
+    pub fn requestKind(self: HunkAuthorityRef) changes_projection.Kind {
         return switch (self) {
             .combined => .combined_hunks,
             .staged_only => .cached_diff,
@@ -184,24 +184,24 @@ pub const ActiveHunkAuthority = struct {
     }
 };
 
-pub const PrimaryReviewBody = struct {
+pub const PrimaryChangesBody = struct {
     loaded: *const LoadedDiff,
     file_index: usize,
     hunk_authority: ?HunkAuthorityRef = null,
 };
 
-/// Single authority facade for the body currently promised by Review.
+/// Single authority facade for the body currently promised by Changes.
 ///
 /// In particular, an accepted inert projection is still a displayed body; it
 /// must never collapse to `none` and accidentally reveal the primary diff
 /// underneath it.
-pub const DisplayedReviewBody = union(enum) {
+pub const DisplayedChangesBody = union(enum) {
     none,
-    primary: PrimaryReviewBody,
+    primary: PrimaryChangesBody,
     cached: *const app_load.LoadedDiffBundle,
-    combined: *const review_projection.CombinedHunkBundle,
-    retained_staged_only: *const review_projection.RetainedStagedOnlyBundle,
-    generated: *const review_projection.GeneratedFileBundle,
+    combined: *const changes_projection.CombinedHunkBundle,
+    retained_staged_only: *const changes_projection.RetainedStagedOnlyBundle,
+    generated: *const changes_projection.GeneratedFileBundle,
     inert_invalid_utf8: struct {
         path_key: []const u8,
         display_path: []const u8,
@@ -218,17 +218,17 @@ pub const ParsedSelectionTarget = diff_surface.ParsedSelectionTarget;
 pub const RawDiffPaneGeometry = diff_surface.RawDiffPaneGeometry;
 pub const SearchTarget = diff_surface.SearchTarget;
 
-/// Short-lived Review-owned implementation of the page-independent body
+/// Short-lived Changes-owned implementation of the page-independent body
 /// resolver contract. Callers construct it on the stack for one resolver call;
 /// returned borrows point into `page`, never into this adapter.
-const ReviewBodyResolver = struct {
+const ChangesBodyResolver = struct {
     view: View,
 
-    fn interface(self: *ReviewBodyResolver) diff_surface.BodyResolver {
+    fn interface(self: *ChangesBodyResolver) diff_surface.BodyResolver {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    fn fromContext(ctx: *anyopaque) *ReviewBodyResolver {
+    fn fromContext(ctx: *anyopaque) *ChangesBodyResolver {
         return @ptrCast(@alignCast(ctx));
     }
     const vtable: diff_surface.BodyResolver.VTable = .{
@@ -291,7 +291,7 @@ const ReviewBodyResolver = struct {
 };
 
 pub const View = struct {
-    page: *const review_page.ReviewPageState,
+    page: *const changes_page.ChangesPageState,
     repo_root: ?[]const u8,
     repo_epoch: u64 = 0,
     root_identity: ?root_capability.Identity = null,
@@ -310,29 +310,29 @@ pub const View = struct {
         };
     }
 
-    fn sharedBodyView(self: View, adapter: *ReviewBodyResolver) diff_surface.navigation.BodyView {
+    fn sharedBodyView(self: View, adapter: *ChangesBodyResolver) diff_surface.navigation.BodyView {
         return .{
             .view = self.sharedView(),
             .resolver = adapter.interface(),
         };
     }
 
-    fn bodyResolverAdapter(self: View) ReviewBodyResolver {
+    fn bodyResolverAdapter(self: View) ChangesBodyResolver {
         return .{ .view = self };
     }
 
-    /// Builds the Review body resolver only for the duration of one shared
+    /// Builds the Changes body resolver only for the duration of one shared
     /// selected-content query. Returned borrows always point into page state.
-    pub fn contentView(self: View, adapter: *ReviewBodyResolver) diff_surface.content.View {
+    pub fn contentView(self: View, adapter: *ChangesBodyResolver) diff_surface.content.View {
         return .{ .navigation = self.sharedBodyView(adapter) };
     }
 
-    pub fn contentResolverAdapter(self: View) ReviewBodyResolver {
+    pub fn contentResolverAdapter(self: View) ChangesBodyResolver {
         return self.bodyResolverAdapter();
     }
 
     /// Builds the shared body view for one synchronous render adapter call.
-    pub fn diffSurfaceBodyView(self: View, adapter: *ReviewBodyResolver) diff_surface.navigation.BodyView {
+    pub fn diffSurfaceBodyView(self: View, adapter: *ChangesBodyResolver) diff_surface.navigation.BodyView {
         return self.sharedBodyView(adapter);
     }
 
@@ -346,8 +346,8 @@ pub const View = struct {
         return adapter.interface().renderProjectedBody(args);
     }
 
-    pub fn displayedReviewBody(self: View) DisplayedReviewBody {
-        switch (self.page.review_projection.displayed) {
+    pub fn displayedChangesBody(self: View) DisplayedChangesBody {
+        switch (self.page.changes_projection.displayed) {
             .ready => |*ready| {
                 if (self.displayedProjectionRequestIsActive(ready.request)) {
                     return switch (ready.value) {
@@ -362,9 +362,9 @@ pub const View = struct {
                         },
                         .generated_added_file => |*bundle| .{ .generated = bundle },
                         .combined_hunks => |*bundle| .{ .combined = bundle },
-                        .primary_combined_authority => |*authority| self.primaryReviewBody(.{ .combined = authority }),
+                        .primary_combined_authority => |*authority| self.primaryChangesBody(.{ .combined = authority }),
                         .retained_staged_only => |*bundle| .{ .retained_staged_only = bundle },
-                        .primary_staged_only_authority => |*authority| self.primaryReviewBody(.{ .staged_only = authority }),
+                        .primary_staged_only_authority => |*authority| self.primaryChangesBody(.{ .staged_only = authority }),
                         .inert_combined => .{ .inert_invalid_utf8 = .{
                             .path_key = ready.request.path_key,
                             .display_path = ready.request.path_key,
@@ -381,22 +381,22 @@ pub const View = struct {
             .idle => {},
         }
 
-        if (self.selectedStatusEntry() != null) return if (self.page.review_projection.hasPending()) .pending else .none;
+        if (self.selectedStatusEntry() != null) return if (self.page.changes_projection.hasPending()) .pending else .none;
 
-        return self.primaryReviewBody(null);
+        return self.primaryChangesBody(null);
     }
 
-    /// Exact scalar identity of the body currently promised by Review.
+    /// Exact scalar identity of the body currently promised by Changes.
     ///
     /// Selection release, hunk action resolution, and session-mark rendering
     /// share this builder so they cannot disagree about presentation lineage.
-    pub fn currentContentToken(self: View) ?review_selection.ReviewContentToken {
+    pub fn currentContentToken(self: View) ?content_selection.ContentToken {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyView(&adapter).currentContentToken();
     }
 
-    fn currentContentTokenDirect(self: View) ?review_selection.ReviewContentToken {
-        const display: review_selection.DisplayBasis = switch (self.displayedReviewBody()) {
+    fn currentContentTokenDirect(self: View) ?content_selection.ContentToken {
+        const display: content_selection.DisplayBasis = switch (self.displayedChangesBody()) {
             .primary => |primary| .{ .loaded = .init(primary.loaded.text) },
             .cached => |bundle| .{ .cached_projection = .{
                 .status_snapshot_revision = self.page.status_snapshot_revision,
@@ -413,16 +413,16 @@ pub const View = struct {
         return .{
             .repo_epoch = self.repo_epoch,
             .root_identity = self.root_identity,
-            .source = review_selection.SourceBasis.init(self.source),
+            .source = content_selection.SourceBasis.init(self.source),
             .source_session_revision = self.page.source_session_revision,
             .display = display,
         };
     }
 
-    fn primaryReviewBody(
+    fn primaryChangesBody(
         self: View,
         hunk_authority: ?HunkAuthorityRef,
-    ) DisplayedReviewBody {
+    ) DisplayedChangesBody {
         const loaded = self.activeLoadedDiffConst() orelse return .none;
         const file_index = self.selectedFileIndex(loaded) orelse return .none;
         if (file_index >= loaded.document.files.len) return .none;
@@ -501,7 +501,7 @@ pub const View = struct {
     }
 
     fn parsedSelectionTargetDirect(self: View, expected: ?diff_selection.Identity) ?ParsedSelectionTarget {
-        const target: ParsedSelectionTarget = switch (self.displayedReviewBody()) {
+        const target: ParsedSelectionTarget = switch (self.displayedChangesBody()) {
             .primary => |primary| blk: {
                 const file = primary.loaded.document.files[primary.file_index];
                 const path_key = diff_file.canonicalPathKey(file) orelse return null;
@@ -646,7 +646,7 @@ pub const View = struct {
 
     fn selectedProjectionLineCountDirect(self: View) usize {
         if (self.selectedStatusEntry() == null) return 0;
-        return switch (self.page.review_projection.displayed) {
+        return switch (self.page.changes_projection.displayed) {
             .ready => |ready| switch (ready.value) {
                 .cached_diff => |bundle| if (bundle.loaded.document.files.len > 0)
                     if (!bundle.loaded.fileTextSelectable(0))
@@ -686,7 +686,7 @@ pub const View = struct {
     }
 
     fn searchUnavailableReasonDirect(self: View) ?diff_surface.SearchUnavailableReason {
-        if (self.displayedReviewBody() == .inert_invalid_utf8) {
+        if (self.displayedChangesBody() == .inert_invalid_utf8) {
             return .invalid_utf8;
         }
         if (self.activeCombinedProjection() != null) {
@@ -804,7 +804,7 @@ pub const View = struct {
     }
 
     fn displayedDiffFileDirect(self: View) ?diff_parser.FileDiff {
-        return switch (self.displayedReviewBody()) {
+        return switch (self.displayedChangesBody()) {
             .primary => |primary| primary.loaded.document.files[primary.file_index],
             .cached => |bundle| bundle.loaded.document.files[0],
             .combined => |bundle| bundle.displayFile(),
@@ -819,7 +819,7 @@ pub const View = struct {
     }
 
     fn displayedSearchTargetDirect(self: View, mode: diff_render.DisplayMode) ?SearchTarget {
-        return switch (self.displayedReviewBody()) {
+        return switch (self.displayedChangesBody()) {
             .cached => |bundle| .{
                 .file = bundle.loaded.document.files[0],
                 .line_index = bundle.loaded.cachedRenderedLineIndex(0, mode) orelse bundle.loaded.renderedLineIndex(0, mode),
@@ -850,7 +850,7 @@ pub const View = struct {
     }
 
     fn displayedDiffLineIndexDirect(self: View, mode: diff_render.DisplayMode) ?diff_view_model.RenderedLineIndex {
-        return switch (self.displayedReviewBody()) {
+        return switch (self.displayedChangesBody()) {
             .primary => |primary| primary.loaded.cachedRenderedLineIndex(primary.file_index, mode),
             .cached => |bundle| bundle.loaded.cachedRenderedLineIndex(0, mode),
             .combined => |bundle| bundle.displayLineIndex(mode),
@@ -860,7 +860,7 @@ pub const View = struct {
     }
 
     fn resolvedTargetDirect(self: View) diff_surface.ResolvedTarget {
-        const body = self.displayedReviewBody();
+        const body = self.displayedChangesBody();
         return .{
             .kind = switch (body) {
                 .none => .none,
@@ -903,7 +903,7 @@ pub const View = struct {
     }
 
     fn activeDiffDisplayDirect(self: View, allocator: std.mem.Allocator, mode: diff_render.DisplayMode) !?ActiveDiffDisplay {
-        const selected: PrimaryReviewBody = switch (self.displayedReviewBody()) {
+        const selected: PrimaryChangesBody = switch (self.displayedChangesBody()) {
             .combined => |bundle| {
                 return .{ .combined_projection = .{
                     .file = bundle.displayFile(),
@@ -950,24 +950,24 @@ pub const View = struct {
     }
 
     fn renderProjectedBodyDirect(self: View, args: diff_surface.RenderProjectedBodyArgs) !void {
-        const body = self.displayedReviewBody();
+        const body = self.displayedChangesBody();
         switch (body) {
             .generated => |bundle| {
-                try review_body_render.renderGenerated(bundle, args);
+                try changes_body_render.renderGenerated(bundle, args);
                 return;
             },
             .inert_invalid_utf8 => |inert| {
-                try review_body_render.renderStatus(inert.display_path, invalid_utf8_body_message, self.selectedStatusLineStats(), args);
+                try changes_body_render.renderStatus(inert.display_path, invalid_utf8_body_message, self.selectedStatusLineStats(), args);
                 return;
             },
             .status => |status| {
-                try review_body_render.renderStatus(status.path, status.message, self.selectedStatusLineStats(), args);
+                try changes_body_render.renderStatus(status.path, status.message, self.selectedStatusLineStats(), args);
                 return;
             },
             .pending => {
                 const entry = self.selectedStatusEntry() orelse return;
                 const path = entry.canonicalPathKey() orelse entry.path;
-                try review_body_render.renderStatus(path, "Loading review projection...", self.selectedStatusLineStats(), args);
+                try changes_body_render.renderStatus(path, "Loading changes projection...", self.selectedStatusLineStats(), args);
                 return;
             },
             .none, .primary => return,
@@ -976,7 +976,7 @@ pub const View = struct {
 
         const mode = diff_render.effectiveMode(diff_render.bodyWidth(args.surface.size().width), args.requested_mode);
         const display = (try self.activeDiffDisplayDirect(args.surface.frameAllocator(), mode)) orelse return;
-        try review_body_render.renderParsed(.{
+        try changes_body_render.renderParsed(.{
             .file = display.file(),
             .line_index = display.lineIndex(),
             .folded_hunks = display.foldedHunks(),
@@ -985,36 +985,36 @@ pub const View = struct {
         }, args);
     }
 
-    pub fn activeGeneratedFileProjection(self: View) ?*const review_projection.GeneratedFileBundle {
-        return switch (self.displayedReviewBody()) {
+    pub fn activeGeneratedFileProjection(self: View) ?*const changes_projection.GeneratedFileBundle {
+        return switch (self.displayedChangesBody()) {
             .generated => |bundle| bundle,
             else => null,
         };
     }
 
     pub fn activeCachedDiffProjection(self: View) ?*const app_load.LoadedDiffBundle {
-        return switch (self.displayedReviewBody()) {
+        return switch (self.displayedChangesBody()) {
             .cached => |bundle| bundle,
             else => null,
         };
     }
 
-    pub fn activeCombinedProjection(self: View) ?*const review_projection.CombinedHunkBundle {
-        return switch (self.displayedReviewBody()) {
+    pub fn activeCombinedProjection(self: View) ?*const changes_projection.CombinedHunkBundle {
+        return switch (self.displayedChangesBody()) {
             .combined => |bundle| bundle,
             else => null,
         };
     }
 
-    pub fn activeRetainedStagedOnlyProjection(self: View) ?*const review_projection.RetainedStagedOnlyBundle {
-        return switch (self.displayedReviewBody()) {
+    pub fn activeRetainedStagedOnlyProjection(self: View) ?*const changes_projection.RetainedStagedOnlyBundle {
+        return switch (self.displayedChangesBody()) {
             .retained_staged_only => |bundle| bundle,
             else => null,
         };
     }
 
     pub fn activeHunkAuthority(self: View) ?ActiveHunkAuthority {
-        return switch (self.displayedReviewBody()) {
+        return switch (self.displayedChangesBody()) {
             .combined => |bundle| .{
                 .display_file = bundle.displayFile(),
                 .authority = .{ .combined = &bundle.authority },
@@ -1046,7 +1046,7 @@ pub const View = struct {
         return self.sharedBodyView(&adapter).hunkInteractionAvailability();
     }
 
-    pub fn displayedProjectionRequestIsActive(self: View, request: review_projection.Request) bool {
+    pub fn displayedProjectionRequestIsActive(self: View, request: changes_projection.Request) bool {
         const repo_root = self.repo_root orelse return false;
         const path_key = self.selectedStagePathKey() orelse return false;
         return request.matchesDisplayIdentity(
@@ -1068,7 +1068,7 @@ pub const View = struct {
     }
 
     fn displayedDiffLineCountDirect(self: View) usize {
-        return switch (self.displayedReviewBody()) {
+        return switch (self.displayedChangesBody()) {
             .generated => |body| body.source.rowCount(),
             // These bodies render their own single presentation row and must
             // never inherit the selected underlying diff's row count as their
@@ -1098,7 +1098,7 @@ pub const View = struct {
     }
 
     fn hunkStagePresentationDirect(self: View, allocator: std.mem.Allocator, file_index: usize) !diff_render.HunkStagePresentation {
-        return switch (self.displayedReviewBody()) {
+        return switch (self.displayedChangesBody()) {
             .combined => |bundle| projectedHunkStagePresentation(allocator, bundle.hunkStageStates()),
             .retained_staged_only, .cached => .all_staged,
             .primary => |primary| blk: {
@@ -1200,7 +1200,7 @@ pub const View = struct {
 };
 
 pub const Controller = struct {
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
     repo_root: ?[]const u8,
     repo_epoch: u64 = 0,
     root_identity: ?root_capability.Identity = null,
@@ -1219,20 +1219,20 @@ pub const Controller = struct {
         };
     }
 
-    fn sharedBodyController(self: Controller, adapter: *ReviewBodyResolver) diff_surface.navigation.BodyController {
+    fn sharedBodyController(self: Controller, adapter: *ChangesBodyResolver) diff_surface.navigation.BodyController {
         return .{
             .controller = self.sharedController(),
             .resolver = adapter.interface(),
         };
     }
 
-    fn bodyResolverAdapter(self: Controller) ReviewBodyResolver {
+    fn bodyResolverAdapter(self: Controller) ChangesBodyResolver {
         return .{ .view = self.view() };
     }
 
     pub const UpdateAdapter = struct {
         navigation: Controller,
-        resolver: ReviewBodyResolver,
+        resolver: ChangesBodyResolver,
 
         pub fn shared(self: *UpdateAdapter) diff_surface.update.Controller {
             return .{
@@ -1445,7 +1445,7 @@ pub const Controller = struct {
         self.sharedController().clearSearch();
     }
 
-    /// Resets only Review-local navigation after the shell commits a different
+    /// Resets only Changes-local navigation after the shell commits a different
     /// repository identity. Repository selection and reload remain shell-owned.
     pub fn resetAfterRepositorySwitch(self: Controller) void {
         self.sharedController().resetAfterRepositorySwitch();
@@ -1486,7 +1486,7 @@ pub const Controller = struct {
         try self.sharedBodyController(&adapter).cycleChangedFileFilter(allocator);
     }
 
-    /// Replace the accepted Review file-visibility lens transactionally.
+    /// Replace the accepted Changes file-visibility lens transactionally.
     /// Search allocation is deliberately after the primary commit: failure
     /// may make the prompt unavailable, but cannot reject a valid lens change.
     fn replaceFileVisibilityLens(
@@ -1571,14 +1571,14 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         repo_epoch: u64,
         root_identity: root_capability.Identity,
-        kind: review_page.action_cursor.TargetKind,
+        kind: changes_page.action_cursor.TargetKind,
         path_key: []const u8,
-    ) !review_page.action_cursor.Prepared {
+    ) !changes_page.action_cursor.Prepared {
         const visible_row = if (self.view().activeLoadedDiffConst()) |loaded|
             loaded.visibleRowOfNode(self.page.viewer.selected_node) orelse 0
         else
             0;
-        return review_page.action_cursor.Prepared.init(
+        return changes_page.action_cursor.Prepared.init(
             allocator,
             repo_epoch,
             root_identity,
@@ -1591,7 +1591,7 @@ pub const Controller = struct {
     pub fn installActionCursor(
         self: Controller,
         allocator: std.mem.Allocator,
-        prepared: *review_page.action_cursor.Prepared,
+        prepared: *changes_page.action_cursor.Prepared,
         action_generation: u64,
     ) void {
         self.page.action_cursor.install(allocator, prepared, action_generation);
@@ -1624,7 +1624,7 @@ pub const Controller = struct {
     fn restoreTypedActionTarget(
         self: Controller,
         loaded: *LoadedDiff,
-        target: *const review_page.action_cursor.Target,
+        target: *const changes_page.action_cursor.Target,
         final: bool,
     ) bool {
         if (typedActionNode(loaded, target)) |node_index| {
@@ -1696,7 +1696,7 @@ pub const Controller = struct {
         return loaded.visibleRowOfNode(node_index) != null;
     }
 
-    pub fn restoreReloadAnchor(self: Controller, loaded: *LoadedDiff, anchor: *const review_page.ReloadAnchor) bool {
+    pub fn restoreReloadAnchor(self: Controller, loaded: *LoadedDiff, anchor: *const changes_page.ReloadAnchor) bool {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyController(&adapter).restoreReloadAnchor(loaded, anchor);
     }
@@ -1715,7 +1715,7 @@ pub const Controller = struct {
         self.sharedBodyController(&adapter).keepDiffCursorVisible();
     }
 
-    pub fn restoreSearchFromReloadAnchor(self: Controller, anchor: *const review_page.ReloadAnchor) void {
+    pub fn restoreSearchFromReloadAnchor(self: Controller, anchor: *const changes_page.ReloadAnchor) void {
         var adapter = self.bodyResolverAdapter();
         self.sharedBodyController(&adapter).restoreSearchFromReloadAnchor(anchor);
     }
@@ -1785,20 +1785,20 @@ pub const Controller = struct {
 
     pub const ExactPathTarget = union(enum) {
         ready: usize,
-        unavailable: page_link.ReviewUnavailableReason,
+        unavailable: page_link.ChangesUnavailableReason,
     };
 
     pub const ExactPathRevealResult = union(enum) {
         selected: usize,
         unchanged: usize,
-        unavailable: page_link.ReviewUnavailableReason,
+        unavailable: page_link.ChangesUnavailableReason,
     };
 
-    /// Classify one Repository path against the accepted retained Review
+    /// Classify one Repository path against the accepted retained Changes
     /// without changing folds, filters, selection, search, or diff position.
     /// The mutation half consumes only the `ready` node synchronously;
     /// an unavailable result is never retained for a future reload.
-    pub fn exactPathTarget(self: Controller, intent: page_link.ReviewLocationIntent) ExactPathTarget {
+    pub fn exactPathTarget(self: Controller, intent: page_link.ChangesLocationIntent) ExactPathTarget {
         if (!diff_source.sourceAllowsRepositoryLink(self.source)) {
             return .{ .unavailable = .source_unavailable };
         }
@@ -1806,7 +1806,7 @@ pub const Controller = struct {
         if (intent.repo_epoch != self.repo_epoch or !intent.root_identity.eql(active_root)) {
             return .{ .unavailable = .repository_mismatch };
         }
-        const loaded = self.activeLoadedDiff() orelse return .{ .unavailable = .no_accepted_review };
+        const loaded = self.activeLoadedDiff() orelse return .{ .unavailable = .no_accepted_changes };
         const node_index = findFileNodeByPathKey(loaded, intent.path) orelse
             return .{ .unavailable = .path_not_found };
         if (!loaded.shouldIncludeFileNode(
@@ -1819,14 +1819,14 @@ pub const Controller = struct {
 
     /// Reveal and select one exact file without retaining the borrowed request.
     /// Fallible visible-tree preparation completes before
-    /// collapsed ancestors or Review navigation state can change.
-    pub fn revealExactPath(self: Controller, intent: page_link.ReviewLocationIntent) !ExactPathRevealResult {
+    /// collapsed ancestors or Changes navigation state can change.
+    pub fn revealExactPath(self: Controller, intent: page_link.ChangesLocationIntent) !ExactPathRevealResult {
         return self.revealExactPathWithAllocator(intent, null);
     }
 
     fn revealExactPathWithAllocator(
         self: Controller,
-        intent: page_link.ReviewLocationIntent,
+        intent: page_link.ChangesLocationIntent,
         allocator_override: ?std.mem.Allocator,
     ) !ExactPathRevealResult {
         const node_index = switch (self.exactPathTarget(intent)) {
@@ -1856,7 +1856,7 @@ pub const Controller = struct {
         return .{ .selected = node_index };
     }
 
-    /// Commit one already validated exact file node through the Review
+    /// Commit one already validated exact file node through the Changes
     /// ancestor-reveal and navigation transaction. Candidate/path admission and
     /// caller-specific failure policy deliberately remain outside this helper.
     fn revealAndSelectExactNode(
@@ -1887,7 +1887,7 @@ pub fn findNodeBySidebarIdentity(
 
 fn typedActionNode(
     loaded: *const LoadedDiff,
-    target: *const review_page.action_cursor.Target,
+    target: *const changes_page.action_cursor.Target,
 ) ?usize {
     for (loaded.tree.nodes, 0..) |node, index| {
         const kind_matches = switch (target.kind) {
@@ -1935,7 +1935,7 @@ pub fn nearestVisibleFileNode(loaded: *const LoadedDiff, visible_row: usize) ?us
     return diff_surface.navigation.nearestVisibleFileNode(loaded, visible_row);
 }
 
-fn projectionSourceKind(source: diff_source.SourceMode) review_projection.SourceKind {
+fn projectionSourceKind(source: diff_source.SourceMode) changes_projection.SourceKind {
     return switch (source) {
         .cached => .cached,
         else => .unstaged,
@@ -1999,7 +1999,7 @@ fn maxHorizontalScrollForText(text: []const u8, visible_width: u16) usize {
 
 const TestHarness = struct {
     const PageStates = struct {
-        review: review_page.ReviewPageState = .{},
+        changes: changes_page.ChangesPageState = .{},
     };
 
     pages: PageStates = .{},
@@ -2011,9 +2011,9 @@ const TestHarness = struct {
     terminal_size: chasen.Size = .{ .width = 100, .height = 20 },
     allocator: ?std.mem.Allocator = null,
 
-    fn init(page: review_page.ReviewPageState, terminal_size: chasen.Size) TestHarness {
+    fn init(page: changes_page.ChangesPageState, terminal_size: chasen.Size) TestHarness {
         return .{
-            .pages = .{ .review = page },
+            .pages = .{ .changes = page },
             .terminal_size = terminal_size,
         };
     }
@@ -2021,7 +2021,7 @@ const TestHarness = struct {
     fn controller(self: *TestHarness) Controller {
         const body_size = shell_layout.compute(self.terminal_size, .{ .page_bar_visible = true }).bodySize();
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = self.repo_root,
             .repo_epoch = self.repo_epoch,
             .root_identity = self.root_identity,
@@ -2034,7 +2034,7 @@ const TestHarness = struct {
     fn view(self: *const TestHarness) View {
         const body_size = shell_layout.compute(self.terminal_size, .{ .page_bar_visible = true }).bodySize();
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = self.repo_root,
             .repo_epoch = self.repo_epoch,
             .root_identity = self.root_identity,
@@ -2043,11 +2043,11 @@ const TestHarness = struct {
         };
     }
 
-    fn reviewNavigation(self: *TestHarness) Controller {
+    fn changesNavigation(self: *TestHarness) Controller {
         return self.controller();
     }
 
-    fn reviewNavigationView(self: *const TestHarness) View {
+    fn changesNavigationView(self: *const TestHarness) View {
         return self.view();
     }
 
@@ -2064,17 +2064,17 @@ const TestHarness = struct {
     }
 
     fn clearLoadedDiff(self: *TestHarness) void {
-        self.pages.review.source_session_revision +%= 1;
+        self.pages.changes.source_session_revision +%= 1;
         self.controller().clearDiffSelection();
-        self.pages.review.load.clearCurrent(self.allocator);
+        self.pages.changes.load.clearCurrent(self.allocator);
         if (self.allocator) |allocator| {
-            self.pages.review.review_projection.deinit(allocator);
-            self.pages.review.staged_hunks.clear(allocator);
+            self.pages.changes.changes_projection.deinit(allocator);
+            self.pages.changes.staged_hunks.clear(allocator);
         }
-        self.pages.review.viewer.diff_scroll = 0;
-        self.pages.review.viewer.diff_horizontal_scroll = 0;
-        self.pages.review.viewer.sidebar_horizontal_scroll = 0;
-        self.pages.review.viewer.diff_cursor = .{ .metadata = 0 };
+        self.pages.changes.viewer.diff_scroll = 0;
+        self.pages.changes.viewer.diff_horizontal_scroll = 0;
+        self.pages.changes.viewer.sidebar_horizontal_scroll = 0;
+        self.pages.changes.viewer.diff_cursor = .{ .metadata = 0 };
         self.controller().clearSearchMatch();
     }
 };
@@ -2120,9 +2120,9 @@ fn prepareStatusOnlyHorizontalScrollHarness(
     status_text: []const u8,
 ) !void {
     harness.repo_root = "/repo";
-    _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    _ = harness.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, status_text);
-    try harness.pages.review.git_status.replace("/repo", &status_bundle);
+    try harness.pages.changes.git_status.replace("/repo", &status_bundle);
 }
 
 fn initProjectionHunkFoldHarness(allocator: std.mem.Allocator) !TestHarness {
@@ -2157,19 +2157,19 @@ fn installCachedHunkFoldProjection(
         displayed_body_horizontal_scroll_cached_patch,
     );
     errdefer cached_bundle.deinit();
-    var request = try review_projection.testing.cloneRequest(
+    var request = try changes_projection.testing.cloneRequest(
         allocator,
-        harness.pages.review.activation.currentIdentity().?,
+        harness.pages.changes.activation.currentIdentity().?,
         1,
         "/repo",
         "a",
         .cached_diff,
         .unstaged,
-        harness.pages.review.source_session_revision,
-        harness.pages.review.status_snapshot_revision,
+        harness.pages.changes.source_session_revision,
+        harness.pages.changes.status_snapshot_revision,
     );
     errdefer request.deinit(allocator);
-    harness.pages.review.review_projection.installReady(.{
+    harness.pages.changes.changes_projection.installReady(.{
         .request = request,
         .value = .{ .cached_diff = cached_bundle },
     });
@@ -2184,10 +2184,10 @@ fn expectProjectionHunkFoldDenied(
     const unified_lines_before = active.renderedLineIndex(0, .unified).lineCount();
     const unified_hunk_lines_before = active.renderedLineIndex(0, .unified).hunkLineCount(0);
     const side_by_side_lines_before = active.renderedLineIndex(0, .side_by_side).lineCount();
-    const cursor_before = harness.pages.review.viewer.diff_cursor;
-    const scroll_before = harness.pages.review.viewer.diff_scroll;
-    const horizontal_scroll_before = harness.pages.review.viewer.diff_horizontal_scroll;
-    const search_before = harness.pages.review.search;
+    const cursor_before = harness.pages.changes.viewer.diff_cursor;
+    const scroll_before = harness.pages.changes.viewer.diff_scroll;
+    const horizontal_scroll_before = harness.pages.changes.viewer.diff_horizontal_scroll;
+    const search_before = harness.pages.changes.search;
 
     try std.testing.expectEqual(HunkInteractionAvailability.available, harness.view().hunkInteractionAvailability());
     try std.testing.expect(harness.view().selectedHunkIndex() != null);
@@ -2206,10 +2206,10 @@ fn expectProjectionHunkFoldDenied(
     try std.testing.expectEqual(unified_lines_before, active.renderedLineIndex(0, .unified).lineCount());
     try std.testing.expectEqual(unified_hunk_lines_before, active.renderedLineIndex(0, .unified).hunkLineCount(0));
     try std.testing.expectEqual(side_by_side_lines_before, active.renderedLineIndex(0, .side_by_side).lineCount());
-    try std.testing.expectEqualDeep(cursor_before, harness.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(scroll_before, harness.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(horizontal_scroll_before, harness.pages.review.viewer.diff_horizontal_scroll);
-    try std.testing.expectEqualDeep(search_before, harness.pages.review.search);
+    try std.testing.expectEqualDeep(cursor_before, harness.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqual(scroll_before, harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(horizontal_scroll_before, harness.pages.changes.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqualDeep(search_before, harness.pages.changes.search);
     try std.testing.expectEqualStrings("", harness.status.text());
 
     harness.controller().toggleSelectedHunkFold();
@@ -2217,10 +2217,10 @@ fn expectProjectionHunkFoldDenied(
     try std.testing.expectEqual(unified_lines_before, active.renderedLineIndex(0, .unified).lineCount());
     try std.testing.expectEqual(unified_hunk_lines_before, active.renderedLineIndex(0, .unified).hunkLineCount(0));
     try std.testing.expectEqual(side_by_side_lines_before, active.renderedLineIndex(0, .side_by_side).lineCount());
-    try std.testing.expectEqualDeep(cursor_before, harness.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(scroll_before, harness.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(horizontal_scroll_before, harness.pages.review.viewer.diff_horizontal_scroll);
-    try std.testing.expectEqualDeep(search_before, harness.pages.review.search);
+    try std.testing.expectEqualDeep(cursor_before, harness.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqual(scroll_before, harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(horizontal_scroll_before, harness.pages.changes.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqualDeep(search_before, harness.pages.changes.search);
     try std.testing.expectEqualStrings(
         "hunk fold is unavailable for projected view",
         harness.status.text(),
@@ -2233,11 +2233,11 @@ fn expectResolverRenderContains(harness: *TestHarness, needle: []const u8) !void
     defer ts.deinit();
     try harness.view().renderProjectedBody(.{
         .surface = &ts.surface,
-        .requested_mode = harness.pages.review.viewer.display_mode,
-        .scroll = harness.pages.review.viewer.diff_scroll,
-        .horizontal_scroll = harness.pages.review.viewer.diff_horizontal_scroll,
+        .requested_mode = harness.pages.changes.viewer.display_mode,
+        .scroll = harness.pages.changes.viewer.diff_scroll,
+        .horizontal_scroll = harness.pages.changes.viewer.diff_horizontal_scroll,
         .pane_active = true,
-        .line_numbers = harness.pages.review.viewer.view_options.line_numbers,
+        .line_numbers = harness.pages.changes.viewer.view_options.line_numbers,
         .highlighted_hunk = harness.view().selectedHunkIndex(),
         .cursor_offset = harness.view().visibleDiffCursorOffset(),
         .palette = .default(),
@@ -2253,11 +2253,11 @@ fn expectResolverRenderOmits(harness: *TestHarness, needle: []const u8) !void {
     defer ts.deinit();
     try harness.view().renderProjectedBody(.{
         .surface = &ts.surface,
-        .requested_mode = harness.pages.review.viewer.display_mode,
-        .scroll = harness.pages.review.viewer.diff_scroll,
-        .horizontal_scroll = harness.pages.review.viewer.diff_horizontal_scroll,
+        .requested_mode = harness.pages.changes.viewer.display_mode,
+        .scroll = harness.pages.changes.viewer.diff_scroll,
+        .horizontal_scroll = harness.pages.changes.viewer.diff_horizontal_scroll,
         .pane_active = true,
-        .line_numbers = harness.pages.review.viewer.view_options.line_numbers,
+        .line_numbers = harness.pages.changes.viewer.view_options.line_numbers,
         .highlighted_hunk = harness.view().selectedHunkIndex(),
         .cursor_offset = harness.view().visibleDiffCursorOffset(),
         .palette = .default(),
@@ -2289,20 +2289,20 @@ fn installCombinedHorizontalScrollProjection(
         cached_bundle.loaded.document.files[0],
         unstaged_bundle.loaded.document.files[0],
     );
-    var request = try review_projection.testing.cloneRequest(
+    var request = try changes_projection.testing.cloneRequest(
         allocator,
-        harness.pages.review.activation.currentIdentity().?,
+        harness.pages.changes.activation.currentIdentity().?,
         1,
         "/repo",
         "a",
         .combined_hunks,
         .unstaged,
-        harness.pages.review.source_session_revision,
-        harness.pages.review.status_snapshot_revision,
+        harness.pages.changes.source_session_revision,
+        harness.pages.changes.status_snapshot_revision,
     );
     errdefer request.deinit(allocator);
 
-    harness.pages.review.review_projection.installReady(.{
+    harness.pages.changes.changes_projection.installReady(.{
         .request = request,
         .value = .{ .combined_hunks = .{
             .presentation = .{
@@ -2318,7 +2318,7 @@ fn installCombinedHorizontalScrollProjection(
                 .projection = projection.authority,
                 .cached_component = cached_authority,
                 .unstaged_component = unstaged_authority,
-                .status_snapshot_revision = harness.pages.review.status_snapshot_revision,
+                .status_snapshot_revision = harness.pages.changes.status_snapshot_revision,
             },
         } },
     });
@@ -2328,7 +2328,7 @@ fn retainCombinedHorizontalScrollProjection(
     harness: *TestHarness,
     allocator: std.mem.Allocator,
 ) !void {
-    const displayed = harness.pages.review.review_projection.displayed.ready.value.combined_hunks.displayFile();
+    const displayed = harness.pages.changes.changes_projection.displayed.ready.value.combined_hunks.displayFile();
     var cached_component = try projection_component.ParsedComponent.parse(
         allocator,
         displayed_body_horizontal_scroll_retained_authority_patch,
@@ -2347,19 +2347,19 @@ fn retainCombinedHorizontalScrollProjection(
         origin.* = .{ .cached = hunk_index };
     }
 
-    var request = try review_projection.testing.cloneRequest(
+    var request = try changes_projection.testing.cloneRequest(
         allocator,
-        harness.pages.review.activation.currentIdentity().?,
+        harness.pages.changes.activation.currentIdentity().?,
         2,
         "/repo",
         "a",
         .cached_diff,
         .unstaged,
-        harness.pages.review.source_session_revision,
-        harness.pages.review.status_snapshot_revision,
+        harness.pages.changes.source_session_revision,
+        harness.pages.changes.status_snapshot_revision,
     );
     errdefer request.deinit(allocator);
-    var candidate: review_projection.StagedOnlyReuseCandidate = .{
+    var candidate: changes_projection.StagedOnlyReuseCandidate = .{
         .fingerprint = diff_presentation_identity.fingerprint(cached_component.document.files[0]),
         .fresh_authority = .{
             .projection = .{
@@ -2367,10 +2367,10 @@ fn retainCombinedHorizontalScrollProjection(
                 .hunk_action_origins = action_origins,
             },
             .cached_component = cached_component,
-            .status_snapshot_revision = harness.pages.review.status_snapshot_revision,
+            .status_snapshot_revision = harness.pages.changes.status_snapshot_revision,
         },
     };
-    harness.pages.review.review_projection.installRetainedStagedOnlyReuse(
+    harness.pages.changes.changes_projection.installRetainedStagedOnlyReuse(
         allocator,
         request,
         &candidate,
@@ -2380,10 +2380,10 @@ fn retainCombinedHorizontalScrollProjection(
 
 fn expectDisplayedBodyHorizontalScrollGeometry(harness: *TestHarness) !void {
     harness.terminal_size = .{ .width = 140, .height = 16 };
-    harness.pages.review.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_scroll = 0;
     inline for ([_]diff_render.DisplayMode{ .unified, .side_by_side }) |mode| {
-        harness.pages.review.viewer.display_mode = mode;
-        harness.pages.review.viewer.view_options.line_numbers = true;
+        harness.pages.changes.viewer.display_mode = mode;
+        harness.pages.changes.viewer.view_options.line_numbers = true;
         const with_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
         const expected_with_line_numbers: usize = switch (mode) {
             .unified => 76,
@@ -2391,11 +2391,11 @@ fn expectDisplayedBodyHorizontalScrollGeometry(harness: *TestHarness) !void {
         };
         try std.testing.expectEqual(expected_with_line_numbers, with_line_numbers);
 
-        harness.pages.review.viewer.diff_horizontal_scroll = 0;
+        harness.pages.changes.viewer.diff_horizontal_scroll = 0;
         harness.controller().scrollDiffHorizontal(.right);
-        try std.testing.expectEqual(@as(usize, 8), harness.pages.review.viewer.diff_horizontal_scroll);
+        try std.testing.expectEqual(@as(usize, 8), harness.pages.changes.viewer.diff_horizontal_scroll);
 
-        harness.pages.review.viewer.view_options.line_numbers = false;
+        harness.pages.changes.viewer.view_options.line_numbers = false;
         const without_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
         const expected_without_line_numbers: usize = switch (mode) {
             .unified => 66,
@@ -2405,15 +2405,15 @@ fn expectDisplayedBodyHorizontalScrollGeometry(harness: *TestHarness) !void {
     }
 
     harness.terminal_size = .{ .width = 60, .height = 16 };
-    harness.pages.review.viewer.view_options.line_numbers = true;
-    harness.pages.review.viewer.display_mode = .side_by_side;
+    harness.pages.changes.viewer.view_options.line_numbers = true;
+    harness.pages.changes.viewer.display_mode = .side_by_side;
     try std.testing.expectEqual(diff_render.DisplayMode.unified, harness.view().effectiveDisplayMode());
     const requested_side_by_side = harness.view().visibleBodyTextMaxHorizontalScroll();
-    harness.pages.review.viewer.display_mode = .unified;
+    harness.pages.changes.viewer.display_mode = .unified;
     try std.testing.expectEqual(requested_side_by_side, harness.view().visibleBodyTextMaxHorizontalScroll());
 }
 
-fn exactReviewIntent(app: *const TestHarness, path: []const u8) page_link.ReviewLocationIntent {
+fn exactChangesIntent(app: *const TestHarness, path: []const u8) page_link.ChangesLocationIntent {
     return .{
         .repo_epoch = app.repo_epoch,
         .root_identity = app.root_identity.?,
@@ -2425,7 +2425,7 @@ fn expectExactPathReady(target: Controller.ExactPathTarget, expected_node: usize
     switch (target) {
         .ready => |node_index| try std.testing.expectEqual(expected_node, node_index),
         .unavailable => |reason| {
-            std.debug.print("expected exact Review path, found unavailable reason {s}\n", .{@tagName(reason)});
+            std.debug.print("expected exact Changes path, found unavailable reason {s}\n", .{@tagName(reason)});
             return error.TestUnexpectedResult;
         },
     }
@@ -2433,11 +2433,11 @@ fn expectExactPathReady(target: Controller.ExactPathTarget, expected_node: usize
 
 fn expectExactPathUnavailable(
     target: Controller.ExactPathTarget,
-    expected: page_link.ReviewUnavailableReason,
+    expected: page_link.ChangesUnavailableReason,
 ) !void {
     switch (target) {
         .ready => |node_index| {
-            std.debug.print("expected unavailable Review path, found node {d}\n", .{node_index});
+            std.debug.print("expected unavailable Changes path, found node {d}\n", .{node_index});
             return error.TestUnexpectedResult;
         },
         .unavailable => |actual| try std.testing.expectEqual(expected, actual),
@@ -2462,7 +2462,7 @@ fn expectExactPathRevealUnchanged(result: Controller.ExactPathRevealResult, expe
 
 fn expectExactPathRevealUnavailable(
     result: Controller.ExactPathRevealResult,
-    expected: page_link.ReviewUnavailableReason,
+    expected: page_link.ChangesUnavailableReason,
 ) !void {
     switch (result) {
         .unavailable => |actual| try std.testing.expectEqual(expected, actual),
@@ -2472,35 +2472,35 @@ fn expectExactPathRevealUnavailable(
 }
 
 fn expectSearchCoordinate(app: *const TestHarness, expected: diff_view_model.BodyCoordinate) !void {
-    try std.testing.expect(app.pages.review.search.match != null);
-    try std.testing.expect(std.meta.eql(expected, app.pages.review.search.match.?.coordinate));
+    try std.testing.expect(app.pages.changes.search.match != null);
+    try std.testing.expect(std.meta.eql(expected, app.pages.changes.search.match.?.coordinate));
 }
 
 fn setDiffSearchQuery(app: *TestHarness, query: []const u8) void {
-    @memcpy(app.pages.review.search.query.buffer[0..query.len], query);
-    app.pages.review.search.query.len = query.len;
-    app.pages.review.search.query.cursor = query.len;
-    @memcpy(app.pages.review.search.input.buffer[0..query.len], query);
-    app.pages.review.search.input.len = query.len;
-    app.pages.review.search.input.cursor = query.len;
+    @memcpy(app.pages.changes.search.query.buffer[0..query.len], query);
+    app.pages.changes.search.query.len = query.len;
+    app.pages.changes.search.query.cursor = query.len;
+    @memcpy(app.pages.changes.search.input.buffer[0..query.len], query);
+    app.pages.changes.search.input.len = query.len;
+    app.pages.changes.search.input.cursor = query.len;
 }
 
 fn setDiffSearchInput(app: *TestHarness, query: []const u8) void {
-    @memcpy(app.pages.review.search.input.buffer[0..query.len], query);
-    app.pages.review.search.input.len = query.len;
-    app.pages.review.search.input.cursor = query.len;
+    @memcpy(app.pages.changes.search.input.buffer[0..query.len], query);
+    app.pages.changes.search.input.len = query.len;
+    app.pages.changes.search.input.cursor = query.len;
 }
 
 fn setFileSearchInput(app: *TestHarness, query: []const u8) void {
-    app.pages.review.file_search.input = .{};
-    @memcpy(app.pages.review.file_search.input.buffer[0..query.len], query);
-    app.pages.review.file_search.input.len = query.len;
-    app.pages.review.file_search.input.cursor = query.len;
+    app.pages.changes.file_search.input = .{};
+    @memcpy(app.pages.changes.file_search.input.buffer[0..query.len], query);
+    app.pages.changes.file_search.input.len = query.len;
+    app.pages.changes.file_search.input.cursor = query.len;
 }
 
 fn setAndRebuildFileSearch(app: *TestHarness, query: []const u8) void {
     setFileSearchInput(app, query);
-    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    app.changesNavigation().rebuildFileSearchProjection(std.testing.allocator);
 }
 
 fn applySharedNavigation(app: *TestHarness, msg: diff_surface.message.Msg) !bool {
@@ -2540,7 +2540,7 @@ const file_search_lens_nodes = [_]file_tree.Node{
     .{ .kind = .file, .name = "b", .path = "b", .path_key = "b", .depth = 0, .status = .added, .target = .{ .diff_file = 1 } },
 };
 
-test "Review navigation keeps diff position at file selection boundary" {
+test "Changes navigation keeps diff position at file selection boundary" {
     var harness = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
@@ -2552,15 +2552,15 @@ test "Review navigation keeps diff position at file selection boundary" {
     harness.controller().selectFileDelta(-1);
     const loaded = harness.controller().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(?usize, 0), harness.view().selectedFileIndex(loaded));
-    try std.testing.expectEqual(@as(usize, 4), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), harness.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, 1), harness.view().selectedHunkIndex());
 
     harness.controller().selectFileAbsolute(0);
-    try std.testing.expectEqual(@as(usize, 4), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), harness.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, 1), harness.view().selectedHunkIndex());
 }
 
-test "Review navigation keeps diff cursor visible across mode changes" {
+test "Changes navigation keeps diff cursor visible across mode changes" {
     var harness = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
@@ -2570,9 +2570,9 @@ test "Review navigation keeps diff cursor visible across mode changes" {
     }, .{ .width = 100, .height = 9 });
 
     harness.controller().placeDiffCursorInComfortBand();
-    try std.testing.expect(harness.pages.review.viewer.diff_scroll > 0);
+    try std.testing.expect(harness.pages.changes.viewer.diff_scroll > 0);
 
-    harness.pages.review.viewer.display_mode = .side_by_side;
+    harness.pages.changes.viewer.display_mode = .side_by_side;
     harness.controller().clampDiffNavigationKeepingHunkVisible();
 
     const target = diff_view_model.hunkBodyLineOffset(
@@ -2581,29 +2581,29 @@ test "Review navigation keeps diff cursor visible across mode changes" {
         harness.view().selectedHunkIndex().?,
     );
     const visible_rows = harness.view().diffVisibleRows();
-    try std.testing.expect(target >= harness.pages.review.viewer.diff_scroll);
-    try std.testing.expect(target < harness.pages.review.viewer.diff_scroll + visible_rows);
+    try std.testing.expect(target >= harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expect(target < harness.pages.changes.viewer.diff_scroll + visible_rows);
 }
 
-test "Review navigation initializes cursor at first rendered body row" {
+test "Changes navigation initializes cursor at first rendered body row" {
     var metadata = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffMetadataOnly()),
     }, .{ .width = 100, .height = 12 });
     metadata.controller().initializeDiffCursorForSelectedFile();
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, metadata.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, metadata.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 0), metadata.view().visibleDiffCursorOffset());
-    const metadata_cursor = metadata.pages.review.viewer.diff_cursor;
+    const metadata_cursor = metadata.pages.changes.viewer.diff_cursor;
     metadata.controller().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 0), metadata.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(metadata_cursor, metadata.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), metadata.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(metadata_cursor, metadata.pages.changes.viewer.diff_cursor);
 
     var binary = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffBinaryOnly()),
     }, .{ .width = 100, .height = 12 });
     binary.controller().initializeDiffCursorForSelectedFile();
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate.binary_marker, binary.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate.binary_marker, binary.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 0), binary.view().visibleDiffCursorOffset());
-    const binary_cursor = binary.pages.review.viewer.diff_cursor;
+    const binary_cursor = binary.pages.changes.viewer.diff_cursor;
     const binary_snapshot = binary.view().displayNavigationSnapshot();
     for ([_]diff_surface.message.Msg{
         .document_first,
@@ -2617,8 +2617,8 @@ test "Review navigation initializes cursor at first rendered body row" {
         try std.testing.expectEqualDeep(binary_snapshot, binary.view().displayNavigationSnapshot());
     }
     binary.controller().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 0), binary.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(binary_cursor, binary.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), binary.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(binary_cursor, binary.pages.changes.viewer.diff_cursor);
 }
 
 test "document navigation applies first last half and full page on rendered rows" {
@@ -2634,7 +2634,7 @@ test "document navigation applies first last half and full page on rendered rows
     const band_last = visible_rows - 1 -| margin;
     const line_count = harness.view().displayedDiffLineCount();
 
-    harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
+    harness.pages.changes.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
         return error.ExpectedCoordinate;
     try std.testing.expect(try applySharedNavigation(&harness, .half_page_down));
     try std.testing.expectEqual(
@@ -2656,7 +2656,7 @@ test "document navigation applies first last half and full page on rendered rows
     for (viewport_cases) |case| {
         harness.terminal_size.height = case.height;
         try std.testing.expectEqual(case.visible_rows, harness.view().diffVisibleRows());
-        harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
+        harness.pages.changes.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
             return error.ExpectedCoordinate;
         _ = try applySharedNavigation(&harness, .half_page_down);
         const half_step = @max(harness.view().diffVisibleRows() / 2, 1);
@@ -2666,55 +2666,55 @@ test "document navigation applies first last half and full page on rendered rows
         );
     }
     harness.terminal_size.height = 15;
-    harness.pages.review.viewer.display_mode = .side_by_side;
-    harness.pages.review.viewer.keyboard_selection_side = .old;
+    harness.pages.changes.viewer.display_mode = .side_by_side;
+    harness.pages.changes.viewer.keyboard_selection_side = .old;
     _ = try applySharedNavigation(&harness, .document_last);
-    try std.testing.expectEqual(diff_selection.Side.old, harness.pages.review.viewer.keyboard_selection_side);
+    try std.testing.expectEqual(diff_selection.Side.old, harness.pages.changes.viewer.keyboard_selection_side);
     _ = try applySharedNavigation(&harness, .document_first);
-    harness.pages.review.viewer.display_mode = .unified;
+    harness.pages.changes.viewer.display_mode = .unified;
 
-    harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(band_last - 1) orelse
+    harness.pages.changes.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(band_last - 1) orelse
         return error.ExpectedCoordinate;
     harness.controller().moveDiffCursorRows(.down);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, band_last), harness.view().selectedDiffCursorOffset());
 
     harness.controller().moveDiffCursorRows(.down);
-    try std.testing.expectEqual(@as(usize, 1), harness.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), harness.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, band_last + 1), harness.view().selectedDiffCursorOffset());
 
-    harness.pages.review.viewer.diff_scroll = 0;
-    harness.pages.review.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
+    harness.pages.changes.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
         return error.ExpectedCoordinate;
     _ = try applySharedNavigation(&harness, .page_diff_down);
     const page_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
     try std.testing.expectEqual(@as(usize, visible_rows), page_offset);
     try std.testing.expectEqual(
         @min(page_offset -| (visible_rows / 2), line_count -| visible_rows),
-        harness.pages.review.viewer.diff_scroll,
+        harness.pages.changes.viewer.diff_scroll,
     );
 
-    harness.pages.review.viewer.diff_scroll = 0;
-    harness.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
+    harness.pages.changes.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_cursor = .{ .hunk_header = 0 };
     harness.controller().selectHunkDelta(1);
     const hunk_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    const hunk_row = hunk_offset - harness.pages.review.viewer.diff_scroll;
+    const hunk_row = hunk_offset - harness.pages.changes.viewer.diff_scroll;
     try std.testing.expect(hunk_row >= margin and hunk_row <= band_last);
 
-    harness.pages.review.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_scroll = 0;
     setDiffSearchQuery(&harness, "new");
     harness.controller().submitSearch();
     const search_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    const search_row = search_offset - harness.pages.review.viewer.diff_scroll;
+    const search_row = search_offset - harness.pages.changes.viewer.diff_scroll;
     try std.testing.expect(search_row >= margin and search_row <= band_last);
 
     harness.terminal_size.height = 8;
-    harness.pages.review.viewer.diff_scroll = 1;
-    harness.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
-    const zero_height_cursor = harness.pages.review.viewer.diff_cursor;
+    harness.pages.changes.viewer.diff_scroll = 1;
+    harness.pages.changes.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const zero_height_cursor = harness.pages.changes.viewer.diff_cursor;
     harness.controller().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 2), harness.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(zero_height_cursor, harness.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 2), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(zero_height_cursor, harness.pages.changes.viewer.diff_cursor);
 }
 
 test "reload search fallback resyncs match without interactive cursor placement" {
@@ -2739,7 +2739,7 @@ test "reload search fallback resyncs match without interactive cursor placement"
         .sidebar_identity = .{ .file = sidebar_path[0..] },
         .selected_target_tag = .diff_file,
         .visible_sidebar_row = 0,
-        .diff_cursor = harness.pages.review.viewer.diff_cursor,
+        .diff_cursor = harness.pages.changes.viewer.diff_cursor,
         .diff_cursor_offset = 0,
         .diff_scroll = 0,
         .diff_horizontal_scroll = 0,
@@ -2747,17 +2747,17 @@ test "reload search fallback resyncs match without interactive cursor placement"
         .search_coordinate = invalid_coordinate,
     };
 
-    const cursor_before = harness.pages.review.viewer.diff_cursor;
+    const cursor_before = harness.pages.changes.viewer.diff_cursor;
     harness.controller().restoreSearchFromReloadAnchor(&anchor);
 
-    try std.testing.expectEqual(cursor_before, harness.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
-    const match = harness.pages.review.search.match orelse return error.ExpectedSearchMatch;
+    try std.testing.expectEqual(cursor_before, harness.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    const match = harness.pages.changes.search.match orelse return error.ExpectedSearchMatch;
     try std.testing.expect(!std.meta.eql(invalid_coordinate, match.coordinate));
-    try std.testing.expect(harness.pages.review.search.match_offset != null);
+    try std.testing.expect(harness.pages.changes.search.match_offset != null);
 }
 
-test "Review mouse selection ignores the opposite side and resumes on its locked side" {
+test "Changes mouse selection ignores the opposite side and resumes on its locked side" {
     var harness = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
@@ -2770,7 +2770,7 @@ test "Review mouse selection ignores the opposite side and resumes on its locked
         .col = 4,
         .row = diff_render.body_start_row + 1,
     });
-    const started = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const started = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Side.old, started.side);
     try std.testing.expectEqual(@as(usize, 0), started.focus.line_index);
 
@@ -2778,7 +2778,7 @@ test "Review mouse selection ignores the opposite side and resumes on its locked
         .col = 72,
         .row = diff_render.body_start_row + 3,
     });
-    const dragged = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const dragged = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Side.old, dragged.side);
     try std.testing.expectEqual(@as(usize, 0), dragged.focus.line_index);
     try std.testing.expect(!dragged.moved);
@@ -2787,13 +2787,13 @@ test "Review mouse selection ignores the opposite side and resumes on its locked
         .col = 10,
         .row = diff_render.body_start_row + 3,
     });
-    const resumed = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const resumed = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Side.old, resumed.side);
     try std.testing.expectEqual(@as(usize, 2), resumed.focus.line_index);
     try std.testing.expect(resumed.moved);
 }
 
-test "Review mouse selection projects scrolled TAB wide combining and emoji cells atomically" {
+test "Changes mouse selection projects scrolled TAB wide combining and emoji cells atomically" {
     const text = "a\t界e\u{301}👩‍💻z";
     const scroll: usize = 2;
     const cases = [_]struct {
@@ -2872,7 +2872,7 @@ test "unified body selects characters while gutter keeps line gestures semantic"
 
     harness.controller().pressDiffMouse(.{ .col = text_start + 3, .row = diff_render.body_start_row + 1 });
     harness.controller().dragDiffMouse(.{ .col = text_start + 4, .row = diff_render.body_start_row + 2 });
-    const characters = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const characters = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Mode.character, characters.mode);
     try std.testing.expectEqual(diff_selection.Side.new, characters.side);
     const range = characters.range();
@@ -2888,7 +2888,7 @@ test "unified body selects characters while gutter keeps line gestures semantic"
     // line boundary; it does not silently switch to whole-line mode.
     const new_line_number_col = raw.col + content_gutter + diff_render.cursor_gutter_width + 6;
     harness.controller().dragDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
-    const into_gutter = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const into_gutter = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Mode.character, into_gutter.mode);
     try std.testing.expectEqual(@as(usize, 0), into_gutter.focus.leading);
     try std.testing.expectEqual(@as(usize, 0), into_gutter.focus.trailing);
@@ -2896,7 +2896,7 @@ test "unified body selects characters while gutter keeps line gestures semantic"
     harness.controller().clearDiffSelection();
     harness.controller().pressDiffMouse(.{ .col = text_start, .row = diff_render.body_start_row + 1 });
     harness.controller().dragDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
-    const first_token_to_gutter = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const first_token_to_gutter = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     const first_token_copy = try diff_selection.copyText(std.testing.allocator, files[0], first_token_to_gutter);
     defer std.testing.allocator.free(first_token_copy);
     try std.testing.expectEqualStrings("A", first_token_copy);
@@ -2904,7 +2904,7 @@ test "unified body selects characters while gutter keeps line gestures semantic"
     harness.controller().clearDiffSelection();
     harness.controller().pressDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
     harness.controller().dragDiffMouse(.{ .col = text_start + 4, .row = diff_render.body_start_row + 2 });
-    const lines_selected = harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const lines_selected = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Mode.line, lines_selected.mode);
     try std.testing.expectEqual(diff_selection.Side.new, lines_selected.side);
 }
@@ -2924,17 +2924,17 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
         },
     }, .{ .width = 100, .height = 12 });
 
-    try std.testing.expect(harness.view().displayedReviewBody() == .inert_invalid_utf8);
+    try std.testing.expect(harness.view().displayedChangesBody() == .inert_invalid_utf8);
     try std.testing.expect(!harness.view().bodyAllowsHunkInteraction());
     try std.testing.expect(harness.view().selectedHunkIndex() == null);
     try std.testing.expect(harness.view().displayedDiffFile() == null);
     try std.testing.expect(harness.view().unsupportedSearchMessage() != null);
-    harness.pages.review.viewer.diff_scroll = 99;
-    harness.pages.review.viewer.diff_horizontal_scroll = 99;
+    harness.pages.changes.viewer.diff_scroll = 99;
+    harness.pages.changes.viewer.diff_horizontal_scroll = 99;
     harness.controller().clampDiffNavigation();
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     const inert_snapshot = harness.view().displayNavigationSnapshot();
     for ([_]diff_surface.message.Msg{
         .document_first,
@@ -2952,14 +2952,14 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
     harness.controller().scrollDiffHorizontal(.right);
     harness.controller().selectHunkDelta(1);
     harness.controller().toggleSelectedHunkFold();
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(harness.pages.review.selection_owner == .none);
+    try std.testing.expect(harness.pages.changes.selection_owner == .none);
 
     harness.controller().selectFileAbsolute(0);
-    try std.testing.expect(harness.view().displayedReviewBody() == .primary);
+    try std.testing.expect(harness.view().displayedChangesBody() == .primary);
     try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
         .kind = .primary,
         .line_count = 0,
@@ -2971,7 +2971,7 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
     }, harness.view().resolvedTarget());
     try std.testing.expect(harness.view().bodyAllowsHunkInteraction());
     harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(harness.pages.review.selection_owner.activeDiff() != null);
+    try std.testing.expect(harness.pages.changes.selection_owner.activeDiff() != null);
 }
 
 test "invalid cached projection cannot fall through to primary hunk authority" {
@@ -2998,13 +2998,13 @@ test "invalid cached projection cannot fall through to primary hunk authority" {
         },
     }, .{ .width = 100, .height = 12 });
     harness.repo_root = "/repo";
-    _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    _ = harness.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
-    try harness.pages.review.git_status.replace("/repo", &status_bundle);
-    harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    try harness.pages.changes.git_status.replace("/repo", &status_bundle);
+    harness.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            harness.pages.review.activation.currentIdentity().?,
+            harness.pages.changes.activation.currentIdentity().?,
             1,
             "/repo",
             "a",
@@ -3016,26 +3016,26 @@ test "invalid cached projection cannot fall through to primary hunk authority" {
         .value = .{ .cached_diff = cached },
     });
     cached_owned = false;
-    defer harness.pages.review.deinit(allocator);
+    defer harness.pages.changes.deinit(allocator);
 
-    try std.testing.expect(harness.view().displayedReviewBody() == .inert_invalid_utf8);
+    try std.testing.expect(harness.view().displayedChangesBody() == .inert_invalid_utf8);
     try std.testing.expect(!harness.view().bodyAllowsHunkInteraction());
     try std.testing.expect(harness.view().activeCachedDiffProjection() == null);
     try std.testing.expect(harness.view().displayedDiffFile() == null);
     try std.testing.expect(harness.view().selectedHunkIndex() == null);
-    harness.pages.review.viewer.diff_scroll = 99;
-    harness.pages.review.viewer.diff_horizontal_scroll = 99;
+    harness.pages.changes.viewer.diff_scroll = 99;
+    harness.pages.changes.viewer.diff_horizontal_scroll = 99;
     harness.controller().clampDiffNavigation();
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     harness.controller().moveDiffCursorPage(.down);
     harness.controller().scrollDiff(.down);
     harness.controller().scrollDiffHorizontal(.right);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(harness.pages.review.selection_owner == .none);
+    try std.testing.expect(harness.pages.changes.selection_owner == .none);
 }
 
 test "either invalid combined component remains inert without primary navigation fallback" {
@@ -3077,13 +3077,13 @@ test "either invalid combined component remains inert without primary navigation
             },
         }, .{ .width = 100, .height = 12 });
         harness.repo_root = "/repo";
-        _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+        _ = harness.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
         var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
-        try harness.pages.review.git_status.replace("/repo", &status_bundle);
-        harness.pages.review.review_projection.installReady(.{
-            .request = try review_projection.testing.cloneRequest(
+        try harness.pages.changes.git_status.replace("/repo", &status_bundle);
+        harness.pages.changes.changes_projection.installReady(.{
+            .request = try changes_projection.testing.cloneRequest(
                 allocator,
-                harness.pages.review.activation.currentIdentity().?,
+                harness.pages.changes.activation.currentIdentity().?,
                 1,
                 "/repo",
                 "a",
@@ -3099,9 +3099,9 @@ test "either invalid combined component remains inert without primary navigation
         });
         cached_owned = false;
         unstaged_owned = false;
-        defer harness.pages.review.deinit(allocator);
+        defer harness.pages.changes.deinit(allocator);
 
-        try std.testing.expect(harness.view().displayedReviewBody() == .inert_invalid_utf8);
+        try std.testing.expect(harness.view().displayedChangesBody() == .inert_invalid_utf8);
         try std.testing.expect(harness.view().activeCombinedProjection() == null);
         try std.testing.expect(harness.view().displayedDiffFile() == null);
         try std.testing.expect(harness.view().selectedHunkIndex() == null);
@@ -3112,9 +3112,9 @@ test "either invalid combined component remains inert without primary navigation
         harness.controller().scrollDiffHorizontal(.right);
         harness.controller().selectHunkDelta(1);
         harness.controller().toggleSelectedHunkFold();
-        try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.review.viewer.diff_cursor);
-        try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_scroll);
-        try std.testing.expectEqual(@as(usize, 0), harness.pages.review.viewer.diff_horizontal_scroll);
+        try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
+        try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     }
 }
 
@@ -3127,19 +3127,19 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .display_mode = .unified, .sidebar_hidden = true },
     }, .{ .width = 100, .height = 12 });
     cached_harness.repo_root = "/repo";
-    _ = cached_harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    _ = cached_harness.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
     var cached_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
-    try cached_harness.pages.review.git_status.replace("/repo", &cached_status);
-    cached_harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(allocator, cached_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .cached_diff, .unstaged, 0, 0),
+    try cached_harness.pages.changes.git_status.replace("/repo", &cached_status);
+    cached_harness.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(allocator, cached_harness.pages.changes.activation.currentIdentity().?, 1, "/repo", "a", .cached_diff, .unstaged, 0, 0),
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_support.diff_cached_projection) },
     });
-    defer cached_harness.pages.review.deinit(allocator);
+    defer cached_harness.pages.changes.deinit(allocator);
     const cached_raw = cached_harness.view().rawDiffPaneGeometry().?;
     const cached_content_width = contentWidth(cached_raw.width);
     const cached_text = cached_raw.col + (cached_raw.width - cached_content_width) + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .unified);
     cached_harness.controller().pressDiffMouse(.{ .col = cached_text + 1, .row = diff_render.body_start_row + 1 });
-    const cached_selection = cached_harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const cached_selection = cached_harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Mode.character, cached_selection.mode);
     try std.testing.expect(cached_selection.identity == .projection_file);
     try std.testing.expect(cached_selection.identity.projection_file.kind == .cached);
@@ -3150,9 +3150,9 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified, .sidebar_hidden = true },
     }, .{ .width = 100, .height = 12 });
     combined_harness.repo_root = "/repo";
-    _ = combined_harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    _ = combined_harness.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
     var combined_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
-    try combined_harness.pages.review.git_status.replace("/repo", &combined_status);
+    try combined_harness.pages.changes.git_status.replace("/repo", &combined_status);
     var cached_bundle = try app_load.buildLoadedBundle(allocator, test_support.diff_cached_projection);
     var cached_owned = true;
     defer if (cached_owned) cached_bundle.deinit();
@@ -3177,8 +3177,8 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
         cached_bundle.loaded.document.files[0],
         unstaged_bundle.loaded.document.files[0],
     );
-    combined_harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(allocator, combined_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .combined_hunks, .unstaged, 0, 0),
+    combined_harness.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(allocator, combined_harness.pages.changes.activation.currentIdentity().?, 1, "/repo", "a", .combined_hunks, .unstaged, 0, 0),
         .value = .{ .combined_hunks = .{
             .presentation = .{
                 .arena = presentation_arena,
@@ -3203,12 +3203,12 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
     unstaged_owned = false;
     cached_authority_owned = false;
     unstaged_authority_owned = false;
-    defer combined_harness.pages.review.deinit(allocator);
+    defer combined_harness.pages.changes.deinit(allocator);
     const combined_raw = combined_harness.view().rawDiffPaneGeometry().?;
     const combined_content_width = contentWidth(combined_raw.width);
     const combined_text = combined_raw.col + (combined_raw.width - combined_content_width) + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .unified);
     combined_harness.controller().pressDiffMouse(.{ .col = combined_text + 1, .row = diff_render.body_start_row + 1 });
-    const combined_selection = combined_harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const combined_selection = combined_harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expect(combined_selection.identity == .projection_file);
     try std.testing.expect(combined_selection.identity.projection_file.kind == .combined);
 
@@ -3218,25 +3218,25 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .display_mode = .unified, .sidebar_hidden = true },
     }, .{ .width = 100, .height = 12 });
     generated_harness.repo_root = "/repo";
-    _ = generated_harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
+    _ = generated_harness.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
     var generated_status = try git_status.StatusBundle.parseOwned(allocator, "?? a\x00");
-    try generated_harness.pages.review.git_status.replace("/repo", &generated_status);
-    generated_harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(allocator, generated_harness.pages.review.activation.currentIdentity().?, 1, "/repo", "a", .generated_added_file, .unstaged, 0, 0),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(allocator, "a", "ABCDEFG\n") },
+    try generated_harness.pages.changes.git_status.replace("/repo", &generated_status);
+    generated_harness.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(allocator, generated_harness.pages.changes.activation.currentIdentity().?, 1, "/repo", "a", .generated_added_file, .unstaged, 0, 0),
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(allocator, "a", "ABCDEFG\n") },
     });
-    defer generated_harness.pages.review.deinit(allocator);
+    defer generated_harness.pages.changes.deinit(allocator);
     const generated_raw = generated_harness.view().rawDiffPaneGeometry().?;
     const generated_content_width = contentWidth(generated_raw.width);
     const generated_text = generated_raw.col + (generated_raw.width - generated_content_width) + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .unified);
     generated_harness.controller().pressDiffMouse(.{ .col = generated_text + 3, .row = diff_render.body_start_row });
-    const generated_selection = generated_harness.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    const generated_selection = generated_harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expect(generated_selection.identity == .generated_file);
     try std.testing.expectEqual(diff_selection.Mode.character, generated_selection.mode);
     try std.testing.expectEqual(@as(usize, 3), generated_selection.anchor.leading);
 }
 
-test "Review navigation snapshot and reload restore share the page owner" {
+test "Changes navigation snapshot and reload restore share the page owner" {
     const allocator = std.testing.allocator;
     var harness = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffOne()),
@@ -3259,7 +3259,7 @@ test "Review navigation snapshot and reload restore share the page owner" {
     try std.testing.expectEqual(@as(usize, 4), snapshot.diff_scroll);
     try std.testing.expectEqual(@as(?usize, 6), snapshot.search_match_offset);
 
-    var anchor: review_page.ReloadAnchor = .{
+    var anchor: changes_page.ReloadAnchor = .{
         .path_key = try allocator.dupe(u8, "a"),
         .sidebar_identity = .{ .file = try allocator.dupe(u8, "a") },
         .selected_target_tag = .diff_file,
@@ -3273,25 +3273,25 @@ test "Review navigation snapshot and reload restore share the page owner" {
     };
     defer anchor.deinit(allocator);
 
-    harness.pages.review.viewer.diff_cursor = .{ .metadata = 0 };
-    harness.pages.review.viewer.diff_scroll = 0;
-    harness.pages.review.viewer.diff_horizontal_scroll = 0;
-    harness.pages.review.viewer.sidebar_horizontal_scroll = 0;
-    harness.pages.review.search.match = null;
-    harness.pages.review.search.match_offset = null;
+    harness.pages.changes.viewer.diff_cursor = .{ .metadata = 0 };
+    harness.pages.changes.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_horizontal_scroll = 0;
+    harness.pages.changes.viewer.sidebar_horizontal_scroll = 0;
+    harness.pages.changes.search.match = null;
+    harness.pages.changes.search.match_offset = null;
 
     const loaded = harness.controller().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     try std.testing.expect(harness.controller().restoreReloadAnchor(loaded, &anchor));
-    try std.testing.expectEqual(snapshot.diff_cursor, harness.pages.review.viewer.diff_cursor);
-    try std.testing.expect(harness.pages.review.viewer.diff_scroll >= snapshot.diff_scroll);
+    try std.testing.expectEqual(snapshot.diff_cursor, harness.pages.changes.viewer.diff_cursor);
+    try std.testing.expect(harness.pages.changes.viewer.diff_scroll >= snapshot.diff_scroll);
     try std.testing.expect(harness.view().visibleDiffCursorOffset() != null);
-    try std.testing.expect(harness.pages.review.viewer.diff_horizontal_scroll <= snapshot.diff_horizontal_scroll);
-    try std.testing.expect(harness.pages.review.viewer.sidebar_horizontal_scroll <= snapshot.sidebar_horizontal_scroll);
+    try std.testing.expect(harness.pages.changes.viewer.diff_horizontal_scroll <= snapshot.diff_horizontal_scroll);
+    try std.testing.expect(harness.pages.changes.viewer.sidebar_horizontal_scroll <= snapshot.sidebar_horizontal_scroll);
 }
 
 test "sidebar visibility toggle uses full diff width and keeps selection" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .focus = .sidebar,
@@ -3302,89 +3302,89 @@ test "sidebar visibility toggle uses full diff width and keeps selection" {
         .terminal_size = .{ .width = 80, .height = 8 },
     };
 
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.reviewNavigationView().effectiveDisplayMode());
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
 
-    app.reviewNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility();
 
-    try std.testing.expect(app.pages.review.viewer.sidebar_hidden);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
+    try std.testing.expect(app.pages.changes.viewer.sidebar_hidden);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.changesNavigationView().effectiveDisplayMode());
 
-    app.reviewNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility();
 
-    try std.testing.expect(!app.pages.review.viewer.sidebar_hidden);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.reviewNavigationView().effectiveDisplayMode());
+    try std.testing.expect(!app.pages.changes.viewer.sidebar_hidden);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
 }
 
 test "sidebar width adjustment clamps and affects effective mode" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .display_mode = .side_by_side },
         } },
         .terminal_size = .{ .width = 104, .height = 8 },
     };
 
-    try std.testing.expectEqual(@as(?u16, null), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.reviewNavigationView().effectiveDisplayMode());
+    try std.testing.expectEqual(@as(?u16, null), app.pages.changes.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
 
-    app.reviewNavigation().adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(?u16, 30), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.reviewNavigationView().effectiveDisplayMode());
+    app.changesNavigation().adjustSidebarWidth(.shrink);
+    try std.testing.expectEqual(@as(?u16, 30), app.pages.changes.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
 
-    app.reviewNavigation().adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
+    app.changesNavigation().adjustSidebarWidth(.shrink);
+    try std.testing.expectEqual(@as(?u16, 26), app.pages.changes.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.changesNavigationView().effectiveDisplayMode());
 
-    app.reviewNavigation().adjustSidebarWidth(.grow);
-    try std.testing.expectEqual(@as(?u16, 30), app.pages.review.viewer.sidebar_width);
+    app.changesNavigation().adjustSidebarWidth(.grow);
+    try std.testing.expectEqual(@as(?u16, 30), app.pages.changes.viewer.sidebar_width);
 }
 
 test "sidebar width remains stored while sidebar is hidden" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .display_mode = .side_by_side },
         } },
         .terminal_size = .{ .width = 104, .height = 8 },
     };
 
-    app.reviewNavigation().adjustSidebarWidth(.shrink);
-    app.reviewNavigation().toggleSidebarVisibility();
-    app.reviewNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().toggleSidebarVisibility();
+    app.changesNavigation().adjustSidebarWidth(.shrink);
 
-    try std.testing.expect(app.pages.review.viewer.sidebar_hidden);
-    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
+    try std.testing.expect(app.pages.changes.viewer.sidebar_hidden);
+    try std.testing.expectEqual(@as(?u16, 26), app.pages.changes.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.changesNavigationView().effectiveDisplayMode());
 
-    app.reviewNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility();
 
-    try std.testing.expect(!app.pages.review.viewer.sidebar_hidden);
-    try std.testing.expectEqual(@as(?u16, 26), app.pages.review.viewer.sidebar_width);
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
+    try std.testing.expect(!app.pages.changes.viewer.sidebar_hidden);
+    try std.testing.expectEqual(@as(?u16, 26), app.pages.changes.viewer.sidebar_width);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.changesNavigationView().effectiveDisplayMode());
 }
 
 test "horizontal scroll uses diff focus arrows and clamps to visible text" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
             .viewer = .{ .focus = .diff, .display_mode = .unified },
         } },
         .terminal_size = .{ .width = 80, .height = 12 },
     };
 
-    app.reviewNavigation().scrollDiffHorizontal(.right);
-    try std.testing.expectEqual(@as(usize, 8), app.pages.review.viewer.diff_horizontal_scroll);
+    app.changesNavigation().scrollDiffHorizontal(.right);
+    try std.testing.expectEqual(@as(usize, 8), app.pages.changes.viewer.diff_horizontal_scroll);
 
-    for (0..20) |_| app.reviewNavigation().scrollDiffHorizontal(.right);
-    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll > 0);
-    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.reviewNavigationView().visibleBodyTextMaxHorizontalScroll());
+    for (0..20) |_| app.changesNavigation().scrollDiffHorizontal(.right);
+    try std.testing.expect(app.pages.changes.viewer.diff_horizontal_scroll > 0);
+    try std.testing.expect(app.pages.changes.viewer.diff_horizontal_scroll <= app.changesNavigationView().visibleBodyTextMaxHorizontalScroll());
 
-    app.reviewNavigation().scrollDiffHorizontal(.left);
-    try std.testing.expect(app.pages.review.viewer.diff_horizontal_scroll <= app.reviewNavigationView().visibleBodyTextMaxHorizontalScroll());
+    app.changesNavigation().scrollDiffHorizontal(.left);
+    try std.testing.expect(app.pages.changes.viewer.diff_horizontal_scroll <= app.changesNavigationView().visibleBodyTextMaxHorizontalScroll());
 }
 
 test "displayed body horizontal scroll preserves primary behavior without a cached index" {
@@ -3396,15 +3396,15 @@ test "displayed body horizontal scroll preserves primary behavior without a cach
         },
     }, .{ .width = 80, .height = 12 });
 
-    try std.testing.expect(harness.view().displayedReviewBody() == .primary);
+    try std.testing.expect(harness.view().displayedChangesBody() == .primary);
     try expectResolverRenderOmits(&harness, "hunks");
     try std.testing.expect(harness.view().displayedDiffLineIndex(.unified) == null);
     const with_line_numbers = harness.view().visibleBodyTextMaxHorizontalScroll();
     try std.testing.expectEqual(@as(usize, 35), with_line_numbers);
 
     harness.controller().scrollDiffHorizontal(.right);
-    try std.testing.expectEqual(@as(usize, 8), harness.pages.review.viewer.diff_horizontal_scroll);
-    harness.pages.review.viewer.view_options.line_numbers = false;
+    try std.testing.expectEqual(@as(usize, 8), harness.pages.changes.viewer.diff_horizontal_scroll);
+    harness.pages.changes.viewer.view_options.line_numbers = false;
     try std.testing.expectEqual(@as(usize, 25), harness.view().visibleBodyTextMaxHorizontalScroll());
 }
 
@@ -3426,22 +3426,22 @@ test "displayed body horizontal scroll uses cached combined retained and generat
     );
     try std.testing.expect(cached_bundle.loaded.collapsed_hunks.len > 0);
     cached_bundle.loaded.collapsed_hunks[0] = true;
-    cached.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    cached.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            cached.pages.review.activation.currentIdentity().?,
+            cached.pages.changes.activation.currentIdentity().?,
             1,
             "/repo",
             "a",
             .cached_diff,
             .unstaged,
-            cached.pages.review.source_session_revision,
-            cached.pages.review.status_snapshot_revision,
+            cached.pages.changes.source_session_revision,
+            cached.pages.changes.status_snapshot_revision,
         ),
         .value = .{ .cached_diff = cached_bundle },
     });
-    defer cached.pages.review.deinit(allocator);
-    try std.testing.expect(cached.view().displayedReviewBody() == .cached);
+    defer cached.pages.changes.deinit(allocator);
+    try std.testing.expect(cached.view().displayedChangesBody() == .cached);
     const cached_target = cached.view().resolvedTarget();
     try std.testing.expectEqual(diff_surface.ReducedBodyKind.projected, cached_target.kind);
     try std.testing.expect(cached_target.line_count > 0);
@@ -3464,8 +3464,8 @@ test "displayed body horizontal scroll uses cached combined retained and generat
     }, .{ .width = 140, .height = 16 });
     try prepareStatusOnlyHorizontalScrollHarness(&combined, allocator, "MM a\x00");
     try installCombinedHorizontalScrollProjection(&combined, allocator);
-    defer combined.pages.review.deinit(allocator);
-    try std.testing.expect(combined.view().displayedReviewBody() == .combined);
+    defer combined.pages.changes.deinit(allocator);
+    try std.testing.expect(combined.view().displayedChangesBody() == .combined);
     const combined_target = combined.view().resolvedTarget();
     try std.testing.expectEqual(diff_surface.ReducedBodyKind.projected, combined_target.kind);
     try std.testing.expectEqual(@as(usize, 0), combined_target.line_count);
@@ -3487,10 +3487,10 @@ test "displayed body horizontal scroll uses cached combined retained and generat
     try prepareStatusOnlyHorizontalScrollHarness(&retained, allocator, "MM a\x00");
     try installCombinedHorizontalScrollProjection(&retained, allocator);
     var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
-    try retained.pages.review.git_status.replace("/repo", &staged_status);
+    try retained.pages.changes.git_status.replace("/repo", &staged_status);
     try retainCombinedHorizontalScrollProjection(&retained, allocator);
-    defer retained.pages.review.deinit(allocator);
-    try std.testing.expect(retained.view().displayedReviewBody() == .retained_staged_only);
+    defer retained.pages.changes.deinit(allocator);
+    try std.testing.expect(retained.view().displayedChangesBody() == .retained_staged_only);
     const retained_target = retained.view().resolvedTarget();
     try std.testing.expectEqual(diff_surface.ReducedBodyKind.projected, retained_target.kind);
     try std.testing.expectEqual(@as(usize, 0), retained_target.line_count);
@@ -3510,26 +3510,26 @@ test "displayed body horizontal scroll uses cached combined retained and generat
         },
     }, .{ .width = 140, .height = 16 });
     try prepareStatusOnlyHorizontalScrollHarness(&generated, allocator, "?? a\x00");
-    generated.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    generated.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            generated.pages.review.activation.currentIdentity().?,
+            generated.pages.changes.activation.currentIdentity().?,
             1,
             "/repo",
             "a",
             .generated_added_file,
             .unstaged,
-            generated.pages.review.source_session_revision,
-            generated.pages.review.status_snapshot_revision,
+            generated.pages.changes.source_session_revision,
+            generated.pages.changes.status_snapshot_revision,
         ),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(
             allocator,
             "a",
             displayed_body_horizontal_scroll_wide_text ++ "\n",
         ) },
     });
-    defer generated.pages.review.deinit(allocator);
-    try std.testing.expect(generated.view().displayedReviewBody() == .generated);
+    defer generated.pages.changes.deinit(allocator);
+    try std.testing.expect(generated.view().displayedChangesBody() == .generated);
     const generated_target = generated.view().resolvedTarget();
     try std.testing.expectEqual(diff_surface.ReducedBodyKind.projected, generated_target.kind);
     try std.testing.expect(generated_target.line_count > 0);
@@ -3567,36 +3567,36 @@ test "displayed body horizontal scroll follows generated visible rows" {
         },
     }, .{ .width = 80, .height = 12 });
     try prepareStatusOnlyHorizontalScrollHarness(&harness, allocator, "?? a\x00");
-    harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    harness.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            harness.pages.review.activation.currentIdentity().?,
+            harness.pages.changes.activation.currentIdentity().?,
             1,
             "/repo",
             "a",
             .generated_added_file,
             .unstaged,
-            harness.pages.review.source_session_revision,
-            harness.pages.review.status_snapshot_revision,
+            harness.pages.changes.source_session_revision,
+            harness.pages.changes.status_snapshot_revision,
         ),
-        .value = .{ .generated_added_file = try review_projection.generatedFileFromContent(
+        .value = .{ .generated_added_file = try changes_projection.generatedFileFromContent(
             allocator,
             "a",
             content,
         ) },
     });
-    defer harness.pages.review.deinit(allocator);
+    defer harness.pages.changes.deinit(allocator);
 
     try std.testing.expect(harness.view().diffVisibleRows() > 0);
     try std.testing.expect(harness.view().diffVisibleRows() < 12);
     try std.testing.expectEqual(@as(usize, 0), harness.view().visibleBodyTextMaxHorizontalScroll());
 
-    harness.pages.review.viewer.diff_scroll = 12;
+    harness.pages.changes.viewer.diff_scroll = 12;
     const visible_max = harness.view().visibleBodyTextMaxHorizontalScroll();
     try std.testing.expect(visible_max > 0);
-    harness.pages.review.viewer.diff_horizontal_scroll = std.math.maxInt(usize);
+    harness.pages.changes.viewer.diff_horizontal_scroll = std.math.maxInt(usize);
     harness.controller().clampDiffHorizontalScrollToVisibleRows();
-    try std.testing.expectEqual(visible_max, harness.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(visible_max, harness.pages.changes.viewer.diff_horizontal_scroll);
 }
 
 test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
@@ -3607,8 +3607,8 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .sidebar_hidden = true },
     }, .{ .width = 80, .height = 12 });
     try prepareStatusOnlyHorizontalScrollHarness(&none, allocator, "M  a\x00");
-    defer none.pages.review.deinit(allocator);
-    try std.testing.expect(none.view().displayedReviewBody() == .none);
+    defer none.pages.changes.deinit(allocator);
+    try std.testing.expect(none.view().displayedChangesBody() == .none);
     try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
         .kind = .none,
         .line_count = 0,
@@ -3619,28 +3619,28 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
         .folded_hunks_source = .underlying_load,
     }, none.view().resolvedTarget());
     try expectResolverRenderOmits(&none, "status:");
-    none.pages.review.viewer.diff_horizontal_scroll = 99;
+    none.pages.changes.viewer.diff_horizontal_scroll = 99;
     none.controller().clampDiffHorizontalScrollToVisibleRows();
-    try std.testing.expectEqual(@as(usize, 0), none.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 0), none.pages.changes.viewer.diff_horizontal_scroll);
 
     var pending = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffWide()),
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .sidebar_hidden = true },
     }, .{ .width = 80, .height = 12 });
     try prepareStatusOnlyHorizontalScrollHarness(&pending, allocator, "M  a\x00");
-    pending.pages.review.review_projection.pending = try review_projection.testing.cloneRequest(
+    pending.pages.changes.changes_projection.pending = try changes_projection.testing.cloneRequest(
         allocator,
-        pending.pages.review.activation.currentIdentity().?,
+        pending.pages.changes.activation.currentIdentity().?,
         1,
         "/repo",
         "a",
         .cached_diff,
         .unstaged,
-        pending.pages.review.source_session_revision,
-        pending.pages.review.status_snapshot_revision,
+        pending.pages.changes.source_session_revision,
+        pending.pages.changes.status_snapshot_revision,
     );
-    defer pending.pages.review.deinit(allocator);
-    try std.testing.expect(pending.view().displayedReviewBody() == .pending);
+    defer pending.pages.changes.deinit(allocator);
+    try std.testing.expect(pending.view().displayedChangesBody() == .pending);
     try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
         .kind = .projected,
         .line_count = 0,
@@ -3650,7 +3650,7 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
         .search_unfold_policy = .suppressed,
         .folded_hunks_source = .underlying_load,
     }, pending.view().resolvedTarget());
-    try expectResolverRenderContains(&pending, "Loading review projection...");
+    try expectResolverRenderContains(&pending, "Loading changes projection...");
     try std.testing.expectEqual(@as(usize, 0), pending.view().visibleBodyTextMaxHorizontalScroll());
 
     var status = TestHarness.init(.{
@@ -3658,27 +3658,27 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .sidebar_hidden = true },
     }, .{ .width = 80, .height = 12 });
     try prepareStatusOnlyHorizontalScrollHarness(&status, allocator, "M  a\x00");
-    status.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    status.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            status.pages.review.activation.currentIdentity().?,
+            status.pages.changes.activation.currentIdentity().?,
             1,
             "/repo",
             "a",
             .cached_diff,
             .unstaged,
-            status.pages.review.source_session_revision,
-            status.pages.review.status_snapshot_revision,
+            status.pages.changes.source_session_revision,
+            status.pages.changes.status_snapshot_revision,
         ),
-        .value = .{ .status_body = try review_projection.statusBodyAlloc(
+        .value = .{ .status_body = try changes_projection.statusBodyAlloc(
             allocator,
             "a",
             "No staged diff.",
             .{},
         ) },
     });
-    defer status.pages.review.deinit(allocator);
-    try std.testing.expect(status.view().displayedReviewBody() == .status);
+    defer status.pages.changes.deinit(allocator);
+    try std.testing.expect(status.view().displayedChangesBody() == .status);
     try std.testing.expectEqual(@as(usize, 1), status.view().displayedDiffLineCount());
     try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
         .kind = .projected,
@@ -3691,10 +3691,10 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
     }, status.view().resolvedTarget());
     try expectResolverRenderContains(&status, "No staged diff.");
     try std.testing.expectEqual(@as(usize, 0), status.view().visibleBodyTextMaxHorizontalScroll());
-    const status_cursor = status.pages.review.viewer.diff_cursor;
+    const status_cursor = status.pages.changes.viewer.diff_cursor;
     status.controller().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 0), status.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(status_cursor, status.pages.review.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), status.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(status_cursor, status.pages.changes.viewer.diff_cursor);
 
     const invalid_patch =
         "diff --git a/a b/a\n" ++
@@ -3708,22 +3708,22 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
         .viewer = .{ .selected_target = .{ .status_only = 0 }, .sidebar_hidden = true },
     }, .{ .width = 80, .height = 12 });
     try prepareStatusOnlyHorizontalScrollHarness(&inert, allocator, "M  a\x00");
-    inert.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    inert.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            inert.pages.review.activation.currentIdentity().?,
+            inert.pages.changes.activation.currentIdentity().?,
             1,
             "/repo",
             "a",
             .cached_diff,
             .unstaged,
-            inert.pages.review.source_session_revision,
-            inert.pages.review.status_snapshot_revision,
+            inert.pages.changes.source_session_revision,
+            inert.pages.changes.status_snapshot_revision,
         ),
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, invalid_patch) },
     });
-    defer inert.pages.review.deinit(allocator);
-    try std.testing.expect(inert.view().displayedReviewBody() == .inert_invalid_utf8);
+    defer inert.pages.changes.deinit(allocator);
+    try std.testing.expect(inert.view().displayedChangesBody() == .inert_invalid_utf8);
     try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
         .kind = .inert,
         .line_count = 1,
@@ -3747,24 +3747,24 @@ test "none body preserves underlying folded hunks through resolver seam" {
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     }, .{ .width = 80, .height = 12 });
     harness.repo_root = "/repo";
-    _ = harness.pages.review.activation.activate(0, .fresh, .fresh, .fresh);
-    harness.pages.review.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    _ = harness.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
+    harness.pages.changes.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            harness.pages.review.activation.currentIdentity().?,
+            harness.pages.changes.activation.currentIdentity().?,
             1,
             "/repo",
             "a",
             .cached_diff,
             .unstaged,
-            harness.pages.review.source_session_revision,
-            harness.pages.review.status_snapshot_revision,
+            harness.pages.changes.source_session_revision,
+            harness.pages.changes.status_snapshot_revision,
         ),
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, "") },
     });
-    defer harness.pages.review.deinit(allocator);
+    defer harness.pages.changes.deinit(allocator);
 
-    try std.testing.expect(harness.view().displayedReviewBody() == .none);
+    try std.testing.expect(harness.view().displayedChangesBody() == .none);
     try std.testing.expectEqual(diff_surface.FoldedHunksSource.underlying_load, harness.view().resolvedTarget().folded_hunks_source);
     try std.testing.expectEqualSlices(bool, &collapsed, harness.view().selectedFoldedHunks());
     const snapshot = harness.view().displayNavigationSnapshot();
@@ -3783,7 +3783,7 @@ test "none body preserves underlying folded hunks through resolver seam" {
 
 test "layout changes reset horizontal scroll only when diff pane width changes" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
             .viewer = .{
                 .display_mode = .side_by_side,
@@ -3793,22 +3793,22 @@ test "layout changes reset horizontal scroll only when diff pane width changes" 
         .terminal_size = .{ .width = 100, .height = 8 },
     };
 
-    app.reviewNavigation().toggleSidebarVisibility();
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
+    app.changesNavigation().toggleSidebarVisibility();
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_horizontal_scroll);
 
-    app.pages.review.viewer.diff_horizontal_scroll = 16;
-    app.reviewNavigation().adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(usize, 16), app.pages.review.viewer.diff_horizontal_scroll);
+    app.pages.changes.viewer.diff_horizontal_scroll = 16;
+    app.changesNavigation().adjustSidebarWidth(.shrink);
+    try std.testing.expectEqual(@as(usize, 16), app.pages.changes.viewer.diff_horizontal_scroll);
 
-    app.reviewNavigation().toggleSidebarVisibility();
-    app.pages.review.viewer.diff_horizontal_scroll = 16;
-    app.reviewNavigation().adjustSidebarWidth(.shrink);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_horizontal_scroll);
+    app.changesNavigation().toggleSidebarVisibility();
+    app.pages.changes.viewer.diff_horizontal_scroll = 16;
+    app.changesNavigation().adjustSidebarWidth(.shrink);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_horizontal_scroll);
 }
 
 test "search resync without pane width change keeps horizontal scroll" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
             .viewer = .{
                 .display_mode = .side_by_side,
@@ -3819,17 +3819,17 @@ test "search resync without pane width change keeps horizontal scroll" {
     };
 
     setDiffSearchQuery(&app, "wide");
-    app.reviewNavigation().submitSearch();
-    app.pages.review.viewer.diff_horizontal_scroll = 16;
+    app.changesNavigation().submitSearch();
+    app.pages.changes.viewer.diff_horizontal_scroll = 16;
 
-    app.reviewNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().adjustSidebarWidth(.shrink);
 
-    try std.testing.expectEqual(@as(usize, 16), app.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 16), app.pages.changes.viewer.diff_horizontal_scroll);
 }
 
 test "diff wheel scroll brings an invisible cursor into the moved viewport" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
@@ -3843,14 +3843,14 @@ test "diff wheel scroll brings an invisible cursor into the moved viewport" {
 
     try std.testing.expect(app.visibleDiffCursorOffset() == null);
 
-    app.reviewNavigation().scrollDiff(.down);
+    app.changesNavigation().scrollDiff(.down);
 
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
 
 test "diff wheel comfort keeps band cursor screen position stable" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
@@ -3860,22 +3860,22 @@ test "diff wheel comfort keeps band cursor screen position stable" {
         } },
         .terminal_size = .{ .width = 140, .height = 15 },
     };
-    const old_scroll = app.pages.review.viewer.diff_scroll;
-    const visible_rows = app.reviewNavigationView().diffVisibleRows();
+    const old_scroll = app.pages.changes.viewer.diff_scroll;
+    const visible_rows = app.changesNavigationView().diffVisibleRows();
     const margin = @min(@as(usize, 8), visible_rows / 3);
     const old_offset = old_scroll + margin;
-    app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
+    app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
 
-    app.reviewNavigation().scrollDiff(.down);
+    app.changesNavigation().scrollDiff(.down);
 
-    const new_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    try std.testing.expectEqual(old_scroll + 1, app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.pages.review.viewer.diff_scroll);
+    const new_offset = app.changesNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
+    try std.testing.expectEqual(old_scroll + 1, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.pages.changes.viewer.diff_scroll);
 }
 
 test "diff wheel comfort recenters edge cursor only after viewport movement" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
@@ -3884,36 +3884,36 @@ test "diff wheel comfort recenters edge cursor only after viewport movement" {
         } },
         .terminal_size = .{ .width = 140, .height = 15 },
     };
-    const line_count = app.reviewNavigationView().selectedFileLineIndex(app.reviewNavigationView().effectiveDisplayMode()).lineCount();
-    const visible_rows = app.reviewNavigationView().diffVisibleRows();
+    const line_count = app.changesNavigationView().selectedFileLineIndex(app.changesNavigationView().effectiveDisplayMode()).lineCount();
+    const visible_rows = app.changesNavigationView().diffVisibleRows();
 
-    app.pages.review.viewer.diff_scroll = 0;
-    app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
-    const cursor_at_bof = app.pages.review.viewer.diff_cursor;
-    app.reviewNavigation().scrollDiff(.up);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(cursor_at_bof, app.pages.review.viewer.diff_cursor);
+    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
+    const cursor_at_bof = app.pages.changes.viewer.diff_cursor;
+    app.changesNavigation().scrollDiff(.up);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(cursor_at_bof, app.pages.changes.viewer.diff_cursor);
 
-    app.reviewNavigation().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.diff_scroll);
+    app.changesNavigation().scrollDiff(.down);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(
-        @min(app.pages.review.viewer.diff_scroll + visible_rows / 2, line_count - 1),
-        app.reviewNavigationView().selectedDiffCursorOffset().?,
+        @min(app.pages.changes.viewer.diff_scroll + visible_rows / 2, line_count - 1),
+        app.changesNavigationView().selectedDiffCursorOffset().?,
     );
 
-    app.pages.review.viewer.diff_scroll = line_count - visible_rows;
-    app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
-    app.reviewNavigation().scrollDiff(.up);
-    try std.testing.expectEqual(line_count - visible_rows - 1, app.pages.review.viewer.diff_scroll);
+    app.pages.changes.viewer.diff_scroll = line_count - visible_rows;
+    app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
+    app.changesNavigation().scrollDiff(.up);
+    try std.testing.expectEqual(line_count - visible_rows - 1, app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(
-        app.pages.review.viewer.diff_scroll + visible_rows / 2,
-        app.reviewNavigationView().selectedDiffCursorOffset().?,
+        app.pages.changes.viewer.diff_scroll + visible_rows / 2,
+        app.changesNavigationView().selectedDiffCursorOffset().?,
     );
 }
 
 test "diff row movement continues from wheel-synced visible cursor" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
@@ -3922,20 +3922,20 @@ test "diff row movement continues from wheel-synced visible cursor" {
         } },
         .terminal_size = .{ .width = 140, .height = 15 },
     };
-    const line_count = app.reviewNavigationView().selectedFileLineIndex(app.reviewNavigationView().effectiveDisplayMode()).lineCount();
-    app.pages.review.viewer.diff_scroll = 0;
-    app.pages.review.viewer.diff_cursor = app.reviewNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
+    const line_count = app.changesNavigationView().selectedFileLineIndex(app.changesNavigationView().effectiveDisplayMode()).lineCount();
+    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
 
-    app.reviewNavigation().scrollDiff(.down);
-    const synced_offset = app.reviewNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    app.reviewNavigation().moveDiffCursorRows(.down);
+    app.changesNavigation().scrollDiff(.down);
+    const synced_offset = app.changesNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
+    app.changesNavigation().moveDiffCursorRows(.down);
 
-    try std.testing.expectEqual(synced_offset + 1, app.reviewNavigationView().selectedDiffCursorOffset().?);
+    try std.testing.expectEqual(synced_offset + 1, app.changesNavigationView().selectedDiffCursorOffset().?);
 }
 
 test "diff header mouse press starts header path owner only on path target" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .side_by_side,
@@ -3945,24 +3945,24 @@ test "diff header mouse press starts header path owner only on path target" {
         .terminal_size = .{ .width = 140, .height = 10 },
     };
 
-    app.reviewNavigation().pressDiffMouse(.{ .col = 1, .row = 0 });
-    const header = app.pages.review.selection_owner.activeHeader() orelse return error.ExpectedHeaderSelection;
+    app.changesNavigation().pressDiffMouse(.{ .col = 1, .row = 0 });
+    const header = app.pages.changes.selection_owner.activeHeader() orelse return error.ExpectedHeaderSelection;
     try std.testing.expectEqual(diff_selection.HeaderKind.loaded_file, header.identity.kind);
     try std.testing.expectEqualStrings("a", header.identity.path_key);
 
-    app.reviewNavigation().dragDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.pages.review.selection_owner.activeHeader() != null);
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
+    app.changesNavigation().dragDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.pages.changes.selection_owner.activeHeader() != null);
+    try std.testing.expect(app.pages.changes.selection_owner.activeDiff() == null);
 
-    app.reviewNavigation().clearDiffSelection();
-    app.reviewNavigation().pressDiffMouse(.{ .col = 120, .row = 0 });
-    try std.testing.expect(app.pages.review.selection_owner.activeHeader() == null);
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
+    app.changesNavigation().clearDiffSelection();
+    app.changesNavigation().pressDiffMouse(.{ .col = 120, .row = 0 });
+    try std.testing.expect(app.pages.changes.selection_owner.activeHeader() == null);
+    try std.testing.expect(app.pages.changes.selection_owner.activeDiff() == null);
 }
 
 test "sidebar layout fallback clears active diff mouse drag" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .side_by_side,
@@ -3972,17 +3972,17 @@ test "sidebar layout fallback clears active diff mouse drag" {
         .terminal_size = .{ .width = 90, .height = 10 },
     };
 
-    app.reviewNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
+    app.changesNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.pages.changes.selection_owner.activeDiff() != null);
 
-    app.reviewNavigation().toggleSidebarVisibility();
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.reviewNavigationView().effectiveDisplayMode());
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
+    app.changesNavigation().toggleSidebarVisibility();
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
+    try std.testing.expect(app.pages.changes.selection_owner.activeDiff() == null);
 }
 
 test "sidebar width growth fallback clears active diff mouse drag" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .side_by_side,
@@ -3993,18 +3993,18 @@ test "sidebar width growth fallback clears active diff mouse drag" {
         .terminal_size = .{ .width = 110, .height = 10 },
     };
 
-    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.reviewNavigationView().effectiveDisplayMode());
-    app.reviewNavigation().pressDiffMouse(.{ .col = 37, .row = diff_render.body_start_row + 1 });
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() != null);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.changesNavigationView().effectiveDisplayMode());
+    app.changesNavigation().pressDiffMouse(.{ .col = 37, .row = diff_render.body_start_row + 1 });
+    try std.testing.expect(app.pages.changes.selection_owner.activeDiff() != null);
 
-    app.reviewNavigation().adjustSidebarWidth(.grow);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.reviewNavigationView().effectiveDisplayMode());
-    try std.testing.expect(app.pages.review.selection_owner.activeDiff() == null);
+    app.changesNavigation().adjustSidebarWidth(.grow);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
+    try std.testing.expect(app.pages.changes.selection_owner.activeDiff() == null);
 }
 
 test "diff scroll cursor sync keeps search state" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
@@ -4016,14 +4016,14 @@ test "diff scroll cursor sync keeps search state" {
         .terminal_size = .{ .width = 140, .height = 8 },
     };
     setDiffSearchQuery(&app, "late new");
-    app.reviewNavigation().submitSearch();
-    const old_match = app.pages.review.search.match orelse return error.ExpectedSearchMatch;
-    const old_match_offset = app.pages.review.search.match_offset;
+    app.changesNavigation().submitSearch();
+    const old_match = app.pages.changes.search.match orelse return error.ExpectedSearchMatch;
+    const old_match_offset = app.pages.changes.search.match_offset;
 
-    app.reviewNavigation().scrollDiff(.down);
+    app.changesNavigation().scrollDiff(.down);
 
-    try std.testing.expect(std.meta.eql(old_match, app.pages.review.search.match.?));
-    try std.testing.expectEqual(old_match_offset, app.pages.review.search.match_offset);
+    try std.testing.expect(std.meta.eql(old_match, app.pages.changes.search.match.?));
+    try std.testing.expectEqual(old_match_offset, app.pages.changes.search.match_offset);
 }
 
 test "display mode scroll remap preserves hunk-local ratio" {
@@ -4034,7 +4034,7 @@ test "display mode scroll remap preserves hunk-local ratio" {
     loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
 
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(loaded),
             .viewer = .{
                 .display_mode = .unified,
@@ -4044,12 +4044,12 @@ test "display mode scroll remap preserves hunk-local ratio" {
         .terminal_size = .{ .width = 140, .height = 8 },
     };
 
-    const old_index = app.reviewNavigationView().selectedFileLineIndex(.unified);
+    const old_index = app.changesNavigationView().selectedFileLineIndex(.unified);
     const old_scroll = old_index.hunkOffset(0) + 3;
-    const new_scroll = app.reviewNavigationView().remapDiffScrollForModeChange(.unified, .side_by_side, old_scroll);
+    const new_scroll = app.changesNavigationView().remapDiffScrollForModeChange(.unified, .side_by_side, old_scroll);
 
     const hunk_index = old_index.hunkIndexAtOffset(old_scroll) orelse return error.ExpectedHunkOffset;
-    const new_index = app.reviewNavigationView().selectedFileLineIndex(.side_by_side);
+    const new_index = app.changesNavigationView().selectedFileLineIndex(.side_by_side);
     const old_local = old_scroll - old_index.hunkOffset(hunk_index);
     const expected_local = old_local * (new_index.hunkLineCount(hunk_index) - 1) / (old_index.hunkLineCount(hunk_index) - 1);
     try std.testing.expectEqual(new_index.hunkOffset(hunk_index) + expected_local, new_scroll);
@@ -4057,7 +4057,7 @@ test "display mode scroll remap preserves hunk-local ratio" {
 
 test "mode change resyncs search match to rendered body offsets" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .display_mode = .unified },
         } },
@@ -4065,23 +4065,23 @@ test "mode change resyncs search match to rendered body offsets" {
     };
     setDiffSearchQuery(&app, "late new");
 
-    app.reviewNavigation().submitSearch();
+    app.changesNavigation().submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 9), app.pages.review.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 9), app.pages.changes.search.match_offset);
 
-    app.pages.review.viewer.display_mode = .side_by_side;
-    app.reviewNavigation().clampDiffNavigationKeepingHunkVisible();
-    app.reviewNavigation().updateSearchMatchOffset();
+    app.pages.changes.viewer.display_mode = .side_by_side;
+    app.changesNavigation().clampDiffNavigationKeepingHunkVisible();
+    app.changesNavigation().updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.pages.review.search.match_offset);
-    try std.testing.expect(app.pages.review.search.match_offset.? >= app.pages.review.viewer.diff_scroll);
-    try std.testing.expect(app.pages.review.search.match_offset.? < app.pages.review.viewer.diff_scroll + app.reviewNavigationView().diffVisibleRows());
+    try std.testing.expectEqual(@as(?usize, 7), app.pages.changes.search.match_offset);
+    try std.testing.expect(app.pages.changes.search.match_offset.? >= app.pages.changes.viewer.diff_scroll);
+    try std.testing.expect(app.pages.changes.search.match_offset.? < app.pages.changes.viewer.diff_scroll + app.changesNavigationView().diffVisibleRows());
 }
 
 test "mode change keeps search near later matches" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .display_mode = .unified },
         } },
@@ -4089,19 +4089,19 @@ test "mode change keeps search near later matches" {
     };
     setDiffSearchQuery(&app, "new");
 
-    app.reviewNavigation().submitSearch();
+    app.changesNavigation().submitSearch();
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
-    app.reviewNavigation().selectSearchMatch(.forward);
+    try std.testing.expectEqual(@as(?usize, 4), app.pages.changes.search.match_offset);
+    app.changesNavigation().selectSearchMatch(.forward);
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 9), app.pages.review.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 9), app.pages.changes.search.match_offset);
 
-    app.pages.review.viewer.display_mode = .side_by_side;
-    app.reviewNavigation().clampDiffNavigationKeepingHunkVisible();
-    app.reviewNavigation().updateSearchMatchOffset();
+    app.pages.changes.viewer.display_mode = .side_by_side;
+    app.changesNavigation().clampDiffNavigationKeepingHunkVisible();
+    app.changesNavigation().updateSearchMatchOffset();
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
-    try std.testing.expectEqual(@as(?usize, 7), app.pages.review.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 7), app.pages.changes.search.match_offset);
 }
 
 test "projection hunk fold authority denies cached projection mutation" {
@@ -4109,9 +4109,9 @@ test "projection hunk fold authority denies cached projection mutation" {
     var app = try initProjectionHunkFoldHarness(allocator);
     try prepareStatusOnlyHorizontalScrollHarness(&app, allocator, "M  a\x00");
     try installCachedHunkFoldProjection(&app, allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
 
-    try std.testing.expect(app.view().displayedReviewBody() == .cached);
+    try std.testing.expect(app.view().displayedChangesBody() == .cached);
     try expectProjectionHunkFoldDenied(&app, allocator);
 }
 
@@ -4120,9 +4120,9 @@ test "projection hunk fold authority denies combined projection mutation" {
     var app = try initProjectionHunkFoldHarness(allocator);
     try prepareStatusOnlyHorizontalScrollHarness(&app, allocator, "MM a\x00");
     try installCombinedHorizontalScrollProjection(&app, allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
 
-    try std.testing.expect(app.view().displayedReviewBody() == .combined);
+    try std.testing.expect(app.view().displayedChangesBody() == .combined);
     try expectProjectionHunkFoldDenied(&app, allocator);
 }
 
@@ -4132,11 +4132,11 @@ test "projection hunk fold authority denies retained staged-only projection muta
     try prepareStatusOnlyHorizontalScrollHarness(&app, allocator, "MM a\x00");
     try installCombinedHorizontalScrollProjection(&app, allocator);
     var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &staged_status);
+    try app.pages.changes.git_status.replace("/repo", &staged_status);
     try retainCombinedHorizontalScrollProjection(&app, allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
 
-    try std.testing.expect(app.view().displayedReviewBody() == .retained_staged_only);
+    try std.testing.expect(app.view().displayedChangesBody() == .retained_staged_only);
     try expectProjectionHunkFoldDenied(&app, allocator);
 }
 
@@ -4149,7 +4149,7 @@ test "folded coordinate offset uses display folds without a cached index" {
     loaded.collapsed_hunks[0] = true;
 
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -4160,7 +4160,7 @@ test "folded coordinate offset uses display folds without a cached index" {
     };
     defer app.clearLoadedDiff();
 
-    try std.testing.expect(app.reviewNavigationView().displayedDiffLineIndex(.unified) == null);
+    try std.testing.expect(app.changesNavigationView().displayedDiffLineIndex(.unified) == null);
     try std.testing.expectEqual(
         @as(?usize, diff_view_model.hunkBodyLineOffsetFolded(
             app_test_support.file_with_hunks,
@@ -4168,21 +4168,21 @@ test "folded coordinate offset uses display folds without a cached index" {
             1,
             &.{ true, false },
         )),
-        app.reviewNavigationView().selectedDiffCursorOffset(),
+        app.changesNavigationView().selectedDiffCursorOffset(),
     );
 
-    app.pages.review.viewer.diff_cursor = .{ .hunk_line = .{
+    app.pages.changes.viewer.diff_cursor = .{ .hunk_line = .{
         .hunk_index = 0,
         .line_index = 0,
     } };
-    try std.testing.expect(app.reviewNavigationView().selectedDiffCursorOffset() == null);
+    try std.testing.expect(app.changesNavigationView().selectedDiffCursorOffset() == null);
 
-    app.pages.review.viewer.keyboard_selection_side = .old;
+    app.pages.changes.viewer.keyboard_selection_side = .old;
     _ = try applySharedNavigation(&app, .document_last);
-    const line_count = app.reviewNavigationView().displayedDiffLineCount();
-    try std.testing.expectEqual(@as(?usize, line_count - 1), app.reviewNavigationView().selectedDiffCursorOffset());
+    const line_count = app.changesNavigationView().displayedDiffLineCount();
+    try std.testing.expectEqual(@as(?usize, line_count - 1), app.changesNavigationView().selectedDiffCursorOffset());
     try std.testing.expect(loaded.collapsed_hunks[0]);
-    try std.testing.expectEqual(diff_selection.Side.old, app.pages.review.viewer.keyboard_selection_side);
+    try std.testing.expectEqual(diff_selection.Side.old, app.pages.changes.viewer.keyboard_selection_side);
 }
 
 test "projection hunk fold authority preserves primary fold behavior" {
@@ -4194,7 +4194,7 @@ test "projection hunk fold authority preserves primary fold behavior" {
     loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
 
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .viewer = .{ .diff_cursor = .{ .hunk_line = .{
                 .hunk_index = 0,
@@ -4205,28 +4205,28 @@ test "projection hunk fold authority preserves primary fold behavior" {
     };
     defer app.clearLoadedDiff();
 
-    try std.testing.expect(app.reviewNavigationView().bodyAllowsHunkFold());
-    try std.testing.expectEqual(@as(usize, 10), app.reviewNavigationView().selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expect(app.changesNavigationView().bodyAllowsHunkFold());
+    try std.testing.expectEqual(@as(usize, 10), app.changesNavigationView().selectedFileLineIndex(.unified).lineCount());
     var controller = app.controller();
     var resolver = controller.bodyResolverAdapter();
     controller.sharedBodyController(&resolver).toggleSelectedHunkFold();
 
-    const active = app.reviewNavigation().activeLoadedDiff().?;
+    const active = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(active.isHunkFolded(0, 0));
     try std.testing.expectEqualDeep(
         diff_view_model.BodyCoordinate{ .hunk_header = 0 },
-        app.pages.review.viewer.diff_cursor,
+        app.pages.changes.viewer.diff_cursor,
     );
-    try std.testing.expectEqual(@as(usize, 5), app.reviewNavigationView().selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expectEqual(@as(usize, 5), app.changesNavigationView().selectedFileLineIndex(.unified).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .unified).hunkLineCount(0));
-    try std.testing.expectEqual(@as(usize, 4), app.reviewNavigationView().selectedFileLineIndex(.side_by_side).lineCount());
+    try std.testing.expectEqual(@as(usize, 4), app.changesNavigationView().selectedFileLineIndex(.side_by_side).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
 
-    app.reviewNavigation().toggleSelectedHunkFold();
+    app.changesNavigation().toggleSelectedHunkFold();
     try std.testing.expect(!active.isHunkFolded(0, 0));
-    try std.testing.expectEqual(@as(usize, 10), app.reviewNavigationView().selectedFileLineIndex(.unified).lineCount());
+    try std.testing.expectEqual(@as(usize, 10), app.changesNavigationView().selectedFileLineIndex(.unified).lineCount());
     try std.testing.expectEqual(@as(usize, 6), active.renderedLineIndex(0, .unified).hunkLineCount(0));
-    try std.testing.expectEqual(@as(usize, 8), app.reviewNavigationView().selectedFileLineIndex(.side_by_side).lineCount());
+    try std.testing.expectEqual(@as(usize, 8), app.changesNavigationView().selectedFileLineIndex(.side_by_side).lineCount());
     try std.testing.expectEqual(@as(usize, 5), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
     try std.testing.expectEqualStrings("", app.status.text());
 }
@@ -4241,7 +4241,7 @@ test "search unfolds folded hunk body matches before setting offset" {
     loaded.setHunkFolded(0, 0, true);
 
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
         } },
         .terminal_size = .{ .width = 100, .height = 12 },
@@ -4249,12 +4249,12 @@ test "search unfolds folded hunk body matches before setting offset" {
     defer app.clearLoadedDiff();
     setDiffSearchQuery(&app, "new");
 
-    app.reviewNavigation().submitSearch();
+    app.changesNavigation().submitSearch();
 
-    const active = app.reviewNavigation().activeLoadedDiff().?;
+    const active = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.pages.changes.search.match_offset);
 }
 
 test "projection hunk fold authority preserves retained staged-only search unfold" {
@@ -4272,9 +4272,9 @@ test "projection hunk fold authority preserves retained staged-only search unfol
     try prepareStatusOnlyHorizontalScrollHarness(&app, allocator, "MM a\x00");
     try installCombinedHorizontalScrollProjection(&app, allocator);
     var staged_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &staged_status);
+    try app.pages.changes.git_status.replace("/repo", &staged_status);
     try retainCombinedHorizontalScrollProjection(&app, allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
 
     const active = app.controller().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     active.setHunkFolded(0, 0, true);
@@ -4300,26 +4300,26 @@ test "manual fold keeps hunk open when it contains active search match" {
     loaded.rendered_line_cache = try diff_view_model.RenderedLineCache.build(allocator, loaded.document);
 
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
         } },
         .terminal_size = .{ .width = 100, .height = 12 },
     };
     defer app.clearLoadedDiff();
     setDiffSearchQuery(&app, "new");
-    app.reviewNavigation().submitSearch();
+    app.changesNavigation().submitSearch();
 
-    app.reviewNavigation().toggleSelectedHunkFold();
+    app.changesNavigation().toggleSelectedHunkFold();
 
-    const active = app.reviewNavigation().activeLoadedDiff().?;
+    const active = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.pages.changes.search.match_offset);
 }
 
 test "file change resyncs retained search query to selected file" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{ .display_mode = .unified },
         } },
@@ -4327,17 +4327,17 @@ test "file change resyncs retained search query to selected file" {
     };
     setDiffSearchQuery(&app, "target");
 
-    app.reviewNavigation().selectFileAbsolute(1);
+    app.changesNavigation().selectFileAbsolute(1);
 
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     try expectSearchCoordinate(&app, .{ .metadata = 0 });
-    try std.testing.expectEqual(@as(?usize, 0), app.pages.review.search.match_offset);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(?usize, 0), app.pages.changes.search.match_offset);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
 }
 
 test "sidebar navigation can select directories without changing selected file" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_node = 1,
@@ -4346,22 +4346,22 @@ test "sidebar navigation can select directories without changing selected file" 
         .terminal_size = .{ .width = 100, .height = 12 },
     };
 
-    app.reviewNavigation().selectFileDelta(-1);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    app.changesNavigation().selectFileDelta(-1);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 
-    app.reviewNavigation().selectFileDelta(1);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    app.changesNavigation().selectFileDelta(1);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 
-    app.reviewNavigation().selectFileDelta(1);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    app.changesNavigation().selectFileDelta(1);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "toggling selected directory collapses visible descendants" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_node = 0,
@@ -4371,20 +4371,20 @@ test "toggling selected directory collapses visible descendants" {
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().toggleSelectedDirectory();
+    try app.changesNavigation().toggleSelectedDirectory();
 
-    const loaded = app.pages.review.load.state.loaded.loaded;
+    const loaded = app.pages.changes.load.state.loaded.loaded;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 1), loaded.tree.visibleNodeCount(&loaded.collapsed_dirs));
     try std.testing.expect(loaded.visible_nodes.len >= loaded.tree.nodes.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
 }
 
-test "review root expansion ignores toggle and expand while retaining diff target" {
+test "changes root expansion ignores toggle and expand while retaining diff target" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
@@ -4395,26 +4395,26 @@ test "review root expansion ignores toggle and expand while retaining diff targe
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().toggleSelectedDirectory();
+    try app.changesNavigation().toggleSelectedDirectory();
 
-    var loaded = app.reviewNavigation().activeLoadedDiff().?;
+    var loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, ""));
 
-    try app.reviewNavigation().expandSelectedDirectory();
+    try app.changesNavigation().expandSelectedDirectory();
 
-    loaded = app.reviewNavigation().activeLoadedDiff().?;
+    loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
-test "review root expansion mouse click selects root without hiding children" {
+test "changes root expansion mouse click selects root without hiding children" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
@@ -4425,19 +4425,19 @@ test "review root expansion mouse click selects root without hiding children" {
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().clickSidebarNode(0);
+    try app.changesNavigation().clickSidebarNode(0);
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 4), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(u16, 1), loaded.tree.nodes[loaded.visibleNodeAt(1).?].depth);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
-test "repository switch resets Review navigation" {
+test "repository switch resets Changes navigation" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
                 .selected_node = 3,
@@ -4449,18 +4449,18 @@ test "repository switch resets Review navigation" {
     };
     setDiffSearchQuery(&app, "needle");
 
-    app.reviewNavigation().resetAfterRepositorySwitch();
+    app.changesNavigation().resetAfterRepositorySwitch();
 
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expect(!app.pages.review.search.mode);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.input.len);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.search.query.len);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expect(!app.pages.changes.search.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.search.input.len);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.search.query.len);
 }
 
-test "review root expansion keeps left and right on root as no-ops" {
+test "changes root expansion keeps left and right on root as no-ops" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -4470,27 +4470,27 @@ test "review root expansion keeps left and right on root as no-ops" {
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().collapseOrSelectParentDirectory();
-    var loaded = app.reviewNavigation().activeLoadedDiff().?;
+    try app.changesNavigation().collapseOrSelectParentDirectory();
+    var loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 
-    try app.reviewNavigation().collapseOrSelectParentDirectory();
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
+    try app.changesNavigation().collapseOrSelectParentDirectory();
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
 
-    try app.reviewNavigation().collapseOrSelectParentDirectory();
-    loaded = app.reviewNavigation().activeLoadedDiff().?;
+    try app.changesNavigation().collapseOrSelectParentDirectory();
+    loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 
-    try app.reviewNavigation().expandSelectedDirectory();
-    loaded = app.reviewNavigation().activeLoadedDiff().?;
+    try app.changesNavigation().expandSelectedDirectory();
+    loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 }
 
 test "file search selects matching file and expands ancestors" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedNested()),
             .viewer = .{
                 .selected_node = 0,
@@ -4501,23 +4501,23 @@ test "file search selects matching file and expands ancestors" {
     };
     defer app.clearLoadedDiff();
 
-    var loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    var loaded = app.changesNavigation().activeLoadedDiff().?;
+    try file_tree.collapse(app.changesNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     setAndRebuildFileSearch(&app, "src/b");
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    loaded = app.reviewNavigation().activeLoadedDiff().?;
+    loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expect(!app.pages.changes.file_search.mode);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 }
 
-test "review root expansion file search reveals only collapsed ancestors" {
+test "changes root expansion file search reveals only collapsed ancestors" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -4529,35 +4529,35 @@ test "review root expansion file search reveals only collapsed ancestors" {
     };
     defer app.clearLoadedDiff();
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
     try loaded.rebuildVisibleNodes(
-        app.reviewNavigation().loadArenaAllocator().?,
+        app.changesNavigation().loadArenaAllocator().?,
         false,
         .all,
     );
-    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    try file_tree.collapse(app.changesNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     try loaded.rebuildVisibleNodes(
-        app.reviewNavigation().loadArenaAllocator().?,
+        app.changesNavigation().loadArenaAllocator().?,
         false,
         .all,
     );
     setAndRebuildFileSearch(&app, "src/b");
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, ""));
-    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expect(!app.pages.changes.file_search.mode);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 }
 
-test "review transition exact lookup accepts diff status and collapsed raw paths" {
+test "changes transition exact lookup accepts diff status and collapsed raw paths" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     {
         var app: TestHarness = .{
-            .pages = .{ .review = .{
+            .pages = .{ .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
                 .viewer = .{ .selected_node = 1 },
             } },
@@ -4566,15 +4566,15 @@ test "review transition exact lookup accepts diff status and collapsed raw paths
         };
         defer app.clearLoadedDiff();
 
-        const loaded = app.reviewNavigation().activeLoadedDiff().?;
-        try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+        const loaded = app.changesNavigation().activeLoadedDiff().?;
+        try file_tree.collapse(app.changesNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
 
         try expectExactPathReady(
-            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/b")),
+            app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/b")),
             2,
         );
         try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-        try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+        try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     }
 
     {
@@ -4589,7 +4589,7 @@ test "review transition exact lookup accepts diff status and collapsed raw paths
             .status = .added,
         }};
         var app: TestHarness = .{
-            .pages = .{ .review = .{
+            .pages = .{ .changes = .{
                 .load = app_test_support.loadState(.{
                     .text = "",
                     .document = .{ .files = &.{} },
@@ -4606,16 +4606,16 @@ test "review transition exact lookup accepts diff status and collapsed raw paths
         defer app.clearLoadedDiff();
 
         try expectExactPathReady(
-            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, raw_path)),
+            app.changesNavigation().exactPathTarget(exactChangesIntent(&app, raw_path)),
             0,
         );
     }
 }
 
-test "review transition exact lookup rejects non-current repository sources" {
+test "changes transition exact lookup rejects non-current repository sources" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{ .selected_node = 1 },
         } },
@@ -4634,20 +4634,20 @@ test "review transition exact lookup rejects non-current repository sources" {
     for (unsupported) |source| {
         app.source = source;
         try expectExactPathUnavailable(
-            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/a")),
+            app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/a")),
             .source_unavailable,
         );
-        try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+        try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     }
 
     app.source = .cached;
     try expectExactPathReady(
-        app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/a")),
+        app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/a")),
         1,
     );
 }
 
-test "review transition exact lookup skips colliding directories before files" {
+test "changes transition exact lookup skips colliding directories before files" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     const replacement_diff =
         \\diff --git a/src/a b/src/a
@@ -4676,7 +4676,7 @@ test "review transition exact lookup skips colliding directories before files" {
     try std.testing.expectEqualStrings("src", replacement_tree.nodes[2].path_key);
 
     var replacement_app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = replacement_diff,
                 .document = replacement_document,
@@ -4692,7 +4692,7 @@ test "review transition exact lookup skips colliding directories before files" {
     };
     defer replacement_app.clearLoadedDiff();
     try expectExactPathReady(
-        replacement_app.reviewNavigation().exactPathTarget(exactReviewIntent(&replacement_app, "src")),
+        replacement_app.changesNavigation().exactPathTarget(exactChangesIntent(&replacement_app, "src")),
         2,
     );
 
@@ -4711,7 +4711,7 @@ test "review transition exact lookup skips colliding directories before files" {
     const directory_document = try diff_parser.parse(directory_allocator, directory_only_diff);
     const directory_tree = try file_tree.build(directory_allocator, directory_document);
     var directory_app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = directory_only_diff,
                 .document = directory_document,
@@ -4727,7 +4727,7 @@ test "review transition exact lookup skips colliding directories before files" {
     };
     defer directory_app.clearLoadedDiff();
     try expectExactPathUnavailable(
-        directory_app.reviewNavigation().exactPathTarget(exactReviewIntent(&directory_app, "src")),
+        directory_app.changesNavigation().exactPathTarget(exactChangesIntent(&directory_app, "src")),
         .path_not_found,
     );
 
@@ -4736,7 +4736,7 @@ test "review transition exact lookup skips colliding directories before files" {
         .{ .kind = .file, .name = "legacy", .path = "legacy", .depth = 0, .target = .{ .status_entry = 0 } },
     };
     var legacy_app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &.{} },
@@ -4752,17 +4752,17 @@ test "review transition exact lookup skips colliding directories before files" {
     };
     defer legacy_app.clearLoadedDiff();
     try expectExactPathReady(
-        legacy_app.reviewNavigation().exactPathTarget(exactReviewIntent(&legacy_app, "legacy")),
+        legacy_app.changesNavigation().exactPathTarget(exactChangesIntent(&legacy_app, "legacy")),
         1,
     );
 }
 
-test "review transition exact lookup preserves reviewed and changed filters" {
+test "changes transition exact lookup preserves reviewed and changed filters" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     {
         var reviewed = [_]bool{ true, false };
         var app: TestHarness = .{
-            .pages = .{ .review = .{
+            .pages = .{ .changes = .{
                 .load = app_test_support.loadState(.{
                     .text = "",
                     .document = .{ .files = &app_test_support.files_two },
@@ -4781,19 +4781,19 @@ test "review transition exact lookup preserves reviewed and changed filters" {
         defer app.clearLoadedDiff();
 
         try expectExactPathUnavailable(
-            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/a")),
+            app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/a")),
             .hidden_by_filters,
         );
         try expectExactPathReady(
-            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/b")),
+            app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/b")),
             2,
         );
-        try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
+        try std.testing.expect(app.pages.changes.review_display.hide_reviewed_files);
     }
 
     {
         var app: TestHarness = .{
-            .pages = .{ .review = .{
+            .pages = .{ .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
                 .review_display = .{ .changed_file_filter = .added },
             } },
@@ -4803,21 +4803,21 @@ test "review transition exact lookup preserves reviewed and changed filters" {
         defer app.clearLoadedDiff();
 
         try expectExactPathUnavailable(
-            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/deleted.zig")),
+            app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/deleted.zig")),
             .hidden_by_filters,
         );
         try expectExactPathReady(
-            app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/added.zig")),
+            app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/added.zig")),
             0,
         );
-        try std.testing.expectEqual(ChangedFileFilter.added, app.pages.review.review_display.changed_file_filter);
+        try std.testing.expectEqual(ChangedFileFilter.added, app.pages.changes.review_display.changed_file_filter);
     }
 }
 
-test "review transition exact lookup rejects identity absence and non-file paths" {
+test "changes transition exact lookup rejects identity absence and non-file paths" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{ .selected_node = 1 },
         } },
@@ -4826,42 +4826,42 @@ test "review transition exact lookup rejects identity absence and non-file paths
     };
     defer app.clearLoadedDiff();
 
-    var wrong_epoch = exactReviewIntent(&app, "src/b");
+    var wrong_epoch = exactChangesIntent(&app, "src/b");
     wrong_epoch.repo_epoch += 1;
-    try expectExactPathUnavailable(app.reviewNavigation().exactPathTarget(wrong_epoch), .repository_mismatch);
+    try expectExactPathUnavailable(app.changesNavigation().exactPathTarget(wrong_epoch), .repository_mismatch);
 
-    var wrong_root = exactReviewIntent(&app, "src/b");
+    var wrong_root = exactChangesIntent(&app, "src/b");
     wrong_root.root_identity.inode += 1;
-    try expectExactPathUnavailable(app.reviewNavigation().exactPathTarget(wrong_root), .repository_mismatch);
+    try expectExactPathUnavailable(app.changesNavigation().exactPathTarget(wrong_root), .repository_mismatch);
     try expectExactPathUnavailable(
-        app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "missing.zig")),
+        app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "missing.zig")),
         .path_not_found,
     );
     try expectExactPathUnavailable(
-        app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src")),
+        app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src")),
         .path_not_found,
     );
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
 
     app.clearLoadedDiff();
     try expectExactPathUnavailable(
-        app.reviewNavigation().exactPathTarget(exactReviewIntent(&app, "src/b")),
-        .no_accepted_review,
+        app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/b")),
+        .no_accepted_changes,
     );
 
     app.root_identity = null;
-    const explicit_intent: page_link.ReviewLocationIntent = .{
+    const explicit_intent: page_link.ChangesLocationIntent = .{
         .repo_epoch = app.repo_epoch,
         .root_identity = identity,
         .path = "src/b",
     };
-    try expectExactPathUnavailable(app.reviewNavigation().exactPathTarget(explicit_intent), .repository_mismatch);
+    try expectExactPathUnavailable(app.changesNavigation().exactPathTarget(explicit_intent), .repository_mismatch);
 }
 
-test "review transition exact reveal expands only target ancestors and selects normally" {
+test "changes transition exact reveal expands only target ancestors and selects normally" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -4890,39 +4890,39 @@ test "review transition exact reveal expands only target ancestors and selects n
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const allocator = app.reviewNavigation().loadArenaAllocator().?;
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
+    const allocator = app.changesNavigation().loadArenaAllocator().?;
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
     try file_tree.collapse(allocator, &loaded.collapsed_dirs, "src");
     try file_tree.collapse(allocator, &loaded.collapsed_dirs, "lib");
     setDiffSearchQuery(&app, "target");
 
     try expectExactPathRevealSelected(
-        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "src/b")),
+        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "src/b")),
         4,
     );
 
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "lib"));
     try std.testing.expectEqual(@as(?usize, 4), loaded.visibleNodeAt(3));
-    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.diff_horizontal_scroll);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.sidebar_horizontal_scroll);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.review.viewer.display_mode);
-    try std.testing.expectEqualStrings("target", app.pages.review.search.query.slice());
-    try std.testing.expect(app.pages.review.selection_owner == .none);
+    try std.testing.expectEqual(@as(usize, 4), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.sidebar_horizontal_scroll);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.changes.viewer.display_mode);
+    try std.testing.expectEqualStrings("target", app.pages.changes.search.query.slice());
+    try std.testing.expect(app.pages.changes.selection_owner == .none);
 }
 
-test "review transition exact reveal selects status-only and reports unchanged" {
+test "changes transition exact reveal selects status-only and reports unchanged" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     const nodes = [_]file_tree.Node{
         .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
         .{ .kind = .file, .name = "new.zig", .path = "new.zig", .depth = 0, .target = .{ .status_entry = 0 }, .status = .added },
     };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_one },
@@ -4942,31 +4942,31 @@ test "review transition exact reveal selects status-only and reports unchanged" 
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
     try expectExactPathRevealSelected(
-        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "new.zig")),
+        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "new.zig")),
         1,
     );
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.review.viewer.display_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.changes.viewer.display_mode);
 
-    app.pages.review.viewer.diff_scroll = 9;
+    app.pages.changes.viewer.diff_scroll = 9;
     try expectExactPathRevealUnchanged(
-        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "new.zig")),
+        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "new.zig")),
         1,
     );
-    try std.testing.expectEqual(@as(usize, 9), app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
-test "review transition selected exact node still reveals collapsed ancestor" {
+test "changes transition selected exact node still reveals collapsed ancestor" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
@@ -4977,25 +4977,25 @@ test "review transition selected exact node still reveals collapsed ancestor" {
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
+    try file_tree.collapse(app.changesNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     try std.testing.expectEqual(@as(?usize, null), loaded.visibleRowOfNode(2));
 
     try expectExactPathRevealSelected(
-        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "src/b")),
+        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "src/b")),
         2,
     );
 
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleRowOfNode(2));
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
-test "review root expansion exact reveal expands only ordinary ancestors" {
+test "changes root expansion exact reveal expands only ordinary ancestors" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
@@ -5006,28 +5006,28 @@ test "review root expansion exact reveal expands only ordinary ancestors" {
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
-    const allocator = app.reviewNavigation().loadArenaAllocator().?;
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
+    const allocator = app.changesNavigation().loadArenaAllocator().?;
     try file_tree.collapse(allocator, &loaded.collapsed_dirs, "src");
     try loaded.rebuildVisibleNodes(allocator, false, .all);
     try std.testing.expectEqual(@as(?usize, null), loaded.visibleRowOfNode(3));
 
     try expectExactPathRevealSelected(
-        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "src/b")),
+        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "src/b")),
         3,
     );
 
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(?usize, 3), loaded.visibleRowOfNode(3));
-    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
-test "review transition unavailable exact reveal preserves navigation folds and filters" {
+test "changes transition unavailable exact reveal preserves navigation folds and filters" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var reviewed = [_]bool{ true, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -5051,29 +5051,29 @@ test "review transition unavailable exact reveal preserves navigation folds and 
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
+    try file_tree.collapse(app.changesNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
 
     try expectExactPathRevealUnavailable(
-        try app.reviewNavigation().revealExactPath(exactReviewIntent(&app, "src/a")),
+        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "src/a")),
         .hidden_by_filters,
     );
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 6), app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.diff_horizontal_scroll);
+    try std.testing.expect(app.pages.changes.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.diff_horizontal_scroll);
     try std.testing.expect(std.meta.eql(
         diff_view_model.BodyCoordinate{ .metadata = 1 },
-        app.pages.review.viewer.diff_cursor,
+        app.pages.changes.viewer.diff_cursor,
     ));
 }
 
-test "review transition exact reveal allocation failure rolls back before ancestor expansion" {
+test "changes transition exact reveal allocation failure rolls back before ancestor expansion" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -5095,34 +5095,34 @@ test "review transition exact reveal allocation failure rolls back before ancest
         .root_identity = identity,
     };
     defer app.clearLoadedDiff();
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
+    try file_tree.collapse(app.changesNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     const visible_before = loaded.visibleNodeCount();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
 
     try std.testing.expectError(
         error.OutOfMemory,
-        app.reviewNavigation().revealExactPathWithAllocator(
-            exactReviewIntent(&app, "src/b"),
+        app.changesNavigation().revealExactPathWithAllocator(
+            exactChangesIntent(&app, "src/b"),
             failing.allocator(),
         ),
     );
 
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(visible_before, loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 7), app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 4), app.pages.review.viewer.diff_horizontal_scroll);
-    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.sidebar_horizontal_scroll);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.review.viewer.display_mode);
-    try std.testing.expect(app.pages.review.selection_owner.activeHeader() != null);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 7), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), app.pages.changes.viewer.diff_horizontal_scroll);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.sidebar_horizontal_scroll);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.changes.viewer.display_mode);
+    try std.testing.expect(app.pages.changes.selection_owner.activeHeader() != null);
 }
 
 test "file search keeps prompt open on no match" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(fileSearchLoadedNested()),
             .file_search = .{ .mode = true },
         } },
@@ -5130,19 +5130,19 @@ test "file search keeps prompt open on no match" {
     };
     setAndRebuildFileSearch(&app, "missing");
 
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    defer app.pages.changes.file_search.deinit(std.testing.allocator);
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expect(app.pages.review.file_search.no_match);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(app.pages.changes.file_search.mode);
+    try std.testing.expect(app.pages.changes.file_search.no_match);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "file search skips hidden reviewed matches" {
     var reviewed = [_]bool{ true, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -5158,46 +5158,46 @@ test "file search skips hidden reviewed matches" {
         } },
     };
     defer app.clearLoadedDiff();
-    try app.reviewNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
-        app.reviewNavigation().loadArenaAllocator().?,
+    try app.changesNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
+        app.changesNavigation().loadArenaAllocator().?,
         true,
         .all,
     );
     setAndRebuildFileSearch(&app, "src");
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expect(!app.pages.review.file_search.no_match);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expect(!app.pages.changes.file_search.mode);
+    try std.testing.expect(!app.pages.changes.file_search.no_match);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 }
 
 test "file search empty Enter accepts the first exact candidate" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(fileSearchLoadedNested()),
             .viewer = .{ .focus = .diff },
         } },
         .terminal_size = .{ .width = 100, .height = 12 },
     };
 
-    app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    app.changesNavigation().enterFileSearchMode(std.testing.allocator);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
     setAndRebuildFileSearch(&app, "   ");
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(!app.pages.changes.file_search.mode);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "file search Enter commits the displayed moved candidate" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(fileSearchLoadedNested()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 1, .focus = .diff },
         } },
@@ -5205,21 +5205,21 @@ test "file search Enter commits the displayed moved candidate" {
     };
     defer app.clearLoadedDiff();
 
-    app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
-    app.pages.review.file_search.move(1);
-    try std.testing.expectEqualStrings("src/b", app.pages.review.file_search.focusedCandidate().?.path_key);
+    app.changesNavigation().enterFileSearchMode(std.testing.allocator);
+    app.pages.changes.file_search.move(1);
+    try std.testing.expectEqualStrings("src/b", app.pages.changes.file_search.focusedCandidate().?.path_key);
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expect(!app.pages.changes.file_search.mode);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 }
 
 test "file search Enter keeps unavailable and stale projections inert" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(fileSearchLoadedNested()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 1 },
             .file_search = .{ .mode = true },
@@ -5227,50 +5227,50 @@ test "file search Enter keeps unavailable and stale projections inert" {
     };
     defer app.clearLoadedDiff();
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expect(!app.pages.review.file_search.projection_available);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
+    try std.testing.expect(app.pages.changes.file_search.mode);
+    try std.testing.expect(!app.pages.changes.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
 
-    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
-    try std.testing.expect(app.pages.review.file_search.projection_available);
-    app.pages.review.accepted_sidebar_revision += 1;
+    app.changesNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    try std.testing.expect(app.pages.changes.file_search.projection_available);
+    app.pages.changes.accepted_sidebar_revision += 1;
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expect(!app.pages.review.file_search.projection_available);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.file_search.candidates.len);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expect(app.pages.changes.file_search.mode);
+    try std.testing.expect(!app.pages.changes.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.file_search.candidates.len);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
 }
 
 test "file search disclosure allocation failure preserves prompt folds and selection" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedNested()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 }, .selected_node = 1 },
             .file_search = .{ .mode = true },
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    defer app.pages.changes.file_search.deinit(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try file_tree.collapse(app.reviewNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
+    try file_tree.collapse(app.changesNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
     setAndRebuildFileSearch(&app, "src/b");
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
 
-    app.reviewNavigation().submitFileSearchWithVisibleAllocator(std.testing.allocator, failing.allocator());
+    app.changesNavigation().submitFileSearchWithVisibleAllocator(std.testing.allocator, failing.allocator());
 
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expect(app.pages.review.file_search.projection_available);
-    try std.testing.expectEqualStrings("src/b", app.pages.review.file_search.focusedCandidate().?.path_key);
+    try std.testing.expect(app.pages.changes.file_search.mode);
+    try std.testing.expect(app.pages.changes.file_search.projection_available);
+    try std.testing.expectEqualStrings("src/b", app.pages.changes.file_search.focusedCandidate().?.path_key);
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(review_page.Focus.sidebar, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
     try std.testing.expectEqualStrings("Could not reveal file search result", app.status.text());
 }
 
@@ -5280,7 +5280,7 @@ test "file search Enter commits an exact status-only candidate" {
         .{ .kind = .file, .name = "new.zig", .path = "new.zig", .path_key = "new.zig", .depth = 0, .target = .{ .status_entry = 0 }, .status = .added },
     };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_one },
@@ -5295,22 +5295,22 @@ test "file search Enter commits an exact status-only candidate" {
         .repo_root = "/repo",
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
     setAndRebuildFileSearch(&app, "new.zig");
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.review.viewer.selected_target.?);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expect(!app.pages.changes.file_search.mode);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 }
 
 test "file search keeps diff focus while sidebar is hidden" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), fileSearchLoadedNested()),
             .viewer = .{ .focus = .diff, .sidebar_hidden = true },
         } },
@@ -5318,28 +5318,28 @@ test "file search keeps diff focus while sidebar is hidden" {
     };
     defer app.clearLoadedDiff();
 
-    app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    app.changesNavigation().enterFileSearchMode(std.testing.allocator);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
     setAndRebuildFileSearch(&app, "   ");
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expect(!app.pages.changes.file_search.mode);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 
-    app.reviewNavigation().enterFileSearchMode(std.testing.allocator);
+    app.changesNavigation().enterFileSearchMode(std.testing.allocator);
     setAndRebuildFileSearch(&app, "src/b");
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(!app.pages.review.file_search.mode);
-    try std.testing.expectEqual(review_page.Focus.diff, app.pages.review.viewer.focus);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(!app.pages.changes.file_search.mode);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "selectedStagePathKey accepts diff and status-only selections" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwoWithStatuses()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         } },
@@ -5347,19 +5347,19 @@ test "selectedStagePathKey accepts diff and status-only selections" {
     };
     defer app.clearLoadedDiff();
 
-    try std.testing.expectEqualStrings("src/added.zig", app.reviewNavigationView().selectedStagePathKey().?);
+    try std.testing.expectEqualStrings("src/added.zig", app.changesNavigationView().selectedStagePathKey().?);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    defer app.pages.review.git_status.deinit();
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-    app.pages.review.viewer.selected_target = .{ .status_only = 0 };
+    defer app.pages.changes.git_status.deinit();
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
+    app.pages.changes.viewer.selected_target = .{ .status_only = 0 };
 
-    try std.testing.expectEqualStrings("src/new.zig", app.reviewNavigationView().selectedStagePathKey().?);
+    try std.testing.expectEqualStrings("src/new.zig", app.changesNavigationView().selectedStagePathKey().?);
 }
 
 test "cached preview uses displayed diff for cursor movement" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .generation = 7 },
             .status_load = .{ .generation = 3 },
             .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
@@ -5368,38 +5368,38 @@ test "cached preview uses displayed diff for cursor movement" {
         .source = .unstaged,
         .repo_root = "/repo",
     };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.pages.changes.changes_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.testing.cloneRequest(
+    const request = try app_changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "a",
         .cached_diff,
         .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
+        app.pages.changes.source_session_revision,
+        app.pages.changes.status_snapshot_revision,
     );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
+    app.pages.changes.changes_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
 
     try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
-    app.reviewNavigation().moveDiffCursorRows(.down);
+    app.changesNavigation().moveDiffCursorRows(.down);
     try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
-    app.reviewNavigation().selectHunkDelta(1);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.pages.review.viewer.diff_cursor);
+    app.changesNavigation().selectHunkDelta(1);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 0 }, app.pages.changes.viewer.diff_cursor);
 }
 
 test "cached preview supports diff search" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .generation = 7 },
             .status_load = .{ .generation = 3 },
             .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
@@ -5408,37 +5408,37 @@ test "cached preview supports diff search" {
         .source = .unstaged,
         .repo_root = "/repo",
     };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.pages.changes.changes_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.testing.cloneRequest(
+    const request = try app_changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "a",
         .cached_diff,
         .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
+        app.pages.changes.source_session_revision,
+        app.pages.changes.status_snapshot_revision,
     );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
+    app.pages.changes.changes_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
 
     setDiffSearchInput(&app, "staged");
-    app.reviewNavigation().submitSearch();
+    app.changesNavigation().submitSearch();
 
-    try std.testing.expect(app.pages.review.search.match != null);
+    try std.testing.expect(app.pages.changes.search.match != null);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{
         .hunk_line = .{ .hunk_index = 0, .line_index = 1 },
-    }, app.pages.review.search.match.?.coordinate);
-    try std.testing.expectEqual(@as(?usize, 2), app.pages.review.search.match_offset);
-    try std.testing.expectEqual(app.pages.review.search.match.?.coordinate, app.pages.review.viewer.diff_cursor);
+    }, app.pages.changes.search.match.?.coordinate);
+    try std.testing.expectEqual(@as(?usize, 2), app.pages.changes.search.match_offset);
+    try std.testing.expectEqual(app.pages.changes.search.match.?.coordinate, app.pages.changes.viewer.diff_cursor);
 }
 
 test "retained cached projection keeps all-staged authority on diff-file route" {
@@ -5446,7 +5446,7 @@ test "retained cached projection keeps all-staged authority on diff-file route" 
     defer arena.deinit();
 
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .status_load = .{ .generation = 3, .pending = .{ .generation = 3 } },
             .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
@@ -5455,41 +5455,41 @@ test "retained cached projection keeps all-staged authority on diff-file route" 
         .source = .unstaged,
         .repo_root = "/repo",
     };
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
-    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.changes.changes_projection.deinit(std.testing.allocator);
+    defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
 
-    const request = try app_review_projection.testing.cloneRequest(
+    const request = try app_changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "a",
         .cached_diff,
         .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
+        app.pages.changes.source_session_revision,
+        app.pages.changes.status_snapshot_revision,
     );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
+    app.pages.changes.changes_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
 
-    try std.testing.expect(app.reviewNavigationView().displayedReviewBody() == .cached);
-    const without_marks = (try app.reviewNavigationView().activeDiffDisplay(arena.allocator(), .unified)) orelse return error.ExpectedCachedDisplay;
+    try std.testing.expect(app.changesNavigationView().displayedChangesBody() == .cached);
+    const without_marks = (try app.changesNavigationView().activeDiffDisplay(arena.allocator(), .unified)) orelse return error.ExpectedCachedDisplay;
     try std.testing.expect(without_marks.hunkStagePresentation() == .all_staged);
 
     const cached_mark_key: session_hunk_mark.Key = .{
-        .content = app.reviewNavigationView().currentContentToken() orelse return error.ExpectedReviewContentToken,
+        .content = app.changesNavigationView().currentContentToken() orelse return error.ExpectedContentToken,
         .display_hunk_index = 0,
     };
-    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", cached_mark_key);
-    const with_marks = (try app.reviewNavigationView().activeDiffDisplay(arena.allocator(), .unified)) orelse return error.ExpectedCachedDisplay;
+    try app.pages.changes.staged_hunks.addExact(std.testing.allocator, "/repo", "a", cached_mark_key);
+    const with_marks = (try app.changesNavigationView().activeDiffDisplay(arena.allocator(), .unified)) orelse return error.ExpectedCachedDisplay;
     try std.testing.expect(with_marks.hunkStagePresentation() == .all_staged);
 }
 
 test "generated preview uses metadata cursor rows and ignores hunk movement" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .generation = 7 },
             .status_load = .{ .generation = 3 },
             .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
@@ -5498,26 +5498,26 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
         .source = .unstaged,
         .repo_root = "/repo",
     };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.pages.changes.changes_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.testing.cloneRequest(
+    const request = try app_changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "src/new.zig",
         .generated_added_file,
         .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
+        app.pages.changes.source_session_revision,
+        app.pages.changes.status_snapshot_revision,
     );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
+    app.pages.changes.changes_projection.displayed = .{ .ready = .{
         .request = request,
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(
+        .value = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(
             std.testing.allocator,
             "src/new.zig",
             "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
@@ -5525,11 +5525,11 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
     } };
 
     try std.testing.expectEqual(@as(?usize, 0), app.visibleDiffCursorOffset());
-    app.reviewNavigation().moveDiffCursorRows(.down);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
+    app.changesNavigation().moveDiffCursorRows(.down);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 1), app.visibleDiffCursorOffset());
-    app.reviewNavigation().selectHunkDelta(1);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.review.viewer.diff_cursor);
+    app.changesNavigation().selectHunkDelta(1);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.changes.viewer.diff_cursor);
 
     _ = try applySharedNavigation(&app, .document_last);
     try std.testing.expectEqual(@as(?usize, 7), app.visibleDiffCursorOffset());
@@ -5541,16 +5541,16 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
         app.visibleDiffCursorOffset(),
     );
 
-    app.pages.review.viewer.diff_scroll = 0;
-    app.pages.review.viewer.diff_cursor = .{ .metadata = 0 };
-    app.reviewNavigation().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 2 }, app.pages.review.viewer.diff_cursor);
+    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_cursor = .{ .metadata = 0 };
+    app.changesNavigation().scrollDiff(.down);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 2 }, app.pages.changes.viewer.diff_cursor);
 }
 
 test "generated preview blocks diff search" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .generation = 7 },
             .status_load = .{ .generation = 3 },
             .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .metadata = 0 } },
@@ -5559,42 +5559,42 @@ test "generated preview blocks diff search" {
         .source = .unstaged,
         .repo_root = "/repo",
     };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.pages.changes.changes_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.testing.cloneRequest(
+    const request = try app_changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "src/new.zig",
         .generated_added_file,
         .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
+        app.pages.changes.source_session_revision,
+        app.pages.changes.status_snapshot_revision,
     );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
+    app.pages.changes.changes_projection.displayed = .{ .ready = .{
         .request = request,
-        .value = .{ .generated_added_file = try app_review_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n") },
+        .value = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(std.testing.allocator, "src/new.zig", "one\ntwo\nthree\n") },
     } };
 
-    app.reviewNavigation().enterSearchMode();
-    try std.testing.expect(!app.pages.review.search.mode);
+    app.changesNavigation().enterSearchMode();
+    try std.testing.expect(!app.pages.changes.search.mode);
     try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
 
     setDiffSearchInput(&app, "two");
-    app.reviewNavigation().submitSearch();
-    try std.testing.expect(app.pages.review.search.match == null);
-    try std.testing.expect(app.pages.review.search.match_offset == null);
+    app.changesNavigation().submitSearch();
+    try std.testing.expect(app.pages.changes.search.match == null);
+    try std.testing.expect(app.pages.changes.search.match_offset == null);
     try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
 }
 
 test "staged new file preview blocks diff search" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .generation = 7 },
             .status_load = .{ .generation = 3 },
             .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
@@ -5603,46 +5603,46 @@ test "staged new file preview blocks diff search" {
         .source = .unstaged,
         .repo_root = "/repo",
     };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.pages.changes.changes_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.testing.cloneRequest(
+    const request = try app_changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "src/new.zig",
         .cached_diff,
         .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
+        app.pages.changes.source_session_revision,
+        app.pages.changes.status_snapshot_revision,
     );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
+    app.pages.changes.changes_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
     try std.testing.expectEqual(
         @as(?diff_surface.SearchUnavailableReason, .staged_new_preview),
-        app.reviewNavigationView().resolvedTarget().search_unavailable,
+        app.changesNavigationView().resolvedTarget().search_unavailable,
     );
 
-    app.reviewNavigation().enterSearchMode();
-    try std.testing.expect(!app.pages.review.search.mode);
+    app.changesNavigation().enterSearchMode();
+    try std.testing.expect(!app.pages.changes.search.mode);
     try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
 
     setDiffSearchInput(&app, "staged");
-    app.reviewNavigation().submitSearch();
-    try std.testing.expect(app.pages.review.search.match == null);
-    try std.testing.expect(app.pages.review.search.match_offset == null);
+    app.changesNavigation().submitSearch();
+    try std.testing.expect(app.pages.changes.search.match == null);
+    try std.testing.expect(app.pages.changes.search.match_offset == null);
     try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
 }
 
 test "staged new file preview does not refresh existing search query" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .generation = 7 },
             .status_load = .{ .generation = 3 },
             .viewer = .{ .selected_target = .{ .status_only = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
@@ -5651,53 +5651,53 @@ test "staged new file preview does not refresh existing search query" {
         .source = .unstaged,
         .repo_root = "/repo",
     };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.pages.changes.changes_projection.deinit(std.testing.allocator);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    const request = try app_review_projection.testing.cloneRequest(
+    const request = try app_changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        app_page.RequestIdentity.review(0, 1),
+        app_page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "src/new.zig",
         .cached_diff,
         .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
+        app.pages.changes.source_session_revision,
+        app.pages.changes.status_snapshot_revision,
     );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
+    app.pages.changes.changes_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .cached_diff = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_cached_projection) },
     } };
 
-    app.pages.review.search.query.insertSlice("staged") catch unreachable;
-    app.reviewNavigation().refreshSearchForSelectedFile();
+    app.pages.changes.search.query.insertSlice("staged") catch unreachable;
+    app.changesNavigation().refreshSearchForSelectedFile();
 
-    try std.testing.expect(app.pages.review.search.match == null);
-    try std.testing.expect(app.pages.review.search.match_offset == null);
+    try std.testing.expect(app.pages.changes.search.match == null);
+    try std.testing.expect(app.pages.changes.search.match_offset == null);
 }
 
 test "hunk stage presentation classifies direct source authority" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .allocator = std.testing.allocator,
         .repo_root = "/repo",
     };
 
-    const unstaged = try app.reviewNavigationView().hunkStagePresentation(std.testing.allocator, 0);
+    const unstaged = try app.changesNavigationView().hunkStagePresentation(std.testing.allocator, 0);
     try std.testing.expect(unstaged == .all_unstaged);
 
     app.source = .cached;
-    const cached = try app.reviewNavigationView().hunkStagePresentation(std.testing.allocator, 0);
+    const cached = try app.changesNavigationView().hunkStagePresentation(std.testing.allocator, 0);
     try std.testing.expect(cached == .all_staged);
 
     app.source = .{ .range = "HEAD~1..HEAD" };
-    const historical = try app.reviewNavigationView().hunkStagePresentation(std.testing.allocator, 0);
+    const historical = try app.changesNavigationView().hunkStagePresentation(std.testing.allocator, 0);
     try std.testing.expect(historical == .all_unstaged);
 }
 
@@ -5706,24 +5706,24 @@ test "hunk stage presentation keeps partial session marks" {
     defer arena.deinit();
 
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .allocator = std.testing.allocator,
         .repo_root = "/repo",
     };
-    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
     const mark_key: session_hunk_mark.Key = .{
-        .content = app.reviewNavigationView().currentContentToken() orelse return error.ExpectedReviewContentToken,
+        .content = app.changesNavigationView().currentContentToken() orelse return error.ExpectedContentToken,
         .display_hunk_index = 0,
     };
-    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
+    try app.pages.changes.staged_hunks.addExact(std.testing.allocator, "/repo", "a", mark_key);
 
-    const presentation = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
+    const presentation = try app.changesNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(presentation == .per_hunk);
     try std.testing.expectEqual(diff_render.HunkStageState.staged, presentation.stateForHunk(0));
     try std.testing.expectEqual(diff_render.HunkStageState.unstaged, presentation.stateForHunk(1));
@@ -5734,49 +5734,49 @@ test "hunk stage presentation uses all-staged only for fresh staged-only status"
     defer arena.deinit();
 
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .allocator = std.testing.allocator,
         .repo_root = "/repo",
     };
-    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    const staged = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
+    try app.pages.changes.git_status.replace("/repo", &staged_bundle);
+    const staged = try app.changesNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(staged == .all_staged);
 
-    const content = app.reviewNavigationView().currentContentToken() orelse return error.ExpectedReviewContentToken;
-    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", .{
+    const content = app.changesNavigationView().currentContentToken() orelse return error.ExpectedContentToken;
+    try app.pages.changes.staged_hunks.addExact(std.testing.allocator, "/repo", "a", .{
         .content = content,
         .display_hunk_index = 0,
     });
-    try app.pages.review.staged_hunks.addExact(std.testing.allocator, "/repo", "a", .{
+    try app.pages.changes.staged_hunks.addExact(std.testing.allocator, "/repo", "a", .{
         .content = content,
         .display_hunk_index = 1,
     });
-    const hunk_by_hunk = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
+    const hunk_by_hunk = try app.changesNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(hunk_by_hunk == .all_staged);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
-    const mixed = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
+    try app.pages.changes.git_status.replace("/repo", &mixed_bundle);
+    const mixed = try app.changesNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(mixed == .per_hunk);
     try std.testing.expectEqual(diff_render.HunkStageState.staged, mixed.stateForHunk(0));
     try std.testing.expectEqual(diff_render.HunkStageState.staged, mixed.stateForHunk(1));
 
-    app.pages.review.status_load.pending = .{ .generation = 1 };
-    const stale = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
+    app.pages.changes.status_load.pending = .{ .generation = 1 };
+    const stale = try app.changesNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(stale == .per_hunk);
     try std.testing.expectEqual(diff_render.HunkStageState.staged, stale.stateForHunk(0));
     try std.testing.expectEqual(diff_render.HunkStageState.staged, stale.stateForHunk(1));
 
-    app.pages.review.status_load.pending = null;
+    app.pages.changes.status_load.pending = null;
     var other_repo_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/other", &other_repo_bundle);
-    const other_repo = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
+    try app.pages.changes.git_status.replace("/other", &other_repo_bundle);
+    const other_repo = try app.changesNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(other_repo == .per_hunk);
     try std.testing.expectEqual(diff_render.HunkStageState.staged, other_repo.stateForHunk(0));
     try std.testing.expectEqual(diff_render.HunkStageState.staged, other_repo.stateForHunk(1));
@@ -5784,7 +5784,7 @@ test "hunk stage presentation uses all-staged only for fresh staged-only status"
 
 test "typed action cursor remaps a directory without changing the sticky diff target" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
@@ -5792,9 +5792,9 @@ test "typed action cursor remaps a directory without changing the sticky diff ta
             },
         } },
     };
-    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+    defer app.pages.changes.action_cursor.deinit(std.testing.allocator);
 
-    var prepared = try review_page.action_cursor.Prepared.init(
+    var prepared = try changes_page.action_cursor.Prepared.init(
         std.testing.allocator,
         3,
         .{ .device = 5, .inode = 8 },
@@ -5802,13 +5802,13 @@ test "typed action cursor remaps a directory without changing the sticky diff ta
         "src",
         1,
     );
-    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
+    app.pages.changes.action_cursor.install(std.testing.allocator, &prepared, 7);
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
 
-    try std.testing.expect(app.reviewNavigation().remapActionCursor(loaded));
-    try std.testing.expect(app.pages.review.action_cursor.hasOwner());
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(app.changesNavigation().remapActionCursor(loaded));
+    try std.testing.expect(app.pages.changes.action_cursor.hasOwner());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "typed action cursor remaps a repository root without changing the sticky diff target" {
@@ -5828,7 +5828,7 @@ test "typed action cursor remaps a repository root without changing the sticky d
         .lines = 0,
     };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(loaded),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -5836,9 +5836,9 @@ test "typed action cursor remaps a repository root without changing the sticky d
             },
         } },
     };
-    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+    defer app.pages.changes.action_cursor.deinit(std.testing.allocator);
 
-    var prepared = try review_page.action_cursor.Prepared.init(
+    var prepared = try changes_page.action_cursor.Prepared.init(
         std.testing.allocator,
         3,
         .{ .device = 5, .inode = 8 },
@@ -5846,16 +5846,16 @@ test "typed action cursor remaps a repository root without changing the sticky d
         "",
         1,
     );
-    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
+    app.pages.changes.action_cursor.install(std.testing.allocator, &prepared, 7);
 
-    try std.testing.expect(app.reviewNavigation().remapActionCursor(app.reviewNavigation().activeLoadedDiff().?));
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(app.changesNavigation().remapActionCursor(app.changesNavigation().activeLoadedDiff().?));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
-test "review root expansion terminal file action reveals an ordinary folded ancestor" {
+test "changes root expansion terminal file action reveals an ordinary folded ancestor" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffRootedNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
@@ -5864,14 +5864,14 @@ test "review root expansion terminal file action reveals an ordinary folded ance
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+    defer app.pages.changes.action_cursor.deinit(std.testing.allocator);
 
-    try app.reviewNavigation().toggleSelectedDirectory();
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
+    try app.changesNavigation().toggleSelectedDirectory();
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
 
-    var prepared = try review_page.action_cursor.Prepared.init(
+    var prepared = try changes_page.action_cursor.Prepared.init(
         std.testing.allocator,
         3,
         .{ .device = 5, .inode = 8 },
@@ -5879,18 +5879,18 @@ test "review root expansion terminal file action reveals an ordinary folded ance
         "src/b",
         0,
     );
-    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
-    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
-    try std.testing.expect(app.pages.review.action_cursor.startMember(7, .source, 11));
-    try std.testing.expect(app.pages.review.action_cursor.startMember(7, .status, 12));
-    try std.testing.expect(app.pages.review.action_cursor.finishMember(7, 3, .status, 12, true));
-    try std.testing.expect(app.pages.review.action_cursor.finishMember(7, 3, .source, 11, true));
+    app.pages.changes.action_cursor.install(std.testing.allocator, &prepared, 7);
+    try std.testing.expect(app.pages.changes.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
+    try std.testing.expect(app.pages.changes.action_cursor.startMember(7, .source, 11));
+    try std.testing.expect(app.pages.changes.action_cursor.startMember(7, .status, 12));
+    try std.testing.expect(app.pages.changes.action_cursor.finishMember(7, 3, .status, 12, true));
+    try std.testing.expect(app.pages.changes.action_cursor.finishMember(7, 3, .source, 11, true));
 
-    try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(app.changesNavigation().finalizeActionCursor(std.testing.allocator));
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
     try std.testing.expect(!file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
-    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "filtered directory action cursor falls back to repository root instead of another file" {
@@ -5906,7 +5906,7 @@ test "filtered directory action cursor falls back to repository root instead of 
     loaded.tree = .{ .nodes = &nodes };
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .added);
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .review_display = .{ .changed_file_filter = .added },
             .viewer = .{
@@ -5916,9 +5916,9 @@ test "filtered directory action cursor falls back to repository root instead of 
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+    defer app.pages.changes.action_cursor.deinit(std.testing.allocator);
 
-    var prepared = try review_page.action_cursor.Prepared.init(
+    var prepared = try changes_page.action_cursor.Prepared.init(
         std.testing.allocator,
         3,
         .{ .device = 5, .inode = 8 },
@@ -5926,15 +5926,15 @@ test "filtered directory action cursor falls back to repository root instead of 
         "src",
         0,
     );
-    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
-    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
-    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .source));
-    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .status));
+    app.pages.changes.action_cursor.install(std.testing.allocator, &prepared, 7);
+    try std.testing.expect(app.pages.changes.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
+    try std.testing.expect(app.pages.changes.action_cursor.failMemberBeforeStart(7, .source));
+    try std.testing.expect(app.pages.changes.action_cursor.failMemberBeforeStart(7, .status));
 
-    try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(file_tree.Node.Kind.repo_root, app.reviewNavigation().activeLoadedDiff().?.tree.nodes[0].kind);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(app.changesNavigation().finalizeActionCursor(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(file_tree.Node.Kind.repo_root, app.changesNavigation().activeLoadedDiff().?.tree.nodes[0].kind);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "disappeared file action cursor keeps the existing nearest-file fallback" {
@@ -5942,7 +5942,7 @@ test "disappeared file action cursor keeps the existing nearest-file fallback" {
     var loaded = app_test_support.loadedDiffRootedNested();
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .all);
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -5951,9 +5951,9 @@ test "disappeared file action cursor keeps the existing nearest-file fallback" {
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.action_cursor.deinit(std.testing.allocator);
+    defer app.pages.changes.action_cursor.deinit(std.testing.allocator);
 
-    var prepared = try review_page.action_cursor.Prepared.init(
+    var prepared = try changes_page.action_cursor.Prepared.init(
         std.testing.allocator,
         3,
         .{ .device = 5, .inode = 8 },
@@ -5961,19 +5961,19 @@ test "disappeared file action cursor keeps the existing nearest-file fallback" {
         "src/discarded.zig",
         3,
     );
-    app.pages.review.action_cursor.install(std.testing.allocator, &prepared, 7);
-    try std.testing.expect(app.pages.review.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
-    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .source));
-    try std.testing.expect(app.pages.review.action_cursor.failMemberBeforeStart(7, .status));
+    app.pages.changes.action_cursor.install(std.testing.allocator, &prepared, 7);
+    try std.testing.expect(app.pages.changes.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .source_and_status));
+    try std.testing.expect(app.pages.changes.action_cursor.failMemberBeforeStart(7, .source));
+    try std.testing.expect(app.pages.changes.action_cursor.failMemberBeforeStart(7, .status));
 
-    try std.testing.expect(app.reviewNavigation().finalizeActionCursor(std.testing.allocator));
-    try std.testing.expectEqual(@as(usize, 3), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(app.changesNavigation().finalizeActionCursor(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "changed file filter keeps only matching status rows" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwoWithStatuses()),
             .review_display = .{ .changed_file_filter = .added },
             .viewer = .{
@@ -5984,20 +5984,20 @@ test "changed file filter keeps only matching status rows" {
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
-        app.reviewNavigation().loadArenaAllocator().?,
+    try app.changesNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
+        app.changesNavigation().loadArenaAllocator().?,
         false,
-        app.pages.review.review_display.changed_file_filter,
+        app.pages.changes.review_display.changed_file_filter,
     );
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 1), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
 }
 
 test "cycling changed file filter rebuilds visible nodes and reconciles selection" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), app_test_support.loadedDiffTwoWithStatuses()),
             .viewer = .{
                 .selected_node = 1,
@@ -6007,19 +6007,19 @@ test "cycling changed file filter rebuilds visible nodes and reconciles selectio
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().cycleChangedFileFilter(std.testing.allocator);
+    try app.changesNavigation().cycleChangedFileFilter(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.review.review_display.changed_file_filter);
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
+    try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.changes.review_display.changed_file_filter);
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "file visibility lens replaces candidate basis and rebuilds retained query" {
     var reviewed = [_]bool{ true, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6034,38 +6034,38 @@ test "file visibility lens replaces candidate basis and rebuilds retained query"
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    defer app.pages.changes.file_search.deinit(std.testing.allocator);
     setFileSearchInput(&app, "");
-    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.file_search.candidates.len);
+    app.changesNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.file_search.candidates.len);
 
-    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
+    try app.changesNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
-    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
-    try std.testing.expectEqual(@as(u64, 2), app.pages.review.accepted_sidebar_revision);
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expect(app.pages.review.file_search.projection_available);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.file_search.candidates.len);
-    try std.testing.expectEqualStrings("b", app.pages.review.file_search.focusedCandidate().?.path_key);
-    try std.testing.expectEqual(@as(u64, 2), app.pages.review.file_search.basis.?.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.changes.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.changes.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.changes.file_search.mode);
+    try std.testing.expect(app.pages.changes.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.file_search.candidates.len);
+    try std.testing.expectEqualStrings("b", app.pages.changes.file_search.focusedCandidate().?.path_key);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.changes.file_search.basis.?.accepted_sidebar_revision);
 
-    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
-    try app.reviewNavigation().cycleChangedFileFilter(std.testing.allocator);
+    try app.changesNavigation().toggleHideReviewedFiles(std.testing.allocator);
+    try app.changesNavigation().cycleChangedFileFilter(std.testing.allocator);
 
-    try std.testing.expect(!app.pages.review.review_display.hide_reviewed_files);
-    try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.review.review_display.changed_file_filter);
-    try std.testing.expectEqual(@as(u64, 4), app.pages.review.accepted_sidebar_revision);
-    try std.testing.expect(app.pages.review.file_search.projection_available);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.file_search.candidates.len);
-    try std.testing.expectEqualStrings("a", app.pages.review.file_search.focusedCandidate().?.path_key);
-    try std.testing.expectEqual(@as(u64, 4), app.pages.review.file_search.basis.?.accepted_sidebar_revision);
+    try std.testing.expect(!app.pages.changes.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.changes.review_display.changed_file_filter);
+    try std.testing.expectEqual(@as(u64, 4), app.pages.changes.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.changes.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.file_search.candidates.len);
+    try std.testing.expectEqualStrings("a", app.pages.changes.file_search.focusedCandidate().?.path_key);
+    try std.testing.expectEqual(@as(u64, 4), app.pages.changes.file_search.basis.?.accepted_sidebar_revision);
 }
 
 test "file visibility lens preparation failure preserves old lens and candidates" {
     var reviewed = [_]bool{ false, false };
     var partial_visible_nodes = [_]usize{0};
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6082,13 +6082,13 @@ test "file visibility lens preparation failure preserves old lens and candidates
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
-    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    defer app.pages.changes.file_search.deinit(std.testing.allocator);
+    app.changesNavigation().rebuildFileSearchProjection(std.testing.allocator);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
 
     try std.testing.expectError(
         error.OutOfMemory,
-        app.reviewNavigation().replaceFileVisibilityLens(
+        app.changesNavigation().replaceFileVisibilityLens(
             std.testing.allocator,
             failing.allocator(),
             true,
@@ -6096,17 +6096,17 @@ test "file visibility lens preparation failure preserves old lens and candidates
         ),
     );
 
-    try std.testing.expect(!app.pages.review.review_display.hide_reviewed_files);
-    try std.testing.expectEqual(@as(u64, 1), app.pages.review.accepted_sidebar_revision);
-    try std.testing.expect(app.pages.review.file_search.projection_available);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.file_search.candidates.len);
-    try std.testing.expectEqual(@as(usize, 1), app.reviewNavigation().activeLoadedDiff().?.visibleNodeCount());
+    try std.testing.expect(!app.pages.changes.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(u64, 1), app.pages.changes.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.changes.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.file_search.candidates.len);
+    try std.testing.expectEqual(@as(usize, 1), app.changesNavigation().activeLoadedDiff().?.visibleNodeCount());
 }
 
 test "candidate rebuild failure cannot reject committed file visibility lens" {
     var reviewed = [_]bool{ true, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6121,25 +6121,25 @@ test "candidate rebuild failure cannot reject committed file visibility lens" {
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    defer app.pages.changes.file_search.deinit(std.testing.allocator);
     setFileSearchInput(&app, "b");
-    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    app.changesNavigation().rebuildFileSearchProjection(std.testing.allocator);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
 
-    try app.reviewNavigation().replaceFileVisibilityLens(
+    try app.changesNavigation().replaceFileVisibilityLens(
         failing.allocator(),
-        app.reviewNavigation().loadArenaAllocator().?,
+        app.changesNavigation().loadArenaAllocator().?,
         true,
         .all,
     );
 
-    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
-    try std.testing.expectEqual(@as(u64, 2), app.pages.review.accepted_sidebar_revision);
-    try std.testing.expectEqual(@as(usize, 1), app.reviewNavigation().activeLoadedDiff().?.visibleNodeCount());
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expectEqualStrings("b", app.pages.review.file_search.input.slice());
-    try std.testing.expect(!app.pages.review.file_search.projection_available);
-    try std.testing.expect(app.pages.review.file_search.focusedCandidate() == null);
+    try std.testing.expect(app.pages.changes.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.changes.accepted_sidebar_revision);
+    try std.testing.expectEqual(@as(usize, 1), app.changesNavigation().activeLoadedDiff().?.visibleNodeCount());
+    try std.testing.expect(app.pages.changes.file_search.mode);
+    try std.testing.expectEqualStrings("b", app.pages.changes.file_search.input.slice());
+    try std.testing.expect(!app.pages.changes.file_search.projection_available);
+    try std.testing.expect(app.pages.changes.file_search.focusedCandidate() == null);
 }
 
 test "file search skips files outside active changed filter" {
@@ -6150,26 +6150,26 @@ test "file search skips files outside active changed filter" {
     var loaded = app_test_support.loadedDiffTwoWithStatuses();
     loaded.tree.nodes = &nodes;
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(loaded),
             .file_search = .{ .mode = true },
             .review_display = .{ .changed_file_filter = .added },
         } },
     };
     setAndRebuildFileSearch(&app, "deleted");
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
+    defer app.pages.changes.file_search.deinit(std.testing.allocator);
 
-    app.reviewNavigation().submitFileSearch(std.testing.allocator);
+    app.changesNavigation().submitFileSearch(std.testing.allocator);
 
-    try std.testing.expect(app.pages.review.file_search.mode);
-    try std.testing.expect(app.pages.review.file_search.no_match);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expect(app.pages.changes.file_search.mode);
+    try std.testing.expect(app.pages.changes.file_search.no_match);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "toggleReviewedFile toggles selected diff target" {
     var reviewed = [_]bool{ false, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6185,23 +6185,23 @@ test "toggleReviewedFile toggles selected diff target" {
             },
         } },
     };
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.changes.reviewed_store.deinit(std.testing.allocator);
 
-    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+    try app.changesNavigation().toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
 
-    app.pages.review.viewer.selected_node = 1;
-    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+    app.pages.changes.viewer.selected_node = 1;
+    try app.changesNavigation().toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ false, false }, &reviewed);
 
-    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+    try app.changesNavigation().toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
 }
 
 test "toggleReviewedFile uses selected target while cursor is on directory" {
     var reviewed = [_]bool{ false, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6218,9 +6218,9 @@ test "toggleReviewedFile uses selected target while cursor is on directory" {
             },
         } },
     };
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.changes.reviewed_store.deinit(std.testing.allocator);
 
-    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+    try app.changesNavigation().toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ false, true }, &reviewed);
 }
 
@@ -6237,7 +6237,7 @@ test "toggleReviewedFile ignores unkeyable files in repository input" {
     };
     var reviewed = [_]bool{false};
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(.{
                 .text = "",
                 .document = .{ .files = &unkeyable_files },
@@ -6252,13 +6252,13 @@ test "toggleReviewedFile ignores unkeyable files in repository input" {
         .repo_root = "/repo",
     };
 
-    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+    try app.changesNavigation().toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{false}, &reviewed);
 }
 
 test "raw reviewed state stays in active load only" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{
                 .selected_node = 0,
@@ -6267,20 +6267,20 @@ test "raw reviewed state stays in active load only" {
         .allocator = std.testing.allocator,
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.changes.reviewed_store.deinit(std.testing.allocator);
 
-    var loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try app.reviewNavigation().materializeReviewedFiles(std.testing.allocator, loaded);
-    app.pages.review.load.state.loaded.reviewed_files_owned = true;
+    var loaded = app.changesNavigation().activeLoadedDiff().?;
+    try app.changesNavigation().materializeReviewedFiles(std.testing.allocator, loaded);
+    app.pages.changes.load.state.loaded.reviewed_files_owned = true;
 
-    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+    try app.changesNavigation().toggleReviewedFile(std.testing.allocator);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded.reviewed_files);
 
     app.clearLoadedDiff();
-    app.pages.review.load.state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffTwo()) };
-    loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try app.reviewNavigation().materializeReviewedFiles(std.testing.allocator, loaded);
-    app.pages.review.load.state.loaded.reviewed_files_owned = true;
+    app.pages.changes.load.state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffTwo()) };
+    loaded = app.changesNavigation().activeLoadedDiff().?;
+    try app.changesNavigation().materializeReviewedFiles(std.testing.allocator, loaded);
+    app.pages.changes.load.state.loaded.reviewed_files_owned = true;
 
     try std.testing.expectEqualSlices(bool, &.{ false, false }, loaded.reviewed_files);
 }
@@ -6288,7 +6288,7 @@ test "raw reviewed state stays in active load only" {
 test "hide reviewed files removes reviewed file rows from visible list" {
     var reviewed = [_]bool{ true, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6306,21 +6306,21 @@ test "hide reviewed files removes reviewed file rows from visible list" {
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
+    try app.changesNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
-    try std.testing.expect(app.pages.review.review_display.hide_reviewed_files);
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
+    try std.testing.expect(app.pages.changes.review_display.hide_reviewed_files);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "hide reviewed files removes directories with no visible file descendants" {
     var reviewed = [_]bool{ true, true };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6338,16 +6338,16 @@ test "hide reviewed files removes directories with no visible file descendants" 
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
+    try app.changesNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
 }
 
 test "hide reviewed files keeps directories for non-contiguous unreviewed descendants" {
     var reviewed = [_]bool{ true, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6365,9 +6365,9 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
     };
     defer app.clearLoadedDiff();
 
-    try app.reviewNavigation().toggleHideReviewedFiles(std.testing.allocator);
+    try app.changesNavigation().toggleHideReviewedFiles(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 4), loaded.visibleNodeAt(1));
@@ -6376,7 +6376,7 @@ test "hide reviewed files keeps directories for non-contiguous unreviewed descen
 test "marking a visible file as reviewed while hidden moves selection" {
     var reviewed = [_]bool{ false, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6394,28 +6394,28 @@ test "marking a visible file as reviewed while hidden moves selection" {
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
-    try app.reviewNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
-        app.reviewNavigation().loadArenaAllocator().?,
+    defer app.pages.changes.reviewed_store.deinit(std.testing.allocator);
+    try app.changesNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
+        app.changesNavigation().loadArenaAllocator().?,
         true,
         .all,
     );
 
-    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+    try app.changesNavigation().toggleReviewedFile(std.testing.allocator);
 
-    const loaded = app.reviewNavigation().activeLoadedDiff().?;
+    const loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
     try std.testing.expectEqual(@as(usize, 2), loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(?usize, 0), loaded.visibleNodeAt(0));
     try std.testing.expectEqual(@as(?usize, 2), loaded.visibleNodeAt(1));
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.viewer.selected_node);
-    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.review.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
 test "marking reviewed under hidden lens rebuilds file search eligibility" {
     var reviewed = [_]bool{ false, false };
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(.init(std.testing.allocator), .{
                 .text = "",
                 .document = .{ .files = &app_test_support.files_two },
@@ -6435,29 +6435,29 @@ test "marking reviewed under hidden lens rebuilds file search eligibility" {
         } },
     };
     defer app.clearLoadedDiff();
-    defer app.pages.review.reviewed_store.deinit(std.testing.allocator);
-    defer app.pages.review.file_search.deinit(std.testing.allocator);
-    try app.reviewNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
-        app.reviewNavigation().loadArenaAllocator().?,
+    defer app.pages.changes.reviewed_store.deinit(std.testing.allocator);
+    defer app.pages.changes.file_search.deinit(std.testing.allocator);
+    try app.changesNavigation().activeLoadedDiff().?.rebuildVisibleNodes(
+        app.changesNavigation().loadArenaAllocator().?,
         true,
         .all,
     );
-    app.reviewNavigation().rebuildFileSearchProjection(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.review.file_search.candidates.len);
+    app.changesNavigation().rebuildFileSearchProjection(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.file_search.candidates.len);
 
-    try app.reviewNavigation().toggleReviewedFile(std.testing.allocator);
+    try app.changesNavigation().toggleReviewedFile(std.testing.allocator);
 
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &reviewed);
-    try std.testing.expectEqual(@as(u64, 2), app.pages.review.accepted_sidebar_revision);
-    try std.testing.expect(app.pages.review.file_search.projection_available);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.file_search.candidates.len);
-    try std.testing.expectEqualStrings("b", app.pages.review.file_search.focusedCandidate().?.path_key);
-    try std.testing.expectEqual(@as(u64, 2), app.pages.review.file_search.basis.?.accepted_sidebar_revision);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.changes.accepted_sidebar_revision);
+    try std.testing.expect(app.pages.changes.file_search.projection_available);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.file_search.candidates.len);
+    try std.testing.expectEqualStrings("b", app.pages.changes.file_search.focusedCandidate().?.path_key);
+    try std.testing.expectEqual(@as(u64, 2), app.pages.changes.file_search.basis.?.accepted_sidebar_revision);
 }
 
 test "canceling edited search restores committed query and match" {
     var app: TestHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .search = .{
                 .match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } } },
@@ -6468,23 +6468,23 @@ test "canceling edited search restores committed query and match" {
     };
     setDiffSearchQuery(&app, "new");
 
-    app.reviewNavigation().enterSearchMode();
-    app.pages.review.search.input.backspace();
-    try app.pages.review.search.input.insert('x');
-    app.reviewNavigation().cancelSearchMode();
+    app.changesNavigation().enterSearchMode();
+    app.pages.changes.search.input.backspace();
+    try app.pages.changes.search.input.insert('x');
+    app.changesNavigation().cancelSearchMode();
 
-    try std.testing.expectEqualStrings("new", app.pages.review.search.query.slice());
-    try std.testing.expectEqualStrings("new", app.pages.review.search.input.slice());
+    try std.testing.expectEqualStrings("new", app.pages.changes.search.query.slice());
+    try std.testing.expectEqualStrings("new", app.pages.changes.search.input.slice());
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
-    try std.testing.expectEqual(@as(?usize, 4), app.pages.review.search.match_offset);
+    try std.testing.expectEqual(@as(?usize, 4), app.pages.changes.search.match_offset);
 }
 
 test "reviewed state is scoped by explicit repository identity" {
     const allocator = std.testing.allocator;
     var app: TestHarness = .{ .repo_root = "/work/one" };
-    defer app.pages.review.reviewed_store.deinit(allocator);
+    defer app.pages.changes.reviewed_store.deinit(allocator);
 
-    try app.pages.review.reviewed_store.set(
+    try app.pages.changes.reviewed_store.set(
         allocator,
         app.repo_root,
         app_test_support.files_two[0],
@@ -6492,13 +6492,13 @@ test "reviewed state is scoped by explicit repository identity" {
     );
 
     var loaded_one = app_test_support.loadedDiffTwo();
-    try app.reviewNavigation().materializeReviewedFiles(allocator, &loaded_one);
+    try app.changesNavigation().materializeReviewedFiles(allocator, &loaded_one);
     defer allocator.free(loaded_one.reviewed_files);
     try std.testing.expectEqualSlices(bool, &.{ true, false }, loaded_one.reviewed_files);
 
     app.repo_root = "/work/two";
     var loaded_two = app_test_support.loadedDiffTwo();
-    try app.reviewNavigation().materializeReviewedFiles(allocator, &loaded_two);
+    try app.changesNavigation().materializeReviewedFiles(allocator, &loaded_two);
     defer allocator.free(loaded_two.reviewed_files);
     try std.testing.expectEqualSlices(bool, &.{ false, false }, loaded_two.reviewed_files);
 }

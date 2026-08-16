@@ -1,6 +1,6 @@
-//! Typed Review-sidebar cursor ownership across Git action refreshes.
+//! Typed Changes-sidebar cursor ownership across Git action refreshes.
 //!
-//! A Review action can rebuild only Git status or both the diff source and Git
+//! A Changes action can rebuild only Git status or both the diff source and Git
 //! status. This owner keeps the tree cursor independent from the sticky diff
 //! target and binds final restoration to the exact action and required loader
 //! generations which produced the successor projection. A later explicit
@@ -339,7 +339,7 @@ pub const State = struct {
         // The shell advances repo_epoch and clears this page owner before it
         // can commit a different physical root identity. Exact generation +
         // epoch therefore identifies a result from the root captured above;
-        // activation id is intentionally excluded so an inactive Review page
+        // activation id is intentionally excluded so an inactive Changes page
         // can still reconcile its retained state.
         if (owner.action_generation != action_generation or owner.repo_epoch != repo_epoch) return false;
         const basis = switch (owner.phase) {

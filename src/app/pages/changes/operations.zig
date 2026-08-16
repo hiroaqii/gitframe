@@ -1,4 +1,4 @@
-//! Review-local action target and authority resolution.
+//! Changes-local action target and authority resolution.
 //!
 //! Target classification is borrowed and synchronous. Before an operation can
 //! outlive that classification, this module clones it into an immutable owned
@@ -10,11 +10,11 @@ const content_fingerprint = @import("../../../content_fingerprint.zig");
 const builtin = @import("builtin");
 const authority = @import("../../diff_surface/authority.zig");
 const navigation = @import("navigation.zig");
-const review_selection = @import("../../diff_surface/selection.zig");
-const review_page = @import("../review.zig");
+const content_selection = @import("../../diff_surface/selection.zig");
+const changes_page = @import("../changes.zig");
 const app_actions = @import("../../actions.zig");
 const git_ops = @import("../../git_ops.zig");
-const review_projection = @import("../../review_projection.zig");
+const changes_projection = @import("../../changes_projection.zig");
 const projection_component = @import("../../projection_component.zig");
 const diff_hunk_projection = @import("../../../diff/hunk_projection.zig");
 const diff_file = @import("../../../diff/file.zig");
@@ -135,9 +135,9 @@ pub const OwnedBranchSwitchProposal = struct {
     }
 };
 
-/// Immutable operation snapshots transferred from Review to shell-owned UI or
+/// Immutable operation snapshots transferred from Changes to shell-owned UI or
 /// task orchestration. Shell code consumes one proposal or calls `deinit`; it
-/// never borrows Review state while a confirmation or async operation is live.
+/// never borrows Changes state while a confirmation or async operation is live.
 pub const OwnedOperationProposal = union(enum) {
     stage_file: OwnedPathProposal,
     unstage_file: OwnedPathProposal,
@@ -200,14 +200,14 @@ pub const CommitSummary = union(enum) {
 };
 
 pub const View = struct {
-    page: *const review_page.ReviewPageState,
+    page: *const changes_page.ChangesPageState,
     navigation: navigation.View,
     source: diff_source.SourceMode,
     repo_root: ?[]const u8,
     activation_state: authority.ActivationState,
 
     /// Git operation authority is stricter than page activation lifetime. The
-    /// old Review body and activation remain visible while a mutation runs,
+    /// old Changes body and activation remain visible while a mutation runs,
     /// but that visual owner must not resolve another file/hunk or remote
     /// action until exact-terminal reconciliation reopens repository reads.
     pub fn activation(self: View) authority.ActivationState {
@@ -215,7 +215,7 @@ pub const View = struct {
         return self.activation_state;
     }
 
-    fn currentContentToken(self: View) ?review_selection.ReviewContentToken {
+    fn currentContentToken(self: View) ?content_selection.ContentToken {
         return self.navigation.currentContentToken();
     }
 
@@ -584,7 +584,7 @@ pub const View = struct {
 
     fn selectedHunkUsesCachedProjection(self: View) bool {
         _ = self.navigation.activeCachedDiffProjection() orelse return false;
-        const request = self.page.review_projection.displayed.request() orelse return false;
+        const request = self.page.changes_projection.displayed.request() orelse return false;
         return request.kind == .cached_diff and
             request.status_snapshot_revision == self.page.status_snapshot_revision;
     }
@@ -669,7 +669,7 @@ pub const View = struct {
     fn currentHunkAuthority(self: View) ?navigation.ActiveHunkAuthority {
         if (!self.activation().satisfiesAction(.stage_hunk)) return null;
         const bundle = self.navigation.activeHunkAuthority() orelse return null;
-        const request = self.page.review_projection.displayed.request() orelse return null;
+        const request = self.page.changes_projection.displayed.request() orelse return null;
         if (request.kind != bundle.authority.requestKind() or
             request.status_snapshot_revision != self.page.status_snapshot_revision) return null;
         if (bundle.authority.statusSnapshotRevision() != self.page.status_snapshot_revision) return null;
@@ -680,7 +680,7 @@ pub const View = struct {
     /// is in flight, but it must not supply another Git patch. Unrelated retained
     /// projections do not govern the currently displayed primary body.
     fn displayedProjectionReadIsFresh(self: View) bool {
-        const request = self.page.review_projection.displayed.request() orelse return true;
+        const request = self.page.changes_projection.displayed.request() orelse return true;
         if (!self.navigation.displayedProjectionRequestIsActive(request.*)) return true;
         return self.page.repository_read_authority.acceptsRead(request.read_epoch);
     }
@@ -702,7 +702,7 @@ pub const View = struct {
 };
 
 pub const Controller = struct {
-    page: *review_page.ReviewPageState,
+    page: *changes_page.ChangesPageState,
     navigation: navigation.Controller,
     view_state: View,
 
@@ -732,7 +732,7 @@ pub const Controller = struct {
         };
     }
 
-    /// Applies only Review-local consequences of an already accepted shell
+    /// Applies only Changes-local consequences of an already accepted shell
     /// action result. Process pending state, diagnostics, and task spawning stay
     /// with the shell; the returned reload intent is executed after this call.
     pub fn applyAcceptedOutcome(
@@ -942,7 +942,7 @@ test "accepted hunk stage keeps mandatory reload when local mark allocation fail
     const backing = std.testing.allocator;
     var fail_index: usize = 0;
     while (fail_index < 3) : (fail_index += 1) {
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
         };
@@ -973,7 +973,7 @@ test "accepted hunk stage keeps mandatory reload when local mark allocation fail
 
 test "accepted hunk add is ignored after its captured content lineage is invalidated" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
@@ -1002,7 +1002,7 @@ test "accepted hunk add is ignored after its captured content lineage is invalid
 
 test "accepted hunk remove consumes only its exact captured key after lineage invalidation" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
@@ -1030,7 +1030,7 @@ test "accepted hunk remove consumes only its exact captured key after lineage in
     try std.testing.expect(!page.staged_hunks.containsExact("/repo", "a", key));
 }
 
-fn testView(page: *const review_page.ReviewPageState, source: diff_source.SourceMode) View {
+fn testView(page: *const changes_page.ChangesPageState, source: diff_source.SourceMode) View {
     return .{
         .page = page,
         .navigation = .{
@@ -1053,13 +1053,13 @@ fn testView(page: *const review_page.ReviewPageState, source: diff_source.Source
     };
 }
 
-fn acceptTestSource(page: *review_page.ReviewPageState) void {
+fn acceptTestSource(page: *changes_page.ChangesPageState) void {
     page.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test"));
 }
 
-test "mutation fence makes retained Review operation targets inert" {
+test "mutation fence makes retained Changes operation targets inert" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
@@ -1153,7 +1153,7 @@ test "mutation fence makes retained Review operation targets inert" {
 }
 
 test "stage target skips only fresh staged-only files" {
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -1218,7 +1218,7 @@ test "retained staged-only read epoch authority builds unstage patch and becomes
     action_origins[0] = .{ .cached = 0 };
     action_origins[1] = .{ .cached = 1 };
 
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
@@ -1227,8 +1227,8 @@ test "retained staged-only read epoch authority builds unstage patch and becomes
     acceptTestSource(&page);
     var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "M  a\x00");
     try page.git_status.replace("/repo", &status);
-    page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
             page.activation.currentIdentity().?,
             1,
@@ -1296,7 +1296,7 @@ test "retained staged-only read epoch authority builds unstage patch and becomes
     try std.testing.expect(page.staged_hunks.containsExact("/repo", "a", other_hunk_key));
     try std.testing.expect(page.staged_hunks.containsExact("/repo", "other.zig", mark_key));
 
-    const displayed_request = page.review_projection.displayed.request().?;
+    const displayed_request = page.changes_projection.displayed.request().?;
     page.repository_read_authority.epoch = .{ .value = 2 };
     try std.testing.expect(view.navigation.displayedProjectionRequestIsActive(displayed_request.*));
     try std.testing.expect(view.selectedHunkToggleOperation() == .stale_status);
@@ -1316,7 +1316,7 @@ test "retained staged-only read epoch authority builds unstage patch and becomes
 
 test "ordinary cached source hunk unstage keeps source and status reload membership" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
     };
@@ -1351,7 +1351,7 @@ test "ordinary cached source hunk unstage keeps source and status reload members
 }
 
 test "stage toggle resolves file operation from fresh status" {
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -1383,9 +1383,9 @@ test "stage toggle resolves file operation from fresh status" {
     try std.testing.expect(testView(&page, .{ .range = "main...HEAD" }).toggleStageTarget() == .unavailable_source);
 }
 
-test "review root expansion retains whole-repository stage authority" {
+test "changes root expansion retains whole-repository stage authority" {
     const loaded = test_support.loadedDiffRootedNested();
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(loaded),
         .viewer = .{
             .selected_target = .{ .diff_file = 1 },
@@ -1424,7 +1424,7 @@ test "review root expansion retains whole-repository stage authority" {
 }
 
 test "unstage target requires fresh staged status" {
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffTwoWithStatuses()),
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
@@ -1453,7 +1453,7 @@ test "unstage target requires fresh staged status" {
 
 test "hunk toggle resolves source and session staged state" {
     const allocator = std.testing.allocator;
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
     };
@@ -1500,7 +1500,7 @@ test "inert cached projection blocks hunk authority without changing file author
     var cached_owned = true;
     defer if (cached_owned) cached.deinit();
 
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
             .selected_target = .{ .status_only = 0 },
@@ -1511,10 +1511,10 @@ test "inert cached projection blocks hunk authority without changing file author
     acceptTestSource(&page);
     var staged = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "M  a\x00");
     try page.git_status.replace("/repo", &staged);
-    page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            app_page.RequestIdentity.review(0, 1),
+            app_page.RequestIdentity.changes(0, 1),
             1,
             "/repo",
             "a",
@@ -1545,7 +1545,7 @@ test "inert boundary retained preview never yields a hunk write" {
     var cached_owned = true;
     defer if (cached_owned) cached.deinit();
 
-    var page: review_page.ReviewPageState = .{
+    var page: changes_page.ChangesPageState = .{
         .viewer = .{
             .selected_target = .{ .status_only = 0 },
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
@@ -1557,10 +1557,10 @@ test "inert boundary retained preview never yields a hunk write" {
     // is unstaged-only and the retained request is one revision behind.
     var unstaged = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, " M a\x00");
     try page.git_status.replace("/repo", &unstaged);
-    page.review_projection.installReady(.{
-        .request = try review_projection.testing.cloneRequest(
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
             allocator,
-            app_page.RequestIdentity.review(0, 1),
+            app_page.RequestIdentity.changes(0, 1),
             1,
             "/repo",
             "a",
@@ -1612,7 +1612,7 @@ test "either inert combined component blocks all hunk targets without primary fa
         var unstaged_owned = true;
         defer if (unstaged_owned) unstaged.deinit();
 
-        var page: review_page.ReviewPageState = .{
+        var page: changes_page.ChangesPageState = .{
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -1623,10 +1623,10 @@ test "either inert combined component blocks all hunk targets without primary fa
         acceptTestSource(&page);
         var status = try @import("../../../git/status.zig").StatusBundle.parseOwned(allocator, "MM a\x00");
         try page.git_status.replace("/repo", &status);
-        page.review_projection.installReady(.{
-            .request = try review_projection.testing.cloneRequest(
+        page.changes_projection.installReady(.{
+            .request = try changes_projection.testing.cloneRequest(
                 allocator,
-                app_page.RequestIdentity.review(0, 1),
+                app_page.RequestIdentity.changes(0, 1),
                 1,
                 "/repo",
                 "a",

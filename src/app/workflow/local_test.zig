@@ -1,6 +1,6 @@
-//! Owner-local contract tests for Review-local Git workflows.
+//! Owner-local contract tests for Changes-local Git workflows.
 //!
-//! The harness composes the workflow with concrete Review/repository ports and
+//! The harness composes the workflow with concrete Changes/repository ports and
 //! the read bridge used by local action outcomes. It does not import the root
 //! App dispatcher.
 
@@ -17,15 +17,15 @@ const app_shell_layout = @import("../shell_layout.zig");
 const app_state = @import("../state.zig");
 const app_test_support = @import("../test_support.zig");
 const app_projection_component = @import("../projection_component.zig");
-const app_review_projection = @import("../review_projection.zig");
+const app_changes_projection = @import("../changes_projection.zig");
 const page = @import("../page.zig");
 const repo_session = @import("../repo_session.zig");
-const review_page = @import("../pages/review.zig");
-const review_action_fence = @import("../pages/review/action_fence.zig");
-const review_navigation = @import("../pages/review/navigation.zig");
-const review_operations = @import("../pages/review/operations.zig");
-const review_read = @import("../pages/review/read_coordinator.zig");
-const review_reload = @import("../pages/review/reload.zig");
+const changes_page = @import("../pages/changes.zig");
+const changes_action_fence = @import("../pages/changes/action_fence.zig");
+const changes_navigation = @import("../pages/changes/navigation.zig");
+const changes_operations = @import("../pages/changes/operations.zig");
+const changes_read = @import("../pages/changes/read_coordinator.zig");
+const changes_reload = @import("../pages/changes/reload.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 const workflow_local = @import("local.zig");
 
@@ -37,7 +37,7 @@ const diff_source = @import("../../diff/source.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const git_status = @import("../../git/status.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
-const review_authority = @import("../diff_surface/authority.zig");
+const changes_authority = @import("../diff_surface/authority.zig");
 
 const StageFileFinished = app_actions.StageFileFinished;
 const StageHunkFinished = app_actions.StageHunkFinished;
@@ -98,7 +98,7 @@ fn expectLocalRootCapabilityClosed(observer: repo_root_capability.RootCapability
 }
 
 const LocalPages = struct {
-    review: review_page.ReviewPageState = .{},
+    changes: changes_page.ChangesPageState = .{},
 };
 
 const LocalConfig = struct {
@@ -113,7 +113,7 @@ const RedrawPlan = struct {
 const LocalHarness = struct {
     pub const Msg = app_message.Msg;
 
-    active_page: page.Id = .review,
+    active_page: page.Id = .changes,
     repo_session: repo_session.State = .{},
     pages: LocalPages = .{},
     config: LocalConfig = .{},
@@ -135,21 +135,21 @@ const LocalHarness = struct {
         return .{ .width = body.width, .height = body.height };
     }
 
-    fn reviewNavigation(self: *LocalHarness) review_navigation.Controller {
+    fn changesNavigation(self: *LocalHarness) changes_navigation.Controller {
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = self.repoSessionView().activeRoot(),
             .repo_epoch = self.repoSessionView().epoch(),
             .root_identity = self.repoSessionView().activeIdentity(),
             .source = self.config.source,
             .layout = self.bodyLayout(),
-            .diagnostics = .{ .target = &self.pages.review.status },
+            .diagnostics = .{ .target = &self.pages.changes.status },
         };
     }
 
-    fn reviewNavigationView(self: *const LocalHarness) review_navigation.View {
+    fn changesNavigationView(self: *const LocalHarness) changes_navigation.View {
         return .{
-            .page = &self.pages.review,
+            .page = &self.pages.changes,
             .repo_root = self.repoSessionView().activeRoot(),
             .repo_epoch = self.repoSessionView().epoch(),
             .root_identity = self.repoSessionView().activeIdentity(),
@@ -158,39 +158,39 @@ const LocalHarness = struct {
         };
     }
 
-    fn reviewOperations(self: *const LocalHarness) review_operations.View {
+    fn changesOperations(self: *const LocalHarness) changes_operations.View {
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigationView(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigationView(),
             .source = self.config.source,
             .repo_root = self.repoSessionView().activeRoot(),
-            .activation_state = self.pages.review.activation.state,
+            .activation_state = self.pages.changes.activation.state,
         };
     }
 
-    fn reviewOperationController(self: *LocalHarness) review_operations.Controller {
+    fn changesOperationController(self: *LocalHarness) changes_operations.Controller {
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigation(),
-            .view_state = self.reviewOperations(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigation(),
+            .view_state = self.changesOperations(),
         };
     }
 
-    fn reviewActionFence(self: *LocalHarness) review_action_fence.Controller {
+    fn changesActionFence(self: *LocalHarness) changes_action_fence.Controller {
         return .{
-            .read_authority = &self.pages.review.repository_read_authority,
-            .activation = &self.pages.review.activation,
-            .action_cursor = &self.pages.review.action_cursor,
-            .auto_reload = &self.pages.review.auto_reload,
-            .review_projection = &self.pages.review.review_projection,
-            .deferred_projection_apply = &self.pages.review.deferred_projection_apply,
+            .read_authority = &self.pages.changes.repository_read_authority,
+            .activation = &self.pages.changes.activation,
+            .action_cursor = &self.pages.changes.action_cursor,
+            .auto_reload = &self.pages.changes.auto_reload,
+            .changes_projection = &self.pages.changes.changes_projection,
+            .deferred_projection_apply = &self.pages.changes.deferred_projection_apply,
         };
     }
 
     fn actionLifecycle(self: *LocalHarness) action_lifecycle.Controller {
         return .{
             .runtime = &self.action_runtime,
-            .fence = self.reviewActionFence(),
+            .fence = self.changesActionFence(),
         };
     }
 
@@ -198,9 +198,9 @@ const LocalHarness = struct {
         return self.action_runtime.view();
     }
 
-    fn currentReviewActionRoot(self: *const LocalHarness) ?[]const u8 {
-        if (self.active_page != .review or
-            self.pages.review.activation.currentIdentity() == null or
+    fn currentChangesActionRoot(self: *const LocalHarness) ?[]const u8 {
+        if (self.active_page != .changes or
+            self.pages.changes.activation.currentIdentity() == null or
             diff_source.sourceIsOneShotInput(self.config.source)) return null;
         return self.repoSessionView().activeRoot();
     }
@@ -209,20 +209,20 @@ const LocalHarness = struct {
         return .{
             .state = &self.local_workflow,
             .lifecycle = self.actionLifecycle(),
-            .operations = self.reviewOperationController(),
+            .operations = self.changesOperationController(),
             .repo = self.repoSessionView(),
-            .current_review_root = self.currentReviewActionRoot(),
+            .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
             .user_config = &self.user_config,
-            .status = &self.pages.review.status,
+            .status = &self.pages.changes.status,
             .overlay = &self.overlay,
         };
     }
 
-    fn reviewRead(self: *LocalHarness) review_read.Controller {
+    fn changesRead(self: *LocalHarness) changes_read.Controller {
         return .{
-            .page_state = &self.pages.review,
-            .fence = self.reviewActionFence().view(),
+            .page_state = &self.pages.changes,
+            .fence = self.changesActionFence().view(),
             .active_page = self.active_page,
             .repo = self.repoSessionView(),
             .source = self.config.source,
@@ -237,10 +237,10 @@ const LocalHarness = struct {
         };
     }
 
-    fn reviewReload(self: *LocalHarness) review_reload.Controller {
+    fn changesReload(self: *LocalHarness) changes_reload.Controller {
         return .{
-            .page = &self.pages.review,
-            .navigation = self.reviewNavigation(),
+            .page = &self.pages.changes,
+            .navigation = self.changesNavigation(),
             .source = self.config.source,
             .repo_root = self.repoSessionView().activeRoot(),
             .repo_epoch = self.repoSessionView().epoch(),
@@ -254,7 +254,7 @@ const LocalHarness = struct {
         maybe_intent: ?workflow_local.ActionReloadIntent,
     ) !void {
         const intent = maybe_intent orelse return;
-        try self.reviewRead().applyActionOutcome(ctx, intent.pending, intent.active_matches, intent.reload);
+        try self.changesRead().applyActionOutcome(ctx, intent.pending, intent.active_matches, intent.reload);
     }
 };
 
@@ -295,8 +295,8 @@ fn testSingleRepoDiscovery(
     } };
 }
 
-fn activateTestReview(app: *LocalHarness) void {
-    _ = app.pages.review.activation.activate(
+fn activateTestChanges(app: *LocalHarness) void {
+    _ = app.pages.changes.activation.activate(
         app.repo_session.repo_epoch,
         .pending,
         .pending,
@@ -305,24 +305,24 @@ fn activateTestReview(app: *LocalHarness) void {
 }
 
 fn syncTestActivation(app: *LocalHarness) void {
-    const source: review_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
+    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
         .immutable
-    else if (app.pages.review.auto_reload.sourceIsActionable())
+    else if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
-    else if (app.pages.review.load.hasPending())
+    else if (app.pages.changes.load.hasPending())
         .pending
     else
         .unavailable;
-    _ = app.pages.review.activation.activate(
+    _ = app.pages.changes.activation.activate(
         app.repo_session.repo_epoch,
         source,
-        review_authority.auxiliaryMember(app.pages.review.status_load),
-        review_authority.auxiliaryMember(app.pages.review.branch_status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.status_load),
+        changes_authority.auxiliaryMember(app.pages.changes.branch_status_load),
     );
 }
 
 fn acceptTestSource(app: *LocalHarness) void {
-    app.pages.review.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
+    app.pages.changes.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
     syncTestActivation(app);
 }
 
@@ -338,19 +338,19 @@ fn beginAcceptedTestAction(
 fn installTestActionCursor(
     app: *LocalHarness,
     allocator: std.mem.Allocator,
-    kind: review_page.action_cursor.TargetKind,
+    kind: changes_page.action_cursor.TargetKind,
     path_key: []const u8,
     action_generation: u64,
 ) !void {
     const identity = app.repoSessionView().activeIdentity() orelse test_action_root_identity;
-    var prepared = try app.reviewNavigation().prepareActionCursor(
+    var prepared = try app.changesNavigation().prepareActionCursor(
         allocator,
         app.repo_session.repo_epoch,
         identity,
         kind,
         path_key,
     );
-    app.reviewNavigation().installActionCursor(allocator, &prepared, action_generation);
+    app.changesNavigation().installActionCursor(allocator, &prepared, action_generation);
 }
 
 fn finishStageFileForTest(
@@ -407,7 +407,7 @@ fn initStageHunkLaunchLocalHarness(
             .discovery = discovery,
             .root = root,
         } },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .viewer = .{
                 .focus = .diff,
@@ -422,12 +422,12 @@ fn initStageHunkLaunchLocalHarness(
     discovery_owned = false;
     arena_owned = false;
     errdefer {
-        app.pages.review.deinit(allocator);
+        app.pages.changes.deinit(allocator);
         app.repo_session.repo_state.deinit(allocator);
     }
     var status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00 M b\x00");
     defer status.deinit();
-    try app.pages.review.git_status.replace(repo_root, &status);
+    try app.pages.changes.git_status.replace(repo_root, &status);
     acceptTestSource(&app);
     return app;
 }
@@ -468,8 +468,8 @@ fn currentTestSessionHunkMarkKey(
     display_hunk_index: usize,
 ) !git_ops.SessionHunkMarkKey {
     return .{
-        .content = app.reviewNavigationView().currentContentToken() orelse
-            return error.ExpectedReviewContentToken,
+        .content = app.changesNavigationView().currentContentToken() orelse
+            return error.ExpectedContentToken,
         .display_hunk_index = display_hunk_index,
     };
 }
@@ -481,7 +481,7 @@ fn addCurrentTestSessionHunkMark(
     path: []const u8,
     display_hunk_index: usize,
 ) !void {
-    try app.pages.review.staged_hunks.addExact(
+    try app.pages.changes.staged_hunks.addExact(
         allocator,
         repo_root,
         path,
@@ -511,7 +511,7 @@ fn clearPendingStatusAndDiffTasks(
 
 fn testCombinedHunkBundle(
     allocator: std.mem.Allocator,
-) !app_review_projection.CombinedHunkBundle {
+) !app_changes_projection.CombinedHunkBundle {
     var cached_bundle = try app_load.buildLoadedBundle(allocator, app_test_support.diff_cached_projection);
     errdefer cached_bundle.deinit();
     var unstaged_bundle = try app_load.buildLoadedBundle(allocator, app_test_support.diff_unstaged_projection);
@@ -579,7 +579,7 @@ fn abandonSingleQueuedAction(
         else => return error.ExpectedLocalActionTerminal,
     }
 
-    try app.reviewRead().maybeStartQueuedRevalidation(ctx);
+    try app.changesRead().maybeStartQueuedRevalidation(ctx);
     const revalidation = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 3), revalidation.len);
     const status_task: *StatusLoadTask = @ptrCast(@alignCast(revalidation[0].ctx));
@@ -601,23 +601,23 @@ fn abandonSingleQueuedAction(
         var completion = entry.failed(entry.ctx, .runtime_abandoned, ctx.allocator());
         completion.deinitUndelivered(ctx.allocator());
     }
-    _ = app.reviewReload().rejectSourceSpawn(ctx.allocator(), source_generation);
-    _ = app.pages.review.status_load.finishTerminal(status_terminal);
-    _ = app.pages.review.branch_status_load.finishTerminal(branch_terminal);
-    app.pages.review.status_load.markSuccess();
-    app.pages.review.branch_status_load.markSuccess();
-    app.pages.review.canonical_status_drain = null;
+    _ = app.changesReload().rejectSourceSpawn(ctx.allocator(), source_generation);
+    _ = app.pages.changes.status_load.finishTerminal(status_terminal);
+    _ = app.pages.changes.branch_status_load.finishTerminal(branch_terminal);
+    app.pages.changes.status_load.markSuccess();
+    app.pages.changes.branch_status_load.markSuccess();
+    app.pages.changes.canonical_status_drain = null;
     syncTestActivation(app);
 }
 
-test "Review mutation read fence ignores rejected hunk task launch" {
+test "Changes mutation read fence ignores rejected hunk task launch" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app = try initStageHunkLaunchLocalHarness(allocator, roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.deinit(allocator);
-    const epoch_before_rejection = app.pages.review.repository_read_authority.epoch;
+    defer app.pages.changes.deinit(allocator);
+    const epoch_before_rejection = app.pages.changes.repository_read_authority.epoch;
 
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{
         ._allocator = allocator,
@@ -627,17 +627,17 @@ test "Review mutation read fence ignores rejected hunk task launch" {
     ctx._pending_tasks_with_len = 0;
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
-    try std.testing.expect(app.pages.review.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
+    try std.testing.expect(app.pages.changes.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(
-        app.pages.review.repository_read_authority.epoch.eql(epoch_before_rejection),
+        app.pages.changes.repository_read_authority.epoch.eql(epoch_before_rejection),
     );
 }
 
-test "Review Git target kinds map to typed action cursor kinds" {
-    try std.testing.expectEqual(review_page.action_cursor.TargetKind.repository_root, workflow_local.testing.actionCursorKindForTest(.repository));
-    try std.testing.expectEqual(review_page.action_cursor.TargetKind.directory, workflow_local.testing.actionCursorKindForTest(.directory));
-    try std.testing.expectEqual(review_page.action_cursor.TargetKind.file, workflow_local.testing.actionCursorKindForTest(.file));
+test "Changes Git target kinds map to typed action cursor kinds" {
+    try std.testing.expectEqual(changes_page.action_cursor.TargetKind.repository_root, workflow_local.testing.actionCursorKindForTest(.repository));
+    try std.testing.expectEqual(changes_page.action_cursor.TargetKind.directory, workflow_local.testing.actionCursorKindForTest(.directory));
+    try std.testing.expectEqual(changes_page.action_cursor.TargetKind.file, workflow_local.testing.actionCursorKindForTest(.file));
 }
 
 test "file and hunk action repository mismatch clear only their matching cursor owner" {
@@ -652,7 +652,7 @@ test "file and hunk action repository mismatch clear only their matching cursor 
             } } },
         },
     };
-    defer app.reviewNavigation().clearActionCursor(allocator);
+    defer app.changesNavigation().clearActionCursor(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
 
     const stage_pending = beginAcceptedTestAction(&app, .stage_file);
@@ -664,7 +664,7 @@ test "file and hunk action repository mismatch clear only their matching cursor 
         .result = .ok,
     });
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_file);
@@ -676,7 +676,7 @@ test "file and hunk action repository mismatch clear only their matching cursor 
         .result = .ok,
     });
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 
     const hunk_pending = beginAcceptedTestAction(&app, .stage_hunk);
@@ -690,7 +690,7 @@ test "file and hunk action repository mismatch clear only their matching cursor 
         .result = .ok,
     });
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
@@ -700,30 +700,30 @@ test "hunk tasks launch exact typed file owners for stage and unstage" {
     defer roots.deinit();
     var app = try initStageHunkLaunchLocalHarness(allocator, roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
 
     try app.localWorkflow().stageSelectedHunk(&ctx);
     const pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedPendingHunkAction;
     try std.testing.expectEqual(app_actions.ActionKind.stage_hunk, pending.kind);
-    try std.testing.expectEqual(pending.generation, app.pages.review.action_cursor.actionGeneration().?);
-    try std.testing.expectEqual(review_page.action_cursor.TargetKind.file, app.pages.review.action_cursor.target().?.kind);
-    try std.testing.expectEqualStrings("a", app.pages.review.action_cursor.target().?.path_key);
+    try std.testing.expectEqual(pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(changes_page.action_cursor.TargetKind.file, app.pages.changes.action_cursor.target().?.kind);
+    try std.testing.expectEqualStrings("a", app.pages.changes.action_cursor.target().?.path_key);
 
     try abandonSingleQueuedAction(&app, &ctx);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 
     try addCurrentTestSessionHunkMark(&app, allocator, roots.a, "a", 0);
     try app.localWorkflow().unstageSelectedHunk(&ctx);
     const unstage_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedPendingHunkAction;
     try std.testing.expectEqual(app_actions.ActionKind.unstage_hunk, unstage_pending.kind);
-    try std.testing.expectEqual(unstage_pending.generation, app.pages.review.action_cursor.actionGeneration().?);
-    try std.testing.expectEqual(review_page.action_cursor.TargetKind.file, app.pages.review.action_cursor.target().?.kind);
-    try std.testing.expectEqualStrings("a", app.pages.review.action_cursor.target().?.path_key);
+    try std.testing.expectEqual(unstage_pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(changes_page.action_cursor.TargetKind.file, app.pages.changes.action_cursor.target().?.kind);
+    try std.testing.expectEqualStrings("a", app.pages.changes.action_cursor.target().?.path_key);
     try abandonSingleQueuedAction(&app, &ctx);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 }
 
 test "hunk task spawn rejection leaves no action or cursor owner" {
@@ -732,13 +732,13 @@ test "hunk task spawn rejection leaves no action or cursor owner" {
     defer roots.deinit();
     var app = try initStageHunkLaunchLocalHarness(allocator, roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
 
     try std.testing.expectError(error.TaskLimitExceeded, app.localWorkflow().stageSelectedHunk(&ctx));
     ctx._pending_tasks_with_len = 0;
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 }
 
 test "accepted hunk stage local mark allocation failure bounds its refresh owner" {
@@ -750,7 +750,7 @@ test "accepted hunk stage local mark allocation failure bounds its refresh owner
     while (fail_offset < 3) : (fail_offset += 1) {
         var app = try initStageHunkLaunchLocalHarness(backing, roots.a);
         defer app.repo_session.repo_state.deinit(backing);
-        defer app.pages.review.deinit(backing);
+        defer app.pages.changes.deinit(backing);
 
         const pending = beginAcceptedTestAction(&app, .stage_hunk);
         try installTestActionCursor(&app, backing, .file, "a", pending.generation);
@@ -773,9 +773,9 @@ test "accepted hunk stage local mark allocation failure bounds its refresh owner
 
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expect(!app.actionLifecycleView().hasPending());
-        try std.testing.expect(app.pages.review.status_load.pending == null);
-        try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
-        try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
+        try std.testing.expect(app.pages.changes.status_load.pending == null);
+        try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
+        try std.testing.expectEqual(@as(usize, 0), app.pages.changes.staged_hunks.items.items.len);
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     }
 }
@@ -790,19 +790,19 @@ test "staged summary distinguishes pending missing and ready status snapshots" {
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     acceptTestSource(&app);
 
     try std.testing.expectEqual(app_commit_panel.StagedSummary.unavailable, app.localWorkflow().stagedSummary());
 
-    app.pages.review.status_load.pending = .{ .generation = 1 };
+    app.pages.changes.status_load.pending = .{ .generation = 1 };
     syncTestActivation(&app);
     try std.testing.expectEqual(app_commit_panel.StagedSummary.loading_or_stale, app.localWorkflow().stagedSummary());
 
-    app.pages.review.status_load.pending = null;
+    app.pages.changes.status_load.pending = null;
     syncTestActivation(&app);
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  staged.zig\x00 M unstaged.zig\x00?? new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
     try std.testing.expectEqual(app_commit_panel.StagedSummary{ .ready = .{ .count = 1 } }, app.localWorkflow().stagedSummary());
 }
@@ -826,7 +826,7 @@ test "finishCommitMessageAssist inserts generated editable draft and truncated w
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("Generated subject", app.local_workflow.commit_panel.subject.slice());
     try std.testing.expectEqualStrings("Generated body", app.local_workflow.commit_panel.body.slice());
-    try std.testing.expectEqualStrings("generated commit message from truncated staged diff", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("generated commit message from truncated staged diff", app.pages.changes.status.text());
 }
 
 test "finishCommitMessageAssist ignores stale result after popup close" {
@@ -870,7 +870,7 @@ test "finishCommitMessageAssist ignores generated draft after user edit" {
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("x", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.pages.changes.status.text());
 }
 
 test "finishCommitMessageAssist failure keeps draft unchanged" {
@@ -890,7 +890,7 @@ test "finishCommitMessageAssist failure keeps draft unchanged" {
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqual(app_commit_panel.CommitError.assist_failed, app.local_workflow.commit_panel.commit_error.?);
     try std.testing.expectEqualStrings("", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("commit-message: failed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("commit-message: failed", app.pages.changes.status.text());
 }
 
 test "finishCommitMessageAssist rejects long subject without mutating draft" {
@@ -937,7 +937,7 @@ test "finishCommitMessageAssist replaces unchanged improved draft" {
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("Improved subject", app.local_workflow.commit_panel.subject.slice());
     try std.testing.expectEqualStrings("Improved body", app.local_workflow.commit_panel.body.slice());
-    try std.testing.expectEqualStrings("improved commit message", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("improved commit message", app.pages.changes.status.text());
 }
 
 test "finishCommitMessageAssist ignores improved draft after user edit" {
@@ -961,7 +961,7 @@ test "finishCommitMessageAssist ignores improved draft after user edit" {
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("Draft subject edited", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.changes.status.text());
 }
 
 test "finishCommitMessageAssist ignores generated draft after edit then clear" {
@@ -985,7 +985,7 @@ test "finishCommitMessageAssist ignores generated draft after edit then clear" {
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.pages.changes.status.text());
 }
 
 test "finishCommitMessageAssist ignores improved draft after edit then restore" {
@@ -1011,7 +1011,7 @@ test "finishCommitMessageAssist ignores improved draft after edit then restore" 
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("Draft subject", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.changes.status.text());
 }
 
 test "finishCommitMessageAssist ignores improved draft after close and reopen" {
@@ -1037,7 +1037,7 @@ test "finishCommitMessageAssist ignores improved draft after close and reopen" {
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("Draft subject", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.review.status.text());
+    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.changes.status.text());
 }
 
 test "resolveCommitMessageAction resolves minimal configs and reports missing or multiple" {
@@ -1078,7 +1078,7 @@ test "resolveCommitMessageAction resolves minimal configs and reports missing or
 
 test "selectedSidebarActionTarget resolves status-only path without loaded diff" {
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .viewer = .{ .selected_target = .{ .status_only = 0 } },
         } },
         .repo_session = .{
@@ -1089,19 +1089,19 @@ test "selectedSidebarActionTarget resolves status-only path without loaded diff"
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? src/new.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    const target = app.reviewOperations().selectedSidebarActionTarget() orelse return error.ExpectedActionTarget;
+    const target = app.changesOperations().selectedSidebarActionTarget() orelse return error.ExpectedActionTarget;
     try std.testing.expectEqual(git_ops.TargetKind.file, target.kind);
     try std.testing.expectEqualStrings("src/new.zig", target.path);
 }
 
 test "selectedStageToggleOperation resolves directory operation from descendants" {
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{ .selected_node = 0 },
         } },
@@ -1114,26 +1114,26 @@ test "selectedStageToggleOperation resolves directory operation from descendants
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     acceptTestSource(&app);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00A  src/b\x00");
-    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
-    switch (app.reviewOperations().toggleStageTarget()) {
+    try app.pages.changes.git_status.replace("/repo", &mixed_bundle);
+    switch (app.changesOperations().toggleStageTarget()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedDirectoryToggleStage,
     }
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "A  src/a\x00M  src/b\x00");
-    try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    switch (app.reviewOperations().toggleStageTarget()) {
+    try app.pages.changes.git_status.replace("/repo", &staged_bundle);
+    switch (app.changesOperations().toggleStageTarget()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedDirectoryToggleUnstage,
     }
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "UU src/a\x00");
-    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
-    switch (app.reviewOperations().toggleStageTarget()) {
+    try app.pages.changes.git_status.replace("/repo", &conflict_bundle);
+    switch (app.changesOperations().toggleStageTarget()) {
         .conflict_unsupported => |target| {
             try std.testing.expectEqual(TargetKind.directory, target.kind);
             try std.testing.expectEqualStrings("src", target.path);
@@ -1144,7 +1144,7 @@ test "selectedStageToggleOperation resolves directory operation from descendants
 
 test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
         } },
@@ -1159,16 +1159,16 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
             } } },
         },
     };
-    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
     acceptTestSource(&app);
 
-    switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .not_staged_hunk => {},
         else => return error.ExpectedNotStagedHunk,
     }
 
     try addCurrentTestSessionHunkMark(&app, std.testing.allocator, "/repo", "a", 0);
-    switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqualStrings("/repo", target.repo_root);
@@ -1180,8 +1180,8 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
         else => return error.ExpectedReadyHunkUnstageTarget,
     }
 
-    app.pages.review.viewer.diff_scroll = 100;
-    switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
+    app.pages.changes.viewer.diff_scroll = 100;
+    switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .offscreen_cursor => {},
         else => return error.ExpectedOffscreenHunkUnstageTarget,
     }
@@ -1189,7 +1189,7 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
 
 test "selectedHunkUnstageTarget supports cached source without session mark" {
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
         } },
@@ -1206,7 +1206,7 @@ test "selectedHunkUnstageTarget supports cached source without session mark" {
     };
     acceptTestSource(&app);
 
-    switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqual(SessionHunkMarkMutation.none, target.session_mark_mutation);
@@ -1220,7 +1220,7 @@ test "selectedHunkUnstageTarget supports cached source without session mark" {
 
 test "projected hunk actions route through original cached and unstaged origins" {
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
             .status_load = .{ .generation = 3 },
             .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 0 } },
@@ -1236,38 +1236,38 @@ test "projected hunk actions route through original cached and unstaged origins"
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.review_projection.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.pages.changes.changes_projection.deinit(std.testing.allocator);
     acceptTestSource(&app);
 
     var mixed_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM a\x00");
-    try app.pages.review.git_status.replace("/repo", &mixed_bundle);
+    try app.pages.changes.git_status.replace("/repo", &mixed_bundle);
 
-    const request = try app_review_projection.testing.cloneRequest(
+    const request = try app_changes_projection.testing.cloneRequest(
         std.testing.allocator,
-        page.RequestIdentity.review(0, 1),
+        page.RequestIdentity.changes(0, 1),
         1,
         "/repo",
         "a",
         .combined_hunks,
         .unstaged,
-        app.pages.review.source_session_revision,
-        app.pages.review.status_snapshot_revision,
+        app.pages.changes.source_session_revision,
+        app.pages.changes.status_snapshot_revision,
     );
-    app.pages.review.review_projection.displayed = .{ .ready = .{
+    app.pages.changes.changes_projection.displayed = .{ .ready = .{
         .request = request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
 
-    switch (app.reviewOperations().selectedHunkToggleOperation()) {
+    switch (app.changesOperations().selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.unstage, operation),
         else => return error.ExpectedProjectedToggleUnstage,
     }
-    switch (app.reviewOperations().selectedHunkStageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkStageTarget(std.testing.allocator)) {
         .already_staged_hunk => {},
         else => return error.ExpectedAlreadyStagedProjectedHunk,
     }
-    switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
@@ -1276,12 +1276,12 @@ test "projected hunk actions route through original cached and unstaged origins"
         else => return error.ExpectedReadyProjectedUnstage,
     }
 
-    app.pages.review.viewer.diff_cursor = .{ .hunk_header = 1 };
-    switch (app.reviewOperations().selectedHunkToggleOperation()) {
+    app.pages.changes.viewer.diff_cursor = .{ .hunk_header = 1 };
+    switch (app.changesOperations().selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedProjectedToggleStage,
     }
-    switch (app.reviewOperations().selectedHunkStageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkStageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqual(@as(usize, 1), target.hunk_index);
@@ -1289,7 +1289,7 @@ test "projected hunk actions route through original cached and unstaged origins"
         },
         else => return error.ExpectedReadyProjectedStage,
     }
-    switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .not_staged_hunk => {},
         else => return error.ExpectedNotStagedProjectedHunk,
     }
@@ -1297,19 +1297,19 @@ test "projected hunk actions route through original cached and unstaged origins"
     // Stage chrome and patch authority are separate contracts. A corrupt or
     // cross-generation-mismatched action origin must fail closed without
     // changing the fresh stage-state decision shown by the toggle UI.
-    const live = app.reviewNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
+    const live = app.changesNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     @constCast(live.hunkActionOrigins())[1] = .{ .cached = 0 };
-    switch (app.reviewOperations().selectedHunkToggleOperation()) {
+    switch (app.changesOperations().selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(ToggleStageOperation.stage, operation),
         else => return error.ExpectedProjectedToggleStage,
     }
-    switch (app.reviewOperations().selectedHunkStageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkStageTarget(std.testing.allocator)) {
         .no_hunk => {},
         else => return error.ExpectedMismatchedActionOriginToFailClosed,
     }
 
     @constCast(&live.authority.status_snapshot_revision).* +%= 1;
-    try std.testing.expect(app.reviewOperations().selectedHunkToggleOperation() == .stale_status);
+    try std.testing.expect(app.changesOperations().selectedHunkToggleOperation() == .stale_status);
 }
 
 test "hunk stage presentation keeps fresh staged authority without clearing action marks" {
@@ -1317,7 +1317,7 @@ test "hunk stage presentation keeps fresh staged authority without clearing acti
     defer arena.deinit();
 
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
         } },
@@ -1332,19 +1332,19 @@ test "hunk stage presentation keeps fresh staged authority without clearing acti
             } } },
         },
     };
-    defer app.pages.review.staged_hunks.deinit(std.testing.allocator);
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
+    defer app.pages.changes.git_status.deinit();
     acceptTestSource(&app);
 
     try addCurrentTestSessionHunkMark(&app, std.testing.allocator, "/repo", "a", 0);
     try addCurrentTestSessionHunkMark(&app, std.testing.allocator, "/repo", "a", 1);
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  a\x00");
-    try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    const presentation = try app.reviewNavigationView().hunkStagePresentation(arena.allocator(), 0);
+    try app.pages.changes.git_status.replace("/repo", &staged_bundle);
+    const presentation = try app.changesNavigationView().hunkStagePresentation(arena.allocator(), 0);
     try std.testing.expect(presentation == .all_staged);
 
-    switch (app.reviewOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
+    switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .ready => |target| {
             defer std.testing.allocator.free(target.patch);
             try std.testing.expectEqualStrings("/repo", target.repo_root);
@@ -1358,7 +1358,7 @@ test "hunk stage presentation keeps fresh staged authority without clearing acti
 test "hunk action results mutate session staged marks" {
     const allocator = std.testing.allocator;
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .allocator = allocator,
@@ -1371,7 +1371,7 @@ test "hunk action results mutate session staged marks" {
             } } },
         },
     };
-    defer app.pages.review.staged_hunks.deinit(allocator);
+    defer app.pages.changes.staged_hunks.deinit(allocator);
     acceptTestSource(&app);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
@@ -1387,8 +1387,8 @@ test "hunk action results mutate session staged marks" {
         .result = .ok,
     });
 
-    try std.testing.expect(app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.staged_hunks.items.items.len);
+    try std.testing.expect(app.pages.changes.staged_hunks.containsExact("/repo", "a", mark_key));
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.staged_hunks.items.items.len);
 
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_hunk);
     try finishUnstageHunkForTest(&app, &ctx, .{
@@ -1400,8 +1400,8 @@ test "hunk action results mutate session staged marks" {
         .result = .ok,
     });
 
-    try std.testing.expect(!app.pages.review.staged_hunks.containsExact("/repo", "a", mark_key));
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
+    try std.testing.expect(!app.pages.changes.staged_hunks.containsExact("/repo", "a", mark_key));
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.staged_hunks.items.items.len);
 }
 
 test "hunk action none effect reloads status without adding a session mark" {
@@ -1409,7 +1409,7 @@ test "hunk action none effect reloads status without adding a session mark" {
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .allocator = allocator,
@@ -1420,8 +1420,8 @@ test "hunk action none effect reloads status without adding a session mark" {
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    activateTestReview(&app);
-    defer app.pages.review.staged_hunks.deinit(allocator);
+    activateTestChanges(&app);
+    defer app.pages.changes.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
 
@@ -1435,8 +1435,8 @@ test "hunk action none effect reloads status without adding a session mark" {
         .result = .ok,
     });
 
-    try std.testing.expectEqual(@as(usize, 0), app.pages.review.staged_hunks.items.items.len);
-    try std.testing.expect(app.pages.review.status_load.isPending());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.staged_hunks.items.items.len);
+    try std.testing.expect(app.pages.changes.status_load.isPending());
 }
 
 test "hunk action none effect reloads status without removing a session mark" {
@@ -1444,7 +1444,7 @@ test "hunk action none effect reloads status without removing a session mark" {
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .allocator = allocator,
@@ -1455,13 +1455,13 @@ test "hunk action none effect reloads status without removing a session mark" {
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    activateTestReview(&app);
-    defer app.pages.review.staged_hunks.deinit(allocator);
+    activateTestChanges(&app);
+    defer app.pages.changes.staged_hunks.deinit(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusTasks(&ctx, allocator);
 
     const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
-    try app.pages.review.staged_hunks.addExact(allocator, roots.a, "a", mark_key);
+    try app.pages.changes.staged_hunks.addExact(allocator, roots.a, "a", mark_key);
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_hunk);
     try finishUnstageHunkForTest(&app, &ctx, .{
         .pending = unstage_pending,
@@ -1472,9 +1472,9 @@ test "hunk action none effect reloads status without removing a session mark" {
         .result = .ok,
     });
 
-    try std.testing.expect(app.pages.review.staged_hunks.containsExact(roots.a, "a", mark_key));
-    try std.testing.expectEqual(@as(usize, 1), app.pages.review.staged_hunks.items.items.len);
-    try std.testing.expect(app.pages.review.status_load.isPending());
+    try std.testing.expect(app.pages.changes.staged_hunks.containsExact(roots.a, "a", mark_key));
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.staged_hunks.items.items.len);
+    try std.testing.expect(app.pages.changes.status_load.isPending());
 }
 
 test "cached source hunk unstage reload decision travels with task result" {
@@ -1482,7 +1482,7 @@ test "cached source hunk unstage reload decision travels with task result" {
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .allocator = allocator,
@@ -1493,13 +1493,13 @@ test "cached source hunk unstage reload decision travels with task result" {
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    activateTestReview(&app);
-    defer app.pages.review.deinit(allocator);
+    activateTestChanges(&app);
+    defer app.pages.changes.deinit(allocator);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
     const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
-    try app.pages.review.staged_hunks.addExact(allocator, roots.a, "a", mark_key);
+    try app.pages.changes.staged_hunks.addExact(allocator, roots.a, "a", mark_key);
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_hunk);
     try finishUnstageHunkForTest(&app, &ctx, .{
         .pending = unstage_pending,
@@ -1511,8 +1511,8 @@ test "cached source hunk unstage reload decision travels with task result" {
         .result = .ok,
     });
 
-    try std.testing.expect(app.pages.review.staged_hunks.containsExact(roots.a, "a", mark_key));
-    switch (app.pages.review.load.pending orelse return error.ExpectedReloadAfterCachedHunkUnstage) {
+    try std.testing.expect(app.pages.changes.staged_hunks.containsExact(roots.a, "a", mark_key));
+    switch (app.pages.changes.load.pending orelse return error.ExpectedReloadAfterCachedHunkUnstage) {
         .diff_load => {},
         .repo_discovery => return error.ExpectedReloadAfterCachedHunkUnstage,
     }
@@ -1522,7 +1522,7 @@ test "cached source hunk unstage reload decision travels with task result" {
 test "directory stage target uses sidebar cursor and status subtree" {
     var app: LocalHarness = .{
         .pages = .{
-            .review = .{
+            .changes = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
                 .viewer = .{
                     // The diff pane still points at a file, but the sidebar cursor is
@@ -1541,13 +1541,13 @@ test "directory stage target uses sidebar cursor and status subtree" {
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00?? src/b\x00M  other.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    switch (app.reviewOperations().stageTarget()) {
+    switch (app.changesOperations().stageTarget()) {
         .ready => |target| {
             try std.testing.expectEqualStrings("/repo", target.repo_root);
             try std.testing.expectEqualStrings("src", target.path);
@@ -1557,15 +1557,15 @@ test "directory stage target uses sidebar cursor and status subtree" {
     }
 
     var staged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00");
-    try app.pages.review.git_status.replace("/repo", &staged_bundle);
-    switch (app.reviewOperations().stageTarget()) {
+    try app.pages.changes.git_status.replace("/repo", &staged_bundle);
+    switch (app.changesOperations().stageTarget()) {
         .no_stageable_content => |path| try std.testing.expectEqualStrings("src", path),
         else => return error.ExpectedNoDirectoryStageableContent,
     }
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00UU src/b\x00");
-    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
-    switch (app.reviewOperations().stageTarget()) {
+    try app.pages.changes.git_status.replace("/repo", &conflict_bundle);
+    switch (app.changesOperations().stageTarget()) {
         .conflict_unsupported => |path| try std.testing.expectEqualStrings("src", path),
         else => return error.ExpectedDirectoryConflictStageReject,
     }
@@ -1573,7 +1573,7 @@ test "directory stage target uses sidebar cursor and status subtree" {
 
 test "directory unstage target scans staged subtree" {
     var app: LocalHarness = .{
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
@@ -1589,13 +1589,13 @@ test "directory unstage target scans staged subtree" {
             } } },
         },
     };
-    defer app.pages.review.git_status.deinit();
+    defer app.pages.changes.git_status.deinit();
     acceptTestSource(&app);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00AM src/b\x00 M other.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
-    switch (app.reviewOperations().unstageTarget()) {
+    switch (app.changesOperations().unstageTarget()) {
         .ready => |target| {
             try std.testing.expectEqualStrings("/repo", target.repo_root);
             try std.testing.expectEqualStrings("src", target.path);
@@ -1605,8 +1605,8 @@ test "directory unstage target scans staged subtree" {
     }
 
     var unstaged_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a\x00?? src/b\x00");
-    try app.pages.review.git_status.replace("/repo", &unstaged_bundle);
-    switch (app.reviewOperations().unstageTarget()) {
+    try app.pages.changes.git_status.replace("/repo", &unstaged_bundle);
+    switch (app.changesOperations().unstageTarget()) {
         .no_staged_content => |target| {
             try std.testing.expectEqualStrings("src", target.path);
             try std.testing.expect(target.kind == .directory);
@@ -1615,8 +1615,8 @@ test "directory unstage target scans staged subtree" {
     }
 
     var conflict_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "M  src/a\x00UU src/b\x00");
-    try app.pages.review.git_status.replace("/repo", &conflict_bundle);
-    switch (app.reviewOperations().unstageTarget()) {
+    try app.pages.changes.git_status.replace("/repo", &conflict_bundle);
+    switch (app.changesOperations().unstageTarget()) {
         .conflict_unsupported => |target| {
             try std.testing.expectEqualStrings("src", target.path);
             try std.testing.expect(target.kind == .directory);
@@ -1632,7 +1632,7 @@ test "stage unstage and discard launch typed action cursor owners with task gene
     var app: LocalHarness = .{
         .allocator = allocator,
         .config = .{ .source = .unstaged },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffNested()),
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
@@ -1645,33 +1645,33 @@ test "stage unstage and discard launch typed action cursor owners with task gene
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.reviewReload().clearLoadedDiff(app.allocator);
-    defer app.pages.review.git_status.deinit();
-    defer app.reviewNavigation().clearActionCursor(allocator);
+    defer app.changesReload().clearLoadedDiff(app.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.changesNavigation().clearActionCursor(allocator);
     acceptTestSource(&app);
     var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
 
     var stageable = try git_status.StatusBundle.parseOwned(allocator, " M src/a\x00?? src/b\x00");
-    try app.pages.review.git_status.replace(roots.a, &stageable);
+    try app.pages.changes.git_status.replace(roots.a, &stageable);
     try app.localWorkflow().stageSelectedFile(&ctx);
     const stage_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedStageAction;
     try std.testing.expectEqual(app_actions.ActionKind.stage_file, stage_pending.kind);
-    try std.testing.expectEqual(stage_pending.generation, app.pages.review.action_cursor.actionGeneration().?);
-    try std.testing.expectEqual(review_page.action_cursor.TargetKind.directory, app.pages.review.action_cursor.target().?.kind);
-    try std.testing.expectEqualStrings("src", app.pages.review.action_cursor.target().?.path_key);
+    try std.testing.expectEqual(stage_pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(changes_page.action_cursor.TargetKind.directory, app.pages.changes.action_cursor.target().?.kind);
+    try std.testing.expectEqualStrings("src", app.pages.changes.action_cursor.target().?.path_key);
     try abandonSingleQueuedAction(&app, &ctx);
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 
     var staged = try git_status.StatusBundle.parseOwned(allocator, "M  src/a\x00M  src/b\x00");
-    try app.pages.review.git_status.replace(roots.a, &staged);
+    try app.pages.changes.git_status.replace(roots.a, &staged);
     try app.localWorkflow().unstageSelectedFile(&ctx);
     const unstage_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedUnstageAction;
     try std.testing.expectEqual(app_actions.ActionKind.unstage_file, unstage_pending.kind);
-    try std.testing.expectEqual(unstage_pending.generation, app.pages.review.action_cursor.actionGeneration().?);
-    try std.testing.expectEqual(review_page.action_cursor.TargetKind.directory, app.pages.review.action_cursor.target().?.kind);
-    try std.testing.expectEqualStrings("src", app.pages.review.action_cursor.target().?.path_key);
+    try std.testing.expectEqual(unstage_pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(changes_page.action_cursor.TargetKind.directory, app.pages.changes.action_cursor.target().?.kind);
+    try std.testing.expectEqualStrings("src", app.pages.changes.action_cursor.target().?.path_key);
     try abandonSingleQueuedAction(&app, &ctx);
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 
     app.local_workflow.discard_confirmation = .{
         .repo_root = try allocator.dupe(u8, roots.a),
@@ -1681,11 +1681,11 @@ test "stage unstage and discard launch typed action cursor owners with task gene
     try app.localWorkflow().confirmDiscardFile(&ctx);
     const discard_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedDiscardAction;
     try std.testing.expectEqual(app_actions.ActionKind.discard_file, discard_pending.kind);
-    try std.testing.expectEqual(discard_pending.generation, app.pages.review.action_cursor.actionGeneration().?);
-    try std.testing.expectEqual(review_page.action_cursor.TargetKind.file, app.pages.review.action_cursor.target().?.kind);
-    try std.testing.expectEqualStrings("src/a", app.pages.review.action_cursor.target().?.path_key);
+    try std.testing.expectEqual(discard_pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
+    try std.testing.expectEqual(changes_page.action_cursor.TargetKind.file, app.pages.changes.action_cursor.target().?.kind);
+    try std.testing.expectEqualStrings("src/a", app.pages.changes.action_cursor.target().?.path_key);
     try abandonSingleQueuedAction(&app, &ctx);
-    try std.testing.expect(!app.pages.review.action_cursor.hasOwner());
+    try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 }
 
 test "fresh status-only targets fail closed without accepted source" {
@@ -1701,19 +1701,19 @@ test "fresh status-only targets fail closed without accepted source" {
             } } },
         },
     };
-    defer app.reviewReload().clearLoadedDiff(app.allocator);
-    defer app.pages.review.git_status.deinit();
-    defer app.pages.review.tree_order.deinit(allocator);
-    defer if (app.pages.review.tree_order_scope) |scope| allocator.free(scope);
+    defer app.changesReload().clearLoadedDiff(app.allocator);
+    defer app.pages.changes.git_status.deinit();
+    defer app.pages.changes.tree_order.deinit(allocator);
+    defer if (app.pages.changes.tree_order_scope) |scope| allocator.free(scope);
 
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "AM src/main.zig\x00");
-    try app.pages.review.git_status.replace("/repo", &status_bundle);
-    try app.reviewReload().createStatusOnlyLoadedSession(allocator, app.pages.review.git_status.document);
-    try std.testing.expect(app.pages.review.auto_reload.accepted_source == null);
+    try app.pages.changes.git_status.replace("/repo", &status_bundle);
+    try app.changesReload().createStatusOnlyLoadedSession(allocator, app.pages.changes.git_status.document);
+    try std.testing.expect(app.pages.changes.auto_reload.accepted_source == null);
 
-    try std.testing.expectEqual(git_ops.StageTargetResult.stale_source, app.reviewOperations().stageTarget());
-    try std.testing.expectEqual(git_ops.UnstageTargetResult.stale_source, app.reviewOperations().unstageTarget());
-    try std.testing.expectEqual(git_ops.DiscardTargetResult.stale_source, app.reviewOperations().discardTarget());
+    try std.testing.expectEqual(git_ops.StageTargetResult.stale_source, app.changesOperations().stageTarget());
+    try std.testing.expectEqual(git_ops.UnstageTargetResult.stale_source, app.changesOperations().unstageTarget());
+    try std.testing.expectEqual(git_ops.DiscardTargetResult.stale_source, app.changesOperations().discardTarget());
 }
 
 test "queued commit-message assist retains staged diff and external cwd across path replacement" {
@@ -1764,12 +1764,12 @@ test "queued commit-message assist retains staged diff and external cwd across p
         .local_workflow = workflow_local.LocalState.init(allocator),
     };
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
     defer app.local_workflow.deinit(allocator);
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "A  a-staged.txt\x00");
-    try app.pages.review.git_status.replace(slot_path, &status_bundle);
-    app.pages.review.status_load.markSuccess();
-    app.pages.review.branch_status_load.markSuccess();
+    try app.pages.changes.git_status.replace(slot_path, &status_bundle);
+    app.pages.changes.status_load.markSuccess();
+    app.pages.changes.branch_status_load.markSuccess();
     acceptTestSource(&app);
     app.local_workflow.commit_panel.open(.commit);
 
@@ -1872,7 +1872,7 @@ test "queued local Git mutation retains the accepted root across path replacemen
         .allocator = allocator,
         .env_map = &parent_environment,
         .config = .{ .source = .unstaged },
-        .pages = .{ .review = .{
+        .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         } },
@@ -1882,12 +1882,12 @@ test "queued local Git mutation retains the accepted root across path replacemen
         } },
     };
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.review.deinit(allocator);
-    defer app.reviewNavigation().clearActionCursor(allocator);
+    defer app.pages.changes.deinit(allocator);
+    defer app.changesNavigation().clearActionCursor(allocator);
     var status_bundle = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
-    try app.pages.review.git_status.replace(slot_path, &status_bundle);
-    app.pages.review.status_load.markSuccess();
-    app.pages.review.branch_status_load.markSuccess();
+    try app.pages.changes.git_status.replace(slot_path, &status_bundle);
+    app.pages.changes.status_load.markSuccess();
+    app.pages.changes.branch_status_load.markSuccess();
     acceptTestSource(&app);
 
     // Queue rejection must close the just-created duplicate. The next

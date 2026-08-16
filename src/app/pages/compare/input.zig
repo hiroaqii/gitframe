@@ -1,4 +1,4 @@
-//! Compare-local input. Mutating Review actions are intentionally absent.
+//! Compare-local input. Mutating Changes actions are intentionally absent.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -144,7 +144,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .copy_current_line => .copy_current_line,
         .copy_current_hunk => .copy_current_hunk,
         .branch_switch => .branch_switch_unavailable,
-        .page_review, .page_repository, .page_compare, .page_config, .help, .reload, .repo_picker, .open_editor, .commit, .amend, .push, .pull, .fetch, .discard => null,
+        .page_changes, .page_repository, .page_compare, .page_config, .help, .reload, .repo_picker, .open_editor, .commit, .amend, .push, .pull, .fetch, .discard => null,
         else => unreachable,
     };
 }
