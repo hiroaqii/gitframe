@@ -32,8 +32,6 @@ pub const RowLayout = struct {
     name_width: u16,
     tree_content_col: u16,
     tree_content_width: u16,
-    stats_col: ?u16,
-    stats_width: u16,
 };
 
 pub const Source = struct {
@@ -133,10 +131,8 @@ pub fn layout(row: Row, width: u16) RowLayout {
         4 +| indent
     else
         2 +| indent;
-    const stats_width: u16 = if (shouldShowStats(row, width, name_col)) 12 else 0;
-    const name_width: u16 = if (width > name_col + stats_width) width - name_col - stats_width else 0;
-    const stats_col: ?u16 = if (stats_width > 0) width - stats_width else null;
-    const tree_content_width: u16 = if (width > tree_content_col + stats_width) width - tree_content_col - stats_width else 0;
+    const name_width: u16 = width -| name_col;
+    const tree_content_width: u16 = width -| tree_content_col;
 
     return .{
         .badge_col = badge_col,
@@ -146,8 +142,6 @@ pub fn layout(row: Row, width: u16) RowLayout {
         .name_width = name_width,
         .tree_content_col = tree_content_col,
         .tree_content_width = tree_content_width,
-        .stats_col = stats_col,
-        .stats_width = stats_width,
     };
 }
 
@@ -165,20 +159,6 @@ pub fn maxHorizontalScroll(row: Row, width: u16) usize {
     const content_width = treeContentDisplayWidth(row);
     if (content_width <= row_layout.tree_content_width) return 0;
     return content_width - row_layout.tree_content_width;
-}
-
-fn hasLineStats(stats: file_tree.Stats) bool {
-    return stats.added != 0 or stats.removed != 0;
-}
-
-fn shouldShowStats(row: Row, width: u16, name_col: u16) bool {
-    const stats_width: u16 = 12;
-    const min_name_width_with_stats: u16 = 8;
-
-    // Keep navigation rows quiet; repository totals remain visible at the root.
-    if (row.kind != .repo_root) return false;
-    return hasLineStats(row.stats) and
-        width > name_col + stats_width + min_name_width_with_stats;
 }
 
 test "rowForNode exposes sidebar row semantics" {
@@ -244,7 +224,6 @@ test "layout keeps sidebar columns in one place" {
     try std.testing.expectEqual(@as(u16, 34), row_layout.name_width);
     try std.testing.expectEqual(@as(u16, 4), row_layout.tree_content_col);
     try std.testing.expectEqual(@as(u16, 36), row_layout.tree_content_width);
-    try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
 }
 
 test "layout reserves a mode badge column for mode-changed file rows" {
@@ -296,7 +275,7 @@ test "layout reserves reviewed gutter for status-less file rows" {
     try std.testing.expectEqual(unreviewed_layout.name_width, reviewed_layout.name_width);
 }
 
-test "layout omits zero line stats" {
+test "layout gives file names the remaining row width" {
     const nodes = [_]file_tree.Node{
         .{
             .kind = .file,
@@ -312,12 +291,10 @@ test "layout omits zero line stats" {
     const collapsed: file_tree.CollapsedSet = .empty;
     const row_layout = layout(rowForNode(tree, &collapsed, &.{false}, 0, 0).?, 40);
 
-    try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
-    try std.testing.expectEqual(@as(u16, 0), row_layout.stats_width);
     try std.testing.expectEqual(@as(u16, 36), row_layout.name_width);
 }
 
-test "layout prioritizes file name over stats in narrow sidebars" {
+test "layout keeps file names usable in narrow sidebars" {
     const nodes = [_]file_tree.Node{
         .{
             .kind = .file,
@@ -333,12 +310,10 @@ test "layout prioritizes file name over stats in narrow sidebars" {
     const collapsed: file_tree.CollapsedSet = .empty;
     const row_layout = layout(rowForNode(tree, &collapsed, &.{false}, 0, 0).?, 14);
 
-    try std.testing.expectEqual(@as(?u16, null), row_layout.stats_col);
-    try std.testing.expectEqual(@as(u16, 0), row_layout.stats_width);
     try std.testing.expect(row_layout.name_width > 0);
 }
 
-test "layout shows stats only for repository root rows" {
+test "layout gives repository roots and directories their full remaining width" {
     const nodes = [_]file_tree.Node{
         .{
             .kind = .repo_root,
@@ -364,10 +339,10 @@ test "layout shows stats only for repository root rows" {
 
     try std.testing.expectEqual(@as(u16, 1), root_layout.tree_content_col);
     try std.testing.expectEqual(@as(u16, 1), root_layout.name_col);
-    try std.testing.expectEqual(@as(?u16, 28), root_layout.stats_col);
+    try std.testing.expectEqual(@as(u16, 39), root_layout.tree_content_width);
     try std.testing.expectEqual(@as(u16, 0), directory_layout.tree_content_col);
     try std.testing.expectEqual(@as(u16, 4), directory_layout.name_col);
-    try std.testing.expectEqual(@as(?u16, null), directory_layout.stats_col);
+    try std.testing.expectEqual(@as(u16, 40), directory_layout.tree_content_width);
 }
 
 test "diff root row has no disclosure state" {
@@ -387,7 +362,7 @@ test "diff root row has no disclosure state" {
     try std.testing.expect(!file_tree.isCollapsed(&collapsed, ""));
 }
 
-test "diff markerless root has exact stats and horizontal geometry" {
+test "diff markerless root uses the full sidebar width" {
     const root_name = "0123456789abcdefghijklmnopqrstuv";
     try std.testing.expectEqual(@as(usize, 32), chasen.text.displayWidth(root_name));
     const nodes = [_]file_tree.Node{.{
@@ -405,17 +380,15 @@ test "diff markerless root has exact stats and horizontal geometry" {
     try std.testing.expectEqual(Row.Fold.none, root.fold);
     try std.testing.expectEqual(@as(usize, 32), treeContentDisplayWidth(root));
 
-    const with_stats = layout(root, 40);
-    try std.testing.expectEqual(@as(u16, 1), with_stats.tree_content_col);
-    try std.testing.expectEqual(@as(u16, 1), with_stats.name_col);
-    try std.testing.expectEqual(@as(u16, 27), with_stats.tree_content_width);
-    try std.testing.expectEqual(@as(?u16, 28), with_stats.stats_col);
-    try std.testing.expectEqual(@as(usize, 5), maxHorizontalScroll(root, 40));
+    const wide = layout(root, 40);
+    try std.testing.expectEqual(@as(u16, 1), wide.tree_content_col);
+    try std.testing.expectEqual(@as(u16, 1), wide.name_col);
+    try std.testing.expectEqual(@as(u16, 39), wide.tree_content_width);
+    try std.testing.expectEqual(@as(usize, 0), maxHorizontalScroll(root, 40));
 
     const narrow = layout(root, 20);
     try std.testing.expectEqual(@as(u16, 1), narrow.tree_content_col);
     try std.testing.expectEqual(@as(u16, 1), narrow.name_col);
     try std.testing.expectEqual(@as(u16, 19), narrow.tree_content_width);
-    try std.testing.expectEqual(@as(?u16, null), narrow.stats_col);
     try std.testing.expectEqual(@as(usize, 13), maxHorizontalScroll(root, 20));
 }

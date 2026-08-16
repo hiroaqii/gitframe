@@ -127,6 +127,12 @@ pub fn pageHeaderPresentation(app: Context) ?page_header.Presentation {
     };
 }
 
+pub fn pageHeaderLineStats(app: Context) ?file_tree.Stats {
+    return diff_surface_view.pageHeaderLineStats(
+        app.page.readSurface(app.source, app.navigation.layout),
+    );
+}
+
 fn headPresentation(
     status: git_branch_status.BranchStatus,
     freshness: page_header.Freshness,
@@ -504,6 +510,32 @@ fn testContext(page: *const changes_page.ChangesPageState, palette: theme.Palett
     return Context.init(page, navigation, palette, .{}, "working tree", .unstaged, null, .{});
 }
 
+test "changes page header line stats project the loaded repository aggregate" {
+    const nodes = [_]file_tree.Node{.{
+        .kind = .repo_root,
+        .name = "gitframe",
+        .path = "",
+        .depth = 0,
+        .stats = .{ .added = 39, .removed = 710 },
+        .target = .repo_root,
+    }};
+    var page: changes_page.ChangesPageState = .{
+        .load = test_support.loadState(.{
+            .text = "",
+            .document = .{ .files = &.{} },
+            .file_text_eligibility = &.{},
+            .tree = .{ .nodes = &nodes },
+            .bytes = 0,
+            .lines = 0,
+        }),
+    };
+    defer page.deinit(std.testing.allocator);
+
+    const stats = pageHeaderLineStats(testContext(&page, .default(), 80, 8)).?;
+    try std.testing.expectEqual(@as(usize, 39), stats.added);
+    try std.testing.expectEqual(@as(usize, 710), stats.removed);
+}
+
 fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette {
     const FakeConfig = struct {
         role: theme.Role,
@@ -819,7 +851,7 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
 }
 
-test "changes markerless root renderer keeps hierarchy stats and selection styling" {
+test "changes markerless root renderer keeps hierarchy and selection styling" {
     const nodes = [_]file_tree.Node{
         .{
             .kind = .repo_root,
@@ -857,10 +889,10 @@ test "changes markerless root renderer keeps hierarchy stats and selection styli
     try std.testing.expect(ts.surface.readCell(0, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(ts.surface.readCell(1, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
     try std.testing.expect(ts.surface.readCell(39, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try ts.expectCellText(28, 0, "+");
-    try ts.expectCellText(32, 0, "-");
-    try std.testing.expect(ts.surface.readCell(28, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(ts.surface.readCell(32, 0).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    const root_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(root_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, root_snapshot, "+51") == null);
+    try std.testing.expect(std.mem.indexOf(u8, root_snapshot, "-25") == null);
     try ts.expectCellText(2, 1, "▾");
     try ts.expectCellText(4, 1, "s");
     try std.testing.expect(ts.surface.readCell(4, 1).?.style.fg.eql(palette.color(.accent)));
@@ -880,7 +912,7 @@ test "changes markerless root renderer keeps hierarchy stats and selection styli
     try std.testing.expect(!retained_trailing.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
-test "changes markerless root renderer has exact scroll and narrow clipping" {
+test "changes markerless root renderer uses full width for scrolling and clipping" {
     const nodes = [_]file_tree.Node{.{
         .kind = .repo_root,
         .name = "0123456789abcdefghijklmnopqrstuv",
@@ -899,9 +931,11 @@ test "changes markerless root renderer has exact scroll and narrow clipping" {
     defer scrolled.deinit();
     try drawSidebarRow(&scrolled.surface, 0, root, true, 1, palette);
     try scrolled.expectCellText(0, 0, " ");
-    try scrolled.expectCellText(1, 0, "1");
-    try scrolled.expectCellText(28, 0, "+");
-    try scrolled.expectCellText(32, 0, "-");
+    try scrolled.expectCellText(1, 0, "0");
+    const scrolled_snapshot = try scrolled.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(scrolled_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled_snapshot, "+68") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled_snapshot, "-3") == null);
 
     var narrow: chasen.testing.TestSurface = undefined;
     try narrow.init(20, 1);

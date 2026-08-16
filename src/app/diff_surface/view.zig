@@ -88,6 +88,21 @@ pub fn activationPresentation(activation: *const diff_surface.authority.Lifecycl
     };
 }
 
+/// Return the exact aggregate previously rendered beside the repository root.
+/// Only an accepted loaded diff with a repository-root row can publish it.
+pub fn pageHeaderLineStats(surface: diff_surface.ReadSurface) ?file_tree.Stats {
+    const loaded = switch (surface.load.state) {
+        .loaded => |session| session.loaded,
+        else => return null,
+    };
+    for (loaded.tree.nodes) |node| {
+        if (node.kind != .repo_root) continue;
+        if (node.stats.added == 0 and node.stats.removed == 0) return null;
+        return node.stats;
+    }
+    return null;
+}
+
 pub fn sourceFooterLabel(source: diff_source.SourceMode) ?[]const u8 {
     return switch (source) {
         .unstaged => null,
@@ -1061,42 +1076,12 @@ pub fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_vie
         const visible = chasen.text.dropToWidth(content, view_primitives.scrollCells(effective_scroll));
         try draw.copyClippedTextAt(&path_area, 0, 0, visible, style);
     }
-
-    if (row_layout.stats_col) |stats_col| {
-        var stats_area = surface.child(.{
-            .col = stats_col,
-            .row = row,
-            .width = row_layout.stats_width,
-            .height = 1,
-        });
-        try drawSidebarStats(&stats_area, row_model, palette, cursor_bg);
-    }
 }
 
 fn fillSidebarCursorRow(surface: *chasen.Surface, row: u16, style: chasen.TextStyle) void {
     for (0..surface.size().width) |col| {
         _ = surface.borrowTextAt(@intCast(col), row, " ", style);
     }
-}
-
-fn drawSidebarStats(surface: *chasen.Surface, row: sidebar_view_model.Row, palette: theme.Palette, cursor_bg: ?chasen.Color) !void {
-    const added_text = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{row.stats.added});
-    const removed_text = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{row.stats.removed});
-    const added_style = sidebarStatStyle(palette.color(.success), cursor_bg);
-    const removed_style = sidebarStatStyle(palette.color(.danger), cursor_bg);
-
-    try draw.copyClippedTextAt(surface, 0, 0, added_text, added_style);
-    const removed_col = chasen.text.displayWidth(added_text) + 1;
-    if (removed_col < surface.size().width) {
-        try draw.copyClippedTextAt(surface, removed_col, 0, removed_text, removed_style);
-    }
-}
-
-fn sidebarStatStyle(fg: chasen.Color, cursor_bg: ?chasen.Color) chasen.TextStyle {
-    return withCursorBackground(.{
-        .fg = fg,
-        .bold = true,
-    }, cursor_bg);
 }
 
 fn sidebarTreeContent(allocator: std.mem.Allocator, row: sidebar_view_model.Row) ![]const u8 {

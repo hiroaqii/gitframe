@@ -16,6 +16,7 @@ const repository_view = @import("pages/repository/view.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const page_header = @import("page_header.zig");
+const file_tree = @import("../file_tree.zig");
 const draw = @import("draw");
 const keymap = @import("keymap");
 const repo_state = @import("../repo/state.zig");
@@ -63,6 +64,11 @@ const StateMessage = struct {
     body: []const u8 = "",
     hint: []const u8 = "",
     tone: StateTone = .muted,
+};
+
+const PageBarMetadata = struct {
+    presentation: ?page_header.Presentation = null,
+    line_stats: ?file_tree.Stats = null,
 };
 
 pub const Context = struct {
@@ -130,7 +136,10 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
         viewPageBar(
             app.active_page,
             sections.body.height == 0 or sections.footer.height == 0,
-            activePageHeaderPresentation(app),
+            .{
+                .presentation = activePageHeaderPresentation(app),
+                .line_stats = activePageHeaderLineStats(app),
+            },
             app.theme,
             &page_bar,
         );
@@ -201,10 +210,18 @@ fn activePageHeaderPresentation(app: Context) ?page_header.Presentation {
     };
 }
 
+fn activePageHeaderLineStats(app: Context) ?file_tree.Stats {
+    return switch (app.active_page) {
+        .changes => changes_view.pageHeaderLineStats(app.changes),
+        .review => review_view.pageHeaderLineStats(app.review),
+        .repository, .config => null,
+    };
+}
+
 fn viewPageBar(
     active: page.Id,
     compact: bool,
-    presentation: ?page_header.Presentation,
+    metadata: PageBarMetadata,
     palette: theme.Palette,
     surface: *chasen.Surface,
 ) void {
@@ -219,30 +236,7 @@ fn viewPageBar(
             const label = std.fmt.allocPrint(surface.frameAllocator(), " {s} ", .{id.label()}) catch id.label();
             draw.copyClippedTextAt(surface, tab.col, shell_layout.page_bar_label_row, label, if (id == active) palette.boldStyle(.accent) else palette.style(.muted)) catch {};
         }
-
-        const context_start = page.tabExtent() +| 1;
-        if (presentation) |value| if (context_start < surface.size().width) {
-            const available_width = surface.size().width - context_start;
-            const text = page_header.formatAlloc(
-                surface.frameAllocator(),
-                value,
-                available_width,
-            ) catch null;
-            if (text) |repository_context| {
-                const text_width = chasen.text.displayWidth(repository_context);
-                const col = surface.size().width - text_width;
-                if (col >= context_start) draw.copyClippedTextAt(
-                    surface,
-                    col,
-                    shell_layout.page_bar_label_row,
-                    repository_context,
-                    switch (value.tone()) {
-                        .fact => palette.style(.info),
-                        .terminal => palette.style(.muted),
-                    },
-                ) catch {};
-            }
-        };
+        drawPageBarMetadata(metadata, palette, surface);
     }
 
     if (surface.size().height <= shell_layout.page_bar_rule_row) return;
@@ -255,6 +249,78 @@ fn viewPageBar(
             rule_style,
         );
     }
+}
+
+const PageBarStatsText = struct {
+    added: []const u8,
+    removed: []const u8,
+    added_width: u16,
+    total_width: u16,
+};
+
+fn pageBarStatsText(surface: *chasen.Surface, stats: file_tree.Stats) ?PageBarStatsText {
+    if (stats.added == 0 and stats.removed == 0) return null;
+    const added = std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added}) catch return null;
+    const removed = std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed}) catch return null;
+    const added_width = chasen.text.displayWidth(added);
+    return .{
+        .added = added,
+        .removed = removed,
+        .added_width = added_width,
+        .total_width = added_width +| 1 +| chasen.text.displayWidth(removed),
+    };
+}
+
+fn drawPageBarMetadata(metadata: PageBarMetadata, palette: theme.Palette, surface: *chasen.Surface) void {
+    const size = surface.size();
+    const context_start = page.tabExtent() +| 1;
+    if (context_start >= size.width) return;
+
+    // All page metadata keeps one terminal cell clear at the right edge.
+    var context_right = size.width - 1;
+    if (metadata.line_stats) |stats| if (pageBarStatsText(surface, stats)) |text| {
+        const stats_right = context_right;
+        if (text.total_width <= stats_right -| context_start) {
+            const stats_col = stats_right - text.total_width;
+            draw.copyClippedTextAt(
+                surface,
+                stats_col,
+                shell_layout.page_bar_label_row,
+                text.added,
+                .{ .fg = palette.color(.success), .bold = true },
+            ) catch {};
+            draw.copyClippedTextAt(
+                surface,
+                stats_col +| text.added_width +| 1,
+                shell_layout.page_bar_label_row,
+                text.removed,
+                .{ .fg = palette.color(.danger), .bold = true },
+            ) catch {};
+            context_right = stats_col -| 2;
+        }
+    };
+
+    const value = metadata.presentation orelse return;
+    if (context_start >= context_right) return;
+    const text = page_header.formatAlloc(
+        surface.frameAllocator(),
+        value,
+        context_right - context_start,
+    ) catch null;
+    const repository_context = text orelse return;
+    const text_width = chasen.text.displayWidth(repository_context);
+    const col = context_right -| text_width;
+    if (col < context_start) return;
+    draw.copyClippedTextAt(
+        surface,
+        col,
+        shell_layout.page_bar_label_row,
+        repository_context,
+        switch (value.tone()) {
+            .fact => palette.style(.info),
+            .terminal => palette.style(.muted),
+        },
+    ) catch {};
 }
 
 fn pageBarRuleStyle(palette: theme.Palette) chasen.TextStyle {
@@ -2341,7 +2407,7 @@ test "page bar renders labels above a full muted rule" {
     try ts.init(60, shell_layout.page_bar_rows);
     defer ts.deinit();
 
-    viewPageBar(.repository, false, null, palette, &ts.surface);
+    viewPageBar(.repository, false, .{}, palette, &ts.surface);
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -2357,7 +2423,7 @@ test "normal narrow page bar keeps its full rule after clipping later tabs" {
     try ts.init(width, shell_layout.page_bar_rows);
     defer ts.deinit();
 
-    viewPageBar(.changes, false, null, palette, &ts.surface);
+    viewPageBar(.changes, false, .{}, palette, &ts.surface);
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -2371,7 +2437,7 @@ test "compact page bar keeps only the active label and draws a rule when availab
     try two_rows.init(30, shell_layout.page_bar_rows);
     defer two_rows.deinit();
 
-    viewPageBar(.review, true, null, .default(), &two_rows.surface);
+    viewPageBar(.review, true, .{}, .default(), &two_rows.surface);
     const snapshot = try two_rows.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
@@ -2381,7 +2447,7 @@ test "compact page bar keeps only the active label and draws a rule when availab
     var one_row: chasen.testing.TestSurface = undefined;
     try one_row.init(30, 1);
     defer one_row.deinit();
-    viewPageBar(.review, true, null, .default(), &one_row.surface);
+    viewPageBar(.review, true, .{}, .default(), &one_row.surface);
     try one_row.expectCellText(2, shell_layout.page_bar_label_row, "R");
     try std.testing.expect(one_row.surface.readCell(0, shell_layout.page_bar_rule_row) == null);
 }
@@ -2395,21 +2461,54 @@ test "page bar renders repository context after tabs and omits it in compact mod
     var wide: chasen.testing.TestSurface = undefined;
     try wide.init(96, shell_layout.page_bar_rows);
     defer wide.deinit();
-    viewPageBar(.changes, false, presentation, .default(), &wide.surface);
+    viewPageBar(.repository, false, .{ .presentation = presentation }, .default(), &wide.surface);
 
     const snapshot = try wide.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Config ") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD feature/page-header ↑2") != null);
+    try wide.expectCellText(95, shell_layout.page_bar_label_row, " ");
     try std.testing.expect(page.tabAtColumn(wide.surface.size().width, page.tabExtent() + 1) == null);
 
     var compact: chasen.testing.TestSurface = undefined;
     try compact.init(96, shell_layout.page_bar_rows);
     defer compact.deinit();
-    viewPageBar(.changes, true, presentation, .default(), &compact.surface);
+    viewPageBar(.repository, true, .{ .presentation = presentation }, .default(), &compact.surface);
     const compact_snapshot = try compact.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(compact_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "HEAD ") == null);
+}
+
+test "page bar moves diff totals to the header with one-cell right padding" {
+    const presentation: page_header.Presentation = .{ .head = .{ .branch = .{
+        .display_name = "main",
+        .upstream = .{ .ahead = 0 },
+        .freshness = .fresh,
+    } } };
+    const palette: theme.Palette = .default();
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(96, shell_layout.page_bar_rows);
+    defer ts.deinit();
+
+    viewPageBar(.changes, false, .{
+        .presentation = presentation,
+        .line_stats = .{ .added = 39, .removed = 710 },
+    }, palette, &ts.surface);
+
+    try ts.expectCellText(87, shell_layout.page_bar_label_row, "+");
+    try ts.expectCellText(91, shell_layout.page_bar_label_row, "-");
+    try ts.expectCellText(95, shell_layout.page_bar_label_row, " ");
+    const added = ts.surface.readCell(87, shell_layout.page_bar_label_row) orelse return error.ExpectedAddedStats;
+    const removed = ts.surface.readCell(91, shell_layout.page_bar_label_row) orelse return error.ExpectedRemovedStats;
+    try std.testing.expect(added.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(added.style.bold);
+    try std.testing.expect(removed.style.fg.eql(palette.color(.danger)));
+    try std.testing.expect(removed.style.bold);
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710") != null);
 }
 
 test "page bar preserves every tab when context is too narrow" {
@@ -2417,11 +2516,11 @@ test "page bar preserves every tab when context is too narrow" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(width, shell_layout.page_bar_rows);
     defer ts.deinit();
-    viewPageBar(.review, false, .{ .review = .{
+    viewPageBar(.review, false, .{ .presentation = .{ .review = .{
         .base_display_name = "origin/main",
         .head_display_name = "feature/topic",
         .freshness = .fresh,
-    } }, .default(), &ts.surface);
+    } } }, .default(), &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Config ") != null);
@@ -2434,6 +2533,7 @@ test "Config page header never borrows another page repository context" {
     var context = harness.context();
     context.active_page = .config;
     try std.testing.expect(activePageHeaderPresentation(context) == null);
+    try std.testing.expect(activePageHeaderLineStats(context) == null);
 }
 
 fn expectFullPageBarRule(surface: *const chasen.Surface, palette: theme.Palette) !void {

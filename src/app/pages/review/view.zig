@@ -10,6 +10,7 @@ const commit_time = @import("../../branch_commit_time.zig");
 const review_navigation = @import("navigation.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const diff_render = @import("../../../diff/render.zig");
+const file_tree = @import("../../../file_tree.zig");
 const keymap = @import("keymap");
 const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
@@ -63,6 +64,12 @@ pub fn pageHeaderPresentation(app: Context) ?page_header.Presentation {
         else
             .fresh,
     } };
+}
+
+pub fn pageHeaderLineStats(app: Context) ?file_tree.Stats {
+    return diff_surface.view.pageHeaderLineStats(
+        app.page.readSurface(.{ .range = "review" }, app.layout),
+    );
 }
 
 fn sourcePending(page: *const review_page.ReviewPageState) bool {
