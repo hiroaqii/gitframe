@@ -229,6 +229,10 @@ fn activePageHeaderLineStats(app: Context) ?file_tree.Stats {
 fn activePageHeaderRemoteActions(app: Context) ?PageBarRemoteActions {
     if (app.active_page != .changes) return null;
     if (app.changes.page.search.mode or app.changes.page.file_search.mode) return null;
+    switch (app.changes.page.load.state) {
+        .empty => |reason| if (reason != .no_changes) return null,
+        else => return null,
+    }
 
     const presentation = changes_view.pageHeaderPresentation(app.changes) orelse return null;
     return switch (presentation) {
@@ -365,9 +369,7 @@ fn drawPageBarMetadata(metadata: PageBarMetadata, palette: theme.Palette, surfac
     const metadata_width = context_right -| context_start;
     const stats_drawable = if (stats_text) |text| text.total_width <= metadata_width else false;
 
-    var action_width = metadata_width;
-    if (stats_drawable) action_width -|= stats_text.?.total_width +| 2;
-    if (metadata.remote_actions) |actions| if (pageBarRemoteActionText(surface, actions, action_width)) |text| {
+    if (metadata.line_stats == null) if (metadata.remote_actions) |actions| if (pageBarRemoteActionText(surface, actions, metadata_width)) |text| {
         const action_col = context_right - text.width;
         draw.copyClippedTextAt(
             surface,
@@ -2554,7 +2556,7 @@ test "page bar renders repository context after tabs and omits it in compact mod
     try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "HEAD ") == null);
 }
 
-test "page bar shows diff totals before remote actions with one-cell right padding" {
+test "page bar hides remote actions while showing diff totals" {
     const presentation: page_header.Presentation = .{ .head = .{ .branch = .{
         .display_name = "main",
         .upstream = .{ .ahead = 0 },
@@ -2571,26 +2573,51 @@ test "page bar shows diff totals before remote actions with one-cell right paddi
         .remote_actions = .{ .keymap = .{}, .push = true, .pull = true },
     }, palette, &ts.surface);
 
-    const action_text = "(P: push / U: pull)";
-    const action_col = ts.surface.size().width - 1 - chasen.text.displayWidth(action_text);
-    const stats_col = action_col - 2 - chasen.text.displayWidth("+39 -710");
+    const stats_col = ts.surface.size().width - 1 - chasen.text.displayWidth("+39 -710");
     try ts.expectCellText(stats_col, shell_layout.page_bar_label_row, "+");
     try ts.expectCellText(stats_col + 4, shell_layout.page_bar_label_row, "-");
-    try ts.expectCellText(action_col, shell_layout.page_bar_label_row, "(");
     try ts.expectCellText(95, shell_layout.page_bar_label_row, " ");
     const added = ts.surface.readCell(stats_col, shell_layout.page_bar_label_row) orelse return error.ExpectedAddedStats;
     const removed = ts.surface.readCell(stats_col + 4, shell_layout.page_bar_label_row) orelse return error.ExpectedRemovedStats;
-    const action = ts.surface.readCell(action_col, shell_layout.page_bar_label_row) orelse return error.ExpectedRemoteActionHint;
     try std.testing.expect(added.style.fg.eql(palette.color(.success)));
     try std.testing.expect(added.style.bold);
     try std.testing.expect(removed.style.fg.eql(palette.color(.danger)));
     try std.testing.expect(removed.style.bold);
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "P: push") == null);
+}
+
+test "page bar shows remote actions only in the clean layout" {
+    const presentation: page_header.Presentation = .{ .head = .{ .branch = .{
+        .display_name = "main",
+        .upstream = .{ .ahead = 0 },
+        .freshness = .fresh,
+    } } };
+    const palette: theme.Palette = .default();
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(96, shell_layout.page_bar_rows);
+    defer ts.deinit();
+
+    viewPageBar(.changes, false, .{
+        .presentation = presentation,
+        .remote_actions = .{ .keymap = .{}, .push = true, .pull = true },
+    }, palette, &ts.surface);
+
+    const action_text = "(P: push / U: pull)";
+    const action_col = ts.surface.size().width - 1 - chasen.text.displayWidth(action_text);
+    try ts.expectCellText(action_col, shell_layout.page_bar_label_row, "(");
+    try ts.expectCellText(95, shell_layout.page_bar_label_row, " ");
+    const action = ts.surface.readCell(action_col, shell_layout.page_bar_label_row) orelse return error.ExpectedRemoteActionHint;
     try std.testing.expect(action.style.eql(palette.style(.muted)));
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710  (P: push / U: pull)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, action_text) != null);
 }
 
 test "page bar remote actions follow configured keys and width fallback" {
