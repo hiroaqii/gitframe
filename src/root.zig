@@ -33,7 +33,6 @@ test {
     _ = @import("app/actions.zig");
     _ = @import("app/auto_reload.zig");
     _ = @import("app/branch_commit_time.zig");
-    _ = @import("app/branch_chrome.zig");
     _ = @import("app/commit_panel.zig");
     _ = @import("app/cursor_viewport.zig");
     _ = @import("app/diff_surface/body_resolver.zig");

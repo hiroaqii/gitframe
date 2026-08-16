@@ -3389,7 +3389,7 @@ test "repository root activation preserves source and expanded All and Changed d
         return error.ExpectedCleanFile;
     _ = state.applyNavigation(allocator, .toggle_changed_filter, size);
     try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
-    const root_click = state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, size) orelse
+    const root_click = state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, size) orelse
         return error.ExpectedRootMouseTarget;
     try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, root_click);
     _ = state.applyNavigation(allocator, root_click, size);
@@ -4850,7 +4850,7 @@ test "repository changed navigation and mouse use only filtered visible rows" {
 
     _ = state.applyNavigation(allocator, .move_down, size);
     try std.testing.expectEqualStrings("c-change.zig", state.selected_path.?);
-    const mouse_msg = state.mouseToMsg(.{ .col = 1, .row = 4 }, .left, size) orelse return error.ExpectedFilteredMouseRow;
+    const mouse_msg = state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, size) orelse return error.ExpectedFilteredMouseRow;
     _ = state.applyNavigation(allocator, mouse_msg, size);
     try std.testing.expectEqualStrings("a-change.zig", state.selected_path.?);
     _ = state.applyNavigation(allocator, .tree_last, size);
@@ -7000,21 +7000,20 @@ test "repository minimum tree disclosure page layout and mouse mapping share tre
     const wide = chasen.Size{ .width = 60, .height = 10 };
     const wide_layout = repository_layout.bodyLayout(wide, state.viewer.tree_width, state.viewer.tree_hidden);
     try std.testing.expectEqual(@as(u16, 28), wide_layout.tree_width);
-    try std.testing.expectEqual(@as(u16, 3), wide_layout.header_rows);
-    try std.testing.expectEqual(@as(u16, 7), wide_layout.treeRows(wide.height));
+    try std.testing.expectEqual(@as(u16, 2), wide_layout.header_rows);
+    try std.testing.expectEqual(@as(u16, 8), wide_layout.treeRows(wide.height));
     try std.testing.expectEqual(Msg.focus_tree, state.mouseToMsg(.{ .col = 1, .row = 0 }, .left, wide).?);
     try std.testing.expect(state.mouseToMsg(.{ .col = wide_layout.tree_width, .row = 1 }, .left, wide) == null);
-    try std.testing.expectEqual(Msg.focus_tree, state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, wide).?);
-    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, wide).?);
-    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 1 }, state.mouseToMsg(.{ .col = 1, .row = 4 }, .left, wide).?);
-    try std.testing.expectEqual(Msg{ .mouse_row = 2 }, state.mouseToMsg(.{ .col = 1, .row = 5 }, .left, wide).?);
+    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, wide).?);
+    try std.testing.expectEqual(Msg{ .mouse_toggle_row = 1 }, state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, wide).?);
+    try std.testing.expectEqual(Msg{ .mouse_row = 2 }, state.mouseToMsg(.{ .col = 1, .row = 4 }, .left, wide).?);
     try std.testing.expectEqual(Msg.wheel_down, state.mouseToMsg(.{ .col = 1, .row = 0 }, .wheel_down, wide).?);
 
-    const directory_toggle = state.mouseToMsg(.{ .col = 1, .row = 4 }, .left, wide).?;
+    const directory_toggle = state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, wide).?;
     _ = state.applyNavigation(std.testing.allocator, directory_toggle, wide);
     const directory = state.bundle.?.tree.nodeIndexForPath("dir", .all) orelse return error.ExpectedDirectory;
     try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
-    const root_toggle = state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, wide).?;
+    const root_toggle = state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, wide).?;
     _ = state.applyNavigation(std.testing.allocator, root_toggle, wide);
     try std.testing.expect(state.bundle.?.tree.nodes[directory].expanded);
     try std.testing.expectEqual(@as(usize, 4), state.tree_projection.visibleLen(&state.bundle.?.tree));
@@ -7023,7 +7022,7 @@ test "repository minimum tree disclosure page layout and mouse mapping share tre
 
     const narrow = chasen.Size{ .width = 20, .height = 6 };
     try std.testing.expectEqual(narrow.width, repository_layout.bodyLayout(narrow, state.viewer.tree_width, state.viewer.tree_hidden).tree_width);
-    try std.testing.expectEqual(Msg{ .mouse_row = 2 }, state.mouseToMsg(.{ .col = 19, .row = 5 }, .left, narrow).?);
+    try std.testing.expectEqual(Msg{ .mouse_row = 3 }, state.mouseToMsg(.{ .col = 19, .row = 5 }, .left, narrow).?);
 }
 
 test "repository tree width controls share rendering mouse and source geometry" {
@@ -7178,16 +7177,16 @@ test "repository incoming viewport scroll places immediate target from root with
     const narrow_body: chasen.Size = .{ .width = 80, .height = 7 };
     try std.testing.expect(state.resolveIncomingAfterActivation(allocator, narrow_body));
     try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_vertical_scroll);
     try expectProjectedPathForTest(&state, 1, "src");
     try expectProjectedPathForTest(&state, 4, "src/app/pages/repository.zig");
 
     _ = state.applyNavigation(allocator, .move_up, narrow_body);
     try std.testing.expectEqual(@as(usize, 3), state.viewer.tree_cursor);
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_vertical_scroll);
     _ = state.applyNavigation(allocator, .move_down, narrow_body);
     try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_vertical_scroll);
 
     state.dismissIncoming(allocator);
     var zero_rows = try page_link.RepositoryIncoming.initOwned(
@@ -7199,7 +7198,7 @@ test "repository incoming viewport scroll places immediate target from root with
     state.acceptIncoming(allocator, &zero_rows);
     try std.testing.expect(state.resolveIncomingAfterActivation(
         allocator,
-        .{ .width = 80, .height = 3 },
+        .{ .width = 80, .height = 2 },
     ));
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_vertical_scroll);
     state.clampForBodySize(.{ .width = 80, .height = 8 });
@@ -7284,7 +7283,7 @@ test "repository incoming viewport scroll applies deferred manifest with the sam
         state.selected_path.?,
     );
     try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_cursor);
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_vertical_scroll);
     try expectProjectedPathForTest(&state, 1, "src");
     try expectProjectedPathForTest(&state, 4, "src/app/pages/repository.zig");
 }

@@ -845,7 +845,7 @@ test "repository incoming viewport scroll App immediate and deferred routes use 
         try std.testing.expectEqual(page.Id.repository, app.active_page);
         try std.testing.expectEqualStrings("src/app/pages/repository.zig", app.pages.repository.selected_path.?);
         try std.testing.expectEqual(@as(usize, 4), app.pages.repository.viewer.tree_cursor);
-        try std.testing.expectEqual(@as(usize, 1), app.pages.repository.viewer.tree_vertical_scroll);
+        try std.testing.expectEqual(@as(usize, 0), app.pages.repository.viewer.tree_vertical_scroll);
         try expectRepositoryProjectedPathForTest(&app.pages.repository, 1, "src");
         try expectRepositoryProjectedPathForTest(&app.pages.repository, 4, "src/app/pages/repository.zig");
     }

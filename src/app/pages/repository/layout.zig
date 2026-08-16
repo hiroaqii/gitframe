@@ -22,9 +22,9 @@ pub const BodyLayout = struct {
     tree_visible: bool,
     source_col: u16,
     source_width: u16,
-    /// Rows 0-1 intentionally mirror the Changes page's spacer before the row-2 Files
-    /// heading. Projected root/tree navigation begins at row 3.
-    header_rows: u16 = 3,
+    /// Row 0 is reserved for compact tree status. The Files mode heading is on
+    /// row 1, and projected root/tree navigation begins at row 2.
+    header_rows: u16 = 2,
 
     pub fn treeRows(self: BodyLayout, body_height: u16) u16 {
         return body_height -| self.header_rows;

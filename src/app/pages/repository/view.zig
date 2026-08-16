@@ -6,7 +6,6 @@ const text_projection = @import("chasen_ui").text_projection;
 const draw = @import("draw");
 const keymap = @import("keymap");
 const theme = @import("theme");
-const branch_chrome = @import("../../branch_chrome.zig");
 const page_header = @import("../../page_header.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const page_link = @import("../../page_link.zig");
@@ -126,7 +125,6 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const tree = &state.bundle.?.tree;
     if (layout.tree_visible) {
         var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
-        try drawRepositoryBranchRow(state, &left, context.palette);
         const mode_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files [all]";
         var key_buffer: [16]u8 = undefined;
         var header_buffer: [64]u8 = undefined;
@@ -136,13 +134,13 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
             mode_header;
         // Keep the current mode as the leading fact, while rendering the
         // shortcut hint as subdued chrome instead of another accent target.
-        if (size.height > 2) {
-            _ = left.copyTextAt(1, 2, mode_header, context.palette.boldStyle(.accent)) catch {};
+        if (size.height > 1) {
+            _ = left.copyTextAt(1, 1, mode_header, context.palette.boldStyle(.accent)) catch {};
             if (tree_header.len > mode_header.len) {
                 var shortcut_style = context.palette.style(.muted);
                 shortcut_style.dim = true;
                 const shortcut_col: u16 = @intCast(1 + chasen.text.displayWidth(mode_header));
-                _ = left.copyTextAt(shortcut_col, 2, tree_header[mode_header.len..], shortcut_style) catch {};
+                _ = left.copyTextAt(shortcut_col, 1, tree_header[mode_header.len..], shortcut_style) catch {};
             }
         }
         if (layout.tree_width < size.width) {
@@ -231,90 +229,6 @@ fn drawIncomingUnavailable(
 
 fn treeStatusAvailable(state: *const RepositoryPageState) bool {
     return if (state.bundle) |bundle| bundle.status_available else false;
-}
-
-const RepositoryBranchRowTone = enum {
-    fact,
-    terminal,
-};
-
-const RepositoryBranchRowPresentation = struct {
-    text: []const u8,
-    tone: RepositoryBranchRowTone,
-    stale_col: ?u16 = null,
-};
-
-/// Project Repository's independent branch owner into its read-only row-0
-/// chrome. A snapshot must name the exact current physical root; otherwise a
-/// retained label from another repository can never cross into presentation.
-fn repositoryBranchRowPresentation(
-    state: *const RepositoryPageState,
-    allocator: std.mem.Allocator,
-    available_width: u16,
-) ?RepositoryBranchRowPresentation {
-    const root_identity = state.root_identity orelse return null;
-    const snapshot_identity = repository_branch.SnapshotIdentity{
-        .repo_epoch = state.repo_epoch,
-        .root_identity = root_identity,
-    };
-    if (state.branch.snapshot.matches(snapshot_identity)) {
-        const formatted = branch_chrome.formatBaseLabel(
-            allocator,
-            state.branch.snapshot.status,
-            available_width,
-        ) catch return .{ .text = "branch", .tone = .fact };
-        const failed = switch (state.branch.freshness) {
-            .failed => true,
-            else => false,
-        };
-        const stale_text = "  stale";
-        const stale_width = chasen.text.displayWidth(stale_text);
-        return .{
-            // The frame/testing allocator owns the formatted text for the
-            // same lifetime as this presentation value.
-            .text = formatted.text,
-            .tone = .fact,
-            // Auxiliary failure never makes the label itself less legible.
-            // Admit the subdued suffix only beside an unclipped complete base;
-            // otherwise the base receives the whole row width.
-            .stale_col = if (failed and
-                !formatted.was_clipped and
-                formatted.full_display_width +| stale_width <= available_width)
-                formatted.full_display_width
-            else
-                null,
-        };
-    }
-
-    return switch (state.branch.freshness) {
-        .validating => .{ .text = "loading branch", .tone = .terminal },
-        .failed => .{ .text = "branch unavailable", .tone = .terminal },
-        .unavailable, .fresh => null,
-    };
-}
-
-fn drawRepositoryBranchRow(
-    state: *const RepositoryPageState,
-    surface: *chasen.Surface,
-    palette: theme.Palette,
-) !void {
-    const size = surface.size();
-    if (size.width <= 1 or size.height == 0) return;
-    const presentation = repositoryBranchRowPresentation(
-        state,
-        surface.frameAllocator(),
-        size.width - 1,
-    ) orelse return;
-    const style = switch (presentation.tone) {
-        .fact => palette.style(.info),
-        .terminal => palette.style(.muted),
-    };
-    try draw.copyClippedTextAt(surface, 1, 0, presentation.text, style);
-    if (presentation.stale_col) |base_width| {
-        var stale_style = palette.style(.muted);
-        stale_style.dim = true;
-        try draw.copyClippedTextAt(surface, 1 +| base_width, 0, "  stale", stale_style);
-    }
 }
 
 fn drawTreeProjectionRow(
@@ -2259,10 +2173,10 @@ test "repository tree cursor background follows active focus and preserves seman
     try active_surface.init(size.width, size.height);
     defer active_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &active_surface.surface);
-    try active_surface.expectCellText(0, 2, " ");
-    try active_surface.expectCellText(1, 2, "F");
-    try active_surface.expectCellText(2, 2, "i");
-    const active_header = active_surface.surface.readCell(1, 2) orelse return error.ExpectedTreeHeader;
+    try active_surface.expectCellText(0, 1, " ");
+    try active_surface.expectCellText(1, 1, "F");
+    try active_surface.expectCellText(2, 1, "i");
+    const active_header = active_surface.surface.readCell(1, 1) orelse return error.ExpectedTreeHeader;
     const active_root = active_surface.surface.readCell(1, root_row) orelse return error.ExpectedRoot;
     const active_directory = active_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
     const active_added = active_surface.surface.readCell(4, added_row) orelse return error.ExpectedAddedFile;
@@ -2337,10 +2251,10 @@ test "repository tree cursor background follows active focus and preserves seman
     try inactive_surface.init(size.width, size.height);
     defer inactive_surface.deinit();
     try view(.{ .page_state = &state, .palette = palette }, &inactive_surface.surface);
-    try inactive_surface.expectCellText(0, 2, " ");
-    try inactive_surface.expectCellText(1, 2, "F");
-    try inactive_surface.expectCellText(2, 2, "i");
-    const inactive_header = inactive_surface.surface.readCell(1, 2) orelse return error.ExpectedTreeHeader;
+    try inactive_surface.expectCellText(0, 1, " ");
+    try inactive_surface.expectCellText(1, 1, "F");
+    try inactive_surface.expectCellText(2, 1, "i");
+    const inactive_header = inactive_surface.surface.readCell(1, 1) orelse return error.ExpectedTreeHeader;
     const inactive_root = inactive_surface.surface.readCell(1, root_row) orelse return error.ExpectedRoot;
     const inactive_directory = inactive_surface.surface.readCell(4, directory_row) orelse return error.ExpectedDirectory;
     const inactive_added = inactive_surface.surface.readCell(4, added_row) orelse return error.ExpectedAddedFile;
@@ -2405,12 +2319,12 @@ test "repository empty root renders without disclosure and mouse activation is i
     try expanded_surface.init(full_size.width, full_size.height);
     defer expanded_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &expanded_surface.surface);
+    try expanded_surface.expectCellText(0, 1, " ");
+    try expanded_surface.expectCellText(1, 1, "F");
+    try expanded_surface.expectCellText(2, 1, "i");
     try expanded_surface.expectCellText(0, 2, " ");
-    try expanded_surface.expectCellText(1, 2, "F");
-    try expanded_surface.expectCellText(2, 2, "i");
-    try expanded_surface.expectCellText(0, 3, " ");
-    try expanded_surface.expectCellText(1, 3, "e");
-    try expanded_surface.expectCellText(0, 4, "R");
+    try expanded_surface.expectCellText(1, 2, "e");
+    try expanded_surface.expectCellText(0, 3, "R");
     const expanded_snapshot = try expanded_surface.snapshot(allocator);
     defer allocator.free(expanded_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Files") != null);
@@ -2423,7 +2337,7 @@ test "repository empty root renders without disclosure and mouse activation is i
     try std.testing.expect(no_file_cell.style.fg.eql(theme.Palette.default().color(.muted)));
     try std.testing.expect(!no_file_cell.style.dim);
 
-    const root_click = state.mouseToMsg(.{ .col = 0, .row = 3 }, .left, full_size) orelse
+    const root_click = state.mouseToMsg(.{ .col = 0, .row = 2 }, .left, full_size) orelse
         return error.ExpectedRootMouseTarget;
     try std.testing.expectEqual(repository_page.Msg{ .mouse_toggle_row = 0 }, root_click);
     _ = state.applyNavigation(allocator, root_click, full_size);
@@ -2433,22 +2347,23 @@ test "repository empty root renders without disclosure and mouse activation is i
     try after_click_surface.init(full_size.width, full_size.height);
     defer after_click_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &after_click_surface.surface);
-    try after_click_surface.expectCellText(0, 3, " ");
-    try after_click_surface.expectCellText(1, 3, "e");
-    try after_click_surface.expectCellText(0, 4, "R");
+    try after_click_surface.expectCellText(0, 2, " ");
+    try after_click_surface.expectCellText(1, 2, "e");
+    try after_click_surface.expectCellText(0, 3, "R");
 
     const compact_size = chasen.Size{ .width = 60, .height = 3 };
     var compact_surface: chasen.testing.TestSurface = undefined;
     try compact_surface.init(compact_size.width, compact_size.height);
     defer compact_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &compact_surface.surface);
-    try compact_surface.expectCellText(0, 2, " ");
-    try compact_surface.expectCellText(1, 2, "F");
-    try compact_surface.expectCellText(2, 2, "i");
+    try compact_surface.expectCellText(0, 1, " ");
+    try compact_surface.expectCellText(1, 1, "F");
+    try compact_surface.expectCellText(2, 1, "i");
+    try compact_surface.expectCellText(1, 2, "e");
     const compact_snapshot = try compact_surface.snapshot(allocator);
     defer allocator.free(compact_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "empty-repo") == null);
-    try std.testing.expectEqual(repository_page.Msg.focus_tree, state.mouseToMsg(.{ .col = 0, .row = 2 }, .left, compact_size).?);
+    try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "empty-repo") != null);
+    try std.testing.expectEqual(repository_page.Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 0, .row = 2 }, .left, compact_size).?);
 
     var width_one: chasen.testing.TestSurface = undefined;
     try width_one.init(1, compact_size.height);
@@ -2460,11 +2375,11 @@ test "repository empty root renders without disclosure and mouse activation is i
     try width_two.init(2, compact_size.height);
     defer width_two.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &width_two.surface);
-    try width_two.expectCellText(0, 2, " ");
-    try width_two.expectCellText(1, 2, "F");
+    try width_two.expectCellText(0, 1, " ");
+    try width_two.expectCellText(1, 1, "F");
 }
 
-test "Repository branch renders read-only facts without moving tree geometry" {
+test "Repository tree omits duplicate branch row and starts one row earlier" {
     const allocator = std.testing.allocator;
     var state = try repositoryBranchViewStateForTest();
     defer state.deinit(allocator);
@@ -2483,100 +2398,18 @@ test "Repository branch renders read-only facts without moving tree geometry" {
 
     const snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "push") == null);
-    try test_surface.expectCellText(1, 0, "m");
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "main ↑0") == null);
     try test_surface.expectCellText(0, 1, " ");
+    try test_surface.expectCellText(1, 1, "F");
+    try test_surface.expectCellText(2, 1, "i");
     try test_surface.expectCellText(0, 2, " ");
-    try test_surface.expectCellText(1, 2, "F");
-    try test_surface.expectCellText(2, 2, "i");
-    try test_surface.expectCellText(0, 3, " ");
-    try test_surface.expectCellText(1, 3, "g");
-    const branch_cell = test_surface.surface.readCell(1, 0) orelse return error.ExpectedRepositoryBranchCell;
-    try std.testing.expect(branch_cell.style.fg.eql(palette.color(.info)));
-    try std.testing.expect(!branch_cell.style.dim);
+    try test_surface.expectCellText(1, 2, "g");
 
     const layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
-    try std.testing.expectEqual(@as(u16, 3), layout.header_rows);
-    try std.testing.expectEqual(@as(u16, 5), layout.treeRows(size.height));
-    try std.testing.expectEqual(repository_page.Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 3 }, .left, size).?);
+    try std.testing.expectEqual(@as(u16, 2), layout.header_rows);
+    try std.testing.expectEqual(@as(u16, 6), layout.treeRows(size.height));
+    try std.testing.expectEqual(repository_page.Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, size).?);
     try std.testing.expect(repository_input.keyToMsg(repository_page.Msg, .{}, .{ .codepoint = 'P' }) == null);
-
-    installRepositoryBranchSnapshotForTest(&state, .{ .head = .detached }, .fresh);
-    test_surface.surface.clearAll();
-    try view(.{ .page_state = &state, .palette = palette, .repo_root = "/work/gitframe" }, &test_surface.surface);
-    const detached = try test_surface.snapshot(allocator);
-    defer allocator.free(detached);
-    try std.testing.expect(std.mem.indexOf(u8, detached, "detached") != null);
-
-    installRepositoryBranchSnapshotForTest(&state, .{ .head = .{ .branch = "topic" } }, .fresh);
-    test_surface.surface.clearAll();
-    try view(.{ .page_state = &state, .palette = palette, .repo_root = "/work/gitframe" }, &test_surface.surface);
-    const no_upstream = try test_surface.snapshot(allocator);
-    defer allocator.free(no_upstream);
-    try std.testing.expect(std.mem.indexOf(u8, no_upstream, "topic no upstream") != null);
-}
-
-test "Repository branch retains last good facts and bounds stale chrome" {
-    const allocator = std.testing.allocator;
-    var state = try repositoryBranchViewStateForTest();
-    defer state.deinit(allocator);
-    state.branch.freshness = .validating;
-
-    var test_surface: chasen.testing.TestSurface = undefined;
-    try test_surface.init(72, 8);
-    defer test_surface.deinit();
-    const palette: theme.Palette = .default();
-    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
-    const loading = try test_surface.snapshot(allocator);
-    defer allocator.free(loading);
-    try std.testing.expect(std.mem.indexOf(u8, loading, "loading branch") != null);
-    const loading_cell = test_surface.surface.readCell(1, 0) orelse return error.ExpectedLoadingBranchCell;
-    try std.testing.expect(loading_cell.style.fg.eql(palette.color(.muted)));
-
-    installRepositoryBranchSnapshotForTest(&state, .{
-        .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{ .ahead = 0, .behind = 0 },
-    }, .validating);
-    test_surface.surface.clearAll();
-    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
-    const retained = try test_surface.snapshot(allocator);
-    defer allocator.free(retained);
-    try std.testing.expect(std.mem.indexOf(u8, retained, "main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, retained, "loading branch") == null);
-
-    state.branch.freshness = .{ .failed = .load_failed };
-    test_surface.surface.clearAll();
-    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
-    const stale = try test_surface.snapshot(allocator);
-    defer allocator.free(stale);
-    try std.testing.expect(std.mem.indexOf(u8, stale, "main ↑0  stale") != null);
-    const base_cell = test_surface.surface.readCell(1, 0) orelse return error.ExpectedRetainedBranchCell;
-    const stale_cell = test_surface.surface.readCell(10, 0) orelse return error.ExpectedStaleBranchCell;
-    try std.testing.expect(base_cell.style.fg.eql(palette.color(.info)));
-    try std.testing.expect(!base_cell.style.dim);
-    try std.testing.expect(stale_cell.style.fg.eql(palette.color(.muted)));
-    try std.testing.expect(stale_cell.style.dim);
-
-    installRepositoryBranchSnapshotForTest(&state, .{
-        .head = .{ .branch = "feature/very-long-ticket-name" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{ .ahead = 0, .behind = 0 },
-    }, .{ .failed = .load_failed });
-    const narrow = repositoryBranchRowPresentation(&state, allocator, 10) orelse return error.ExpectedNarrowBranchPresentation;
-    defer allocator.free(narrow.text);
-    try std.testing.expect(narrow.stale_col == null);
-    try std.testing.expect(chasen.text.displayWidth(narrow.text) <= 10);
-
-    state.branch.snapshot.deinit();
-    state.branch.freshness = .{ .failed = .load_failed };
-    test_surface.surface.clearAll();
-    try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
-    const unavailable = try test_surface.snapshot(allocator);
-    defer allocator.free(unavailable);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "branch unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "main ↑0") == null);
 }
 
 test "Repository page header requires matching epoch and physical root" {
@@ -2675,7 +2508,7 @@ test "Repository branch yields row zero to full page owners" {
     try std.testing.expect(std.mem.indexOf(u8, incoming_unavailable, "branch-first") == null);
 }
 
-test "Repository branch keeps bundle search chrome and hides with the tree" {
+test "Repository file search keeps tree chrome and hides with the tree" {
     const allocator = std.testing.allocator;
     var state = try repositoryBranchViewStateForTest();
     defer state.deinit(allocator);
@@ -2692,7 +2525,7 @@ test "Repository branch keeps bundle search chrome and hides with the tree" {
     try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
     const search_with_bundle = try test_surface.snapshot(allocator);
     defer allocator.free(search_with_bundle);
-    try std.testing.expect(std.mem.indexOf(u8, search_with_bundle, "main ↑0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_with_bundle, "main ↑0") == null);
     try std.testing.expect(std.mem.indexOf(u8, search_with_bundle, "Find file:") != null);
 
     state.file_search.mode = false;
@@ -2713,10 +2546,10 @@ test "Repository branch keeps bundle search chrome and hides with the tree" {
     const mismatched = try test_surface.snapshot(allocator);
     defer allocator.free(mismatched);
     try std.testing.expect(std.mem.indexOf(u8, mismatched, "main ↑0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, mismatched, "branch unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatched, "branch unavailable") == null);
 }
 
-test "Repository branch clips width one and two without moving Files" {
+test "Repository compact tree keeps Files on row one" {
     const allocator = std.testing.allocator;
     var state = try repositoryBranchViewStateForTest();
     defer state.deinit(allocator);
@@ -2739,10 +2572,9 @@ test "Repository branch clips width one and two without moving Files" {
     defer width_two.deinit();
     try view(.{ .page_state = &state, .palette = .default() }, &width_two.surface);
     try width_two.expectCellText(0, 0, " ");
-    try width_two.expectCellText(1, 0, "…");
     try width_two.expectCellText(0, 1, " ");
+    try width_two.expectCellText(1, 1, "F");
     try width_two.expectCellText(0, 2, " ");
-    try width_two.expectCellText(1, 2, "F");
 }
 
 test "repository root renders without disclosure and activation preserves opened descendants" {
@@ -2766,10 +2598,10 @@ test "repository root renders without disclosure and activation preserves opened
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "main.zig") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading selected file") != null);
+    try test_surface.expectCellText(0, 1, " ");
+    try test_surface.expectCellText(1, 1, "F");
     try test_surface.expectCellText(0, 2, " ");
-    try test_surface.expectCellText(1, 2, "F");
-    try test_surface.expectCellText(0, 3, " ");
-    try test_surface.expectCellText(1, 3, "g");
+    try test_surface.expectCellText(1, 2, "g");
 
     state.viewer.tree_width = 30;
     var wide_surface: chasen.testing.TestSurface = undefined;
@@ -2782,8 +2614,8 @@ test "repository root renders without disclosure and activation preserves opened
     state.viewer.tree_horizontal_scroll = 1;
     test_surface.surface.clearAll();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/gitframe" }, &test_surface.surface);
-    try test_surface.expectCellText(0, 3, " ");
-    try test_surface.expectCellText(1, 3, "i");
+    try test_surface.expectCellText(0, 2, " ");
+    try test_surface.expectCellText(1, 2, "i");
     state.viewer.tree_horizontal_scroll = 0;
     const layout = repository_layout.bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
     try test_surface.expectCellText(
@@ -2984,9 +2816,9 @@ test "repository filter discoverability header follows effective keymap and clip
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]  (F: toggle") != null);
-        try test_surface.expectCellText(27, 2, "e");
-        const mode_cell = test_surface.surface.readCell(1, 2) orelse return error.ExpectedFilterModeCell;
-        const shortcut_cell = test_surface.surface.readCell(19, 2) orelse return error.ExpectedFilterShortcutCell;
+        try test_surface.expectCellText(27, 1, "e");
+        const mode_cell = test_surface.surface.readCell(1, 1) orelse return error.ExpectedFilterModeCell;
+        const shortcut_cell = test_surface.surface.readCell(19, 1) orelse return error.ExpectedFilterShortcutCell;
         const palette: theme.Palette = .default();
         try std.testing.expect(mode_cell.style.fg.eql(palette.color(.accent)));
         try std.testing.expect(mode_cell.style.bold);
@@ -3088,9 +2920,9 @@ test "repository filter discoverability distinguishes loading unavailable and no
         defer test_surface.deinit();
         const palette: theme.Palette = .default();
         try view(.{ .page_state = &state, .palette = palette }, &test_surface.surface);
-        try test_surface.expectCellText(0, 2, " ");
-        try test_surface.expectCellText(1, 2, "F");
-        try test_surface.expectCellText(28, 2, ")");
+        try test_surface.expectCellText(0, 1, " ");
+        try test_surface.expectCellText(1, 1, "F");
+        try test_surface.expectCellText(28, 1, ")");
         const layout = repository_layout.bodyLayout(.{ .width = 120, .height = 8 }, state.viewer.tree_width, state.viewer.tree_hidden);
         const message_cell = test_surface.surface.readCell(0, layout.header_rows + 1) orelse
             return error.ExpectedChangedFilesMessage;

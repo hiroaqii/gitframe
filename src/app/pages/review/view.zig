@@ -93,7 +93,6 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .palette = app.palette,
         .mode_toggle_key = displayModeToggleKey(app, mode_key_buffer[0..]),
     };
-    const branch = try branchPresentation(app, surface.frameAllocator());
     const empty_message: ?diff_surface.view.StateMessage = if (app.page.basis) |basis|
         try emptyStateMessage(surface.frameAllocator(), basis.base.display_name, basis.ahead_count)
     else
@@ -110,7 +109,6 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .repo_root = app.repo_root,
         .no_changes_actions = .{},
         .empty_message = empty_message,
-        .branch = branch,
         .diff_pane = pane_adapter.interface(),
     });
 }
@@ -294,36 +292,6 @@ fn navigationView(app: Context) review_navigation.View {
 fn displayModeToggleKey(app: Context, buffer: []u8) ?[]const u8 {
     if (app.page.search.mode or app.page.file_search.mode or app.page.base_picker.open) return null;
     return app.keymap.display(.toggle_display_mode, buffer);
-}
-
-fn branchPresentation(app: Context, allocator: std.mem.Allocator) !?diff_surface.view.SidebarBranchPresentation {
-    if (app.page.basis_failure) |failure| {
-        const message = try basisFailureText(allocator, failure);
-        return .{ .text = if (app.page.hasAcceptedDisplay())
-            try std.fmt.allocPrint(allocator, "stale  {s}", .{message})
-        else
-            message };
-    }
-    if (app.page.load_failure) |message| return .{ .text = if (app.page.hasAcceptedDisplay())
-        try std.fmt.allocPrint(allocator, "stale  {s}", .{firstLine(message)})
-    else
-        firstLine(message) };
-    const basis = app.page.basis orelse return .{ .text = "resolving review base..." };
-    const pending = switch (app.page.activation.state) {
-        .active => |active| active.members.source == .pending,
-        .inactive => false,
-    };
-    const same_endpoint = std.mem.eql(u8, basis.base.oid.slice(), basis.head_oid.slice());
-    return .{
-        .text = try std.fmt.allocPrint(allocator, "{s}...{s}  merge-base {s}  +{d}{s}{s}", .{
-            basis.base.display_name,
-            basis.head_display,
-            basis.merge_base_oid.short(),
-            basis.ahead_count,
-            if (same_endpoint) "  base == head" else "",
-            if (pending) "  loading" else "",
-        }),
-    };
 }
 
 fn viewInitialFailure(app: Context, surface: *chasen.Surface) !void {

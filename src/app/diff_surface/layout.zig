@@ -4,7 +4,7 @@
 const std = @import("std");
 const diff_render = @import("../../diff/render.zig");
 
-pub const sidebar_header_rows: u16 = 3;
+pub const sidebar_header_rows: u16 = 2;
 pub const diff_body_start_row: u16 = diff_render.body_start_row;
 pub const search_marker_gutter_width: u16 = 1;
 

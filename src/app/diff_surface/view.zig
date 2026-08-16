@@ -286,7 +286,6 @@ pub const ViewArgs = struct {
     repo_root: ?[]const u8 = null,
     no_changes_actions: NoChangesActionPresentation,
     empty_message: ?StateMessage = null,
-    branch: ?SidebarBranchPresentation,
     diff_pane: DiffPaneRenderer,
 };
 
@@ -363,7 +362,7 @@ fn viewEmptySidebarChrome(surface: *chasen.Surface, args: ViewArgs) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    try drawSidebarDetailRow(surface, 0, args.state, args.palette, args.branch);
+    try drawSidebarDetailRow(surface, 0, args.state, args.palette);
     try drawSidebarSummary(surface, 0, 0, args.palette);
     try drawEmptySidebarRoot(surface, args.repo_root, args.palette);
 }
@@ -397,7 +396,7 @@ fn viewLoadedDiff(surface: *chasen.Surface, args: ViewArgs, loaded: loaded_diff.
         .width = sidebar_width,
         .height = size.height,
     });
-    try viewSidebar(&sidebar, args.state, loaded, args.palette, args.branch);
+    try viewSidebar(&sidebar, args.state, loaded, args.palette);
     drawSidebarSeparator(surface, sidebar_width, args.palette);
 
     if (size.width <= sidebar_width + 1) return;
@@ -896,11 +895,11 @@ fn drawFileSearchInput(surface: *chasen.Surface, col: u16, row: u16, text: []con
 
 pub fn drawSidebarSummary(surface: *chasen.Surface, file_count: usize, hunk_count: usize, palette: theme.Palette) !void {
     const size = surface.size();
-    if (size.width == 0 or size.height <= 2) return;
+    if (size.width == 0 or size.height <= 1) return;
 
     const stats_col: u16 = 1;
     if (stats_col < size.width) {
-        _ = try surface.printAt(stats_col, 2, palette.style(.muted), "{d} files / {d} hunks", .{ file_count, hunk_count });
+        _ = try surface.printAt(stats_col, 1, palette.style(.muted), "{d} files / {d} hunks", .{ file_count, hunk_count });
     }
 }
 
@@ -959,37 +958,17 @@ test "sidebar summary omits Files label and empty state keeps repository root" {
     try std.testing.expect(std.mem.indexOf(u8, loaded_snapshot, "Files") == null);
 }
 
-/// Fully normalized page-owned branch chrome. The shared renderer owns only
-/// placement and style; pages remain responsible for branch status, action
-/// reachability, effective key labels, clipping, and hint composition.
-pub const SidebarBranchPresentation = struct {
-    text: []const u8,
-    hint: ?Hint = null,
-
-    pub const Hint = struct {
-        text: []const u8,
-        col: u16,
-    };
-};
-
-/// Whether the detail row can show page-owned branch presentation. Filter
-/// chrome has precedence and is rendered entirely from shared surface state.
-pub fn sidebarDetailNeedsBranch(display: *const app_state.ReviewDisplayState) bool {
-    return !display.hide_reviewed_files and display.changed_file_filter == .all;
-}
-
-/// Draw the loaded file sidebar from shared state plus normalized page chrome.
+/// Draw the loaded file sidebar from shared state.
 pub fn viewSidebar(
     surface: *chasen.Surface,
     state: diff_surface.ReadSurface,
     loaded: loaded_diff.LoadedDiff,
     palette: theme.Palette,
-    branch: ?SidebarBranchPresentation,
 ) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    try drawSidebarDetailRow(surface, 0, state, palette, branch);
+    try drawSidebarDetailRow(surface, 0, state, palette);
 
     try drawSidebarSummary(surface, loaded.document.files.len, loaded.document.totalHunks(), palette);
 
@@ -1021,7 +1000,6 @@ pub fn drawSidebarDetailRow(
     row: u16,
     state: diff_surface.ReadSurface,
     palette: theme.Palette,
-    branch: ?SidebarBranchPresentation,
 ) !void {
     const size = surface.size();
     if (size.width <= 2 or row >= size.height) return;
@@ -1037,14 +1015,6 @@ pub fn drawSidebarDetailRow(
     }
     if (state.review_display.changed_file_filter != .all) {
         try draw.copyClippedTextAt(surface, 1, row, state.review_display.changed_file_filter.label(), palette.style(.prompt));
-        return;
-    }
-
-    if (branch) |presentation| {
-        try draw.copyClippedTextAt(surface, 1, row, presentation.text, palette.style(.info));
-        if (presentation.hint) |hint| {
-            try draw.copyClippedTextAt(surface, hint.col, row, hint.text, sidebarBranchHintStyle(palette));
-        }
     }
 }
 
@@ -1185,8 +1155,4 @@ fn reviewedStyle(palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextSt
 
 fn modeBadgeStyle(palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextStyle {
     return withCursorBackground(.{ .fg = palette.color(.info), .bold = true }, cursor_bg);
-}
-
-fn sidebarBranchHintStyle(palette: theme.Palette) chasen.TextStyle {
-    return palette.style(.muted);
 }

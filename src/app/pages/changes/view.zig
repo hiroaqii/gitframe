@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const chasen = @import("chasen");
 const draw = @import("draw");
-const branch_chrome = @import("../../branch_chrome.zig");
 const app_page = @import("../../page.zig");
 const page_header = @import("../../page_header.zig");
 const changes_projection = @import("../../changes_projection.zig");
@@ -164,7 +163,6 @@ test "reloadable activation reports validating and stale while one-shot input st
 
 pub fn view(app: Context, surface: *chasen.Surface) !void {
     var diff_pane_adapter: ChangesDiffPaneRenderer = .{ .app = app };
-    var branch_scratch: SidebarBranchScratch = undefined;
     var fetch_key_buffer: [16]u8 = undefined;
     return diff_surface_view.view(surface, .{
         .state = app.page.readSurface(app.source, app.navigation.layout),
@@ -173,7 +171,6 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .repo_root = app.repo_root,
         .no_changes_actions = viewNoChangesActionPresentation(app, fetch_key_buffer[0..]),
         .empty_message = null,
-        .branch = viewBranchRowPresentation(app, surface, &branch_scratch),
         .diff_pane = diff_pane_adapter.interface(),
     });
 }
@@ -201,75 +198,14 @@ fn viewNoChangesActionPresentation(app: Context, fetch_key_buffer: []u8) diff_su
     return noChangesActionPresentation(app.empty_remote_hints, fetch_key);
 }
 
-fn viewBranchRowPresentation(app: Context, surface: *chasen.Surface, scratch: *SidebarBranchScratch) ?diff_surface_view.SidebarBranchPresentation {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0 or app.page.viewer.sidebar_hidden) return null;
-
-    const sidebar_width = changes_layout.sidebarWidth(size.width, app.page.viewer.sidebar_width);
-    switch (app.page.load.state) {
-        .loaded => {
-            const search_pane_width = size.width -| (sidebar_width +| 1);
-            if (app.page.file_search.mode and search_pane_width < diff_surface_view.file_search_min_pane_width) return null;
-        },
-        .empty => |reason| if (reason != .no_changes or app.page.file_search.mode) return null,
-        else => return null,
-    }
-
-    var sidebar = surface.child(.{ .col = 0, .row = 0, .width = sidebar_width, .height = size.height });
-    return sidebarBranchRowPresentation(app, &sidebar, scratch);
-}
-
 /// Draw the file tree side pane from the materialized sidebar view-model.
 pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
-    var branch_scratch: SidebarBranchScratch = undefined;
     return diff_surface_view.viewSidebar(
         surface,
         app.page.readSurface(app.source, app.navigation.layout),
         loaded,
         app.theme,
-        sidebarBranchRowPresentation(app, surface, &branch_scratch),
     );
-}
-
-fn drawSidebarDetailRow(app: Context, surface: *chasen.Surface, row: u16) !void {
-    var branch_scratch: SidebarBranchScratch = undefined;
-    return diff_surface_view.drawSidebarDetailRow(
-        surface,
-        row,
-        app.page.readSurface(app.source, app.navigation.layout),
-        app.theme,
-        sidebarBranchRowPresentation(app, surface, &branch_scratch),
-    );
-}
-
-const SidebarBranchScratch = struct {
-    push_key: [16]u8,
-    pull_key: [16]u8,
-    hint: [64]u8,
-};
-
-fn sidebarBranchRowPresentation(app: Context, surface: *chasen.Surface, scratch: *SidebarBranchScratch) ?diff_surface_view.SidebarBranchPresentation {
-    const size = surface.size();
-    if (size.width <= 2 or size.height == 0) return null;
-    if (!diff_surface_view.sidebarDetailNeedsBranch(&app.page.review_display)) return null;
-
-    const available_width = size.width - 1;
-    if (branchStatusSidebarPresentation(app.page, app.repo_root, surface.frameAllocator(), available_width)) |presentation| {
-        var result: diff_surface_view.SidebarBranchPresentation = .{ .text = presentation.text };
-
-        if (changesBranchActionHintInputReachable(app.page)) {
-            const push_key = app.keymap.display(.push, scratch.push_key[0..]);
-            const pull_key = app.keymap.display(.pull, scratch.pull_key[0..]);
-            if (changesBranchActionHintForKeys(presentation, available_width, push_key, pull_key, scratch.hint[0..])) |hint| {
-                result.hint = .{
-                    .text = hint.text,
-                    .col = 1 + hint.base_display_width,
-                };
-            }
-        }
-        return result;
-    }
-    return null;
 }
 
 const drawSidebarRow = diff_surface_view.drawSidebarRow;
@@ -461,161 +397,6 @@ test "changes no-changes adapter normalizes fetch capability and key" {
     try std.testing.expectEqualStrings("Ctrl+f", allowed.fetch_key.?);
 }
 
-const SidebarBranchPresentation = struct {
-    text: []const u8,
-    full_display_width: ?u16 = null,
-    was_clipped: bool = false,
-    action_hints: ActionHints = .{},
-
-    const ActionHints = struct {
-        push: bool = false,
-        pull: bool = false,
-    };
-};
-
-const ChangesBranchActionHint = struct {
-    text: []const u8,
-    base_display_width: u16,
-};
-
-fn branchStatusSidebarPresentation(page: *const changes_page.ChangesPageState, repo_root: ?[]const u8, allocator: std.mem.Allocator, available_width: u16) ?SidebarBranchPresentation {
-    const root = repo_root orelse return null;
-    if (page.branch_status_load.pending) |pending| {
-        const has_retained_snapshot = if (page.branch_status.repo_root) |snapshot_root|
-            std.mem.eql(u8, root, snapshot_root)
-        else
-            false;
-        if (pending.origin == .foreground or !has_retained_snapshot) return .{ .text = "loading branch" };
-    }
-
-    const snapshot_root = page.branch_status.repo_root orelse return null;
-    if (!std.mem.eql(u8, root, snapshot_root)) return null;
-
-    const formatted = branch_chrome.formatBaseLabel(allocator, page.branch_status.status, available_width) catch return .{ .text = "branch" };
-    return .{
-        // The caller-provided frame/testing allocator owns this transferred
-        // text for the same lifetime as the returned presentation.
-        .text = formatted.text,
-        .full_display_width = formatted.full_display_width,
-        .was_clipped = formatted.was_clipped,
-        .action_hints = branchStatusActionHints(page.branch_status.status),
-    };
-}
-
-fn branchStatusActionHints(status: git_branch_status.BranchStatus) SidebarBranchPresentation.ActionHints {
-    return switch (status.head) {
-        .branch => .{
-            .push = true,
-            .pull = if (status.upstream) |upstream| upstream.remote_branch.len > 0 else false,
-        },
-        .detached, .unknown => .{},
-    };
-}
-
-/// Text-input modes consume keys before Changes's normal action route. Keep the
-/// branch fact visible, but do not advertise a shortcut that cannot currently
-/// reach the existing push or pull command.
-fn changesBranchActionHintInputReachable(page: *const changes_page.ChangesPageState) bool {
-    return !page.search.mode and !page.file_search.mode;
-}
-
-/// Compose discoverability chrome only when it fits after an unclipped base.
-/// The existing key/input and Changes operation paths remain the sole action
-/// authority; this helper uses only stable branch topology and bound keys.
-fn changesBranchActionHintForKeys(
-    presentation: SidebarBranchPresentation,
-    available_width: u16,
-    push_key: ?[]const u8,
-    pull_key: ?[]const u8,
-    buffer: []u8,
-) ?ChangesBranchActionHint {
-    if (presentation.was_clipped) return null;
-    const base_width = presentation.full_display_width orelse return null;
-    if (base_width > available_width) return null;
-
-    const push = eligibleActionKey(presentation.action_hints.push, push_key);
-    const pull = eligibleActionKey(presentation.action_hints.pull, pull_key);
-
-    if (push) |push_label| {
-        if (pull) |pull_label| {
-            if (changesBranchActionHintCandidate(
-                base_width,
-                available_width,
-                buffer,
-                "  ({s}: push / {s}: pull)",
-                .{ push_label, pull_label },
-            )) |hint| return hint;
-        }
-        return changesBranchActionHintCandidate(
-            base_width,
-            available_width,
-            buffer,
-            "  ({s}: push)",
-            .{push_label},
-        );
-    }
-    if (pull) |pull_label| {
-        return changesBranchActionHintCandidate(
-            base_width,
-            available_width,
-            buffer,
-            "  ({s}: pull)",
-            .{pull_label},
-        );
-    }
-    return null;
-}
-
-fn eligibleActionKey(eligible: bool, key: ?[]const u8) ?[]const u8 {
-    if (!eligible) return null;
-    const bound_key = key orelse return null;
-    if (bound_key.len == 0) return null;
-    return bound_key;
-}
-
-fn changesBranchActionHintCandidate(
-    base_width: u16,
-    available_width: u16,
-    buffer: []u8,
-    comptime format: []const u8,
-    args: anytype,
-) ?ChangesBranchActionHint {
-    const hint = std.fmt.bufPrint(buffer, format, args) catch return null;
-    if (chasen.text.displayWidth(hint) > available_width - base_width) return null;
-    return .{ .text = hint, .base_display_width = base_width };
-}
-
-test "branch sidebar retains background snapshot but shows foreground loading" {
-    var builder = git_branch_status.Builder.init(std.testing.allocator);
-    errdefer builder.deinit();
-    try builder.setBranchHead("main");
-    var bundle = builder.finish();
-    var branch_status: git_branch_status.State = .{};
-    try branch_status.replace("/repo", &bundle);
-
-    var page_state: changes_page.ChangesPageState = .{
-        .branch_status = branch_status,
-        .branch_status_load = .{
-            .generation = 1,
-            .pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 },
-            .freshness = .stale_refresh,
-        },
-    };
-    defer page_state.branch_status.deinit();
-
-    const retained = branchStatusSidebarPresentation(&page_state, "/repo", std.testing.allocator, 80).?;
-    defer std.testing.allocator.free(retained.text);
-    try std.testing.expectEqualStrings("main no upstream", retained.text);
-    try std.testing.expect(retained.action_hints.push);
-    try std.testing.expect(!retained.action_hints.pull);
-
-    page_state.branch_status_load.pending.?.origin = .foreground;
-    const loading = branchStatusSidebarPresentation(&page_state, "/repo", std.testing.allocator, 80).?;
-    try std.testing.expectEqualStrings("loading branch", loading.text);
-    try std.testing.expect(!loading.action_hints.push);
-    try std.testing.expect(!loading.action_hints.pull);
-}
-
 test "Changes page header admits only exact-root branch snapshots" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
@@ -663,292 +444,24 @@ test "Changes page header admits only exact-root branch snapshots" {
     try std.testing.expect(pageHeaderPresentation(context) == null);
 }
 
-test "changes branch action hint renders effective keys with muted hint style" {
-    var builder = git_branch_status.Builder.init(std.testing.allocator);
-    errdefer builder.deinit();
-    try builder.setBranchHead("main");
-    try builder.setUpstream("origin/main");
-    builder.setAheadBehind(0, 0);
-    var bundle = builder.finish();
-    var branch_status: git_branch_status.State = .{};
-    try branch_status.replace("/repo", &bundle);
-
-    var page_state: changes_page.ChangesPageState = .{ .branch_status = branch_status };
-    defer page_state.branch_status.deinit();
-    var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 4, 5, 6 } };
-
-    var context = testContext(&page_state, palette, 48, 4);
-    context.repo_root = "/repo";
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(48, 1);
-    defer ts.deinit();
-
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const default_snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(default_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, default_snapshot, "main ↑0  (P: push / U: pull)") != null);
-
-    const base_cell = ts.surface.readCell(1, 0) orelse return error.ExpectedBranchBaseCell;
-    const hint_cell = ts.surface.readCell(10, 0) orelse return error.ExpectedBranchHintCell;
-    try std.testing.expect(base_cell.style.fg.eql(palette.color(.info)));
-    try std.testing.expect(!base_cell.style.dim);
-    try std.testing.expect(hint_cell.style.eql(palette.style(.muted)));
-    try std.testing.expect(!hint_cell.style.dim);
-
-    var config: keymap.Config = .{};
-    config.set(.push, .{ .ctrl = .s });
-    config.set(.pull, .{ .ctrl = .q });
-    context.keymap = keymap.Effective.fromConfig(config);
-    ts.surface.clearAll();
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const configured_snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(configured_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, configured_snapshot, "main ↑0  (Ctrl+s: push / Ctrl+q: pull)") != null);
-
-    var pull_unbound: keymap.Effective = .{};
-    pull_unbound.bindings[@intFromEnum(keymap.PublicAction.pull)] = null;
-    context.keymap = pull_unbound;
-    ts.surface.clearAll();
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const pull_unbound_snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(pull_unbound_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, pull_unbound_snapshot, "main ↑0  (P: push)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pull_unbound_snapshot, ": pull)") == null);
-
-    var push_unbound: keymap.Effective = .{};
-    push_unbound.bindings[@intFromEnum(keymap.PublicAction.push)] = null;
-    context.keymap = push_unbound;
-    ts.surface.clearAll();
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const push_unbound_snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(push_unbound_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, push_unbound_snapshot, "main ↑0  (U: pull)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, push_unbound_snapshot, ": push") == null);
-
-    push_unbound.bindings[@intFromEnum(keymap.PublicAction.pull)] = null;
-    context.keymap = push_unbound;
-    ts.surface.clearAll();
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const both_unbound_snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(both_unbound_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, both_unbound_snapshot, "main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, both_unbound_snapshot, ": push") == null);
-    try std.testing.expect(std.mem.indexOf(u8, both_unbound_snapshot, ": pull") == null);
-}
-
-test "changes branch action hint follows text input authority" {
-    var builder = git_branch_status.Builder.init(std.testing.allocator);
-    errdefer builder.deinit();
-    try builder.setBranchHead("main");
-    try builder.setUpstream("origin/main");
-    builder.setAheadBehind(0, 0);
-    var bundle = builder.finish();
-    var branch_status: git_branch_status.State = .{};
-    try branch_status.replace("/repo", &bundle);
-
-    var page_state: changes_page.ChangesPageState = .{ .branch_status = branch_status };
-    defer page_state.branch_status.deinit();
-    var context = testContext(&page_state, .default(), 48, 4);
-    context.repo_root = "/repo";
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(48, 1);
-    defer ts.deinit();
-
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const normal_before = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(normal_before);
-    try std.testing.expect(std.mem.indexOf(u8, normal_before, "main ↑0  (P: push / U: pull)") != null);
-
-    page_state.file_search.mode = true;
-    ts.surface.clearAll();
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const file_search = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(file_search);
-    try std.testing.expect(std.mem.indexOf(u8, file_search, "main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, file_search, ": push") == null);
-    try std.testing.expect(std.mem.indexOf(u8, file_search, ": pull") == null);
-
-    page_state.file_search.mode = false;
-    page_state.search.mode = true;
-    ts.surface.clearAll();
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const diff_search = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(diff_search);
-    try std.testing.expect(std.mem.indexOf(u8, diff_search, "main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diff_search, ": push") == null);
-    try std.testing.expect(std.mem.indexOf(u8, diff_search, ": pull") == null);
-
-    page_state.search.mode = false;
-    ts.surface.clearAll();
-    try drawSidebarDetailRow(context, &ts.surface, 0);
-    const normal_after = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(normal_after);
-    try std.testing.expect(std.mem.indexOf(u8, normal_after, "main ↑0  (P: push / U: pull)") != null);
-}
-
-test "changes branch action hint follows topology and width fallback" {
-    const upstream_status: git_branch_status.BranchStatus = .{
-        .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{},
-    };
-    var formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, upstream_status, 80);
-    defer formatted.deinit(std.testing.allocator);
-    const presentation: SidebarBranchPresentation = .{
-        .text = formatted.text,
-        .full_display_width = formatted.full_display_width,
-        .was_clipped = formatted.was_clipped,
-        .action_hints = branchStatusActionHints(upstream_status),
-    };
-    try std.testing.expect(presentation.action_hints.push);
-    try std.testing.expect(presentation.action_hints.pull);
-
-    const full_hint_width = chasen.text.displayWidth("  (P: push / U: pull)");
-    const push_hint_width = chasen.text.displayWidth("  (P: push)");
-    const pull_hint_width = chasen.text.displayWidth("  (U: pull)");
-    const full_exact_width = presentation.full_display_width.? + full_hint_width;
-    const push_exact_width = presentation.full_display_width.? + push_hint_width;
-    const pull_exact_width = presentation.full_display_width.? + pull_hint_width;
-    var hint_buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "  (P: push / U: pull)",
-        changesBranchActionHintForKeys(presentation, full_exact_width, "P", "U", hint_buffer[0..]).?.text,
-    );
-    try std.testing.expectEqualStrings(
-        "  (P: push)",
-        changesBranchActionHintForKeys(presentation, full_exact_width - 1, "P", "U", hint_buffer[0..]).?.text,
-    );
-    try std.testing.expectEqualStrings(
-        "  (P: push)",
-        changesBranchActionHintForKeys(presentation, push_exact_width, "P", "U", hint_buffer[0..]).?.text,
-    );
-    try std.testing.expect(changesBranchActionHintForKeys(presentation, push_exact_width - 1, "P", "U", hint_buffer[0..]) == null);
-    try std.testing.expectEqualStrings(
-        "  (U: pull)",
-        changesBranchActionHintForKeys(presentation, pull_exact_width, null, "U", hint_buffer[0..]).?.text,
-    );
-    try std.testing.expectEqualStrings(
-        "  (P: push)",
-        changesBranchActionHintForKeys(presentation, push_exact_width, "P", null, hint_buffer[0..]).?.text,
-    );
-    try std.testing.expect(changesBranchActionHintForKeys(presentation, full_exact_width, null, null, hint_buffer[0..]) == null);
-
-    const no_upstream_status: git_branch_status.BranchStatus = .{ .head = .{ .branch = "main" } };
-    const no_upstream_hints = branchStatusActionHints(no_upstream_status);
-    try std.testing.expect(no_upstream_hints.push);
-    try std.testing.expect(!no_upstream_hints.pull);
-
-    var no_upstream_formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, no_upstream_status, 80);
-    defer no_upstream_formatted.deinit(std.testing.allocator);
-    const no_upstream_presentation: SidebarBranchPresentation = .{
-        .text = no_upstream_formatted.text,
-        .full_display_width = no_upstream_formatted.full_display_width,
-        .was_clipped = no_upstream_formatted.was_clipped,
-        .action_hints = no_upstream_hints,
-    };
-    try std.testing.expectEqualStrings(
-        "  (P: push)",
-        changesBranchActionHintForKeys(no_upstream_presentation, 80, "P", "U", hint_buffer[0..]).?.text,
-    );
-
-    const malformed_upstream_status: git_branch_status.BranchStatus = .{
-        .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin", .remote = "origin", .remote_branch = "" },
-    };
-    const malformed_upstream_hints = branchStatusActionHints(malformed_upstream_status);
-    try std.testing.expect(malformed_upstream_hints.push);
-    try std.testing.expect(!malformed_upstream_hints.pull);
-
-    var malformed_upstream_formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, malformed_upstream_status, 80);
-    defer malformed_upstream_formatted.deinit(std.testing.allocator);
-    const malformed_upstream_presentation: SidebarBranchPresentation = .{
-        .text = malformed_upstream_formatted.text,
-        .full_display_width = malformed_upstream_formatted.full_display_width,
-        .was_clipped = malformed_upstream_formatted.was_clipped,
-        .action_hints = malformed_upstream_hints,
-    };
-    try std.testing.expectEqualStrings(
-        "  (P: push)",
-        changesBranchActionHintForKeys(malformed_upstream_presentation, 80, "P", "U", hint_buffer[0..]).?.text,
-    );
-}
-
-test "changes branch action hint drops before base clipping and omits non-branch terminals" {
-    const upstream_status: git_branch_status.BranchStatus = .{
-        .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
-        .ahead_behind = .{},
-    };
-    var formatted = try branch_chrome.formatBaseLabel(std.testing.allocator, upstream_status, 80);
-    defer formatted.deinit(std.testing.allocator);
-    var clipped = try branch_chrome.formatBaseLabel(std.testing.allocator, upstream_status, formatted.full_display_width - 1);
-    defer clipped.deinit(std.testing.allocator);
-    const clipped_presentation: SidebarBranchPresentation = .{
-        .text = clipped.text,
-        .full_display_width = clipped.full_display_width,
-        .was_clipped = clipped.was_clipped,
-        .action_hints = branchStatusActionHints(upstream_status),
-    };
-    try std.testing.expect(clipped_presentation.was_clipped);
-    var hint_buffer: [64]u8 = undefined;
-    try std.testing.expect(changesBranchActionHintForKeys(
-        clipped_presentation,
-        formatted.full_display_width - 1,
-        "P",
-        "U",
-        hint_buffer[0..],
-    ) == null);
-
-    const loading: SidebarBranchPresentation = .{ .text = "loading branch" };
-    const detached: SidebarBranchPresentation = .{
-        .text = "detached",
-        .full_display_width = 8,
-        .action_hints = branchStatusActionHints(.{ .head = .detached }),
-    };
-    const unknown: SidebarBranchPresentation = .{
-        .text = "unknown branch",
-        .full_display_width = 14,
-        .action_hints = branchStatusActionHints(.{ .head = .unknown }),
-    };
-    try std.testing.expect(!detached.action_hints.push);
-    try std.testing.expect(!detached.action_hints.pull);
-    try std.testing.expect(!unknown.action_hints.push);
-    try std.testing.expect(!unknown.action_hints.pull);
-    try std.testing.expect(changesBranchActionHintForKeys(loading, 80, "P", "U", hint_buffer[0..]) == null);
-    try std.testing.expect(changesBranchActionHintForKeys(detached, 80, "P", "U", hint_buffer[0..]) == null);
-    try std.testing.expect(changesBranchActionHintForKeys(unknown, 80, "P", "U", hint_buffer[0..]) == null);
-}
-
-test "changes filter summary owns sidebar detail row over branch action hint" {
-    var builder = git_branch_status.Builder.init(std.testing.allocator);
-    errdefer builder.deinit();
-    try builder.setBranchHead("main");
-    try builder.setUpstream("origin/main");
-    builder.setAheadBehind(0, 0);
-    var bundle = builder.finish();
-    var branch_status: git_branch_status.State = .{};
-    try branch_status.replace("/repo", &bundle);
-
+test "changes filter summary remains in compact sidebar detail row" {
     var page_state: changes_page.ChangesPageState = .{
-        .branch_status = branch_status,
         .review_display = .{ .changed_file_filter = .modified },
     };
-    defer page_state.branch_status.deinit();
-    var context = testContext(&page_state, .default(), 48, 4);
-    context.repo_root = "/repo";
+    const context = testContext(&page_state, .default(), 48, 4);
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(48, 1);
     defer ts.deinit();
 
-    try drawSidebarDetailRow(context, &ts.surface, 0);
+    try diff_surface_view.drawSidebarDetailRow(
+        &ts.surface,
+        0,
+        page_state.readSurface(context.source, context.navigation.layout),
+        context.theme,
+    );
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified only") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "main ↑0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, ": push") == null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, ": pull") == null);
 }
 
 pub fn drawSearchMatchMarker(app: Context, surface: *chasen.Surface) void {
@@ -1195,14 +708,15 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     defer ts.deinit();
 
     const selected_row = changes_layout.sidebar_header_rows;
+    const summary_row = changes_layout.sidebar_header_rows - 1;
     try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(2, changes_layout.sidebar_header_rows, "A");
     try ts.expectCellText(2, changes_layout.sidebar_header_rows + 1, "D");
-    try ts.expectCellText(1, 2, "2");
+    try ts.expectCellText(1, summary_row, "2");
     const active_badge = ts.surface.readCell(2, selected_row) orelse return error.ExpectedActiveBadge;
     const active_path = ts.surface.readCell(6, selected_row) orelse return error.ExpectedActivePath;
     const active_trailing = ts.surface.readCell(33, selected_row) orelse return error.ExpectedActiveTrailingCell;
-    const active_summary = ts.surface.readCell(1, 2) orelse return error.ExpectedActiveSummary;
+    const active_summary = ts.surface.readCell(1, summary_row) orelse return error.ExpectedActiveSummary;
     try std.testing.expect(active_badge.style.fg.eql(palette.color(.success)));
     for ([_]chasen.Cell{ active_badge, active_path, active_trailing }) |cell| {
         try std.testing.expect(cell.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1219,7 +733,7 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     const inactive_badge = ts.surface.readCell(2, selected_row) orelse return error.ExpectedInactiveBadge;
     const inactive_path = ts.surface.readCell(6, selected_row) orelse return error.ExpectedInactivePath;
     const inactive_trailing = ts.surface.readCell(33, selected_row) orelse return error.ExpectedInactiveTrailingCell;
-    const inactive_summary = ts.surface.readCell(1, 2) orelse return error.ExpectedInactiveSummary;
+    const inactive_summary = ts.surface.readCell(1, summary_row) orelse return error.ExpectedInactiveSummary;
     try std.testing.expect(inactive_badge.style.fg.eql(palette.color(.success)));
     for ([_]chasen.Cell{ inactive_badge, inactive_path, inactive_trailing }) |cell| {
         try std.testing.expect(!cell.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1271,7 +785,7 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     try short.init(12, changes_layout.sidebar_header_rows);
     defer short.deinit();
     try viewSidebar(testContext(&page, palette, 80, 9), &short.surface, page.load.state.loaded.loaded);
-    try short.expectCellText(1, 2, "2");
+    try short.expectCellText(1, summary_row, "2");
 
     const nodes = [_]file_tree.Node{.{
         .kind = .file,
