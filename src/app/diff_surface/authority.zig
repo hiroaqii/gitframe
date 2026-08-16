@@ -1,7 +1,7 @@
 //! Shared diff-page action authority vocabulary.
 //!
 //! Requirements are evaluated against the current page activation and member
-//! freshness vector. Changes and Compare retain independent lifecycle state.
+//! freshness vector. Changes and Review retain independent lifecycle state.
 
 const std = @import("std");
 const auto_reload = @import("../auto_reload.zig");
@@ -112,24 +112,24 @@ pub const Member = enum {
 /// identities from being admitted accidentally.
 pub const Owner = enum {
     changes,
-    compare,
+    review,
 
     fn identity(self: Owner, repo_epoch: u64, activation_id: u64) page.RequestIdentity {
         return switch (self) {
             .changes => page.RequestIdentity.changes(repo_epoch, activation_id),
-            .compare => page.RequestIdentity.compare(repo_epoch, activation_id),
+            .review => page.RequestIdentity.review(repo_epoch, activation_id),
         };
     }
 
     fn matches(self: Owner, origin: page.Id) bool {
         return switch (self) {
             .changes => origin == .changes,
-            .compare => origin == .compare,
+            .review => origin == .review,
         };
     }
 };
 
-/// Persistent Changes or Compare activation owner.
+/// Persistent Changes or Review activation owner.
 ///
 /// Retained documents and reload fingerprints live outside this value. Leaving
 /// the owning page therefore revokes action authority without destroying last-good
@@ -336,22 +336,22 @@ test "lifecycle identity authority is isolated by diff page owner" {
     var changes = Lifecycle.init(.changes);
     const changes_activation = changes.activate(4, .pending, .pending, .pending);
     const changes_identity = changes.currentIdentity().?;
-    const compare_for_changes = page.RequestIdentity.compare(4, changes_activation);
+    const review_for_changes = page.RequestIdentity.review(4, changes_activation);
     try std.testing.expectEqual(page.Id.changes, changes_identity.origin);
     try std.testing.expect(changes.finishMember(changes_identity, .source, .fresh));
-    try std.testing.expect(!changes.finishMember(compare_for_changes, .source, .failed));
+    try std.testing.expect(!changes.finishMember(review_for_changes, .source, .failed));
     try std.testing.expect(changes.acceptsRepoEpoch(changes_identity, 4));
-    try std.testing.expect(!changes.acceptsRepoEpoch(compare_for_changes, 4));
+    try std.testing.expect(!changes.acceptsRepoEpoch(review_for_changes, 4));
 
-    var compare = Lifecycle.init(.compare);
-    const compare_activation = compare.activate(4, .pending, .unavailable, .unavailable);
-    const compare_identity = compare.currentIdentity().?;
-    const changes_for_compare = page.RequestIdentity.changes(4, compare_activation);
-    try std.testing.expectEqual(page.Id.compare, compare_identity.origin);
-    try std.testing.expect(compare.finishMember(compare_identity, .source, .immutable));
-    try std.testing.expect(!compare.finishMember(changes_for_compare, .source, .failed));
-    try std.testing.expect(compare.acceptsRepoEpoch(compare_identity, 4));
-    try std.testing.expect(!compare.acceptsRepoEpoch(changes_for_compare, 4));
+    var review = Lifecycle.init(.review);
+    const review_activation = review.activate(4, .pending, .unavailable, .unavailable);
+    const review_identity = review.currentIdentity().?;
+    const changes_for_review = page.RequestIdentity.changes(4, review_activation);
+    try std.testing.expectEqual(page.Id.review, review_identity.origin);
+    try std.testing.expect(review.finishMember(review_identity, .source, .immutable));
+    try std.testing.expect(!review.finishMember(changes_for_review, .source, .failed));
+    try std.testing.expect(review.acceptsRepoEpoch(review_identity, 4));
+    try std.testing.expect(!review.acceptsRepoEpoch(changes_for_review, 4));
 }
 
 test "queued revalidation belongs to the current activation" {

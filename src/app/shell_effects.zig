@@ -59,7 +59,7 @@ pub const OriginContext = struct {
     snapshot: effect_origin.Snapshot,
     changes_repo_epoch: u64,
     repository_repo_epoch: u64,
-    compare_repo_epoch: u64,
+    review_repo_epoch: u64,
 
     pub fn changes(self: OriginContext) effect_origin.PageOrigin {
         return .{
@@ -77,11 +77,11 @@ pub const OriginContext = struct {
         };
     }
 
-    pub fn compare(self: OriginContext) effect_origin.PageOrigin {
+    pub fn review(self: OriginContext) effect_origin.PageOrigin {
         return .{
-            .page_id = .compare,
-            .repo_epoch = self.compare_repo_epoch,
-            .activation_id = self.snapshot.compare_activation_id,
+            .page_id = .review,
+            .repo_epoch = self.review_repo_epoch,
+            .activation_id = self.snapshot.review_activation_id,
         };
     }
 };
@@ -90,7 +90,7 @@ pub const DiagnosticPorts = struct {
     shell: *app_state.StatusMessage,
     changes: *app_state.StatusMessage,
     repository: *app_state.StatusMessage,
-    compare: *app_state.StatusMessage,
+    review: *app_state.StatusMessage,
 };
 
 pub const RedrawSink = struct {
@@ -134,8 +134,8 @@ pub const Controller = struct {
         return self.origins.repository();
     }
 
-    pub fn compareOrigin(self: Controller) effect_origin.PageOrigin {
-        return self.origins.compare();
+    pub fn reviewOrigin(self: Controller) effect_origin.PageOrigin {
+        return self.origins.review();
     }
 
     pub fn requestEditor(
@@ -337,7 +337,7 @@ pub const Controller = struct {
             .page => |captured| switch (captured.page_id) {
                 .changes => self.diagnostics.changes.set(fmt, args),
                 .repository => self.diagnostics.repository.set(fmt, args),
-                .compare => self.diagnostics.compare.set(fmt, args),
+                .review => self.diagnostics.review.set(fmt, args),
                 .config => self.diagnostics.shell.set(fmt, args),
             },
             .shell_surface => self.diagnostics.shell.set(fmt, args),

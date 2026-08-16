@@ -10,7 +10,7 @@ const page = @import("page.zig");
 const page_coordinator = @import("page_coordinator.zig");
 const page_link = @import("page_link.zig");
 const repo_session = @import("repo_session.zig");
-const compare_page = @import("pages/compare.zig");
+const review_page = @import("pages/review.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_selection = @import("pages/repository/selection.zig");
 const repository_tasks = @import("pages/repository/tasks.zig");
@@ -31,7 +31,7 @@ const repository_tree_model = @import("../repository/tree.zig");
 const PageStates = struct {
     changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
-    compare: compare_page.ComparePageState = .{},
+    review: review_page.ReviewPageState = .{},
     config: page.LazyPlaceholder = .{},
 };
 
@@ -52,7 +52,7 @@ const TestApp = struct {
             .active_page = &self.active_page,
             .changes = &self.pages.changes,
             .repository = &self.pages.repository,
-            .compare = &self.pages.compare,
+            .review = &self.pages.review,
             .config_page = &self.pages.config,
             .repo = self.repo_session.view(),
             .source = self.config.source,
@@ -132,22 +132,22 @@ test "repository source header page switch cancels header owner without weakenin
     try std.testing.expect(!app.pages.repository.activeMouseSourceRange());
 
     app.overlay.openHelp();
-    try requestPageSwitchForTest(&app, &ctx, .compare);
+    try requestPageSwitchForTest(&app, &ctx, .review);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
     try std.testing.expectEqualStrings("close help before switching pages", app.status.text());
     app.overlay.close();
 
     app.pages.repository.selection_owner = .{ .source_header = repositoryHeaderSelectionForTest() };
-    try requestPageSwitchForTest(&app, &ctx, .compare);
-    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try requestPageSwitchForTest(&app, &ctx, .review);
+    try std.testing.expectEqual(page.Id.review, app.active_page);
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 
     app.active_page = .repository;
     app.pages.repository.active = true;
     app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
     app.status.clear();
-    try requestPageSwitchForTest(&app, &ctx, .compare);
+    try requestPageSwitchForTest(&app, &ctx, .review);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.activeMouseSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
@@ -157,14 +157,14 @@ test "repository source header page switch cancels header owner without weakenin
         0,
     ) };
     app.status.clear();
-    try requestPageSwitchForTest(&app, &ctx, .compare);
-    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try requestPageSwitchForTest(&app, &ctx, .review);
+    try std.testing.expectEqual(page.Id.review, app.active_page);
     try std.testing.expect(!app.pages.repository.activeBorrowedSourceRange());
 }
 
 test "repository keyboard line selection page exits preserve semantic viewport" {
     const allocator = std.testing.allocator;
-    const targets = [_]page.Id{ .compare, .changes };
+    const targets = [_]page.Id{ .review, .changes };
 
     inline for (targets) |target| inline for (.{ false, true }) |retain_prior| {
         var app: TestApp = .{
@@ -207,23 +207,23 @@ test "page transition blocker leaves page and Changes state unchanged" {
     const activation_id = app_testing.pageCoordinator(&app).activateChanges();
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = std.testing.allocator };
 
-    try app.update(.{ .switch_page = .compare }, &ctx);
+    try app.update(.{ .switch_page = .review }, &ctx);
 
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expect(app.pages.changes.search.mode);
     try std.testing.expectEqual(activation_id, app.pages.changes.activation.state.active.activation_id);
     try std.testing.expectEqualStrings("finish search before switching pages", app.status.text());
-    try std.testing.expect(app.pages.compare.activation.state == .inactive);
+    try std.testing.expect(app.pages.review.activation.state == .inactive);
 }
 
-test "Compare mouse selection and base picker block App page transitions" {
+test "Review mouse selection and base picker block App page transitions" {
     const allocator = std.testing.allocator;
-    var app: TestApp = .{ .allocator = allocator, .active_page = .compare };
-    defer app.pages.compare.deinit(allocator);
-    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    var app: TestApp = .{ .allocator = allocator, .active_page = .review };
+    defer app.pages.review.deinit(allocator);
+    _ = app.pages.review.activate(app.repo_session.repo_epoch);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
-    app.pages.compare.selection_owner = .{ .diff = .{
+    app.pages.review.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "b/src/compare.zig" } },
         .side = .new,
         .mode = .line,
@@ -232,32 +232,32 @@ test "Compare mouse selection and base picker block App page transitions" {
         .moved = true,
     } };
     try requestPageSwitchForTest(&app, &ctx, .config);
-    try std.testing.expectEqual(page.Id.compare, app.active_page);
-    try std.testing.expectEqualStrings("finish Compare mouse selection before switching pages", app.status.text());
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqualStrings("finish Review mouse selection before switching pages", app.status.text());
 
-    app.pages.compare.selection_owner = .none;
-    _ = app.pages.compare.beginBasePicker(allocator).?;
+    app.pages.review.selection_owner = .none;
+    _ = app.pages.review.beginBasePicker(allocator).?;
     try requestPageSwitchForTest(&app, &ctx, .config);
-    try std.testing.expectEqual(page.Id.compare, app.active_page);
-    try std.testing.expectEqualStrings("close Compare base picker before switching pages", app.status.text());
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqualStrings("close Review base picker before switching pages", app.status.text());
 
-    app.pages.compare.closeBasePicker(allocator);
-    app.pages.compare.search.mode = true;
+    app.pages.review.closeBasePicker(allocator);
+    app.pages.review.search.mode = true;
     try requestPageSwitchForTest(&app, &ctx, .config);
-    try std.testing.expectEqual(page.Id.compare, app.active_page);
-    try std.testing.expectEqualStrings("finish Compare search before switching pages", app.status.text());
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expectEqualStrings("finish Review search before switching pages", app.status.text());
 }
 
-test "Compare retained selection survives page transitions and clears on repository replacement" {
+test "Review retained selection survives page transitions and clears on repository replacement" {
     const allocator = std.testing.allocator;
-    var app: TestApp = .{ .allocator = allocator, .active_page = .compare };
-    defer app.pages.compare.deinit(allocator);
-    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
-    app.pages.compare.completed_selection = .{
+    var app: TestApp = .{ .allocator = allocator, .active_page = .review };
+    defer app.pages.review.deinit(allocator);
+    _ = app.pages.review.activate(app.repo_session.repo_epoch);
+    app.pages.review.completed_selection = .{
         .token = .{
             .repo_epoch = app.repo_session.repo_epoch,
             .root_identity = null,
-            .source = diff_surface.selection.SourceBasis.init(.{ .range = "compare" }),
+            .source = diff_surface.selection.SourceBasis.init(.{ .range = "review" }),
             .source_session_revision = 1,
             .display = .{ .loaded = content_fingerprint.Fingerprint.init("diff") },
         },
@@ -276,34 +276,34 @@ test "Compare retained selection survives page transitions and clears on reposit
             },
         } },
     };
-    app.pages.compare.pinned_selection_basis = .{
+    app.pages.review.pinned_selection_basis = .{
         .base_oid = .{},
         .head_oid = .{},
         .diff_base_oid = .{},
     };
-    const retained_token = app.pages.compare.completed_selection.?.token;
-    const retained_pin = app.pages.compare.pinned_selection_basis.?;
+    const retained_token = app.pages.review.completed_selection.?.token;
+    const retained_pin = app.pages.review.pinned_selection_basis.?;
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
     try requestPageSwitchForTest(&app, &ctx, .config);
     try std.testing.expectEqual(page.Id.config, app.active_page);
-    try std.testing.expect(app.pages.compare.completed_selection.?.token.eql(retained_token));
-    try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.review.pinned_selection_basis.?.eql(retained_pin));
 
-    try requestPageSwitchForTest(&app, &ctx, .compare);
-    try std.testing.expectEqual(page.Id.compare, app.active_page);
-    try std.testing.expect(app.pages.compare.completed_selection.?.token.eql(retained_token));
-    try std.testing.expect(app.pages.compare.pinned_selection_basis.?.eql(retained_pin));
+    try requestPageSwitchForTest(&app, &ctx, .review);
+    try std.testing.expectEqual(page.Id.review, app.active_page);
+    try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.review.pinned_selection_basis.?.eql(retained_pin));
 
-    // Repository commitment invalidates the complete Compare owner before
+    // Repository commitment invalidates the complete Review owner before
     // page coordination reactivates it. The coordinator must not perform a
     // second candidate-only clear that could preserve a virtual-row ordinal.
-    app.pages.compare.viewer.diff_scroll = 9;
-    app.pages.compare.deinit(allocator);
-    try std.testing.expectEqual(page_coordinator.Intent.compare_refresh, app.controller().acceptedRepositoryChange());
-    try std.testing.expect(app.pages.compare.completed_selection == null);
-    try std.testing.expect(app.pages.compare.pinned_selection_basis == null);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.compare.viewer.diff_scroll);
+    app.pages.review.viewer.diff_scroll = 9;
+    app.pages.review.deinit(allocator);
+    try std.testing.expectEqual(page_coordinator.Intent.review_refresh, app.controller().acceptedRepositoryChange());
+    try std.testing.expect(app.pages.review.completed_selection == null);
+    try std.testing.expect(app.pages.review.pinned_selection_basis == null);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);
 }
 
 test "changes repository transition commit selects exact retained Changes path" {

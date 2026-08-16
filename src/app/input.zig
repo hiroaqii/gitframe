@@ -12,19 +12,19 @@ const key_input = @import("key_input.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const changes_input = @import("pages/changes/input.zig");
-const compare_input = @import("pages/compare/input.zig");
+const review_input = @import("pages/review/input.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_input = @import("pages/repository/input.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
 pub const ChangesContext = changes_input.Context;
-pub const CompareContext = compare_input.Context;
+pub const ReviewContext = review_input.Context;
 
 pub const KeyContext = struct {
     active_page: page.Id = .changes,
     changes: ChangesContext = .{},
-    compare: CompareContext = .{},
+    review: ReviewContext = .{},
     repository: repository_input.Context = .{},
     commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
@@ -104,10 +104,10 @@ pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
 
 fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
-    // Compare base search v1 is key-event-only. The modal owns this event even
+    // Review base search v1 is key-event-only. The modal owns this event even
     // if an underlying diff/file search flag is retained, so pasted bytes can
     // never leak through to that hidden input.
-    if (context.active_page == .compare and context.compare.base_picker_open) return null;
+    if (context.active_page == .review and context.review.base_picker_open) return null;
     if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
         const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
         return translateChangesMsg(changes_msg);
@@ -116,9 +116,9 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         const repository_msg = repository_input.pasteToMsg(repository_page.Msg, context.repository, text) orelse return null;
         return .{ .repository = repository_msg };
     }
-    if (context.active_page == .compare and (context.compare.search_mode or context.compare.file_search_mode)) {
-        const compare_msg = compare_input.pasteToMsg(context.compare, text) orelse return null;
-        return .{ .compare = compare_msg };
+    if (context.active_page == .review and (context.review.search_mode or context.review.file_search_mode)) {
+        const review_msg = review_input.pasteToMsg(context.review, text) orelse return null;
+        return .{ .review = review_msg };
     }
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
@@ -141,11 +141,11 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         const repository_msg = repository_input.keyToMsg(repository_page.Msg, context.repository, key) orelse return null;
         return .{ .repository = repository_msg };
     }
-    if (context.active_page == .compare and
-        (context.compare.search_mode or context.compare.file_search_mode or context.compare.base_picker_open))
+    if (context.active_page == .review and
+        (context.review.search_mode or context.review.file_search_mode or context.review.base_picker_open))
     {
-        const compare_msg = compare_input.keyToMsg(context.compare, key) orelse return null;
-        return .{ .compare = compare_msg };
+        const review_msg = review_input.keyToMsg(context.review, key) orelse return null;
+        return .{ .review = review_msg };
     }
     if (context.repo_picker_mode) return repoPickerKeyToMsg(context, key);
     if (context.help_mode) return helpKeyToMsg(context, key);
@@ -171,9 +171,9 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
             return .{ .repository = repository_msg };
         }
     }
-    if (context.active_page == .compare) {
-        if (compare_input.keyToMsg(context.compare, key)) |compare_msg| {
-            return .{ .compare = compare_msg };
+    if (context.active_page == .review) {
+        if (review_input.keyToMsg(context.review, key)) |review_msg| {
+            return .{ .review = review_msg };
         }
     }
     if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return app_message.Msg.quit;
@@ -183,7 +183,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
 fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     return switch (context.active_page) {
         .changes => translateChangesMsg(changes_input.selectionKeyToMsg(context.changes, key) orelse return null),
-        .compare => .{ .compare = compare_input.selectionKeyToMsg(context.compare, key) orelse return null },
+        .review => .{ .review = review_input.selectionKeyToMsg(context.review, key) orelse return null },
         .repository => .{ .repository = repository_input.selectionKeyToMsg(
             repository_page.Msg,
             context.repository,
@@ -197,7 +197,7 @@ fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
     const bindings = [_]struct { action: keymap.PublicAction, id: page.Id }{
         .{ .action = .page_changes, .id = .changes },
         .{ .action = .page_repository, .id = .repository },
-        .{ .action = .page_compare, .id = .compare },
+        .{ .action = .page_review, .id = .review },
         .{ .action = .page_config, .id = .config },
     };
     for (bindings) |binding| {
@@ -492,10 +492,10 @@ test "root selection preflight preserves modal and configured V precedence" {
     try std.testing.expectEqual(changesMsg(.{ .selection_action = .clear }), keyToMsg(active, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(changesMsg(.scroll_diff_left), keyToMsg(active, .{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(
-        app_message.Msg{ .compare = .{ .shared = .scroll_diff_right } },
+        app_message.Msg{ .review = .{ .shared = .scroll_diff_right } },
         keyToMsg(.{
-            .active_page = .compare,
-            .compare = .{ .focus = .diff, .selection_owner = .keyboard_line },
+            .active_page = .review,
+            .review = .{ .focus = .diff, .selection_owner = .keyboard_line },
         }, .{ .codepoint = chasen.Key.right }).?,
     );
     try std.testing.expectEqual(
@@ -649,8 +649,8 @@ test "root selection preflight consumes document navigation only for live owners
             keyToMsg(.{ .changes = .{ .selection_owner = .mouse } }, key).?,
         );
         try std.testing.expectEqual(
-            app_message.Msg{ .compare = .{ .shared = .selection_owned_noop } },
-            keyToMsg(.{ .active_page = .compare, .compare = .{ .selection_owner = .header } }, key).?,
+            app_message.Msg{ .review = .{ .shared = .selection_owned_noop } },
+            keyToMsg(.{ .active_page = .review, .review = .{ .selection_owner = .header } }, key).?,
         );
         try std.testing.expectEqual(
             app_message.Msg{ .repository = .selection_owned_noop },
@@ -666,10 +666,10 @@ test "root selection preflight consumes document navigation only for live owners
         .keymap = custom,
         .changes = .{ .selection_owner = .mouse, .keymap = custom },
     }, z).?);
-    try std.testing.expectEqual(app_message.Msg{ .compare = .{ .shared = .selection_owned_noop } }, keyToMsg(.{
-        .active_page = .compare,
+    try std.testing.expectEqual(app_message.Msg{ .review = .{ .shared = .selection_owned_noop } }, keyToMsg(.{
+        .active_page = .review,
         .keymap = custom,
-        .compare = .{ .selection_owner = .mouse, .keymap = custom },
+        .review = .{ .selection_owner = .mouse, .keymap = custom },
     }, z).?);
     try std.testing.expectEqual(app_message.Msg{ .repository = .selection_owned_noop }, keyToMsg(.{
         .active_page = .repository,
@@ -678,7 +678,7 @@ test "root selection preflight consumes document navigation only for live owners
     }, z).?);
 
     try std.testing.expect(keyToMsg(.{ .changes = .{ .retained_selection_action_available = true } }, .{ .codepoint = 'g' }) == null);
-    try std.testing.expect(keyToMsg(.{ .active_page = .compare, .compare = .{ .retained_selection_action_available = true } }, .{ .codepoint = 'g' }) == null);
+    try std.testing.expect(keyToMsg(.{ .active_page = .review, .review = .{ .retained_selection_action_available = true } }, .{ .codepoint = 'g' }) == null);
     try std.testing.expectEqual(
         app_message.Msg{ .repository = .source_first },
         keyToMsg(.{ .active_page = .repository, .repository = .{
@@ -766,8 +766,8 @@ test "eventToMsg rejects invalid paste and ignores non-input modes" {
     try std.testing.expect(eventToMsg(.{ .discard_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
     try std.testing.expect(eventToMsg(.{ .amend_confirmation_mode = true }, .{ .paste = "ignored" }) == null);
     try std.testing.expect(eventToMsg(.{
-        .active_page = .compare,
-        .compare = .{
+        .active_page = .review,
+        .review = .{
             .base_picker_open = true,
             .base_picker_query_mode = true,
             .search_mode = true,

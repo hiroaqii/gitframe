@@ -183,25 +183,25 @@ pub const BranchListLoadFinished = struct {
     }
 };
 
-/// One atomically resolved Compare read. Identity and generation remain beside
-/// the owned result until the Compare page accepts or rejects the completion.
-pub const CompareLoadFinished = struct {
+/// One atomically resolved Review read. Identity and generation remain beside
+/// the owned result until the Review page accepts or rejects the completion.
+pub const ReviewLoadFinished = struct {
     identity: page.RequestIdentity,
     generation: u64,
-    result: CompareLoadTaskResult,
+    result: ReviewLoadTaskResult,
 
-    pub fn deinit(self: *CompareLoadFinished, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ReviewLoadFinished, allocator: std.mem.Allocator) void {
         self.result.deinit(allocator);
         self.* = undefined;
     }
 };
 
-pub const CompareBranchListFinished = struct {
+pub const ReviewBranchListFinished = struct {
     identity: page.RequestIdentity,
     generation: u64,
     result: BranchListLoadTaskResult,
 
-    pub fn deinit(self: *CompareBranchListFinished, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ReviewBranchListFinished, allocator: std.mem.Allocator) void {
         self.result.deinit(allocator);
         self.* = undefined;
     }
@@ -227,12 +227,12 @@ pub const ChangesReadFinished = union(enum) {
     }
 };
 
-/// Read results whose acceptance and retained state belong to Compare.
-pub const CompareReadFinished = union(enum) {
-    source: CompareLoadFinished,
-    branch_list: CompareBranchListFinished,
+/// Read results whose acceptance and retained state belong to Review.
+pub const ReviewReadFinished = union(enum) {
+    source: ReviewLoadFinished,
+    branch_list: ReviewBranchListFinished,
 
-    pub fn deinit(self: *CompareReadFinished, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ReviewReadFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
             inline else => |*finished| finished.deinit(allocator),
         }
@@ -272,7 +272,7 @@ pub const CoordinatorReadFinished = union(enum) {
 /// than adding Repository-shaped tags beside Changes tags in App.Msg.
 pub const ReadFinished = union(enum) {
     changes: ChangesReadFinished,
-    compare: CompareReadFinished,
+    review: ReviewReadFinished,
     shell: ShellReadFinished,
     coordinator: CoordinatorReadFinished,
 
@@ -382,13 +382,13 @@ pub const BranchListLoadTaskResult = union(enum) {
     }
 };
 
-/// The diff half of one Compare completion. An empty Git diff is a successful
+/// The diff half of one Review completion. An empty Git diff is a successful
 /// snapshot and therefore stays paired with its resolved basis.
-pub const CompareDiffBundle = union(enum) {
+pub const ReviewDiffBundle = union(enum) {
     empty,
     loaded: LoadedDiffBundle,
 
-    pub fn deinit(self: *CompareDiffBundle) void {
+    pub fn deinit(self: *ReviewDiffBundle) void {
         switch (self.*) {
             .empty => {},
             .loaded => |*bundle| bundle.deinit(),
@@ -397,36 +397,36 @@ pub const CompareDiffBundle = union(enum) {
     }
 };
 
-pub const CompareLoadedBundle = struct {
+pub const ReviewLoadedBundle = struct {
     basis: diff_basis.BranchDiffBasis,
-    diff: CompareDiffBundle,
+    diff: ReviewDiffBundle,
 
-    pub fn deinit(self: *CompareLoadedBundle, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ReviewLoadedBundle, allocator: std.mem.Allocator) void {
         self.basis.deinit(allocator);
         self.diff.deinit();
         self.* = undefined;
     }
 };
 
-pub const CompareBasisFailureResult = struct {
+pub const ReviewBasisFailureResult = struct {
     kind: diff_basis.BasisFailure,
     attempted: diff_basis.BaseTarget,
 
-    pub fn deinit(self: *CompareBasisFailureResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ReviewBasisFailureResult, allocator: std.mem.Allocator) void {
         self.attempted.deinit(allocator);
         self.* = undefined;
     }
 };
 
-pub const CompareLoadTaskResult = union(enum) {
+pub const ReviewLoadTaskResult = union(enum) {
     /// Neutral state used only after an owned member has been moved out.
     empty,
-    loaded: CompareLoadedBundle,
-    basis_failed: CompareBasisFailureResult,
+    loaded: ReviewLoadedBundle,
+    basis_failed: ReviewBasisFailureResult,
     failed: []u8,
     failed_static: []const u8,
 
-    pub fn deinit(self: *CompareLoadTaskResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ReviewLoadTaskResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .empty, .failed_static => {},
             .loaded => |*bundle| bundle.deinit(allocator),
@@ -803,12 +803,12 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
     };
 }
 
-/// Async owner for one Compare snapshot request.
+/// Async owner for one Review snapshot request.
 ///
 /// `init` is the only constructor: it duplicates descriptor authority and
 /// snapshots the controlled Git environment plus the optional user target
 /// before the task can be spawned.
-pub fn CompareLoadTask(comptime Msg: type) type {
+pub fn ReviewLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
         generation: u64,
@@ -839,7 +839,7 @@ pub fn CompareLoadTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runCompareLoad(
+            return task.finish(allocator, runReviewLoad(
                 task.root.dir(),
                 task.target,
                 &task.environment,
@@ -858,12 +858,12 @@ pub fn CompareLoadTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: CompareLoadTaskResult) Msg {
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: ReviewLoadTaskResult) Msg {
             defer {
                 task.deinitOwned(allocator);
                 allocator.destroy(task);
             }
-            return Msg.loadFinished(.{ .compare = .{ .source = CompareLoadFinished{
+            return Msg.loadFinished(.{ .review = .{ .source = ReviewLoadFinished{
                 .identity = task.identity,
                 .generation = task.generation,
                 .result = result,
@@ -878,9 +878,9 @@ pub fn CompareLoadTask(comptime Msg: type) type {
     };
 }
 
-/// Compare-owned asynchronous branch-list read. The task snapshots the
+/// Review-owned asynchronous branch-list read. The task snapshots the
 /// physical repository descriptor before spawn and never reopens cwd text.
-pub fn CompareBranchListLoadTask(comptime Msg: type) type {
+pub fn ReviewBranchListLoadTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
         generation: u64,
@@ -903,7 +903,7 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runCompareBranchListLoad(
+            return task.finish(allocator, runReviewBranchListLoad(
                 task.root.dir(),
                 task.env_map,
                 allocator,
@@ -924,7 +924,7 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
         fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchListLoadTaskResult) Msg {
             defer allocator.destroy(task);
             task.root.deinit();
-            return Msg.loadFinished(.{ .compare = .{ .branch_list = .{
+            return Msg.loadFinished(.{ .review = .{ .branch_list = .{
                 .identity = task.identity,
                 .generation = task.generation,
                 .result = result,
@@ -1341,7 +1341,7 @@ pub fn runBranchListLoad(
     }
 }
 
-pub fn runCompareBranchListLoad(
+pub fn runReviewBranchListLoad(
     cwd: std.Io.Dir,
     env_map: ?*const std.process.Environ.Map,
     allocator: std.mem.Allocator,
@@ -1349,8 +1349,8 @@ pub fn runCompareBranchListLoad(
 ) BranchListLoadTaskResult {
     var environment = git_command.LocalGitEnvironment.initFromParent(allocator, env_map) catch |err| {
         return .{
-            .failed = std.fmt.allocPrint(allocator, "Compare base list failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Compare base list failed: OutOfMemory" },
+            .failed = std.fmt.allocPrint(allocator, "Review base list failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Review base list failed: OutOfMemory" },
         };
     };
     defer environment.deinit();
@@ -1360,8 +1360,8 @@ pub fn runCompareBranchListLoad(
         .include_tip_committer_unix = true,
     }) catch |err| {
         return .{
-            .failed = std.fmt.allocPrint(allocator, "Compare base list failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Compare base list failed: OutOfMemory" },
+            .failed = std.fmt.allocPrint(allocator, "Review base list failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Review base list failed: OutOfMemory" },
         };
     };
 
@@ -1372,15 +1372,15 @@ pub fn runCompareBranchListLoad(
     };
 }
 
-/// Run the single structured Compare domain operation and translate its raw
+/// Run the single structured Review domain operation and translate its raw
 /// owned values into the page-independent, validated diff-basis vocabulary.
-pub fn runCompareLoad(
+pub fn runReviewLoad(
     cwd: std.Io.Dir,
     target: ?diff_basis.BaseTarget,
     environment: *const git_command.LocalGitEnvironment,
     allocator: std.mem.Allocator,
     io: std.Io,
-) CompareLoadTaskResult {
+) ReviewLoadTaskResult {
     var raw = git_compare.loadCompareSnapshot(allocator, io, .{
         .cwd = cwd,
         .environment = environment,
@@ -1390,54 +1390,54 @@ pub fn runCompareLoad(
             .kind = value.kind,
         } else null,
     }) catch |err| {
-        return compareLoadError(allocator, "Compare load failed", err);
+        return reviewLoadError(allocator, "Review load failed", err);
     };
     defer raw.deinit(allocator);
 
     return switch (raw) {
-        .snapshot => |snapshot| translateCompareSnapshot(allocator, io, snapshot),
-        .basis_failed => |failure| translateCompareBasisFailure(allocator, failure.kind, failure.attempted),
-        .failed => |message| duplicateCompareFailure(allocator, message),
+        .snapshot => |snapshot| translateReviewSnapshot(allocator, io, snapshot),
+        .basis_failed => |failure| translateReviewBasisFailure(allocator, failure.kind, failure.attempted),
+        .failed => |message| duplicateReviewFailure(allocator, message),
         .failed_static => |message| .{ .failed_static = message },
     };
 }
 
-fn translateCompareSnapshot(
+fn translateReviewSnapshot(
     allocator: std.mem.Allocator,
     io: std.Io,
     snapshot: git_compare.CompareSnapshot,
-) CompareLoadTaskResult {
-    const base_oid = parseCompareOid(snapshot.base_oid) orelse
-        return .{ .failed_static = "Compare load returned an invalid base oid" };
-    const head_oid = parseCompareOid(snapshot.head_oid) orelse
-        return .{ .failed_static = "Compare load returned an invalid head oid" };
-    const merge_base_oid = parseCompareOid(snapshot.merge_base_oid) orelse
-        return .{ .failed_static = "Compare load returned an invalid merge-base oid" };
-    const ahead_count = parseCompareAheadCount(snapshot.ahead_count) orelse
-        return .{ .failed_static = "Compare load returned an invalid ahead count" };
+) ReviewLoadTaskResult {
+    const base_oid = parseReviewOid(snapshot.base_oid) orelse
+        return .{ .failed_static = "Review load returned an invalid base oid" };
+    const head_oid = parseReviewOid(snapshot.head_oid) orelse
+        return .{ .failed_static = "Review load returned an invalid head oid" };
+    const merge_base_oid = parseReviewOid(snapshot.merge_base_oid) orelse
+        return .{ .failed_static = "Review load returned an invalid merge-base oid" };
+    const ahead_count = parseReviewAheadCount(snapshot.ahead_count) orelse
+        return .{ .failed_static = "Review load returned an invalid ahead count" };
 
-    var diff: CompareDiffBundle = if (snapshot.diff.len == 0)
+    var diff: ReviewDiffBundle = if (snapshot.diff.len == 0)
         .empty
     else
         .{ .loaded = buildLoadedBundleWithIo(allocator, io, snapshot.diff) catch |err| {
-            return compareLoadError(allocator, "Compare diff parse failed", err);
+            return reviewLoadError(allocator, "Review diff parse failed", err);
         } };
     var diff_owned = true;
     defer if (diff_owned) diff.deinit();
 
     const full_ref = allocator.dupe(u8, snapshot.target.full_ref) catch
-        return .{ .failed_static = "Compare load failed: OutOfMemory" };
+        return .{ .failed_static = "Review load failed: OutOfMemory" };
     var full_ref_owned = true;
     defer if (full_ref_owned) allocator.free(full_ref);
     const display_name = allocator.dupe(u8, snapshot.target.display_name) catch
-        return .{ .failed_static = "Compare load failed: OutOfMemory" };
+        return .{ .failed_static = "Review load failed: OutOfMemory" };
     var display_name_owned = true;
     defer if (display_name_owned) allocator.free(display_name);
     const head_display = if (snapshot.head_name) |name|
-        allocator.dupe(u8, name) catch return .{ .failed_static = "Compare load failed: OutOfMemory" }
+        allocator.dupe(u8, name) catch return .{ .failed_static = "Review load failed: OutOfMemory" }
     else
         std.fmt.allocPrint(allocator, "HEAD@{s}", .{head_oid.short()}) catch
-            return .{ .failed_static = "Compare load failed: OutOfMemory" };
+            return .{ .failed_static = "Review load failed: OutOfMemory" };
 
     diff_owned = false;
     full_ref_owned = false;
@@ -1460,17 +1460,17 @@ fn translateCompareSnapshot(
     } };
 }
 
-fn translateCompareBasisFailure(
+fn translateReviewBasisFailure(
     allocator: std.mem.Allocator,
     kind: git_compare.CompareBasisFailure,
     attempted: git_compare.CompareTarget,
-) CompareLoadTaskResult {
+) ReviewLoadTaskResult {
     const full_ref = allocator.dupe(u8, attempted.full_ref) catch
-        return .{ .failed_static = "Compare load failed: OutOfMemory" };
+        return .{ .failed_static = "Review load failed: OutOfMemory" };
     var full_ref_owned = true;
     defer if (full_ref_owned) allocator.free(full_ref);
     const display_name = allocator.dupe(u8, attempted.display_name) catch
-        return .{ .failed_static = "Compare load failed: OutOfMemory" };
+        return .{ .failed_static = "Review load failed: OutOfMemory" };
     full_ref_owned = false;
     return .{ .basis_failed = .{
         .kind = switch (kind) {
@@ -1486,21 +1486,21 @@ fn translateCompareBasisFailure(
     } };
 }
 
-fn duplicateCompareFailure(allocator: std.mem.Allocator, message: []const u8) CompareLoadTaskResult {
+fn duplicateReviewFailure(allocator: std.mem.Allocator, message: []const u8) ReviewLoadTaskResult {
     return .{
         .failed = allocator.dupe(u8, message) catch
-            return .{ .failed_static = "Compare load failed: OutOfMemory" },
+            return .{ .failed_static = "Review load failed: OutOfMemory" },
     };
 }
 
-fn compareLoadError(allocator: std.mem.Allocator, prefix: []const u8, err: anyerror) CompareLoadTaskResult {
+fn reviewLoadError(allocator: std.mem.Allocator, prefix: []const u8, err: anyerror) ReviewLoadTaskResult {
     return .{
         .failed = std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, @errorName(err) }) catch
-            return .{ .failed_static = "Compare load failed: OutOfMemory" },
+            return .{ .failed_static = "Review load failed: OutOfMemory" },
     };
 }
 
-pub fn parseCompareOid(text: []const u8) ?diff_basis.Oid {
+pub fn parseReviewOid(text: []const u8) ?diff_basis.Oid {
     if (text.len != 40 and text.len != 64) return null;
     for (text) |byte| if (!std.ascii.isHex(byte)) return null;
     var oid: diff_basis.Oid = .{};
@@ -1509,7 +1509,7 @@ pub fn parseCompareOid(text: []const u8) ?diff_basis.Oid {
     return oid;
 }
 
-pub fn parseCompareAheadCount(text: []const u8) ?usize {
+pub fn parseReviewAheadCount(text: []const u8) ?usize {
     if (text.len == 0) return null;
     for (text) |byte| if (!std.ascii.isDigit(byte)) return null;
     return std.fmt.parseInt(usize, text, 10) catch null;
@@ -3228,21 +3228,21 @@ fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
     return error.GitCommandFailed;
 }
 
-test "Compare oid and ahead parsers reject malformed backend output" {
+test "Review oid and ahead parsers reject malformed backend output" {
     const sha1 = "0123456789abcdef0123456789abcdef01234567";
     const sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    try std.testing.expectEqualStrings(sha1, parseCompareOid(sha1).?.slice());
-    try std.testing.expectEqualStrings(sha256, parseCompareOid(sha256).?.slice());
-    try std.testing.expect(parseCompareOid("0123456") == null);
-    try std.testing.expect(parseCompareOid("z123456789abcdef0123456789abcdef01234567") == null);
-    try std.testing.expectEqual(@as(?usize, 42), parseCompareAheadCount("42"));
-    try std.testing.expect(parseCompareAheadCount("") == null);
-    try std.testing.expect(parseCompareAheadCount(" 42") == null);
-    try std.testing.expect(parseCompareAheadCount("42\n") == null);
-    try std.testing.expect(parseCompareAheadCount("+42") == null);
+    try std.testing.expectEqualStrings(sha1, parseReviewOid(sha1).?.slice());
+    try std.testing.expectEqualStrings(sha256, parseReviewOid(sha256).?.slice());
+    try std.testing.expect(parseReviewOid("0123456") == null);
+    try std.testing.expect(parseReviewOid("z123456789abcdef0123456789abcdef01234567") == null);
+    try std.testing.expectEqual(@as(?usize, 42), parseReviewAheadCount("42"));
+    try std.testing.expect(parseReviewAheadCount("") == null);
+    try std.testing.expect(parseReviewAheadCount(" 42") == null);
+    try std.testing.expect(parseReviewAheadCount("42\n") == null);
+    try std.testing.expect(parseReviewAheadCount("+42") == null);
 }
 
-test "runCompareLoad returns an atomic validated basis and diff bundle" {
+test "runReviewLoad returns an atomic validated basis and diff bundle" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3260,7 +3260,7 @@ test "runCompareLoad returns an atomic validated basis and diff bundle" {
     try runTestGit(io, &.{ "git", "add", "feature.txt" }, tmp.dir);
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "feature" }, tmp.dir);
 
-    var result = runCompareLoad(tmp.dir, .{
+    var result = runReviewLoad(tmp.dir, .{
         .full_ref = @constCast("refs/heads/main"),
         .display_name = @constCast("main"),
         .kind = .local,
@@ -3273,11 +3273,11 @@ test "runCompareLoad returns an atomic validated basis and diff bundle" {
             try std.testing.expectEqual(@as(usize, 1), bundle.basis.ahead_count);
             try std.testing.expect(bundle.diff == .loaded);
         },
-        else => return error.ExpectedCompareLoad,
+        else => return error.ExpectedReviewLoad,
     }
 }
 
-test "runCompareLoad treats empty diff as success and labels detached head" {
+test "runReviewLoad treats empty diff as success and labels detached head" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3292,7 +3292,7 @@ test "runCompareLoad treats empty diff as success and labels detached head" {
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, tmp.dir);
     try runTestGit(io, &.{ "git", "switch", "--detach", "HEAD" }, tmp.dir);
 
-    var result = runCompareLoad(tmp.dir, null, &environment, allocator, io);
+    var result = runReviewLoad(tmp.dir, null, &environment, allocator, io);
     defer result.deinit(allocator);
     switch (result) {
         .loaded => |bundle| {
@@ -3300,11 +3300,11 @@ test "runCompareLoad treats empty diff as success and labels detached head" {
             try std.testing.expectEqual(@as(usize, 0), bundle.basis.ahead_count);
             try std.testing.expect(bundle.diff == .empty);
         },
-        else => return error.ExpectedEmptyCompareLoad,
+        else => return error.ExpectedEmptyReviewLoad,
     }
 }
 
-test "CompareLoadTask owns cloned target and routes failed terminal to Compare" {
+test "ReviewLoadTask owns cloned target and routes failed terminal to Review" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const TestMsg = union(enum) {
         load: ReadFinished,
@@ -3313,7 +3313,7 @@ test "CompareLoadTask owns cloned target and routes failed terminal to Compare" 
             return .{ .load = msg };
         }
     };
-    const Task = CompareLoadTask(TestMsg);
+    const Task = ReviewLoadTask(TestMsg);
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3330,18 +3330,18 @@ test "CompareLoadTask owns cloned target and routes failed terminal to Compare" 
     defer target.deinit(allocator);
 
     const task = try allocator.create(Task);
-    task.* = try Task.init(page.RequestIdentity.compare(9, 4), 17, root, target, null, allocator);
+    task.* = try Task.init(page.RequestIdentity.review(9, 4), 17, root, target, null, allocator);
     try std.testing.expect(task.target.?.full_ref.ptr != target.full_ref.ptr);
     const message = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
     var finished = switch (message.load) {
-        .compare => |compare| switch (compare) {
+        .review => |review| switch (review) {
             .source => |payload| payload,
             .branch_list => return error.UnexpectedReadRoute,
         },
         else => return error.UnexpectedReadRoute,
     };
     defer finished.deinit(allocator);
-    try std.testing.expectEqual(page.RequestIdentity.compare(9, 4), finished.identity);
+    try std.testing.expectEqual(page.RequestIdentity.review(9, 4), finished.identity);
     try std.testing.expectEqual(@as(u64, 17), finished.generation);
     try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
         .failed_static => |value| value,
@@ -3349,7 +3349,7 @@ test "CompareLoadTask owns cloned target and routes failed terminal to Compare" 
     });
 }
 
-test "CompareLoadTask destroy releases cloned spawn payload" {
+test "ReviewLoadTask destroy releases cloned spawn payload" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const TestMsg = union(enum) {
         load: ReadFinished,
@@ -3358,7 +3358,7 @@ test "CompareLoadTask destroy releases cloned spawn payload" {
             return .{ .load = msg };
         }
     };
-    const Task = CompareLoadTask(TestMsg);
+    const Task = ReviewLoadTask(TestMsg);
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3375,11 +3375,11 @@ test "CompareLoadTask destroy releases cloned spawn payload" {
     defer target.deinit(allocator);
 
     const task = try allocator.create(Task);
-    task.* = try Task.init(page.RequestIdentity.compare(1, 1), 1, root, target, null, allocator);
+    task.* = try Task.init(page.RequestIdentity.review(1, 1), 1, root, target, null, allocator);
     Task.destroy(task, allocator);
 }
 
-test "CompareBranchListLoadTask routes its terminal and destroy closes descriptor ownership" {
+test "ReviewBranchListLoadTask routes its terminal and destroy closes descriptor ownership" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const TestMsg = union(enum) {
         load: ReadFinished,
@@ -3388,7 +3388,7 @@ test "CompareBranchListLoadTask routes its terminal and destroy closes descripto
             return .{ .load = msg };
         }
     };
-    const Task = CompareBranchListLoadTask(TestMsg);
+    const Task = ReviewBranchListLoadTask(TestMsg);
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3399,17 +3399,17 @@ test "CompareBranchListLoadTask routes its terminal and destroy closes descripto
     defer root.deinit();
 
     const terminal_task = try allocator.create(Task);
-    terminal_task.* = try Task.init(page.RequestIdentity.compare(7, 8), 9, root, null);
+    terminal_task.* = try Task.init(page.RequestIdentity.review(7, 8), 9, root, null);
     const message = Task.failed(terminal_task, .{ .start_failed = "SystemResources" }, allocator);
     var finished = switch (message.load) {
-        .compare => |compare| switch (compare) {
+        .review => |review| switch (review) {
             .branch_list => |payload| payload,
             .source => return error.UnexpectedReadRoute,
         },
         else => return error.UnexpectedReadRoute,
     };
     defer finished.deinit(allocator);
-    try std.testing.expectEqual(page.RequestIdentity.compare(7, 8), finished.identity);
+    try std.testing.expectEqual(page.RequestIdentity.review(7, 8), finished.identity);
     try std.testing.expectEqual(@as(u64, 9), finished.generation);
     try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
         .failed_static => |value| value,
@@ -3417,11 +3417,11 @@ test "CompareBranchListLoadTask routes its terminal and destroy closes descripto
     });
 
     const destroyed_task = try allocator.create(Task);
-    destroyed_task.* = try Task.init(page.RequestIdentity.compare(1, 2), 3, root, null);
+    destroyed_task.* = try Task.init(page.RequestIdentity.review(1, 2), 3, root, null);
     Task.destroy(destroyed_task, allocator);
 }
 
-test "CompareBranchListLoadTask keeps physical root and controlled environment after path replacement" {
+test "ReviewBranchListLoadTask keeps physical root and controlled environment after path replacement" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const TestMsg = union(enum) {
         load: ReadFinished,
@@ -3430,7 +3430,7 @@ test "CompareBranchListLoadTask keeps physical root and controlled environment a
             return .{ .load = msg };
         }
     };
-    const Task = CompareBranchListLoadTask(TestMsg);
+    const Task = ReviewBranchListLoadTask(TestMsg);
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3451,7 +3451,7 @@ test "CompareBranchListLoadTask keeps physical root and controlled environment a
     try injected_env.put("GIT_DIR", "/definitely/not/the/pinned/repository");
 
     const task = try allocator.create(Task);
-    task.* = try Task.init(page.RequestIdentity.compare(2, 3), 4, root, &injected_env);
+    task.* = try Task.init(page.RequestIdentity.review(2, 3), 4, root, &injected_env);
     try tmp.dir.rename("repo", tmp.dir, "pinned-repo", io);
     try tmp.dir.createDir(io, "repo", .default_dir);
     var replacement = try tmp.dir.openDir(io, "repo", .{});
@@ -3460,7 +3460,7 @@ test "CompareBranchListLoadTask keeps physical root and controlled environment a
 
     const message = Task.run(task, allocator, io);
     var finished = switch (message.load) {
-        .compare => |compare| switch (compare) {
+        .review => |review| switch (review) {
             .branch_list => |payload| payload,
             .source => return error.UnexpectedReadRoute,
         },
@@ -3481,7 +3481,7 @@ test "CompareBranchListLoadTask keeps physical root and controlled environment a
     try std.testing.expect(found_pinned);
 }
 
-test "Compare task translation keeps basis failure kinds and attempted target" {
+test "Review task translation keeps basis failure kinds and attempted target" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
         backend: git_compare.CompareBasisFailure,
@@ -3492,7 +3492,7 @@ test "Compare task translation keeps basis failure kinds and attempted target" {
         .{ .backend = .head_unresolved, .expected = .head_unresolved },
     };
     for (cases) |case| {
-        var result = translateCompareBasisFailure(allocator, case.backend, .{
+        var result = translateReviewBasisFailure(allocator, case.backend, .{
             .full_ref = @constCast("refs/heads/base"),
             .display_name = @constCast("base"),
             .kind = .local,
@@ -3508,7 +3508,7 @@ test "Compare task translation keeps basis failure kinds and attempted target" {
     }
 }
 
-test "runCompareLoad separates process failure from basis failure" {
+test "runReviewLoad separates process failure from basis failure" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
@@ -3516,7 +3516,7 @@ test "runCompareLoad separates process failure from basis failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = ".git", .data = "invalid gitfile\n" });
-    var result = runCompareLoad(tmp.dir, .{
+    var result = runReviewLoad(tmp.dir, .{
         .full_ref = @constCast("refs/heads/main"),
         .display_name = @constCast("main"),
         .kind = .local,
@@ -3525,7 +3525,7 @@ test "runCompareLoad separates process failure from basis failure" {
     try std.testing.expect(result == .failed or result == .failed_static);
 }
 
-test "CompareLoadTask duplicate retains physical root after path replacement" {
+test "ReviewLoadTask duplicate retains physical root after path replacement" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const TestMsg = union(enum) {
         load: ReadFinished,
@@ -3534,7 +3534,7 @@ test "CompareLoadTask duplicate retains physical root after path replacement" {
             return .{ .load = msg };
         }
     };
-    const Task = CompareLoadTask(TestMsg);
+    const Task = ReviewLoadTask(TestMsg);
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3560,7 +3560,7 @@ test "CompareLoadTask duplicate retains physical root after path replacement" {
     try parent_env.put("GIT_DIR", "/definitely/not/the/pinned/repository");
 
     const task = try allocator.create(Task);
-    task.* = try Task.init(page.RequestIdentity.compare(2, 3), 1, root, null, &parent_env, allocator);
+    task.* = try Task.init(page.RequestIdentity.review(2, 3), 1, root, null, &parent_env, allocator);
     try std.testing.expectEqualStrings("queue-time", task.environment.map.get("UTSUWA_COMPARE_CANARY").?);
     try std.testing.expect(task.environment.map.get("GIT_DIR") == null);
     try std.testing.expect(parent_env.get("GIT_DIR") != null);
@@ -3574,7 +3574,7 @@ test "CompareLoadTask duplicate retains physical root after path replacement" {
 
     const message = Task.run(task, allocator, io);
     var finished = switch (message.load) {
-        .compare => |compare| switch (compare) {
+        .review => |review| switch (review) {
             .source => |payload| payload,
             .branch_list => return error.UnexpectedReadRoute,
         },

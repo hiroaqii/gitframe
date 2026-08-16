@@ -87,7 +87,7 @@ test "Repository drag auto-scroll coordinator transfers terminal only for active
     try std.testing.expectEqual(drag_auto_scroll.StepOutcome.stale_owner, active.auto_scroll.?);
     try std.testing.expectEqual(repository_coordinator.Redraw.default, active.redraw);
 
-    app.active_page = .compare;
+    app.active_page = .review;
     var inactive = app.controller().update(&ctx, step);
     defer inactive.deinit(allocator);
     try std.testing.expect(inactive.auto_scroll == null);
@@ -392,7 +392,7 @@ test "Repository page header unchanged branch completion redraws fresh terminal"
     var inactive_request = try app.pages.repository.prepareBranchRequest(allocator, root_path, &app.repo_session.repo_state.root.?);
     defer inactive_request.deinit(allocator);
     app.pages.repository.deactivate();
-    app.active_page = .compare;
+    app.active_page = .review;
     app.redraw_plan = .{};
     updateRepositoryForTest(&app, &ctx, .{ .branch_finished = .{
         .identity = inactive_request.identity,

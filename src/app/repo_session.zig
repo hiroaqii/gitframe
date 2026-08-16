@@ -19,7 +19,7 @@ const changes_repository_session = @import("pages/changes/repository_session.zig
 const changes_navigation = if (builtin.is_test) @import("pages/changes/navigation.zig") else struct {};
 const changes_page = if (builtin.is_test) @import("pages/changes.zig") else struct {};
 const changes_reload = if (builtin.is_test) @import("pages/changes/reload.zig") else struct {};
-const compare_page = @import("pages/compare.zig");
+const review_page = @import("pages/review.zig");
 const repository_page = @import("pages/repository.zig");
 const discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
@@ -196,11 +196,11 @@ pub const RepositoryInvalidationPort = struct {
     }
 };
 
-/// Narrow Compare capability used only to discard state tied to the old repo.
-pub const CompareInvalidationPort = struct {
-    page: *compare_page.ComparePageState,
+/// Narrow Review capability used only to discard state tied to the old repo.
+pub const ReviewInvalidationPort = struct {
+    page: *review_page.ReviewPageState,
 
-    fn invalidateBeforeReplacement(self: CompareInvalidationPort, allocator: std.mem.Allocator) void {
+    fn invalidateBeforeReplacement(self: ReviewInvalidationPort, allocator: std.mem.Allocator) void {
         self.page.deinit(allocator);
     }
 };
@@ -215,7 +215,7 @@ pub const Controller = struct {
     action_pending: bool,
     changes: changes_repository_session.Controller,
     repository: RepositoryInvalidationPort,
-    compare: CompareInvalidationPort,
+    review: ReviewInvalidationPort,
     shell: remote_state.RepositoryInvalidationPort,
 
     fn view(self: Controller) View {
@@ -303,7 +303,7 @@ pub const Controller = struct {
             const next_epoch = nextEpoch(self.state.repo_epoch);
             self.shell.invalidateBeforeRepositoryReplacement(allocator);
             self.changes.invalidateBeforeReplacement(allocator);
-            self.compare.invalidateBeforeReplacement(allocator);
+            self.review.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(
                 allocator,
                 next_epoch,
@@ -385,7 +385,7 @@ pub const Controller = struct {
             const next_epoch = nextEpoch(self.state.repo_epoch);
             self.shell.invalidateBeforeRepositoryReplacement(allocator);
             self.changes.invalidateBeforeReplacement(allocator);
-            self.compare.invalidateBeforeReplacement(allocator);
+            self.review.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(allocator, next_epoch, prepared.candidate.?.identity);
             self.state.repo_epoch = next_epoch;
             const committed = prepared.candidate.?;
@@ -920,7 +920,7 @@ fn expandUserPath(allocator: std.mem.Allocator, path: []const u8, home: ?[]const
 const RepoSessionTestPages = struct {
     changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
-    compare: compare_page.ComparePageState = .{},
+    review: review_page.ReviewPageState = .{},
 };
 
 /// Exact test assembly for this owner. It mirrors the root's short-lived
@@ -989,7 +989,7 @@ const RepoSessionTestApp = struct {
                 .reload = self.changesReload(),
             },
             .repository = .{ .page = &self.pages.repository },
-            .compare = .{ .page = &self.pages.compare },
+            .review = .{ .page = &self.pages.review },
             .shell = self.remote.repositoryInvalidationPort(&self.overlay),
         };
     }

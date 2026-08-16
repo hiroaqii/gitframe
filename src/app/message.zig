@@ -8,7 +8,7 @@ const actions = @import("actions.zig");
 const load = @import("load.zig");
 const page = @import("page.zig");
 const push_retry = @import("push_retry.zig");
-const compare_input = @import("pages/compare/input.zig");
+const review_input = @import("pages/review/input.zig");
 const diff_surface = @import("diff_surface.zig");
 const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const repository_page = @import("pages/repository.zig");
@@ -59,7 +59,7 @@ pub const ShellEffectFinished = union(enum) {
 
 pub const MouseSelectionTarget = union(enum) {
     changes: ?changes_message.MousePoint,
-    compare: ?diff_surface.MousePoint,
+    review: ?diff_surface.MousePoint,
     repository: ?repository_layout.BodyPoint,
 };
 
@@ -79,7 +79,7 @@ pub const Msg = union(enum) {
     push_upstream_finalize_finished: push_retry.FinalizeFinished,
     shell_effect_finished: ShellEffectFinished,
     changes: changes_message.Msg,
-    compare: compare_input.Msg,
+    review: review_input.Msg,
     repository: repository_page.Msg,
     mouse_selection_drag: MouseSelectionContinuation,
     mouse_selection_release: MouseSelectionContinuation,
@@ -326,8 +326,8 @@ test "undelivered remaining read routes release owned payloads" {
     } } });
     branch_list_msg.deinitUndelivered(allocator);
 
-    var compare_msg = Msg.loadFinished(.{ .compare = .{ .source = .{
-        .identity = page.RequestIdentity.compare(3, 5),
+    var review_msg = Msg.loadFinished(.{ .review = .{ .source = .{
+        .identity = page.RequestIdentity.review(3, 5),
         .generation = 4,
         .result = .{ .loaded = .{
             .basis = .{
@@ -345,7 +345,7 @@ test "undelivered remaining read routes release owned payloads" {
             .diff = .empty,
         } },
     } } });
-    compare_msg.deinitUndelivered(allocator);
+    review_msg.deinitUndelivered(allocator);
 }
 
 test "undelivered plain root message is a no-op" {

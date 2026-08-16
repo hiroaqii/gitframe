@@ -16,10 +16,10 @@ const page = @import("app/page.zig");
 const page_coordinator = @import("app/page_coordinator.zig");
 const shell_input = @import("app/shell_input.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
-const compare_page = @import("app/pages/compare.zig");
-const compare_coordinator = @import("app/pages/compare/coordinator.zig");
-const compare_input = @import("app/pages/compare/input.zig");
-const compare_navigation = @import("app/pages/compare/navigation.zig");
+const review_page = @import("app/pages/review.zig");
+const review_coordinator = @import("app/pages/review/coordinator.zig");
+const review_input = @import("app/pages/review/input.zig");
+const review_navigation = @import("app/pages/review/navigation.zig");
 const changes_page = @import("app/pages/changes.zig");
 const changes_content = @import("app/pages/changes/content.zig");
 const changes_action_fence = @import("app/pages/changes/action_fence.zig");
@@ -60,7 +60,7 @@ const ShellEffectFinishedMsg = app_message.ShellEffectFinished;
 const PageStates = struct {
     changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
-    compare: compare_page.ComparePageState = .{},
+    review: review_page.ReviewPageState = .{},
     config: page.LazyPlaceholder = .{},
 };
 
@@ -138,7 +138,7 @@ pub const App = struct {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.pages.changes.deinit(deinit_ctx.allocator);
         self.pages.repository.deinit(deinit_ctx.allocator);
-        self.pages.compare.deinit(deinit_ctx.allocator);
+        self.pages.review.deinit(deinit_ctx.allocator);
         self.repo_session.deinit(deinit_ctx.allocator);
         self.local_workflow.deinit(deinit_ctx.allocator);
         self.remote_workflow.deinit(deinit_ctx.allocator);
@@ -164,7 +164,7 @@ pub const App = struct {
             .action_pending = self.actionLifecycleView().hasPending(),
             .changes = self.changesRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
-            .compare = .{ .page = &self.pages.compare },
+            .review = .{ .page = &self.pages.review },
             .shell = self.remote_workflow.repositoryInvalidationPort(&self.overlay),
         };
     }
@@ -179,13 +179,13 @@ pub const App = struct {
         };
     }
 
-    fn compareCoordinator(self: *App) compare_coordinator.Controller {
+    fn reviewCoordinator(self: *App) review_coordinator.Controller {
         const body_size = self.shellLayout().bodySize();
         return .{
-            .page_state = &self.pages.compare,
+            .page_state = &self.pages.review,
             .repo = self.repoSessionView(),
             .layout = .{ .width = body_size.width, .height = body_size.height },
-            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
             .env_map = self.env_map,
         };
     }
@@ -195,7 +195,7 @@ pub const App = struct {
             .active_page = &self.active_page,
             .changes = &self.pages.changes,
             .repository = &self.pages.repository,
-            .compare = &self.pages.compare,
+            .review = &self.pages.review,
             .config_page = &self.pages.config,
             .repo = self.repoSessionView(),
             .source = self.config.source,
@@ -225,7 +225,7 @@ pub const App = struct {
             .none => {},
             .changes_revalidation => try self.changesRead().requestRevalidation(ctx),
             .changes_repository_changed => try self.changesRead().startDiffLoad(ctx, .repo_switch),
-            .compare_refresh => try self.compareCoordinator().refresh(ctx),
+            .review_refresh => try self.reviewCoordinator().refresh(ctx),
         }
     }
 
@@ -262,9 +262,9 @@ pub const App = struct {
     fn displayModeToggleHintWidth(self: *const App, target: page.Id) u16 {
         const reachable = switch (target) {
             .changes => !self.pages.changes.search.mode and !self.pages.changes.file_search.mode,
-            .compare => !self.pages.compare.search.mode and
-                !self.pages.compare.file_search.mode and
-                !self.pages.compare.base_picker.open,
+            .review => !self.pages.review.search.mode and
+                !self.pages.review.file_search.mode and
+                !self.pages.review.base_picker.open,
             .repository, .config => false,
         };
         if (!reachable) return 0;
@@ -371,20 +371,20 @@ pub const App = struct {
     fn shellEffectOrigins(self: *const App) shell_effects.OriginContext {
         const repo_epoch = self.repoSessionView().epoch();
         const changes_identity = self.pages.changes.activation.currentIdentity();
-        const compare_identity = self.pages.compare.activation.currentIdentity();
+        const review_identity = self.pages.review.activation.currentIdentity();
         return .{
             .snapshot = .{
                 .active_page = self.active_page,
                 .repo_epoch = repo_epoch,
                 .changes_activation_id = self.pages.changes.activation.next_activation_id,
                 .repository_activation_id = self.pages.repository.activation_id,
-                .compare_activation_id = self.pages.compare.activation.next_activation_id,
+                .review_activation_id = self.pages.review.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = self.localWorkflowView().commitPanelInstanceId(),
             },
             .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
-            .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
+            .review_repo_epoch = if (review_identity) |identity| identity.repo_epoch else repo_epoch,
         };
     }
 
@@ -398,7 +398,7 @@ pub const App = struct {
                 .shell = &self.status,
                 .changes = &self.pages.changes.status,
                 .repository = &self.pages.repository.status,
-                .compare = &self.pages.compare.status,
+                .review = &self.pages.review.status,
             },
             .redraw = .{ .skip_requested = &self.redraw_plan.skip_requested },
         };
@@ -454,19 +454,19 @@ pub const App = struct {
                 self.drag_auto_scroll.clear();
                 const changes_selection_anchor = self.changesNavigation().captureSelectionViewportAnchor();
                 self.changesNavigation().clearMouseDiffSelection();
-                const previous_compare_view = self.compareCoordinator().navigationView();
-                var previous_compare_adapter = previous_compare_view.resolver();
-                const previous_compare_body = previous_compare_view.bodyView(&previous_compare_adapter);
-                const compare_selection_anchor = previous_compare_body.captureSelectionViewportAnchor();
-                if (self.pages.compare.selection_owner.activeMouseSelection()) {
-                    self.pages.compare.selection_owner = .none;
+                const previous_review_view = self.reviewCoordinator().navigationView();
+                var previous_review_adapter = previous_review_view.resolver();
+                const previous_review_body = previous_review_view.bodyView(&previous_review_adapter);
+                const review_selection_anchor = previous_review_body.captureSelectionViewportAnchor();
+                if (self.pages.review.selection_owner.activeMouseSelection()) {
+                    self.pages.review.selection_owner = .none;
                 }
                 const repository_selection_anchor = self.pages.repository.captureSelectionViewportAnchor();
                 self.pages.repository.cancelMouseOwner();
                 const previous_width = self.changesNavigationView().diffPaneWidth();
                 const previous_mode = self.changesNavigationView().effectiveDisplayMode();
-                const previous_compare_width = previous_compare_body.view.diffPaneWidth();
-                const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
+                const previous_review_width = previous_review_body.view.diffPaneWidth();
+                const previous_review_mode = previous_review_body.view.effectiveDisplayMode();
                 self.terminal_size = size;
                 self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
@@ -479,20 +479,20 @@ pub const App = struct {
                 self.changesNavigation().updateSearchMatchOffset();
                 self.changesNavigation().scrollSearchMatchIntoView();
                 self.changesNavigation().clampDiffNavigation();
-                const compare_controller = self.compareCoordinator().navigation();
-                var compare_adapter = compare_controller.updateAdapter();
-                var compare_body = compare_adapter.bodyController();
-                compare_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_compare_width);
-                if (previous_compare_mode != compare_body.controller.view().effectiveDisplayMode()) {
-                    compare_body.controller.clearMouseDiffSelection();
-                    self.pages.compare.advanceSelectionLayoutRevision();
+                const review_controller = self.reviewCoordinator().navigation();
+                var review_adapter = review_controller.updateAdapter();
+                var review_body = review_adapter.bodyController();
+                review_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_review_width);
+                if (previous_review_mode != review_body.controller.view().effectiveDisplayMode()) {
+                    review_body.controller.clearMouseDiffSelection();
+                    self.pages.review.advanceSelectionLayoutRevision();
                 }
-                if (compare_selection_anchor) |anchor| compare_body.restoreSelectionViewportAnchor(anchor);
-                compare_body.controller.clampSidebarHorizontalScroll();
-                compare_body.clampDiffNavigationKeepingHunkVisible();
-                compare_body.updateSearchMatchOffset();
-                compare_body.controller.scrollSearchMatchIntoView();
-                compare_body.clampDiffNavigation();
+                if (review_selection_anchor) |anchor| review_body.restoreSelectionViewportAnchor(anchor);
+                review_body.controller.clampSidebarHorizontalScroll();
+                review_body.clampDiffNavigationKeepingHunkVisible();
+                review_body.updateSearchMatchOffset();
+                review_body.controller.scrollSearchMatchIntoView();
+                review_body.clampDiffNavigation();
                 const repository_body_size = self.shellLayout().bodySize();
                 if (repository_selection_anchor) |anchor|
                     self.pages.repository.restoreSelectionViewportAnchor(anchor, repository_body_size)
@@ -510,7 +510,7 @@ pub const App = struct {
             ),
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
-            .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
+            .review => |review_msg| _ = try self.updateReview(ctx, review_msg),
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
             .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
             .mouse_selection_release => |continuation| try self.updateMouseSelectionRelease(ctx, continuation),
@@ -568,8 +568,8 @@ pub const App = struct {
             .open_help => {
                 self.drag_auto_scroll.clear();
                 if (self.active_page == .changes) self.changesNavigation().clearMouseDiffSelection();
-                if (self.active_page == .compare and self.pages.compare.selection_owner.activeMouseSelection()) {
-                    self.pages.compare.selection_owner = .none;
+                if (self.active_page == .review and self.pages.review.selection_owner.activeMouseSelection()) {
+                    self.pages.review.selection_owner = .none;
                 }
                 if (self.active_page == .repository) {
                     self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize());
@@ -612,7 +612,7 @@ pub const App = struct {
                     }
                 },
                 .repository => self.repositoryCoordinator().requestReload(),
-                .compare => try self.compareCoordinator().refresh(ctx),
+                .review => try self.reviewCoordinator().refresh(ctx),
                 .config => self.status.set("reload is not available on this page yet", .{}),
             },
             .auto_reload_tick => try self.changesRead().autoReloadTick(ctx),
@@ -621,7 +621,7 @@ pub const App = struct {
                 switch (self.active_page) {
                     .changes => self.changesNavigation().clearDiffSelection(),
                     .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
-                    .compare => self.pages.compare.selection_owner = .none,
+                    .review => self.pages.review.selection_owner = .none,
                     .config => {},
                 }
             },
@@ -635,7 +635,7 @@ pub const App = struct {
         self.changesRead().retireSupersededActionCursor(ctx, self.actionLifecycleView().generation());
         try self.changesRead().applyDeferredSourceIfReady(ctx);
         try self.changesRead().applyDeferredProjectionIfReady(ctx);
-        if (try self.compareCoordinator().applyDeferred(ctx) == .skip) self.redraw_plan.requestSkip();
+        if (try self.reviewCoordinator().applyDeferred(ctx) == .skip) self.redraw_plan.requestSkip();
         try self.changesRead().maybeStartQueuedRevalidation(ctx);
         try self.repositoryCoordinator().startPending(ctx);
         const revalidation_queued_before_projection = self.changesRead().hasQueuedFullRevalidation();
@@ -652,10 +652,10 @@ pub const App = struct {
         }
         self.actionLifecycle().reconcileSpinner(ctx);
         if (!self.redraw_plan.resolvesToSkip() and
-            self.active_page == .compare and
-            self.pages.compare.base_picker.open)
+            self.active_page == .review and
+            self.pages.review.base_picker.open)
         {
-            self.compareCoordinator().prepareModalRedraw(ctx.io());
+            self.reviewCoordinator().prepareModalRedraw(ctx.io());
         }
         if (!self.redraw_plan.resolvesToSkip() and self.overlay.isSwitchBranch()) {
             self.remoteWorkflow().prepareBranchSwitchModalRedraw(ctx.io());
@@ -683,10 +683,10 @@ pub const App = struct {
                 _ = try self.updateChanges(ctx, .{ .mouse_diff_drag = point });
                 break :blk .changes;
             },
-            .compare => |point| blk: {
-                if (self.active_page != .compare) break :blk .compare;
-                _ = try self.updateCompare(ctx, .{ .shared = .{ .mouse_diff_drag = point } });
-                break :blk .compare;
+            .review => |point| blk: {
+                if (self.active_page != .review) break :blk .review;
+                _ = try self.updateReview(ctx, .{ .shared = .{ .mouse_diff_drag = point } });
+                break :blk .review;
             },
             .repository => |point| blk: {
                 if (self.active_page != .repository) break :blk .repository;
@@ -713,8 +713,8 @@ pub const App = struct {
             .changes => |point| {
                 if (self.active_page == .changes) _ = try self.updateChanges(ctx, .{ .mouse_diff_release = point });
             },
-            .compare => |point| {
-                if (self.active_page == .compare) _ = try self.updateCompare(ctx, .{ .shared = .{ .mouse_diff_release = point } });
+            .review => |point| {
+                if (self.active_page == .review) _ = try self.updateReview(ctx, .{ .shared = .{ .mouse_diff_release = point } });
             },
             .repository => |point| {
                 if (self.active_page == .repository) _ = self.updateRepository(ctx, .{ .mouse_owner_release = point });
@@ -739,7 +739,7 @@ pub const App = struct {
 
         const outcome: ?drag_auto_scroll.StepOutcome = switch (active.target) {
             .changes => try self.updateChanges(ctx, .{ .mouse_diff_auto_scroll_step = active.intent }),
-            .compare => try self.updateCompare(ctx, .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } }),
+            .review => try self.updateReview(ctx, .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } }),
             .repository => blk: {
                 const body_size = self.shellLayout().bodySize();
                 const body_point: repository_layout.BodyPoint = .{
@@ -767,7 +767,7 @@ pub const App = struct {
     ) ?drag_auto_scroll.Viewport {
         if (self.active_page != switch (target) {
             .changes => page.Id.changes,
-            .compare => page.Id.compare,
+            .review => page.Id.review,
             .repository => page.Id.repository,
         }) return null;
 
@@ -776,8 +776,8 @@ pub const App = struct {
                 var adapter = self.changesNavigation().updateAdapter();
                 break :blk diffAutoScrollViewport(adapter.shared().navigation);
             },
-            .compare => blk: {
-                var adapter = self.compareCoordinator().navigation().updateAdapter();
+            .review => blk: {
+                var adapter = self.reviewCoordinator().navigation().updateAdapter();
                 break :blk diffAutoScrollViewport(adapter.bodyController());
             },
             .repository => self.pages.repository.sourceAutoScrollViewport(self.shellLayout().bodySize()),
@@ -861,12 +861,12 @@ pub const App = struct {
         return auto_scroll;
     }
 
-    fn updateCompare(
+    fn updateReview(
         self: *App,
         ctx: *chasen.Ctx(Msg),
-        msg: compare_input.Msg,
+        msg: review_input.Msg,
     ) !?drag_auto_scroll.StepOutcome {
-        var outcome = try self.compareCoordinator().update(ctx, msg);
+        var outcome = try self.reviewCoordinator().update(ctx, msg);
         defer outcome.deinit(ctx.allocator());
         const auto_scroll = outcome.auto_scroll;
         if (outcome.takeClipboard()) |taken| {
@@ -911,14 +911,14 @@ pub const App = struct {
                 .projection => |result| try self.changesRead().finishProjectionLoad(ctx.allocator(), result),
                 .projection_syntax => |result| self.changesRead().finishGeneratedProjectionSyntax(ctx.allocator(), result),
             },
-            .compare => |compare_result| switch (compare_result) {
+            .review => |review_result| switch (review_result) {
                 .source => |result| {
-                    if (try self.compareCoordinator().finishLoad(ctx, result) == .skip) {
+                    if (try self.reviewCoordinator().finishLoad(ctx, result) == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
                 .branch_list => |result| {
-                    if (self.compareCoordinator().finishBranchList(ctx.allocator(), result) == .skip) {
+                    if (self.reviewCoordinator().finishBranchList(ctx.allocator(), result) == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
@@ -1030,7 +1030,7 @@ pub const App = struct {
         if (app_message.keepsEphemeralStatus(msg)) return;
         self.status.clearIfEphemeral();
         if (self.active_page == .changes) self.pages.changes.status.clearIfEphemeral();
-        if (self.active_page == .compare) self.pages.compare.status.clearIfEphemeral();
+        if (self.active_page == .review) self.pages.review.status.clearIfEphemeral();
         if (self.active_page == .repository) self.pages.repository.status.clearIfEphemeral();
     }
 
@@ -1046,8 +1046,8 @@ pub const App = struct {
         const remote = self.remoteWorkflowView();
         return .{
             .changes = self.changesViewContext(),
-            .compare = .{
-                .page = &self.pages.compare,
+            .review = .{
+                .page = &self.pages.review,
                 .palette = self.theme,
                 .repo_root = self.repoSessionView().activeRoot(),
                 .repo_epoch = self.repoSessionView().epoch(),
@@ -1134,16 +1134,16 @@ pub const App = struct {
         const body_size = layout.bodySize();
         const repo = self.repoSessionView();
         const picker = repo.picker();
-        const compare_navigation_view: compare_navigation.View = .{
-            .page = &self.pages.compare,
+        const review_navigation_view: review_navigation.View = .{
+            .page = &self.pages.review,
             .repo_root = repo.activeRoot(),
             .repo_epoch = repo.epoch(),
             .root_identity = repo.activeIdentity(),
             .layout = .{ .width = body_size.width, .height = body_size.height },
-            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
         };
-        var compare_body_adapter = compare_navigation_view.resolver();
-        const compare_body_view = compare_navigation_view.bodyView(&compare_body_adapter);
+        var review_body_adapter = review_navigation_view.resolver();
+        const review_body_view = review_navigation_view.bodyView(&review_body_adapter);
         const changes_navigation_view = self.changesNavigationView();
         return .{
             .active_page = self.active_page,
@@ -1166,26 +1166,26 @@ pub const App = struct {
                 .sidebar_hidden = self.pages.changes.viewer.sidebar_hidden,
                 .sidebar_width = self.pages.changes.viewer.sidebar_width,
             },
-            .compare = .{
+            .review = .{
                 .key = .{
-                    .search_mode = self.pages.compare.search.mode,
-                    .file_search_mode = self.pages.compare.file_search.mode,
-                    .search_query_len = self.pages.compare.search.query.len,
-                    .focus = self.pages.compare.viewer.focus,
-                    .sidebar_hidden = self.pages.compare.viewer.sidebar_hidden,
-                    .side_by_side = compare_navigation_view.view().effectiveDisplayMode() == .side_by_side,
-                    .base_picker_open = self.pages.compare.base_picker.open,
-                    .base_picker_query_mode = self.pages.compare.base_picker.input_mode == .query,
-                    .base_picker_query_len = self.pages.compare.base_picker.query.len,
-                    .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.compare.selection_owner),
-                    .retained_selection_action_available = compare_body_view.retainedSelectionActionAvailable(),
+                    .search_mode = self.pages.review.search.mode,
+                    .file_search_mode = self.pages.review.file_search.mode,
+                    .search_query_len = self.pages.review.search.query.len,
+                    .focus = self.pages.review.viewer.focus,
+                    .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
+                    .side_by_side = review_navigation_view.view().effectiveDisplayMode() == .side_by_side,
+                    .base_picker_open = self.pages.review.base_picker.open,
+                    .base_picker_query_mode = self.pages.review.base_picker.input_mode == .query,
+                    .base_picker_query_len = self.pages.review.base_picker.query.len,
+                    .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.review.selection_owner),
+                    .retained_selection_action_available = review_body_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,
                 },
-                .selection_owner = &self.pages.compare.selection_owner,
-                .loaded = compare_body_view.view.activeLoadedDiffConst(),
-                .selected_node = self.pages.compare.viewer.selected_node,
-                .sidebar_hidden = self.pages.compare.viewer.sidebar_hidden,
-                .sidebar_width = self.pages.compare.viewer.sidebar_width,
+                .selection_owner = &self.pages.review.selection_owner,
+                .loaded = review_body_view.view.activeLoadedDiffConst(),
+                .selected_node = self.pages.review.viewer.selected_node,
+                .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
+                .sidebar_width = self.pages.review.viewer.sidebar_width,
             },
             .repository = .{
                 .key = self.pages.repository.inputContext(self.keymap),
@@ -1210,7 +1210,7 @@ pub const App = struct {
         return switch (self.active_page) {
             .changes => &self.pages.changes.status,
             .repository => &self.pages.repository.status,
-            .compare => &self.pages.compare.status,
+            .review => &self.pages.review.status,
             .config => null,
         };
     }
@@ -1219,7 +1219,7 @@ pub const App = struct {
         return switch (self.active_page) {
             .changes => &self.pages.changes.status,
             .repository => &self.pages.repository.status,
-            .compare => &self.pages.compare.status,
+            .review => &self.pages.review.status,
             .config => null,
         };
     }
@@ -1328,7 +1328,7 @@ pub const App = struct {
         const origin = switch (self.active_page) {
             .changes => effects.changesOrigin(),
             .repository => effects.repositoryOrigin(),
-            .compare => effects.compareOrigin(),
+            .review => effects.reviewOrigin(),
             .config => return,
         };
         const queued = effects.queueClipboardAccepted(ctx, .{
@@ -1397,7 +1397,7 @@ pub const App = struct {
 
     /// Applies only the shell effects authorized by a completed repository
     /// commitment. A rejected capability open must not reload or reset the
-    /// still-authoritative Changes or Compare page.
+    /// still-authoritative Changes or Review page.
     fn finishChangesRepoDiscovery(
         self: *App,
         ctx: *chasen.Ctx(Msg),
@@ -1423,7 +1423,7 @@ pub const App = struct {
         }
 
         try self.changesRead().acceptRepoDiscoveryCommit(ctx);
-        if (outcome == .changed and self.active_page == .compare) {
+        if (outcome == .changed and self.active_page == .review) {
             try self.applyRepoSessionCommit(ctx, outcome);
         }
     }

@@ -14,7 +14,7 @@ const page = @import("page.zig");
 const page_link = @import("page_link.zig");
 const page_transition = @import("page_transition.zig");
 const repo_session = @import("repo_session.zig");
-const compare_page = @import("pages/compare.zig");
+const review_page = @import("pages/review.zig");
 const repository_page = @import("pages/repository.zig");
 const changes_page = @import("pages/changes.zig");
 const changes_content = @import("pages/changes/content.zig");
@@ -39,14 +39,14 @@ pub const Intent = enum {
     none,
     changes_revalidation,
     changes_repository_changed,
-    compare_refresh,
+    review_refresh,
 };
 
 pub const Controller = struct {
     active_page: *page.Id,
     changes: *changes_page.ChangesPageState,
     repository: *repository_page.RepositoryPageState,
-    compare: *compare_page.ComparePageState,
+    review: *review_page.ReviewPageState,
     config_page: *page.LazyPlaceholder,
     repo: repo_session.View,
     source: diff_source.SourceMode,
@@ -77,9 +77,9 @@ pub const Controller = struct {
     pub fn acceptedRepositoryChange(self: Controller) Intent {
         return switch (self.active_page.*) {
             .changes => .changes_repository_changed,
-            .compare => blk: {
-                _ = self.compare.activate(self.repo.epoch());
-                break :blk .compare_refresh;
+            .review => blk: {
+                _ = self.review.activate(self.repo.epoch());
+                break :blk .review_refresh;
             },
             .repository, .config => .none,
         };
@@ -127,7 +127,7 @@ pub const Controller = struct {
 
         if (self.active_page.* == .changes) self.deactivateChangesForPageSwitch(allocator);
         if (self.active_page.* == .repository) self.deactivateRepositoryForPageSwitch();
-        if (self.active_page.* == .compare) self.compare.deactivate();
+        if (self.active_page.* == .review) self.review.deactivate();
         self.active_page.* = target;
         return switch (target) {
             .changes => blk: {
@@ -138,9 +138,9 @@ pub const Controller = struct {
                 self.repository.activate(self.repo.epoch(), self.repo.activeIdentity());
                 break :blk .none;
             },
-            .compare => blk: {
-                _ = self.compare.activate(self.repo.epoch());
-                break :blk .compare_refresh;
+            .review => blk: {
+                _ = self.review.activate(self.repo.epoch());
+                break :blk .review_refresh;
             },
             .config => blk: {
                 self.config_page.ensureInitialized();
@@ -152,14 +152,14 @@ pub const Controller = struct {
     fn transitionSnapshot(self: Controller) page_transition.Snapshot {
         return .{
             .changes_mouse_selection = self.changes.selection_owner.activeMouseSelection(),
-            .compare_mouse_selection = self.compare.selection_owner.activeMouseSelection(),
+            .review_mouse_selection = self.review.selection_owner.activeMouseSelection(),
             .repository_mouse_selection = self.repository.activeMouseSourceRange(),
             .changes_deferred_apply = self.changes.deferredSourceBlocksPageTransition(),
-            .compare_deferred_apply = self.compare.deferred_load_apply != null,
+            .review_deferred_apply = self.review.deferred_load_apply != null,
             .changes_search = self.changes.search.mode,
             .changes_file_search = self.changes.file_search.mode,
-            .compare_search = self.compare.search.mode,
-            .compare_file_search = self.compare.file_search.mode,
+            .review_search = self.review.search.mode,
+            .review_file_search = self.review.file_search.mode,
             .repository_source_search = self.repository.source_search.mode,
             .repository_file_search = self.repository.file_search.mode,
             .repo_picker = self.repo.picker().model.mode,
@@ -167,7 +167,7 @@ pub const Controller = struct {
             .commit_input = self.shell_blockers.commit_input,
             .confirmation = self.shell_blockers.confirmation,
             .branch_switch = self.shell_blockers.branch_switch,
-            .compare_base_picker = self.compare.base_picker.open,
+            .review_base_picker = self.review.base_picker.open,
             .push_error = self.shell_blockers.push_error,
             .git_action = self.shell_blockers.git_action,
             .foreground_command = self.shell_blockers.foreground_command,

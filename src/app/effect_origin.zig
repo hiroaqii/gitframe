@@ -43,7 +43,7 @@ pub const Snapshot = struct {
     repo_epoch: u64,
     changes_activation_id: u64,
     repository_activation_id: u64,
-    compare_activation_id: u64,
+    review_activation_id: u64,
     push_error_instance_id: ?u64,
     commit_panel_instance_id: ?u64,
 };
@@ -54,7 +54,7 @@ pub fn classify(origin: Origin, current: Snapshot) Liveness {
             const activation_matches = switch (captured.page_id) {
                 .changes => captured.activation_id == current.changes_activation_id,
                 .repository => captured.activation_id == current.repository_activation_id,
-                .compare => captured.activation_id == current.compare_activation_id,
+                .review => captured.activation_id == current.review_activation_id,
                 .config => true,
             };
             if (captured.repo_epoch != current.repo_epoch or !activation_matches) break :blk .stale;
@@ -77,7 +77,7 @@ test "repository selection inactive page accepts same-instance clipboard complet
         .repo_epoch = 4,
         .changes_activation_id = 9,
         .repository_activation_id = 5,
-        .compare_activation_id = 7,
+        .review_activation_id = 7,
         .push_error_instance_id = null,
         .commit_panel_instance_id = null,
     };
@@ -109,7 +109,7 @@ test "reopened shell surface rejects prior clipboard completion" {
         .repo_epoch = 4,
         .changes_activation_id = 9,
         .repository_activation_id = 5,
-        .compare_activation_id = 7,
+        .review_activation_id = 7,
         .push_error_instance_id = 12,
         .commit_panel_instance_id = 18,
     };

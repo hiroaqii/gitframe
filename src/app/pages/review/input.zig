@@ -1,4 +1,4 @@
-//! Compare-local input. Mutating Changes actions are intentionally absent.
+//! Review-local input. Mutating Changes actions are intentionally absent.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -100,7 +100,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.home, .{})) return shared(.select_first_file);
     if (key.matches(chasen.Key.end, .{})) return shared(.select_last_file);
 
-    // A user binding consumes the key even when it names an operation Compare
+    // A user binding consumes the key even when it names an operation Review
     // intentionally does not expose. This is what lets a user-bound `m` win
     // over the page-local picker mnemonic.
     if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action, context.focus == .diff);
@@ -144,7 +144,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .copy_current_line => .copy_current_line,
         .copy_current_hunk => .copy_current_hunk,
         .branch_switch => .branch_switch_unavailable,
-        .page_changes, .page_repository, .page_compare, .page_config, .help, .reload, .repo_picker, .open_editor, .commit, .amend, .push, .pull, .fetch, .discard => null,
+        .page_changes, .page_repository, .page_review, .page_config, .help, .reload, .repo_picker, .open_editor, .commit, .amend, .push, .pull, .fetch, .discard => null,
         else => unreachable,
     };
 }
@@ -164,7 +164,7 @@ test "user binding wins over hardcoded base picker mnemonic" {
     try std.testing.expectEqual(Msg.open_base_picker, keyToMsg(.{}, .{ .codepoint = 'm' }).?);
 }
 
-test "Compare exposes display actions but no write actions" {
+test "Review exposes display actions but no write actions" {
     try std.testing.expectEqual(Msg{ .shared = .toggle_display_mode }, keyToMsg(.{}, .{ .codepoint = 'u' }).?);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 's' }) == null);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'P' }) == null);
@@ -172,7 +172,7 @@ test "Compare exposes display actions but no write actions" {
     try std.testing.expectEqual(Msg.branch_switch_unavailable, keyToMsg(.{}, .{ .codepoint = 'b' }).?);
 }
 
-test "Compare document navigation preserves Home End focus and custom bindings" {
+test "Review document navigation preserves Home End focus and custom bindings" {
     try std.testing.expectEqual(Msg{ .shared = .select_first_file }, keyToMsg(.{}, .{ .codepoint = chasen.Key.home }).?);
     try std.testing.expectEqual(Msg{ .shared = .select_last_file }, keyToMsg(.{}, .{ .codepoint = chasen.Key.end }).?);
     try std.testing.expect(keyToMsg(.{ .focus = .sidebar }, .{ .codepoint = 'G' }) == null);
@@ -190,7 +190,7 @@ test "Compare document navigation preserves Home End focus and custom bindings" 
     try std.testing.expect(keyToMsg(.{ .focus = .diff, .keymap = custom }, .{ .codepoint = 'G' }) == null);
 }
 
-test "Compare routes admitted retained actions through shared input" {
+test "Review routes admitted retained actions through shared input" {
     const retained: Context = .{ .retained_selection_action_available = true };
     try std.testing.expectEqual(
         Msg{ .shared = .{ .selection_action = .copy } },
@@ -207,7 +207,7 @@ test "Compare routes admitted retained actions through shared input" {
     );
 }
 
-test "Compare keyboard line selection maps side start and movement" {
+test "Review keyboard line selection maps side start and movement" {
     const normal: Context = .{ .focus = .diff, .side_by_side = true };
     try std.testing.expectEqual(Msg{ .shared = .{ .keyboard_select_side = .old } }, keyToMsg(normal, .{ .codepoint = 'h' }).?);
     try std.testing.expectEqual(Msg{ .shared = .begin_keyboard_line_selection }, keyToMsg(normal, .{ .codepoint = 'V' }).?);

@@ -190,20 +190,20 @@ fn changesOperationController(app: *App) changes_operations.Controller {
 fn shellEffectOrigins(app: *const App) shell_effects.OriginContext {
     const repo_epoch = app.repo_session.view().epoch();
     const changes_identity = app.pages.changes.activation.currentIdentity();
-    const compare_identity = app.pages.compare.activation.currentIdentity();
+    const review_identity = app.pages.review.activation.currentIdentity();
     return .{
         .snapshot = .{
             .active_page = app.active_page,
             .repo_epoch = repo_epoch,
             .changes_activation_id = app.pages.changes.activation.next_activation_id,
             .repository_activation_id = app.pages.repository.activation_id,
-            .compare_activation_id = app.pages.compare.activation.next_activation_id,
+            .review_activation_id = app.pages.review.activation.next_activation_id,
             .push_error_instance_id = if (app.overlay.isPushError()) app.overlay.push_error_instance_id else null,
             .commit_panel_instance_id = app.local_workflow.view().commitPanelInstanceId(),
         },
         .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
         .repository_repo_epoch = app.pages.repository.repo_epoch,
-        .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
+        .review_repo_epoch = if (review_identity) |identity| identity.repo_epoch else repo_epoch,
     };
 }
 
@@ -240,7 +240,7 @@ fn shellEffects(app: *App) shell_effects.Controller {
             .shell = &app.status,
             .changes = &app.pages.changes.status,
             .repository = &app.pages.repository.status,
-            .compare = &app.pages.compare.status,
+            .review = &app.pages.review.status,
         },
         .redraw = .{ .skip_requested = &app.redraw_plan.skip_requested },
     };
@@ -276,7 +276,7 @@ fn repoSession(app: *App) repo_session.Controller {
         .action_pending = app.action_runtime.view().hasPending(),
         .changes = .{ .page = &app.pages.changes, .navigation = changesNavigation(app), .reload = changesReload(app) },
         .repository = .{ .page = &app.pages.repository },
-        .compare = .{ .page = &app.pages.compare },
+        .review = .{ .page = &app.pages.review },
         .shell = app.remote_workflow.repositoryInvalidationPort(&app.overlay),
     };
 }

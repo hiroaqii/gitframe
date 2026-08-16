@@ -1,4 +1,4 @@
-//! Owner-local tests for Compare coordination.
+//! Owner-local tests for Review coordination.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -14,25 +14,25 @@ const diff_view_model = @import("../../../diff/view_model.zig");
 const git_refs = @import("../../../git/refs.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
-const compare_page = @import("../compare.zig");
-const compare_coordinator = @import("coordinator.zig");
+const review_page = @import("../review.zig");
+const review_coordinator = @import("coordinator.zig");
 
-const CompareLoadFinished = app_load.CompareLoadFinished;
-const CompareLoadTask = app_load.CompareLoadTask(app_message.Msg);
-const CompareBranchListLoadTask = app_load.CompareBranchListLoadTask(app_message.Msg);
+const ReviewLoadFinished = app_load.ReviewLoadFinished;
+const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
+const ReviewBranchListLoadTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
 
 const TestApp = struct {
     allocator: ?std.mem.Allocator = null,
-    active_page: page.Id = .compare,
+    active_page: page.Id = .review,
     repo_session: repo_session.State = .{},
-    pages: struct { compare: compare_page.ComparePageState = .{} } = .{},
+    pages: struct { review: review_page.ReviewPageState = .{} } = .{},
     layout: diff_surface.Layout = .{ .width = 100, .height = 30 },
 
     const Msg = app_message.Msg;
 
-    fn controller(self: *TestApp) compare_coordinator.Controller {
+    fn controller(self: *TestApp) review_coordinator.Controller {
         return .{
-            .page_state = &self.pages.compare,
+            .page_state = &self.pages.review,
             .repo = self.repo_session.view(),
             .layout = self.layout,
             .env_map = null,
@@ -42,12 +42,12 @@ const TestApp = struct {
     fn update(self: *TestApp, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         switch (msg) {
             .reload => try self.controller().refresh(ctx),
-            .compare => |compare_msg| {
-                var outcome = try self.controller().update(ctx, compare_msg);
+            .review => |review_msg| {
+                var outcome = try self.controller().update(ctx, review_msg);
                 defer outcome.deinit(ctx.allocator());
             },
             .load_finished => |finished| switch (finished) {
-                .compare => |compare_finished| switch (compare_finished) {
+                .review => |review_finished| switch (review_finished) {
                     .source => |source| _ = try self.controller().finishLoad(ctx, source),
                     .branch_list => |branches| _ = self.controller().finishBranchList(ctx.allocator(), branches),
                 },
@@ -58,10 +58,10 @@ const TestApp = struct {
     }
 };
 
-test "Compare document navigation and diff wheel share rendered cursor authority" {
+test "Review document navigation and diff wheel share rendered cursor authority" {
     const allocator = std.testing.allocator;
     var app: TestApp = .{
-        .pages = .{ .compare = .{
+        .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
@@ -72,59 +72,59 @@ test "Compare document navigation and diff wheel share rendered cursor authority
         } },
         .layout = .{ .width = 140, .height = 9 },
     };
-    defer app.pages.compare.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
-    const old_scroll = app.pages.compare.viewer.diff_scroll;
+    const old_scroll = app.pages.review.viewer.diff_scroll;
     const navigation = app.controller().navigation();
     var update_adapter = navigation.updateAdapter();
     const body = update_adapter.bodyController();
     const visible_rows = body.view().view.diffVisibleRows();
     const line_count = body.view().sourceDiffLineCount();
 
-    app.pages.compare.viewer.diff_cursor = body.view().selectedCoordinateAtOffset(0) orelse
+    app.pages.review.viewer.diff_cursor = body.view().selectedCoordinateAtOffset(0) orelse
         return error.ExpectedCoordinate;
-    try app.update(.{ .compare = .{ .shared = .document_last } }, &ctx);
+    try app.update(.{ .review = .{ .shared = .document_last } }, &ctx);
     var document_adapter = app.controller().navigation().updateAdapter();
     try std.testing.expectEqual(
         @as(?usize, line_count - 1),
         document_adapter.bodyController().view().selectedDiffCursorOffset(),
     );
-    try app.update(.{ .compare = .{ .shared = .document_first } }, &ctx);
+    try app.update(.{ .review = .{ .shared = .document_first } }, &ctx);
     document_adapter = app.controller().navigation().updateAdapter();
     try std.testing.expectEqual(@as(?usize, 0), document_adapter.bodyController().view().selectedDiffCursorOffset());
-    try app.update(.{ .compare = .{ .shared = .half_page_down } }, &ctx);
+    try app.update(.{ .review = .{ .shared = .half_page_down } }, &ctx);
     document_adapter = app.controller().navigation().updateAdapter();
     try std.testing.expectEqual(
         @as(?usize, @min(@max(visible_rows / 2, 1), line_count - 1)),
         document_adapter.bodyController().view().selectedDiffCursorOffset(),
     );
 
-    app.pages.compare.viewer.display_mode = .side_by_side;
-    app.pages.compare.viewer.keyboard_selection_side = .old;
-    try app.update(.{ .compare = .{ .shared = .page_diff_down } }, &ctx);
-    try std.testing.expect(app.pages.compare.viewer.keyboard_selection_side == .old);
-    app.pages.compare.viewer.display_mode = .unified;
-    app.pages.compare.viewer.diff_scroll = old_scroll;
-    app.pages.compare.viewer.diff_cursor = body.view().selectedCoordinateAtOffset(old_scroll) orelse
+    app.pages.review.viewer.display_mode = .side_by_side;
+    app.pages.review.viewer.keyboard_selection_side = .old;
+    try app.update(.{ .review = .{ .shared = .page_diff_down } }, &ctx);
+    try std.testing.expect(app.pages.review.viewer.keyboard_selection_side == .old);
+    app.pages.review.viewer.display_mode = .unified;
+    app.pages.review.viewer.diff_scroll = old_scroll;
+    app.pages.review.viewer.diff_cursor = body.view().selectedCoordinateAtOffset(old_scroll) orelse
         return error.ExpectedCoordinate;
 
-    try app.update(.{ .compare = .{ .shared = .mouse_diff_wheel_down } }, &ctx);
+    try app.update(.{ .review = .{ .shared = .mouse_diff_wheel_down } }, &ctx);
 
     var result_adapter = app.controller().navigation().updateAdapter();
     const result_body = result_adapter.bodyController();
-    try std.testing.expectEqual(diff_surface.Focus.diff, app.pages.compare.viewer.focus);
-    try std.testing.expectEqual(old_scroll + 1, app.pages.compare.viewer.diff_scroll);
+    try std.testing.expectEqual(diff_surface.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(old_scroll + 1, app.pages.review.viewer.diff_scroll);
     try std.testing.expectEqual(
-        app.pages.compare.viewer.diff_scroll + visible_rows / 2,
+        app.pages.review.viewer.diff_scroll + visible_rows / 2,
         result_body.view().selectedDiffCursorOffset().?,
     );
 }
 
-test "Compare coordinator returns shared drag auto-scroll outcome" {
+test "Review coordinator returns shared drag auto-scroll outcome" {
     const allocator = std.testing.allocator;
     var app: TestApp = .{
-        .pages = .{ .compare = .{
+        .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .side_by_side,
@@ -143,7 +143,7 @@ test "Compare coordinator returns shared drag auto-scroll outcome" {
         } },
         .layout = .{ .width = 100, .height = 9 },
     };
-    defer app.pages.compare.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
     var outcome = try app.controller().update(&ctx, .{
@@ -158,118 +158,118 @@ test "Compare coordinator returns shared drag auto-scroll outcome" {
     });
     defer outcome.deinit(allocator);
     try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, outcome.auto_scroll.?);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.compare.viewer.diff_scroll);
-    const selection = app.pages.compare.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expectEqual(@as(usize, 1), app.pages.review.viewer.diff_scroll);
+    const selection = app.pages.review.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expect(selection.side == .old);
     try std.testing.expectEqual(@as(usize, 1), selection.focus.line_index);
 }
 
-test "Compare reload retries user intent and preserves accepted display on failure" {
+test "Review reload retries user intent and preserves accepted display on failure" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app: TestApp = .{
         .allocator = allocator,
-        .active_page = .compare,
+        .active_page = .review,
         .repo_session = .{
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
-    defer app.pages.compare.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
-    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    _ = app.pages.review.activate(app.repo_session.repo_epoch);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    const initial = app.pages.compare.beginRefresh().?;
-    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+    const initial = app.pages.review.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
         allocator,
         initial.identity,
         initial.generation,
         'a',
         'b',
     ) } } }, &ctx);
-    if (app.pages.compare.base_target) |*target| target.deinit(allocator);
-    app.pages.compare.base_target = .{
+    if (app.pages.review.base_target) |*target| target.deinit(allocator);
+    app.pages.review.base_target = .{
         .full_ref = try allocator.dupe(u8, "refs/heads/topic"),
         .display_name = try allocator.dupe(u8, "topic"),
         .kind = .local,
     };
 
     try app.update(.reload, &ctx);
-    const failed_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const failed_task: *ReviewLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     try std.testing.expectEqualStrings("refs/heads/topic", failed_task.target.?.full_ref);
     const failed_identity = failed_task.identity;
     const failed_generation = failed_task.generation;
     try abandonSingleQueuedTask(&ctx, allocator);
-    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppBasisFailureFinished(
+    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppBasisFailureFinished(
         allocator,
         failed_identity,
         failed_generation,
         "topic",
     ) } } }, &ctx);
 
-    try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
-    try std.testing.expect(app.pages.compare.load.state == .loaded);
-    try std.testing.expectEqualStrings("topic", app.pages.compare.basis_failure.?.attempted.display_name);
-    try std.testing.expectEqualStrings("topic", app.pages.compare.base_target.?.display_name);
+    try std.testing.expectEqualStrings("main", app.pages.review.basis.?.base.display_name);
+    try std.testing.expect(app.pages.review.load.state == .loaded);
+    try std.testing.expectEqualStrings("topic", app.pages.review.basis_failure.?.attempted.display_name);
+    try std.testing.expectEqualStrings("topic", app.pages.review.base_target.?.display_name);
 
     try app.update(.reload, &ctx);
-    const retry_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const retry_task: *ReviewLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     try std.testing.expectEqualStrings("refs/heads/topic", retry_task.target.?.full_ref);
-    try std.testing.expect(app.pages.compare.basis_failure == null);
-    try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
+    try std.testing.expect(app.pages.review.basis_failure == null);
+    try std.testing.expectEqualStrings("main", app.pages.review.basis.?.base.display_name);
 }
 
-test "Compare refresh restores its anchor after atomic replacement" {
+test "Review refresh restores its anchor after atomic replacement" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app: TestApp = .{
         .allocator = allocator,
-        .active_page = .compare,
+        .active_page = .review,
         .repo_session = .{
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
-    defer app.pages.compare.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
-    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    _ = app.pages.review.activate(app.repo_session.repo_epoch);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    const initial = app.pages.compare.beginRefresh().?;
-    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+    const initial = app.pages.review.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
         allocator,
         initial.identity,
         initial.generation,
         'a',
         'b',
     ) } } }, &ctx);
-    app.pages.compare.viewer.diff_cursor = .{ .hunk_header = 0 };
-    const selected_before = app.pages.compare.viewer.selected_target.?;
+    app.pages.review.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const selected_before = app.pages.review.viewer.selected_target.?;
 
     try app.update(.reload, &ctx);
-    try std.testing.expect(app.pages.compare.refresh_anchor != null);
-    const stale_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expect(app.pages.review.refresh_anchor != null);
+    const stale_task: *ReviewLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     const stale_identity = stale_task.identity;
     const stale_generation = stale_task.generation;
     try app.update(.reload, &ctx);
-    const current_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
+    const current_task: *ReviewLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
     const identity = current_task.identity;
     const generation = current_task.generation;
     try std.testing.expectEqual(@as(usize, 2), abandonQueuedTasks(&ctx, allocator));
-    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
         allocator,
         stale_identity,
         stale_generation,
         'a',
         'b',
     ) } } }, &ctx);
-    try std.testing.expect(app.pages.compare.refresh_anchor != null);
-    try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+    try std.testing.expect(app.pages.review.refresh_anchor != null);
+    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
         allocator,
         identity,
         generation,
@@ -277,15 +277,15 @@ test "Compare refresh restores its anchor after atomic replacement" {
         'b',
     ) } } }, &ctx);
 
-    try std.testing.expect(app.pages.compare.refresh_anchor == null);
-    try std.testing.expectEqual(selected_before, app.pages.compare.viewer.selected_target.?);
+    try std.testing.expect(app.pages.review.refresh_anchor == null);
+    try std.testing.expectEqual(selected_before, app.pages.review.viewer.selected_target.?);
     try std.testing.expectEqual(
         diff_view_model.BodyCoordinate{ .hunk_header = 0 },
-        app.pages.compare.viewer.diff_cursor,
+        app.pages.review.viewer.diff_cursor,
     );
 }
 
-test "Compare app route retains viewed marks only for an unchanged oid pair" {
+test "Review app route retains viewed marks only for an unchanged oid pair" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { base: u8, head: u8, retained: bool }{
         .{ .base = 'a', .head = 'b', .retained = true },
@@ -295,110 +295,110 @@ test "Compare app route retains viewed marks only for an unchanged oid pair" {
     for (cases) |case| {
         var app: TestApp = .{
             .allocator = allocator,
-            .active_page = .compare,
+            .active_page = .review,
             .repo_session = .{
                 .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, "/repo") },
             },
         };
-        defer app.pages.compare.deinit(allocator);
+        defer app.pages.review.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+        _ = app.pages.review.activate(app.repo_session.repo_epoch);
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
-        const initial = app.pages.compare.beginRefresh().?;
-        try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        const initial = app.pages.review.beginRefresh().?;
+        try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
             allocator,
             initial.identity,
             initial.generation,
             'a',
             'b',
         ) } } }, &ctx);
-        const first_loaded = switch (app.pages.compare.load.state) {
+        const first_loaded = switch (app.pages.review.load.state) {
             .loaded => |*session| &session.loaded,
-            else => return error.ExpectedLoadedCompare,
+            else => return error.ExpectedLoadedReview,
         };
-        try app.pages.compare.reviewed_store.set(allocator, "/repo", first_loaded.document.files[0], true);
+        try app.pages.review.reviewed_store.set(allocator, "/repo", first_loaded.document.files[0], true);
         first_loaded.reviewed_files[0] = true;
 
-        const replacement = app.pages.compare.beginRefresh().?;
-        try app.update(.{ .load_finished = .{ .compare = .{ .source = try compareAppLoadedFinished(
+        const replacement = app.pages.review.beginRefresh().?;
+        try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
             allocator,
             replacement.identity,
             replacement.generation,
             case.base,
             case.head,
         ) } } }, &ctx);
-        const second_loaded = switch (app.pages.compare.load.state) {
+        const second_loaded = switch (app.pages.review.load.state) {
             .loaded => |*session| &session.loaded,
-            else => return error.ExpectedLoadedCompare,
+            else => return error.ExpectedLoadedReview,
         };
         try std.testing.expectEqual(case.retained, second_loaded.reviewed_files[0]);
     }
 }
 
-test "Compare picker rejects replaced and closed generations through the App route" {
+test "Review picker rejects replaced and closed generations through the App route" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app: TestApp = .{
         .allocator = allocator,
-        .active_page = .compare,
+        .active_page = .review,
         .repo_session = .{
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
-    defer app.pages.compare.deinit(allocator);
+    defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
-    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    _ = app.pages.review.activate(app.repo_session.repo_epoch);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app.update(.{ .compare = .open_base_picker }, &ctx);
-    const first: *CompareBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try app.update(.{ .review = .open_base_picker }, &ctx);
+    const first: *ReviewBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     const first_identity = first.identity;
     const first_generation = first.generation;
-    try app.update(.{ .compare = .open_base_picker }, &ctx);
-    const second: *CompareBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
+    try app.update(.{ .review = .open_base_picker }, &ctx);
+    const second: *ReviewBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
     const second_identity = second.identity;
     const second_generation = second.generation;
     try std.testing.expect(second_generation > first_generation);
 
-    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
+    try app.update(.{ .load_finished = .{ .review = .{ .branch_list = .{
         .identity = first_identity,
         .generation = first_generation,
         .result = try branchListForTest(allocator, &.{.{ .name = "stale", .oid = "1111111111111111111111111111111111111111" }}),
     } } } }, &ctx);
-    try std.testing.expect(app.pages.compare.base_picker.accepted == null);
-    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
+    try std.testing.expect(app.pages.review.base_picker.accepted == null);
+    try app.update(.{ .load_finished = .{ .review = .{ .branch_list = .{
         .identity = second_identity,
         .generation = second_generation,
         .result = try branchListForTest(allocator, &.{.{ .name = "accepted", .oid = "2222222222222222222222222222222222222222" }}),
     } } } }, &ctx);
-    try std.testing.expectEqualStrings("accepted", app.pages.compare.base_picker.accepted.?.branches[0].name);
+    try std.testing.expectEqualStrings("accepted", app.pages.review.base_picker.accepted.?.branches[0].name);
 
-    try app.update(.{ .compare = .close_base_picker }, &ctx);
-    try std.testing.expect(app.pages.compare.base_picker.accepted == null);
-    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
+    try app.update(.{ .review = .close_base_picker }, &ctx);
+    try std.testing.expect(app.pages.review.base_picker.accepted == null);
+    try app.update(.{ .load_finished = .{ .review = .{ .branch_list = .{
         .identity = second_identity,
         .generation = second_generation,
         .result = try branchListForTest(allocator, &.{.{ .name = "closed", .oid = "3333333333333333333333333333333333333333" }}),
     } } } }, &ctx);
-    try std.testing.expect(app.pages.compare.base_picker.accepted == null);
+    try std.testing.expect(app.pages.review.base_picker.accepted == null);
 }
 
-test "Compare load route admits failure intent through the Compare owner" {
+test "Review load route admits failure intent through the Review owner" {
     const allocator = std.testing.allocator;
     var app: TestApp = .{
         .repo_session = .{ .repo_epoch = 12 },
     };
-    defer app.pages.compare.deinit(allocator);
-    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
-    const request = app.pages.compare.beginRefresh().?;
+    defer app.pages.review.deinit(allocator);
+    _ = app.pages.review.activate(app.repo_session.repo_epoch);
+    const request = app.pages.review.beginRefresh().?;
     var tc: chasen.testing.TestCtx(TestApp.Msg) = .{};
     defer tc.resetTransient();
 
-    try app.update(.{ .load_finished = .{ .compare = .{ .source = .{
+    try app.update(.{ .load_finished = .{ .review = .{ .source = .{
         .identity = request.identity,
         .generation = request.generation,
         .result = .{ .basis_failed = .{
@@ -411,10 +411,10 @@ test "Compare load route admits failure intent through the Compare owner" {
         } },
     } } } }, &tc.ctx);
 
-    try std.testing.expectEqualStrings("gone", app.pages.compare.basis_failure.?.attempted.display_name);
+    try std.testing.expectEqualStrings("gone", app.pages.review.basis_failure.?.attempted.display_name);
 }
 
-const compare_app_test_diff =
+const review_app_test_diff =
     "diff --git a/src/compare.zig b/src/compare.zig\n" ++
     "--- a/src/compare.zig\n" ++
     "+++ b/src/compare.zig\n" ++
@@ -422,19 +422,19 @@ const compare_app_test_diff =
     "-old\n" ++
     "+new\n";
 
-fn compareAppTestOid(byte: u8) diff_basis.Oid {
+fn reviewAppTestOid(byte: u8) diff_basis.Oid {
     var oid: diff_basis.Oid = .{ .len = 40 };
     @memset(oid.bytes[0..40], byte);
     return oid;
 }
 
-fn compareAppLoadedFinished(
+fn reviewAppLoadedFinished(
     allocator: std.mem.Allocator,
     identity: page.RequestIdentity,
     generation: u64,
     base_byte: u8,
     head_byte: u8,
-) !CompareLoadFinished {
+) !ReviewLoadFinished {
     const full_ref = try allocator.dupe(u8, "refs/heads/main");
     errdefer allocator.free(full_ref);
     const display_name = try allocator.dupe(u8, "main");
@@ -450,24 +450,24 @@ fn compareAppLoadedFinished(
                     .full_ref = full_ref,
                     .display_name = display_name,
                     .kind = .local,
-                    .oid = compareAppTestOid(base_byte),
+                    .oid = reviewAppTestOid(base_byte),
                 },
                 .head_display = head_display,
-                .merge_base_oid = compareAppTestOid(base_byte),
-                .head_oid = compareAppTestOid(head_byte),
+                .merge_base_oid = reviewAppTestOid(base_byte),
+                .head_oid = reviewAppTestOid(head_byte),
                 .ahead_count = 1,
             },
-            .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, compare_app_test_diff) },
+            .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, review_app_test_diff) },
         } },
     };
 }
 
-fn compareAppBasisFailureFinished(
+fn reviewAppBasisFailureFinished(
     allocator: std.mem.Allocator,
     identity: page.RequestIdentity,
     generation: u64,
     name: []const u8,
-) !CompareLoadFinished {
+) !ReviewLoadFinished {
     const full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
     errdefer allocator.free(full_ref);
     return .{

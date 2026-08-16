@@ -33,11 +33,11 @@ const MousePane = enum {
 
 const ActiveDiffSelectionOwner = union(enum) {
     changes: *const diff_selection.Owner,
-    compare: *const diff_selection.Owner,
+    review: *const diff_selection.Owner,
 
     fn active(self: ActiveDiffSelectionOwner) bool {
         return switch (self) {
-            inline .changes, .compare => |owner| owner.activeMouseSelection(),
+            inline .changes, .review => |owner| owner.activeMouseSelection(),
         };
     }
 };
@@ -54,8 +54,8 @@ pub const ChangesContext = struct {
     sidebar_width: ?u16,
 };
 
-pub const CompareContext = struct {
-    key: app_input.CompareContext,
+pub const ReviewContext = struct {
+    key: app_input.ReviewContext,
     selection_owner: *const diff_selection.Owner,
     loaded: ?*const loaded_diff.LoadedDiff,
     selected_node: usize,
@@ -71,7 +71,7 @@ pub const RepositoryContext = struct {
 pub const View = struct {
     active_page: page.Id,
     changes: ChangesContext,
-    compare: CompareContext,
+    review: ReviewContext,
     repository: RepositoryContext,
     commit_panel_mode: bool,
     repo_picker_mode: bool,
@@ -94,7 +94,7 @@ pub const View = struct {
         return .{
             .active_page = self.active_page,
             .changes = self.changes.key,
-            .compare = self.compare.key,
+            .review = self.review.key,
             .repository = self.repository.key,
             .commit_panel_mode = self.commit_panel_mode,
             .repo_picker_mode = self.repo_picker_mode,
@@ -125,14 +125,14 @@ pub const View = struct {
                     } },
                     else => {},
                 },
-                .compare => switch (mouse.type) {
+                .review => switch (mouse.type) {
                     .drag => return .{ .mouse_selection_drag = .{
                         .pointer = self.bodyPointerSample(mouse),
-                        .target = .{ .compare = self.bodyMousePoint(mouse) },
+                        .target = .{ .review = self.bodyMousePoint(mouse) },
                     } },
                     .release => return .{ .mouse_selection_release = .{
                         .pointer = self.bodyPointerSample(mouse),
-                        .target = .{ .compare = self.bodyMousePoint(mouse) },
+                        .target = .{ .review = self.bodyMousePoint(mouse) },
                     } },
                     else => {},
                 },
@@ -164,7 +164,7 @@ pub const View = struct {
         }
 
         if ((self.active_page == .changes and (self.changes.key.search_mode or self.changes.key.file_search_mode)) or
-            (self.active_page == .compare and (self.compare.key.search_mode or self.compare.key.file_search_mode or self.compare.key.base_picker_open)) or
+            (self.active_page == .review and (self.review.key.search_mode or self.review.key.file_search_mode or self.review.key.base_picker_open)) or
             (self.active_page == .repository and (self.repository.key.source_search_mode or self.repository.key.file_search_mode)) or
             self.commit_panel_mode or self.repo_picker_mode) return null;
         if (mouse.type != .press) return null;
@@ -225,17 +225,17 @@ pub const View = struct {
             return .{ .repository = repository_msg };
         }
 
-        if (self.active_page == .compare) {
-            const pane = self.compareMousePane(mouse) orelse return null;
+        if (self.active_page == .review) {
+            const pane = self.reviewMousePane(mouse) orelse return null;
             return switch (mouse.button) {
                 .left => switch (pane) {
-                    .sidebar => .{ .compare = .{ .shared = self.compareSidebarClickToMsg(mouse) } },
-                    .diff => .{ .compare = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } },
+                    .sidebar => .{ .review = .{ .shared = self.reviewSidebarClickToMsg(mouse) } },
+                    .diff => .{ .review = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } },
                 },
-                .wheel_up => .{ .compare = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_up else .mouse_diff_wheel_up } },
-                .wheel_down => .{ .compare = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_down else .mouse_diff_wheel_down } },
-                .wheel_left => if (pane == .diff) .{ .compare = .{ .shared = .mouse_diff_wheel_left } } else null,
-                .wheel_right => if (pane == .diff) .{ .compare = .{ .shared = .mouse_diff_wheel_right } } else null,
+                .wheel_up => .{ .review = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_up else .mouse_diff_wheel_up } },
+                .wheel_down => .{ .review = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_down else .mouse_diff_wheel_down } },
+                .wheel_left => if (pane == .diff) .{ .review = .{ .shared = .mouse_diff_wheel_left } } else null,
+                .wheel_right => if (pane == .diff) .{ .review = .{ .shared = .mouse_diff_wheel_right } } else null,
                 else => null,
             };
         }
@@ -258,33 +258,33 @@ pub const View = struct {
     fn activeDiffSelectionOwner(self: View) ?ActiveDiffSelectionOwner {
         return switch (self.active_page) {
             .changes => .{ .changes = self.changes.selection_owner },
-            .compare => .{ .compare = self.compare.selection_owner },
+            .review => .{ .review = self.review.selection_owner },
             .repository, .config => null,
         };
     }
 
-    fn compareMousePane(self: View, mouse: anytype) ?MousePane {
-        _ = self.compare.loaded orelse return null;
+    fn reviewMousePane(self: View, mouse: anytype) ?MousePane {
+        _ = self.review.loaded orelse return null;
         const point = self.bodyMousePoint(mouse) orelse return null;
-        if (self.compare.sidebar_hidden) return .diff;
+        if (self.review.sidebar_hidden) return .diff;
         const sidebar_width = changes_layout.sidebarWidth(
             self.layout.content.width,
-            self.compare.sidebar_width,
+            self.review.sidebar_width,
         );
         if (point.col < sidebar_width) return .sidebar;
         if (point.col == sidebar_width) return null;
         return .diff;
     }
 
-    fn compareSidebarClickToMsg(self: View, mouse: anytype) diff_surface.message.Msg {
+    fn reviewSidebarClickToMsg(self: View, mouse: anytype) diff_surface.message.Msg {
         const point = self.bodyMousePoint(mouse) orelse return .focus_sidebar;
         const body_height = self.layout.body.height;
         if (point.row < sidebar_header_rows or body_height <= sidebar_header_rows) return .focus_sidebar;
-        const loaded = self.compare.loaded orelse return .focus_sidebar;
+        const loaded = self.review.loaded orelse return .focus_sidebar;
         const visible_rows: usize = body_height - sidebar_header_rows;
         const body_row: usize = point.row - sidebar_header_rows;
         const node_index = loaded.sidebarNodeAtBodyRow(
-            self.compare.selected_node,
+            self.review.selected_node,
             visible_rows,
             body_row,
         ) orelse return .focus_sidebar;

@@ -1,8 +1,8 @@
-//! Compare adapter for the page-independent diff-surface navigation contract.
+//! Review adapter for the page-independent diff-surface navigation contract.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const compare_page = @import("../compare.zig");
+const review_page = @import("../review.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const context = @import("../../../context.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
@@ -16,13 +16,13 @@ const file_tree = @import("../../../file_tree.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
-const source: diff_source.SourceMode = compare_page.selection_source;
+const source: diff_source.SourceMode = review_page.selection_source;
 
-/// Read-only Compare adapter. Rendering and content inspection must construct
+/// Read-only Review adapter. Rendering and content inspection must construct
 /// this value directly from a const page borrow; mutation authority belongs to
 /// `Controller` below.
 pub const View = struct {
-    page: *const compare_page.ComparePageState,
+    page: *const review_page.ReviewPageState,
     repo_root: ?[]const u8,
     repo_epoch: u64,
     root_identity: ?root_capability.Identity,
@@ -77,9 +77,9 @@ pub const View = struct {
     }
 };
 
-/// Mutable Compare adapter used only by update/input integration.
+/// Mutable Review adapter used only by update/input integration.
 pub const Controller = struct {
-    page: *compare_page.ComparePageState,
+    page: *review_page.ReviewPageState,
     repo_root: ?[]const u8,
     repo_epoch: u64,
     root_identity: ?root_capability.Identity,
@@ -108,7 +108,7 @@ pub const Controller = struct {
     }
 
     /// Short-lived mutable adapter whose navigation and body resolver are
-    /// constructed from the same Compare page owner. Callers cannot pair a
+    /// constructed from the same Review page owner. Callers cannot pair a
     /// controller from one page with a resolver borrowed from another page.
     pub const UpdateAdapter = struct {
         navigation: Controller,
@@ -309,7 +309,7 @@ fn cloneSidebarIdentity(allocator: std.mem.Allocator, identity: context.SidebarI
     };
 }
 
-test "Compare navigation separates read-only View from mutable Controller authority" {
+test "Review navigation separates read-only View from mutable Controller authority" {
     const view_page = @typeInfo(@FieldType(View, "page")).pointer;
     const controller_page = @typeInfo(@FieldType(Controller, "page")).pointer;
     try std.testing.expect(view_page.is_const);
@@ -321,9 +321,9 @@ test "Compare navigation separates read-only View from mutable Controller author
     try std.testing.expect(@hasDecl(Controller, "updateAdapter"));
 }
 
-test "Compare selection release installs pinned retained actions" {
+test "Review selection release installs pinned retained actions" {
     const allocator = std.testing.allocator;
-    var page: compare_page.ComparePageState = .{
+    var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .basis = .{
             .base = .{
@@ -430,9 +430,9 @@ test "Compare selection release installs pinned retained actions" {
     try std.testing.expectEqualStrings("Could not retain selected text", page.status.text());
 }
 
-test "Compare keyboard line selection completes with exact pin and retries allocation failure" {
+test "Review keyboard line selection completes with exact pin and retries allocation failure" {
     const allocator = std.testing.allocator;
-    var page: compare_page.ComparePageState = .{
+    var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .basis = .{
             .base = .{
@@ -476,7 +476,7 @@ test "Compare keyboard line selection completes with exact pin and retries alloc
     var copied = try adapter.shared().apply(allocator, .{ .selection_action = .copy });
     defer copied.deinit(allocator);
     try std.testing.expectEqual(diff_surface.update.RetentionTransition.installed, copied.retention_transition);
-    try std.testing.expect(page.pinned_selection_basis.?.eql(compare_page.PinnedSelectionBasis.init(page.basis.?)));
+    try std.testing.expect(page.pinned_selection_basis.?.eql(review_page.PinnedSelectionBasis.init(page.basis.?)));
     var effect = copied.takeEffect() orelse return error.ExpectedSelectionEffect;
     defer effect.deinit(allocator);
     switch (effect) {
@@ -511,9 +511,9 @@ test "Compare keyboard line selection completes with exact pin and retries alloc
     try std.testing.expect(page.pinned_selection_basis == null);
 }
 
-test "Compare retained candidate and pin replace transactionally and survive rejected installs" {
+test "Review retained candidate and pin replace transactionally and survive rejected installs" {
     const allocator = std.testing.allocator;
-    var page: compare_page.ComparePageState = .{
+    var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .basis = .{
             .base = .{
@@ -582,7 +582,7 @@ test "Compare retained candidate and pin replace transactionally and survive rej
     try std.testing.expect(replacement_fragment_ptr != initial_fragment_ptr);
     try std.testing.expect(replacement_token.eql(initial_token));
     try std.testing.expect(!replacement_pin.eql(initial_pin));
-    try std.testing.expect(replacement_pin.eql(compare_page.PinnedSelectionBasis.init(page.basis.?)));
+    try std.testing.expect(replacement_pin.eql(review_page.PinnedSelectionBasis.init(page.basis.?)));
 
     // Candidate construction failure must leave the prior candidate and pin
     // byte-for-byte authoritative while ending only the live drag.

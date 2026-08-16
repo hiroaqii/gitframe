@@ -7,7 +7,7 @@ const app_mod = @import("../../app.zig");
 const app_commit_panel = @import("../commit_panel.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const app_test_support = @import("../test_support.zig");
-const compare_navigation = @import("../pages/compare/navigation.zig");
+const review_navigation = @import("../pages/review/navigation.zig");
 const changes_navigation = @import("../pages/changes/navigation.zig");
 const changes_reload = @import("../pages/changes/reload.zig");
 const changes_authority = @import("../diff_surface/authority.zig");
@@ -78,7 +78,7 @@ fn changesReload(app: *App) changes_reload.Controller {
     };
 }
 
-fn retainedCompareAppForViewTest(
+fn retainedReviewAppForViewTest(
     allocator: std.mem.Allocator,
     terminal_size: chasen.Size,
     mode: diff_render.DisplayMode,
@@ -86,10 +86,10 @@ fn retainedCompareAppForViewTest(
 ) !App {
     var app: App = .{
         .allocator = allocator,
-        .active_page = .compare,
+        .active_page = .review,
         .terminal_size = terminal_size,
         .theme = paletteWithOverride(.pane_cursor_bg, .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } }),
-        .pages = .{ .compare = .{
+        .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .sidebar_hidden = true, .display_mode = mode },
             .basis = .{
@@ -106,7 +106,7 @@ fn retainedCompareAppForViewTest(
             },
         } },
     };
-    errdefer app.pages.compare.deinit(allocator);
+    errdefer app.pages.review.deinit(allocator);
     const drag: diff_selection.DragSelection = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .side = side,
@@ -115,18 +115,18 @@ fn retainedCompareAppForViewTest(
         .focus = .{ .hunk_index = 0, .line_index = 3 },
         .moved = true,
     };
-    app.pages.compare.completed_selection = try @import("../diff_surface/selection.zig").buildParsed(allocator, .{
+    app.pages.review.completed_selection = try @import("../diff_surface/selection.zig").buildParsed(allocator, .{
         .repo_epoch = 0,
         .root_identity = null,
-        .source = @import("../diff_surface/selection.zig").SourceBasis.init(.{ .range = "compare" }),
-        .source_session_revision = app.pages.compare.source_session_revision,
+        .source = @import("../diff_surface/selection.zig").SourceBasis.init(.{ .range = "review" }),
+        .source_session_revision = app.pages.review.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
     }, app_test_support.loadedDiffOne().document.files[0], drag);
-    try std.testing.expect(app.pages.compare.installPinnedSelectionBasis());
+    try std.testing.expect(app.pages.review.installPinnedSelectionBasis());
 
     const body_size = app_shell_layout.compute(terminal_size, .{ .page_bar_visible = true }).bodySize();
-    const controller: compare_navigation.Controller = .{
-        .page = &app.pages.compare,
+    const controller: review_navigation.Controller = .{
+        .page = &app.pages.review,
         .repo_root = null,
         .repo_epoch = 0,
         .root_identity = null,
@@ -216,7 +216,7 @@ test "load empty state shows actionable no changes message" {
     try app_test_support.expectSnapshotContains(&ts, "Press r to reload or q to quit.");
 }
 
-test "Compare retained actions render at gate sizes for unified and both side-by-side sides" {
+test "Review retained actions render at gate sizes for unified and both side-by-side sides" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
         size: chasen.Size,
@@ -229,8 +229,8 @@ test "Compare retained actions render at gate sizes for unified and both side-by
         .{ .size = .{ .width = 120, .height = 32 }, .mode = .side_by_side, .side = .new },
     };
     for (cases) |case| {
-        var app = try retainedCompareAppForViewTest(allocator, case.size, case.mode, case.side);
-        defer app.pages.compare.deinit(allocator);
+        var app = try retainedReviewAppForViewTest(allocator, case.size, case.mode, case.side);
+        defer app.pages.review.deinit(allocator);
         var surface: chasen.testing.TestSurface = undefined;
         try surface.init(case.size.width, case.size.height);
         defer surface.deinit();

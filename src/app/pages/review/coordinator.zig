@@ -1,6 +1,6 @@
-//! Compare-page input, task, and completion coordination.
+//! Review-page input, task, and completion coordination.
 //!
-//! The controller is a short-lived composition over the retained Compare page
+//! The controller is a short-lived composition over the retained Review page
 //! and a read-only repository snapshot. It owns task terminals and translates
 //! page-local commands into typed clipboard effects without importing App.
 
@@ -15,19 +15,19 @@ const repo_session = @import("../../repo_session.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const diff_selection = @import("../../../diff/selection.zig");
-const compare_page = @import("../compare.zig");
-const compare_input = @import("input.zig");
-const compare_navigation = @import("navigation.zig");
+const review_page = @import("../review.zig");
+const review_input = @import("input.zig");
+const review_navigation = @import("navigation.zig");
 
-const CompareLoadTask = app_load.CompareLoadTask(app_message.Msg);
-const BranchListTask = app_load.CompareBranchListLoadTask(app_message.Msg);
+const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
+const BranchListTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
 
 pub const Redraw = enum {
     default,
     skip,
 };
 
-/// Clipboard text may borrow the accepted Compare snapshot or own a short
+/// Clipboard text may borrow the accepted Review snapshot or own a short
 /// allocation. Root consumes the effect synchronously before `deinit`.
 pub const ClipboardEffect = struct {
     origin: effect_origin.Origin,
@@ -58,13 +58,13 @@ pub const UpdateOutcome = struct {
 };
 
 pub const Controller = struct {
-    page_state: *compare_page.ComparePageState,
+    page_state: *review_page.ReviewPageState,
     repo: repo_session.View,
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
     env_map: ?*std.process.Environ.Map,
 
-    pub fn navigation(self: Controller) compare_navigation.Controller {
+    pub fn navigation(self: Controller) review_navigation.Controller {
         return .{
             .page = self.page_state,
             .repo_root = self.repo.activeRoot(),
@@ -75,7 +75,7 @@ pub const Controller = struct {
         };
     }
 
-    pub fn navigationView(self: Controller) compare_navigation.View {
+    pub fn navigationView(self: Controller) review_navigation.View {
         return .{
             .page = self.page_state,
             .repo_root = self.repo.activeRoot(),
@@ -89,7 +89,7 @@ pub const Controller = struct {
     pub fn update(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        msg: compare_input.Msg,
+        msg: review_input.Msg,
     ) !UpdateOutcome {
         switch (msg) {
             .shared => |shared_msg| {
@@ -123,17 +123,17 @@ pub const Controller = struct {
             .base_picker_enter_query => self.page_state.base_picker.enterQuery(),
             .base_picker_leave_query => self.page_state.base_picker.leaveQuery(),
             .base_picker_clear_query => self.page_state.base_picker.clearQuery(ctx.allocator()) catch
-                self.page_state.status.set("Could not clear Compare base search", .{}),
+                self.page_state.status.set("Could not clear Review base search", .{}),
             .base_picker_insert => |codepoint| self.page_state.base_picker.insertQuery(ctx.allocator(), codepoint) catch
-                self.page_state.status.set("Could not update Compare base search", .{}),
+                self.page_state.status.set("Could not update Review base search", .{}),
             .base_picker_backspace => self.page_state.base_picker.backspaceQuery(ctx.allocator()) catch
-                self.page_state.status.set("Could not update Compare base search", .{}),
+                self.page_state.status.set("Could not update Review base search", .{}),
             .base_picker_previous => self.page_state.base_picker.moveSelection(-1),
             .base_picker_next => self.page_state.base_picker.moveSelection(1),
             .choose_base => if (try self.page_state.chooseBasePickerTarget(ctx.allocator())) try self.refresh(ctx),
             .copy_current_line => return self.copyCurrentLine(),
             .copy_current_hunk => return try self.copyCurrentHunk(ctx.allocator()),
-            .branch_switch_unavailable => self.page_state.status.set("branch switching is not available in Compare", .{}),
+            .branch_switch_unavailable => self.page_state.status.set("branch switching is not available in Review", .{}),
         }
         return .{};
     }
@@ -148,11 +148,11 @@ pub const Controller = struct {
         self.page_state.clearRefreshFailure(ctx.allocator());
 
         const request = self.page_state.beginRefresh() orelse return;
-        const task = ctx.allocator().create(CompareLoadTask) catch |err| {
-            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not allocate Compare load task");
+        const task = ctx.allocator().create(ReviewLoadTask) catch |err| {
+            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not allocate Review load task");
             return err;
         };
-        task.* = CompareLoadTask.init(
+        task.* = ReviewLoadTask.init(
             request.identity,
             request.generation,
             capability.*,
@@ -161,12 +161,12 @@ pub const Controller = struct {
             ctx.allocator(),
         ) catch |err| {
             ctx.allocator().destroy(task);
-            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not prepare Compare load task");
+            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not prepare Review load task");
             return err;
         };
-        ctx.task().spawnWith(.{ .ctx = task, .run = CompareLoadTask.run, .failed = CompareLoadTask.failed }) catch |err| {
+        ctx.task().spawnWith(.{ .ctx = task, .run = ReviewLoadTask.run, .failed = ReviewLoadTask.failed }) catch |err| {
             task.destroy(ctx.allocator());
-            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not start Compare load task");
+            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not start Review load task");
             return err;
         };
     }
@@ -174,7 +174,7 @@ pub const Controller = struct {
     pub fn finishLoad(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        result: app_load.CompareLoadFinished,
+        result: app_load.ReviewLoadFinished,
     ) !Redraw {
         var finished = result;
         defer finished.deinit(ctx.allocator());
@@ -204,7 +204,7 @@ pub const Controller = struct {
             self.page_state.failRefresh(ctx.allocator(), .{
                 .identity = finished.identity,
                 .generation = finished.generation,
-            }, self.repo.epoch(), "Could not apply Compare load");
+            }, self.repo.epoch(), "Could not apply Review load");
             self.clearRefreshAnchor(ctx.allocator());
             return err;
         };
@@ -238,7 +238,7 @@ pub const Controller = struct {
     pub fn finishBranchList(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: app_load.CompareBranchListFinished,
+        result: app_load.ReviewBranchListFinished,
     ) Redraw {
         var finished = result;
         defer finished.deinit(allocator);
@@ -265,11 +265,11 @@ pub const Controller = struct {
     fn startBasePicker(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         const request = self.page_state.beginBasePicker(ctx.allocator()) orelse return;
         const capability = self.repo.activeCapability() orelse {
-            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Compare base picker requires a repository");
+            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Review base picker requires a repository");
             return;
         };
         const task = ctx.allocator().create(BranchListTask) catch |err| {
-            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not allocate Compare base list task");
+            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not allocate Review base list task");
             return err;
         };
         task.* = BranchListTask.init(
@@ -279,12 +279,12 @@ pub const Controller = struct {
             self.env_map,
         ) catch |err| {
             ctx.allocator().destroy(task);
-            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not prepare Compare base list task");
+            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not prepare Review base list task");
             return err;
         };
         ctx.task().spawnWith(.{ .ctx = task, .run = BranchListTask.run, .failed = BranchListTask.failed }) catch |err| {
             task.destroy(ctx.allocator());
-            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not start Compare base list task");
+            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not start Review base list task");
             return err;
         };
     }
@@ -342,7 +342,7 @@ pub const Controller = struct {
     fn effectOrigin(self: Controller) effect_origin.PageOrigin {
         const identity = self.page_state.activation.currentIdentity();
         return .{
-            .page_id = .compare,
+            .page_id = .review,
             .repo_epoch = if (identity) |value| value.repo_epoch else self.repo.epoch(),
             .activation_id = if (identity) |value| value.activation_id else self.page_state.activation.next_activation_id,
         };
@@ -376,7 +376,7 @@ fn semanticViewportLoadedFinished(
     generation: u64,
     base_byte: u8,
     head_byte: u8,
-) !app_load.CompareLoadFinished {
+) !app_load.ReviewLoadFinished {
     const full_ref = try allocator.dupe(u8, "refs/heads/main");
     errdefer allocator.free(full_ref);
     const display_name = try allocator.dupe(u8, "main");
@@ -404,22 +404,22 @@ fn semanticViewportLoadedFinished(
     };
 }
 
-test "Compare changed reload restores semantic viewport after removing retained actions" {
+test "Review changed reload restores semantic viewport after removing retained actions" {
     const allocator = std.testing.allocator;
     var repo: repo_session.State = .{};
     defer repo.deinit(allocator);
-    var compare: compare_page.ComparePageState = .{};
-    defer compare.deinit(allocator);
-    _ = compare.activate(repo.repo_epoch);
+    var review: review_page.ReviewPageState = .{};
+    defer review.deinit(allocator);
+    _ = review.activate(repo.repo_epoch);
     const controller: Controller = .{
-        .page_state = &compare,
+        .page_state = &review,
         .repo = repo.view(),
         .layout = .{ .width = 80, .height = 9 },
         .env_map = null,
     };
     var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
 
-    const initial = compare.beginRefresh().?;
+    const initial = review.beginRefresh().?;
     try std.testing.expectEqual(
         Redraw.default,
         try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
@@ -430,10 +430,10 @@ test "Compare changed reload restores semantic viewport after removing retained 
             'b',
         )),
     );
-    compare.viewer.selected_target = .{ .diff_file = 0 };
-    compare.viewer.selected_node = 0;
-    compare.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 5 } };
-    compare.selection_owner = .{ .diff = diff_selection.DragSelection{
+    review.viewer.selected_target = .{ .diff_file = 0 };
+    review.viewer.selected_node = 0;
+    review.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 5 } };
+    review.selection_owner = .{ .diff = diff_selection.DragSelection{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
         .side = .new,
         .mode = .line,
@@ -442,8 +442,8 @@ test "Compare changed reload restores semantic viewport after removing retained 
         .moved = true,
     } };
     const outgoing_view = controller.navigationView();
-    compare.replaceRefreshAnchor(allocator, try outgoing_view.captureAnchor(allocator));
-    const replacement = compare.beginRefresh().?;
+    review.replaceRefreshAnchor(allocator, try outgoing_view.captureAnchor(allocator));
+    const replacement = review.beginRefresh().?;
     try std.testing.expectEqual(
         Redraw.default,
         try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
@@ -454,63 +454,63 @@ test "Compare changed reload restores semantic viewport after removing retained 
             'd',
         )),
     );
-    try std.testing.expect(compare.deferred_load_apply != null);
-    try std.testing.expect(compare.completed_selection == null);
+    try std.testing.expect(review.deferred_load_apply != null);
+    try std.testing.expect(review.completed_selection == null);
 
-    const scroll_before_auto = compare.viewer.diff_scroll;
+    const scroll_before_auto = review.viewer.diff_scroll;
     var auto = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_auto_scroll_step = .{
         .direction = .down,
         .endpoint = .{ .col = 20, .row = 8 },
     } } });
     defer auto.deinit(allocator);
     try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, auto.auto_scroll.?);
-    try std.testing.expectEqual(scroll_before_auto + 1, compare.viewer.diff_scroll);
-    try std.testing.expect(compare.deferred_load_apply != null);
+    try std.testing.expectEqual(scroll_before_auto + 1, review.viewer.diff_scroll);
+    try std.testing.expect(review.deferred_load_apply != null);
 
     var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
     defer release.deinit(allocator);
-    try std.testing.expect(compare.completed_selection != null);
-    try std.testing.expect(compare.pinned_selection_basis != null);
+    try std.testing.expect(review.completed_selection != null);
+    try std.testing.expect(review.pinned_selection_basis != null);
 
     var outgoing_resolver = outgoing_view.resolver();
     const outgoing_body = outgoing_view.bodyView(&outgoing_resolver);
     const projection = outgoing_body.selectionActionProjection() orelse return error.ExpectedSelectionActionProjection;
-    compare.viewer.diff_scroll = projection.insertionOffset();
+    review.viewer.diff_scroll = projection.insertionOffset();
     const outgoing_anchor = outgoing_body.captureSelectionViewportAnchor() orelse return error.ExpectedSelectionViewport;
     try std.testing.expectEqual(
         Redraw.default,
         try controller.applyDeferred(&ctx),
     );
-    try std.testing.expect(compare.deferred_load_apply == null);
-    try std.testing.expect(compare.completed_selection == null);
-    try std.testing.expect(compare.pinned_selection_basis == null);
+    try std.testing.expect(review.deferred_load_apply == null);
+    try std.testing.expect(review.completed_selection == null);
+    try std.testing.expect(review.pinned_selection_basis == null);
 
     const incoming_view = controller.navigationView();
     var incoming_resolver = incoming_view.resolver();
     const incoming_body = incoming_view.bodyView(&incoming_resolver);
     const expected_scroll = incoming_body.restoreSelectionViewportAnchor(outgoing_anchor);
     try std.testing.expect(expected_scroll != outgoing_anchor.raw_presentation_scroll);
-    try std.testing.expectEqual(expected_scroll, compare.viewer.diff_scroll);
+    try std.testing.expectEqual(expected_scroll, review.viewer.diff_scroll);
 }
 
-test "Compare deferred exact and stale completions reconcile only after release" {
+test "Review deferred exact and stale completions reconcile only after release" {
     const allocator = std.testing.allocator;
 
     {
         var repo: repo_session.State = .{};
         defer repo.deinit(allocator);
-        var compare: compare_page.ComparePageState = .{};
-        defer compare.deinit(allocator);
-        _ = compare.activate(repo.repo_epoch);
+        var review: review_page.ReviewPageState = .{};
+        defer review.deinit(allocator);
+        _ = review.activate(repo.repo_epoch);
         const controller: Controller = .{
-            .page_state = &compare,
+            .page_state = &review,
             .repo = repo.view(),
             .layout = .{ .width = 80, .height = 9 },
             .env_map = null,
         };
         var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
 
-        const initial = compare.beginRefresh().?;
+        const initial = review.beginRefresh().?;
         try std.testing.expectEqual(
             Redraw.default,
             try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
@@ -521,10 +521,10 @@ test "Compare deferred exact and stale completions reconcile only after release"
                 'b',
             )),
         );
-        compare.viewer.selected_target = .{ .diff_file = 0 };
-        compare.viewer.selected_node = 0;
-        compare.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 5 } };
-        compare.selection_owner = .{ .diff = .{
+        review.viewer.selected_target = .{ .diff_file = 0 };
+        review.viewer.selected_node = 0;
+        review.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 5 } };
+        review.selection_owner = .{ .diff = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
             .side = .new,
             .mode = .line,
@@ -532,8 +532,8 @@ test "Compare deferred exact and stale completions reconcile only after release"
             .focus = .{ .hunk_index = 0, .line_index = 5 },
             .moved = true,
         } };
-        compare.replaceRefreshAnchor(allocator, try controller.navigationView().captureAnchor(allocator));
-        const exact = compare.beginRefresh().?;
+        review.replaceRefreshAnchor(allocator, try controller.navigationView().captureAnchor(allocator));
+        const exact = review.beginRefresh().?;
         try std.testing.expectEqual(
             Redraw.default,
             try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
@@ -544,46 +544,46 @@ test "Compare deferred exact and stale completions reconcile only after release"
                 'b',
             )),
         );
-        try std.testing.expect(compare.deferred_load_apply != null);
+        try std.testing.expect(review.deferred_load_apply != null);
 
         var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
         defer release.deinit(allocator);
-        const retained_ptr = compare.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
-        const retained_token = compare.completed_selection.?.token;
-        const retained_pin = compare.pinned_selection_basis.?;
+        const retained_ptr = review.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
+        const retained_token = review.completed_selection.?.token;
+        const retained_pin = review.pinned_selection_basis.?;
         try std.testing.expectEqual(
             Redraw.default,
             try controller.applyDeferred(&ctx),
         );
-        try std.testing.expect(compare.deferred_load_apply == null);
+        try std.testing.expect(review.deferred_load_apply == null);
         try std.testing.expectEqual(
             retained_ptr,
-            compare.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr,
+            review.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr,
         );
-        try std.testing.expect(compare.completed_selection.?.token.source_session_revision > retained_token.source_session_revision);
+        try std.testing.expect(review.completed_selection.?.token.source_session_revision > retained_token.source_session_revision);
         try std.testing.expectEqual(
-            compare.source_session_revision,
-            compare.completed_selection.?.token.source_session_revision,
+            review.source_session_revision,
+            review.completed_selection.?.token.source_session_revision,
         );
-        try std.testing.expect(compare.pinned_selection_basis.?.eql(retained_pin));
-        try std.testing.expect(compare.retainedSelectionAdmitted());
+        try std.testing.expect(review.pinned_selection_basis.?.eql(retained_pin));
+        try std.testing.expect(review.retainedSelectionAdmitted());
     }
 
     {
         var repo: repo_session.State = .{};
         defer repo.deinit(allocator);
-        var compare: compare_page.ComparePageState = .{};
-        defer compare.deinit(allocator);
-        _ = compare.activate(repo.repo_epoch);
+        var review: review_page.ReviewPageState = .{};
+        defer review.deinit(allocator);
+        _ = review.activate(repo.repo_epoch);
         const controller: Controller = .{
-            .page_state = &compare,
+            .page_state = &review,
             .repo = repo.view(),
             .layout = .{ .width = 80, .height = 9 },
             .env_map = null,
         };
         var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
 
-        const initial = compare.beginRefresh().?;
+        const initial = review.beginRefresh().?;
         try std.testing.expectEqual(
             Redraw.default,
             try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
@@ -594,9 +594,9 @@ test "Compare deferred exact and stale completions reconcile only after release"
                 'b',
             )),
         );
-        compare.viewer.selected_target = .{ .diff_file = 0 };
-        compare.viewer.selected_node = 0;
-        compare.selection_owner = .{ .diff = .{
+        review.viewer.selected_target = .{ .diff_file = 0 };
+        review.viewer.selected_node = 0;
+        review.selection_owner = .{ .diff = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
             .side = .new,
             .mode = .line,
@@ -604,8 +604,8 @@ test "Compare deferred exact and stale completions reconcile only after release"
             .focus = .{ .hunk_index = 0, .line_index = 5 },
             .moved = true,
         } };
-        compare.replaceRefreshAnchor(allocator, try controller.navigationView().captureAnchor(allocator));
-        const old = compare.beginRefresh().?;
+        review.replaceRefreshAnchor(allocator, try controller.navigationView().captureAnchor(allocator));
+        const old = review.beginRefresh().?;
         try std.testing.expectEqual(
             Redraw.default,
             try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
@@ -616,25 +616,25 @@ test "Compare deferred exact and stale completions reconcile only after release"
                 'd',
             )),
         );
-        try std.testing.expect(compare.deferred_load_apply != null);
-        _ = compare.beginRefresh().?;
+        try std.testing.expect(review.deferred_load_apply != null);
+        _ = review.beginRefresh().?;
 
         var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
         defer release.deinit(allocator);
-        const retained_ptr = compare.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
-        const retained_token = compare.completed_selection.?.token;
-        const retained_pin = compare.pinned_selection_basis.?;
-        const retained_revision = compare.source_session_revision;
+        const retained_ptr = review.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
+        const retained_token = review.completed_selection.?.token;
+        const retained_pin = review.pinned_selection_basis.?;
+        const retained_revision = review.source_session_revision;
         try std.testing.expectEqual(Redraw.skip, try controller.applyDeferred(&ctx));
-        try std.testing.expect(compare.deferred_load_apply == null);
+        try std.testing.expect(review.deferred_load_apply == null);
         try std.testing.expectEqual(
             retained_ptr,
-            compare.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr,
+            review.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr,
         );
-        try std.testing.expect(compare.completed_selection.?.token.eql(retained_token));
-        try std.testing.expect(compare.pinned_selection_basis.?.eql(retained_pin));
-        try std.testing.expectEqual(retained_revision, compare.source_session_revision);
-        try std.testing.expect(compare.refresh_anchor != null);
-        try std.testing.expect(compare.retainedSelectionAdmitted());
+        try std.testing.expect(review.completed_selection.?.token.eql(retained_token));
+        try std.testing.expect(review.pinned_selection_basis.?.eql(retained_pin));
+        try std.testing.expectEqual(retained_revision, review.source_session_revision);
+        try std.testing.expect(review.refresh_anchor != null);
+        try std.testing.expect(review.retainedSelectionAdmitted());
     }
 }

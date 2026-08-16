@@ -1,13 +1,13 @@
-//! Compare presentation built exclusively from shared diff-surface renderers.
+//! Review presentation built exclusively from shared diff-surface renderers.
 
 const std = @import("std");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
 const draw = @import("draw");
 const theme = @import("theme");
-const compare_page = @import("../compare.zig");
+const review_page = @import("../review.zig");
 const commit_time = @import("../../branch_commit_time.zig");
-const compare_navigation = @import("navigation.zig");
+const review_navigation = @import("navigation.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const diff_render = @import("../../../diff/render.zig");
 const keymap = @import("keymap");
@@ -15,7 +15,7 @@ const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 
 pub const Context = struct {
-    page: *const compare_page.ComparePageState,
+    page: *const review_page.ReviewPageState,
     palette: theme.Palette,
     repo_root: ?[]const u8,
     repo_epoch: u64,
@@ -27,7 +27,7 @@ pub const Context = struct {
         const navigation = navigationView(self);
         var resolver = navigation.resolver();
         return diff_surface.view.footer(.{
-            .surface = self.page.readSurface(.{ .range = "compare" }, self.layout),
+            .surface = self.page.readSurface(.{ .range = "review" }, self.layout),
             .auto_reload_enabled = false,
             .selection_action_visible = navigation.bodyView(&resolver).retainedSelectionActionAvailable(),
         });
@@ -43,17 +43,17 @@ pub fn pageHeaderPresentation(app: Context) ?page_header.Presentation {
         app.page.load_failure != null or
         sourceFailed(app.page);
     const identity = app.page.accepted_repository_identity orelse
-        return compareTerminal(pending, failed);
+        return reviewTerminal(pending, failed);
     if (!identity.matches(app.repo_epoch, app.root_identity))
-        return compareTerminal(pending, failed);
+        return reviewTerminal(pending, failed);
 
-    const basis = app.page.basis orelse return compareTerminal(pending, failed);
-    const target = app.page.base_target orelse return compareTerminal(pending, failed);
+    const basis = app.page.basis orelse return reviewTerminal(pending, failed);
+    const target = app.page.base_target orelse return reviewTerminal(pending, failed);
     if (!std.mem.eql(u8, target.full_ref, basis.base.full_ref))
-        return compareTerminal(pending, failed);
-    if (!app.page.hasAcceptedDisplay()) return compareTerminal(pending, failed);
+        return reviewTerminal(pending, failed);
+    if (!app.page.hasAcceptedDisplay()) return reviewTerminal(pending, failed);
 
-    return .{ .compare = .{
+    return .{ .review = .{
         .base_display_name = basis.base.display_name,
         .head_display_name = basis.head_display,
         .freshness = if (pending)
@@ -65,23 +65,23 @@ pub fn pageHeaderPresentation(app: Context) ?page_header.Presentation {
     } };
 }
 
-fn sourcePending(page: *const compare_page.ComparePageState) bool {
+fn sourcePending(page: *const review_page.ReviewPageState) bool {
     return switch (page.activation.state) {
         .active => |active| active.members.source == .pending,
         .inactive => false,
     };
 }
 
-fn sourceFailed(page: *const compare_page.ComparePageState) bool {
+fn sourceFailed(page: *const review_page.ReviewPageState) bool {
     return switch (page.activation.state) {
         .active => |active| active.members.source == .failed,
         .inactive => false,
     };
 }
 
-fn compareTerminal(pending: bool, failed: bool) ?page_header.Presentation {
-    if (pending) return .{ .terminal = .{ .kind = .compare, .state = .loading } };
-    if (failed) return .{ .terminal = .{ .kind = .compare, .state = .unavailable } };
+fn reviewTerminal(pending: bool, failed: bool) ?page_header.Presentation {
+    if (pending) return .{ .terminal = .{ .kind = .review, .state = .loading } };
+    if (failed) return .{ .terminal = .{ .kind = .review, .state = .unavailable } };
     return null;
 }
 
@@ -104,7 +104,7 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
     }
 
     try diff_surface.view.view(surface, .{
-        .state = app.page.readSurface(.{ .range = "compare" }, app.layout),
+        .state = app.page.readSurface(.{ .range = "review" }, app.layout),
         .palette = app.palette,
         .source_label = "branch comparison",
         .repo_root = app.repo_root,
@@ -122,7 +122,7 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, 96),
         .dialog_height = @min(surface.size().height, 22),
-        .title = "Compare base",
+        .title = "Review base",
         .backdrop = false,
         .border = .rounded,
         .title_style = app.palette.boldStyle(.accent),
@@ -250,12 +250,12 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     const footer = if (picker.input_mode == .query)
         "Type: filter  Up/Down: move  Tab: command  Esc: clear"
     else
-        "/: filter  j/k: move  Enter: compare  Esc: close";
+        "/: filter  j/k: move  Enter: review  Esc: close";
     try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.palette.style(.accent));
 }
 
 const DiffPaneAdapter = struct {
-    context: compare_navigation.View,
+    context: review_navigation.View,
     palette: theme.Palette,
     mode_toggle_key: ?[]const u8,
 
@@ -277,7 +277,7 @@ const DiffPaneAdapter = struct {
     }
 };
 
-fn navigationView(app: Context) compare_navigation.View {
+fn navigationView(app: Context) review_navigation.View {
     var key_buffer: [16]u8 = undefined;
     return .{
         .page = app.page,
@@ -308,7 +308,7 @@ fn branchPresentation(app: Context, allocator: std.mem.Allocator) !?diff_surface
         try std.fmt.allocPrint(allocator, "stale  {s}", .{firstLine(message)})
     else
         firstLine(message) };
-    const basis = app.page.basis orelse return .{ .text = "resolving compare base..." };
+    const basis = app.page.basis orelse return .{ .text = "resolving review base..." };
     const pending = switch (app.page.activation.state) {
         .active => |active| active.members.source == .pending,
         .inactive => false,
@@ -340,7 +340,7 @@ fn viewInitialFailure(app: Context, surface: *chasen.Surface) !void {
     }
 }
 
-fn basisFailureText(allocator: std.mem.Allocator, failure: compare_page.BasisFailureState) ![]const u8 {
+fn basisFailureText(allocator: std.mem.Allocator, failure: review_page.BasisFailureState) ![]const u8 {
     return switch (failure.kind) {
         .missing_base_ref => try std.fmt.allocPrint(allocator, "base {s} not found", .{failure.attempted.display_name}),
         .no_merge_base => try std.fmt.allocPrint(allocator, "no merge base with {s} (shallow clone may have insufficient history)", .{failure.attempted.display_name}),
@@ -381,7 +381,7 @@ fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
     return @min(selected -| (visible / 2), len - visible);
 }
 
-test "empty Compare state distinguishes zero ahead commits from an empty net file diff" {
+test "empty Review state distinguishes zero ahead commits from an empty net file diff" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -390,9 +390,9 @@ test "empty Compare state distinguishes zero ahead commits from an empty net fil
     try std.testing.expectEqualStrings("No commits are ahead of main.", message.body);
 }
 
-test "Compare page header binds the accepted pair to repository and target" {
+test "Review page header binds the accepted pair to repository and target" {
     const allocator = std.testing.allocator;
-    var state: compare_page.ComparePageState = .{};
+    var state: review_page.ReviewPageState = .{};
     defer state.deinit(allocator);
     _ = state.activate(7);
     state.activation.state.active.members.source = .fresh;
@@ -441,7 +441,7 @@ test "Compare page header binds the accepted pair to repository and target" {
     state.activation.state.active.members.source = .pending;
     try std.testing.expect(pageHeaderPresentation(context).? == .terminal);
     context.repo_epoch = 7;
-    try std.testing.expect(pageHeaderPresentation(context).? == .compare);
+    try std.testing.expect(pageHeaderPresentation(context).? == .review);
 
     state.activation.state.active.members.source = .failed;
     const stale = pageHeaderPresentation(context).?;
@@ -453,7 +453,7 @@ test "Compare page header binds the accepted pair to repository and target" {
     try std.testing.expect(pageHeaderPresentation(context).? == .terminal);
 }
 
-test "empty Compare state describes one ahead commit accurately" {
+test "empty Review state describes one ahead commit accurately" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -462,7 +462,7 @@ test "empty Compare state describes one ahead commit accurately" {
     try std.testing.expectEqualStrings("1 commit is ahead of main, but its net file diff is empty.", message.body);
 }
 
-test "empty Compare state describes multiple ahead commits accurately" {
+test "empty Review state describes multiple ahead commits accurately" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -471,8 +471,8 @@ test "empty Compare state describes multiple ahead commits accurately" {
     try std.testing.expectEqualStrings("3 commits are ahead of origin/main, but their net file diff is empty.", message.body);
 }
 
-fn pickerPageForViewTest(allocator: std.mem.Allocator) !compare_page.ComparePageState {
-    var page_state: compare_page.ComparePageState = .{};
+fn pickerPageForViewTest(allocator: std.mem.Allocator) !review_page.ReviewPageState {
+    var page_state: review_page.ReviewPageState = .{};
     errdefer page_state.deinit(allocator);
     const specs = [_]struct {
         full_ref: []const u8,
@@ -526,7 +526,7 @@ fn pickerPageForViewTest(allocator: std.mem.Allocator) !compare_page.ComparePage
     return page_state;
 }
 
-fn pickerViewContext(page_state: *const compare_page.ComparePageState, width: u16, height: u16) Context {
+fn pickerViewContext(page_state: *const review_page.ReviewPageState, width: u16, height: u16) Context {
     return .{
         .page = page_state,
         .palette = .default(),
@@ -537,8 +537,8 @@ fn pickerViewContext(page_state: *const compare_page.ComparePageState, width: u1
     };
 }
 
-test "Compare display mode header key follows the effective keymap and modal owner" {
-    var page_state: compare_page.ComparePageState = .{};
+test "Review display mode header key follows the effective keymap and modal owner" {
+    var page_state: review_page.ReviewPageState = .{};
     var config: keymap.Config = .{};
     config.set(.toggle_display_mode, .{ .plain_codepoint = 'z' });
     var context = pickerViewContext(&page_state, 90, 10);
@@ -561,7 +561,7 @@ test "Compare display mode header key follows the effective keymap and modal own
     try std.testing.expect(displayModeToggleKey(context, buffer[0..]) == null);
 }
 
-test "Compare base picker narrow and wide surfaces keep time independent from long branch names" {
+test "Review base picker narrow and wide surfaces keep time independent from long branch names" {
     const allocator = std.testing.allocator;
     var page_state = try pickerPageForViewTest(allocator);
     defer page_state.deinit(allocator);
@@ -585,7 +585,7 @@ test "Compare base picker narrow and wide surfaces keep time independent from lo
     }
 }
 
-test "Compare base picker compact surface preserves filter candidate and footer before helper rows" {
+test "Review base picker compact surface preserves filter candidate and footer before helper rows" {
     const allocator = std.testing.allocator;
     var page_state = try pickerPageForViewTest(allocator);
     defer page_state.deinit(allocator);
@@ -606,7 +606,7 @@ test "Compare base picker compact surface preserves filter candidate and footer 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "last commit:") == null);
 }
 
-test "Compare base picker surface renders query no-match loading and failure terminals" {
+test "Review base picker surface renders query no-match loading and failure terminals" {
     const allocator = std.testing.allocator;
     var page_state = try pickerPageForViewTest(allocator);
     defer page_state.deinit(allocator);
@@ -637,14 +637,14 @@ test "Compare base picker surface renders query no-match loading and failure ter
     try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Esc: close") != null);
 
     page_state.base_picker.loading = false;
-    page_state.base_picker.failure = .{ .static = "Compare base list failed" };
+    page_state.base_picker.failure = .{ .static = "Review base list failed" };
     var failure: chasen.testing.TestSurface = undefined;
     try failure.init(80, 12);
     defer failure.deinit();
     try viewBasePicker(pickerViewContext(&page_state, 80, 12), &failure.surface);
     const failure_snapshot = try failure.snapshot(allocator);
     defer allocator.free(failure_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, failure_snapshot, "Compare base list failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failure_snapshot, "Review base list failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, failure_snapshot, "Filter:") != null);
     try std.testing.expect(std.mem.indexOf(u8, failure_snapshot, "Esc: close") != null);
 
