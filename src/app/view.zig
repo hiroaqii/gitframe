@@ -66,9 +66,16 @@ const StateMessage = struct {
     tone: StateTone = .muted,
 };
 
+const PageBarRemoteActions = struct {
+    keymap: keymap.Effective,
+    push: bool,
+    pull: bool,
+};
+
 const PageBarMetadata = struct {
     presentation: ?page_header.Presentation = null,
     line_stats: ?file_tree.Stats = null,
+    remote_actions: ?PageBarRemoteActions = null,
 };
 
 pub const Context = struct {
@@ -139,6 +146,7 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
             .{
                 .presentation = activePageHeaderPresentation(app),
                 .line_stats = activePageHeaderLineStats(app),
+                .remote_actions = activePageHeaderRemoteActions(app),
             },
             app.theme,
             &page_bar,
@@ -218,6 +226,27 @@ fn activePageHeaderLineStats(app: Context) ?file_tree.Stats {
     };
 }
 
+fn activePageHeaderRemoteActions(app: Context) ?PageBarRemoteActions {
+    if (app.active_page != .changes) return null;
+    if (app.changes.page.search.mode or app.changes.page.file_search.mode) return null;
+
+    const presentation = changes_view.pageHeaderPresentation(app.changes) orelse return null;
+    return switch (presentation) {
+        .head => |head| switch (head) {
+            .branch => |branch| .{
+                .keymap = app.keymap,
+                .push = true,
+                .pull = switch (branch.upstream) {
+                    .ahead => true,
+                    .no_upstream => false,
+                },
+            },
+            .detached, .unknown => null,
+        },
+        .review, .terminal => null,
+    };
+}
+
 fn viewPageBar(
     active: page.Id,
     compact: bool,
@@ -271,6 +300,60 @@ fn pageBarStatsText(surface: *chasen.Surface, stats: file_tree.Stats) ?PageBarSt
     };
 }
 
+const PageBarRemoteActionText = struct {
+    text: []const u8,
+    width: u16,
+};
+
+fn pageBarRemoteActionText(
+    surface: *chasen.Surface,
+    actions: PageBarRemoteActions,
+    available_width: u16,
+) ?PageBarRemoteActionText {
+    var push_buffer: [16]u8 = undefined;
+    var pull_buffer: [16]u8 = undefined;
+    const push_key = if (actions.push) actions.keymap.display(.push, push_buffer[0..]) else null;
+    const pull_key = if (actions.pull) actions.keymap.display(.pull, pull_buffer[0..]) else null;
+
+    if (push_key) |push| {
+        if (pull_key) |pull| {
+            if (pageBarRemoteActionCandidate(
+                surface,
+                available_width,
+                "({s}: push / {s}: pull)",
+                .{ push, pull },
+            )) |candidate| return candidate;
+        }
+        return pageBarRemoteActionCandidate(
+            surface,
+            available_width,
+            "({s}: push)",
+            .{push},
+        );
+    }
+    if (pull_key) |pull| {
+        return pageBarRemoteActionCandidate(
+            surface,
+            available_width,
+            "({s}: pull)",
+            .{pull},
+        );
+    }
+    return null;
+}
+
+fn pageBarRemoteActionCandidate(
+    surface: *chasen.Surface,
+    available_width: u16,
+    comptime format: []const u8,
+    args: anytype,
+) ?PageBarRemoteActionText {
+    const text = std.fmt.allocPrint(surface.frameAllocator(), format, args) catch return null;
+    const width = chasen.text.displayWidth(text);
+    if (width > available_width) return null;
+    return .{ .text = text, .width = width };
+}
+
 fn drawPageBarMetadata(metadata: PageBarMetadata, palette: theme.Palette, surface: *chasen.Surface) void {
     const size = surface.size();
     const context_start = page.tabExtent() +| 1;
@@ -278,27 +361,44 @@ fn drawPageBarMetadata(metadata: PageBarMetadata, palette: theme.Palette, surfac
 
     // All page metadata keeps one terminal cell clear at the right edge.
     var context_right = size.width - 1;
-    if (metadata.line_stats) |stats| if (pageBarStatsText(surface, stats)) |text| {
-        const stats_right = context_right;
-        if (text.total_width <= stats_right -| context_start) {
-            const stats_col = stats_right - text.total_width;
-            draw.copyClippedTextAt(
-                surface,
-                stats_col,
-                shell_layout.page_bar_label_row,
-                text.added,
-                .{ .fg = palette.color(.success), .bold = true },
-            ) catch {};
-            draw.copyClippedTextAt(
-                surface,
-                stats_col +| text.added_width +| 1,
-                shell_layout.page_bar_label_row,
-                text.removed,
-                .{ .fg = palette.color(.danger), .bold = true },
-            ) catch {};
-            context_right = stats_col -| 2;
-        }
+    const stats_text = if (metadata.line_stats) |stats| pageBarStatsText(surface, stats) else null;
+    const metadata_width = context_right -| context_start;
+    const stats_drawable = if (stats_text) |text| text.total_width <= metadata_width else false;
+
+    var action_width = metadata_width;
+    if (stats_drawable) action_width -|= stats_text.?.total_width +| 2;
+    if (metadata.remote_actions) |actions| if (pageBarRemoteActionText(surface, actions, action_width)) |text| {
+        const action_col = context_right - text.width;
+        draw.copyClippedTextAt(
+            surface,
+            action_col,
+            shell_layout.page_bar_label_row,
+            text.text,
+            palette.style(.muted),
+        ) catch {};
+        context_right = action_col -| 2;
     };
+
+    if (stats_drawable) {
+        const text = stats_text.?;
+        const stats_right = context_right;
+        const stats_col = stats_right - text.total_width;
+        draw.copyClippedTextAt(
+            surface,
+            stats_col,
+            shell_layout.page_bar_label_row,
+            text.added,
+            .{ .fg = palette.color(.success), .bold = true },
+        ) catch {};
+        draw.copyClippedTextAt(
+            surface,
+            stats_col +| text.added_width +| 1,
+            shell_layout.page_bar_label_row,
+            text.removed,
+            .{ .fg = palette.color(.danger), .bold = true },
+        ) catch {};
+        context_right = stats_col -| 2;
+    }
 
     const value = metadata.presentation orelse return;
     if (context_start >= context_right) return;
@@ -2454,7 +2554,7 @@ test "page bar renders repository context after tabs and omits it in compact mod
     try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "HEAD ") == null);
 }
 
-test "page bar moves diff totals to the header with one-cell right padding" {
+test "page bar shows diff totals before remote actions with one-cell right padding" {
     const presentation: page_header.Presentation = .{ .head = .{ .branch = .{
         .display_name = "main",
         .upstream = .{ .ahead = 0 },
@@ -2468,22 +2568,51 @@ test "page bar moves diff totals to the header with one-cell right padding" {
     viewPageBar(.changes, false, .{
         .presentation = presentation,
         .line_stats = .{ .added = 39, .removed = 710 },
+        .remote_actions = .{ .keymap = .{}, .push = true, .pull = true },
     }, palette, &ts.surface);
 
-    try ts.expectCellText(87, shell_layout.page_bar_label_row, "+");
-    try ts.expectCellText(91, shell_layout.page_bar_label_row, "-");
+    const action_text = "(P: push / U: pull)";
+    const action_col = ts.surface.size().width - 1 - chasen.text.displayWidth(action_text);
+    const stats_col = action_col - 2 - chasen.text.displayWidth("+39 -710");
+    try ts.expectCellText(stats_col, shell_layout.page_bar_label_row, "+");
+    try ts.expectCellText(stats_col + 4, shell_layout.page_bar_label_row, "-");
+    try ts.expectCellText(action_col, shell_layout.page_bar_label_row, "(");
     try ts.expectCellText(95, shell_layout.page_bar_label_row, " ");
-    const added = ts.surface.readCell(87, shell_layout.page_bar_label_row) orelse return error.ExpectedAddedStats;
-    const removed = ts.surface.readCell(91, shell_layout.page_bar_label_row) orelse return error.ExpectedRemovedStats;
+    const added = ts.surface.readCell(stats_col, shell_layout.page_bar_label_row) orelse return error.ExpectedAddedStats;
+    const removed = ts.surface.readCell(stats_col + 4, shell_layout.page_bar_label_row) orelse return error.ExpectedRemovedStats;
+    const action = ts.surface.readCell(action_col, shell_layout.page_bar_label_row) orelse return error.ExpectedRemoteActionHint;
     try std.testing.expect(added.style.fg.eql(palette.color(.success)));
     try std.testing.expect(added.style.bold);
     try std.testing.expect(removed.style.fg.eql(palette.color(.danger)));
     try std.testing.expect(removed.style.bold);
+    try std.testing.expect(action.style.eql(palette.style(.muted)));
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710  (P: push / U: pull)") != null);
+}
+
+test "page bar remote actions follow configured keys and width fallback" {
+    var config: keymap.Config = .{};
+    config.set(.push, .{ .ctrl = .s });
+    config.set(.pull, .{ .ctrl = .q });
+    const actions: PageBarRemoteActions = .{
+        .keymap = keymap.Effective.fromConfig(config),
+        .push = true,
+        .pull = true,
+    };
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(80, 1);
+    defer ts.deinit();
+
+    const full = pageBarRemoteActionText(&ts.surface, actions, 80).?;
+    try std.testing.expectEqualStrings("(Ctrl+s: push / Ctrl+q: pull)", full.text);
+
+    const push_only_width = chasen.text.displayWidth("(Ctrl+s: push)");
+    const fallback = pageBarRemoteActionText(&ts.surface, actions, push_only_width).?;
+    try std.testing.expectEqualStrings("(Ctrl+s: push)", fallback.text);
 }
 
 test "page bar preserves every tab when context is too narrow" {
