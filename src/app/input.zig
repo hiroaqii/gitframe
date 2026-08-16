@@ -634,6 +634,100 @@ test "root selection preflight routes Repository owners before configured action
     );
 }
 
+test "root selection preflight consumes document navigation only for live owners" {
+    const keys = [_]chasen.Key{
+        .{ .codepoint = 'g' },
+        .{ .codepoint = 'G' },
+        .{ .codepoint = 'u', .mods = .{ .ctrl = true } },
+        .{ .codepoint = 'd', .mods = .{ .ctrl = true } },
+        .{ .codepoint = 'b', .mods = .{ .ctrl = true } },
+        .{ .codepoint = 'f', .mods = .{ .ctrl = true } },
+    };
+    for (keys) |key| {
+        try std.testing.expectEqual(
+            reviewMsg(.selection_owned_noop),
+            keyToMsg(.{ .review = .{ .selection_owner = .mouse } }, key).?,
+        );
+        try std.testing.expectEqual(
+            app_message.Msg{ .compare = .{ .shared = .selection_owned_noop } },
+            keyToMsg(.{ .active_page = .compare, .compare = .{ .selection_owner = .header } }, key).?,
+        );
+        try std.testing.expectEqual(
+            app_message.Msg{ .repository = .selection_owned_noop },
+            keyToMsg(.{ .active_page = .repository, .repository = .{ .selection_owner = .keyboard_line } }, key).?,
+        );
+    }
+
+    var config: keymap.Config = .{};
+    config.set(.document_first, .{ .plain_codepoint = 'z' });
+    const custom = keymap.Effective.fromConfig(config);
+    const z = chasen.Key{ .codepoint = 'z' };
+    try std.testing.expectEqual(reviewMsg(.selection_owned_noop), keyToMsg(.{
+        .keymap = custom,
+        .review = .{ .selection_owner = .mouse, .keymap = custom },
+    }, z).?);
+    try std.testing.expectEqual(app_message.Msg{ .compare = .{ .shared = .selection_owned_noop } }, keyToMsg(.{
+        .active_page = .compare,
+        .keymap = custom,
+        .compare = .{ .selection_owner = .mouse, .keymap = custom },
+    }, z).?);
+    try std.testing.expectEqual(app_message.Msg{ .repository = .selection_owned_noop }, keyToMsg(.{
+        .active_page = .repository,
+        .keymap = custom,
+        .repository = .{ .selection_owner = .mouse, .keymap = custom },
+    }, z).?);
+
+    try std.testing.expect(keyToMsg(.{ .review = .{ .retained_selection_action_available = true } }, .{ .codepoint = 'g' }) == null);
+    try std.testing.expect(keyToMsg(.{ .active_page = .compare, .compare = .{ .retained_selection_action_available = true } }, .{ .codepoint = 'g' }) == null);
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .source_first },
+        keyToMsg(.{ .active_page = .repository, .repository = .{
+            .focus = .source,
+            .source_available = true,
+            .retained_selection_action_available = true,
+        } }, .{ .codepoint = 'g' }).?,
+    );
+
+    var overlap_config: keymap.Config = .{};
+    overlap_config.set(.copy_current_line, .{ .plain_codepoint = 'x' });
+    overlap_config.set(.document_first, .{ .plain_codepoint = 'y' });
+    const overlap = keymap.Effective.fromConfig(overlap_config);
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .source_first },
+        keyToMsg(.{ .active_page = .repository, .keymap = overlap, .repository = .{
+            .focus = .source,
+            .source_available = true,
+            .retained_selection_action_available = true,
+            .keymap = overlap,
+        } }, .{ .codepoint = 'y' }).?,
+    );
+}
+
+test "root keeps Review N and Repository match keys outside document ownership" {
+    try std.testing.expectEqual(
+        reviewMsg(.finish_review_needs_changes),
+        keyToMsg(.{ .review = .{ .review_mode = true, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
+    );
+    try std.testing.expectEqual(
+        reviewMsg(.select_previous_search_match),
+        keyToMsg(.{ .review = .{ .review_mode = true, .search_query_len = 1, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
+    );
+
+    for ([_]chasen.Key{ .{ .codepoint = 'n' }, .{ .codepoint = 'N' }, .{ .codepoint = 'p' } }) |key| {
+        try std.testing.expectEqual(
+            app_message.Msg{ .repository = .selection_owned_noop },
+            keyToMsg(.{ .active_page = .repository, .repository = .{ .selection_owner = .header, .source_query_len = 1 } }, key).?,
+        );
+    }
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .previous_source_match },
+        keyToMsg(.{ .active_page = .repository, .repository = .{
+            .retained_selection_action_available = true,
+            .source_query_len = 1,
+        } }, .{ .codepoint = 'N' }).?,
+    );
+}
+
 test "eventToMsg maps winsize event" {
     const msg = eventToMsg(.{}, .{ .winsize = .{
         .cols = 120,

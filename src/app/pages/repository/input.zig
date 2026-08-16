@@ -54,6 +54,10 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
         return if (context.focus == .source) voidMsg(Msg, "source_last") else voidMsg(Msg, "tree_last");
     }
 
+    if (key_input.matchesShiftedAscii(key, 'n', 'N')) {
+        return if (context.source_query_len > 0) voidMsg(Msg, "previous_source_match") else null;
+    }
+
     if (key_input.hasCommandModifier(key)) return null;
 
     return switch (key.codepoint) {
@@ -70,9 +74,18 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
 /// Bounded owner grammar used by root preflight after modal owners and before
 /// configured root actions. Repository identity remains in the page adapter.
 pub fn selectionKeyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
+    if (context.selection_owner != .none and
+        (key.matches('n', .{}) or
+            key_input.matchesShiftedAscii(key, 'n', 'N') or
+            key.matches('p', .{})))
+    {
+        return voidMsg(Msg, "selection_owned_noop");
+    }
+
     const command = selection_input.keyToCommand(.{
         .owner_kind = context.selection_owner,
         .retained_action_available = context.retained_selection_action_available,
+        .keymap = context.keymap,
     }, key) orelse return null;
     return switch (command) {
         .move_up => payload(Msg, "keyboard_line_selection_move", @import("../../direction.zig").Vertical.up),
@@ -85,19 +98,31 @@ pub fn selectionKeyToMsg(comptime Msg: type, context: Context, key: chasen.Key) 
 }
 
 fn publicActionToMsg(comptime Msg: type, context: Context, action: keymap.PublicAction) ?Msg {
+    if (keymap.isDocumentNavigationAction(action)) return documentNavigationActionToMsg(Msg, context, action);
     return switch (action) {
         .search => if (context.source_available) voidMsg(Msg, "enter_source_search") else null,
         .file_search => voidMsg(Msg, "enter_file_search"),
         .changed_file_filter => voidMsg(Msg, "toggle_changed_filter"),
         .toggle_line_numbers => voidMsg(Msg, "toggle_line_numbers"),
-        .first_file => voidMsg(Msg, "tree_first"),
-        .last_file => voidMsg(Msg, "tree_last"),
         .page_up => voidMsg(Msg, "page_up"),
         .page_down => voidMsg(Msg, "page_down"),
         .toggle_sidebar => voidMsg(Msg, "toggle_tree_visibility"),
         .decrease_sidebar_width => voidMsg(Msg, "decrease_tree_width"),
         .increase_sidebar_width => voidMsg(Msg, "increase_tree_width"),
         else => null,
+    };
+}
+
+fn documentNavigationActionToMsg(comptime Msg: type, context: Context, action: keymap.PublicAction) ?Msg {
+    if (context.focus != .source or !context.source_available) return null;
+    return switch (action) {
+        .document_first => voidMsg(Msg, "source_first"),
+        .document_last => voidMsg(Msg, "source_last"),
+        .half_page_up => voidMsg(Msg, "half_page_up"),
+        .half_page_down => voidMsg(Msg, "half_page_down"),
+        .page_backward => voidMsg(Msg, "page_up"),
+        .page_forward => voidMsg(Msg, "page_down"),
+        else => unreachable,
     };
 }
 
@@ -143,6 +168,8 @@ const TestMsg = union(enum) {
     scroll_right,
     page_up,
     page_down,
+    half_page_up,
+    half_page_down,
     source_first,
     source_last,
     tree_first,
@@ -239,7 +266,65 @@ test "repository keyboard line selection owns bounded keys and preserves horizon
     try std.testing.expectEqual(TestMsg.selection_action_unavailable, keyToMsg(TestMsg, active, .{ .codepoint = 'a' }).?);
     try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, active, .{ .codepoint = 'V' }).?);
     try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, active, .{ .codepoint = 'h' }).?);
+    try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, active, .{ .codepoint = 'g' }).?);
+    try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, active, .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(TestMsg.scroll_left, keyToMsg(TestMsg, active, .{ .codepoint = chasen.Key.left }).?);
+}
+
+test "repository document navigation is source scoped and configurable" {
+    const source: Context = .{ .focus = .source, .source_available = true };
+    const cases = [_]struct { key: chasen.Key, expected: TestMsg }{
+        .{ .key = .{ .codepoint = 'g' }, .expected = .source_first },
+        .{ .key = .{ .codepoint = 'G' }, .expected = .source_last },
+        .{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } }, .expected = .half_page_up },
+        .{ .key = .{ .codepoint = 'd', .mods = .{ .ctrl = true } }, .expected = .half_page_down },
+        .{ .key = .{ .codepoint = 'b', .mods = .{ .ctrl = true } }, .expected = .page_up },
+        .{ .key = .{ .codepoint = 'f', .mods = .{ .ctrl = true } }, .expected = .page_down },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, keyToMsg(TestMsg, source, case.key).?);
+        try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .tree, .source_available = true }, case.key) == null);
+        try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .source }, case.key) == null);
+    }
+    try std.testing.expectEqual(
+        keyToMsg(TestMsg, source, .{ .codepoint = chasen.Key.page_up }).?,
+        keyToMsg(TestMsg, source, .{ .codepoint = 'b', .mods = .{ .ctrl = true } }).?,
+    );
+    try std.testing.expectEqual(
+        keyToMsg(TestMsg, source, .{ .codepoint = chasen.Key.page_down }).?,
+        keyToMsg(TestMsg, source, .{ .codepoint = 'f', .mods = .{ .ctrl = true } }).?,
+    );
+    try std.testing.expectEqual(TestMsg.source_first, keyToMsg(TestMsg, source, .{ .codepoint = chasen.Key.home }).?);
+    try std.testing.expectEqual(TestMsg.tree_first, keyToMsg(TestMsg, .{}, .{ .codepoint = chasen.Key.home }).?);
+
+    var config: keymap.Config = .{};
+    config.set(.half_page_down, .{ .plain_codepoint = 'z' });
+    const custom = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(TestMsg.half_page_down, keyToMsg(TestMsg, .{ .focus = .source, .source_available = true, .keymap = custom }, .{ .codepoint = 'z' }).?);
+    try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, .{ .focus = .source, .source_available = true, .selection_owner = .mouse, .keymap = custom }, .{ .codepoint = 'z' }).?);
+}
+
+test "repository source match keys are owned only by live selections" {
+    const keys = [_]chasen.Key{
+        .{ .codepoint = 'n' },
+        .{ .codepoint = 'N' },
+        .{ .codepoint = 'p' },
+    };
+    for ([_]selection_input.OwnerKind{ .keyboard_line, .mouse, .header }) |owner| {
+        for (keys) |key| {
+            try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, .{ .selection_owner = owner, .source_query_len = 1 }, key).?);
+            try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, .{ .selection_owner = owner }, key).?);
+        }
+    }
+
+    const expected = [_]TestMsg{ .next_source_match, .previous_source_match, .previous_source_match };
+    for (keys, expected) |key, message| {
+        try std.testing.expectEqual(message, keyToMsg(TestMsg, .{ .source_query_len = 1 }, key).?);
+        try std.testing.expect(keyToMsg(TestMsg, .{}, key) == null);
+        try std.testing.expectEqual(message, keyToMsg(TestMsg, .{ .retained_selection_action_available = true, .source_query_len = 1 }, key).?);
+    }
+
+    try std.testing.expectEqual(TestMsg{ .source_search_insert = 'N' }, keyToMsg(TestMsg, .{ .source_search_mode = true, .selection_owner = .mouse }, .{ .codepoint = 'N' }).?);
 }
 
 test "repository mouse owners consume selection grammar and configured V wins before begin" {

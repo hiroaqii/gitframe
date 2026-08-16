@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
+const keymap = @import("keymap");
 const key_input = @import("../key_input.zig");
 const selection_input = @import("../selection_input.zig");
 const diff_selection = @import("../../diff/selection.zig");
@@ -17,6 +18,7 @@ pub const Context = struct {
     file_search_mode: bool = false,
     selection_owner: SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
+    keymap: keymap.Effective = .{},
 };
 
 pub fn selectionOwnerKind(owner: diff_selection.Owner) SelectionOwnerKind {
@@ -46,6 +48,7 @@ pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?message.Msg {
     const command = selection_input.keyToCommand(.{
         .owner_kind = context.selection_owner,
         .retained_action_available = context.retained_selection_action_available,
+        .keymap = context.keymap,
     }, key) orelse return null;
     return switch (command) {
         .move_up => .{ .keyboard_line_selection_move = .up },
@@ -106,4 +109,22 @@ test "mouse and header selection consume selection keys without acquiring keyboa
         try std.testing.expect(selectionKeyToMsg(context, .{ .codepoint = chasen.Key.left }) == null);
         try std.testing.expect(selectionKeyToMsg(context, .{ .codepoint = chasen.Key.right }) == null);
     }
+}
+
+test "diff selection forwards default and custom document navigation bindings" {
+    const active: Context = .{ .selection_owner = .keyboard_line };
+    try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(active, .{ .codepoint = 'g' }).?);
+    try std.testing.expectEqual(
+        message.Msg.selection_owned_noop,
+        selectionKeyToMsg(active, .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).?,
+    );
+
+    var config: keymap.Config = .{};
+    config.set(.document_first, .{ .plain_codepoint = 'z' });
+    const custom: Context = .{
+        .selection_owner = .header,
+        .keymap = keymap.Effective.fromConfig(config),
+    };
+    try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(custom, .{ .codepoint = 'z' }).?);
+    try std.testing.expect(selectionKeyToMsg(custom, .{ .codepoint = 'g' }) == null);
 }

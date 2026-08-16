@@ -1073,6 +1073,35 @@ test "keymap rejects removed page_history and accepts page_compare" {
     try std.testing.expect(parsed.keymap.get(.page_compare).?.eql(.{ .plain_codepoint = '3' }));
 }
 
+test "keymap rejects removed file edges and accepts document navigation actions" {
+    inline for (.{ "first_file", "last_file" }) |removed| {
+        const input = try std.fmt.allocPrint(std.testing.allocator,
+            \\schema_version = 1
+            \\[keymap]
+            \\{s} = "z"
+        , .{removed});
+        defer std.testing.allocator.free(input);
+        try std.testing.expectError(error.UnknownKey, parseConfigToml(input));
+    }
+
+    const parsed = try parseConfigToml(
+        \\schema_version = 1
+        \\[keymap]
+        \\document_first = "g"
+        \\document_last = "G"
+        \\half_page_up = "ctrl+u"
+        \\half_page_down = "ctrl+d"
+        \\page_backward = "ctrl+b"
+        \\page_forward = "ctrl+f"
+    );
+    try std.testing.expect(parsed.keymap.get(.document_first).?.eql(.{ .plain_codepoint = 'g' }));
+    try std.testing.expect(parsed.keymap.get(.document_last).?.eql(.{ .shifted_ascii = .{ .lower = 'g', .upper = 'G' } }));
+    try std.testing.expect(parsed.keymap.get(.half_page_up).?.eql(.{ .ctrl = .u }));
+    try std.testing.expect(parsed.keymap.get(.half_page_down).?.eql(.{ .ctrl = .d }));
+    try std.testing.expect(parsed.keymap.get(.page_backward).?.eql(.{ .ctrl = .b }));
+    try std.testing.expect(parsed.keymap.get(.page_forward).?.eql(.{ .ctrl = .f }));
+}
+
 test "loadConfig accepts external action definitions" {
     const allocator = std.testing.allocator;
     const path = "zig-cache/tmp/gitframe-actions-config.toml";

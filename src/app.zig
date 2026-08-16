@@ -1228,6 +1228,7 @@ pub const App = struct {
         return .{
             .overlay = &self.overlay,
             .content_size = self.shellLayout().contentSize(),
+            .help_page = self.active_page,
             .push_error_message = self.remoteWorkflowView().pushErrorMessage(),
         };
     }

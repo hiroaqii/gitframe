@@ -5,6 +5,7 @@
 //! retaining application state or importing `app.zig`. Overlay scrolling is a
 //! separate synchronous controller over the root-owned overlay value.
 
+const std = @import("std");
 const chasen = @import("chasen");
 
 const app_input = @import("input.zig");
@@ -337,6 +338,7 @@ pub const View = struct {
 pub const OverlayScrollController = struct {
     overlay: *app_state.OverlayState,
     content_size: chasen.Size,
+    help_page: page.Id,
     push_error_message: ?[]const u8,
 
     pub fn scrollHelp(self: OverlayScrollController, delta: isize) void {
@@ -345,14 +347,14 @@ pub const OverlayScrollController = struct {
     }
 
     pub fn pageHelp(self: OverlayScrollController, pages: isize) void {
-        const rows = @max(@as(usize, app_view.helpVisibleRows(self.content_size)), 1);
+        const rows = @max(@as(usize, app_view.helpVisibleRows(self.content_size, self.help_page)), 1);
         self.scrollHelp(pageDelta(rows, pages));
     }
 
     pub fn clampHelp(self: OverlayScrollController) void {
         self.overlay.help_scroll = @min(
             self.overlay.help_scroll,
-            app_view.helpMaxScroll(self.content_size),
+            app_view.helpMaxScroll(self.content_size, self.help_page),
         );
     }
 
@@ -390,4 +392,32 @@ fn applySignedScroll(current: usize, delta: isize) usize {
         return current -| (amount + 1);
     }
     return current +| @as(usize, @intCast(delta));
+}
+
+test "Repository Help controller bounds row and page scrolling" {
+    const size: chasen.Size = .{ .width = 80, .height = 12 };
+    const visible_rows: usize = app_view.helpVisibleRows(size, .repository);
+    const max_scroll = app_view.helpMaxScroll(size, .repository);
+    try std.testing.expect(visible_rows > 0);
+    try std.testing.expect(max_scroll > visible_rows);
+
+    var overlay: app_state.OverlayState = .{};
+    overlay.openHelpForPage(.repository);
+    const controller: OverlayScrollController = .{
+        .overlay = &overlay,
+        .content_size = size,
+        .help_page = .repository,
+        .push_error_message = null,
+    };
+
+    controller.scrollHelp(1);
+    try std.testing.expectEqual(@as(usize, 1), overlay.help_scroll);
+    controller.pageHelp(1);
+    try std.testing.expectEqual(@min(1 + visible_rows, max_scroll), overlay.help_scroll);
+    controller.scrollHelp(std.math.maxInt(isize));
+    try std.testing.expectEqual(max_scroll, overlay.help_scroll);
+    controller.pageHelp(-1);
+    try std.testing.expectEqual(max_scroll -| visible_rows, overlay.help_scroll);
+    controller.scrollHelp(-std.math.maxInt(isize));
+    try std.testing.expectEqual(@as(usize, 0), overlay.help_scroll);
 }

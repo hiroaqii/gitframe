@@ -73,8 +73,33 @@ pub fn pageSourceProjected(
     geometry: source_geometry.SourceGeometry,
     projection: ?selection_action.Projection,
 ) void {
+    pageSourceByRowsProjected(viewer, document, direction, geometry.navigationRows(), geometry, projection);
+}
+
+pub fn halfPageSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry) void {
+    halfPageSourceProjected(viewer, document, direction, geometry, null);
+}
+
+pub fn halfPageSourceProjected(
+    viewer: *model.ViewerState,
+    document: *const source.Document,
+    direction: isize,
+    geometry: source_geometry.SourceGeometry,
+    projection: ?selection_action.Projection,
+) void {
+    const step = @max(@as(usize, geometry.visible_source_rows) / 2, 1);
+    pageSourceByRowsProjected(viewer, document, direction, step, geometry, projection);
+}
+
+fn pageSourceByRowsProjected(
+    viewer: *model.ViewerState,
+    document: *const source.Document,
+    direction: isize,
+    step: usize,
+    geometry: source_geometry.SourceGeometry,
+    projection: ?selection_action.Projection,
+) void {
     const current = sourceToPresentation(projection, viewer.source_cursor);
-    const step = geometry.navigationRows();
     const target = if (direction < 0) current -| step else current +| step;
     viewer.source_cursor = @min(
         presentationToSource(projection, target, if (direction < 0) .before else .after),
@@ -273,6 +298,11 @@ test "repository source comfort keeps single row navigation in band and permits 
     try std.testing.expectEqual(@as(usize, 22), viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 19), viewer.source_vertical_scroll);
 
+    viewer.source_cursor = 20;
+    viewer.source_vertical_scroll = 20;
+    halfPageSource(&viewer, &document, 1, geometry);
+    try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
+
     firstSource(&viewer, &document, geometry);
     try std.testing.expectEqual(@as(usize, 0), viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll);
@@ -341,6 +371,11 @@ test "repository source comfort centers pages and places explicit search in band
     try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 19), viewer.source_vertical_scroll);
 
+    halfPageSource(&viewer, &document, 1, geometry);
+    try std.testing.expectEqual(@as(usize, 29), viewer.source_cursor);
+    halfPageSource(&viewer, &document, -1, geometry);
+    try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
+
     viewer.source_vertical_scroll = 0;
     revealMatch(&viewer, &document, .{ .line = 50, .start = 0, .end = 0 }, geometry);
     try std.testing.expectEqual(@as(usize, 50), viewer.source_cursor);
@@ -374,6 +409,8 @@ test "repository source comfort keeps reconciliation minimal and handles tiny vi
     wheelSource(&viewer, &document, 1, zero_rows);
     try std.testing.expectEqual(@as(usize, 6), viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
+    halfPageSource(&viewer, &document, 1, zero_rows);
+    try std.testing.expectEqual(@as(usize, 7), viewer.source_cursor);
 
     const one_row = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 3 }, &document, true);
     viewer.source_cursor = 20;
@@ -401,6 +438,10 @@ test "repository source comfort keeps reconciliation minimal and handles tiny vi
     };
     clampSource(&empty_viewer, &empty, three_rows);
     wheelSource(&empty_viewer, &empty, 1, three_rows);
+    halfPageSource(&empty_viewer, &empty, 1, three_rows);
+    pageSource(&empty_viewer, &empty, -1, three_rows);
+    firstSource(&empty_viewer, &empty, three_rows);
+    lastSource(&empty_viewer, &empty, three_rows);
     try std.testing.expectEqual(@as(usize, 0), empty_viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 0), empty_viewer.source_vertical_scroll);
 }
@@ -473,6 +514,17 @@ test "repository projected navigation counts action rows without cursor authorit
     revealMatchProjected(&viewer, &document, .{ .line = 2, .start = 0, .end = 0 }, geometry, projection);
     try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
     try std.testing.expect(projection.sourceToPresentation(2).? >= viewer.source_vertical_scroll);
+
+    viewer.source_cursor = 1;
+    viewer.source_vertical_scroll = 0;
+    halfPageSourceProjected(&viewer, &document, 1, geometry, projection);
+    try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
+    try std.testing.expectEqual(
+        selection_action.Location{ .source = 2 },
+        projection.locate(projection.sourceToPresentation(viewer.source_cursor).?).?,
+    );
+    halfPageSourceProjected(&viewer, &document, -1, geometry, projection);
+    try std.testing.expectEqual(@as(usize, 1), viewer.source_cursor);
 }
 
 test "repository repeated navigation uses precomputed width for admitted worst shapes" {

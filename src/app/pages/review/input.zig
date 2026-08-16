@@ -32,6 +32,7 @@ pub const Context = struct {
             .file_search_mode = self.file_search_mode,
             .selection_owner = self.selection_owner,
             .retained_selection_action_available = self.retained_selection_action_available,
+            .keymap = self.keymap,
         };
     }
 };
@@ -91,6 +92,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
 }
 
 fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
+    if (keymap.isDocumentNavigationAction(action)) return null;
     return switch (action) {
         .page_review, .page_repository, .page_compare, .page_config => null,
         .help, .reload => null,
@@ -113,12 +115,11 @@ fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
         .changed_file_filter => .cycle_changed_file_filter,
         .mark_reviewed => .toggle_reviewed_file,
         .hide_reviewed => .toggle_hide_reviewed_files,
-        .first_file => .select_first_file,
-        .last_file => .select_last_file,
         .page_up => .page_diff_up,
         .page_down => .page_diff_down,
         .copy_current_line => .copy_current_line,
         .copy_current_hunk => .copy_current_hunk,
+        else => unreachable,
     };
 }
 
@@ -242,7 +243,6 @@ test "static Review command matrix preserves configurable defaults" {
         .{ .codepoint = 'L', .expected = .toggle_line_numbers },
         .{ .codepoint = 'y', .expected = .copy_current_line },
         .{ .codepoint = 'Y', .expected = .copy_current_hunk },
-        .{ .codepoint = 'G', .expected = .select_last_file },
         .{ .codepoint = 'F', .expected = .cycle_changed_file_filter },
         .{ .codepoint = 'H', .expected = .toggle_hide_reviewed_files },
         .{ .codepoint = chasen.Key.home, .expected = .select_first_file },
@@ -251,10 +251,20 @@ test "static Review command matrix preserves configurable defaults" {
     for (cases) |case| try std.testing.expectEqual(case.expected, keyToMsg(.{}, .{ .codepoint = case.codepoint }).?);
 }
 
+test "Review keeps Home End and owns new document actions as no-op until follow-up" {
+    try std.testing.expectEqual(Msg.select_first_file, keyToMsg(.{}, .{ .codepoint = chasen.Key.home }).?);
+    try std.testing.expectEqual(Msg.select_last_file, keyToMsg(.{}, .{ .codepoint = chasen.Key.end }).?);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'g' }) == null);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'f', .mods = .{ .ctrl = true } }) == null);
+
+    var config: keymap.Config = .{};
+    config.set(.document_first, .{ .plain_codepoint = 'z' });
+    try std.testing.expect(keyToMsg(.{ .keymap = keymap.Effective.fromConfig(config) }, .{ .codepoint = 'z' }) == null);
+}
+
 test "shifted terminal encodings preserve Review commands" {
     const Case = struct { lower: u21, upper: u21, expected: Msg };
     const cases = [_]Case{
-        .{ .lower = 'g', .upper = 'G', .expected = .select_last_file },
         .{ .lower = 'f', .upper = 'F', .expected = .cycle_changed_file_filter },
         .{ .lower = 'h', .upper = 'H', .expected = .toggle_hide_reviewed_files },
         .{ .lower = 'p', .upper = 'P', .expected = .request_push },

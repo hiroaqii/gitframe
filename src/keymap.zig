@@ -27,8 +27,12 @@ pub const PublicAction = enum {
     changed_file_filter,
     mark_reviewed,
     hide_reviewed,
-    first_file,
-    last_file,
+    document_first,
+    document_last,
+    half_page_up,
+    half_page_down,
+    page_backward,
+    page_forward,
     page_up,
     page_down,
     copy_current_line,
@@ -53,9 +57,13 @@ pub const NamedKey = enum {
 };
 
 pub const CtrlKey = enum {
+    b,
+    d,
     enter,
+    f,
     q,
     s,
+    u,
 };
 
 pub const KeySpec = union(enum) {
@@ -144,12 +152,29 @@ pub fn actionFromKey(key: []const u8) ?PublicAction {
     return null;
 }
 
+pub fn isDocumentNavigationAction(action: PublicAction) bool {
+    return switch (action) {
+        .document_first,
+        .document_last,
+        .half_page_up,
+        .half_page_down,
+        .page_backward,
+        .page_forward,
+        => true,
+        else => false,
+    };
+}
+
 pub fn parseKeySpec(value: []const u8) ?KeySpec {
     if (std.mem.startsWith(u8, value, "ctrl+")) {
         const name = value["ctrl+".len..];
+        if (std.mem.eql(u8, name, "b")) return .{ .ctrl = .b };
+        if (std.mem.eql(u8, name, "d")) return .{ .ctrl = .d };
         if (std.mem.eql(u8, name, "enter")) return .{ .ctrl = .enter };
+        if (std.mem.eql(u8, name, "f")) return .{ .ctrl = .f };
         if (std.mem.eql(u8, name, "q")) return .{ .ctrl = .q };
         if (std.mem.eql(u8, name, "s")) return .{ .ctrl = .s };
+        if (std.mem.eql(u8, name, "u")) return .{ .ctrl = .u };
         return null;
     }
 
@@ -238,8 +263,12 @@ fn defaultSpec(action: PublicAction) ?KeySpec {
         .changed_file_filter => shiftedAscii('f', 'F'),
         .mark_reviewed => .{ .plain_codepoint = 'v' },
         .hide_reviewed => shiftedAscii('h', 'H'),
-        .first_file => .{ .plain_codepoint = 'g' },
-        .last_file => shiftedAscii('g', 'G'),
+        .document_first => .{ .plain_codepoint = 'g' },
+        .document_last => shiftedAscii('g', 'G'),
+        .half_page_up => .{ .ctrl = .u },
+        .half_page_down => .{ .ctrl = .d },
+        .page_backward => .{ .ctrl = .b },
+        .page_forward => .{ .ctrl = .f },
         .page_up => .{ .named = .page_up },
         .page_down => .{ .named = .page_down },
         .copy_current_line => .{ .plain_codepoint = 'y' },
@@ -327,17 +356,25 @@ fn namedDisplay(named: NamedKey) []const u8 {
 
 fn ctrlCodepoint(ctrl: CtrlKey) u21 {
     return switch (ctrl) {
+        .b => 'b',
+        .d => 'd',
         .enter => chasen.Key.enter,
+        .f => 'f',
         .q => 'q',
         .s => 's',
+        .u => 'u',
     };
 }
 
 fn ctrlDisplay(ctrl: CtrlKey) []const u8 {
     return switch (ctrl) {
+        .b => "Ctrl+b",
+        .d => "Ctrl+d",
         .enter => "Ctrl+Enter",
+        .f => "Ctrl+f",
         .q => "Ctrl+q",
         .s => "Ctrl+s",
+        .u => "Ctrl+u",
     };
 }
 
@@ -385,7 +422,36 @@ test "parseKeySpec handles printable shifted named and ctrl forms" {
     try std.testing.expect(parseKeySpec("space").?.eql(.{ .named = .space }));
     try std.testing.expect(parseKeySpec(" ").?.eql(.{ .named = .space }));
     try std.testing.expect(parseKeySpec("ctrl+s").?.eql(.{ .ctrl = .s }));
+    try std.testing.expect(parseKeySpec("ctrl+b").?.eql(.{ .ctrl = .b }));
+    try std.testing.expect(parseKeySpec("ctrl+d").?.eql(.{ .ctrl = .d }));
+    try std.testing.expect(parseKeySpec("ctrl+f").?.eql(.{ .ctrl = .f }));
+    try std.testing.expect(parseKeySpec("ctrl+u").?.eql(.{ .ctrl = .u }));
     try std.testing.expect(parseKeySpec("unknown") == null);
+}
+
+test "document navigation actions share typed defaults and one predicate" {
+    const defaults: Effective = .{};
+    const cases = [_]struct {
+        action: PublicAction,
+        key: chasen.Key,
+        display: []const u8,
+    }{
+        .{ .action = .document_first, .key = .{ .codepoint = 'g' }, .display = "g" },
+        .{ .action = .document_last, .key = .{ .codepoint = 'G' }, .display = "G" },
+        .{ .action = .half_page_up, .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } }, .display = "Ctrl+u" },
+        .{ .action = .half_page_down, .key = .{ .codepoint = 'd', .mods = .{ .ctrl = true } }, .display = "Ctrl+d" },
+        .{ .action = .page_backward, .key = .{ .codepoint = 'b', .mods = .{ .ctrl = true } }, .display = "Ctrl+b" },
+        .{ .action = .page_forward, .key = .{ .codepoint = 'f', .mods = .{ .ctrl = true } }, .display = "Ctrl+f" },
+    };
+    var buffer: [16]u8 = undefined;
+    for (cases) |case| {
+        try std.testing.expect(isDocumentNavigationAction(case.action));
+        try std.testing.expectEqual(case.action, defaults.actionForKey(case.key).?);
+        try std.testing.expectEqualStrings(case.display, defaults.display(case.action, buffer[0..]).?);
+    }
+    try std.testing.expect(!isDocumentNavigationAction(.page_up));
+    try std.testing.expect(actionFromKey("first_file") == null);
+    try std.testing.expect(actionFromKey("last_file") == null);
 }
 
 test "effective keymap matches overridden actions" {
@@ -444,6 +510,10 @@ test "validateConfig rejects reserved and duplicate effective bindings" {
     var fetch_duplicate: Config = .{};
     fetch_duplicate.set(.fetch, .{ .plain_codepoint = 'r' });
     try std.testing.expect(!validateConfig(fetch_duplicate));
+
+    var document_duplicate: Config = .{};
+    document_duplicate.set(.fetch, .{ .ctrl = .d });
+    try std.testing.expect(!validateConfig(document_duplicate));
 
     try std.testing.expect(validateConfig(.{}));
 }

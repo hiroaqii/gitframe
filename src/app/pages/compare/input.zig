@@ -43,6 +43,7 @@ pub const Context = struct {
             .file_search_mode = self.file_search_mode,
             .selection_owner = self.selection_owner,
             .retained_selection_action_available = self.retained_selection_action_available,
+            .keymap = self.keymap,
         };
     }
 };
@@ -124,6 +125,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
 }
 
 fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
+    if (keymap.isDocumentNavigationAction(action)) return null;
     return switch (action) {
         .search => shared(.enter_search),
         .file_search => shared(.enter_file_search),
@@ -135,14 +137,13 @@ fn publicActionToMsg(action: keymap.PublicAction) ?Msg {
         .changed_file_filter => shared(.cycle_changed_file_filter),
         .mark_reviewed => shared(.toggle_reviewed_file),
         .hide_reviewed => shared(.toggle_hide_reviewed_files),
-        .first_file => shared(.select_first_file),
-        .last_file => shared(.select_last_file),
         .page_up => shared(.page_diff_up),
         .page_down => shared(.page_diff_down),
         .copy_current_line => .copy_current_line,
         .copy_current_hunk => .copy_current_hunk,
         .branch_switch => .branch_switch_unavailable,
         .page_review, .page_repository, .page_compare, .page_config, .help, .reload, .repo_picker, .open_editor, .commit, .amend, .push, .pull, .fetch, .discard => null,
+        else => unreachable,
     };
 }
 
@@ -167,6 +168,17 @@ test "Compare exposes display actions but no write actions" {
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'P' }) == null);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'U' }) == null);
     try std.testing.expectEqual(Msg.branch_switch_unavailable, keyToMsg(.{}, .{ .codepoint = 'b' }).?);
+}
+
+test "Compare keeps Home End and owns new document actions as no-op until follow-up" {
+    try std.testing.expectEqual(Msg{ .shared = .select_first_file }, keyToMsg(.{}, .{ .codepoint = chasen.Key.home }).?);
+    try std.testing.expectEqual(Msg{ .shared = .select_last_file }, keyToMsg(.{}, .{ .codepoint = chasen.Key.end }).?);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'G' }) == null);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'b', .mods = .{ .ctrl = true } }) == null);
+
+    var config: keymap.Config = .{};
+    config.set(.document_last, .{ .plain_codepoint = 'z' });
+    try std.testing.expect(keyToMsg(.{ .keymap = keymap.Effective.fromConfig(config) }, .{ .codepoint = 'z' }) == null);
 }
 
 test "Compare routes admitted retained actions through shared input" {

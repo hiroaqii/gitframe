@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
+const keymap = @import("keymap");
 const key_input = @import("key_input.zig");
 
 pub const OwnerKind = enum {
@@ -27,9 +28,17 @@ pub const Command = enum {
 pub const Context = struct {
     owner_kind: OwnerKind = .none,
     retained_action_available: bool = false,
+    keymap: keymap.Effective = .{},
 };
 
 pub fn keyToCommand(context: Context, key: chasen.Key) ?Command {
+    if (context.keymap.actionForKey(key)) |action| {
+        if (keymap.isDocumentNavigationAction(action)) {
+            // Completed-only candidates do not own navigation, even when a
+            // custom binding overlaps the retained y/a grammar below.
+            return if (context.owner_kind != .none) .owned_noop else null;
+        }
+    }
     const escape = key.matches(chasen.Key.escape, .{});
     const copy = key.matches('y', .{});
     const ask = key.matches('a', .{});
@@ -102,4 +111,37 @@ test "selection input ignores modifiers and unrelated keys" {
     try std.testing.expect(keyToCommand(active, .{ .codepoint = ' ' }) == null);
     try std.testing.expect(keyToCommand(.{ .owner_kind = .mouse }, .{ .codepoint = ' ' }) == null);
     try std.testing.expect(keyToCommand(.{ .retained_action_available = true }, .{ .codepoint = 'j' }) == null);
+}
+
+test "selection input consumes default and custom document navigation only for live owners" {
+    const ctrl_d = chasen.Key{ .codepoint = 'd', .mods = .{ .ctrl = true } };
+    for ([_]OwnerKind{ .keyboard_line, .mouse, .header }) |owner| {
+        try std.testing.expectEqual(Command.owned_noop, keyToCommand(.{ .owner_kind = owner }, .{ .codepoint = 'g' }).?);
+        try std.testing.expectEqual(Command.owned_noop, keyToCommand(.{ .owner_kind = owner }, ctrl_d).?);
+    }
+    try std.testing.expect(keyToCommand(.{}, .{ .codepoint = 'g' }) == null);
+    try std.testing.expect(keyToCommand(.{ .retained_action_available = true }, ctrl_d) == null);
+
+    var config: keymap.Config = .{};
+    config.set(.document_first, .{ .plain_codepoint = 'z' });
+    const custom = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(
+        Command.owned_noop,
+        keyToCommand(.{ .owner_kind = .keyboard_line, .keymap = custom }, .{ .codepoint = 'z' }).?,
+    );
+    try std.testing.expect(keyToCommand(.{ .owner_kind = .keyboard_line, .keymap = custom }, .{ .codepoint = 'g' }) == null);
+
+    var overlap_config: keymap.Config = .{};
+    overlap_config.set(.copy_current_line, .{ .plain_codepoint = 'x' });
+    overlap_config.set(.document_first, .{ .plain_codepoint = 'y' });
+    try std.testing.expect(keymap.validateConfig(overlap_config));
+    const overlap = keymap.Effective.fromConfig(overlap_config);
+    try std.testing.expect(keyToCommand(.{
+        .retained_action_available = true,
+        .keymap = overlap,
+    }, .{ .codepoint = 'y' }) == null);
+    try std.testing.expectEqual(
+        Command.owned_noop,
+        keyToCommand(.{ .owner_kind = .mouse, .keymap = overlap }, .{ .codepoint = 'y' }).?,
+    );
 }

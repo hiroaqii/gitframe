@@ -128,6 +128,8 @@ pub const Msg = union(enum) {
     toggle_directory,
     page_up,
     page_down,
+    half_page_up,
+    half_page_down,
     scroll_left,
     scroll_right,
     mouse_row: usize,
@@ -1729,6 +1731,8 @@ pub const RepositoryPageState = struct {
                 .source => if (source) |document| repository_navigation.pageSourceProjected(&self.viewer, document, 1, source_geometry.?, source_projection),
                 .tree => if (!self.viewer.tree_hidden) self.moveCursor(@intCast(@max(body_height -| 1, 1)), body_height),
             },
+            .half_page_up => if (source) |document| repository_navigation.halfPageSourceProjected(&self.viewer, document, -1, source_geometry.?, source_projection),
+            .half_page_down => if (source) |document| repository_navigation.halfPageSourceProjected(&self.viewer, document, 1, source_geometry.?, source_projection),
             .toggle_directory => if (!self.viewer.tree_hidden) self.toggleCursor(body_height),
             .scroll_left => switch (self.viewer.focus) {
                 .source => if (source) |document| repository_navigation.scrollSourceHorizontal(&self.viewer, document, -8, source_geometry.?),
@@ -6071,6 +6075,14 @@ test "repository source comfort page routes wheel page search boundaries and mou
     try std.testing.expectEqual(@as(usize, 9), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 7), state.viewer.source_vertical_scroll);
 
+    state.viewer.source_cursor = 5;
+    state.viewer.source_vertical_scroll = 5;
+    _ = state.applyNavigation(allocator, .half_page_down, size);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
+    _ = state.applyNavigation(allocator, .half_page_up, size);
+    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_cursor);
+
     _ = state.applyNavigation(allocator, .enter_source_search, size);
     for ("needle") |byte| _ = state.applyNavigation(allocator, .{ .source_search_insert = byte }, size);
     _ = state.applyNavigation(allocator, .submit_source_search, size);
@@ -6833,6 +6845,9 @@ test "repository selection retains candidate across inactive page and presentati
 
     _ = state.applyNavigation(allocator, .focus_source, size);
     _ = state.applyNavigation(allocator, .source_last, size);
+    _ = state.applyNavigation(allocator, .half_page_up, size);
+    _ = state.applyNavigation(allocator, .page_down, size);
+    try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
     _ = state.applyNavigation(allocator, .enter_source_search, size);
     for ("needle") |byte| _ = state.applyNavigation(allocator, .{ .source_search_insert = byte }, size);
     _ = state.applyNavigation(allocator, .submit_source_search, size);
@@ -7544,6 +7559,31 @@ test "repository accepted current source excludes retained revalidation authorit
 
     state.displayed_document.?.manifest_revision += 1;
     try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+}
+
+test "repository document navigation keeps displayed last-good source authority" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "zero\none\ntwo\nthree\nfour\nfive\n");
+    defer state.deinit(allocator);
+    state.freshness = .fresh;
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 4;
+    state.needs_document_revalidation = true;
+
+    try std.testing.expect(state.currentSource() != null);
+    try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
+    _ = state.applyNavigation(allocator, .source_first, .{ .width = 60, .height = 6 });
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
+    _ = state.applyNavigation(allocator, .half_page_down, .{ .width = 60, .height = 6 });
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_cursor);
+
+    var unavailable: RepositoryPageState = .{};
+    defer unavailable.deinit(allocator);
+    unavailable.viewer.focus = .source;
+    unavailable.viewer.source_cursor = 7;
+    _ = unavailable.applyNavigation(allocator, .source_first, .{ .width = 60, .height = 6 });
+    _ = unavailable.applyNavigation(allocator, .half_page_down, .{ .width = 60, .height = 6 });
+    try std.testing.expectEqual(@as(usize, 7), unavailable.viewer.source_cursor);
 }
 
 test "repository accepted source authority requires a matching completion after spawn rejection" {
