@@ -1589,18 +1589,12 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         .changes => {
             const footer = app.changes.footer();
             if (!footer.normal_action_hints_enabled) return result;
-            if (footer.sidebar_hidden) {
-                appendFooterAction(app, &result, key_buffers, .toggle_sidebar, "sidebar", .focus);
-            }
 
             if (app.review_mode) {
                 appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'a' }, "a", "approve", .primary);
                 appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'N' }, "N", "changes", .primary);
-            } else {
-                appendUnclaimedFooterItem(app, &result, .{ .codepoint = ' ' }, "Space", "stage", .primary);
-                appendFooterAction(app, &result, key_buffers, .commit, "commit", .secondary);
             }
-            appendFooterAction(app, &result, key_buffers, .branch_switch, "branch", .secondary);
+            appendFooterAction(app, &result, key_buffers, .branch_switch, "branch", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
             result.append(ui.key_hint.item("q", if (app.review_mode) "cancel" else "quit"), .quit);
@@ -1614,13 +1608,6 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                 return result;
             }
 
-            if (input.tree_hidden) {
-                appendFooterAction(app, &result, key_buffers, .toggle_sidebar, "tree", .focus);
-            }
-            appendFooterAction(app, &result, key_buffers, .file_search, "find file", .primary);
-            if (input.source_available) {
-                appendFooterAction(app, &result, key_buffers, .search, "search", .secondary);
-            }
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
             result.append(ui.key_hint.item("q", "quit"), .quit);
@@ -1628,9 +1615,6 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         .review => {
             const footer = app.review.footer();
             if (!footer.normal_action_hints_enabled or app.review.page.base_picker.open) return result;
-            if (footer.sidebar_hidden) {
-                appendFooterAction(app, &result, key_buffers, .toggle_sidebar, "sidebar", .focus);
-            }
             appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "base", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
@@ -2204,8 +2188,6 @@ test "footer normal-mode hints match the decided page lists" {
     var context = harness.context();
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("Space", "stage"),
-        ui.key_hint.item("c", "commit"),
         ui.key_hint.item("b", "branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2216,8 +2198,6 @@ test "footer normal-mode hints match the decided page lists" {
     context.active_page = .repository;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("f", "find file"),
-        ui.key_hint.item("/", "search"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
         ui.key_hint.item("q", "quit"),
@@ -2249,8 +2229,12 @@ test "footer normal-mode hints follow state and local key ownership" {
 
     harness.changes.viewer.sidebar_hidden = true;
     var hints = footerHints(harness.context(), &key_buffers);
-    try std.testing.expectEqualStrings("B", hints.items[0].keys);
-    try std.testing.expectEqualStrings("sidebar", hints.items[0].action);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "branch"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
 
     harness.changes.viewer.sidebar_hidden = false;
     harness.review_mode = true;
@@ -2282,7 +2266,6 @@ test "footer normal-mode hints follow state and local key ownership" {
     context.active_page = .repository;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("f", "find file"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
         ui.key_hint.item("q", "quit"),
@@ -2292,8 +2275,11 @@ test "footer normal-mode hints follow state and local key ownership" {
     context = harness.context();
     context.active_page = .repository;
     hints = footerHints(context, &key_buffers);
-    try std.testing.expectEqualStrings("B", hints.items[0].keys);
-    try std.testing.expectEqualStrings("tree", hints.items[0].action);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
 
     harness.repository.viewer.tree_hidden = false;
     harness.changes.search.mode = true;
@@ -2329,7 +2315,7 @@ test "footer hint projection keeps priority items and original display order" {
     try expectProjectedFooterHintItems(&projected, hints.slice());
 }
 
-test "narrow footer keeps repository switch and primary page action" {
+test "narrow footer keeps repository switch and page-specific action" {
     var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 40, .height = 12 } };
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(40, 1);
@@ -2339,7 +2325,7 @@ test "narrow footer keeps repository switch and primary page action" {
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space: stage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "b: branch") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "R: switch repo") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "?: help") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Tab: focus") == null);
