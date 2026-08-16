@@ -184,7 +184,12 @@ fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     return switch (context.active_page) {
         .review => translateReviewMsg(review_input.selectionKeyToMsg(context.review, key) orelse return null),
         .compare => .{ .compare = compare_input.selectionKeyToMsg(context.compare, key) orelse return null },
-        .repository, .config => null,
+        .repository => .{ .repository = repository_input.selectionKeyToMsg(
+            repository_page.Msg,
+            context.repository,
+            key,
+        ) orelse return null },
+        .config => null,
     };
 }
 
@@ -516,6 +521,117 @@ test "root selection preflight preserves modal and configured V precedence" {
         .help_mode = true,
         .review = active.review,
     }, .{ .codepoint = chasen.Key.escape }).?);
+}
+
+test "root selection preflight routes Repository owners before configured actions" {
+    const v = chasen.Key{ .codepoint = 'V' };
+    var root_config: keymap.Config = .{};
+    root_config.set(.page_review, .{ .plain_codepoint = 'V' });
+    const root_keymap = keymap.Effective.fromConfig(root_config);
+
+    try std.testing.expectEqual(
+        app_message.Msg{ .switch_page = .review },
+        keyToMsg(.{
+            .active_page = .repository,
+            .keymap = root_keymap,
+            .repository = .{ .retained_selection_action_available = true },
+        }, v).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .selection_owned_noop },
+        keyToMsg(.{
+            .active_page = .repository,
+            .keymap = root_keymap,
+            .repository = .{ .selection_owner = .keyboard_line },
+        }, v).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .begin_keyboard_line_selection },
+        keyToMsg(.{ .active_page = .repository }, v).?,
+    );
+
+    var page_config: keymap.Config = .{};
+    page_config.set(.toggle_line_numbers, .{ .plain_codepoint = 'V' });
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .toggle_line_numbers },
+        keyToMsg(.{
+            .active_page = .repository,
+            .repository = .{
+                .retained_selection_action_available = true,
+                .keymap = keymap.Effective.fromConfig(page_config),
+            },
+        }, v).?,
+    );
+
+    const active: KeyContext = .{
+        .active_page = .repository,
+        .repository = .{
+            .focus = .source,
+            .selection_owner = .keyboard_line,
+            .retained_selection_action_available = true,
+        },
+    };
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .{ .keyboard_line_selection_move = .down } },
+        keyToMsg(active, .{ .codepoint = 'j' }).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .{ .selection_action = .copy } },
+        keyToMsg(active, .{ .codepoint = 'y' }).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .selection_action_unavailable },
+        keyToMsg(active, .{ .codepoint = 'a' }).?,
+    );
+    for ([_]repository_input.Context{
+        .{ .selection_owner = .mouse, .retained_selection_action_available = true },
+        .{ .selection_owner = .header, .retained_selection_action_available = true },
+    }) |repository| {
+        const context: KeyContext = .{ .active_page = .repository, .repository = repository };
+        try std.testing.expectEqual(
+            app_message.Msg{ .repository = .selection_owned_noop },
+            keyToMsg(context, .{ .codepoint = 'y' }).?,
+        );
+        try std.testing.expectEqual(
+            app_message.Msg{ .repository = .selection_owned_noop },
+            keyToMsg(context, .{ .codepoint = 'j' }).?,
+        );
+        try std.testing.expectEqual(
+            app_message.Msg{ .repository = .selection_owned_noop },
+            keyToMsg(context, v).?,
+        );
+        try std.testing.expectEqual(
+            app_message.Msg{ .repository = .{ .selection_action = .clear } },
+            keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?,
+        );
+    }
+    const retained: KeyContext = .{
+        .active_page = .repository,
+        .repository = .{ .retained_selection_action_available = true },
+    };
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .{ .selection_action = .copy } },
+        keyToMsg(retained, .{ .codepoint = 'y' }).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .selection_action_unavailable },
+        keyToMsg(retained, .{ .codepoint = 'a' }).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg.cancel_remote_action,
+        keyToMsg(.{
+            .active_page = .repository,
+            .remote_action_cancelable = true,
+            .repository = active.repository,
+        }, .{ .codepoint = chasen.Key.escape }).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .cancel_source_search },
+        keyToMsg(.{
+            .active_page = .repository,
+            .repository = .{ .source_search_mode = true, .selection_owner = .keyboard_line },
+        }, .{ .codepoint = chasen.Key.escape }).?,
+    );
 }
 
 test "eventToMsg maps winsize event" {

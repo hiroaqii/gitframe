@@ -126,7 +126,7 @@ pub const Controller = struct {
         }
 
         if (self.active_page.* == .review) self.deactivateReviewForPageSwitch(allocator);
-        if (self.active_page.* == .repository) self.repository.deactivate();
+        if (self.active_page.* == .repository) self.deactivateRepositoryForPageSwitch();
         if (self.active_page.* == .compare) self.compare.deactivate();
         self.active_page.* = target;
         return switch (target) {
@@ -153,7 +153,7 @@ pub const Controller = struct {
         return .{
             .review_mouse_selection = self.review.selection_owner.activeMouseSelection(),
             .compare_mouse_selection = self.compare.selection_owner.activeMouseSelection(),
-            .repository_mouse_selection = self.repository.activeSourceRange(),
+            .repository_mouse_selection = self.repository.activeMouseSourceRange(),
             .review_deferred_apply = self.review.deferredSourceBlocksPageTransition(),
             .compare_deferred_apply = self.compare.deferred_load_apply != null,
             .review_search = self.review.search.mode,
@@ -208,7 +208,7 @@ pub const Controller = struct {
         std.debug.assert(self.active_page.* == .repository);
         const target = self.repository.reviewTarget();
         self.repository.dismissIncoming(allocator);
-        self.repository.deactivate();
+        self.deactivateRepositoryForPageSwitch();
         self.active_page.* = .review;
         _ = self.activateReview();
 
@@ -226,6 +226,11 @@ pub const Controller = struct {
                 }
             },
         }
+    }
+
+    fn deactivateRepositoryForPageSwitch(self: Controller) void {
+        self.repository.clearLiveSelectionPreservingViewport(self.body_size);
+        self.repository.deactivate();
     }
 
     fn deactivateReviewForPageSwitch(self: Controller, allocator: std.mem.Allocator) void {

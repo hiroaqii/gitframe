@@ -78,6 +78,7 @@ test {
     _ = @import("app/push_retry.zig");
     _ = @import("app/repo_picker.zig");
     _ = @import("app/review_projection.zig");
+    _ = @import("app/selection_input.zig");
     _ = @import("app/state.zig");
     _ = @import("app/text_buffer.zig");
     _ = @import("app/text_edit.zig");

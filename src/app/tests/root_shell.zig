@@ -16,6 +16,7 @@ const review_navigation = @import("../pages/review/navigation.zig");
 const review_reload = @import("../pages/review/reload.zig");
 const compare_page = @import("../pages/compare.zig");
 const compare_navigation = @import("../pages/compare/navigation.zig");
+const repository_selection = @import("../pages/repository/selection.zig");
 const diff_surface = @import("../diff_surface.zig");
 const review_authority = @import("../diff_surface/authority.zig");
 const context = @import("../../context.zig");
@@ -545,6 +546,20 @@ test "terminal resize preserves semantic keyboard line selection while focus los
     try app.update(.focus_lost, &tc.ctx);
     try std.testing.expect(app.pages.review.selection_owner == .none);
     try std.testing.expect(app.pages.compare.selection_owner.activeKeyboardLineSelection());
+
+    app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(.{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .path = "main.zig",
+        .source_fingerprint = content_fingerprint.Fingerprint.init("source"),
+    }, 0) };
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &tc.ctx);
+    try std.testing.expect(app.pages.repository.activeKeyboardLineSelection());
+    try std.testing.expect(!app.pages.repository.activeMouseOwner());
+
+    app.active_page = .repository;
+    try app.update(.focus_lost, &tc.ctx);
+    try std.testing.expect(!app.pages.repository.activeBorrowedSourceRange());
 }
 
 test "Compare retained actions route keyboard and mouse through App after narrow resize" {
@@ -713,11 +728,18 @@ test "Compare retained actions route keyboard and mouse through App after narrow
 }
 
 test "help overlay opens and closes before normal shortcuts" {
-    var app: App = .{};
+    var app: App = .{ .active_page = .repository };
+    app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(.{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .path = "main.zig",
+        .source_fingerprint = content_fingerprint.Fingerprint.init("source"),
+    }, 0) };
 
     const open_msg = app.handleEvent(.{ .key_press = .{ .codepoint = '?' } }) orelse return error.ExpectedOpenHelp;
     try app.update(open_msg, undefined);
     try std.testing.expectEqual(OverlayKind.help, app.overlay.kind);
+    try std.testing.expect(!app.pages.repository.activeBorrowedSourceRange());
 
     const scroll_msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'j' } }) orelse return error.ExpectedHelpScroll;
     try std.testing.expectEqual(App.Msg.help_scroll_down, scroll_msg);

@@ -20,6 +20,11 @@ pub const Mode = enum {
     line,
 };
 
+pub const Origin = enum {
+    mouse,
+    keyboard_line,
+};
+
 pub const Point = struct {
     line_index: usize,
     /// Strict byte boundaries for character mode. Line mode ignores them.
@@ -70,6 +75,7 @@ pub const RepositoryContentToken = struct {
 pub const DragSelection = struct {
     token: RepositoryContentToken,
     mode: Mode,
+    origin: Origin = .mouse,
     anchor: Point,
     focus: Point,
     anchor_cell: ?Cell = null,
@@ -79,6 +85,17 @@ pub const DragSelection = struct {
         return .{
             .token = token,
             .mode = mode,
+            .anchor = point,
+            .focus = point,
+        };
+    }
+
+    pub fn initKeyboardLine(token: RepositoryContentToken, line_index: usize) DragSelection {
+        const point = pointFromLine(line_index);
+        return .{
+            .token = token,
+            .mode = .line,
+            .origin = .keyboard_line,
             .anchor = point,
             .focus = point,
         };
@@ -114,6 +131,11 @@ pub const DragSelection = struct {
         }
         return .{ .start = self.focus, .end = self.anchor };
     }
+
+    pub fn lineCount(self: DragSelection) usize {
+        const normalized = self.range();
+        return normalized.end.line_index - normalized.start.line_index + 1;
+    }
 };
 
 /// Borrowed identity of the selected path rendered in the Repository source
@@ -141,7 +163,7 @@ pub const SourceHeaderPathSelection = struct {
     identity: SourceHeaderIdentity,
 };
 
-/// Exclusive owner of Repository pointer gestures.
+/// Exclusive owner of a Repository live selection gesture.
 ///
 pub const Owner = union(enum) {
     none,
@@ -153,6 +175,16 @@ pub const Owner = union(enum) {
             .none, .source_header => null,
             .source => |selection| selection,
         };
+    }
+
+    pub fn activeMouseSource(self: Owner) ?DragSelection {
+        const selection = self.activeSource() orelse return null;
+        return if (selection.origin == .mouse) selection else null;
+    }
+
+    pub fn activeKeyboardLineSelection(self: Owner) ?DragSelection {
+        const selection = self.activeSource() orelse return null;
+        return if (selection.origin == .keyboard_line) selection else null;
     }
 
     pub fn activeSourceHeader(self: Owner) ?SourceHeaderPathSelection {
@@ -167,14 +199,22 @@ pub const Owner = union(enum) {
     pub fn activeMouseOwner(self: Owner) bool {
         return switch (self) {
             .none => false,
-            .source, .source_header => true,
+            .source => |selection| selection.origin == .mouse,
+            .source_header => true,
         };
     }
 
     /// Whether accepted source bytes are borrowed by a live range gesture.
     /// Page-transition blocking and later deferred source apply use only this
     /// narrower question, never the aggregate mouse-owner predicate.
-    pub fn activeSourceRange(self: Owner) bool {
+    pub fn activeMouseSourceRange(self: Owner) bool {
+        return switch (self) {
+            .none, .source_header => false,
+            .source => |selection| selection.origin == .mouse,
+        };
+    }
+
+    pub fn activeBorrowedSourceRange(self: Owner) bool {
         return switch (self) {
             .none, .source_header => false,
             .source => true,
@@ -303,7 +343,7 @@ pub fn buildCompletedSelection(
     document: *const source.Document,
     selection: DragSelection,
 ) BuildError!CompletedSelection {
-    if (!selection.moved) return error.NotMoved;
+    if (!selection.moved and selection.origin == .mouse) return error.NotMoved;
     if (!selection.token.source_fingerprint.eql(document.fingerprint)) return error.StaleContent;
 
     const range = selection.range();
@@ -319,7 +359,7 @@ pub fn buildCompletedSelection(
         return error.InvalidSelection;
     }
 
-    const line_count = range.end.line_index - range.start.line_index + 1;
+    const line_count = selection.lineCount();
     var text_len: usize = 0;
     var line_index = range.start.line_index;
     while (line_index <= range.end.line_index) : (line_index += 1) {
@@ -412,7 +452,8 @@ fn testToken(path: []const u8, bytes: []const u8) RepositoryContentToken {
 test "repository selection owner keeps pointer and source-range predicates explicit" {
     var owner: Owner = .none;
     try std.testing.expect(!owner.activeMouseOwner());
-    try std.testing.expect(!owner.activeSourceRange());
+    try std.testing.expect(!owner.activeMouseSourceRange());
+    try std.testing.expect(!owner.activeBorrowedSourceRange());
     try std.testing.expect(owner.activeSource() == null);
 
     owner = .{ .source = DragSelection.init(
@@ -421,12 +462,39 @@ test "repository selection owner keeps pointer and source-range predicates expli
         pointFromBoundary(0, 0),
     ) };
     try std.testing.expect(owner.activeMouseOwner());
-    try std.testing.expect(owner.activeSourceRange());
+    try std.testing.expect(owner.activeMouseSourceRange());
+    try std.testing.expect(owner.activeBorrowedSourceRange());
     try std.testing.expect(owner.activeSource() != null);
+
+    owner = .{ .source = DragSelection.initKeyboardLine(
+        testToken("main.zig", "source"),
+        2,
+    ) };
+    try std.testing.expect(!owner.activeMouseOwner());
+    try std.testing.expect(!owner.activeMouseSourceRange());
+    try std.testing.expect(owner.activeBorrowedSourceRange());
+    try std.testing.expectEqual(@as(usize, 1), owner.activeKeyboardLineSelection().?.lineCount());
 
     owner = .none;
     try std.testing.expect(!owner.activeMouseOwner());
-    try std.testing.expect(!owner.activeSourceRange());
+    try std.testing.expect(!owner.activeMouseSourceRange());
+    try std.testing.expect(!owner.activeBorrowedSourceRange());
+}
+
+test "repository keyboard line selection completes one exact line without mouse movement" {
+    const bytes = "alpha\nbeta\ngamma";
+    var document = try testDocument(bytes);
+    defer document.deinit(std.testing.allocator);
+    const live = DragSelection.initKeyboardLine(testToken("src/example.zig", bytes), 1);
+
+    try std.testing.expect(!live.moved);
+    try std.testing.expectEqual(@as(usize, 1), live.lineCount());
+    var completed = try buildCompletedSelection(std.testing.allocator, &document, live);
+    defer completed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("beta", completed.text);
+    try std.testing.expectEqual(@as(usize, 1), completed.line_count);
+    try std.testing.expectEqual(@as(u32, 2), completed.source_start);
+    try std.testing.expectEqual(@as(u32, 2), completed.source_end);
 }
 
 fn testDocument(bytes: []const u8) !source.Document {
@@ -738,7 +806,7 @@ test "repository source header identity and owner predicates stay policy-specifi
 
     const header_owner: Owner = .{ .source_header = .{ .identity = base } };
     try std.testing.expect(header_owner.activeMouseOwner());
-    try std.testing.expect(!header_owner.activeSourceRange());
+    try std.testing.expect(!header_owner.activeMouseSourceRange());
     try std.testing.expect(header_owner.activeSource() == null);
     try std.testing.expect(header_owner.activeSourceHeader().?.identity.eql(base));
 
@@ -748,6 +816,6 @@ test "repository source header identity and owner predicates stay policy-specifi
         pointFromBoundary(0, 0),
     ) };
     try std.testing.expect(source_owner.activeMouseOwner());
-    try std.testing.expect(source_owner.activeSourceRange());
+    try std.testing.expect(source_owner.activeMouseSourceRange());
     try std.testing.expect(source_owner.activeSourceHeader() == null);
 }

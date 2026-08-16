@@ -536,7 +536,9 @@ pub const App = struct {
             .commit_panel_move_down => self.localWorkflow().commitPanelMoveDown(),
             .enter_repo_picker => {
                 self.drag_auto_scroll.clear();
-                if (self.active_page == .repository) self.pages.repository.cancelMouseOwner();
+                if (self.active_page == .repository) {
+                    self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize());
+                }
                 try self.repoSession().enterPicker(ctx.allocator());
             },
             .cancel_repo_picker => try self.repoSession().cancelPicker(ctx.allocator()),
@@ -569,7 +571,9 @@ pub const App = struct {
                 if (self.active_page == .compare and self.pages.compare.selection_owner.activeMouseSelection()) {
                     self.pages.compare.selection_owner = .none;
                 }
-                if (self.active_page == .repository) self.pages.repository.cancelMouseOwner();
+                if (self.active_page == .repository) {
+                    self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize());
+                }
                 self.overlay.openHelpForPage(self.active_page);
             },
             .close_help => self.overlay.close(),
@@ -616,7 +620,7 @@ pub const App = struct {
                 self.drag_auto_scroll.clear();
                 switch (self.active_page) {
                     .review => self.reviewNavigation().clearDiffSelection(),
-                    .repository => self.pages.repository.cancelMouseOwner(),
+                    .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
                     .compare => self.pages.compare.selection_owner = .none,
                     .config => {},
                 }

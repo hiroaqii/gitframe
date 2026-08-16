@@ -412,7 +412,10 @@ fn drawDocumentCheckpoint(
     switch (displayed.value) {
         .source => |*document| {
             const live_selection = state.liveSourceSelection();
-            const retained_selection = state.retainedSourceSelection();
+            const retained_selection = if (live_selection) |live|
+                if (live.origin == .keyboard_line) null else state.retainedSourceSelection()
+            else
+                state.retainedSourceSelection();
             try drawSourceWithRetained(
                 surface,
                 document,
@@ -647,8 +650,25 @@ pub fn drawSourceWithRetained(
     if (size.height <= geometry.body_first_row) return;
     const source_active = viewer.focus == .source;
 
-    const action_projection = if (retained_selection) |completed|
-        selection_action.Projection.init(document.rowCount(), completed.range.end.line_index)
+    const ActionPresentation = struct {
+        tail: usize,
+        line_count: usize,
+    };
+    const active_keyboard = if (live_selection) |live| live.origin == .keyboard_line else false;
+    const visible_retained = if (active_keyboard) null else retained_selection;
+    const action_presentation: ?ActionPresentation = if (live_selection) |live|
+        if (live.origin == .keyboard_line)
+            .{ .tail = live.range().end.line_index, .line_count = live.lineCount() }
+        else if (visible_retained) |completed|
+            .{ .tail = completed.range.end.line_index, .line_count = completed.line_count }
+        else
+            null
+    else if (visible_retained) |completed|
+        .{ .tail = completed.range.end.line_index, .line_count = completed.line_count }
+    else
+        null;
+    const action_projection = if (action_presentation) |presentation|
+        selection_action.Projection.init(document.rowCount(), presentation.tail)
     else
         null;
     const presentation_rows = if (action_projection) |projection|
@@ -667,7 +687,7 @@ pub fn drawSourceWithRetained(
         const line_index = switch (location) {
             .source => |value| value,
             .action => |action_row| {
-                const completed = retained_selection orelse continue;
+                const presentation = action_presentation orelse continue;
                 const style: chasen.TextStyle = .{
                     .fg = palette.color(.foreground),
                     .bg = palette.color(.pane_cursor_bg),
@@ -678,7 +698,7 @@ pub fn drawSourceWithRetained(
                     row,
                     selection_action.actionLayout(.{ .col = 0, .width = geometry.width }),
                     action_row,
-                    completed.line_count,
+                    presentation.line_count,
                     style,
                 );
                 continue;
@@ -709,7 +729,7 @@ pub fn drawSourceWithRetained(
             draw.copyClippedTextAt(surface, number_col, row, number, sourceRowStyle(palette.style(number_role), source_active, current, palette)) catch {};
         }
         if (geometry.text_width == 0) {
-            applyCompletedSelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, retained_selection, palette.color(.diff_selection_bg));
+            applyCompletedSelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, visible_retained, palette.color(.diff_selection_bg));
             applySelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_selection_bg));
             continue;
         }
@@ -738,7 +758,7 @@ pub fn drawSourceWithRetained(
                 sourceRowStyle(palette.boldStyle(.warning), source_active, current, palette),
             );
         };
-        applyCompletedSelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, retained_selection, palette.color(.diff_selection_bg));
+        applyCompletedSelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, visible_retained, palette.color(.diff_selection_bg));
         applySelectionLineStyles(surface, geometry, row, document, line_index, projection, viewer.source_horizontal_scroll, live_selection, palette.color(.diff_selection_bg));
     }
 }
@@ -1780,6 +1800,54 @@ test "repository retained selection inserts actions and shares its background wi
     const snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 lines selected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, selection_action.controls_text) != null);
+}
+
+test "repository keyboard line selection hides prior retained presentation until completion" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "zero\none\ntwo\nthree\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const token: selection.RepositoryContentToken = .{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+        .path = "main.zig",
+        .source_fingerprint = document.fingerprint,
+    };
+    var prior_drag = selection.DragSelection.init(token, .line, selection.pointFromLine(0));
+    prior_drag.update(selection.pointFromLine(1));
+    var completed = try selection.buildCompletedSelection(allocator, &document, prior_drag);
+    defer completed.deinit(allocator);
+    const live = selection.DragSelection.initKeyboardLine(token, 2);
+
+    const palette: theme.Palette = .default();
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(32, 9);
+    defer test_surface.deinit();
+    try drawSourceWithRetained(
+        &test_surface.surface,
+        &document,
+        null,
+        null,
+        .{ .focus = .source, .source_cursor = 2 },
+        .{},
+        &completed,
+        live,
+        palette,
+    );
+
+    const geometry = source_geometry.SourceGeometry.init(test_surface.surface.size(), &document, true);
+    const prior_cell = test_surface.surface.readCell(geometry.text_col, geometry.body_first_row) orelse
+        return error.ExpectedPriorCell;
+    const active_cell = test_surface.surface.readCell(geometry.text_col, geometry.body_first_row + 2) orelse
+        return error.ExpectedActiveCell;
+    try std.testing.expect(!prior_cell.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(active_cell.style.bg.eql(palette.color(.diff_selection_bg)));
+
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 lines selected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 lines selected") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, selection_action.controls_text) != null);
 }
 

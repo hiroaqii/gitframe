@@ -6,16 +6,11 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const key_input = @import("../key_input.zig");
+const selection_input = @import("../selection_input.zig");
 const diff_selection = @import("../../diff/selection.zig");
-const selection_action = @import("../selection_action.zig");
 const message = @import("message.zig");
 
-pub const SelectionOwnerKind = enum {
-    none,
-    mouse,
-    keyboard_line,
-    header,
-};
+pub const SelectionOwnerKind = selection_input.OwnerKind;
 
 pub const Context = struct {
     search_mode: bool = false,
@@ -48,44 +43,17 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?message.Msg {
 /// Bounded selection grammar used both by page-local input and by the root
 /// preflight that runs after modal owners but before configured root actions.
 pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?message.Msg {
-    const escape = key.matches(chasen.Key.escape, .{});
-    const copy = key.matches('y', .{});
-    const ask = key.matches('a', .{});
-    const begin = key_input.matchesShiftedAscii(key, 'v', 'V');
-    const up = key.matches('k', .{}) or key.matches(chasen.Key.up, .{});
-    const down = key.matches('j', .{}) or key.matches(chasen.Key.down, .{});
-    const lateral = key.matches('h', .{}) or key.matches('l', .{});
-
-    return switch (context.selection_owner) {
-        .keyboard_line => if (escape)
-            .{ .selection_action = .clear }
-        else if (copy)
-            .{ .selection_action = .copy }
-        else if (ask)
-            .selection_action_unavailable
-        else if (up)
-            .{ .keyboard_line_selection_move = .up }
-        else if (down)
-            .{ .keyboard_line_selection_move = .down }
-        else if (begin or lateral)
-            .selection_owned_noop
-        else
-            null,
-        .mouse, .header => if (escape)
-            .{ .selection_action = .clear }
-        else if (copy or ask or begin or up or down or lateral)
-            .selection_owned_noop
-        else
-            null,
-        .none => if (context.retained_selection_action_available)
-            if (selection_action.keyToAction(key)) |action|
-                .{ .selection_action = action }
-            else if (ask)
-                .selection_action_unavailable
-            else
-                null
-        else
-            null,
+    const command = selection_input.keyToCommand(.{
+        .owner_kind = context.selection_owner,
+        .retained_action_available = context.retained_selection_action_available,
+    }, key) orelse return null;
+    return switch (command) {
+        .move_up => .{ .keyboard_line_selection_move = .up },
+        .move_down => .{ .keyboard_line_selection_move = .down },
+        .copy => .{ .selection_action = .copy },
+        .clear => .{ .selection_action = .clear },
+        .ask => .selection_action_unavailable,
+        .owned_noop => .selection_owned_noop,
     };
 }
 

@@ -125,6 +125,26 @@ pub fn wheelSourceProjected(
     }
 }
 
+/// Scroll only the projected viewport. A keyboard line selection owns the
+/// semantic cursor/endpoint, so a pointer wheel must not retarget either one.
+pub fn scrollSourceViewportProjected(
+    viewer: *model.ViewerState,
+    document: *const source.Document,
+    direction: isize,
+    geometry: source_geometry.SourceGeometry,
+    projection: ?selection_action.Projection,
+) void {
+    const bounds = sourceBounds(document, geometry, projection);
+    const current = bounds.clampScroll(viewer.source_vertical_scroll);
+    const requested = if (direction < 0)
+        current -| 1
+    else if (direction > 0)
+        current +| 1
+    else
+        current;
+    viewer.source_vertical_scroll = bounds.clampScroll(requested);
+}
+
 pub fn firstSource(viewer: *model.ViewerState, document: *const source.Document, geometry: source_geometry.SourceGeometry) void {
     firstSourceProjected(viewer, document, geometry, null);
 }

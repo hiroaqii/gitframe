@@ -13,6 +13,7 @@ const repo_session = @import("repo_session.zig");
 const compare_page = @import("pages/compare.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_selection = @import("pages/repository/selection.zig");
+const repository_tasks = @import("pages/repository/tasks.zig");
 const review_page = @import("pages/review.zig");
 const review_content = @import("pages/review/content.zig");
 const review_navigation = @import("pages/review/navigation.zig");
@@ -23,6 +24,9 @@ const diff_source = @import("../diff/source.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 const repo_root_capability = @import("../repo/root_capability.zig");
+const repository_manifest_model = @import("../repository/manifest.zig");
+const repository_source_document = @import("../repository/source.zig");
+const repository_tree_model = @import("../repository/tree.zig");
 
 const PageStates = struct {
     review: review_page.ReviewPageState = .{},
@@ -39,6 +43,7 @@ const TestApp = struct {
     config: diff_source.CliConfig = .{},
     status: app_state.StatusMessage = .{},
     overlay: app_state.OverlayState = .{},
+    body_size: chasen.Size = .{ .width = 100, .height = 30 },
 
     const Msg = app_message.Msg;
 
@@ -51,7 +56,7 @@ const TestApp = struct {
             .config_page = &self.pages.config,
             .repo = self.repo_session.view(),
             .source = self.config.source,
-            .body_size = .{ .width = 100, .height = 30 },
+            .body_size = self.body_size,
             .status = &self.status,
             .shell_blockers = .{ .help = self.overlay.isHelp() },
         };
@@ -124,7 +129,7 @@ test "repository source header page switch cancels header owner without weakenin
     app.pages.repository.selection_owner = .{ .source_header = repositoryHeaderSelectionForTest() };
     try requestPageSwitchForTest(&app, &ctx, .repository);
     try std.testing.expect(app.pages.repository.activeMouseOwner());
-    try std.testing.expect(!app.pages.repository.activeSourceRange());
+    try std.testing.expect(!app.pages.repository.activeMouseSourceRange());
 
     app.overlay.openHelp();
     try requestPageSwitchForTest(&app, &ctx, .compare);
@@ -144,8 +149,56 @@ test "repository source header page switch cancels header owner without weakenin
     app.status.clear();
     try requestPageSwitchForTest(&app, &ctx, .compare);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
-    try std.testing.expect(app.pages.repository.activeSourceRange());
+    try std.testing.expect(app.pages.repository.activeMouseSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
+
+    app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(
+        repositoryLiveSelectionForTest().token,
+        0,
+    ) };
+    app.status.clear();
+    try requestPageSwitchForTest(&app, &ctx, .compare);
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try std.testing.expect(!app.pages.repository.activeBorrowedSourceRange());
+}
+
+test "repository keyboard line selection page exits preserve semantic viewport" {
+    const allocator = std.testing.allocator;
+    const targets = [_]page.Id{ .compare, .review };
+
+    inline for (targets) |target| inline for (.{ false, true }) |retain_prior| {
+        var app: TestApp = .{
+            .allocator = allocator,
+            .active_page = .repository,
+            .body_size = .{ .width = 36, .height = 7 },
+            .pages = .{ .repository = try repositorySelectionViewportStateForTest(allocator, retain_prior) },
+        };
+        defer app.pages.repository.deinit(allocator);
+        var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+
+        const viewport_before = app.pages.repository.captureSelectionViewportAnchor() orelse
+            return error.ExpectedSelectionViewportAnchor;
+        try std.testing.expectEqual(@as(usize, 3), viewport_before.semantic_source);
+        try std.testing.expectEqual(@as(isize, 0), viewport_before.signed_screen_delta);
+
+        try requestPageSwitchForTest(&app, &ctx, target);
+
+        try std.testing.expectEqual(target, app.active_page);
+        try std.testing.expect(!app.pages.repository.active);
+        try std.testing.expect(!app.pages.repository.activeBorrowedSourceRange());
+        try std.testing.expectEqual(retain_prior, app.pages.repository.retainedSourceSelection() != null);
+        if (retain_prior) {
+            const viewport_after = app.pages.repository.captureSelectionViewportAnchor() orelse
+                return error.ExpectedRetainedViewportAnchor;
+            try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
+            try std.testing.expectEqual(viewport_before.signed_screen_delta, viewport_after.signed_screen_delta);
+        } else {
+            try std.testing.expectEqual(
+                viewport_before.semantic_source,
+                app.pages.repository.viewer.source_vertical_scroll,
+            );
+        }
+    };
 }
 
 test "page transition blocker leaves page and Review state unchanged" {
@@ -742,6 +795,87 @@ fn repositoryLiveSelectionForTest() repository_selection.DragSelection {
         .character,
         .{ .line_index = 0, .leading_byte = 0, .trailing_byte = 1 },
     );
+}
+
+fn repositorySelectionViewportStateForTest(
+    allocator: std.mem.Allocator,
+    retain_prior: bool,
+) !repository_page.RepositoryPageState {
+    const content = "zero\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\n";
+    const root_identity: repo_root_capability.Identity = .{ .device = 2, .inode = 3 };
+    var state: repository_page.RepositoryPageState = .{
+        .initialized = true,
+        .active = true,
+        .activation_id = 4,
+        .repo_epoch = 1,
+        .root_identity = root_identity,
+        .bundle = try repositorySelectionBundleForTest(allocator),
+        .load_state = .loaded,
+        .freshness = .fresh,
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .viewer = .{
+            .focus = .source,
+            .source_cursor = 2,
+            .source_vertical_scroll = 5,
+        },
+    };
+    errdefer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.firstFilePath();
+    state.displayed_document = try repositorySelectionDocumentForTest(allocator, content);
+    const token: repository_selection.RepositoryContentToken = .{
+        .repo_epoch = state.repo_epoch,
+        .root_identity = root_identity,
+        .path = state.displayed_document.?.path,
+        .source_fingerprint = content_fingerprint.Fingerprint.init(content),
+    };
+    if (retain_prior) {
+        var prior = repository_selection.DragSelection.init(
+            token,
+            .line,
+            repository_selection.pointFromLine(0),
+        );
+        prior.update(repository_selection.pointFromLine(6));
+        state.completed_selection = try repository_selection.buildCompletedSelection(
+            allocator,
+            &state.displayed_document.?.value.source,
+            prior,
+        );
+    }
+    state.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(token, 2) };
+    return state;
+}
+
+fn repositorySelectionBundleForTest(allocator: std.mem.Allocator) !repository_tasks.Bundle {
+    var document = try repository_manifest_model.parseOwned(allocator, try allocator.dupe(u8, "main.zig\x00"));
+    errdefer document.deinit(allocator);
+    return .{
+        .tree = try repository_tree_model.Tree.build(allocator, &document),
+        .document = document,
+    };
+}
+
+fn repositorySelectionDocumentForTest(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+) !repository_page.DisplayedDocument {
+    const bytes = try allocator.dupe(u8, content);
+    var document = repository_source_document.Document.initOwned(
+        allocator,
+        bytes,
+        .init(bytes),
+    ) catch |err| {
+        allocator.free(bytes);
+        return err;
+    };
+    errdefer document.deinit(allocator);
+    return .{
+        .path = try allocator.dupe(u8, "main.zig"),
+        .manifest_revision = 5,
+        .source_revision = 6,
+        .authority = .accepted,
+        .value = .{ .source = document },
+    };
 }
 
 const TestRepoPair = struct {

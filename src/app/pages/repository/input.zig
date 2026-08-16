@@ -5,6 +5,7 @@ const chasen = @import("chasen");
 const keymap = @import("keymap");
 const key_input = @import("../../key_input.zig");
 const selection_action = @import("../../selection_action.zig");
+const selection_input = @import("../../selection_input.zig");
 const model = @import("model.zig");
 
 pub const Context = struct {
@@ -13,6 +14,7 @@ pub const Context = struct {
     tree_hidden: bool = false,
     source_search_mode: bool = false,
     file_search_mode: bool = false,
+    selection_owner: selection_input.OwnerKind = .none,
     retained_selection_action_available: bool = false,
     source_query_len: usize = 0,
     keymap: keymap.Effective = .{},
@@ -29,9 +31,7 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
     if (context.source_search_mode) return sourceSearchKey(Msg, key);
     if (context.file_search_mode) return fileSearchKey(Msg, key);
 
-    if (context.retained_selection_action_available) {
-        if (selection_action.keyToAction(key)) |action| return payload(Msg, "selection_action", action);
-    }
+    if (selectionKeyToMsg(Msg, context, key)) |msg| return msg;
 
     // A configured action claims its normal-mode key even when Repository does
     // not own that action or its current precondition is unavailable. Falling
@@ -41,6 +41,8 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
     if (context.keymap.actionForKey(key)) |action| {
         return publicActionToMsg(Msg, context, action);
     }
+
+    if (key_input.matchesShiftedAscii(key, 'v', 'V')) return voidMsg(Msg, "begin_keyboard_line_selection");
 
     if (key.matches(chasen.Key.tab, .{}) and context.source_available and !context.tree_hidden) return voidMsg(Msg, "toggle_focus");
     if (key.matches(chasen.Key.escape, .{}) and context.source_query_len > 0) return voidMsg(Msg, "clear_source_search");
@@ -62,6 +64,23 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
         'n' => if (context.source_query_len > 0) voidMsg(Msg, "next_source_match") else null,
         'p' => if (context.source_query_len > 0) voidMsg(Msg, "previous_source_match") else null,
         else => null,
+    };
+}
+
+/// Bounded owner grammar used by root preflight after modal owners and before
+/// configured root actions. Repository identity remains in the page adapter.
+pub fn selectionKeyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
+    const command = selection_input.keyToCommand(.{
+        .owner_kind = context.selection_owner,
+        .retained_action_available = context.retained_selection_action_available,
+    }, key) orelse return null;
+    return switch (command) {
+        .move_up => payload(Msg, "keyboard_line_selection_move", @import("../../direction.zig").Vertical.up),
+        .move_down => payload(Msg, "keyboard_line_selection_move", @import("../../direction.zig").Vertical.down),
+        .copy => payload(Msg, "selection_action", selection_action.Action.copy),
+        .clear => payload(Msg, "selection_action", selection_action.Action.clear),
+        .ask => voidMsg(Msg, "selection_action_unavailable"),
+        .owned_noop => voidMsg(Msg, "selection_owned_noop"),
     };
 }
 
@@ -112,6 +131,10 @@ fn payload(comptime Msg: type, comptime field: []const u8, value: anytype) Msg {
 
 const TestMsg = union(enum) {
     selection_action: selection_action.Action,
+    selection_owned_noop,
+    selection_action_unavailable,
+    begin_keyboard_line_selection,
+    keyboard_line_selection_move: @import("../../direction.zig").Vertical,
     toggle_focus,
     toggle_directory,
     move_up,
@@ -199,6 +222,42 @@ test "repository retained actions follow modal owners and precede navigation" {
     try std.testing.expectEqual(
         TestMsg.cancel_file_search,
         keyToMsg(TestMsg, file_modal, .{ .codepoint = chasen.Key.escape }).?,
+    );
+}
+
+test "repository keyboard line selection owns bounded keys and preserves horizontal navigation" {
+    const active: Context = .{
+        .focus = .source,
+        .source_available = true,
+        .selection_owner = .keyboard_line,
+        .retained_selection_action_available = true,
+    };
+    try std.testing.expectEqual(TestMsg{ .keyboard_line_selection_move = .down }, keyToMsg(TestMsg, active, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(TestMsg{ .keyboard_line_selection_move = .up }, keyToMsg(TestMsg, active, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(TestMsg{ .selection_action = .copy }, keyToMsg(TestMsg, active, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(TestMsg{ .selection_action = .clear }, keyToMsg(TestMsg, active, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(TestMsg.selection_action_unavailable, keyToMsg(TestMsg, active, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, active, .{ .codepoint = 'V' }).?);
+    try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, active, .{ .codepoint = 'h' }).?);
+    try std.testing.expectEqual(TestMsg.scroll_left, keyToMsg(TestMsg, active, .{ .codepoint = chasen.Key.left }).?);
+}
+
+test "repository mouse owners consume selection grammar and configured V wins before begin" {
+    for ([_]selection_input.OwnerKind{ .mouse, .header }) |owner| {
+        const context: Context = .{ .selection_owner = owner };
+        try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, context, .{ .codepoint = 'y' }).?);
+        try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, context, .{ .codepoint = 'j' }).?);
+        try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, context, .{ .codepoint = 'V' }).?);
+        try std.testing.expectEqual(TestMsg{ .selection_action = .clear }, keyToMsg(TestMsg, context, .{ .codepoint = chasen.Key.escape }).?);
+    }
+
+    const v = chasen.Key{ .codepoint = 'V' };
+    try std.testing.expectEqual(TestMsg.begin_keyboard_line_selection, keyToMsg(TestMsg, .{}, v).?);
+    var config: keymap.Config = .{};
+    config.set(.toggle_line_numbers, .{ .plain_codepoint = 'V' });
+    try std.testing.expectEqual(
+        TestMsg.toggle_line_numbers,
+        keyToMsg(TestMsg, .{ .keymap = keymap.Effective.fromConfig(config) }, v).?,
     );
 }
 

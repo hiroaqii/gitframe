@@ -7,6 +7,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const text_projection = @import("chasen_ui").text_projection;
 const keymap = @import("keymap");
+const app_direction = @import("../direction.zig");
 const app_state = @import("../state.zig");
 const drag_auto_scroll = @import("../drag_auto_scroll.zig");
 const selection_action = @import("../selection_action.zig");
@@ -42,6 +43,14 @@ const repository_tree_projection = @import("repository/tree_projection.zig");
 
 const repository_tab_width: usize = 4;
 pub const SelectionViewportAnchor = selection_action.ViewportAnchor(usize);
+
+pub const SourceSelectionPresentation = struct {
+    pub const Owner = enum { active_keyboard, completed };
+
+    range: repository_selection.Range,
+    line_count: usize,
+    owner: Owner,
+};
 
 pub const LoadState = enum { idle, no_repository, loading, loaded, empty, failed };
 
@@ -165,6 +174,10 @@ pub const Msg = union(enum) {
     wheel_up,
     wheel_down,
     selection_action: selection_action.Action,
+    selection_owned_noop,
+    selection_action_unavailable,
+    begin_keyboard_line_selection,
+    keyboard_line_selection_move: app_direction.Vertical,
 
     pub fn deinitUndelivered(self: *Msg, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -324,7 +337,8 @@ pub const RepositoryPageState = struct {
         self.path_history.deinit(allocator);
         self.clearFileSearchDocumentAuthority();
         self.incoming.deinit(allocator);
-        self.cancelMouseOwner();
+        self.clearLiveSelection();
+        std.debug.assert(!self.activeBorrowedSourceRange());
         self.clearCompletedSelection(allocator);
         if (self.bundle) |*bundle| bundle.deinit(allocator);
         if (self.displayed_document) |*document| document.deinit(allocator);
@@ -334,7 +348,7 @@ pub const RepositoryPageState = struct {
 
     pub fn activate(self: *RepositoryPageState, repo_epoch: u64, identity: ?root_capability.Identity) void {
         self.clearFileSearchDocumentAuthority();
-        self.cancelMouseOwner();
+        self.clearLiveSelection();
         self.initialized = true;
         self.active = true;
         self.activation_id +%= 1;
@@ -369,7 +383,7 @@ pub const RepositoryPageState = struct {
 
     pub fn deactivate(self: *RepositoryPageState) void {
         self.file_search_source_focus.clear();
-        self.cancelMouseOwner();
+        self.clearLiveSelection();
         self.active = false;
         self.path_history.retire(false);
         if (self.bundle != null) self.freshness = .validating;
@@ -386,7 +400,8 @@ pub const RepositoryPageState = struct {
             const owner = allocator orelse @panic("Repository incoming replacement requires an allocator");
             self.incoming.dismiss(owner);
         }
-        self.cancelMouseOwner();
+        self.clearLiveSelection();
+        std.debug.assert(!self.activeBorrowedSourceRange());
         if (self.completed_selection != null) {
             const owner = allocator orelse @panic("Repository completed-selection replacement requires an allocator");
             self.clearCompletedSelection(owner);
@@ -1013,7 +1028,9 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
-        self.cancelMouseOwner();
+        // The shared authority transition clears borrowed source storage and
+        // preserves the semantic viewport across any projection change.
+        if (self.selection_owner.activeSourceHeader() != null) self.cancelMouseOwner();
         self.path_history.retire(false);
         self.branch.requestReload(
             self.active,
@@ -1284,12 +1301,13 @@ pub const RepositoryPageState = struct {
         else
             null;
 
-        // The live drag borrows the displayed document and must always end
+        // Every live source range borrows the displayed document and must end
         // before its storage is replaced. A completed candidate is independent
         // owned state: retain it only when the incoming document proves the
         // same complete semantic content token. Delivery generations and the
         // replacement allocation itself are intentionally irrelevant.
-        self.cancelMouseOwner();
+        self.clearLiveSelection();
+        std.debug.assert(!self.activeBorrowedSourceRange());
         self.reconcileCompletedSelectionForDocument(allocator, finished);
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -1427,7 +1445,8 @@ pub const RepositoryPageState = struct {
 
     fn replaceBundle(self: *RepositoryPageState, allocator: std.mem.Allocator, incoming: *repository_tasks.Bundle) !void {
         self.clearFileSearchDocumentAuthority();
-        self.cancelMouseOwner();
+        self.clearLiveSelection();
+        std.debug.assert(!self.activeBorrowedSourceRange());
         const previous_selected = self.selected_path;
         const previous_cursor_identity = if (self.bundle) |*previous|
             self.tree_projection.cursorIdentity(&previous.tree, self.viewer.tree_cursor)
@@ -1585,6 +1604,76 @@ pub const RepositoryPageState = struct {
         self.status.set("{s}", .{message});
     }
 
+    fn reconcileLiveSelectionForMessage(
+        self: *RepositoryPageState,
+        msg: Msg,
+        body_size: chasen.Size,
+    ) void {
+        const keep = switch (self.selection_owner) {
+            .none => true,
+            .source_header => switch (msg) {
+                .mouse_owner_drag,
+                .mouse_owner_release,
+                .cancel_mouse_owner,
+                .selection_action,
+                .selection_owned_noop,
+                => true,
+                else => false,
+            },
+            .source => |live| switch (live.origin) {
+                .mouse => switch (msg) {
+                    .mouse_owner_drag,
+                    .mouse_owner_release,
+                    .mouse_source_auto_scroll_step,
+                    .cancel_mouse_owner,
+                    .selection_action,
+                    .selection_owned_noop,
+                    => true,
+                    else => false,
+                },
+                .keyboard_line => switch (msg) {
+                    .keyboard_line_selection_move,
+                    .selection_action,
+                    .selection_action_unavailable,
+                    .selection_owned_noop,
+                    .scroll_left,
+                    .scroll_right,
+                    .toggle_tree_visibility,
+                    .decrease_tree_width,
+                    .increase_tree_width,
+                    .toggle_line_numbers,
+                    .enter_source_search,
+                    .cancel_source_search,
+                    .clear_source_search,
+                    .source_search_backspace,
+                    .source_search_move_left,
+                    .source_search_move_right,
+                    .source_search_insert,
+                    .source_search_paste,
+                    .submit_source_search,
+                    .next_source_match,
+                    .previous_source_match,
+                    .enter_file_search,
+                    .cancel_file_search,
+                    .submit_file_search,
+                    .file_search_previous,
+                    .file_search_next,
+                    .file_search_backspace,
+                    .file_search_insert,
+                    .file_search_paste,
+                    .mouse_source_press,
+                    .mouse_source_header_press,
+                    .mouse_source_wheel_up,
+                    .mouse_source_wheel_down,
+                    .cancel_mouse_owner,
+                    => true,
+                    else => false,
+                },
+            },
+        };
+        if (!keep) self.clearLiveSelectionPreservingViewport(body_size);
+    }
+
     pub fn applyNavigation(
         self: *RepositoryPageState,
         allocator: std.mem.Allocator,
@@ -1598,13 +1687,14 @@ pub const RepositoryPageState = struct {
         // mutate retained browser state. Pure presentation/cancel commands do
         // not retarget the browser and therefore retain the owner.
         if (navigationDismissesIncoming(msg)) self.dismissIncoming(allocator);
-        // Drag/release/auto-scroll are the only continuations of a live mouse owner.
-        // Any independent page command becomes an explicit cancel terminal so
-        // keyboard navigation/search cannot silently retarget the gesture.
-        switch (msg) {
-            .mouse_owner_drag, .mouse_owner_release, .mouse_source_auto_scroll_step, .cancel_mouse_owner => {},
-            else => self.cancelMouseOwner(),
-        }
+        self.reconcileLiveSelectionForMessage(msg, body_size);
+        const keyboard_search_cursor = if (switch (msg) {
+            .submit_source_search, .next_source_match, .previous_source_match => true,
+            else => false,
+        }) if (self.selection_owner.activeKeyboardLineSelection()) |live|
+            live.focus.line_index
+        else
+            null else null;
         const previous = self.selected_path;
         const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
         const body_height = layout.treeRows(body_size.height);
@@ -1667,13 +1757,23 @@ pub const RepositoryPageState = struct {
             .mouse_source_auto_scroll_step => |step| result.auto_scroll = self.autoScrollSourceSelection(step, body_size),
             .cancel_mouse_owner => self.cancelMouseOwner(),
             .selection_action => |action| result.command = self.applySelectionAction(allocator, action, body_size),
+            .selection_owned_noop => {},
+            .selection_action_unavailable => self.status.set("Ask is not available for this selection", .{}),
+            .begin_keyboard_line_selection => self.beginKeyboardLineSelection(body_size),
+            .keyboard_line_selection_move => |direction| self.moveKeyboardLineSelection(allocator, direction, body_size),
             .mouse_source_wheel_up => if (source) |document| {
                 self.viewer.focus = .source;
-                repository_navigation.wheelSourceProjected(&self.viewer, document, -1, source_geometry.?, source_projection);
+                if (self.activeKeyboardLineSelection())
+                    repository_navigation.scrollSourceViewportProjected(&self.viewer, document, -1, source_geometry.?, source_projection)
+                else
+                    repository_navigation.wheelSourceProjected(&self.viewer, document, -1, source_geometry.?, source_projection);
             },
             .mouse_source_wheel_down => if (source) |document| {
                 self.viewer.focus = .source;
-                repository_navigation.wheelSourceProjected(&self.viewer, document, 1, source_geometry.?, source_projection);
+                if (self.activeKeyboardLineSelection())
+                    repository_navigation.scrollSourceViewportProjected(&self.viewer, document, 1, source_geometry.?, source_projection)
+                else
+                    repository_navigation.wheelSourceProjected(&self.viewer, document, 1, source_geometry.?, source_projection);
             },
             .focus_tree => if (!self.viewer.tree_hidden) {
                 self.viewer.focus = .tree;
@@ -1761,12 +1861,22 @@ pub const RepositoryPageState = struct {
             result.selected_path_changed = true;
         }
         if (file_search_submitted) self.commitFileSearchSourceFocus();
+        if (keyboard_search_cursor) |cursor| if (self.viewer.source_cursor != cursor) {
+            const document = self.currentSource();
+            const viewport_anchor = if (document) |value| self.captureSourceViewportAnchor(value) else null;
+            self.clearLiveSelection();
+            if (document) |value| if (viewport_anchor) |anchor| {
+                const geometry = self.sourceGeometry(body_size, value);
+                self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
+            };
+        };
         return result;
     }
 
     fn invalidateSelectedDocument(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
         self.clearFileSearchDocumentAuthority();
-        self.cancelMouseOwner();
+        self.clearLiveSelection();
+        std.debug.assert(!self.activeBorrowedSourceRange());
         self.clearCompletedSelection(allocator);
         self.pending_syntax_generation = null;
         self.pending_change_map_generation = null;
@@ -1780,12 +1890,26 @@ pub const RepositoryPageState = struct {
     }
 
     /// Separates scheduling intent from the authority of retained visible
-    /// bytes. A terminal request failure may consume retry intent, but it must
-    /// never promote the last-good document back to accepted authority.
+    /// bytes. Every live source range borrows that authority, so commit its
+    /// release before changing the authority at this shared boundary. A
+    /// terminal request failure may consume retry intent, but it must never
+    /// promote the last-good document back to accepted authority.
     fn invalidateDisplayedDocumentAuthority(self: *RepositoryPageState) void {
+        const viewport_anchor = if (self.activeKeyboardLineSelection())
+            if (self.currentSource()) |document| self.captureSourceViewportAnchor(document) else null
+        else
+            null;
+        if (self.activeBorrowedSourceRange()) self.clearLiveSelection();
+        std.debug.assert(!self.activeBorrowedSourceRange());
         if (self.displayed_document) |*document| {
             document.authority = .revalidation_required;
         }
+        if (viewport_anchor) |anchor| if (self.currentSource()) |document| {
+            // This page-level authority boundary has no frame geometry. Match
+            // document replacement by preserving the semantic top without
+            // inventing a terminal height; the coordinator clamps next frame.
+            self.restoreSourceViewportAnchor(anchor, document, 0);
+        };
     }
 
     fn requireDocumentRevalidation(self: *RepositoryPageState) void {
@@ -1844,7 +1968,12 @@ pub const RepositoryPageState = struct {
             .tree_hidden = self.viewer.tree_hidden,
             .source_search_mode = self.source_search.mode,
             .file_search_mode = self.file_search.mode,
-            .retained_selection_action_available = self.completed_selection != null,
+            .selection_owner = switch (self.selection_owner) {
+                .none => .none,
+                .source_header => .header,
+                .source => |selection| if (selection.origin == .keyboard_line) .keyboard_line else .mouse,
+            },
+            .retained_selection_action_available = self.retainedSourceSelection() != null,
             .source_query_len = self.source_search.query.len,
             .keymap = effective_keymap,
         };
@@ -2095,10 +2224,18 @@ pub const RepositoryPageState = struct {
         return self.selection_owner.activeMouseOwner();
     }
 
-    /// Only a live source-content range. This is intentionally narrower than
-    /// `activeMouseOwner` for page-transition and deferred-refresh policy.
-    pub fn activeSourceRange(self: *const RepositoryPageState) bool {
-        return self.selection_owner.activeSourceRange();
+    /// Only a mouse-origin source range. Keyboard ranges never acquire pointer
+    /// continuation, auto-scroll, or page-transition blocker authority.
+    pub fn activeMouseSourceRange(self: *const RepositoryPageState) bool {
+        return self.selection_owner.activeMouseSourceRange();
+    }
+
+    pub fn activeKeyboardLineSelection(self: *const RepositoryPageState) bool {
+        return self.selection_owner.activeKeyboardLineSelection() != null;
+    }
+
+    pub fn activeBorrowedSourceRange(self: *const RepositoryPageState) bool {
+        return self.selection_owner.activeBorrowedSourceRange();
     }
 
     /// Body-relative source viewport used only by the root pointer policy.
@@ -2108,7 +2245,7 @@ pub const RepositoryPageState = struct {
         self: *const RepositoryPageState,
         body_size: chasen.Size,
     ) ?drag_auto_scroll.Viewport {
-        const live = self.selection_owner.activeSource() orelse return null;
+        const live = self.selection_owner.activeMouseSource() orelse return null;
         const token = self.currentContentToken() orelse return null;
         if (!live.token.eql(token)) return null;
         const document = self.currentSource() orelse return null;
@@ -2157,10 +2294,35 @@ pub const RepositoryPageState = struct {
         return projectSourceHeaderPresentation(self, selected_path);
     }
 
-    /// End any borrowed Repository pointer owner before its storage or screen
-    /// geometry can be replaced.
+    /// End only pointer-origin ownership. Layout-only transitions call this so
+    /// a semantic keyboard range can survive geometry changes.
     pub fn cancelMouseOwner(self: *RepositoryPageState) void {
+        if (self.selection_owner.activeMouseOwner()) self.selection_owner = .none;
+    }
+
+    /// End every borrowed live range before document or repository authority
+    /// changes. Owned completed candidates have an independent lifecycle.
+    pub fn clearLiveSelection(self: *RepositoryPageState) void {
         self.selection_owner = .none;
+    }
+
+    /// End a semantic keyboard projection without retargeting the visible
+    /// source top. Pointer owners do not own a presentation projection, so
+    /// their cancellation remains allocation-free and mapping-neutral.
+    pub fn clearLiveSelectionPreservingViewport(
+        self: *RepositoryPageState,
+        body_size: chasen.Size,
+    ) void {
+        const document = self.currentSource();
+        const viewport_anchor = if (self.activeKeyboardLineSelection())
+            if (document) |value| self.captureSourceViewportAnchor(value) else null
+        else
+            null;
+        self.clearLiveSelection();
+        if (viewport_anchor) |anchor| if (document) |value| {
+            const geometry = self.sourceGeometry(body_size, value);
+            self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
+        };
     }
 
     fn clearCompletedSelection(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
@@ -2179,10 +2341,27 @@ pub const RepositoryPageState = struct {
         return if (completed.isAdmitted(document, token)) completed else null;
     }
 
-    pub fn selectionActionProjection(self: *const RepositoryPageState) ?selection_action.Projection {
+    pub fn sourceSelectionPresentation(self: *const RepositoryPageState) ?SourceSelectionPresentation {
+        if (self.selection_owner.activeKeyboardLineSelection()) |live| {
+            const document = self.currentSource() orelse return null;
+            const token = self.currentContentToken() orelse return null;
+            const range = live.range();
+            const content_lines = document.contentLineCount();
+            if (!live.token.eql(token) or content_lines == 0 or
+                range.start.line_index >= content_lines or range.end.line_index >= content_lines)
+            {
+                return null;
+            }
+            return .{ .range = range, .line_count = live.lineCount(), .owner = .active_keyboard };
+        }
         const completed = self.retainedSourceSelection() orelse return null;
+        return .{ .range = completed.range, .line_count = completed.line_count, .owner = .completed };
+    }
+
+    pub fn selectionActionProjection(self: *const RepositoryPageState) ?selection_action.Projection {
+        const presentation = self.sourceSelectionPresentation() orelse return null;
         const document = self.currentSource() orelse return null;
-        return selection_action.Projection.init(document.rowCount(), completed.range.end.line_index);
+        return selection_action.Projection.init(document.rowCount(), presentation.range.end.line_index);
     }
 
     fn sourceProjectionBasis(
@@ -2235,7 +2414,7 @@ pub const RepositoryPageState = struct {
     pub fn captureSelectionViewportAnchor(
         self: *const RepositoryPageState,
     ) ?SelectionViewportAnchor {
-        if (self.retainedSourceSelection() == null) return null;
+        if (self.sourceSelectionPresentation() == null) return null;
         const document = self.currentSource() orelse return null;
         return self.captureSourceViewportAnchor(document);
     }
@@ -2265,6 +2444,154 @@ pub const RepositoryPageState = struct {
             const geometry = self.sourceGeometry(body_size, value);
             self.restoreSourceViewportAnchor(captured, value, geometry.visible_source_rows);
         };
+    }
+
+    fn clearLiveAndCompletedSelectionPreservingViewport(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        body_size: chasen.Size,
+    ) void {
+        const document = self.currentSource();
+        const anchor = if (document) |value| self.captureSourceViewportAnchor(value) else null;
+        self.clearLiveSelection();
+        self.clearCompletedSelection(allocator);
+        if (document) |value| if (anchor) |captured| {
+            const geometry = self.sourceGeometry(body_size, value);
+            self.restoreSourceViewportAnchor(captured, value, geometry.visible_source_rows);
+        };
+    }
+
+    fn beginKeyboardLineSelection(self: *RepositoryPageState, body_size: chasen.Size) void {
+        if (self.selection_owner != .none or self.source_search.mode or self.file_search.mode) return;
+        if (!self.viewer.tree_hidden and self.viewer.focus != .source) {
+            self.status.set("Keyboard selection requires source focus", .{});
+            return;
+        }
+        const document = self.acceptedCurrentSourceForSelection() orelse {
+            self.status.set("Source selection is not available", .{});
+            return;
+        };
+        const content_lines = document.contentLineCount();
+        if (content_lines == 0) {
+            self.status.set("No source line is available for selection", .{});
+            return;
+        }
+        const token = self.currentContentToken() orelse {
+            self.status.set("Source selection has no current basis", .{});
+            return;
+        };
+
+        const viewport_anchor = self.captureSourceViewportAnchor(document);
+        const line_index = @min(self.viewer.source_cursor, content_lines - 1);
+        self.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(token, line_index) };
+        self.viewer.focus = .source;
+        self.viewer.source_cursor = line_index;
+        const geometry = self.sourceGeometry(body_size, document);
+        self.restoreSourceViewportAnchor(viewport_anchor, document, geometry.visible_source_rows);
+        repository_navigation.moveSourceProjected(
+            &self.viewer,
+            document,
+            0,
+            geometry,
+            self.selectionActionProjection(),
+        );
+        self.revealKeyboardSelectionAction(document, geometry);
+        self.status.clear();
+    }
+
+    fn moveKeyboardLineSelection(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        direction: app_direction.Vertical,
+        body_size: chasen.Size,
+    ) void {
+        var live = self.selection_owner.activeKeyboardLineSelection() orelse return;
+        const document = self.acceptedCurrentSourceForSelection() orelse {
+            self.invalidateActiveKeyboardSelection(allocator, body_size, "Source selection is no longer available");
+            return;
+        };
+        const token = self.currentContentToken() orelse {
+            self.invalidateActiveKeyboardSelection(allocator, body_size, "Source selection has no current basis");
+            return;
+        };
+        const content_lines = document.contentLineCount();
+        if (!live.token.eql(token) or content_lines == 0 or
+            live.anchor.line_index >= content_lines or live.focus.line_index >= content_lines)
+        {
+            self.invalidateActiveKeyboardSelection(allocator, body_size, "Source selection is no longer current");
+            return;
+        }
+
+        const next_line = switch (direction) {
+            .up => live.focus.line_index -| 1,
+            .down => @min(live.focus.line_index +| 1, content_lines - 1),
+        };
+        if (next_line == live.focus.line_index) return;
+
+        const viewport_anchor = self.captureSourceViewportAnchor(document);
+        live.update(repository_selection.pointFromLine(next_line));
+        self.selection_owner = .{ .source = live };
+        self.viewer.focus = .source;
+        self.viewer.source_cursor = next_line;
+        const geometry = self.sourceGeometry(body_size, document);
+        self.restoreSourceViewportAnchor(viewport_anchor, document, geometry.visible_source_rows);
+        repository_navigation.moveSourceProjected(
+            &self.viewer,
+            document,
+            0,
+            geometry,
+            self.selectionActionProjection(),
+        );
+        self.revealKeyboardSelectionAction(document, geometry);
+        self.status.clear();
+    }
+
+    fn revealKeyboardSelectionAction(
+        self: *RepositoryPageState,
+        document: *const source_document.Document,
+        geometry: repository_source_geometry.SourceGeometry,
+    ) void {
+        const live = self.selection_owner.activeKeyboardLineSelection() orelse return;
+        if (live.focus.line_index != live.range().end.line_index) return;
+        const projection = self.selectionActionProjection() orelse return;
+        self.viewer.source_vertical_scroll = projection.reveal(
+            self.viewer.source_vertical_scroll,
+            geometry.visible_source_rows,
+        );
+        repository_navigation.clampSourceProjected(
+            &self.viewer,
+            document,
+            geometry,
+            projection,
+        );
+    }
+
+    fn invalidateActiveKeyboardSelection(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        body_size: chasen.Size,
+        message: []const u8,
+    ) void {
+        const document = self.currentSource();
+        const viewport_anchor = if (document) |value| self.captureSourceViewportAnchor(value) else null;
+        self.clearLiveSelection();
+        if (self.completed_selection != null and self.retainedSourceSelection() == null) {
+            self.clearCompletedSelection(allocator);
+        }
+        if (document) |value| if (viewport_anchor) |anchor| {
+            const geometry = self.sourceGeometry(body_size, value);
+            self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
+        };
+        self.status.set("{s}", .{message});
+    }
+
+    fn keyboardLineSelectionAdmitted(self: *const RepositoryPageState) bool {
+        const live = self.selection_owner.activeKeyboardLineSelection() orelse return false;
+        const document = self.acceptedCurrentSourceForSelection() orelse return false;
+        const token = self.currentContentToken() orelse return false;
+        const content_lines = document.contentLineCount();
+        return live.mode == .line and live.token.eql(token) and content_lines > 0 and
+            live.anchor.line_index < content_lines and live.focus.line_index < content_lines;
     }
 
     /// Reconcile only an already accepted selected-document result. At this
@@ -2359,8 +2686,17 @@ pub const RepositoryPageState = struct {
 
     fn pressSourceHeader(self: *RepositoryPageState, point: repository_layout.BodyPoint, body_size: chasen.Size) void {
         const identity = self.sourceHeaderPathHit(point, body_size) orelse return;
-        if (self.currentSource() != null) self.viewer.focus = .source;
+        const document = self.currentSource();
+        const viewport_anchor = if (self.activeKeyboardLineSelection())
+            if (document) |value| self.captureSourceViewportAnchor(value) else null
+        else
+            null;
+        if (document != null) self.viewer.focus = .source;
         self.selection_owner = .{ .source_header = .{ .identity = identity } };
+        if (viewport_anchor) |anchor| if (document) |value| {
+            const geometry = self.sourceGeometry(body_size, value);
+            self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
+        };
     }
 
     fn selectionActionHit(
@@ -2389,13 +2725,9 @@ pub const RepositoryPageState = struct {
     }
 
     fn dragMouseOwner(self: *RepositoryPageState, point: ?repository_layout.BodyPoint, body_size: chasen.Size) void {
-        switch (self.selection_owner) {
-            .none => {},
-            .source => self.dragSourceSelection(point, body_size),
-            // A header gesture owns the pointer stream but has no moving
-            // endpoint: both click and drag release copy the same whole path.
-            .source_header => {},
-        }
+        if (self.selection_owner.activeMouseSource() != null) self.dragSourceSelection(point, body_size);
+        // A header gesture owns the pointer stream but has no moving endpoint:
+        // both click and drag release copy the same whole path.
     }
 
     fn releaseMouseOwner(
@@ -2404,11 +2736,11 @@ pub const RepositoryPageState = struct {
         point: ?repository_layout.BodyPoint,
         body_size: chasen.Size,
     ) ?Command {
-        return switch (self.selection_owner) {
-            .none => null,
-            .source => self.releaseSourceSelection(allocator, point, body_size),
-            .source_header => self.releaseSourceHeaderPath(allocator),
-        };
+        if (self.selection_owner.activeMouseSource() != null) {
+            return self.releaseSourceSelection(allocator, point, body_size);
+        }
+        if (self.selection_owner.activeSourceHeader() != null) return self.releaseSourceHeaderPath(allocator);
+        return null;
     }
 
     fn releaseSourceHeaderPath(self: *RepositoryPageState, allocator: std.mem.Allocator) ?Command {
@@ -2471,6 +2803,10 @@ pub const RepositoryPageState = struct {
                 @as(usize, point.col - geometry.text_col),
             ) orelse return,
         };
+        const viewport_anchor = if (self.activeKeyboardLineSelection())
+            self.captureSourceViewportAnchor(document)
+        else
+            null;
         self.viewer.focus = .source;
         self.viewer.source_cursor = line_index;
         self.selection_owner = .{ .source = repository_selection.DragSelection.initAtCell(
@@ -2479,10 +2815,13 @@ pub const RepositoryPageState = struct {
             logical_point,
             .{ .col = point.col, .row = point.row },
         ) };
+        if (viewport_anchor) |anchor| {
+            self.restoreSourceViewportAnchor(anchor, document, geometry.visible_source_rows);
+        }
     }
 
     fn dragSourceSelection(self: *RepositoryPageState, point: ?repository_layout.BodyPoint, body_size: chasen.Size) void {
-        var live = self.selection_owner.activeSource() orelse return;
+        var live = self.selection_owner.activeMouseSource() orelse return;
         const local = point orelse return;
         const document = self.currentSource() orelse {
             self.cancelMouseOwner();
@@ -2527,7 +2866,7 @@ pub const RepositoryPageState = struct {
         step: drag_auto_scroll.Step,
         body_size: chasen.Size,
     ) drag_auto_scroll.StepOutcome {
-        const live = self.selection_owner.activeSource() orelse {
+        const live = self.selection_owner.activeMouseSource() orelse {
             self.cancelMouseOwner();
             return .stale_owner;
         };
@@ -2559,7 +2898,7 @@ pub const RepositoryPageState = struct {
             .col = step.endpoint.col,
             .row = step.endpoint.row,
         }, body_size);
-        if (self.selection_owner.activeSource() == null) return .stale_owner;
+        if (self.selection_owner.activeMouseSource() == null) return .stale_owner;
         return .moved;
     }
 
@@ -2569,9 +2908,9 @@ pub const RepositoryPageState = struct {
         point: ?repository_layout.BodyPoint,
         body_size: chasen.Size,
     ) ?Command {
-        if (!self.activeSourceRange()) return null;
+        if (!self.activeMouseSourceRange()) return null;
         self.dragSourceSelection(point, body_size);
-        const live = self.selection_owner.activeSource() orelse {
+        const live = self.selection_owner.activeMouseSource() orelse {
             // A defensive identity failure inside the final drag invalidates
             // the basis for both the gesture and any prior candidate.
             self.clearCompletedSelectionPreservingViewport(allocator, body_size);
@@ -2654,15 +2993,42 @@ pub const RepositoryPageState = struct {
         action: selection_action.Action,
         body_size: chasen.Size,
     ) ?Command {
+        if (action == .clear) {
+            if (self.selection_owner != .none or self.completed_selection != null) {
+                self.clearLiveAndCompletedSelectionPreservingViewport(allocator, body_size);
+                self.status.clear();
+            }
+            return null;
+        }
+
+        if (self.selection_owner.activeKeyboardLineSelection() != null and
+            !self.keyboardLineSelectionAdmitted())
+        {
+            self.invalidateActiveKeyboardSelection(
+                allocator,
+                body_size,
+                "Source selection is no longer current",
+            );
+            return null;
+        }
+        // Pointer owners never become keyboard completion transactions. Plain
+        // selection keys normally map to `selection_owned_noop`; retain this
+        // guard for direct/synthetic messages too.
+        if (self.selection_owner.activeMouseOwner()) return null;
+
         const Adapter = struct {
             state: *RepositoryPageState,
             body_size: chasen.Size,
 
             pub fn available(adapter: *@This()) bool {
-                return adapter.state.completed_selection != null;
+                return adapter.state.selection_owner.activeKeyboardLineSelection() != null or
+                    adapter.state.completed_selection != null;
             }
 
             pub fn copy(adapter: *@This(), owner: std.mem.Allocator) selection_action.CopyError![]u8 {
+                if (adapter.state.selection_owner.activeKeyboardLineSelection() != null) {
+                    return adapter.state.completeKeyboardLineSelection(owner, adapter.body_size);
+                }
                 const completed = if (adapter.state.completed_selection) |*value| value else return error.AuthorityInvalid;
                 const document = adapter.state.currentSource() orelse return error.AuthorityInvalid;
                 const token = adapter.state.currentContentToken() orelse return error.AuthorityInvalid;
@@ -2671,7 +3037,7 @@ pub const RepositoryPageState = struct {
             }
 
             pub fn clear(adapter: *@This(), owner: std.mem.Allocator) void {
-                adapter.state.clearCompletedSelectionPreservingViewport(owner, adapter.body_size);
+                adapter.state.clearLiveAndCompletedSelectionPreservingViewport(owner, adapter.body_size);
             }
         };
         var adapter: Adapter = .{ .state = self, .body_size = body_size };
@@ -2690,10 +3056,56 @@ pub const RepositoryPageState = struct {
                 break :blk null;
             },
             .preparation_failed => blk: {
-                self.status.set("Could not prepare source selection copy", .{});
+                if (self.selection_owner.activeKeyboardLineSelection() != null)
+                    self.status.set("Could not complete source selection; press y to retry", .{})
+                else
+                    self.status.set("Could not prepare source selection copy", .{});
                 break :blk null;
             },
         };
+    }
+
+    fn completeKeyboardLineSelection(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        body_size: chasen.Size,
+    ) selection_action.CopyError![]u8 {
+        const live = self.selection_owner.activeKeyboardLineSelection() orelse return error.AuthorityInvalid;
+        const document = self.acceptedCurrentSourceForSelection() orelse return error.AuthorityInvalid;
+        const token = self.currentContentToken() orelse return error.AuthorityInvalid;
+        if (!live.token.eql(token)) return error.AuthorityInvalid;
+
+        const candidate = repository_selection.buildCompletedSelection(allocator, document, live) catch
+            return error.OutOfMemory;
+
+        const admitted_document = self.acceptedCurrentSourceForSelection() orelse {
+            var rejected = candidate;
+            rejected.deinit(allocator);
+            return error.AuthorityInvalid;
+        };
+        const admitted_token = self.currentContentToken() orelse {
+            var rejected = candidate;
+            rejected.deinit(allocator);
+            return error.AuthorityInvalid;
+        };
+        if (!candidate.isAdmitted(admitted_document, admitted_token)) {
+            var rejected = candidate;
+            rejected.deinit(allocator);
+            return error.AuthorityInvalid;
+        }
+
+        const viewport_anchor = self.captureSourceViewportAnchor(admitted_document);
+        const prior = self.completed_selection;
+        self.completed_selection = candidate;
+        self.clearLiveSelection();
+        if (prior) |value| {
+            var owned = value;
+            owned.deinit(allocator);
+        }
+        const geometry = self.sourceGeometry(body_size, admitted_document);
+        self.restoreSourceViewportAnchor(viewport_anchor, admitted_document, geometry.visible_source_rows);
+
+        return self.completed_selection.?.clipboardText(allocator) catch error.OutOfMemory;
     }
 
     pub fn mouseToMsg(self: *const RepositoryPageState, point: repository_layout.BodyPoint, button: MouseButton, size: chasen.Size) ?Msg {
@@ -2747,6 +3159,11 @@ fn navigationDismissesIncoming(msg: Msg) bool {
         .decrease_tree_width,
         .increase_tree_width,
         .cancel_mouse_owner,
+        .selection_action,
+        .selection_owned_noop,
+        .selection_action_unavailable,
+        .begin_keyboard_line_selection,
+        .keyboard_line_selection_move,
         .cancel_source_search,
         .cancel_file_search,
         .manifest_finished,
@@ -3556,6 +3973,507 @@ fn installFirstLineCandidateForTest(
     completed = undefined;
 }
 
+test "repository keyboard line selection begins moves crosses and copies exact lines" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    var state = try selectionStateForTest(
+        "main.zig\x00",
+        "zero\none\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+    );
+    defer state.deinit(allocator);
+    try installFirstLineCandidateForTest(&state, allocator);
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 2;
+
+    _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+    try std.testing.expect(state.activeKeyboardLineSelection());
+    try std.testing.expect(!state.activeMouseOwner());
+    try std.testing.expect(!state.activeMouseSourceRange());
+    try std.testing.expect(state.activeBorrowedSourceRange());
+    try std.testing.expectEqual(@as(usize, 1), state.sourceSelectionPresentation().?.line_count);
+    try std.testing.expectEqual(SourceSelectionPresentation.Owner.active_keyboard, state.sourceSelectionPresentation().?.owner);
+    try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+
+    _ = state.applyNavigation(allocator, .{ .keyboard_line_selection_move = .down }, size);
+    try std.testing.expectEqual(@as(usize, 3), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 2), state.sourceSelectionPresentation().?.line_count);
+    _ = state.applyNavigation(allocator, .{ .keyboard_line_selection_move = .up }, size);
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.sourceSelectionPresentation().?.line_count);
+    _ = state.applyNavigation(allocator, .{ .keyboard_line_selection_move = .up }, size);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
+    const crossed = state.selection_owner.activeKeyboardLineSelection().?;
+    try std.testing.expectEqual(@as(usize, 1), crossed.range().start.line_index);
+    try std.testing.expectEqual(@as(usize, 2), crossed.range().end.line_index);
+    try std.testing.expectEqual(@as(usize, 2), crossed.lineCount());
+
+    const focus_before_wheel = crossed.focus;
+    const cursor_before_wheel = state.viewer.source_cursor;
+    _ = state.applyNavigation(allocator, .mouse_source_wheel_down, size);
+    try std.testing.expectEqual(cursor_before_wheel, state.viewer.source_cursor);
+    try std.testing.expect(std.meta.eql(focus_before_wheel, state.selection_owner.activeKeyboardLineSelection().?.focus));
+
+    _ = state.applyNavigation(allocator, .toggle_line_numbers, size);
+    _ = state.applyNavigation(allocator, .increase_tree_width, size);
+    _ = state.applyNavigation(allocator, .scroll_right, size);
+    try std.testing.expect(state.activeKeyboardLineSelection());
+    _ = state.applyNavigation(allocator, .enter_source_search, size);
+    _ = state.applyNavigation(allocator, .{ .source_search_insert = 'x' }, size);
+    _ = state.applyNavigation(allocator, .cancel_source_search, size);
+    try std.testing.expect(state.activeKeyboardLineSelection());
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    _ = state.applyNavigation(allocator, .cancel_file_search, size);
+    try std.testing.expect(state.activeKeyboardLineSelection());
+
+    _ = state.applyNavigation(allocator, .selection_action_unavailable, size);
+    try std.testing.expect(state.activeKeyboardLineSelection());
+    try std.testing.expectEqualStrings("Ask is not available for this selection", state.status.text());
+
+    const action_geometry = state.sourceGeometry(size, state.currentSource().?);
+    const action_projection = state.selectionActionProjection().?;
+    const controls_offset = action_projection.actionScreenRow(
+        .controls,
+        state.viewer.source_vertical_scroll,
+        action_geometry.visible_source_rows,
+    ) orelse return error.ExpectedSelectionControls;
+    const page_layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
+    try std.testing.expectEqual(
+        Msg{ .selection_action = .copy },
+        state.mouseToMsg(.{
+            .col = page_layout.source_col,
+            .row = action_geometry.body_first_row + @as(u16, @intCast(controls_offset)),
+        }, .left, size).?,
+    );
+
+    var copied = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+    defer copied.deinit(allocator);
+    var command = copied.takeCommand() orelse return error.ExpectedSourceCopyCommand;
+    defer command.deinit(allocator);
+    switch (command) {
+        .copy_source_selection => |text| try std.testing.expectEqualStrings("one\ntwo\n", text),
+        else => return error.ExpectedSourceCopyCommand,
+    }
+    try std.testing.expect(!state.activeBorrowedSourceRange());
+    try std.testing.expect(state.completed_selection != null);
+    try std.testing.expectEqualStrings("one\ntwo\n", state.completed_selection.?.text);
+    try std.testing.expectEqual(SourceSelectionPresentation.Owner.completed, state.sourceSelectionPresentation().?.owner);
+
+    _ = state.applyNavigation(allocator, .selection_action_unavailable, size);
+    try std.testing.expect(state.completed_selection != null);
+    try std.testing.expectEqualStrings("Ask is not available for this selection", state.status.text());
+
+    _ = state.applyNavigation(allocator, .{ .selection_action = .clear }, size);
+    try std.testing.expect(state.completed_selection == null);
+    try std.testing.expect(state.selection_owner == .none);
+    try std.testing.expect(state.selectionActionProjection() == null);
+
+    state.viewer.focus = .tree;
+    _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+    try std.testing.expect(!state.activeKeyboardLineSelection());
+    try std.testing.expectEqualStrings("Keyboard selection requires source focus", state.status.text());
+
+    state.viewer.tree_hidden = true;
+    _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+    try std.testing.expect(state.activeKeyboardLineSelection());
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    _ = state.applyNavigation(allocator, .{ .selection_action = .clear }, size);
+    state.viewer.tree_hidden = false;
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 2;
+    _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+    _ = state.applyNavigation(allocator, .enter_source_search, size);
+    for ("seven") |byte| _ = state.applyNavigation(allocator, .{ .source_search_insert = byte }, size);
+    _ = state.applyNavigation(allocator, .submit_source_search, size);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
+    try std.testing.expect(!state.activeKeyboardLineSelection());
+}
+
+test "repository keyboard line selection saturates and movement allocates nothing" {
+    const backing = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 50, .height = 5 };
+    var state = try selectionStateForTest("main.zig\x00", "zero\none\ntwo\n");
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+    defer state.deinit(failing.allocator());
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 0;
+    _ = state.applyNavigation(failing.allocator(), .begin_keyboard_line_selection, size);
+    try std.testing.expect(state.activeKeyboardLineSelection());
+
+    _ = state.applyNavigation(failing.allocator(), .{ .keyboard_line_selection_move = .up }, size);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.selection_owner.activeKeyboardLineSelection().?.lineCount());
+    for (0..8) |_| _ = state.applyNavigation(failing.allocator(), .{ .keyboard_line_selection_move = .down }, size);
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 3), state.selection_owner.activeKeyboardLineSelection().?.lineCount());
+}
+
+test "repository keyboard line selection preserves retry owners across allocation failures" {
+    const backing = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+
+    {
+        var state = try selectionStateForTest("main.zig\x00", "zero\none\ntwo\n");
+        try installFirstLineCandidateForTest(&state, backing);
+        state.viewer.focus = .source;
+        state.viewer.source_cursor = 1;
+        _ = state.applyNavigation(backing, .begin_keyboard_line_selection, size);
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+        defer state.deinit(failing.allocator());
+
+        var failed = state.applyNavigation(failing.allocator(), .{ .selection_action = .copy }, size);
+        defer failed.deinit(failing.allocator());
+        try std.testing.expect(failed.command == null);
+        try std.testing.expect(state.activeKeyboardLineSelection());
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+        _ = state.applyNavigation(failing.allocator(), .{ .selection_action = .clear }, size);
+        try std.testing.expect(!state.activeKeyboardLineSelection());
+        try std.testing.expect(state.completed_selection == null);
+    }
+
+    {
+        var state = try selectionStateForTest("main.zig\x00", "zero\none\ntwo\n");
+        try installFirstLineCandidateForTest(&state, backing);
+        state.viewer.focus = .source;
+        state.viewer.source_cursor = 1;
+        _ = state.applyNavigation(backing, .begin_keyboard_line_selection, size);
+        // Candidate text and token path allocate first; fail the separate
+        // clipboard duplicate after the new completed owner is installed.
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 2 });
+        defer state.deinit(failing.allocator());
+
+        var failed = state.applyNavigation(failing.allocator(), .{ .selection_action = .copy }, size);
+        defer failed.deinit(failing.allocator());
+        try std.testing.expect(failed.command == null);
+        try std.testing.expect(!state.activeKeyboardLineSelection());
+        try std.testing.expectEqualStrings("one", state.completed_selection.?.text);
+        try std.testing.expectEqualStrings("Could not prepare source selection copy", state.status.text());
+    }
+
+    {
+        var state = try selectionStateForTest("main.zig\x00", "zero\none\ntwo\n");
+        defer state.deinit(backing);
+        try installFirstLineCandidateForTest(&state, backing);
+        state.viewer.focus = .source;
+        state.viewer.source_cursor = 1;
+        _ = state.applyNavigation(backing, .begin_keyboard_line_selection, size);
+        switch (state.selection_owner) {
+            .source => |*live| live.token.repo_epoch +%= 1,
+            .none, .source_header => return error.ExpectedKeyboardSelection,
+        }
+
+        var rejected = state.applyNavigation(backing, .{ .selection_action = .copy }, size);
+        defer rejected.deinit(backing);
+        try std.testing.expect(rejected.command == null);
+        try std.testing.expect(!state.activeKeyboardLineSelection());
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+    }
+}
+
+test "repository keyboard line selection reload clears borrow and retains prior owned candidate" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    var state = try selectionStateForTest("main.zig\x00", "zero\none\ntwo\n");
+    defer state.deinit(allocator);
+    try installFirstLineCandidateForTest(&state, allocator);
+    state.viewer.focus = .source;
+    state.viewer.source_cursor = 1;
+    _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+    try std.testing.expect(state.activeBorrowedSourceRange());
+
+    state.requestReload(true);
+    try std.testing.expect(!state.activeBorrowedSourceRange());
+    try std.testing.expect(state.completed_selection != null);
+    try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+
+    state.markRequestPreparationFailed(error.OutOfMemory);
+    try std.testing.expect(!state.activeBorrowedSourceRange());
+    try std.testing.expect(state.completed_selection != null);
+    _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+    try std.testing.expect(!state.activeKeyboardLineSelection());
+    var copied = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+    defer copied.deinit(allocator);
+    try std.testing.expect(copied.command != null);
+    try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+}
+
+test "repository keyboard line selection document revalidation clears borrow across request failure terminals" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    var root = try TestRoot.init();
+    defer root.deinit();
+
+    inline for (.{ false, true }) |fingerprint_mismatch| {
+        var state = try selectionStateForTest(
+            "main.zig\x00",
+            "zero\none\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+        );
+        defer state.deinit(allocator);
+        state.root_identity = root.capability.identity;
+        try installFirstLineCandidateForTest(&state, allocator);
+        state.viewer.focus = .source;
+        state.viewer.source_cursor = 2;
+        _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+        state.viewer.source_vertical_scroll = 5;
+        try std.testing.expect(state.activeBorrowedSourceRange());
+        const viewport_before = state.captureSourceViewportAnchor(state.currentSource().?);
+        try std.testing.expectEqual(@as(usize, 3), viewport_before.semantic_source);
+
+        const generation: u64 = if (fingerprint_mismatch) 42 else 41;
+        state.change_map_generation = generation;
+        state.pending_change_map_generation = generation;
+        var mismatch_finished: repository_tasks.ChangeMapFinished = .{
+            .identity = .{
+                .origin = .repository,
+                .repo_epoch = state.repo_epoch,
+                .activation_id = state.activation_id,
+            },
+            .root_identity = state.root_identity.?,
+            .generation = generation,
+            .manifest_revision = state.manifest_revision,
+            .source_revision = state.displayed_document.?.source_revision,
+            .path = try allocator.dupe(u8, state.selected_path.?),
+            .fingerprint = state.currentSource().?.fingerprint,
+            .content_line_count = state.currentSource().?.contentLineCount(),
+            .result = .unavailable,
+        };
+        defer mismatch_finished.deinit(allocator);
+        if (fingerprint_mismatch) {
+            mismatch_finished.fingerprint = .init("newer source snapshot");
+        } else {
+            mismatch_finished.content_line_count += 1;
+        }
+
+        try std.testing.expectEqual(
+            ApplyOutcome.discarded,
+            state.applyChangeMapFinished(allocator, &mismatch_finished),
+        );
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expectEqual(
+            DisplayedDocument.Authority.revalidation_required,
+            state.displayed_document.?.authority,
+        );
+        try std.testing.expect(state.needs_document_revalidation);
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+        const viewport_after = state.captureSourceViewportAnchor(state.currentSource().?);
+        try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
+        try std.testing.expectEqual(viewport_before.signed_screen_delta, viewport_after.signed_screen_delta);
+
+        const pending_context = state.inputContext(.{});
+        try std.testing.expect(pending_context.selection_owner == .none);
+        try std.testing.expect(pending_context.retained_selection_action_available);
+        const move_down = repository_input.keyToMsg(Msg, pending_context, .{ .codepoint = 'j' }).?;
+        const move_up = repository_input.keyToMsg(Msg, pending_context, .{ .codepoint = 'k' }).?;
+        try std.testing.expectEqual(Msg.move_down, move_down);
+        try std.testing.expectEqual(Msg.move_up, move_up);
+        _ = state.applyNavigation(allocator, move_down, size);
+        try std.testing.expectEqual(@as(usize, 3), state.viewer.source_cursor);
+        _ = state.applyNavigation(allocator, move_up, size);
+        try std.testing.expectEqual(@as(usize, 2), state.viewer.source_cursor);
+
+        const copy = repository_input.keyToMsg(Msg, pending_context, .{ .codepoint = 'y' }).?;
+        try std.testing.expectEqual(Msg{ .selection_action = .copy }, copy);
+        var copied = state.applyNavigation(allocator, copy, size);
+        defer copied.deinit(allocator);
+        var copy_command = copied.takeCommand() orelse return error.ExpectedSourceCopyCommand;
+        defer copy_command.deinit(allocator);
+        switch (copy_command) {
+            .copy_source_selection => |text| try std.testing.expectEqualStrings("zero", text),
+            else => return error.ExpectedSourceCopyCommand,
+        }
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            state.prepareDocumentRequest(failing.allocator(), &root.capability),
+        );
+        state.markDocumentRequestPreparationFailed(error.OutOfMemory);
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+        try std.testing.expect(state.wantsDocumentRequest());
+
+        var request = try state.prepareDocumentRequest(allocator, &root.capability);
+        defer request.deinit(allocator);
+        try std.testing.expect(state.pending_document_generation == request.generation);
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expect(state.inputContext(.{}).selection_owner == .none);
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+
+        state.rejectDocumentSpawn(request.generation);
+        try std.testing.expect(state.pending_document_generation == null);
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+
+        const stale_bytes = try allocator.dupe(
+            u8,
+            "zero\none\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+        );
+        var stale_document: repository_tasks.DocumentFinished = .{
+            .identity = request.identity,
+            .root_identity = request.root.identity,
+            .generation = request.generation,
+            .manifest_revision = request.manifest_revision,
+            .path = try allocator.dupe(u8, request.path),
+            .value = .{ .source = try source_document.Document.initOwned(
+                allocator,
+                stale_bytes,
+                .init(stale_bytes),
+            ) },
+        };
+        defer stale_document.deinit(allocator);
+        try std.testing.expectEqual(
+            ApplyOutcome.discarded,
+            state.applyDocumentFinished(allocator, &stale_document),
+        );
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+
+        const clear = repository_input.keyToMsg(
+            Msg,
+            state.inputContext(.{}),
+            .{ .codepoint = chasen.Key.escape },
+        ).?;
+        try std.testing.expectEqual(Msg{ .selection_action = .clear }, clear);
+        var cleared = state.applyNavigation(allocator, clear, size);
+        defer cleared.deinit(allocator);
+        try std.testing.expect(cleared.command == null);
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expect(state.completed_selection == null);
+    }
+
+    inline for (.{ false, true }) |fingerprint_mismatch| {
+        var state = try selectionStateForTest(
+            "main.zig\x00",
+            "zero\none\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+        );
+        defer state.deinit(allocator);
+        state.root_identity = root.capability.identity;
+        state.viewer.focus = .source;
+        state.viewer.source_cursor = 2;
+        _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+        state.viewer.source_vertical_scroll = 5;
+        const viewport_before = state.captureSourceViewportAnchor(state.currentSource().?);
+        try std.testing.expectEqual(@as(usize, 3), viewport_before.semantic_source);
+
+        const generation: u64 = if (fingerprint_mismatch) 52 else 51;
+        state.change_map_generation = generation;
+        state.pending_change_map_generation = generation;
+        var mismatch_finished: repository_tasks.ChangeMapFinished = .{
+            .identity = .{
+                .origin = .repository,
+                .repo_epoch = state.repo_epoch,
+                .activation_id = state.activation_id,
+            },
+            .root_identity = state.root_identity.?,
+            .generation = generation,
+            .manifest_revision = state.manifest_revision,
+            .source_revision = state.displayed_document.?.source_revision,
+            .path = try allocator.dupe(u8, state.selected_path.?),
+            .fingerprint = state.currentSource().?.fingerprint,
+            .content_line_count = state.currentSource().?.contentLineCount(),
+            .result = .unavailable,
+        };
+        defer mismatch_finished.deinit(allocator);
+        if (fingerprint_mismatch)
+            mismatch_finished.fingerprint = .init("newer source snapshot")
+        else
+            mismatch_finished.content_line_count += 1;
+
+        try std.testing.expectEqual(
+            ApplyOutcome.discarded,
+            state.applyChangeMapFinished(allocator, &mismatch_finished),
+        );
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expect(state.completed_selection == null);
+        const viewport_after = state.captureSourceViewportAnchor(state.currentSource().?);
+        try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
+        try std.testing.expectEqual(viewport_before.signed_screen_delta, viewport_after.signed_screen_delta);
+    }
+}
+
+test "repository mouse and header owners keep prior candidate until all-owner clear" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    inline for (.{ false, true }) |header_owner| {
+        var state = try selectionStateForTest("main.zig\x00", "zero\none\n");
+        defer state.deinit(allocator);
+        try installFirstLineCandidateForTest(&state, allocator);
+        if (!header_owner) {
+            state.selection_owner = .{ .source = repository_selection.DragSelection.init(
+                state.currentContentToken().?,
+                .line,
+                repository_selection.pointFromLine(0),
+            ) };
+        } else {
+            state.selection_owner = .{ .source_header = .{ .identity = state.currentSourceHeaderIdentity().? } };
+        }
+
+        _ = state.applyNavigation(allocator, .selection_owned_noop, size);
+        try std.testing.expect(state.activeMouseOwner());
+        try std.testing.expect(state.completed_selection != null);
+        var synthetic_copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+        defer synthetic_copy.deinit(allocator);
+        try std.testing.expect(synthetic_copy.command == null);
+        try std.testing.expect(state.activeMouseOwner());
+        try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
+
+        _ = state.applyNavigation(allocator, .{ .selection_action = .clear }, size);
+        try std.testing.expect(!state.activeMouseOwner());
+        try std.testing.expect(state.completed_selection == null);
+    }
+
+    inline for (.{ false, true }) |retain_prior| inline for (.{ false, true }) |header_press| {
+        var replaced = try selectionStateForTest(
+            "main.zig\x00",
+            "zero\none\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+        );
+        defer replaced.deinit(allocator);
+        try installFirstLineCandidateForTest(&replaced, allocator);
+        if (!retain_prior) replaced.clearCompletedSelection(allocator);
+        replaced.viewer.focus = .source;
+        replaced.viewer.source_cursor = 2;
+        _ = replaced.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+        replaced.viewer.source_vertical_scroll = 5;
+        const viewport_before = replaced.captureSourceViewportAnchor(replaced.currentSource().?);
+        try std.testing.expectEqual(@as(usize, 3), viewport_before.semantic_source);
+
+        if (header_press) {
+            const page_layout = repository_layout.bodyLayout(size, replaced.viewer.tree_width, replaced.viewer.tree_hidden);
+            const header_target = repository_source_header.layout(
+                page_layout.source_width,
+                replaced.sourceHeaderPresentation().?,
+            ).path_target orelse return error.ExpectedPathTarget;
+            _ = replaced.applyNavigation(allocator, .{ .mouse_source_header_press = .{
+                .col = header_target.col,
+                .row = repository_source_geometry.source_path_row,
+            } }, size);
+            try std.testing.expect(replaced.selection_owner.activeSourceHeader() != null);
+        } else {
+            const geometry = replaced.sourceGeometry(size, replaced.currentSource().?);
+            const pressed_line = geometry.contentLineAtProjected(
+                geometry.body_first_row,
+                replaced.viewer.source_vertical_scroll,
+                replaced.currentSource().?,
+                replaced.selectionActionProjection(),
+            ) orelse return error.ExpectedSourceLine;
+            try std.testing.expectEqual(@as(usize, 3), pressed_line);
+            _ = replaced.applyNavigation(allocator, .{ .mouse_source_press = .{
+                .col = geometry.text_col,
+                .row = geometry.body_first_row,
+            } }, size);
+            try std.testing.expect(replaced.activeMouseSourceRange());
+            try std.testing.expectEqual(pressed_line, replaced.viewer.source_cursor);
+        }
+        try std.testing.expect(!replaced.activeKeyboardLineSelection());
+        try std.testing.expectEqual(retain_prior, replaced.completed_selection != null);
+        if (retain_prior) try std.testing.expectEqualStrings("zero", replaced.completed_selection.?.text);
+        const viewport_after = replaced.captureSourceViewportAnchor(replaced.currentSource().?);
+        try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
+        try std.testing.expectEqual(viewport_before.signed_screen_delta, viewport_after.signed_screen_delta);
+    };
+}
+
 fn expectDocumentReplacementCandidateForTest(content: ?[]const u8, retained: bool) !void {
     const allocator = std.testing.allocator;
     var state = try selectionStateForTest("main.zig\x00", "old source\n");
@@ -3743,7 +4661,7 @@ test "repository source header copies a loading byte-exact path and excludes chr
     var pressed = state.applyNavigation(allocator, press, size);
     defer pressed.deinit(allocator);
     try std.testing.expect(state.activeMouseOwner());
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.sourceHeaderSelected());
     try std.testing.expect(state.completed_selection == null);
 
@@ -3779,7 +4697,7 @@ test "repository source header locks gesture kind and revalidates release identi
     _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
     _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = body_point }, size);
     try std.testing.expect(state.selection_owner.activeSourceHeader() != null);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     var header_release = state.applyNavigation(allocator, .{ .mouse_owner_release = body_point }, size);
     defer header_release.deinit(allocator);
     try std.testing.expect(header_release.command != null);
@@ -3787,7 +4705,7 @@ test "repository source header locks gesture kind and revalidates release identi
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = body_point }, size);
     _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = header_point }, size);
     try std.testing.expect(state.selection_owner.activeSource() != null);
-    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expect(state.activeMouseSourceRange());
     state.cancelMouseOwner();
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
@@ -5198,7 +6116,7 @@ test "repository drag auto-scroll validates token and steps one projected row" {
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
-    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expect(state.activeMouseSourceRange());
     const token_before = state.selection_owner.activeSource().?.token;
     try std.testing.expect(state.selection_owner.activeSource().?.mode == .character);
     const viewport = state.sourceAutoScrollViewport(size) orelse return error.ExpectedSourceViewport;
@@ -5314,7 +6232,7 @@ test "repository drag auto-scroll validates token and steps one projected row" {
     } }, size);
     defer edge.deinit(allocator);
     try std.testing.expectEqual(drag_auto_scroll.StepOutcome.content_edge, edge.auto_scroll.?);
-    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expect(state.activeMouseSourceRange());
 
     state.repo_epoch += 1;
     var stale = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
@@ -5337,19 +6255,19 @@ test "repository selection live gesture fixes mode and resumes after leaving the
 
     state.source_search.mode = true;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     state.source_search.mode = false;
     state.file_search.mode = true;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     state.file_search.mode = false;
 
     // Separators are focus-only dead space and never create a selection.
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.separator_col.?, .row = first_row } }, size);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col + 3, .row = first_row } }, size);
-    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expect(state.activeMouseSourceRange());
     try std.testing.expect(state.liveSourceSelection() != null);
     try std.testing.expectEqual(repository_selection.Mode.character, state.selection_owner.activeSource().?.mode);
     try std.testing.expectEqual(@as(usize, 3), state.selection_owner.activeSource().?.anchor.leading_byte);
@@ -5371,7 +6289,7 @@ test "repository selection live gesture fixes mode and resumes after leaving the
     try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.focus.trailing_byte);
     var character_release = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
     defer character_release.deinit(allocator);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.liveSourceSelection() == null);
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.gutter_col, .row = first_row } }, size);
@@ -5381,7 +6299,7 @@ test "repository selection live gesture fixes mode and resumes after leaving the
     try std.testing.expectEqual(@as(usize, 1), state.selection_owner.activeSource().?.focus.line_index);
     var line_release = state.applyNavigation(allocator, .{ .mouse_owner_release = .{ .col = geometry.text_col + 2, .row = first_row + 1 } }, size);
     defer line_release.deinit(allocator);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.line_number_col, .row = first_row } }, size);
     try std.testing.expectEqual(repository_selection.Mode.line, state.selection_owner.activeSource().?.mode);
@@ -5463,13 +6381,18 @@ test "repository selection synthetic empty row rejects every gesture stage" {
     const size: chasen.Size = .{ .width = 60, .height = 6 };
     const geometry = state.sourceGeometry(size, state.currentSource().?);
 
+    state.viewer.focus = .source;
+    _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+    try std.testing.expect(!state.activeKeyboardLineSelection());
+    try std.testing.expectEqualStrings("No source line is available for selection", state.status.text());
+
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.gutter_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     var release = state.applyNavigation(allocator, .{ .mouse_owner_release = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
     defer release.deinit(allocator);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
 }
 
 test "repository selection owner replacement cancels live borrowed selection first" {
@@ -5480,15 +6403,15 @@ test "repository selection owner replacement cancels live borrowed selection fir
     const geometry = state.sourceGeometry(size, state.currentSource().?);
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expect(state.activeMouseSourceRange());
     try std.testing.expect(state.liveSourceSelection() != null);
     state.viewer.focus = .tree;
     try std.testing.expect(state.applyNavigation(allocator, .move_down, size).selected_path_changed);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.displayed_document == null);
 
     state.repositoryChanged(allocator, 9, .{ .device = 10, .inode = 11 });
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.bundle == null);
 }
 
@@ -5500,18 +6423,18 @@ test "repository selection accepted manifest and document replacement cancel liv
     var geometry = state.sourceGeometry(size, state.currentSource().?);
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expect(state.activeMouseSourceRange());
     var incoming = try bundleForTest("main.zig\x00");
     var incoming_owned = true;
     defer if (incoming_owned) incoming.deinit(allocator);
     try state.replaceBundle(allocator, &incoming);
     incoming_owned = false;
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.liveSourceSelection() == null);
 
     geometry = state.sourceGeometry(size, state.currentSource().?);
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
-    try std.testing.expect(state.activeSourceRange());
+    try std.testing.expect(state.activeMouseSourceRange());
     try std.testing.expect(state.liveSourceSelection() != null);
     state.document_generation = 8;
     state.pending_document_generation = 8;
@@ -5528,7 +6451,7 @@ test "repository selection accepted manifest and document replacement cancel liv
     };
     defer replacement.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &replacement));
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.liveSourceSelection() == null);
     try std.testing.expectEqualStrings("old source", state.currentSource().?.lineBody(0).?);
 }
@@ -5550,7 +6473,7 @@ test "repository selection moved release installs candidate and explicit copy co
     } }, size);
     var update = state.applyNavigation(allocator, .{ .mouse_owner_release = null }, size);
     defer update.deinit(allocator);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.completed_selection != null);
     try std.testing.expectEqualStrings("DEFG\nHIJKL", state.completed_selection.?.text);
     try std.testing.expect(update.command == null);
@@ -5608,7 +6531,7 @@ test "repository selection actions share wide narrow render geometry and dispatc
         Msg{ .selection_action = .clear },
         state.mouseToMsg(.{ .col = wide_layout.source_col + 9, .row = controls_row }, .left, wide).?,
     );
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
 
     var copied = state.applyNavigation(allocator, .{ .selection_action = .copy }, wide);
     defer copied.deinit(allocator);
@@ -5719,7 +6642,7 @@ test "repository selection candidate and clipboard allocation failures have sepa
         defer update.deinit(failing.allocator());
         try std.testing.expect(update.command == null);
         try std.testing.expectEqualStrings("ABC", state.completed_selection.?.text);
-        try std.testing.expect(!state.activeSourceRange());
+        try std.testing.expect(!state.activeMouseSourceRange());
     }
 
     var observed_clipboard_failure = false;
@@ -5745,7 +6668,7 @@ test "repository selection candidate and clipboard allocation failures have sepa
             if (copy.command != null) continue;
             observed_clipboard_failure = true;
             try std.testing.expectEqualStrings("ABC", state.completed_selection.?.text);
-            try std.testing.expect(!state.activeSourceRange());
+            try std.testing.expect(!state.activeMouseSourceRange());
         }
     }
     try std.testing.expect(observed_clipboard_failure);
@@ -5770,7 +6693,7 @@ test "repository selection stale release clears prior candidate" {
     defer update.deinit(allocator);
     try std.testing.expect(update.command == null);
     try std.testing.expect(state.completed_selection == null);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
 }
 
 test "repository selection real empty line keeps candidate without copy command" {
@@ -5957,9 +6880,9 @@ test "repository selection retains candidate across inactive page and presentati
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     _ = state.applyNavigation(allocator, .cancel_mouse_owner, size);
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
@@ -5968,7 +6891,7 @@ test "repository selection retains candidate across inactive page and presentati
     } }, size);
     state.cancelMouseOwner();
     state.clampForBodySize(.{ .width = 50, .height = 5 });
-    try std.testing.expect(!state.activeSourceRange());
+    try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.completed_selection.?.token.view().eql(retained_token));
 }
 
