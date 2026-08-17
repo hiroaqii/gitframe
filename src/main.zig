@@ -154,8 +154,32 @@ fn configForStartup(
                     "gitframe: cannot load config {s}: read failed\n",
                     .{display_path},
                 ),
+                .read_permission_denied => try stderr.print(
+                    "gitframe: cannot load config {s}: permission denied\n",
+                    .{display_path},
+                ),
+                .read_is_directory => try stderr.print(
+                    "gitframe: cannot load config {s}: path is a directory\n",
+                    .{display_path},
+                ),
+                .read_too_large => try stderr.print(
+                    "gitframe: cannot load config {s}: file is too large (must be smaller than 64 KiB)\n",
+                    .{display_path},
+                ),
                 .invalid_toml => try stderr.print(
                     "gitframe: cannot load config {s}: invalid TOML\n",
+                    .{display_path},
+                ),
+                .invalid_action_config => try stderr.print(
+                    "gitframe: cannot load config {s}: invalid external action configuration\n",
+                    .{display_path},
+                ),
+                .missing_action_input => try stderr.print(
+                    "gitframe: cannot load config {s}: external action is missing required stdin\n",
+                    .{display_path},
+                ),
+                .duplicate_action_input => try stderr.print(
+                    "gitframe: cannot load config {s}: multiple external actions use the same stdin\n",
                     .{display_path},
                 ),
                 .unsupported_schema_version => try stderr.print(
@@ -344,7 +368,13 @@ test "config startup rejects every failure reason before runtime setup" {
     };
     const cases = [_]Case{
         .{ .failure = .read_failed, .reason = "read failed" },
+        .{ .failure = .read_permission_denied, .reason = "permission denied" },
+        .{ .failure = .read_is_directory, .reason = "path is a directory" },
+        .{ .failure = .read_too_large, .reason = "file is too large" },
         .{ .failure = .invalid_toml, .reason = "invalid TOML" },
+        .{ .failure = .invalid_action_config, .reason = "invalid external action configuration" },
+        .{ .failure = .missing_action_input, .reason = "external action is missing required stdin" },
+        .{ .failure = .duplicate_action_input, .reason = "multiple external actions use the same stdin" },
         .{ .failure = .unsupported_schema_version, .reason = "unsupported schema version" },
         .{ .failure = .unsupported_action_schema, .reason = "unsupported external action schema" },
     };

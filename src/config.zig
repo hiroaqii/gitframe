@@ -63,6 +63,11 @@ pub const ExternalActionInput = enum {
     commit_message_context,
 };
 
+/// External actions intentionally cover only the commit-message workflow.
+/// The legacy `scope`, `output`, and `label` fields and the generic
+/// `selection_context` / `review_context` inputs remain unsupported rather
+/// than being accepted as silent no-ops. AI Ask must use a separate,
+/// versioned typed contract instead of widening this schema again.
 pub const ExternalActionConfig = struct {
     id: []const u8 = "",
     argv: [max_external_action_argv][]const u8 = undefined,
@@ -106,7 +111,6 @@ pub const Paths = struct {
 };
 
 pub const LoadWarning = enum {
-    invalid_toml,
     invalid_json,
     unsupported_schema_version,
     read_failed,
@@ -114,7 +118,13 @@ pub const LoadWarning = enum {
 
 pub const ConfigLoadFailure = enum {
     read_failed,
+    read_permission_denied,
+    read_is_directory,
+    read_too_large,
     invalid_toml,
+    invalid_action_config,
+    missing_action_input,
+    duplicate_action_input,
     unsupported_schema_version,
     unsupported_action_schema,
 };
@@ -246,16 +256,12 @@ fn loadTomlConfig(
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_config_bytes)) catch |err| {
         return switch (err) {
             error.FileNotFound => .{ .success = .{} },
-            else => .{ .failure = .read_failed },
+            else => .{ .failure = classifyConfigReadError(err) },
         };
     };
     const config = parseConfigToml(bytes) catch |err| {
         allocator.free(bytes);
-        return .{ .failure = switch (err) {
-            error.UnsupportedSchemaVersion => .unsupported_schema_version,
-            error.UnsupportedActionSchema => .unsupported_action_schema,
-            else => .invalid_toml,
-        } };
+        return .{ .failure = classifyConfigParseError(err) };
     };
 
     return .{ .success = .{
@@ -263,6 +269,36 @@ fn loadTomlConfig(
         .source_bytes = bytes,
         .allocator = allocator,
     } };
+}
+
+fn classifyConfigReadError(err: anyerror) ConfigLoadFailure {
+    return switch (err) {
+        error.AccessDenied, error.PermissionDenied => .read_permission_denied,
+        error.IsDir => .read_is_directory,
+        error.StreamTooLong, error.FileTooBig => .read_too_large,
+        else => .read_failed,
+    };
+}
+
+fn classifyConfigParseError(err: TomlParseError) ConfigLoadFailure {
+    return switch (err) {
+        error.UnsupportedSchemaVersion => .unsupported_schema_version,
+        error.UnsupportedActionSchema => .unsupported_action_schema,
+        error.MissingActionInput => .missing_action_input,
+        error.DuplicateActionInput => .duplicate_action_input,
+        error.InvalidActionId,
+        error.InvalidActionInput,
+        error.InvalidActionArgument,
+        error.UnknownActionKey,
+        error.TooManyActionArguments,
+        error.TooManyActions,
+        error.MissingActionId,
+        error.MissingActionArgv,
+        error.DuplicateActionKey,
+        error.DuplicateActionId,
+        => .invalid_action_config,
+        else => .invalid_toml,
+    };
 }
 
 const TomlParseError = error{
@@ -279,9 +315,12 @@ const TomlParseError = error{
     InvalidKeyBinding,
     InvalidActionId,
     InvalidActionInput,
+    InvalidActionArgument,
     UnknownSection,
     UnknownKey,
+    UnknownActionKey,
     TooManyArguments,
+    TooManyActionArguments,
     TooManyActions,
     MissingPathPlaceholder,
     MissingActionId,
@@ -289,7 +328,9 @@ const TomlParseError = error{
     MissingActionInput,
     UnknownPlaceholder,
     DuplicateKey,
+    DuplicateActionKey,
     DuplicateActionId,
+    DuplicateActionInput,
     UnsupportedSchemaVersion,
     UnsupportedActionSchema,
 };
@@ -461,17 +502,20 @@ fn flushExternalAction(config: *ExternalActionsConfig, state: *?ExternalActionPa
 
 fn parseExternalActionField(state: *ExternalActionParseState, key: []const u8, value: []const u8) TomlParseError!void {
     if (std.mem.eql(u8, key, "id")) {
-        if (state.seen_id) return error.DuplicateKey;
+        if (state.seen_id) return error.DuplicateActionKey;
         const id = try parseTomlString(value);
         if (!isValidExternalActionId(id)) return error.InvalidActionId;
         state.value.id = id;
         state.seen_id = true;
     } else if (std.mem.eql(u8, key, "argv")) {
-        if (state.seen_argv) return error.DuplicateKey;
-        try parseStringArrayInto(max_external_action_argv, &state.value.argv, &state.value.argv_len, value);
+        if (state.seen_argv) return error.DuplicateActionKey;
+        parseStringArrayInto(max_external_action_argv, &state.value.argv, &state.value.argv_len, value) catch |err| switch (err) {
+            error.TooManyArguments => return error.TooManyActionArguments,
+            else => return err,
+        };
         state.seen_argv = true;
     } else if (std.mem.eql(u8, key, "stdin")) {
-        if (state.seen_stdin) return error.DuplicateKey;
+        if (state.seen_stdin) return error.DuplicateActionKey;
         state.value.stdin = try parseExternalActionInput(value);
         state.seen_stdin = true;
     } else if (std.mem.eql(u8, key, "label") or
@@ -480,7 +524,7 @@ fn parseExternalActionField(state: *ExternalActionParseState, key: []const u8, v
     {
         return error.UnsupportedActionSchema;
     } else {
-        return error.UnknownKey;
+        return error.UnknownActionKey;
     }
 }
 
@@ -572,8 +616,8 @@ fn validateExternalActionConfig(
     if (action.argv_len == 0) return error.MissingActionArgv;
 
     for (action.argvSlice()) |arg| {
-        if (arg.len == 0) return error.InvalidString;
-        try validateExternalActionPlaceholders(arg);
+        if (arg.len == 0) return error.InvalidActionArgument;
+        validateExternalActionPlaceholders(arg) catch return error.InvalidActionArgument;
     }
 }
 
@@ -584,6 +628,9 @@ fn validateExternalActionsConfig(actions: ExternalActionsConfig) TomlParseError!
         while (other_index < items.len) : (other_index += 1) {
             if (std.mem.eql(u8, action.id, items[other_index].id)) {
                 return error.DuplicateActionId;
+            }
+            if (action.stdin == items[other_index].stdin) {
+                return error.DuplicateActionInput;
             }
         }
     }
@@ -753,7 +800,52 @@ test "loadConfig fails when an existing config path cannot be read" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.read_failed, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.read_is_directory, failure);
+}
+
+test "config read errors preserve actionable failure reasons" {
+    try std.testing.expectEqual(
+        ConfigLoadFailure.read_permission_denied,
+        classifyConfigReadError(error.AccessDenied),
+    );
+    try std.testing.expectEqual(
+        ConfigLoadFailure.read_permission_denied,
+        classifyConfigReadError(error.PermissionDenied),
+    );
+    try std.testing.expectEqual(
+        ConfigLoadFailure.read_is_directory,
+        classifyConfigReadError(error.IsDir),
+    );
+    try std.testing.expectEqual(
+        ConfigLoadFailure.read_too_large,
+        classifyConfigReadError(error.StreamTooLong),
+    );
+    try std.testing.expectEqual(
+        ConfigLoadFailure.read_too_large,
+        classifyConfigReadError(error.FileTooBig),
+    );
+    try std.testing.expectEqual(
+        ConfigLoadFailure.read_failed,
+        classifyConfigReadError(error.Unexpected),
+    );
+}
+
+test "loadConfig rejects config files at the size limit" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-oversized-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    var contents: [max_config_bytes]u8 = undefined;
+    @memset(contents[0..], ' ');
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = contents[0..] });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.read_too_large, failure);
 }
 
 test "loadConfig fails for invalid toml without a config payload" {
@@ -1205,7 +1297,7 @@ test "loadConfig rejects invalid external action ids" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
 }
 
 test "loadConfig rejects duplicate external action ids" {
@@ -1233,7 +1325,34 @@ test "loadConfig rejects duplicate external action ids" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
+}
+
+test "loadConfig rejects multiple external actions with the same stdin" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-actions-duplicate-stdin-config.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\schema_version = 1
+        \\[[actions]]
+        \\id = "first"
+        \\argv = ["first-tool"]
+        \\stdin = "staged_diff"
+        \\[[actions]]
+        \\id = "second"
+        \\argv = ["second-tool"]
+        \\stdin = "staged_diff"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.duplicate_action_input, failure);
 }
 
 test "loadConfig rejects external action missing explicit stdin" {
@@ -1255,7 +1374,7 @@ test "loadConfig rejects external action missing explicit stdin" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.missing_action_input, failure);
 }
 
 test "loadConfig rejects external action missing id" {
@@ -1277,7 +1396,7 @@ test "loadConfig rejects external action missing id" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
 }
 
 test "loadConfig rejects invalid external action argv" {
@@ -1300,7 +1419,7 @@ test "loadConfig rejects invalid external action argv" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
 }
 
 test "loadConfig rejects too many external actions" {
@@ -1387,7 +1506,7 @@ test "loadConfig rejects too many external actions" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
 }
 
 test "loadConfig rejects too many external action argv items" {
@@ -1410,7 +1529,7 @@ test "loadConfig rejects too many external action argv items" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
 }
 
 test "loadConfig rejects unknown external action stdin values" {
@@ -1433,7 +1552,7 @@ test "loadConfig rejects unknown external action stdin values" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
 }
 
 test "loadConfig distinguishes unsupported external action schema" {
@@ -1442,6 +1561,8 @@ test "loadConfig distinguishes unsupported external action schema" {
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
+    // Migration boundary: removed generic fields and inputs stay rejected.
+    // AI Ask receives a separate typed contract instead of reopening this one.
     const cases = [_][]const u8{
         \\[[actions]]
         \\id = "tool"
@@ -1509,7 +1630,7 @@ test "loadConfig rejects commit action target placeholders" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
 }
 
 test "loadConfig rejects unknown external action keys" {
@@ -1533,7 +1654,7 @@ test "loadConfig rejects unknown external action keys" {
         .failure => |value| value,
         .success => return error.ExpectedConfigFailure,
     };
-    try std.testing.expectEqual(ConfigLoadFailure.invalid_toml, failure);
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_action_config, failure);
 }
 
 test "loadConfig rejects invalid keymap overrides" {
