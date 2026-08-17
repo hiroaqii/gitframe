@@ -170,11 +170,13 @@ test "reloadable activation reports validating and stale while one-shot input st
 pub fn view(app: Context, surface: *chasen.Surface) !void {
     var diff_pane_adapter: ChangesDiffPaneRenderer = .{ .app = app };
     var fetch_key_buffer: [16]u8 = undefined;
+    var filter_key_buffer: [16]u8 = undefined;
     return diff_surface_view.view(surface, .{
         .state = app.page.readSurface(app.source, app.navigation.layout),
         .palette = app.theme,
         .source_label = app.source_label,
         .repo_root = app.repo_root,
+        .file_filter_binding = app.keymap.display(.changed_file_filter, filter_key_buffer[0..]),
         .no_changes_actions = viewNoChangesActionPresentation(app, fetch_key_buffer[0..]),
         .empty_message = null,
         .diff_pane = diff_pane_adapter.interface(),
@@ -206,10 +208,12 @@ fn viewNoChangesActionPresentation(app: Context, fetch_key_buffer: []u8) diff_su
 
 /// Draw the file tree side pane from the materialized sidebar view-model.
 pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
+    var filter_key_buffer: [16]u8 = undefined;
     return diff_surface_view.viewSidebar(
         surface,
         app.page.readSurface(app.source, app.navigation.layout),
         loaded,
+        app.keymap.display(.changed_file_filter, filter_key_buffer[0..]),
         app.theme,
     );
 }
@@ -450,7 +454,7 @@ test "Changes page header admits only exact-root branch snapshots" {
     try std.testing.expect(pageHeaderPresentation(context) == null);
 }
 
-test "changes filter summary remains in compact sidebar detail row" {
+test "changes active file filter uses compact discoverability row" {
     var page_state: changes_page.ChangesPageState = .{
         .review_display = .{ .changed_file_filter = .modified },
     };
@@ -463,11 +467,52 @@ test "changes filter summary remains in compact sidebar detail row" {
         &ts.surface,
         0,
         page_state.readSurface(context.source, context.navigation.layout),
+        "F",
         context.theme,
     );
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [modified]  (F: filter)") != null);
+    const mode_cell = ts.surface.readCell(1, 0) orelse return error.ExpectedFilterMode;
+    const hint_cell = ts.surface.readCell(20, 0) orelse return error.ExpectedFilterHint;
+    try std.testing.expect(mode_cell.style.fg.eql(context.theme.color(.accent)));
+    try std.testing.expect(mode_cell.style.bold);
+    try std.testing.expect(hint_cell.style.fg.eql(context.theme.color(.muted)));
+    try std.testing.expect(hint_cell.style.dim);
+
+    page_state.review_display.changed_file_filter = .all;
+    ts.surface.clearAll();
+    try diff_surface_view.drawSidebarDetailRow(
+        &ts.surface,
+        0,
+        page_state.readSurface(context.source, context.navigation.layout),
+        "F",
+        context.theme,
+    );
+    const all_snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(all_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, all_snapshot, "Files") == null);
+}
+
+test "changes reviewed and file filters retain combined status" {
+    var page_state: changes_page.ChangesPageState = .{
+        .review_display = .{ .changed_file_filter = .modified, .hide_reviewed_files = true },
+    };
+    const context = testContext(&page_state, .default(), 48, 4);
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(48, 1);
+    defer ts.deinit();
+
+    try diff_surface_view.drawSidebarDetailRow(
+        &ts.surface,
+        0,
+        page_state.readSurface(context.source, context.navigation.layout),
+        "F",
+        context.theme,
+    );
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "hiding reviewed / modified only") != null);
 }
 
 pub fn drawSearchMatchMarker(app: Context, surface: *chasen.Surface) void {
@@ -849,6 +894,64 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     const snapshot = try narrow.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "very_long") != null);
+}
+
+test "empty status-filter projection keeps repository root as context" {
+    const nodes = [_]file_tree.Node{
+        .{
+            .kind = .repo_root,
+            .name = "gitframe",
+            .path = "",
+            .depth = 0,
+            .target = .repo_root,
+        },
+        .{
+            .kind = .file,
+            .name = "added.zig",
+            .path = "src/added.zig",
+            .depth = 1,
+            .target = .{ .diff_file = 0 },
+            .status = .added,
+        },
+        .{
+            .kind = .file,
+            .name = "deleted.zig",
+            .path = "src/deleted.zig",
+            .depth = 1,
+            .target = .{ .diff_file = 1 },
+            .status = .deleted,
+        },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loaded: loaded_diff.LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &test_support.files_two_statuses },
+        .file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8 },
+        .tree = .{ .nodes = &nodes },
+        .collapsed_dirs = .{},
+        .bytes = 0,
+        .lines = 0,
+    };
+    try loaded.rebuildVisibleNodes(arena.allocator(), false, .binary);
+    try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
+
+    var page: changes_page.ChangesPageState = .{
+        .review_display = .{ .changed_file_filter = .binary },
+    };
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(34, 6);
+    defer ts.deinit();
+
+    try viewSidebar(testContext(&page, .default(), 80, 9), &ts.surface, loaded);
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [binary]  (F: filter)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 files / 0 hunks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "gitframe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "added.zig") == null);
+    try ts.expectCellText(1, changes_layout.sidebar_header_rows, "g");
 }
 
 test "changes markerless root renderer keeps hierarchy and selection styling" {

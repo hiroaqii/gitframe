@@ -299,6 +299,7 @@ pub const ViewArgs = struct {
     palette: theme.Palette,
     source_label: []const u8,
     repo_root: ?[]const u8 = null,
+    file_filter_binding: ?[]const u8 = null,
     no_changes_actions: NoChangesActionPresentation,
     empty_message: ?StateMessage = null,
     diff_pane: DiffPaneRenderer,
@@ -377,7 +378,7 @@ fn viewEmptySidebarChrome(surface: *chasen.Surface, args: ViewArgs) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    try drawSidebarDetailRow(surface, 0, args.state, args.palette);
+    try drawSidebarDetailRow(surface, 0, args.state, args.file_filter_binding, args.palette);
     try drawSidebarSummary(surface, 0, 0, args.palette);
     try drawEmptySidebarRoot(surface, args.repo_root, args.palette);
 }
@@ -411,7 +412,7 @@ fn viewLoadedDiff(surface: *chasen.Surface, args: ViewArgs, loaded: loaded_diff.
         .width = sidebar_width,
         .height = size.height,
     });
-    try viewSidebar(&sidebar, args.state, loaded, args.palette);
+    try viewSidebar(&sidebar, args.state, loaded, args.file_filter_binding, args.palette);
     drawSidebarSeparator(surface, sidebar_width, args.palette);
 
     if (size.width <= sidebar_width + 1) return;
@@ -978,12 +979,13 @@ pub fn viewSidebar(
     surface: *chasen.Surface,
     state: diff_surface.ReadSurface,
     loaded: loaded_diff.LoadedDiff,
+    filter_binding: ?[]const u8,
     palette: theme.Palette,
 ) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    try drawSidebarDetailRow(surface, 0, state, palette);
+    try drawSidebarDetailRow(surface, 0, state, filter_binding, palette);
 
     try drawSidebarSummary(surface, loaded.document.files.len, loaded.document.totalHunks(), palette);
 
@@ -1037,13 +1039,15 @@ pub fn drawSidebarDetailRow(
     surface: *chasen.Surface,
     row: u16,
     state: diff_surface.ReadSurface,
+    filter_binding: ?[]const u8,
     palette: theme.Palette,
 ) !void {
     const size = surface.size();
     if (size.width <= 2 or row >= size.height) return;
 
-    if (state.review_display.hide_reviewed_files and state.review_display.changed_file_filter != .all) {
-        const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{state.review_display.changed_file_filter.label()});
+    const filter = state.review_display.changed_file_filter;
+    if (state.review_display.hide_reviewed_files and filter != .all) {
+        const text = try std.fmt.allocPrint(surface.frameAllocator(), "hiding reviewed / {s}", .{filter.label()});
         try draw.copyClippedTextAt(surface, 1, row, text, palette.style(.prompt));
         return;
     }
@@ -1051,9 +1055,18 @@ pub fn drawSidebarDetailRow(
         try draw.copyClippedTextAt(surface, 1, row, "hiding reviewed", palette.style(.prompt));
         return;
     }
-    if (state.review_display.changed_file_filter != .all) {
-        try draw.copyClippedTextAt(surface, 1, row, state.review_display.changed_file_filter.label(), palette.style(.prompt));
-    }
+    if (filter == .all) return;
+
+    const mode = try std.fmt.allocPrint(surface.frameAllocator(), "Files [{s}]", .{filter.shortLabel()});
+    try draw.copyClippedTextAt(surface, 1, row, mode, palette.boldStyle(.accent));
+
+    const binding = filter_binding orelse return;
+    const hint_col = 1 +| @as(u16, @intCast(chasen.text.displayWidth(mode))) +| 2;
+    if (hint_col >= size.width) return;
+    const hint = try std.fmt.allocPrint(surface.frameAllocator(), "({s}: filter)", .{binding});
+    var hint_style = palette.style(.muted);
+    hint_style.dim = true;
+    try draw.copyClippedTextAt(surface, hint_col, row, hint, hint_style);
 }
 
 pub fn drawSidebarRow(surface: *chasen.Surface, row: u16, row_model: sidebar_view_model.Row, cursor_active: bool, horizontal_scroll: usize, palette: theme.Palette) !void {

@@ -95,6 +95,7 @@ fn reviewTerminal(pending: bool, failed: bool) ?page_header.Presentation {
 pub fn view(app: Context, surface: *chasen.Surface) !void {
     const navigation_context = navigationView(app);
     var mode_key_buffer: [16]u8 = undefined;
+    var filter_key_buffer: [16]u8 = undefined;
     var pane_adapter = DiffPaneAdapter{
         .context = navigation_context,
         .palette = app.palette,
@@ -114,6 +115,7 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .palette = app.palette,
         .source_label = "branch comparison",
         .repo_root = app.repo_root,
+        .file_filter_binding = app.keymap.display(.changed_file_filter, filter_key_buffer[0..]),
         .no_changes_actions = .{},
         .empty_message = empty_message,
         .diff_pane = pane_adapter.interface(),

@@ -39,6 +39,17 @@ pub const ChangedFileFilter = enum {
         };
     }
 
+    pub fn shortLabel(self: ChangedFileFilter) []const u8 {
+        return switch (self) {
+            .all => "all",
+            .modified => "modified",
+            .added => "added",
+            .deleted => "deleted",
+            .renamed => "renamed",
+            .binary => "binary",
+        };
+    }
+
     pub fn matches(self: ChangedFileFilter, status: ?file_tree.Status) bool {
         return switch (self) {
             .all => true,
