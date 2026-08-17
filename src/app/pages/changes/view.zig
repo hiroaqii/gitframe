@@ -213,6 +213,7 @@ pub fn viewSidebar(app: Context, surface: *chasen.Surface, loaded: loaded_diff.L
         surface,
         app.page.readSurface(app.source, app.navigation.layout),
         loaded,
+        app.repo_root,
         app.keymap.display(.changed_file_filter, filter_key_buffer[0..]),
         app.theme,
     );
@@ -899,17 +900,10 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
 test "empty status-filter projection keeps repository root as context" {
     const nodes = [_]file_tree.Node{
         .{
-            .kind = .repo_root,
-            .name = "gitframe",
-            .path = "",
-            .depth = 0,
-            .target = .repo_root,
-        },
-        .{
             .kind = .file,
             .name = "added.zig",
             .path = "src/added.zig",
-            .depth = 1,
+            .depth = 0,
             .target = .{ .diff_file = 0 },
             .status = .added,
         },
@@ -917,7 +911,7 @@ test "empty status-filter projection keeps repository root as context" {
             .kind = .file,
             .name = "deleted.zig",
             .path = "src/deleted.zig",
-            .depth = 1,
+            .depth = 0,
             .target = .{ .diff_file = 1 },
             .status = .deleted,
         },
@@ -943,7 +937,9 @@ test "empty status-filter projection keeps repository root as context" {
     try ts.init(34, 6);
     defer ts.deinit();
 
-    try viewSidebar(testContext(&page, .default(), 80, 9), &ts.surface, loaded);
+    var context = testContext(&page, .default(), 80, 9);
+    context.repo_root = "/work/gitframe";
+    try viewSidebar(context, &ts.surface, loaded);
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);

@@ -412,7 +412,7 @@ fn viewLoadedDiff(surface: *chasen.Surface, args: ViewArgs, loaded: loaded_diff.
         .width = sidebar_width,
         .height = size.height,
     });
-    try viewSidebar(&sidebar, args.state, loaded, args.file_filter_binding, args.palette);
+    try viewSidebar(&sidebar, args.state, loaded, args.repo_root, args.file_filter_binding, args.palette);
     drawSidebarSeparator(surface, sidebar_width, args.palette);
 
     if (size.width <= sidebar_width + 1) return;
@@ -979,6 +979,7 @@ pub fn viewSidebar(
     surface: *chasen.Surface,
     state: diff_surface.ReadSurface,
     loaded: loaded_diff.LoadedDiff,
+    repo_root: ?[]const u8,
     filter_binding: ?[]const u8,
     palette: theme.Palette,
 ) !void {
@@ -991,7 +992,7 @@ pub fn viewSidebar(
 
     if (size.height <= layout.sidebar_header_rows) return;
     if (loaded.visibleNodeCount() == 0) {
-        try drawFilteredSidebarRoot(surface, loaded, palette);
+        try drawFilteredSidebarRoot(surface, loaded, repo_root, palette);
         return;
     }
 
@@ -1019,7 +1020,12 @@ pub fn viewSidebar(
 /// Keep repository identity visible when an active filter projects every file
 /// out of the navigable tree. The contextual root is deliberately inert: the
 /// empty projection and its cursor/navigation semantics remain unchanged.
-fn drawFilteredSidebarRoot(surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff, palette: theme.Palette) !void {
+fn drawFilteredSidebarRoot(
+    surface: *chasen.Surface,
+    loaded: loaded_diff.LoadedDiff,
+    repo_root: ?[]const u8,
+    palette: theme.Palette,
+) !void {
     for (loaded.tree.nodes, 0..) |node, node_index| {
         if (node.kind != .repo_root) continue;
         var row_model = sidebar_view_model.rowForNode(
@@ -1033,6 +1039,7 @@ fn drawFilteredSidebarRoot(surface: *chasen.Surface, loaded: loaded_diff.LoadedD
         try drawSidebarRow(surface, layout.sidebar_header_rows, row_model, false, 0, palette);
         return;
     }
+    try drawEmptySidebarRoot(surface, repo_root, palette);
 }
 
 pub fn drawSidebarDetailRow(
