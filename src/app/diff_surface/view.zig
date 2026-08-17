@@ -988,6 +988,10 @@ pub fn viewSidebar(
     try drawSidebarSummary(surface, loaded.document.files.len, loaded.document.totalHunks(), palette);
 
     if (size.height <= layout.sidebar_header_rows) return;
+    if (loaded.visibleNodeCount() == 0) {
+        try drawFilteredSidebarRoot(surface, loaded, palette);
+        return;
+    }
 
     const visible_rows: usize = size.height - layout.sidebar_header_rows;
     // Sidebar has no independent scroll state; derive the visible window
@@ -1007,6 +1011,25 @@ pub fn viewSidebar(
         }, visible_index, state.viewer.selected_node) orelse continue;
         const cursor_active = state.viewer.focus == .sidebar and !state.file_search.mode;
         try drawSidebarRow(surface, row, row_model, cursor_active, state.viewer.sidebar_horizontal_scroll, palette);
+    }
+}
+
+/// Keep repository identity visible when an active filter projects every file
+/// out of the navigable tree. The contextual root is deliberately inert: the
+/// empty projection and its cursor/navigation semantics remain unchanged.
+fn drawFilteredSidebarRoot(surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff, palette: theme.Palette) !void {
+    for (loaded.tree.nodes, 0..) |node, node_index| {
+        if (node.kind != .repo_root) continue;
+        var row_model = sidebar_view_model.rowForNode(
+            loaded.tree,
+            &loaded.collapsed_dirs,
+            loaded.reviewed_files,
+            node_index,
+            node_index,
+        ) orelse return;
+        row_model.selected = false;
+        try drawSidebarRow(surface, layout.sidebar_header_rows, row_model, false, 0, palette);
+        return;
     }
 }
 
