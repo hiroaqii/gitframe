@@ -33,10 +33,6 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var review_output: gitframe.review_session.Output = .{};
-    defer review_output.deinit(init.gpa);
-    const review_output_ptr: ?*gitframe.review_session.Output = if (config.review_mode) &review_output else null;
-
     var config_paths = try gitframe.config.resolvePaths(init.gpa, init.environ_map);
     defer config_paths.deinit(init.gpa);
     var user_config_result = gitframe.config.loadConfig(init.gpa, init.io, config_paths.config);
@@ -79,7 +75,6 @@ pub fn main(init: std.process.Init) !void {
         }, gitframe.App{
             .config = config,
             .env_map = init.environ_map,
-            .review_output = review_output_ptr,
             .user_config = user_config.*,
             .repo_session = .{
                 .state_path = config_paths.state,
@@ -89,7 +84,6 @@ pub fn main(init: std.process.Init) !void {
             .theme = palette,
         });
         try printStatsSummary(init.io, summary);
-        try finishReviewOutputIfNeeded(init.io, config, &review_output);
         return;
     }
 
@@ -110,7 +104,6 @@ pub fn main(init: std.process.Init) !void {
     }, gitframe.App{
         .config = config,
         .env_map = init.environ_map,
-        .review_output = review_output_ptr,
         .user_config = user_config.*,
         .repo_session = .{
             .state_path = config_paths.state,
@@ -119,7 +112,6 @@ pub fn main(init: std.process.Init) !void {
         .keymap = effective_keymap,
         .theme = palette,
     });
-    try finishReviewOutputIfNeeded(init.io, config, &review_output);
 }
 
 fn startupDiagnosticWriter(file: std.Io.File, io: std.Io, buffer: []u8) std.Io.File.Writer {
@@ -225,7 +217,6 @@ fn printHelp(io: std.Io) !void {
         \\  --no-watch        Disable automatic reload
         \\  --stats-summary   Print runtime timing summary after exit
         \\  --export-context  Print initial selection context JSON and exit
-        \\  --review          Print a review result JSON after exit
         \\  -h, --help        Show this help
         \\
         \\Default:
@@ -307,21 +298,6 @@ fn printStatsSummary(io: std.Io, summary: StatsSummary) !void {
         nsToUs(summary.max_render_ns),
     });
     try stderr.flush();
-}
-
-fn finishReviewOutputIfNeeded(io: std.Io, config: gitframe.CliConfig, output: *const gitframe.review_session.Output) !void {
-    if (!config.review_mode) return;
-    if (!output.ready) {
-        try printLoadError(io, error.MissingReviewResult);
-        return error.MissingReviewResult;
-    }
-
-    var buffer: [4096]u8 = undefined;
-    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
-    const stdout = &stdout_file_writer.interface;
-    try stdout.writeAll(output.json.items);
-    try stdout.flush();
-    std.process.exit(output.exit_code);
 }
 
 fn printLoadError(io: std.Io, err: anyerror) !void {

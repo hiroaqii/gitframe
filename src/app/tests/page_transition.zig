@@ -33,7 +33,6 @@ const git_refs = @import("../../git/refs.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
-const review_session = @import("../../review_session/session.zig");
 const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
 
 const App = app_mod.App;
@@ -864,36 +863,6 @@ test "changes repository transition page bar exposes deleted target as unavailab
     try std.testing.expectEqualStrings("src/deleted.zig", unavailable.path);
     try std.testing.expect(app.pages.repository.selected_path == null);
     try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
-}
-
-test "live review waiter blocks direct keyboard and mouse page switches with one reason" {
-    var output: review_session.Output = .{};
-    var app: App = .{
-        .review_output = &output,
-        .terminal_size = .{ .width = 100, .height = 20 },
-    };
-    _ = activateChanges(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-
-    try app.update(.{ .switch_page = .repository }, &ctx);
-    try std.testing.expectEqual(page.Id.changes, app.active_page);
-    try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
-
-    app.status.clear();
-    const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '3' } }) orelse return error.ExpectedPageSwitch;
-    try app.update(keyboard, &ctx);
-    try std.testing.expectEqual(page.Id.changes, app.active_page);
-    try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
-
-    app.status.clear();
-    const layout = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
-    const config_tab = page.tab(.config);
-    const bar = layout.page_bar orelse return error.ExpectedPageBar;
-    const mouse = app.handleEvent(app_test_support.mouseEvent(bar.col + config_tab.col, bar.row, .left)) orelse
-        return error.ExpectedPageSwitch;
-    try app.update(mouse, &ctx);
-    try std.testing.expectEqual(page.Id.changes, app.active_page);
-    try std.testing.expectEqualStrings("finish review session before switching pages", app.status.text());
 }
 
 const review_app_test_diff =

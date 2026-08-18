@@ -29,7 +29,6 @@ pub const Blocker = enum {
     push_error,
     git_action,
     foreground_command,
-    live_review_waiter,
     teardown,
 
     pub fn message(self: Blocker) []const u8 {
@@ -54,7 +53,6 @@ pub const Blocker = enum {
             .push_error => "close push error before switching pages",
             .git_action => "finish current git action before switching pages",
             .foreground_command => "finish foreground command before switching pages",
-            .live_review_waiter => "finish review session before switching pages",
             .teardown => "application is shutting down",
         };
     }
@@ -81,7 +79,6 @@ pub const Snapshot = struct {
     push_error: bool = false,
     git_action: bool = false,
     foreground_command: bool = false,
-    live_review_waiter: bool = false,
     teardown: bool = false,
 };
 
@@ -96,7 +93,6 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.teardown) return .{ .blocked = .teardown };
     if (snapshot.git_action) return .{ .blocked = .git_action };
     if (snapshot.foreground_command) return .{ .blocked = .foreground_command };
-    if (snapshot.live_review_waiter) return .{ .blocked = .live_review_waiter };
     if (snapshot.repo_picker) return .{ .blocked = .repo_picker };
     if (snapshot.help) return .{ .blocked = .help };
     if (snapshot.commit_input) return .{ .blocked = .commit_input };
@@ -122,11 +118,7 @@ test "ordinary reads do not block page transitions" {
     try std.testing.expectEqual(Disposition.allowed, disposition(.changes, .repository, .{}));
 }
 
-test "live review waiter and teardown are explicit transition blockers" {
-    try std.testing.expectEqual(
-        Disposition{ .blocked = .live_review_waiter },
-        disposition(.changes, .repository, .{ .live_review_waiter = true }),
-    );
+test "teardown is an explicit transition blocker" {
     try std.testing.expectEqual(
         Disposition{ .blocked = .teardown },
         disposition(.changes, .repository, .{ .teardown = true }),
@@ -188,7 +180,6 @@ test "Changes Repository transitions reject every blocker in both directions" {
         .{ .blocker = .push_error, .snapshot = .{ .push_error = true } },
         .{ .blocker = .git_action, .snapshot = .{ .git_action = true } },
         .{ .blocker = .foreground_command, .snapshot = .{ .foreground_command = true } },
-        .{ .blocker = .live_review_waiter, .snapshot = .{ .live_review_waiter = true } },
         .{ .blocker = .teardown, .snapshot = .{ .teardown = true } },
     };
     const directions = [_]struct { active: page.Id, target: page.Id }{

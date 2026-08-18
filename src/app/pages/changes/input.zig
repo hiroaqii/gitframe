@@ -21,7 +21,6 @@ pub const Context = struct {
     focus: changes_page.Focus = .sidebar,
     sidebar_hidden: bool = false,
     side_by_side: bool = false,
-    review_mode: bool = false,
     selection_owner: diff_surface_input.SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
     keymap: keymap.Effective = .{},
@@ -73,11 +72,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
 
     if (key_input.matchesShiftedAscii(key, 'j', 'J')) return if (context.focus == .diff) .select_next_hunk else null;
     if (key_input.matchesShiftedAscii(key, 'k', 'K')) return if (context.focus == .diff) .select_previous_hunk else null;
-    if (key_input.matchesShiftedAscii(key, 'n', 'N')) {
-        if (context.search_query_len > 0) return .select_previous_search_match;
-        return if (context.review_mode) .finish_review_needs_changes else null;
-    }
-    if (context.review_mode and key.matches('a', .{})) return .finish_review_approved;
+    if (key_input.matchesShiftedAscii(key, 'n', 'N') and context.search_query_len > 0) return .select_previous_search_match;
     if (key_input.hasCommandModifier(key)) return null;
 
     return switch (key.codepoint) {
@@ -86,7 +81,6 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
         'n' => if (context.search_query_len > 0) .select_next_search_match else .select_next_hunk,
         'p' => if (context.search_query_len > 0) .select_previous_search_match else .select_previous_hunk,
         ' ' => if (context.focus == .diff) .toggle_selected_hunk else .toggle_selected_file,
-        'q' => if (context.review_mode) .finish_review_canceled else null,
         else => null,
     };
 }
@@ -147,7 +141,6 @@ test "normal mapping is focus and changes-mode aware" {
     try std.testing.expectEqual(Msg.select_next_file, keyToMsg(.{}, chasen.Key{ .codepoint = 'j' }).?);
     try std.testing.expectEqual(Msg.scroll_diff_down, keyToMsg(.{ .focus = .diff }, chasen.Key{ .codepoint = 'j' }).?);
     try std.testing.expect(keyToMsg(.{}, chasen.Key{ .codepoint = 'q' }) == null);
-    try std.testing.expectEqual(Msg.finish_review_canceled, keyToMsg(.{ .review_mode = true }, chasen.Key{ .codepoint = 'q' }).?);
 }
 
 test "retained selection actions override line copy and empty escape fallback" {
@@ -221,11 +214,10 @@ test "search query disambiguates match and hunk navigation" {
     try std.testing.expectEqual(Msg.select_next_hunk, keyToMsg(.{ .focus = .diff, .search_query_len = 1 }, .{ .codepoint = 'J' }).?);
 }
 
-test "review result commands require review mode" {
+test "removed review result commands are absent" {
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'a' }) == null);
-    try std.testing.expectEqual(Msg.finish_review_approved, keyToMsg(.{ .review_mode = true }, .{ .codepoint = 'a' }).?);
-    try std.testing.expectEqual(Msg.finish_review_needs_changes, keyToMsg(.{ .review_mode = true }, .{ .codepoint = 'N' }).?);
-    try std.testing.expectEqual(Msg.finish_review_canceled, keyToMsg(.{ .review_mode = true }, .{ .codepoint = 'q' }).?);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'N' }) == null);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'q' }) == null);
 }
 
 test "configured view copy and operation commands map through Changes owner" {

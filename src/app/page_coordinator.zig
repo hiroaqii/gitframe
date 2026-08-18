@@ -31,7 +31,6 @@ pub const ShellBlockers = struct {
     push_error: bool = false,
     git_action: bool = false,
     foreground_command: bool = false,
-    live_review_waiter: bool = false,
     teardown: bool = false,
 };
 
@@ -171,7 +170,6 @@ pub const Controller = struct {
             .push_error = self.shell_blockers.push_error,
             .git_action = self.shell_blockers.git_action,
             .foreground_command = self.shell_blockers.foreground_command,
-            .live_review_waiter = self.shell_blockers.live_review_waiter,
             .teardown = self.shell_blockers.teardown,
         };
     }

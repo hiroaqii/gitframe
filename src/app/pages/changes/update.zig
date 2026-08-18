@@ -20,7 +20,6 @@ const diff_selection = @import("../../../diff/selection.zig");
 const diff_render = @import("../../../diff/render.zig");
 const file_tree = if (builtin.is_test) @import("../../../file_tree.zig") else struct {};
 const loaded_diff = if (builtin.is_test) @import("../../../loaded_diff.zig") else struct {};
-const review_session = @import("../../../review_session/session.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
 pub const Command = union(enum) {
@@ -41,7 +40,6 @@ pub const Command = union(enum) {
     copy_diff_selection: []u8,
     /// Owns the cloned identity path until App consumes/deinitializes it.
     copy_diff_header_path: diff_selection.HeaderPathSelection,
-    finish_review: review_session.Decision,
 
     pub fn deinit(self: *Command, allocator: ?std.mem.Allocator) void {
         switch (self.*) {
@@ -113,9 +111,6 @@ pub const Controller = struct {
                 .open_selected_file_in_editor => result.command = .open_selected_file_in_editor,
                 .copy_current_line => result.command = .copy_current_line,
                 .copy_current_hunk => result.command = .copy_current_hunk,
-                .finish_review_approved => result.command = .{ .finish_review = .approved },
-                .finish_review_needs_changes => result.command = .{ .finish_review = .needs_changes },
-                .finish_review_canceled => result.command = .{ .finish_review = .canceled },
                 else => unreachable,
             }
         }

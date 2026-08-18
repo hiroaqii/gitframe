@@ -94,9 +94,6 @@ pub const Msg = union(enum) {
     begin_keyboard_line_selection,
     keyboard_line_selection_move: @import("../../direction.zig").Vertical,
     selection_action_unavailable,
-    finish_review_approved,
-    finish_review_needs_changes,
-    finish_review_canceled,
 
     /// Narrows the flat Changes-compatible vocabulary to shared read-only
     /// authority. Page-only commands return null.

@@ -483,7 +483,6 @@ test "root selection preflight preserves modal and configured V precedence" {
     const active: KeyContext = .{
         .changes = .{
             .focus = .diff,
-            .review_mode = true,
             .selection_owner = .keyboard_line,
             .retained_selection_action_available = true,
         },
@@ -703,14 +702,10 @@ test "root selection preflight consumes document navigation only for live owners
     );
 }
 
-test "root keeps Changes N and Repository match keys outside document ownership" {
-    try std.testing.expectEqual(
-        changesMsg(.finish_review_needs_changes),
-        keyToMsg(.{ .changes = .{ .review_mode = true, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
-    );
+test "root keeps Changes and Repository match keys outside document ownership" {
     try std.testing.expectEqual(
         changesMsg(.select_previous_search_match),
-        keyToMsg(.{ .changes = .{ .review_mode = true, .search_query_len = 1, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
+        keyToMsg(.{ .changes = .{ .search_query_len = 1, .selection_owner = .keyboard_line } }, .{ .codepoint = 'N' }).?,
     );
 
     for ([_]chasen.Key{ .{ .codepoint = 'n' }, .{ .codepoint = 'N' }, .{ .codepoint = 'p' } }) |key| {
@@ -783,9 +778,8 @@ test "shell nests Changes void and payload messages under one route" {
 
 test "shell routes plain q by active Changes context" {
     try std.testing.expectEqual(app_message.Msg.quit, keyToMsg(.{}, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(changesMsg(.finish_review_canceled), keyToMsg(.{ .changes = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(changesMsg(.{ .search_insert = 'q' }), keyToMsg(.{ .changes = .{ .search_mode = true, .review_mode = true } }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{ .help_mode = true, .changes = .{ .review_mode = true } }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(changesMsg(.{ .search_insert = 'q' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(app_message.Msg.close_help, keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'q' }).?);
 }
 
 test "shell owns help repo picker and reload before Changes delegation" {

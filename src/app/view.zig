@@ -84,7 +84,6 @@ pub const Context = struct {
     repository: repository_view.ViewContext,
     active_page: page.Id,
     page_bar_visible: bool,
-    review_mode: bool,
     theme: theme.Palette,
     keymap: keymap.Effective,
     terminal_size: chasen.Size,
@@ -1692,14 +1691,10 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             const footer = app.changes.footer();
             if (!footer.normal_action_hints_enabled) return result;
 
-            if (app.review_mode) {
-                appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'a' }, "a", "approve", .primary);
-                appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'N' }, "N", "changes", .primary);
-            }
             appendFooterAction(app, &result, key_buffers, .branch_switch, "branch", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
-            result.append(ui.key_hint.item("q", if (app.review_mode) "cancel" else "quit"), .quit);
+            result.append(ui.key_hint.item("q", "quit"), .quit);
         },
         .repository => {
             const input = app.repository.page_state.inputContext(app.keymap);
@@ -2184,7 +2179,6 @@ const ShellViewTestHarness = struct {
     branch_switch: app_state.BranchSwitchState = .{},
     push_confirmation: ?app_state.PushConfirmation = null,
     remote_cancelable: bool = false,
-    review_mode: bool = false,
 
     fn context(self: *const ShellViewTestHarness) Context {
         const navigation: @import("pages/changes/navigation.zig").View = .{
@@ -2213,7 +2207,6 @@ const ShellViewTestHarness = struct {
             },
             .active_page = .changes,
             .page_bar_visible = false,
-            .review_mode = self.review_mode,
             .theme = self.theme,
             .keymap = self.keymap,
             .terminal_size = self.terminal_size,
@@ -2339,18 +2332,6 @@ test "footer normal-mode hints follow state and local key ownership" {
     });
 
     harness.changes.viewer.sidebar_hidden = false;
-    harness.review_mode = true;
-    hints = footerHints(harness.context(), &key_buffers);
-    try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("a", "approve"),
-        ui.key_hint.item("N", "changes"),
-        ui.key_hint.item("b", "branch"),
-        ui.key_hint.item("R", "switch repo"),
-        ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "cancel"),
-    });
-
-    harness.review_mode = false;
     var config: keymap.Config = .{};
     config.set(.branch_switch, .{ .plain_codepoint = 'm' });
     harness.keymap = keymap.Effective.fromConfig(config);
@@ -3019,7 +3000,6 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .branch_switch }, .description = "switch branch" },
     .{ .key = .{ .action = .discard }, .description = "discard selected file changes" },
     .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
-    .{ .key = .{ .text = "a / N" }, .description = "approve / needs changes in review mode" },
     .{ .key = .{ .text = "Home / End" }, .description = "first / last file" },
 };
 

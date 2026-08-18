@@ -27,7 +27,6 @@ const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_status = @import("../../git/status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
-const review_session = @import("../../review_session/session.zig");
 
 const App = app_mod.App;
 const OverlayKind = app_state.OverlayKind;
@@ -1295,27 +1294,6 @@ test "normal and help commit keys use the same nested Changes adapter" {
     try std.testing.expect(normal.local_workflow.commit_panel.is_open);
     try std.testing.expect(help.local_workflow.commit_panel.is_open);
     try std.testing.expect(!help.overlay.isHelp());
-}
-
-test "review session q writes structured canceled output before quitting" {
-    var output: review_session.Output = .{};
-    defer output.deinit(std.testing.allocator);
-    var app: App = .{
-        .allocator = std.testing.allocator,
-        .config = .{ .review_mode = true },
-        .review_output = &output,
-    };
-    _ = app.pages.changes.activation.activate(0, .fresh, .unavailable, .unavailable);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-
-    const msg = app.handleEvent(.{ .key_press = .{ .codepoint = 'q' } }) orelse return error.ExpectedChangesCancel;
-    try std.testing.expectEqual(App.Msg{ .changes = .finish_review_canceled }, msg);
-    try app.update(msg, &ctx);
-
-    try std.testing.expect(ctx.shouldQuit());
-    try std.testing.expect(output.ready);
-    try std.testing.expectEqual(@as(u8, 130), output.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, output.json.items, "\"decision\":\"canceled\"") != null);
 }
 
 test "focus loss terminates selection without a deferred result" {

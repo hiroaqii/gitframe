@@ -21,7 +21,7 @@ const diff_view_model = @import("../../diff/view_model.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
 const git_status = @import("../../git/status.zig");
-const review_session_state = @import("../../review_session/state.zig");
+const reviewed_files = @import("../../reviewed_files.zig");
 const diff_surface = @import("../diff_surface.zig");
 
 pub const Focus = diff_surface.Focus;
@@ -226,7 +226,7 @@ pub const ChangesPageState = struct {
     tree_order: file_tree.StableOrder = .{},
     tree_order_scope: ?[]u8 = null,
     action_cursor: action_cursor.State = .{},
-    reviewed_store: review_session_state.Store = .{},
+    reviewed_store: reviewed_files.Store = .{},
     selection_owner: diff_selection.Owner = .none,
     completed_selection: ?content_selection.CompletedSelection = null,
     /// Non-zero semantic generation of the selected body's source-row map.

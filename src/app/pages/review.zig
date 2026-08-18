@@ -17,7 +17,7 @@ const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_refs = @import("../../git/refs.zig");
-const review_session_state = @import("../../review_session/state.zig");
+const reviewed_files = @import("../../reviewed_files.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const commit_time = @import("../branch_commit_time.zig");
 
@@ -364,7 +364,7 @@ pub const ReviewPageState = struct {
     file_search_return_focus: diff_surface.Focus = .sidebar,
     accepted_sidebar_revision: u64 = 1,
     review_display: app_state.ReviewDisplayState = .{},
-    reviewed_store: review_session_state.Store = .{},
+    reviewed_store: reviewed_files.Store = .{},
     tree_order: file_tree.StableOrder = .{},
     tree_order_scope: ?[]u8 = null,
     selection_owner: diff_selection.Owner = .none,

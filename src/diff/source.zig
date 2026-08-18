@@ -32,7 +32,6 @@ pub const CliConfig = struct {
     auto_reload: AutoReloadOverride = .inherit,
     stats_summary: bool = false,
     export_context: bool = false,
-    review_mode: bool = false,
 
     pub fn sourceLabel(self: CliConfig) []const u8 {
         return switch (self.source) {
@@ -144,7 +143,6 @@ pub const ParseArgsError = error{
     InvalidRange,
     TooManyInputs,
     ConflictingSourceMode,
-    ConflictingOutputMode,
     ConflictingWatchOverride,
     UnsupportedWatchSource,
 };
@@ -192,11 +190,7 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
         } else if (std.mem.eql(u8, arg, "--stats-summary")) {
             config.stats_summary = true;
         } else if (std.mem.eql(u8, arg, "--export-context")) {
-            if (config.review_mode) return error.ConflictingOutputMode;
             config.export_context = true;
-        } else if (std.mem.eql(u8, arg, "--review")) {
-            if (config.export_context) return error.ConflictingOutputMode;
-            config.review_mode = true;
         } else if (std.mem.eql(u8, arg, "--range")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
@@ -477,20 +471,9 @@ test "parseArgs accepts context export mode" {
     try std.testing.expect(config.source == .cached);
 }
 
-test "parseArgs accepts review mode" {
-    const args = [_][]const u8{ "gitframe", "--review", "--cached" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.review_mode);
-    try std.testing.expect(config.source == .cached);
-}
-
-test "parseArgs rejects conflicting output modes" {
-    const export_then_review = [_][]const u8{ "gitframe", "--export-context", "--review" };
-    try std.testing.expectError(error.ConflictingOutputMode, parseArgs(export_then_review[0..]));
-
-    const review_then_export = [_][]const u8{ "gitframe", "--review", "--export-context" };
-    try std.testing.expectError(error.ConflictingOutputMode, parseArgs(review_then_export[0..]));
+test "parseArgs rejects removed review mode" {
+    const args = [_][]const u8{ "gitframe", "--review" };
+    try std.testing.expectError(error.UnknownOption, parseArgs(args[0..]));
 }
 
 test "parseArgs rejects watch with stdin" {

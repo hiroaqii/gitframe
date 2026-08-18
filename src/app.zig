@@ -46,7 +46,6 @@ const diff_render = @import("diff/render.zig");
 const diff_selection = @import("diff/selection.zig");
 const diff_source = @import("diff/source.zig");
 const keymap = @import("keymap");
-const review_session = @import("review_session/session.zig");
 const theme = @import("theme");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
@@ -93,7 +92,6 @@ pub const App = struct {
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     env_map: ?*std.process.Environ.Map = null,
-    review_output: ?*review_session.Output = null,
     /// Set immediately before handing terminal ownership to Chasen teardown.
     /// The event loop normally stops at once; retaining the bit also makes the
     /// transition matrix total for direct/future Session API requests.
@@ -210,7 +208,6 @@ pub const App = struct {
                 .push_error = self.overlay.isPushError(),
                 .git_action = self.actionLifecycleView().hasPending(),
                 .foreground_command = self.remoteWorkflowView().hasForeground() or self.shellEffectsView().hasEditorForeground(),
-                .live_review_waiter = if (self.review_output) |output| !output.ready else false,
                 .teardown = self.teardown_requested,
             },
         };
@@ -466,7 +463,7 @@ pub const App = struct {
                 const previous_width = self.changesNavigationView().diffPaneWidth();
                 const previous_mode = self.changesNavigationView().effectiveDisplayMode();
                 const previous_review_width = previous_review_body.view.diffPaneWidth();
-                const previous_review_mode = previous_review_body.view.effectiveDisplayMode();
+                const previous_review_display_mode = previous_review_body.view.effectiveDisplayMode();
                 self.terminal_size = size;
                 self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
@@ -483,7 +480,7 @@ pub const App = struct {
                 var review_adapter = review_controller.updateAdapter();
                 var review_body = review_adapter.bodyController();
                 review_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_review_width);
-                if (previous_review_mode != review_body.controller.view().effectiveDisplayMode()) {
+                if (previous_review_display_mode != review_body.controller.view().effectiveDisplayMode()) {
                     review_body.controller.clearMouseDiffSelection();
                     self.pages.review.advanceSelectionLayoutRevision();
                 }
@@ -856,7 +853,6 @@ pub const App = struct {
             .copy_current_hunk => try self.copyCurrentHunk(ctx),
             .copy_diff_selection => |text| self.copyDiffSelection(ctx, text),
             .copy_diff_header_path => |selection| self.copyDiffHeaderPath(ctx, selection),
-            .finish_review => |decision| try self.finishReview(ctx, decision),
         }
         return auto_scroll;
     }
@@ -1063,7 +1059,6 @@ pub const App = struct {
             },
             .active_page = self.active_page,
             .page_bar_visible = true,
-            .review_mode = self.config.review_mode,
             .theme = self.theme,
             .keymap = self.keymap,
             .terminal_size = self.terminal_size,
@@ -1155,7 +1150,6 @@ pub const App = struct {
                     .focus = self.pages.changes.viewer.focus,
                     .sidebar_hidden = self.pages.changes.viewer.sidebar_hidden,
                     .side_by_side = changes_navigation_view.effectiveDisplayMode() == .side_by_side,
-                    .review_mode = self.config.review_mode,
                     .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.changes.selection_owner),
                     .retained_selection_action_available = changes_navigation_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,
@@ -1439,42 +1433,6 @@ pub const App = struct {
         }
     }
 
-    fn finishReview(self: *App, ctx: *chasen.Ctx(Msg), decision: review_session.Decision) !void {
-        if (self.actionLifecycleView().hasPending()) {
-            self.setChangesStatus("finish current git action before finishing review", .{});
-            return;
-        }
-
-        if (decision != .canceled and
-            (self.active_page != .changes or !self.pages.changes.activation.state.satisfiesAction(.read_diff)))
-        {
-            self.setChangesStatus("review source is still being validated", .{});
-            return;
-        }
-
-        const output = self.review_output orelse {
-            self.setChangesStatus("review output is not configured", .{});
-            return;
-        };
-
-        var reviewed_paths: std.ArrayList([]const u8) = .empty;
-        defer reviewed_paths.deinit(ctx.allocator());
-        self.pages.changes.reviewed_store.appendPathKeysForRepo(ctx.allocator(), self.repoSessionView().activeRoot(), &reviewed_paths) catch {
-            self.setChangesStatus("could not finalize review result", .{});
-            return;
-        };
-        std.mem.sort([]const u8, reviewed_paths.items, {}, pathLessThan);
-
-        // Quit only after serialization succeeds; otherwise the TUI remains
-        // open and stdout never receives a partial machine-readable result.
-        output.set(ctx.allocator(), decision, self.selectionContext(), reviewed_paths.items) catch {
-            self.setChangesStatus("could not finalize review result", .{});
-            return;
-        };
-        self.teardown_requested = true;
-        ctx.quit();
-    }
-
     pub fn selectionContext(self: *const App) context.SelectionContext {
         return initial_selection.contextForSelection(
             self.config.source,
@@ -1501,8 +1459,4 @@ fn diffAutoScrollViewport(
         .first_row = diff_render.body_start_row,
         .last_row = @intCast(last_row_value),
     };
-}
-
-fn pathLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-    return std.mem.lessThan(u8, lhs, rhs);
 }

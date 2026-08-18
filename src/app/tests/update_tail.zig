@@ -41,7 +41,6 @@ const git_branch_status = @import("../../git/branch_status.zig");
 const git_status = @import("../../git/status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
-const review_session = @import("../../review_session/session.zig");
 const source_syntax_runtime = @import("../../syntax/source_runtime.zig");
 
 const App = app_mod.App;
