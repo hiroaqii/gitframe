@@ -229,10 +229,16 @@ test "Review selection status renders in the fixed header row for unified and bo
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "y Copy") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc Clear") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "[y Copy]") == null);
-        const side_label = if (case.side == .old) "BEFORE" else "AFTER";
-        const opposite_label = if (case.side == .old) "AFTER" else "BEFORE";
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, side_label) != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, opposite_label) == null);
+        if (case.mode == .unified) {
+            const side_label = if (case.side == .old) "Selection side: BEFORE" else "Selection side: AFTER";
+            const opposite_label = if (case.side == .old) "Selection side: AFTER" else "Selection side: BEFORE";
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, side_label) != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, opposite_label) == null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "Selection side:") == null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "BEFORE") == null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "AFTER") == null);
+        }
 
         var normal_action = false;
         var row: u16 = 0;

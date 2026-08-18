@@ -163,18 +163,18 @@ fn statusLead(variant: StatusVariant, side: StatusSide) []const u8 {
     return switch (variant) {
         .full => switch (side) {
             .none => "VISUAL · ",
-            .before => "VISUAL · BEFORE · ",
-            .after => "VISUAL · AFTER  · ",
+            .before => "VISUAL · Selection side: BEFORE · ",
+            .after => "VISUAL · Selection side: AFTER  · ",
         },
         .compact => switch (side) {
             .none => "",
-            .before => "BEFORE · ",
-            .after => "AFTER  · ",
+            .before => "Selection side: BEFORE · ",
+            .after => "Selection side: AFTER  · ",
         },
         .tight => switch (side) {
             .none => "",
-            .before => "B · ",
-            .after => "A · ",
+            .before => "Selection side: BEFORE · ",
+            .after => "Selection side: AFTER  · ",
         },
         .actions_only => "",
     };
@@ -340,7 +340,7 @@ test "fixed selection status exposes complete actions from wide to narrow panes"
     try std.testing.expect(repository_minimum.clear != null);
 
     const copy_with_count = statusLayout(.{ .col = 0, .width = 19 }, presentation);
-    try std.testing.expectEqual(Region{ .col = 8, .width = 8 }, copy_with_count.copy.?);
+    try std.testing.expectEqual(Region{ .col = 0, .width = 8 }, copy_with_count.copy.?);
     try std.testing.expect(copy_with_count.clear == null);
 
     const narrow = statusLayout(.{ .col = 1, .width = 9 }, presentation);

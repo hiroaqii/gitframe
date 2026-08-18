@@ -399,7 +399,9 @@ pub const BodyView = struct {
     }
 
     pub fn selectionStatusPresentation(self: BodyView) ?selection_action.StatusPresentation {
-        return (self.selectionPresentation() orelse return null).status();
+        var status = (self.selectionPresentation() orelse return null).status();
+        if (self.view.effectiveDisplayMode() == .side_by_side) status.side = .none;
+        return status;
     }
 
     pub fn retainedSelectionActionAvailable(self: BodyView) bool {
