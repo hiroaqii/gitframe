@@ -9,14 +9,19 @@ const message = @import("message.zig");
 const selection = @import("selection.zig");
 const selection_action = @import("../selection_action.zig");
 
+pub const SelectionCopy = struct {
+    text: []u8,
+    generation: u64,
+};
+
 /// Owned output which a page adapter translates into its physical effect.
 pub const Effect = union(enum) {
-    copy_diff_selection: []u8,
+    copy_diff_selection: SelectionCopy,
     copy_diff_header_path: diff_selection.HeaderPathSelection,
 
     pub fn deinit(self: *Effect, allocator: ?std.mem.Allocator) void {
         switch (self.*) {
-            .copy_diff_selection => |text| (allocator orelse unreachable).free(text),
+            .copy_diff_selection => |copy| (allocator orelse unreachable).free(copy.text),
             .copy_diff_header_path => |*header| (allocator orelse unreachable).free(header.identity.path_key),
         }
         self.* = undefined;
@@ -196,7 +201,18 @@ pub const Controller = struct {
                 self.navigation.controller.surface.viewer.view_options.toggleLineNumbers();
                 self.navigation.clampDiffHorizontalScrollToVisibleRows();
             },
-            .enter_search => self.navigation.enterSearchMode(),
+            .enter_search => {
+                if (self.navigation.controller.surface.completed_selection.* != null) {
+                    self.navigation.controller.clearCompletedSelectionWithViewport(
+                        self.navigation.resolver,
+                        allocator orelse return error.MissingAllocator,
+                    );
+                    result.retention_transition = .cleared;
+                } else if (self.navigation.controller.surface.selection_owner.* != .none) {
+                    self.navigation.controller.clearDiffSelection();
+                }
+                self.navigation.enterSearchMode();
+            },
             .cancel_search => self.navigation.controller.cancelSearchMode(),
             .clear_search => self.navigation.controller.clearSearch(),
             .submit_search => self.navigation.submitSearch(),
@@ -314,6 +330,9 @@ pub const Controller = struct {
                 }
                 if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
                 self.navigation.controller.surface.completed_selection.* = candidate;
+                const generation = selection_action.advanceGeneration(
+                    self.navigation.controller.surface.selection_generation,
+                );
                 candidate = undefined;
                 self.navigation.controller.clearDiffSelection();
 
@@ -321,7 +340,10 @@ pub const Controller = struct {
                     break :blk .{ .retention_transition = .installed };
                 }
                 const clipboard = self.navigation.controller.surface.completed_selection.*.?.clipboardText(allocator) catch break :blk .{};
-                break :blk .{ .effect = .{ .copy_diff_selection = clipboard } };
+                break :blk .{ .effect = .{ .copy_diff_selection = .{
+                    .text = clipboard,
+                    .generation = generation,
+                } } };
             },
             .diff_header => |header| blk: {
                 const effect: Effect = .{ .copy_diff_header_path = try cloneHeaderSelection(allocator, header) };
@@ -366,7 +388,10 @@ pub const Controller = struct {
         var adapter: Adapter = .{ .controller = self };
         switch (selection_action.dispatch(allocator, action, &adapter)) {
             .none => {},
-            .copy => |text| result.effect = .{ .copy_diff_selection = text },
+            .copy => |text| result.effect = .{ .copy_diff_selection = .{
+                .text = text,
+                .generation = self.navigation.controller.surface.selection_generation.*,
+            } },
             .cleared => result.retention_transition = .cleared,
             .authority_invalid => {
                 result.retention_transition = .cleared;
@@ -405,6 +430,9 @@ pub const Controller = struct {
 
         if (self.navigation.controller.surface.completed_selection.*) |*prior| prior.deinit(allocator);
         self.navigation.controller.surface.completed_selection.* = candidate;
+        const generation = selection_action.advanceGeneration(
+            self.navigation.controller.surface.selection_generation,
+        );
         candidate = undefined;
         self.navigation.controller.clearDiffSelection();
         if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions) {
@@ -415,7 +443,10 @@ pub const Controller = struct {
             self.navigation.controller.setStatus("Could not prepare selected text for copying; press y to retry", .{});
             return true;
         };
-        result.effect = .{ .copy_diff_selection = clipboard };
+        result.effect = .{ .copy_diff_selection = .{
+            .text = clipboard,
+            .generation = generation,
+        } };
         return true;
     }
 
@@ -527,7 +558,10 @@ fn cloneHeaderSelection(allocator: std.mem.Allocator, header: diff_selection.Hea
 
 test "update deinit releases untaken selection text effect" {
     var update: Update = .{ .effect = .{
-        .copy_diff_selection = try std.testing.allocator.dupe(u8, "selected text"),
+        .copy_diff_selection = .{
+            .text = try std.testing.allocator.dupe(u8, "selected text"),
+            .generation = 7,
+        },
     } };
     update.deinit(std.testing.allocator);
     try std.testing.expect(update.effect == null);
@@ -547,14 +581,20 @@ test "update deinit releases untaken header path effect" {
 
 test "takeEffect transfers the sole payload owner" {
     var update: Update = .{ .effect = .{
-        .copy_diff_selection = try std.testing.allocator.dupe(u8, "transferred text"),
+        .copy_diff_selection = .{
+            .text = try std.testing.allocator.dupe(u8, "transferred text"),
+            .generation = 8,
+        },
     } };
     var effect = update.takeEffect() orelse return error.ExpectedEffect;
     defer effect.deinit(std.testing.allocator);
 
     update.deinit(std.testing.allocator);
     switch (effect) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings("transferred text", text),
+        .copy_diff_selection => |copy| {
+            try std.testing.expectEqualStrings("transferred text", copy.text);
+            try std.testing.expectEqual(@as(u64, 8), copy.generation);
+        },
         .copy_diff_header_path => return error.ExpectedSelectionEffect,
     }
 }

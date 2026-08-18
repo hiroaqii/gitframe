@@ -2629,7 +2629,7 @@ pub const Controller = struct {
     /// A failure terminal replaces the outgoing diff with a one-row status
     /// body. Restore only the retained-selection viewport component against
     /// that installed basis, then clamp even when no such anchor exists so a
-    /// stale source or virtual-row ordinal cannot survive the owner change.
+    /// stale source ordinal cannot survive the owner change.
     fn reconcileInstalledProjectionFailureViewport(
         self: Controller,
         local_navigation: ?*const changes_page.ReloadAnchor,
@@ -3348,9 +3348,9 @@ pub const Controller = struct {
         defer if (static_failure) |*body| body.deinit(allocator);
 
         // Failure terminals do not need the owned reload/navigation snapshot,
-        // but they still retire the action projection. Capture its scalar
+        // but they still retire the retained selection. Capture its scalar
         // semantic viewport while the outgoing display is alive so the
-        // failure body cannot inherit a virtual-row ordinal.
+        // failure body cannot inherit a stale source ordinal.
         const terminal_selection_viewport = switch (result.result) {
             .failed, .failed_static => self.navigation.captureSelectionViewportAnchor(),
             .ready, .reuse_candidate, .staged_only_reuse_candidate => null,
@@ -4666,54 +4666,33 @@ const TestProjectionTerminal = enum {
 };
 
 const TestSelectionViewportTop = enum {
-    action_before,
-    summary,
-    controls,
-    action_after,
+    source_start,
+    source_early,
+    source_late,
+    source_end,
 };
 
-/// Places a real Changes viewport at each boundary around the retained action
-/// projection.  These assertions intentionally inspect the captured scalar
-/// anchor, rather than merely duplicating the pure projection tests: every
-/// caller below then drives that anchor through an actual projection owner
-/// terminal.
+/// Places a real Changes viewport around the selected range while the fixed
+/// status row is visible. Source and presentation ordinals must remain equal.
 fn captureTestSelectionViewportTop(
     controller: Controller,
     top: TestSelectionViewportTop,
 ) !selection_action.SelectionViewportAnchor {
-    const block = controller.navigation.view().selectionActionRenderBlock() orelse
-        return error.ExpectedSelectionActionBlock;
-    const summary = block.projection.actionPresentationRow(0) orelse
-        return error.ExpectedSelectionActionSummary;
-    const controls = block.projection.actionPresentationRow(1) orelse
-        return error.ExpectedSelectionActionControls;
+    const view = controller.navigation.view();
+    const max_scroll = view.displayedDiffLineCount() -| view.diffVisibleRows();
     const raw_scroll = switch (top) {
-        .action_before => summary -| 1,
-        .summary => summary,
-        .controls => controls,
-        .action_after => controls +| 1,
+        .source_start => 0,
+        .source_early => @min(1, max_scroll),
+        .source_late => max_scroll / 2,
+        .source_end => max_scroll,
     };
-    if (raw_scroll >= block.projection.source_rows +| block.projection.virtual_rows) {
-        return error.ExpectedSourceAfterSelectionAction;
-    }
     controller.page.viewer.diff_scroll = raw_scroll;
     const anchor = controller.navigation.captureSelectionViewportAnchor() orelse
         return error.ExpectedSelectionViewportAnchor;
     try std.testing.expectEqual(raw_scroll, anchor.raw_presentation_scroll);
     try std.testing.expectEqual(
-        switch (top) {
-            .action_before => block.projection.after_source_row,
-            .summary, .controls, .action_after => block.projection.after_source_row + 1,
-        },
+        raw_scroll,
         anchor.source_offset_fallback,
-    );
-    try std.testing.expectEqual(
-        switch (top) {
-            .action_before, .action_after => @as(isize, 0),
-            .summary => @as(isize, 2),
-            .controls => @as(isize, 1),
-        },
-        anchor.signed_screen_delta,
     );
     // Downstream cursor reconciliation is part of the integration contract.
     // Keep it on the semantic source represented by the viewport top so it
@@ -4794,11 +4773,11 @@ fn testMultiFileProjectionSelectionScope(
     var viewport_anchor: ?selection_action.SelectionViewportAnchor = null;
     if (owner == .target_path and terminal != .cache_hit) {
         viewport_anchor = try captureTestSelectionViewportTop(controller, switch (terminal) {
-            .normal_ready => .action_before,
-            .failed => .controls,
-            .failed_static => .action_after,
-            .spawn_rejected => .summary,
-            .exact_candidate => .summary,
+            .normal_ready => .source_start,
+            .failed => .source_late,
+            .failed_static => .source_end,
+            .spawn_rejected => .source_early,
+            .exact_candidate => .source_early,
             .cache_hit => unreachable,
         });
         try expectParsedTestSelectionViewport(viewport_anchor.?);
@@ -4840,7 +4819,7 @@ fn testMultiFileProjectionSelectionScope(
             );
             try std.testing.expectEqual(@as(usize, 1), page.changes_projection.cacheLen());
             if (owner == .target_path) {
-                viewport_anchor = try captureTestSelectionViewportTop(controller, .summary);
+                viewport_anchor = try captureTestSelectionViewportTop(controller, .source_early);
                 try expectParsedTestSelectionViewport(viewport_anchor.?);
             }
             var update = try controller.prepareProjection(allocator);
@@ -7869,7 +7848,7 @@ test "selection viewport reload exact transfer preserves candidate and changed c
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
     const original_layout_revision = page.selection_layout_revision;
-    const exact_viewport = try captureTestSelectionViewportTop(controller, .summary);
+    const exact_viewport = try captureTestSelectionViewportTop(controller, .source_early);
     try expectParsedTestSelectionViewport(exact_viewport);
 
     var repartitioned = try testCombinedBundle(
@@ -7908,7 +7887,7 @@ test "selection viewport reload exact transfer preserves candidate and changed c
         test_combined_changed_unstaged,
     );
     try std.testing.expect(!changed.presentation.fingerprint.eql(accepted.presentation.fingerprint));
-    const changed_viewport = try captureTestSelectionViewportTop(controller, .controls);
+    const changed_viewport = try captureTestSelectionViewportTop(controller, .source_late);
     try expectParsedTestSelectionViewport(changed_viewport);
     controller.advanceStatusSnapshotRevision(allocator);
     try std.testing.expect(page.completed_selection != null);
@@ -10229,7 +10208,7 @@ test "combined hint-free eager completion anchor allocation failure closes pendi
         controller.navigation.layout.height = 7;
 
         try installTestCombinedCandidate(controller, backing, 1, 74 + fail_index, 0);
-        const viewport_anchor = try captureTestSelectionViewportTop(controller, .summary);
+        const viewport_anchor = try captureTestSelectionViewportTop(controller, .source_early);
         try expectParsedTestSelectionViewport(viewport_anchor);
         const retained_before = &page.changes_projection.displayed.ready.value.combined_hunks;
         const presentation_text_ptr = retained_before.presentation.cached_bundle.loaded.text.ptr;
@@ -10333,10 +10312,10 @@ test "combined candidate closes when replacement request allocation fails" {
         controller.advanceStatusSnapshotRevision(backing);
         try std.testing.expect(page.completed_selection != null);
         const viewport_anchor = try captureTestSelectionViewportTop(controller, switch (fail_index) {
-            0 => .action_before,
-            1 => .summary,
-            2 => .controls,
-            3 => .action_after,
+            0 => .source_start,
+            1 => .source_early,
+            2 => .source_late,
+            3 => .source_end,
             else => unreachable,
         });
         try expectParsedTestSelectionViewport(viewport_anchor);
@@ -10365,7 +10344,7 @@ test "combined candidate spawn rejection closes only the matching replacement" {
 
     try installTestCombinedCandidate(controller, allocator, 1, 1, 0);
     controller.advanceStatusSnapshotRevision(allocator);
-    const viewport_anchor = try captureTestSelectionViewportTop(controller, .controls);
+    const viewport_anchor = try captureTestSelectionViewportTop(controller, .source_late);
     try expectParsedTestSelectionViewport(viewport_anchor);
     var update = try controller.prepareProjection(allocator);
     defer update.deinit(allocator);
@@ -10403,7 +10382,7 @@ test "projection candidate survives exact rebuild and clears on changed content 
     page.changes_projection.installReady(try testGeneratedReady(allocator, 1, "a", 0, 0));
     const displayed = &page.changes_projection.displayed.ready.value.generated_added_file;
     page.completed_selection = try testGeneratedCandidate(controller, allocator, displayed);
-    const exact_viewport = try captureTestSelectionViewportTop(controller, .summary);
+    const exact_viewport = try captureTestSelectionViewportTop(controller, .source_early);
     try expectGeneratedTestSelectionViewport(exact_viewport);
 
     page.changes_projection.pending = try changes_projection.testing.cloneRequest(
@@ -10442,7 +10421,7 @@ test "projection candidate survives exact rebuild and clears on changed content 
     try std.testing.expect(!exact_viewport.basis.eql(exact_viewport_after.basis));
     try expectTestSelectionViewportRestored(controller, exact_viewport);
 
-    const changed_viewport = try captureTestSelectionViewportTop(controller, .controls);
+    const changed_viewport = try captureTestSelectionViewportTop(controller, .source_late);
     try expectGeneratedTestSelectionViewport(changed_viewport);
 
     page.changes_projection.pending = try changes_projection.testing.cloneRequest(

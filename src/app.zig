@@ -851,7 +851,7 @@ pub const App = struct {
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .copy_current_line => self.copyCurrentLine(ctx),
             .copy_current_hunk => try self.copyCurrentHunk(ctx),
-            .copy_diff_selection => |text| self.copyDiffSelection(ctx, text),
+            .copy_diff_selection => |copy| self.copyDiffSelection(ctx, copy),
             .copy_diff_header_path => |selection| self.copyDiffHeaderPath(ctx, selection),
         }
         return auto_scroll;
@@ -872,6 +872,7 @@ pub const App = struct {
                 .origin = effect.origin,
                 .label = effect.label,
                 .text = effect.text,
+                .selection_generation = effect.selection_generation,
             });
         }
         return auto_scroll;
@@ -893,6 +894,7 @@ pub const App = struct {
                 .origin = effect.origin,
                 .label = effect.label,
                 .text = effect.text,
+                .selection_generation = effect.selection_generation,
             });
         }
         return auto_scroll;
@@ -960,7 +962,9 @@ pub const App = struct {
             .editor => |result| if (self.shellEffects().finishEditor(result) == .reload_changes) {
                 try self.changesRead().reloadAfterEditor(ctx);
             },
-            .clipboard => |result| self.shellEffects().finishClipboard(result),
+            .clipboard => |result| if (self.shellEffects().finishClipboard(result)) |completion| {
+                self.finishSelectionCopy(ctx.allocator(), completion);
+            },
         }
     }
 
@@ -1262,20 +1266,42 @@ pub const App = struct {
         }
     }
 
-    fn copyDiffSelection(self: *App, ctx: *chasen.Ctx(Msg), text: []const u8) void {
+    fn copyDiffSelection(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        copy: diff_surface.update.SelectionCopy,
+    ) void {
         self.shellEffects().queueClipboard(ctx, .{
             .origin = .{ .page = self.shellEffects().changesOrigin() },
             .label = "diff selection",
-            .text = text,
+            .text = copy.text,
+            .selection_generation = copy.generation,
         });
     }
 
-    fn copySourceSelection(self: *App, ctx: *chasen.Ctx(Msg), text: []const u8) void {
-        self.shellEffects().queueClipboard(ctx, .{
-            .origin = .{ .page = self.shellEffects().repositoryOrigin() },
-            .label = "source selection",
-            .text = text,
-        });
+    fn finishSelectionCopy(
+        self: *App,
+        allocator: std.mem.Allocator,
+        completion: shell_effects.SelectionCopyCompletion,
+    ) void {
+        switch (completion.origin.page_id) {
+            .changes => _ = self.changesNavigation().clearCompletedSelectionAfterCopy(
+                allocator,
+                completion.generation,
+            ),
+            .review => {
+                var adapter = self.reviewCoordinator().navigation().updateAdapter();
+                if (adapter.bodyController().clearCompletedSelectionAfterCopy(
+                    allocator,
+                    completion.generation,
+                )) self.pages.review.pinned_selection_basis = null;
+            },
+            .repository => _ = self.pages.repository.clearCompletedSelectionAfterCopy(
+                allocator,
+                completion.generation,
+            ),
+            .config => {},
+        }
     }
 
     fn copySourceHeaderPath(self: *App, ctx: *chasen.Ctx(Msg), path: []const u8) void {

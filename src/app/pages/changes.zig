@@ -229,6 +229,7 @@ pub const ChangesPageState = struct {
     reviewed_store: reviewed_files.Store = .{},
     selection_owner: diff_selection.Owner = .none,
     completed_selection: ?content_selection.CompletedSelection = null,
+    selection_generation: u64 = 0,
     /// Non-zero semantic generation of the selected body's source-row map.
     selection_layout_revision: u64 = 1,
 
@@ -313,6 +314,7 @@ pub const ChangesPageState = struct {
             .tree_order_scope = &self.tree_order_scope,
             .selection_owner = &self.selection_owner,
             .completed_selection = &self.completed_selection,
+            .selection_generation = &self.selection_generation,
             .source_session_revision = &self.source_session_revision,
             .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
             .selection_layout_revision = &self.selection_layout_revision,
@@ -348,6 +350,7 @@ pub const ChangesPageState = struct {
             .tree_order_scope = &self.tree_order_scope,
             .selection_owner = &self.selection_owner,
             .completed_selection = &self.completed_selection,
+            .selection_generation = &self.selection_generation,
             .source_session_revision = &self.source_session_revision,
             .pending_initial_first_visible_selection = &self.pending_initial_first_visible_selection,
             .selection_layout_revision = &self.selection_layout_revision,

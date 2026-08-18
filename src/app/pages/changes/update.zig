@@ -37,13 +37,13 @@ pub const Command = union(enum) {
     copy_current_hunk,
     /// Separately owned clipboard bytes assembled from the installed page
     /// candidate. They never borrow the displayed diff/source owner.
-    copy_diff_selection: []u8,
+    copy_diff_selection: diff_surface_update.SelectionCopy,
     /// Owns the cloned identity path until App consumes/deinitializes it.
     copy_diff_header_path: diff_selection.HeaderPathSelection,
 
     pub fn deinit(self: *Command, allocator: ?std.mem.Allocator) void {
         switch (self.*) {
-            .copy_diff_selection => |text| (allocator orelse unreachable).free(text),
+            .copy_diff_selection => |copy| (allocator orelse unreachable).free(copy.text),
             .copy_diff_header_path => |*selection| (allocator orelse unreachable).free(selection.identity.path_key),
             else => {},
         }
@@ -81,8 +81,7 @@ pub const Controller = struct {
             var shared_update = try adapter.shared().apply(allocator, shared_msg);
             defer shared_update.deinit(allocator);
             switch (shared_update.retention_transition) {
-                .none, .cleared => {},
-                .installed => self.navigation.revealCompletedSelectionAction(),
+                .none, .installed, .cleared => {},
             }
             if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
             result.auto_scroll = shared_update.auto_scroll;
@@ -120,7 +119,7 @@ pub const Controller = struct {
 
 fn commandFromEffect(effect: diff_surface_update.Effect) Command {
     return switch (effect) {
-        .copy_diff_selection => |text| .{ .copy_diff_selection = text },
+        .copy_diff_selection => |copy| .{ .copy_diff_selection = copy },
         .copy_diff_header_path => |header| .{ .copy_diff_header_path = header },
     };
 }
@@ -555,10 +554,13 @@ test "changes mouse release retains candidate until explicit copy or clear" {
     defer copied.deinit(std.testing.allocator);
     var command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer command.deinit(std.testing.allocator);
-    switch (command) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
+    const copy_generation = switch (command) {
+        .copy_diff_selection => |copy| blk: {
+            try std.testing.expectEqualStrings("one\ntwo\nnew\n", copy.text);
+            break :blk copy.generation;
+        },
         else => return error.ExpectedCopyCommand,
-    }
+    };
     try std.testing.expect(page.completed_selection != null);
 
     const navigation_token = page.completed_selection.?.token;
@@ -585,9 +587,15 @@ test "changes mouse release retains candidate until explicit copy or clear" {
     try std.testing.expect(page.completed_selection != null);
     try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
 
-    var cleared = try controller.apply(std.testing.allocator, .{ .selection_action = .clear });
-    defer cleared.deinit(std.testing.allocator);
-    try std.testing.expect(cleared.command == null);
+    try std.testing.expect(!controller.navigation.clearCompletedSelectionAfterCopy(
+        std.testing.allocator,
+        copy_generation + 1,
+    ));
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(controller.navigation.clearCompletedSelectionAfterCopy(
+        std.testing.allocator,
+        copy_generation,
+    ));
     try std.testing.expect(page.completed_selection == null);
 }
 
@@ -621,16 +629,19 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     try std.testing.expectEqual(diff_selection.Origin.keyboard_line, started.origin);
     try std.testing.expectEqual(diff_selection.Side.old, started.side);
     try std.testing.expectEqual(@as(usize, 1), started.selected_line_count);
-    try std.testing.expectEqual(@as(usize, 1), controller.navigation.view().selectionActionRenderBlock().?.line_count);
+    try std.testing.expectEqual(@as(usize, 1), controller.navigation.view().selectionStatusPresentation().?.line_count);
 
     var search = try controller.apply(null, .enter_search);
     search.deinit(null);
     try std.testing.expect(page.search.mode);
-    try std.testing.expect(page.selection_owner.activeKeyboardLineSelection());
-    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } };
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expect(page.completed_selection == null);
     var cancel_search = try controller.apply(null, .cancel_search);
     cancel_search.deinit(null);
     try std.testing.expect(!page.search.mode);
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
+    var restart_after_search = try controller.apply(failing.allocator(), .begin_keyboard_line_selection);
+    restart_after_search.deinit(failing.allocator());
     try std.testing.expect(page.selection_owner.activeKeyboardLineSelection());
 
     for (0..2) |_| {
@@ -640,7 +651,7 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     const extended = page.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Side.old, extended.side);
     try std.testing.expectEqual(@as(usize, 3), extended.selected_line_count);
-    try std.testing.expectEqual(@as(usize, 3), controller.navigation.view().selectionActionRenderBlock().?.line_count);
+    try std.testing.expectEqual(@as(usize, 3), controller.navigation.view().selectionStatusPresentation().?.line_count);
 
     var ask = try controller.apply(null, .selection_action_unavailable);
     ask.deinit(null);
@@ -656,7 +667,7 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     var command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer command.deinit(allocator);
     switch (command) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nold\n", text),
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings("one\ntwo\nold\n", copy.text),
         else => return error.ExpectedCopyCommand,
     }
     try std.testing.expect(page.selection_owner == .none);
@@ -678,9 +689,9 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     var hunks_command = copied_hunks.takeCommand() orelse return error.ExpectedCopyCommand;
     defer hunks_command.deinit(allocator);
     switch (hunks_command) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings(
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings(
             "one\ntwo\nnew\nfour\nlate one\nlate new\n",
-            text,
+            copy.text,
         ),
         else => return error.ExpectedCopyCommand,
     }
@@ -763,7 +774,7 @@ test "Changes keyboard line selection clipboard preparation failure installs a r
             var command = retried.takeCommand() orelse return error.ExpectedCopyCommand;
             defer command.deinit(allocator);
             switch (command) {
-                .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\n", text),
+                .copy_diff_selection => |copy| try std.testing.expectEqualStrings("one\ntwo\n", copy.text),
                 else => return error.ExpectedCopyCommand,
             }
             try std.testing.expect(page.completed_selection != null);
@@ -838,23 +849,23 @@ test "Changes keyboard line selection skips a folded hunk but counts and copies 
     const active = page.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(@as(usize, 2), active.focus.hunk_index);
     try std.testing.expectEqual(@as(usize, 4), active.selected_line_count);
-    try std.testing.expectEqual(@as(usize, 4), controller.navigation.view().selectionActionRenderBlock().?.line_count);
+    try std.testing.expectEqual(@as(usize, 4), controller.navigation.view().selectionStatusPresentation().?.line_count);
 
     var copied = try controller.apply(allocator, .{ .selection_action = .copy });
     defer copied.deinit(allocator);
     var command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer command.deinit(allocator);
     switch (command) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings(
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings(
             "start\nhidden context\nhidden added\nend\n",
-            text,
+            copy.text,
         ),
         else => return error.ExpectedCopyCommand,
     }
     try std.testing.expectEqual(@as(usize, 4), page.completed_selection.?.lineCount());
 }
 
-test "changes action rows route mouse Copy and Clear for retained and active keyboard selections" {
+test "Changes fixed status row routes mouse Copy and Clear without changing body coordinates" {
     const allocator = std.testing.allocator;
     var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
@@ -879,26 +890,19 @@ test "changes action rows route mouse Copy and Clear for retained and active key
     var release = try controller.apply(allocator, .{ .mouse_diff_release = null });
     release.deinit(allocator);
 
-    const block = controller.navigation.view().selectionActionRenderBlock().?;
     const raw = controller.navigation.view().rawDiffPaneGeometry().?;
-    const content_width = diff_surface_navigation.contentWidth(raw.width);
-    const gutter = raw.width - content_width;
-    const body_width = diff_render.bodyWidth(content_width);
-    const action_layout = diff_render.selectionActionLayout(
-        body_width,
-        page.viewer.display_mode,
-        block.side,
+    const action_layout = diff_surface.selection_action.statusLayout(
+        .{ .col = 1, .width = raw.width - 1 },
+        controller.navigation.view().selectionStatusPresentation().?,
     );
-    const controls = block.projection.actionPresentationRow(1).? - page.viewer.diff_scroll;
-    const summary = block.projection.actionPresentationRow(0).? - page.viewer.diff_scroll;
     const copy_point = diff_surface.MousePoint{
-        .col = raw.col + gutter + diff_render.cursor_gutter_width + action_layout.copy.?.col,
-        .row = @intCast(@as(usize, diff_render.body_start_row) + controls),
+        .col = raw.col + action_layout.copy.?.col,
+        .row = 1,
     };
 
     var inert = try controller.apply(allocator, .{ .mouse_diff_press = .{
         .col = copy_point.col,
-        .row = @intCast(@as(usize, diff_render.body_start_row) + summary),
+        .row = diff_render.body_start_row,
     } });
     inert.deinit(allocator);
     try std.testing.expect(page.completed_selection != null);
@@ -909,13 +913,13 @@ test "changes action rows route mouse Copy and Clear for retained and active key
     var copy_command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer copy_command.deinit(allocator);
     switch (copy_command) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings("one\ntwo\nnew\n", copy.text),
         else => return error.ExpectedCopyCommand,
     }
     try std.testing.expect(page.completed_selection != null);
 
     const clear_point = diff_surface.MousePoint{
-        .col = raw.col + gutter + diff_render.cursor_gutter_width + action_layout.clear.?.col,
+        .col = raw.col + action_layout.clear.?.col,
         .row = copy_point.row,
     };
     var cleared = try controller.apply(allocator, .{ .mouse_diff_press = clear_point });
@@ -925,11 +929,13 @@ test "changes action rows route mouse Copy and Clear for retained and active key
     page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
     var begin_for_clear = try controller.apply(null, .begin_keyboard_line_selection);
     begin_for_clear.deinit(null);
-    const active_clear_block = controller.navigation.view().selectionActionRenderBlock().?;
-    const active_clear_controls = active_clear_block.projection.actionPresentationRow(1).? - page.viewer.diff_scroll;
+    const active_clear_layout = diff_surface.selection_action.statusLayout(
+        .{ .col = 1, .width = raw.width - 1 },
+        controller.navigation.view().selectionStatusPresentation().?,
+    );
     const active_clear_point = diff_surface.MousePoint{
-        .col = raw.col + gutter + diff_render.cursor_gutter_width + action_layout.clear.?.col,
-        .row = @intCast(@as(usize, diff_render.body_start_row) + active_clear_controls),
+        .col = raw.col + active_clear_layout.clear.?.col,
+        .row = 1,
     };
     var active_cleared = try controller.apply(allocator, .{ .mouse_diff_press = active_clear_point });
     active_cleared.deinit(allocator);
@@ -938,18 +944,20 @@ test "changes action rows route mouse Copy and Clear for retained and active key
 
     var begin_for_copy = try controller.apply(null, .begin_keyboard_line_selection);
     begin_for_copy.deinit(null);
-    const active_copy_block = controller.navigation.view().selectionActionRenderBlock().?;
-    const active_copy_controls = active_copy_block.projection.actionPresentationRow(1).? - page.viewer.diff_scroll;
+    const active_copy_layout = diff_surface.selection_action.statusLayout(
+        .{ .col = 1, .width = raw.width - 1 },
+        controller.navigation.view().selectionStatusPresentation().?,
+    );
     const active_copy_point = diff_surface.MousePoint{
-        .col = raw.col + gutter + diff_render.cursor_gutter_width + action_layout.copy.?.col,
-        .row = @intCast(@as(usize, diff_render.body_start_row) + active_copy_controls),
+        .col = raw.col + active_copy_layout.copy.?.col,
+        .row = 1,
     };
     var active_copied = try controller.apply(allocator, .{ .mouse_diff_press = active_copy_point });
     defer active_copied.deinit(allocator);
     var active_copy_command = active_copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer active_copy_command.deinit(allocator);
     switch (active_copy_command) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one", text),
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings("one", copy.text),
         else => return error.ExpectedCopyCommand,
     }
     try std.testing.expect(page.selection_owner == .none);

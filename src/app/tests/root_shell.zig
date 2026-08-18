@@ -8,6 +8,7 @@ const app_load = @import("../load.zig");
 const app_message = @import("../message.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const app_state = @import("../state.zig");
+const selection_action = @import("../selection_action.zig");
 const app_view = @import("../view.zig");
 const action_lifecycle = @import("../workflow/action_lifecycle.zig");
 const page = @import("../page.zig");
@@ -139,35 +140,28 @@ fn installRootReviewSelection(app: *App, allocator: std.mem.Allocator) !void {
         .source_session_revision = app.pages.review.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
     }, loaded.document.files[0], selection);
+    _ = selection_action.advanceGeneration(&app.pages.review.selection_generation);
     if (!app.pages.review.installPinnedSelectionBasis()) return error.ExpectedReviewSelectionPin;
-    var adapter = reviewNavigation(app).updateAdapter();
-    var body = adapter.bodyController();
-    body.controller.revealCompletedSelectionAction(body.resolver);
 }
 
-fn reviewActionMouseEvent(app: *App, target: diff_render.SelectionActionTarget) !chasen.Event {
+fn reviewActionMouseEvent(app: *App, target: selection_action.Action) !chasen.Event {
     const navigation_view = reviewNavigation(app).view();
     var resolver = navigation_view.resolver();
     const body = navigation_view.bodyView(&resolver);
-    const block = body.selectionActionRenderBlock() orelse return error.ExpectedSelectionActionBlock;
+    const presentation = body.selectionStatusPresentation() orelse return error.ExpectedSelectionStatus;
     const raw = body.view.rawDiffPaneGeometry() orelse return error.ExpectedDiffPane;
-    const content_width = diff_surface.navigation.contentWidth(raw.width);
-    const gutter = raw.width - content_width;
-    const body_width = diff_render.bodyWidth(content_width);
-    const action_layout = diff_render.selectionActionLayout(
-        body_width,
-        app.pages.review.viewer.display_mode,
-        block.side,
+    const action_layout = diff_surface.selection_action.statusLayout(
+        .{ .col = 1, .width = raw.width - 1 },
+        presentation,
     );
     const region = switch (target) {
         .copy => action_layout.copy orelse return error.ExpectedCopyAction,
         .clear => action_layout.clear orelse return error.ExpectedClearAction,
     };
-    const controls = block.projection.actionPresentationRow(1).? - app.pages.review.viewer.diff_scroll;
     const layout = shellLayout(app);
     return app_test_support.mouseEvent(
-        layout.body.col + raw.col + gutter + diff_render.cursor_gutter_width + region.col,
-        layout.body.row + diff_render.body_start_row + controls,
+        layout.body.col + raw.col + region.col,
+        layout.body.row + 1,
         .left,
     );
 }
@@ -293,18 +287,18 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     try std.testing.expect(third_generation != second_generation);
 
     var repeated_ticks: usize = 0;
-    var crossed_presentation_only_row = false;
+    var encountered_non_selectable_row = false;
     while (app.pages.changes.selection_owner.activeDiff().?.focus.hunk_index == 0 and repeated_ticks < 8) {
         const focus_before = app.pages.changes.selection_owner.activeDiff().?.focus;
         tc.resetTransient();
         try app.update(.{ .drag_auto_scroll_tick = third_generation }, &tc.ctx);
         const focus_after = app.pages.changes.selection_owner.activeDiff().?.focus;
-        crossed_presentation_only_row = crossed_presentation_only_row or std.meta.eql(focus_before, focus_after);
+        encountered_non_selectable_row = encountered_non_selectable_row or std.meta.eql(focus_before, focus_after);
         repeated_ticks += 1;
     }
     const completed_focus = app.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expect(repeated_ticks >= 2);
-    try std.testing.expect(crossed_presentation_only_row);
+    try std.testing.expect(encountered_non_selectable_row);
     try std.testing.expectEqual(@as(usize, 1), completed_focus.focus.hunk_index);
     try std.testing.expect(completed_focus.side == .new);
     try std.testing.expectEqual(third_generation, app.drag_auto_scroll.active.?.generation);
@@ -325,14 +319,10 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     try std.testing.expectEqual(@as(u8, 1), tc.ctx._pending_clipboard_copies_len);
     try std.testing.expectEqualStrings("one\ntwo\nnew\nfour\nlate one\n", tc.ctx._pending_clipboard_copies[0].text);
 
-    // A later live drag can coexist with the retained #78 action projection.
-    // Scrolling an action row to the edge must not turn its label into a new
-    // semantic selection endpoint.
+    // A later live drag can coexist with the retained status line. The fixed
+    // header row must never become a semantic selection endpoint.
     tc.resetTransient();
     try app.update(.{ .terminal_resized = .{ .width = 80, .height = 10 } }, &tc.ctx);
-    var action_adapter = changesNavigation(&app).updateAdapter();
-    const action_body = action_adapter.shared().navigation.view();
-    const action_projection = action_body.selectionActionProjection() orelse return error.ExpectedSelectionActionProjection;
     app.pages.changes.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .side = .new,
@@ -342,13 +332,12 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
         .anchor_cell = .{ .col = 12, .row = diff_render.body_start_row },
     } };
     const focus_before_action = app.pages.changes.selection_owner.activeDiff().?.focus;
-    const action_row = action_projection.actionPresentationRow(.summary);
-    app.pages.changes.viewer.diff_scroll = action_row + 1;
+    app.pages.changes.viewer.diff_scroll = 2;
     try app.update(.{ .changes = .{ .mouse_diff_auto_scroll_step = .{
         .direction = .up,
-        .endpoint = .{ .col = 12, .row = diff_render.body_start_row },
+        .endpoint = .{ .col = 12, .row = 1 },
     } } }, &tc.ctx);
-    try std.testing.expectEqual(action_row, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
     try std.testing.expect(std.meta.eql(focus_before_action, app.pages.changes.selection_owner.activeDiff().?.focus));
 }
 
@@ -661,12 +650,6 @@ test "Review retained actions route keyboard and mouse through App after narrow 
     try std.testing.expect(app.pages.review.pinned_selection_basis.?.eql(retained_pin));
     try std.testing.expect(app.pages.review.retainedSelectionAdmitted());
 
-    var narrow_view = reviewNavigation(&app).view();
-    var narrow_resolver = narrow_view.resolver();
-    const narrow_body = narrow_view.bodyView(&narrow_resolver);
-    const narrow_projection = narrow_body.selectionActionProjection() orelse
-        return error.ExpectedNarrowSelectionAction;
-    app.pages.review.viewer.diff_scroll = narrow_projection.insertionOffset();
     const mouse_copy = app.handleEvent(try reviewActionMouseEvent(&app, .copy)) orelse
         return error.ExpectedReviewMouseCopy;
     try std.testing.expectEqual(
@@ -681,6 +664,32 @@ test "Review retained actions route keyboard and mouse through App after narrow 
     try std.testing.expectEqualStrings("one\ntwo\nnew\n", ctx._pending_clipboard_copies[2].text);
     try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.review.pinned_selection_basis.?.eql(retained_pin));
+
+    // Success for an older generation must not clear the newer selection.
+    try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+        .request_id = ctx._pending_clipboard_copies[0].request_id,
+        .outcome = .sent,
+    } } }, &ctx);
+    try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.review.pinned_selection_basis.?.eql(retained_pin));
+
+    // Success for the current generation clears both the retained bytes and
+    // Review's pinned basis. A failed older request cannot clear a later
+    // replacement.
+    try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+        .request_id = ctx._pending_clipboard_copies[2].request_id,
+        .outcome = .sent,
+    } } }, &ctx);
+    try std.testing.expect(app.pages.review.completed_selection == null);
+    try std.testing.expect(app.pages.review.pinned_selection_basis == null);
+    try installRootReviewSelection(&app, allocator);
+    const replacement_token = app.pages.review.completed_selection.?.token;
+    try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+        .request_id = ctx._pending_clipboard_copies[1].request_id,
+        .outcome = .unsupported_runtime,
+    } } }, &ctx);
+    try std.testing.expect(app.pages.review.completed_selection.?.token.eql(replacement_token));
+    try std.testing.expect(app.pages.review.pinned_selection_basis != null);
 
     var keyboard_clear_view = reviewNavigation(&app).view();
     var keyboard_clear_resolver = keyboard_clear_view.resolver();
@@ -700,16 +709,13 @@ test "Review retained actions route keyboard and mouse through App after narrow 
     var after_keyboard_resolver = after_keyboard_view.resolver();
     const after_keyboard_body = after_keyboard_view.bodyView(&after_keyboard_resolver);
     const expected_keyboard_scroll = after_keyboard_body.restoreSelectionViewportAnchor(keyboard_anchor);
-    try std.testing.expect(expected_keyboard_scroll != keyboard_anchor.raw_presentation_scroll);
+    try std.testing.expectEqual(keyboard_anchor.raw_presentation_scroll, expected_keyboard_scroll);
     try std.testing.expectEqual(expected_keyboard_scroll, app.pages.review.viewer.diff_scroll);
 
     try installRootReviewSelection(&app, allocator);
     var mouse_clear_view = reviewNavigation(&app).view();
     var mouse_clear_resolver = mouse_clear_view.resolver();
     const mouse_clear_body = mouse_clear_view.bodyView(&mouse_clear_resolver);
-    const mouse_clear_projection = mouse_clear_body.selectionActionProjection() orelse
-        return error.ExpectedMouseClearAction;
-    app.pages.review.viewer.diff_scroll = mouse_clear_projection.insertionOffset();
     const mouse_anchor = mouse_clear_body.captureSelectionViewportAnchor() orelse
         return error.ExpectedMouseClearAnchor;
     const mouse_clear = app.handleEvent(try reviewActionMouseEvent(&app, .clear)) orelse
@@ -721,9 +727,9 @@ test "Review retained actions route keyboard and mouse through App after narrow 
     var after_mouse_resolver = after_mouse_view.resolver();
     const after_mouse_body = after_mouse_view.bodyView(&after_mouse_resolver);
     const expected_mouse_scroll = after_mouse_body.restoreSelectionViewportAnchor(mouse_anchor);
-    try std.testing.expect(expected_mouse_scroll != mouse_anchor.raw_presentation_scroll);
+    try std.testing.expectEqual(mouse_anchor.raw_presentation_scroll, expected_mouse_scroll);
     try std.testing.expectEqual(expected_mouse_scroll, app.pages.review.viewer.diff_scroll);
-    try std.testing.expectEqual(@as(usize, 3), app.shell_effects_state.clipboard_copies.count());
+    try std.testing.expectEqual(@as(usize, 0), app.shell_effects_state.clipboard_copies.count());
 }
 
 test "help overlay opens and closes before normal shortcuts" {

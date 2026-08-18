@@ -34,6 +34,7 @@ pub const ClipboardEffect = struct {
     label: []const u8,
     text: []const u8,
     owned_text: ?[]u8 = null,
+    selection_generation: ?u64 = null,
 
     pub fn deinit(self: *ClipboardEffect, allocator: std.mem.Allocator) void {
         if (self.owned_text) |owned| allocator.free(owned);
@@ -101,8 +102,8 @@ pub const Controller = struct {
                 const auto_scroll = page_update.auto_scroll;
                 const effect = page_update.takeEffect() orelse return .{ .auto_scroll = auto_scroll };
                 return switch (effect) {
-                    .copy_diff_selection => |text| .{
-                        .clipboard = self.ownedClipboard("diff selection", text),
+                    .copy_diff_selection => |copy| .{
+                        .clipboard = self.ownedSelectionClipboard("diff selection", copy),
                         .auto_scroll = auto_scroll,
                     },
                     .copy_diff_header_path => |selection_value| blk: {
@@ -339,6 +340,16 @@ pub const Controller = struct {
         };
     }
 
+    fn ownedSelectionClipboard(
+        self: Controller,
+        label: []const u8,
+        copy: diff_surface.update.SelectionCopy,
+    ) ClipboardEffect {
+        var effect = self.ownedClipboard(label, copy.text);
+        effect.selection_generation = copy.generation;
+        return effect;
+    }
+
     fn effectOrigin(self: Controller) effect_origin.PageOrigin {
         const identity = self.page_state.activation.currentIdentity();
         return .{
@@ -474,8 +485,10 @@ test "Review changed reload restores semantic viewport after removing retained a
 
     var outgoing_resolver = outgoing_view.resolver();
     const outgoing_body = outgoing_view.bodyView(&outgoing_resolver);
-    const projection = outgoing_body.selectionActionProjection() orelse return error.ExpectedSelectionActionProjection;
-    review.viewer.diff_scroll = projection.insertionOffset();
+    review.viewer.diff_scroll = @min(
+        outgoing_body.selectedDiffCursorOffset() orelse 0,
+        outgoing_body.sourceDiffLineCount() -| outgoing_body.view.diffVisibleRows(),
+    );
     const outgoing_anchor = outgoing_body.captureSelectionViewportAnchor() orelse return error.ExpectedSelectionViewport;
     try std.testing.expectEqual(
         Redraw.default,
@@ -489,7 +502,7 @@ test "Review changed reload restores semantic viewport after removing retained a
     var incoming_resolver = incoming_view.resolver();
     const incoming_body = incoming_view.bodyView(&incoming_resolver);
     const expected_scroll = incoming_body.restoreSelectionViewportAnchor(outgoing_anchor);
-    try std.testing.expect(expected_scroll != outgoing_anchor.raw_presentation_scroll);
+    try std.testing.expectEqual(outgoing_anchor.raw_presentation_scroll, expected_scroll);
     try std.testing.expectEqual(expected_scroll, review.viewer.diff_scroll);
 }
 

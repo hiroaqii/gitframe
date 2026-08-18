@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const cursor_viewport = @import("../../cursor_viewport.zig");
-const selection_action = @import("../../selection_action.zig");
 const model = @import("model.zig");
 const source_geometry = @import("source_geometry.zig");
 const source = @import("../../../repository/source.zig");
@@ -12,27 +11,11 @@ const repository_tree = @import("../../../repository/tree.zig");
 fn sourceBounds(
     document: *const source.Document,
     geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
 ) cursor_viewport.Bounds {
     return .{
-        .content_rows = if (projection) |value| value.presentationRows() else document.rowCount(),
+        .content_rows = document.rowCount(),
         .visible_rows = geometry.visible_source_rows,
     };
-}
-
-fn sourceToPresentation(projection: ?selection_action.Projection, source_row: usize) usize {
-    return if (projection) |value| value.sourceToPresentation(source_row) orelse source_row else source_row;
-}
-
-fn presentationToSource(
-    projection: ?selection_action.Projection,
-    presentation_row: usize,
-    bias: selection_action.Bias,
-) usize {
-    return if (projection) |value|
-        value.nearestSource(presentation_row, bias) orelse 0
-    else
-        presentation_row;
 }
 
 fn moveSourceCursor(viewer: *model.ViewerState, document: *const source.Document, delta: isize) void {
@@ -43,73 +26,38 @@ fn moveSourceCursor(viewer: *model.ViewerState, document: *const source.Document
 }
 
 pub fn moveSource(viewer: *model.ViewerState, document: *const source.Document, delta: isize, geometry: source_geometry.SourceGeometry) void {
-    moveSourceProjected(viewer, document, delta, geometry, null);
-}
-
-pub fn moveSourceProjected(
-    viewer: *model.ViewerState,
-    document: *const source.Document,
-    delta: isize,
-    geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
-) void {
     moveSourceCursor(viewer, document, delta);
-    clampSourceProjected(viewer, document, geometry, projection);
+    clampSource(viewer, document, geometry);
     viewer.source_vertical_scroll = cursor_viewport.placeCursorInComfortBand(
-        sourceBounds(document, geometry, projection),
+        sourceBounds(document, geometry),
         viewer.source_vertical_scroll,
-        sourceToPresentation(projection, viewer.source_cursor),
+        viewer.source_cursor,
     );
 }
 
 pub fn pageSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry) void {
-    pageSourceProjected(viewer, document, direction, geometry, null);
-}
-
-pub fn pageSourceProjected(
-    viewer: *model.ViewerState,
-    document: *const source.Document,
-    direction: isize,
-    geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
-) void {
-    pageSourceByRowsProjected(viewer, document, direction, geometry.navigationRows(), geometry, projection);
+    pageSourceByRows(viewer, document, direction, geometry.navigationRows(), geometry);
 }
 
 pub fn halfPageSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry) void {
-    halfPageSourceProjected(viewer, document, direction, geometry, null);
-}
-
-pub fn halfPageSourceProjected(
-    viewer: *model.ViewerState,
-    document: *const source.Document,
-    direction: isize,
-    geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
-) void {
     const step = @max(@as(usize, geometry.visible_source_rows) / 2, 1);
-    pageSourceByRowsProjected(viewer, document, direction, step, geometry, projection);
+    pageSourceByRows(viewer, document, direction, step, geometry);
 }
 
-fn pageSourceByRowsProjected(
+fn pageSourceByRows(
     viewer: *model.ViewerState,
     document: *const source.Document,
     direction: isize,
     step: usize,
     geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
 ) void {
-    const current = sourceToPresentation(projection, viewer.source_cursor);
-    const target = if (direction < 0) current -| step else current +| step;
-    viewer.source_cursor = @min(
-        presentationToSource(projection, target, if (direction < 0) .before else .after),
-        document.rowCount() - 1,
-    );
-    clampSourceProjected(viewer, document, geometry, projection);
+    const target = if (direction < 0) viewer.source_cursor -| step else viewer.source_cursor +| step;
+    viewer.source_cursor = @min(target, document.rowCount() - 1);
+    clampSource(viewer, document, geometry);
     viewer.source_vertical_scroll = cursor_viewport.centerCursor(
-        sourceBounds(document, geometry, projection),
+        sourceBounds(document, geometry),
         viewer.source_vertical_scroll,
-        sourceToPresentation(projection, viewer.source_cursor),
+        viewer.source_cursor,
     );
 }
 
@@ -117,17 +65,7 @@ fn pageSourceByRowsProjected(
 /// reverted to preserve the old cursor, and a clamped no-move preserves that
 /// cursor exactly.
 pub fn wheelSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry) void {
-    wheelSourceProjected(viewer, document, direction, geometry, null);
-}
-
-pub fn wheelSourceProjected(
-    viewer: *model.ViewerState,
-    document: *const source.Document,
-    direction: isize,
-    geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
-) void {
-    const bounds = sourceBounds(document, geometry, projection);
+    const bounds = sourceBounds(document, geometry);
     const old_scroll = bounds.clampScroll(viewer.source_vertical_scroll);
     const requested_scroll = if (direction < 0)
         old_scroll -| 1
@@ -141,25 +79,21 @@ pub fn wheelSourceProjected(
         bounds,
         old_scroll,
         new_scroll,
-        sourceToPresentation(projection, viewer.source_cursor),
+        viewer.source_cursor,
     )) |cursor| {
-        viewer.source_cursor = @min(
-            presentationToSource(projection, cursor, if (direction < 0) .before else .after),
-            document.rowCount() - 1,
-        );
+        viewer.source_cursor = @min(cursor, document.rowCount() - 1);
     }
 }
 
-/// Scroll only the projected viewport. A keyboard line selection owns the
+/// Scroll only the viewport. A keyboard line selection owns the
 /// semantic cursor/endpoint, so a pointer wheel must not retarget either one.
-pub fn scrollSourceViewportProjected(
+pub fn scrollSourceViewport(
     viewer: *model.ViewerState,
     document: *const source.Document,
     direction: isize,
     geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
 ) void {
-    const bounds = sourceBounds(document, geometry, projection);
+    const bounds = sourceBounds(document, geometry);
     const current = bounds.clampScroll(viewer.source_vertical_scroll);
     const requested = if (direction < 0)
         current -| 1
@@ -171,31 +105,13 @@ pub fn scrollSourceViewportProjected(
 }
 
 pub fn firstSource(viewer: *model.ViewerState, document: *const source.Document, geometry: source_geometry.SourceGeometry) void {
-    firstSourceProjected(viewer, document, geometry, null);
-}
-
-pub fn firstSourceProjected(
-    viewer: *model.ViewerState,
-    document: *const source.Document,
-    geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
-) void {
     viewer.source_cursor = 0;
-    clampSourceProjected(viewer, document, geometry, projection);
+    clampSource(viewer, document, geometry);
 }
 
 pub fn lastSource(viewer: *model.ViewerState, document: *const source.Document, geometry: source_geometry.SourceGeometry) void {
-    lastSourceProjected(viewer, document, geometry, null);
-}
-
-pub fn lastSourceProjected(
-    viewer: *model.ViewerState,
-    document: *const source.Document,
-    geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
-) void {
     viewer.source_cursor = document.rowCount() - 1;
-    clampSourceProjected(viewer, document, geometry, projection);
+    clampSource(viewer, document, geometry);
 }
 
 pub fn scrollSourceHorizontal(viewer: *model.ViewerState, document: *const source.Document, delta: isize, geometry: source_geometry.SourceGeometry) void {
@@ -212,21 +128,12 @@ pub fn clampSource(
     document: *const source.Document,
     geometry: source_geometry.SourceGeometry,
 ) void {
-    clampSourceProjected(viewer, document, geometry, null);
-}
-
-pub fn clampSourceProjected(
-    viewer: *model.ViewerState,
-    document: *const source.Document,
-    geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
-) void {
-    const bounds = sourceBounds(document, geometry, projection);
+    const bounds = sourceBounds(document, geometry);
     viewer.source_cursor = @min(viewer.source_cursor, document.rowCount() - 1);
     viewer.source_vertical_scroll = cursor_viewport.keepCursorVisible(
         bounds,
         viewer.source_vertical_scroll,
-        sourceToPresentation(projection, viewer.source_cursor),
+        viewer.source_cursor,
     );
     const maximum = document.maxDisplayWidth() -| @as(usize, geometry.text_width);
     viewer.source_horizontal_scroll = @min(viewer.source_horizontal_scroll, maximum);
@@ -238,16 +145,6 @@ pub fn revealMatch(
     match: source.Match,
     geometry: source_geometry.SourceGeometry,
 ) void {
-    revealMatchProjected(viewer, document, match, geometry, null);
-}
-
-pub fn revealMatchProjected(
-    viewer: *model.ViewerState,
-    document: *const source.Document,
-    match: source.Match,
-    geometry: source_geometry.SourceGeometry,
-    projection: ?selection_action.Projection,
-) void {
     viewer.focus = .source;
     viewer.source_cursor = match.line;
     const match_col = document.displayColumnForByte(match.line, match.start) orelse 0;
@@ -255,11 +152,11 @@ pub fn revealMatchProjected(
     if (geometry.text_width > 0 and match_col >= viewer.source_horizontal_scroll + geometry.text_width) {
         viewer.source_horizontal_scroll = match_col - geometry.text_width + 1;
     }
-    clampSourceProjected(viewer, document, geometry, projection);
+    clampSource(viewer, document, geometry);
     viewer.source_vertical_scroll = cursor_viewport.placeCursorInComfortBand(
-        sourceBounds(document, geometry, projection),
+        sourceBounds(document, geometry),
         viewer.source_vertical_scroll,
-        sourceToPresentation(projection, viewer.source_cursor),
+        viewer.source_cursor,
     );
 }
 
@@ -483,48 +380,6 @@ test "repository selection navigation clamps cursor scroll and horizontal cells"
     try std.testing.expectEqual(@as(usize, 2), viewer.source_vertical_scroll);
     scrollSourceHorizontal(&viewer, &document, 8, geometry);
     try std.testing.expectEqual(@as(usize, 6), viewer.source_horizontal_scroll);
-}
-
-test "repository projected navigation counts action rows without cursor authority" {
-    const allocator = std.testing.allocator;
-    const bytes = try allocator.dupe(u8, "one\ntwo\nthree\nfour\n");
-    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
-    defer document.deinit(allocator);
-    const geometry = source_geometry.SourceGeometry.init(.{ .width = 20, .height = 4 }, &document, true);
-    const projection = selection_action.Projection.init(document.rowCount(), 1).?;
-    var viewer: model.ViewerState = .{ .focus = .source };
-
-    lastSourceProjected(&viewer, &document, geometry, projection);
-    try std.testing.expectEqual(@as(usize, 3), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 4), viewer.source_vertical_scroll);
-
-    firstSourceProjected(&viewer, &document, geometry, projection);
-    try std.testing.expectEqual(@as(usize, 0), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll);
-
-    viewer.source_cursor = 1;
-    viewer.source_vertical_scroll = 1;
-    moveSourceProjected(&viewer, &document, 1, geometry, projection);
-    try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
-    try std.testing.expectEqual(
-        selection_action.Location{ .source = 2 },
-        projection.locate(projection.sourceToPresentation(viewer.source_cursor).?).?,
-    );
-
-    revealMatchProjected(&viewer, &document, .{ .line = 2, .start = 0, .end = 0 }, geometry, projection);
-    try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
-    try std.testing.expect(projection.sourceToPresentation(2).? >= viewer.source_vertical_scroll);
-
-    viewer.source_cursor = 1;
-    viewer.source_vertical_scroll = 0;
-    halfPageSourceProjected(&viewer, &document, 1, geometry, projection);
-    try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
-    try std.testing.expectEqual(
-        selection_action.Location{ .source = 2 },
-        projection.locate(projection.sourceToPresentation(viewer.source_cursor).?).?,
-    );
-    halfPageSourceProjected(&viewer, &document, -1, geometry, projection);
-    try std.testing.expectEqual(@as(usize, 1), viewer.source_cursor);
 }
 
 test "repository repeated navigation uses precomputed width for admitted worst shapes" {

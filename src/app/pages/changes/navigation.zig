@@ -443,9 +443,9 @@ pub const View = struct {
         return self.sharedBodyView(&adapter).diffSelectionView();
     }
 
-    pub fn selectionActionRenderBlock(self: View) ?diff_render.SelectionActionBlock {
+    pub fn selectionStatusPresentation(self: View) ?diff_surface.selection_action.StatusPresentation {
         var adapter = self.bodyResolverAdapter();
-        return self.sharedBodyView(&adapter).selectionActionRenderBlock();
+        return self.sharedBodyView(&adapter).selectionStatusPresentation();
     }
 
     pub fn renderDiffScroll(self: View) usize {
@@ -1301,9 +1301,12 @@ pub const Controller = struct {
         self.sharedController().clearCompletedSelectionWithViewport(adapter.interface(), allocator);
     }
 
-    pub fn revealCompletedSelectionAction(self: Controller) void {
-        var adapter = self.bodyResolverAdapter();
-        self.sharedController().revealCompletedSelectionAction(adapter.interface());
+    pub fn clearCompletedSelectionAfterCopy(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        generation: u64,
+    ) bool {
+        return self.sharedController().clearCompletedSelectionAfterCopy(allocator, generation);
     }
 
     pub fn captureSelectionViewportAnchor(self: Controller) ?diff_surface.selection_action.SelectionViewportAnchor {

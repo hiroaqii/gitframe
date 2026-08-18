@@ -31,6 +31,7 @@ pub const ClipboardEffect = struct {
     origin: effect_origin.Origin,
     label: []const u8,
     text: []u8,
+    selection_generation: ?u64 = null,
 
     pub fn deinit(self: *ClipboardEffect, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
@@ -112,10 +113,11 @@ pub const Controller = struct {
                 const auto_scroll = page_update.auto_scroll;
                 const command = page_update.takeCommand() orelse return .{ .auto_scroll = auto_scroll };
                 return .{ .auto_scroll = auto_scroll, .clipboard = switch (command) {
-                    .copy_source_selection => |text| .{
+                    .copy_source_selection => |copy| .{
                         .origin = .{ .page = self.effectOrigin() },
                         .label = "source selection",
-                        .text = text,
+                        .text = copy.text,
+                        .selection_generation = copy.generation,
                     },
                     .copy_source_header_path => |text| .{
                         .origin = .{ .page = self.effectOrigin() },

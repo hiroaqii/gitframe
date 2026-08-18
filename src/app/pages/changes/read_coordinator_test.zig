@@ -3023,15 +3023,12 @@ test "Changes canonical publication exact acceptance retains navigation search a
         displayed,
         selection,
     );
-    const action_block = app.changesNavigationView().selectionActionRenderBlock() orelse
-        return error.ExpectedSelectionActionBlock;
-    const summary_row = action_block.projection.actionPresentationRow(0) orelse
-        return error.ExpectedSelectionActionSummary;
-    app.pages.changes.viewer.diff_scroll = summary_row;
+    const selected_tail = app.changesNavigationView().displayedDiffLineCount() -|
+        app.changesNavigationView().diffVisibleRows();
+    app.pages.changes.viewer.diff_scroll = selected_tail;
     const selection_viewport_before = app.changesNavigationView().captureSelectionViewportAnchor() orelse
         return error.ExpectedSelectionViewportAnchor;
-    try std.testing.expectEqual(summary_row, selection_viewport_before.raw_presentation_scroll);
-    try std.testing.expectEqual(@as(isize, 2), selection_viewport_before.signed_screen_delta);
+    try std.testing.expectEqual(selected_tail, selection_viewport_before.raw_presentation_scroll);
     switch (selection_viewport_before.semantic_source) {
         .parsed => |coordinate| app.pages.changes.viewer.diff_cursor = coordinate,
         .none, .generated_row => return error.ExpectedParsedSelectionViewportSource,
@@ -3509,15 +3506,12 @@ test "Changes canonical publication projection failure publishes failure body at
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
     _ = try installCanonicalPublicationLineageOwners(&app, allocator, roots.a);
-    const action_block = app.changesNavigationView().selectionActionRenderBlock() orelse
-        return error.ExpectedSelectionActionBlock;
-    const controls_row = action_block.projection.actionPresentationRow(1) orelse
-        return error.ExpectedSelectionActionControls;
-    app.pages.changes.viewer.diff_scroll = controls_row;
+    const selected_tail = app.changesNavigationView().displayedDiffLineCount() -|
+        app.changesNavigationView().diffVisibleRows();
+    app.pages.changes.viewer.diff_scroll = selected_tail;
     const selection_viewport_before = app.changesNavigationView().captureSelectionViewportAnchor() orelse
         return error.ExpectedSelectionViewportAnchor;
-    try std.testing.expectEqual(controls_row, selection_viewport_before.raw_presentation_scroll);
-    try std.testing.expectEqual(@as(isize, 1), selection_viewport_before.signed_screen_delta);
+    try std.testing.expectEqual(selected_tail, selection_viewport_before.raw_presentation_scroll);
     switch (selection_viewport_before.semantic_source) {
         .parsed => |coordinate| app.pages.changes.viewer.diff_cursor = coordinate,
         .none, .generated_row => return error.ExpectedParsedSelectionViewportSource,

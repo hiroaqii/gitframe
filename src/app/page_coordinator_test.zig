@@ -178,8 +178,7 @@ test "repository keyboard line selection page exits preserve semantic viewport" 
 
         const viewport_before = app.pages.repository.captureSelectionViewportAnchor() orelse
             return error.ExpectedSelectionViewportAnchor;
-        try std.testing.expectEqual(@as(usize, 3), viewport_before.semantic_source);
-        try std.testing.expectEqual(@as(isize, 0), viewport_before.signed_screen_delta);
+        try std.testing.expectEqual(@as(usize, 5), viewport_before.semantic_source);
 
         try requestPageSwitchForTest(&app, &ctx, target);
 
@@ -191,7 +190,6 @@ test "repository keyboard line selection page exits preserve semantic viewport" 
             const viewport_after = app.pages.repository.captureSelectionViewportAnchor() orelse
                 return error.ExpectedRetainedViewportAnchor;
             try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
-            try std.testing.expectEqual(viewport_before.signed_screen_delta, viewport_after.signed_screen_delta);
         } else {
             try std.testing.expectEqual(
                 viewport_before.semantic_source,
@@ -297,7 +295,7 @@ test "Review retained selection survives page transitions and clears on reposito
 
     // Repository commitment invalidates the complete Review owner before
     // page coordination reactivates it. The coordinator must not perform a
-    // second candidate-only clear that could preserve a virtual-row ordinal.
+    // second candidate-only clear that could preserve stale scroll state.
     app.pages.review.viewer.diff_scroll = 9;
     app.pages.review.deinit(allocator);
     try std.testing.expectEqual(page_coordinator.Intent.review_refresh, app.controller().acceptedRepositoryChange());

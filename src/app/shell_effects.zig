@@ -26,6 +26,12 @@ pub const ClipboardCopyState = struct {
     /// Caller-provided static label; only literal labels are retained after
     /// synchronous queueing. Clipboard text itself is copied by the runtime.
     label: []const u8,
+    selection_generation: ?u64 = null,
+};
+
+pub const SelectionCopyCompletion = struct {
+    origin: effect_origin.PageOrigin,
+    generation: u64,
 };
 
 pub const State = struct {
@@ -107,6 +113,9 @@ pub const CopyRequest = struct {
     /// the asynchronous completion is admitted.
     label: []const u8,
     text: []const u8,
+    /// Present only for retained-selection copies. A successful asynchronous
+    /// completion may clear exactly this generation and no later selection.
+    selection_generation: ?u64 = null,
 };
 
 pub const EditorFinishOutcome = enum {
@@ -301,6 +310,7 @@ pub const Controller = struct {
         self.state.clipboard_copies.putAssumeCapacity(request_id.id, .{
             .origin = request.origin,
             .label = request.label,
+            .selection_generation = request.selection_generation,
         });
         return true;
     }
@@ -308,23 +318,34 @@ pub const Controller = struct {
     pub fn finishClipboard(
         self: Controller,
         finished: app_message.ClipboardCopyFinished,
-    ) void {
+    ) ?SelectionCopyCompletion {
         const removed = self.state.clipboard_copies.fetchRemove(finished.request_id.id) orelse {
             self.redraw.requestSkip();
-            return;
+            return null;
         };
         const pending = removed.value;
         const liveness = effect_origin.classify(pending.origin, self.origins.snapshot);
         if (liveness == .stale) {
             self.redraw.requestSkip();
-            return;
+            return null;
         }
+        var selection_completion: ?SelectionCopyCompletion = null;
         switch (finished.outcome) {
-            .sent => self.setEffectStatus(pending.origin, "clipboard copy sent: {s}", .{pending.label}),
+            .sent => {
+                self.setEffectStatus(pending.origin, "clipboard copy sent: {s}", .{pending.label});
+                if (pending.selection_generation) |generation| switch (pending.origin) {
+                    .page => |origin| selection_completion = .{
+                        .origin = origin,
+                        .generation = generation,
+                    },
+                    .shell_surface => {},
+                };
+            },
             .unsupported_runtime => self.setEffectStatus(pending.origin, "clipboard copy unavailable: {s}", .{pending.label}),
             .write_failed => |err| self.setEffectStatus(pending.origin, "clipboard copy failed: {s}: {s}", .{ pending.label, err }),
         }
         if (liveness == .live_inactive) self.redraw.requestSkip();
+        return selection_completion;
     }
 
     fn setEffectStatus(

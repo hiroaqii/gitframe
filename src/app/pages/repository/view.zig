@@ -189,10 +189,15 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         return;
     }
     if (state.selected_path) |path| {
-        try drawSourceHeader(
+        const selection_status: ?selection_action.StatusPresentation = if (state.sourceSelectionPresentation()) |selected|
+            .{ .line_count = selected.line_count }
+        else
+            null;
+        try drawSourceHeaderWithStatus(
             &right,
             state.sourceHeaderPresentation().?,
             state.source_search,
+            selection_status,
             state.viewer.focus == .source,
             state.sourceHeaderSelected(),
             context.palette,
@@ -453,6 +458,26 @@ pub fn drawSourceHeader(
     path_selected: bool,
     palette: theme.Palette,
 ) !void {
+    return drawSourceHeaderWithStatus(
+        surface,
+        presentation,
+        search,
+        null,
+        source_active,
+        path_selected,
+        palette,
+    );
+}
+
+pub fn drawSourceHeaderWithStatus(
+    surface: *chasen.Surface,
+    presentation: source_header.Presentation,
+    search: model.SourceSearchState,
+    selection_status: ?selection_action.StatusPresentation,
+    source_active: bool,
+    path_selected: bool,
+    palette: theme.Palette,
+) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
     const header_layout = source_header.layout(size.width, presentation);
@@ -505,6 +530,19 @@ pub fn drawSourceHeader(
         ) catch {};
     }
     if (size.height <= source_geometry.source_search_or_rule_row) return;
+    if (search.mode and drawSearchRow(surface, search, palette)) return;
+    if (selection_status) |selected| {
+        try selection_action.drawStatusLine(
+            surface,
+            source_geometry.source_search_or_rule_row,
+            .{ .col = 1, .width = size.width - 1 },
+            selected,
+            palette.style(.pane_command_fg),
+            palette.color(.selection_action_fg),
+            palette.color(.selection_action_bg),
+        );
+        return;
+    }
     if (drawSearchRow(surface, search, palette)) return;
     const style = sourceHeaderRuleStyle(source_active, palette);
     for (0..size.width) |col| {
@@ -564,60 +602,13 @@ pub fn drawSourceWithRetained(
     if (size.height <= geometry.body_first_row) return;
     const source_active = viewer.focus == .source;
 
-    const ActionPresentation = struct {
-        tail: usize,
-        line_count: usize,
-    };
     const active_keyboard = if (live_selection) |live| live.origin == .keyboard_line else false;
     const visible_retained = if (active_keyboard) null else retained_selection;
-    const action_presentation: ?ActionPresentation = if (live_selection) |live|
-        if (live.origin == .keyboard_line)
-            .{ .tail = live.range().end.line_index, .line_count = live.lineCount() }
-        else if (visible_retained) |completed|
-            .{ .tail = completed.range.end.line_index, .line_count = completed.line_count }
-        else
-            null
-    else if (visible_retained) |completed|
-        .{ .tail = completed.range.end.line_index, .line_count = completed.line_count }
-    else
-        null;
-    const action_projection = if (action_presentation) |presentation|
-        selection_action.Projection.init(document.rowCount(), presentation.tail)
-    else
-        null;
-    const presentation_rows = if (action_projection) |projection|
-        projection.presentationRows()
-    else
-        document.rowCount();
     const rows = geometry.navigationRows();
     var body_row: usize = 0;
-    while (body_row < rows and viewer.source_vertical_scroll + body_row < presentation_rows) : (body_row += 1) {
-        const presentation_row = viewer.source_vertical_scroll + body_row;
-        const location: selection_action.Location = if (action_projection) |projection|
-            projection.locate(presentation_row) orelse continue
-        else
-            .{ .source = presentation_row };
+    while (body_row < rows and viewer.source_vertical_scroll + body_row < document.rowCount()) : (body_row += 1) {
+        const line_index = viewer.source_vertical_scroll + body_row;
         const row = geometry.body_first_row + @as(u16, @intCast(body_row));
-        const line_index = switch (location) {
-            .source => |value| value,
-            .action => |action_row| {
-                const presentation = action_presentation orelse continue;
-                const style: chasen.TextStyle = .{
-                    .fg = palette.color(.foreground),
-                    .bg = palette.color(.pane_cursor_bg),
-                    .dim = !source_active,
-                };
-                try selection_action.drawActionRow(
-                    surface,
-                    row,
-                    selection_action.actionLayout(.{ .col = 0, .width = geometry.width }),
-                    action_row,
-                    presentation.line_count,
-                    style,
-                );
-                continue;
-            },
-        };
         const line = document.lineBody(line_index).?;
         const projection = try text_projection.Projection.init(line, .{ .tab_width = repository_tab_width });
         const current = line_index == viewer.source_cursor;
@@ -937,8 +928,8 @@ fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, pale
     if (!search.mode and search.query.len == 0) return false;
     if (surface.size().height <= source_geometry.source_search_or_rule_row) return true;
     if (search.mode) {
-        const text = std.fmt.allocPrint(surface.frameAllocator(), "/{s}", .{search.input.slice()}) catch return true;
-        draw.copyClippedTextAt(surface, 1, source_geometry.source_search_or_rule_row, text, palette.boldStyle(.prompt)) catch {};
+        const text = std.fmt.allocPrint(surface.frameAllocator(), "search: {s}", .{search.input.slice()}) catch return true;
+        draw.copyClippedTextAt(surface, 1, source_geometry.source_search_or_rule_row, text, palette.style(.pane_command_fg)) catch {};
     } else if (search.query.len > 0) {
         const prefix = if (search.match != null) "match: " else "no match: ";
         const text = std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}", .{ prefix, search.query.slice() }) catch return true;
@@ -1263,7 +1254,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, true, false, .default());
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
     var snapshot = try test_surface.snapshot(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "search: needle") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/main.zig") != null);
     try test_surface.expectCellText(0, source_geometry.source_search_or_rule_row, "─");
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
@@ -1277,9 +1268,13 @@ test "repository source search checkpoint appears without moving source rows" {
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, search, null, .default());
     snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "/needle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "search: needle") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "─") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
+    const search_cell = test_surface.surface.readCell(1, source_geometry.source_search_or_rule_row) orelse
+        return error.ExpectedSourceSearchCell;
+    try std.testing.expect(search_cell.style.fg.eql(theme.Palette.default().color(.pane_command_fg)));
+    try std.testing.expect(!search_cell.style.bold);
 }
 
 test "repository source retained search result replaces the normal separator" {
@@ -1301,6 +1296,47 @@ test "repository source retained search result replaces the normal separator" {
     const status_cell = test_surface.surface.readCell(1, source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceSearchStatusCell;
     try std.testing.expect(status_cell.style.fg.eql(palette.color(.muted)));
+}
+
+test "repository selection status replaces the fixed separator without moving source rows" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "first\nsecond\n");
+    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    var test_surface: chasen.testing.TestSurface = undefined;
+    try test_surface.init(48, 6);
+    defer test_surface.deinit();
+
+    try drawSourceHeaderWithStatus(
+        &test_surface.surface,
+        sourceHeaderPresentationForTest("src/main.zig"),
+        .{},
+        .{ .line_count = 2 },
+        true,
+        false,
+        .default(),
+    );
+    try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
+
+    const snapshot = try test_surface.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "VISUAL ·  2 lines selected  y Copy   Esc Clear ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "[y Copy]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 second") != null);
+    const status_cell = test_surface.surface.readCell(1, source_geometry.source_search_or_rule_row) orelse
+        return error.ExpectedSelectionStatusCell;
+    try std.testing.expect(status_cell.style.fg.eql(theme.Palette.default().color(.pane_command_fg)));
+    try std.testing.expect(!status_cell.style.bold);
+    const actions = selection_action.statusLayout(
+        .{ .col = 1, .width = test_surface.surface.size().width - 1 },
+        .{ .line_count = 2 },
+    );
+    try std.testing.expect(test_surface.surface.readCell(actions.copy.?.col, source_geometry.source_search_or_rule_row).?.style.fg.eql(theme.Palette.default().color(.selection_action_fg)));
+    try std.testing.expect(test_surface.surface.readCell(actions.clear.?.col, source_geometry.source_search_or_rule_row).?.style.fg.eql(theme.Palette.default().color(.selection_action_fg)));
+    try std.testing.expect(test_surface.surface.readCell(actions.copy.?.col, source_geometry.source_search_or_rule_row).?.style.bg.eql(theme.Palette.default().color(.selection_action_bg)));
+    try std.testing.expect(test_surface.surface.readCell(actions.clear.?.col, source_geometry.source_search_or_rule_row).?.style.bg.eql(theme.Palette.default().color(.selection_action_bg)));
+    try std.testing.expect(test_surface.surface.readCell(actions.copy.?.col + actions.copy.?.width, source_geometry.source_search_or_rule_row).?.style.bg.eql(.default));
 }
 
 test "repository source match overlay remains distinct on the cursor line" {
@@ -1662,7 +1698,7 @@ test "repository selection whole-line style covers gutter numbers body and trail
     }
 }
 
-test "repository retained selection inserts actions and shares its background with live selection" {
+test "repository retained selection keeps source rows fixed and shares its background with live selection" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "one\ntwo\nthree\n");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
@@ -1705,16 +1741,12 @@ test "repository retained selection inserts actions and shares its background wi
     try std.testing.expect(live_cell.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(!live_cell.style.bg.eql(palette.color(.diff_cursor)));
     try std.testing.expect(test_surface.surface.readCell(0, first + 1).?.style.bg.eql(palette.color(.diff_selection_bg)));
-    try test_surface.expectCellText(0, first + 2, "2");
-    try test_surface.expectCellText(0, first + 3, "[");
-    try test_surface.expectCellText(geometry.line_number_col, first + 4, "3");
-    try std.testing.expect(test_surface.surface.readCell(0, first + 2).?.style.fg.eql(palette.color(.foreground)));
-    try std.testing.expect(test_surface.surface.readCell(0, first + 2).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try test_surface.expectCellText(geometry.line_number_col, first + 2, "3");
 
     const snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 lines selected") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, selection_action.controls_text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "lines selected") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, selection_action.controls_text) == null);
 }
 
 test "repository keyboard line selection hides prior retained presentation until completion" {
@@ -1760,9 +1792,9 @@ test "repository keyboard line selection hides prior retained presentation until
 
     const snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 lines selected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 lines selected") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 lines selected") == null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, selection_action.controls_text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, selection_action.controls_text) == null);
 }
 
 test "repository source syntax projection visits dense line and spans only once" {

@@ -139,11 +139,7 @@ pub const Controller = struct {
             transition: diff_surface.update.RetentionTransition,
         ) void {
             switch (transition) {
-                .none => {},
-                .installed => {
-                    var body = self.bodyController();
-                    body.controller.revealCompletedSelectionAction(body.resolver);
-                },
+                .none, .installed => {},
                 .cleared => self.navigation.page.pinned_selection_basis = null,
             }
         }
@@ -369,7 +365,7 @@ test "Review selection release installs pinned retained actions" {
     var effect = copied.takeEffect() orelse return error.ExpectedSelectionEffect;
     defer effect.deinit(allocator);
     switch (effect) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings("one\ntwo\nnew\n", copy.text),
         .copy_diff_header_path => return error.ExpectedSelectionEffect,
     }
     var cleared = try adapter.shared().apply(allocator, .{ .selection_action = .clear });
@@ -407,7 +403,7 @@ test "Review selection release installs pinned retained actions" {
         var copied_effect = copied_case.takeEffect() orelse return error.ExpectedSelectionEffect;
         defer copied_effect.deinit(allocator);
         switch (copied_effect) {
-            .copy_diff_selection => |text| try std.testing.expectEqualStrings(case.expected, text),
+            .copy_diff_selection => |copy| try std.testing.expectEqualStrings(case.expected, copy.text),
             .copy_diff_header_path => return error.ExpectedSelectionEffect,
         }
         var cleared_case = try adapter.shared().apply(allocator, .{ .selection_action = .clear });
@@ -480,7 +476,7 @@ test "Review keyboard line selection completes with exact pin and retries alloca
     var effect = copied.takeEffect() orelse return error.ExpectedSelectionEffect;
     defer effect.deinit(allocator);
     switch (effect) {
-        .copy_diff_selection => |text| try std.testing.expectEqualStrings("one\ntwo\nnew\n", text),
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings("one\ntwo\nnew\n", copy.text),
         .copy_diff_header_path => return error.ExpectedSelectionEffect,
     }
     try std.testing.expect(page.selection_owner == .none);

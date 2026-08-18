@@ -311,17 +311,17 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
         },
         .inert_invalid_utf8 => |inert| {
             try changes_body_render.renderStatus(inert.display_path, changes_navigation.invalid_utf8_body_message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
-            drawPaneHeaderRule(surface, active, app.theme);
+            drawProjectedHeaderDetail(app, surface, active);
             return;
         },
         .status => |status| {
             try changes_body_render.renderStatus(status.path, status.message, app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
-            drawPaneHeaderRule(surface, active, app.theme);
+            drawProjectedHeaderDetail(app, surface, active);
             return;
         },
         .pending => {
             try changes_body_render.renderStatus(path, "Loading changes projection...", app.selectedStatusLineStats(), projectedBodyRenderArgs(app, &content, active, mode_toggle_key));
-            drawPaneHeaderRule(surface, active, app.theme);
+            drawProjectedHeaderDetail(app, surface, active);
             return;
         },
         .none, .primary => {},
@@ -358,21 +358,19 @@ fn displayModeToggleKey(app: Context, buffer: []u8) ?[]const u8 {
 }
 
 fn finishProjectedBody(app: Context, pane: *chasen.Surface, content: *chasen.Surface, active: bool) !void {
-    if (app.navigation.selectionActionRenderBlock()) |block| {
-        try diff_render.composeSelectionAction(
-            content,
-            block,
-            app.page.viewer.diff_scroll,
-            app.navigation.renderDiffScroll(),
-            app.page.viewer.display_mode,
-            active,
-            app.theme,
-        );
-    }
-    drawPaneHeaderRule(pane, active, app.theme);
+    _ = content;
+    drawProjectedHeaderDetail(app, pane, active);
 }
 
-const drawPaneHeaderRule = diff_surface_view.drawPaneHeaderRule;
+fn drawProjectedHeaderDetail(app: Context, pane: *chasen.Surface, active: bool) void {
+    diff_surface_view.drawDiffHeaderDetailRow(
+        pane,
+        app.page.readSurface(app.source, app.navigation.layout),
+        app.navigation.selectionStatusPresentation(),
+        active,
+        app.theme,
+    );
+}
 
 fn drawStatusBody(surface: *chasen.Surface, path: []const u8, message: []const u8, stats: ?file_tree.Stats, active: bool, palette: theme.Palette) !void {
     try changes_body_render.renderStatus(path, message, stats, .{
@@ -595,12 +593,12 @@ fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette 
     return theme.Palette.fromConfig(FakeConfig{ .role = role, .color = color });
 }
 
-test "changes pane title and white rule stay stable while search keeps focus treatment" {
+test "changes pane title and white rule stay stable while search uses normal prompt weight" {
     var palette: theme.Palette = .default();
     palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
     palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 4, 5, 6 } };
     palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@intFromEnum(theme.Role.pane_command_fg)] = .{ .rgb = .{ 10, 11, 12 } };
 
     const title = sidebarTitleStyle(palette);
     const branch = sidebarBranchStyle(palette);
@@ -621,9 +619,9 @@ test "changes pane title and white rule stay stable while search keeps focus tre
     try std.testing.expect(active_rule.dim);
     try std.testing.expect(inactive_rule.fg.eql(.default));
     try std.testing.expect(inactive_rule.dim);
-    try std.testing.expect(active_search.fg.eql(palette.color(.prompt)));
-    try std.testing.expect(active_search.bold);
-    try std.testing.expect(inactive_search.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(active_search.fg.eql(palette.color(.pane_command_fg)));
+    try std.testing.expect(!active_search.bold);
+    try std.testing.expect(inactive_search.fg.eql(palette.color(.pane_command_fg)));
     try std.testing.expect(!inactive_search.bold);
 }
 

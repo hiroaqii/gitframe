@@ -14,6 +14,9 @@ pub const Role = enum {
     staged,
     amend,
     pane_cursor_bg,
+    pane_command_fg,
+    selection_action_fg,
+    selection_action_bg,
     pane_active_line_number,
 
     syntax_keyword,
@@ -125,6 +128,11 @@ pub const Palette = struct {
         // remain in the foreground, while diff_cursor stays available as the
         // stronger mouse-selection background.
         palette.set(.pane_cursor_bg, .{ .rgb = .{ 45, 48, 58 } });
+        // Keep the shared pane command/status row independent from prompt and
+        // syntax roles, and keep action text distinct from its lavender label.
+        palette.set(.pane_command_fg, .{ .rgb = .{ 180, 142, 173 } });
+        palette.set(.selection_action_fg, .{ .rgb = .{ 234, 251, 255 } });
+        palette.set(.selection_action_bg, .{ .rgb = .{ 49, 93, 112 } });
         // Keep the active pane line marker independent from syntax accent
         // colors so it stays distinct from adjacent source tokens. Repository
         // uses it directly; Changes and Review use it through shared diff rendering.
@@ -309,6 +317,9 @@ test "roleFromKey maps known theme keys" {
     try std.testing.expectEqual(Role.diff_added_bg, roleFromKey("diff_added_bg").?);
     try std.testing.expectEqual(Role.diff_selection_bg, roleFromKey("diff_selection_bg").?);
     try std.testing.expectEqual(Role.pane_cursor_bg, roleFromKey("pane_cursor_bg").?);
+    try std.testing.expectEqual(Role.pane_command_fg, roleFromKey("pane_command_fg").?);
+    try std.testing.expectEqual(Role.selection_action_fg, roleFromKey("selection_action_fg").?);
+    try std.testing.expectEqual(Role.selection_action_bg, roleFromKey("selection_action_bg").?);
     try std.testing.expectEqual(Role.pane_active_line_number, roleFromKey("pane_active_line_number").?);
     try std.testing.expectEqual(Role.syntax_keyword, roleFromKey("syntax_keyword").?);
     try std.testing.expectEqual(Role.syntax_comment, roleFromKey("syntax_comment").?);
@@ -325,6 +336,13 @@ test "Palette.default keeps active pane line number independent from accent" {
 
 test "Palette.default preserves neutral pane cursor background" {
     try std.testing.expect(Palette.default().color(.pane_cursor_bg).eql(.{ .rgb = .{ 45, 48, 58 } }));
+}
+
+test "Palette.default uses the lavender command and smoky-blue action treatment" {
+    const palette = Palette.default();
+    try std.testing.expect(palette.color(.pane_command_fg).eql(.{ .rgb = .{ 180, 142, 173 } }));
+    try std.testing.expect(palette.color(.selection_action_fg).eql(.{ .rgb = .{ 234, 251, 255 } }));
+    try std.testing.expect(palette.color(.selection_action_bg).eql(.{ .rgb = .{ 49, 93, 112 } }));
 }
 
 test "Palette.default uses the retained selection visual reference color" {

@@ -11,6 +11,7 @@ const draw = @import("draw");
 const theme = @import("theme");
 const diff_surface = @import("../diff_surface.zig");
 const app_load_state = @import("../load_state.zig");
+const selection_action = @import("../selection_action.zig");
 const app_state = @import("../state.zig");
 const view_primitives = @import("../view_primitives.zig");
 const diff_render = @import("../../diff/render.zig");
@@ -51,7 +52,7 @@ pub const FooterArgs = struct {
     surface: diff_surface.ReadSurface,
     /// Page-owned policy narrowed to a presentation-only value.
     auto_reload_enabled: bool,
-    /// True only when the retained selection action block is admitted for the
+    /// True only when the retained selection status is admitted for the
     /// exact body currently on screen. A stale retained candidate must not
     /// suppress otherwise reachable normal-mode hints.
     selection_action_visible: bool = false,
@@ -514,18 +515,7 @@ pub fn viewDiffPane(
             });
         },
     }
-    if (body.selectionActionRenderBlock()) |block| {
-        try diff_render.composeSelectionAction(
-            &diff_content,
-            block,
-            state.viewer.diff_scroll,
-            body.renderDiffScroll(),
-            state.viewer.display_mode,
-            active,
-            palette,
-        );
-    }
-    drawDiffHeaderDetailRow(surface, state, active, palette);
+    drawDiffHeaderDetailRow(surface, state, body.selectionStatusPresentation(), active, palette);
     drawSearchMatchMarkerAt(surface, state, palette, if (state.search.match_offset) |offset| body.sourceToPresentationOffset(offset) else null);
 }
 
@@ -717,6 +707,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     var order_scope: ?[]u8 = null;
     var selection_owner: diff_selection.Owner = .none;
     var completed: ?diff_surface.selection.CompletedSelection = null;
+    var selection_generation: u64 = 0;
     var source_revision: u64 = 0;
     var pending_initial_selection = false;
     var selection_layout_revision: u64 = 1;
@@ -735,6 +726,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
         .tree_order_scope = &order_scope,
         .selection_owner = &selection_owner,
         .completed_selection = &completed,
+        .selection_generation = &selection_generation,
         .source_session_revision = &source_revision,
         .pending_initial_first_visible_selection = &pending_initial_selection,
         .reload_anchor = null,
@@ -767,21 +759,17 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     try std.testing.expectEqual(@as(usize, 0), fake.unexpected);
 }
 
-fn drawDiffHeaderDetailRow(surface: *chasen.Surface, state: diff_surface.ReadSurface, active: bool, palette: theme.Palette) void {
+pub fn drawDiffHeaderDetailRow(
+    surface: *chasen.Surface,
+    state: diff_surface.ReadSurface,
+    selection_status: ?selection_action.StatusPresentation,
+    active: bool,
+    palette: theme.Palette,
+) void {
     const size = surface.size();
     if (size.width == 0 or size.height <= 1) return;
 
     surface.clear(.{ .col = 0, .row = 1, .width = size.width, .height = 1 });
-    if (!state.search.mode and state.search.query.len > 0) {
-        const label_col: u16 = 1;
-        const match_text = if (state.search.match_offset) |offset|
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ state.search.query.slice(), offset + 1 }) catch "search"
-        else
-            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{state.search.query.slice()}) catch "search";
-        draw.copyClippedTextAt(surface, label_col, 1, match_text, paneSearchStyle(active, palette)) catch {};
-        return;
-    }
-
     if (state.search.mode) {
         const label = "search: ";
         const label_col: u16 = 1;
@@ -792,6 +780,29 @@ fn drawDiffHeaderDetailRow(surface: *chasen.Surface, state: diff_surface.ReadSur
             drawInputLine(surface, input_col, 1, state.search.input.slice(), state.search.input.cursor, style) catch {};
             view_primitives.showInputCursor(surface, input_col, 1, state.search.input.slice(), state.search.input.cursor);
         }
+        return;
+    }
+
+    if (selection_status) |presentation| {
+        selection_action.drawStatusLine(
+            surface,
+            1,
+            .{ .col = 1, .width = size.width - 1 },
+            presentation,
+            paneSearchStyle(active, palette),
+            palette.color(.selection_action_fg),
+            palette.color(.selection_action_bg),
+        ) catch {};
+        return;
+    }
+
+    if (state.search.query.len > 0) {
+        const label_col: u16 = 1;
+        const match_text = if (state.search.match_offset) |offset|
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} @ {d}", .{ state.search.query.slice(), offset + 1 }) catch "search"
+        else
+            std.fmt.allocPrint(surface.frameAllocator(), "search: {s} (no match)", .{state.search.query.slice()}) catch "search";
+        draw.copyClippedTextAt(surface, label_col, 1, match_text, paneSearchStyle(active, palette)) catch {};
         return;
     }
 
@@ -843,11 +854,8 @@ pub fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {
     });
 }
 
-pub fn paneSearchStyle(active: bool, palette: theme.Palette) chasen.TextStyle {
-    return if (active)
-        palette.boldStyle(.prompt)
-    else
-        palette.style(.prompt);
+pub fn paneSearchStyle(_: bool, palette: theme.Palette) chasen.TextStyle {
+    return palette.style(.pane_command_fg);
 }
 
 pub fn paneHeaderRuleStyle(_: bool, _: theme.Palette) chasen.TextStyle {

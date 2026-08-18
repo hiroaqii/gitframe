@@ -94,16 +94,36 @@ test "clipboard copy result status uses best-effort wording" {
     const origin: effect_origin.Origin = .{ .page = app.shellEffects().changesOrigin() };
 
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 1, .{ .origin = origin, .label = "current line" });
-    app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 1 }, .outcome = .sent });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 1 }, .outcome = .sent });
     try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.changes.status.text());
 
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 2, .{ .origin = origin, .label = "current hunk" });
-    app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 2 }, .outcome = .unsupported_runtime });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 2 }, .outcome = .unsupported_runtime });
     try std.testing.expectEqualStrings("clipboard copy unavailable: current hunk", app.pages.changes.status.text());
 
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 3, .{ .origin = origin, .label = "current line" });
-    app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 3 }, .outcome = .{ .write_failed = "BrokenPipe" } });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 3 }, .outcome = .{ .write_failed = "BrokenPipe" } });
     try std.testing.expectEqualStrings("clipboard copy failed: current line: BrokenPipe", app.pages.changes.status.text());
+
+    try app.shell_state.clipboard_copies.put(std.testing.allocator, 4, .{
+        .origin = origin,
+        .label = "diff selection",
+        .selection_generation = 9,
+    });
+    const completion = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 4 }, .outcome = .sent }) orelse
+        return error.ExpectedSelectionCopyCompletion;
+    try std.testing.expectEqual(page.Id.changes, completion.origin.page_id);
+    try std.testing.expectEqual(@as(u64, 9), completion.generation);
+
+    try app.shell_state.clipboard_copies.put(std.testing.allocator, 5, .{
+        .origin = origin,
+        .label = "diff selection",
+        .selection_generation = 10,
+    });
+    try std.testing.expect(app.shellEffects().finishClipboard(.{
+        .request_id = .{ .id = 5 },
+        .outcome = .unsupported_runtime,
+    }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
 }
 
@@ -155,7 +175,7 @@ test "Review clipboard terminals and queue failure preserve retained selection a
             .origin = origin,
             .label = "diff selection",
         });
-        app.shellEffects().finishClipboard(.{
+        _ = app.shellEffects().finishClipboard(.{
             .request_id = .{ .id = request_id },
             .outcome = outcome,
         });
@@ -203,7 +223,7 @@ test "inactive Changes clipboard completion retains diagnostic without redraw" {
         .label = "current line",
     });
 
-    app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 4 }, .outcome = .sent });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 4 }, .outcome = .sent });
 
     try std.testing.expectEqualStrings("clipboard copy sent: current line", app.pages.changes.status.text());
     try std.testing.expectEqualStrings("", app.status.text());
@@ -230,7 +250,7 @@ test "repository selection late clipboard completion cannot target a new page in
     app.pages.repository.deactivate();
     app.active_page = .changes;
 
-    app.shellEffects().finishClipboard(.{ .request_id = inactive_request_id, .outcome = .sent });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = inactive_request_id, .outcome = .sent });
 
     try std.testing.expectEqualStrings("clipboard copy sent: source selection", app.pages.repository.status.text());
     try std.testing.expectEqualStrings("", app.status.text());
@@ -240,7 +260,7 @@ test "repository selection late clipboard completion cannot target a new page in
     app.redraw_plan = .{};
     app.pages.repository.activation_id = 6;
 
-    app.shellEffects().finishClipboard(.{ .request_id = stale_request_id, .outcome = .sent });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = stale_request_id, .outcome = .sent });
 
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
     try std.testing.expectEqualStrings("", app.pages.repository.status.text());
@@ -262,7 +282,7 @@ test "closed shell surface discards clipboard completion presentation" {
         .label = "old push error",
     });
 
-    app.shellEffects().finishClipboard(.{
+    _ = app.shellEffects().finishClipboard(.{
         .request_id = .{ .id = 5 },
         .outcome = .sent,
     });
@@ -274,7 +294,7 @@ test "closed shell surface discards clipboard completion presentation" {
     app.redraw_plan = .{};
     app.overlay.openPushError();
     try std.testing.expect(app.overlay.push_error_instance_id != instance_id);
-    app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 7 }, .outcome = .sent });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 7 }, .outcome = .sent });
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
@@ -292,7 +312,7 @@ test "live shell surface owns clipboard completion presentation" {
         .label = "push error",
     });
 
-    app.shellEffects().finishClipboard(.{
+    _ = app.shellEffects().finishClipboard(.{
         .request_id = .{ .id = 6 },
         .outcome = .sent,
     });
@@ -311,12 +331,12 @@ test "clipboard completion rejects unknown id and superseded page instance" {
     });
     _ = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
 
-    app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 999 }, .outcome = .sent });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 999 }, .outcome = .sent });
     try std.testing.expectEqual(@as(usize, 1), app.shell_state.clipboard_copies.count());
     try std.testing.expectEqualStrings("", app.pages.changes.status.text());
 
     app.redraw_plan = .{};
-    app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 8 }, .outcome = .sent });
+    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 8 }, .outcome = .sent });
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
     try std.testing.expectEqualStrings("", app.pages.changes.status.text());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());

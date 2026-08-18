@@ -7,7 +7,6 @@ const app_mod = @import("../../app.zig");
 const app_commit_panel = @import("../commit_panel.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const app_test_support = @import("../test_support.zig");
-const review_navigation = @import("../pages/review/navigation.zig");
 const changes_navigation = @import("../pages/changes/navigation.zig");
 const changes_reload = @import("../pages/changes/reload.zig");
 const changes_authority = @import("../diff_surface/authority.zig");
@@ -88,7 +87,7 @@ fn retainedReviewAppForViewTest(
         .allocator = allocator,
         .active_page = .review,
         .terminal_size = terminal_size,
-        .theme = paletteWithOverride(.pane_cursor_bg, .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } }),
+        .theme = paletteWithOverride(.selection_action_bg, .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } }),
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .sidebar_hidden = true, .display_mode = mode },
@@ -124,17 +123,6 @@ fn retainedReviewAppForViewTest(
     }, app_test_support.loadedDiffOne().document.files[0], drag);
     try std.testing.expect(app.pages.review.installPinnedSelectionBasis());
 
-    const body_size = app_shell_layout.compute(terminal_size, .{ .page_bar_visible = true }).bodySize();
-    const controller: review_navigation.Controller = .{
-        .page = &app.pages.review,
-        .repo_root = null,
-        .repo_epoch = 0,
-        .root_identity = null,
-        .layout = .{ .width = body_size.width, .height = body_size.height },
-    };
-    var adapter = controller.updateAdapter();
-    var body = adapter.bodyController();
-    body.controller.revealCompletedSelectionAction(body.resolver);
     return app;
 }
 
@@ -216,7 +204,7 @@ test "load empty state shows actionable no changes message" {
     try app_test_support.expectSnapshotContains(&ts, "Press r to reload or q to quit.");
 }
 
-test "Review retained actions render at gate sizes for unified and both side-by-side sides" {
+test "Review selection status renders in the fixed header row for unified and both side-by-side sides" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
         size: chasen.Size,
@@ -238,23 +226,31 @@ test "Review retained actions render at gate sizes for unified and both side-by-
         const snapshot = try surface.snapshot(allocator);
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "3 lines selected") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "[y Copy] [Esc Clear]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "y Copy") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc Clear") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "[y Copy]") == null);
+        const side_label = if (case.side == .old) "BEFORE" else "AFTER";
+        const opposite_label = if (case.side == .old) "AFTER" else "BEFORE";
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, side_label) != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, opposite_label) == null);
 
-        var themed_action = false;
+        var normal_action = false;
         var row: u16 = 0;
-        while (row < case.size.height and !themed_action) : (row += 1) {
+        while (row < case.size.height and !normal_action) : (row += 1) {
             var col: u16 = 0;
             while (col < case.size.width) : (col += 1) {
                 const cell = surface.surface.readCell(col, row) orelse continue;
-                if (std.mem.eql(u8, cell.char.grapheme, "[") and
-                    cell.style.bg.eql(app.theme.color(.pane_cursor_bg)))
+                if (std.mem.eql(u8, cell.char.grapheme, "y") and
+                    cell.style.fg.eql(app.theme.color(.selection_action_fg)) and
+                    cell.style.bg.eql(app.theme.color(.selection_action_bg)) and
+                    !cell.style.bold)
                 {
-                    themed_action = true;
+                    normal_action = true;
                     break;
                 }
             }
         }
-        try std.testing.expect(themed_action);
+        try std.testing.expect(normal_action);
     }
 }
 
