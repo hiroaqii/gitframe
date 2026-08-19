@@ -192,7 +192,7 @@ test "repository source comfort keeps single row navigation in band and permits 
     var document = try sourceDocumentWithRowsForTest(allocator, 100);
     defer document.deinit(allocator);
     const geometry = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 11 }, &document, true);
-    try std.testing.expectEqual(@as(u16, 9), geometry.visible_source_rows);
+    try std.testing.expectEqual(@as(u16, 8), geometry.visible_source_rows);
 
     var viewer: model.ViewerState = .{
         .focus = .source,
@@ -213,7 +213,7 @@ test "repository source comfort keeps single row navigation in band and permits 
     viewer.source_vertical_scroll = 20;
     moveSource(&viewer, &document, -1, geometry);
     try std.testing.expectEqual(@as(usize, 22), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 19), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
 
     viewer.source_cursor = 20;
     viewer.source_vertical_scroll = 20;
@@ -225,7 +225,7 @@ test "repository source comfort keeps single row navigation in band and permits 
     try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll);
     lastSource(&viewer, &document, geometry);
     try std.testing.expectEqual(@as(usize, 99), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 91), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 92), viewer.source_vertical_scroll);
 }
 
 test "repository source comfort keeps wheel viewport primary at edges and inside band" {
@@ -264,9 +264,9 @@ test "repository source comfort keeps wheel viewport primary at edges and inside
     try std.testing.expectEqual(@as(usize, 4), viewer.source_cursor);
 
     viewer.source_cursor = 95;
-    viewer.source_vertical_scroll = 91;
+    viewer.source_vertical_scroll = 92;
     wheelSource(&viewer, &document, 1, geometry);
-    try std.testing.expectEqual(@as(usize, 91), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 92), viewer.source_vertical_scroll);
     try std.testing.expectEqual(@as(usize, 95), viewer.source_cursor);
 }
 
@@ -282,21 +282,21 @@ test "repository source comfort centers pages and places explicit search in band
     };
 
     pageSource(&viewer, &document, 1, geometry);
-    try std.testing.expectEqual(@as(usize, 34), viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 33), viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 29), viewer.source_vertical_scroll);
     pageSource(&viewer, &document, -1, geometry);
     try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 19), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
 
     halfPageSource(&viewer, &document, 1, geometry);
-    try std.testing.expectEqual(@as(usize, 29), viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 28), viewer.source_cursor);
     halfPageSource(&viewer, &document, -1, geometry);
     try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
 
     viewer.source_vertical_scroll = 0;
     revealMatch(&viewer, &document, .{ .line = 50, .start = 0, .end = 0 }, geometry);
     try std.testing.expectEqual(@as(usize, 50), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 44), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 45), viewer.source_vertical_scroll);
 }
 
 test "repository source line jump centers real rows and preserves horizontal scroll" {
@@ -339,9 +339,9 @@ test "repository source comfort keeps reconciliation minimal and handles tiny vi
     clampSource(&viewer, &document, regular);
     try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
 
-    const three_rows = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 5 }, &document, true);
-    clampSource(&viewer, &document, three_rows);
-    try std.testing.expectEqual(@as(usize, 22), viewer.source_vertical_scroll);
+    const two_rows = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 5 }, &document, true);
+    clampSource(&viewer, &document, two_rows);
+    try std.testing.expectEqual(@as(usize, 23), viewer.source_vertical_scroll);
 
     const zero_rows = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 2 }, &document, true);
     viewer.source_cursor = 5;
@@ -355,21 +355,21 @@ test "repository source comfort keeps reconciliation minimal and handles tiny vi
     halfPageSource(&viewer, &document, 1, zero_rows);
     try std.testing.expectEqual(@as(usize, 7), viewer.source_cursor);
 
-    const one_row = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 3 }, &document, true);
+    const spacer_only = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 3 }, &document, true);
     viewer.source_cursor = 20;
     viewer.source_vertical_scroll = 20;
-    moveSource(&viewer, &document, 1, one_row);
-    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
+    moveSource(&viewer, &document, 1, spacer_only);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
 
-    const two_rows = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 4 }, &document, true);
+    const one_row = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 4 }, &document, true);
+    viewer.source_cursor = 21;
+    viewer.source_vertical_scroll = 20;
+    moveSource(&viewer, &document, 1, one_row);
+    try std.testing.expectEqual(@as(usize, 22), viewer.source_vertical_scroll);
+
     viewer.source_cursor = 21;
     viewer.source_vertical_scroll = 20;
     moveSource(&viewer, &document, 1, two_rows);
-    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
-
-    viewer.source_cursor = 21;
-    viewer.source_vertical_scroll = 20;
-    moveSource(&viewer, &document, 1, three_rows);
     try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
 
     var empty = try sourceDocumentWithRowsForTest(allocator, 0);
@@ -379,12 +379,12 @@ test "repository source comfort keeps reconciliation minimal and handles tiny vi
         .source_cursor = 99,
         .source_vertical_scroll = 99,
     };
-    clampSource(&empty_viewer, &empty, three_rows);
-    wheelSource(&empty_viewer, &empty, 1, three_rows);
-    halfPageSource(&empty_viewer, &empty, 1, three_rows);
-    pageSource(&empty_viewer, &empty, -1, three_rows);
-    firstSource(&empty_viewer, &empty, three_rows);
-    lastSource(&empty_viewer, &empty, three_rows);
+    clampSource(&empty_viewer, &empty, two_rows);
+    wheelSource(&empty_viewer, &empty, 1, two_rows);
+    halfPageSource(&empty_viewer, &empty, 1, two_rows);
+    pageSource(&empty_viewer, &empty, -1, two_rows);
+    firstSource(&empty_viewer, &empty, two_rows);
+    lastSource(&empty_viewer, &empty, two_rows);
     try std.testing.expectEqual(@as(usize, 0), empty_viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 0), empty_viewer.source_vertical_scroll);
 }
@@ -419,7 +419,8 @@ test "repository selection navigation clamps cursor scroll and horizontal cells"
     const bytes = try allocator.dupe(u8, "one\ntwo\n0123456789\n");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
     defer document.deinit(allocator);
-    const geometry = source_geometry.SourceGeometry.init(.{ .width = 7, .height = 3 }, &document, true);
+    // One source row remains visible after the three-row Repository chrome.
+    const geometry = source_geometry.SourceGeometry.init(.{ .width = 7, .height = 4 }, &document, true);
     var viewer: model.ViewerState = .{ .focus = .source };
     moveSource(&viewer, &document, 20, geometry);
     try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);

@@ -8,13 +8,15 @@ const std = @import("std");
 const chasen = @import("chasen");
 const source = @import("../../../repository/source.zig");
 
-/// Fixed Repository source chrome. The accepted path owns row 0, while source
-/// search presentation or the normal separator exclusively owns row 1.
-/// Drawing and input both consume `source_body_first_row`, so neither chrome
-/// row can accidentally become selectable source content.
+/// Fixed Repository source chrome. The accepted path owns row 0, source search
+/// presentation or the normal separator exclusively owns row 1, and row 2 is
+/// the same non-interactive spacer used above the Review and Changes bodies.
+/// Drawing and input both consume `source_body_first_row`, so no chrome or
+/// spacer row can accidentally become selectable source content.
 pub const source_path_row: u16 = 0;
 pub const source_search_or_rule_row: u16 = 1;
-pub const source_body_first_row: u16 = 2;
+pub const source_spacer_row: u16 = 2;
+pub const source_body_first_row: u16 = 3;
 
 pub const Region = enum {
     gutter,
@@ -94,7 +96,7 @@ test "repository selection geometry shares narrow line number and body boundarie
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
     defer document.deinit(allocator);
 
-    const numbered = SourceGeometry.init(.{ .width = 10, .height = 4 }, &document, true);
+    const numbered = SourceGeometry.init(.{ .width = 10, .height = 5 }, &document, true);
     try std.testing.expectEqual(@as(u16, 2), numbered.line_number_width);
     try std.testing.expectEqual(@as(?u16, 3), numbered.separator_col);
     try std.testing.expectEqual(@as(u16, 4), numbered.text_col);
@@ -106,6 +108,7 @@ test "repository selection geometry shares narrow line number and body boundarie
     try std.testing.expectEqual(Region.text, numbered.regionAt(4).?);
     try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_path_row, 0, &document));
     try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_search_or_rule_row, 0, &document));
+    try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_spacer_row, 0, &document));
     try std.testing.expectEqual(@as(?usize, 0), numbered.contentLineAt(numbered.body_first_row, 0, &document));
     try std.testing.expectEqual(@as(?usize, 1), numbered.contentLineAt(numbered.body_first_row + 1, 0, &document));
     try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(numbered.height, 0, &document));

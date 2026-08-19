@@ -4512,7 +4512,9 @@ test "repository keyboard line selection document revalidation clears borrow acr
 
 test "repository mouse and header owners keep prior candidate until all-owner clear" {
     const allocator = std.testing.allocator;
-    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    // Preserve the four-row source viewport this ownership test exercises;
+    // Repository now reserves one additional visual spacer row.
+    const size: chasen.Size = .{ .width = 60, .height = 7 };
     inline for (.{ false, true }) |header_owner| {
         var state = try selectionStateForTest("main.zig\x00", "zero\none\n");
         defer state.deinit(allocator);
@@ -6167,7 +6169,7 @@ test "repository source comfort page routes wheel page search boundaries and mou
     defer state.deinit(allocator);
     const size: chasen.Size = .{ .width = 60, .height = 6 };
     const geometry = state.sourceGeometry(size, state.currentSource().?);
-    try std.testing.expectEqual(@as(u16, 4), geometry.visible_source_rows);
+    try std.testing.expectEqual(@as(u16, 3), geometry.visible_source_rows);
 
     state.viewer.focus = .source;
     state.viewer.source_cursor = 5;
@@ -6175,24 +6177,24 @@ test "repository source comfort page routes wheel page search boundaries and mou
     _ = state.applyNavigation(allocator, .mouse_source_wheel_down, size);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
 
     _ = state.applyNavigation(allocator, .wheel_down, size);
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
 
     state.viewer.focus = .source;
     state.viewer.source_cursor = 5;
     state.viewer.source_vertical_scroll = 5;
     _ = state.applyNavigation(allocator, .page_down, size);
-    try std.testing.expectEqual(@as(usize, 9), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 7), state.viewer.source_vertical_scroll);
 
     state.viewer.source_cursor = 5;
     state.viewer.source_vertical_scroll = 5;
     _ = state.applyNavigation(allocator, .half_page_down, size);
-    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
     _ = state.applyNavigation(allocator, .half_page_up, size);
     try std.testing.expectEqual(@as(usize, 5), state.viewer.source_cursor);
@@ -6201,14 +6203,14 @@ test "repository source comfort page routes wheel page search boundaries and mou
     for ("needle") |byte| _ = state.applyNavigation(allocator, .{ .source_search_insert = byte }, size);
     _ = state.applyNavigation(allocator, .submit_source_search, size);
     try std.testing.expectEqual(@as(usize, 12), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 10), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 11), state.viewer.source_vertical_scroll);
 
     _ = state.applyNavigation(allocator, .source_first, size);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
     _ = state.applyNavigation(allocator, .source_last, size);
     try std.testing.expectEqual(@as(usize, 19), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 16), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 17), state.viewer.source_vertical_scroll);
 
     state.viewer.source_cursor = 8;
     state.viewer.source_vertical_scroll = 5;
@@ -6220,9 +6222,9 @@ test "repository source comfort page routes wheel page search boundaries and mou
     try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
     _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{
         .col = geometry.text_col,
-        .row = geometry.body_first_row + 3,
+        .row = geometry.body_first_row + geometry.visible_source_rows - 1,
     } }, size);
-    try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
 }
 
@@ -6235,7 +6237,9 @@ test "repository drag auto-scroll validates token and steps one projected row" {
         "row 15\n" ++ "row 16\n" ++ "row 17\n" ++ "row 18\n" ++ "row 19\n";
     var state = try selectionStateForTest("main.zig\x00", content);
     defer state.deinit(allocator);
-    const size: chasen.Size = .{ .width = 60, .height = 6 };
+    // Keep four visible source rows so the first tick still resolves the
+    // tab-and-wide-glyph fixture row after adding the visual spacer.
+    const size: chasen.Size = .{ .width = 60, .height = 7 };
     const geometry = state.sourceGeometry(size, state.currentSource().?);
     state.viewer.source_vertical_scroll = 5;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
@@ -7725,17 +7729,18 @@ test "repository document navigation keeps displayed last-good source authority"
 
     try std.testing.expect(state.currentSource() != null);
     try std.testing.expect(state.acceptedCurrentSourceForSelection() == null);
-    _ = state.applyNavigation(allocator, .source_first, .{ .width = 60, .height = 6 });
+    const size: chasen.Size = .{ .width = 60, .height = 7 };
+    _ = state.applyNavigation(allocator, .source_first, size);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
-    _ = state.applyNavigation(allocator, .half_page_down, .{ .width = 60, .height = 6 });
+    _ = state.applyNavigation(allocator, .half_page_down, size);
     try std.testing.expectEqual(@as(usize, 2), state.viewer.source_cursor);
 
     var unavailable: RepositoryPageState = .{};
     defer unavailable.deinit(allocator);
     unavailable.viewer.focus = .source;
     unavailable.viewer.source_cursor = 7;
-    _ = unavailable.applyNavigation(allocator, .source_first, .{ .width = 60, .height = 6 });
-    _ = unavailable.applyNavigation(allocator, .half_page_down, .{ .width = 60, .height = 6 });
+    _ = unavailable.applyNavigation(allocator, .source_first, size);
+    _ = unavailable.applyNavigation(allocator, .half_page_down, size);
     try std.testing.expectEqual(@as(usize, 7), unavailable.viewer.source_cursor);
 }
 

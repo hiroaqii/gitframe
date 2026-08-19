@@ -990,17 +990,18 @@ test "repository source gutter renders added and modified rows without moving te
     defer test_surface.deinit();
 
     try drawSource(&test_surface.surface, &document, null, &map, .{ .focus = .source, .source_cursor = 1 }, .{}, null, palette);
-    try test_surface.expectCellText(0, 2, "▌");
-    try test_surface.expectCellText(0, 3, "▌");
-    try test_surface.expectCellText(0, 4, " ");
-    try test_surface.expectCellText(3, 2, "a");
-    try test_surface.expectCellText(3, 3, "m");
-    try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(0, 2).?.style.fg);
-    try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(0, 3).?.style.fg);
-    try std.testing.expect(!test_surface.surface.readCell(0, 2).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(0, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(3, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(39, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    const first = source_geometry.source_body_first_row;
+    try test_surface.expectCellText(0, first, "▌");
+    try test_surface.expectCellText(0, first + 1, "▌");
+    try test_surface.expectCellText(0, first + 2, " ");
+    try test_surface.expectCellText(3, first, "a");
+    try test_surface.expectCellText(3, first + 1, "m");
+    try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(0, first).?.style.fg);
+    try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(0, first + 1).?.style.fg);
+    try std.testing.expect(!test_surface.surface.readCell(0, first).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(0, first + 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(3, first + 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    try std.testing.expect(test_surface.surface.readCell(39, first + 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
 test "repository empty source keeps one synthetic viewer row" {
@@ -1012,8 +1013,8 @@ test "repository empty source keeps one synthetic viewer row" {
     try test_surface.init(12, 4);
     defer test_surface.deinit();
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
-    try test_surface.expectCellText(0, 2, " ");
-    try test_surface.expectCellText(1, 2, "1");
+    try test_surface.expectCellText(0, source_geometry.source_body_first_row, " ");
+    try test_surface.expectCellText(1, source_geometry.source_body_first_row, "1");
 }
 
 test "repository source geometry handles narrow line-number transitions" {
@@ -1257,6 +1258,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "search: needle") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/main.zig") != null);
     try test_surface.expectCellText(0, source_geometry.source_search_or_rule_row, "─");
+    try test_surface.expectCellText(0, source_geometry.source_spacer_row, " ");
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
     allocator.free(snapshot);
 
@@ -1270,6 +1272,7 @@ test "repository source search checkpoint appears without moving source rows" {
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "search: needle") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "─") == null);
+    try test_surface.expectCellText(0, source_geometry.source_spacer_row, " ");
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1 first") != null);
     const search_cell = test_surface.surface.readCell(1, source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceSearchCell;
@@ -1352,8 +1355,9 @@ test "repository source match overlay remains distinct on the cursor line" {
         .match = .{ .line = 0, .start = 2, .end = 8 },
     };
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source, .source_cursor = 0 }, search, null, palette);
-    const match_cell = test_surface.surface.readCell(7, 2) orelse return error.ExpectedMatchCell;
-    const plain_cell = test_surface.surface.readCell(3, 2) orelse return error.ExpectedPlainCell;
+    const first = source_geometry.source_body_first_row;
+    const match_cell = test_surface.surface.readCell(7, first) orelse return error.ExpectedMatchCell;
+    const plain_cell = test_surface.surface.readCell(3, first) orelse return error.ExpectedPlainCell;
     try std.testing.expect(match_cell.style.fg.eql(palette.color(.warning)));
     try std.testing.expect(match_cell.style.bold);
     try std.testing.expect(match_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1387,10 +1391,11 @@ test "repository source syntax uses neutral styles below the search overlay" {
     try syntax_surface.init(24, 6);
     defer syntax_surface.deinit();
     try drawSource(&syntax_surface.surface, &document, &spans, null, .{ .focus = .source }, .{}, null, palette);
-    const keyword_cell = syntax_surface.surface.readCell(3, 2) orelse return error.ExpectedKeywordCell;
-    const plain_cell = syntax_surface.surface.readCell(9, 2) orelse return error.ExpectedPlainCell;
-    const comment_cell = syntax_surface.surface.readCell(3, 3) orelse return error.ExpectedCommentCell;
-    const foreground_cell = syntax_surface.surface.readCell(3, 4) orelse return error.ExpectedForegroundCell;
+    const first = source_geometry.source_body_first_row;
+    const keyword_cell = syntax_surface.surface.readCell(3, first) orelse return error.ExpectedKeywordCell;
+    const plain_cell = syntax_surface.surface.readCell(9, first) orelse return error.ExpectedPlainCell;
+    const comment_cell = syntax_surface.surface.readCell(3, first + 1) orelse return error.ExpectedCommentCell;
+    const foreground_cell = syntax_surface.surface.readCell(3, first + 2) orelse return error.ExpectedForegroundCell;
     try std.testing.expectEqual(palette.color(.syntax_keyword), keyword_cell.style.fg);
     try std.testing.expectEqual(palette.color(.foreground), plain_cell.style.fg);
     try std.testing.expectEqual(palette.color(.syntax_comment), comment_cell.style.fg);
@@ -1405,7 +1410,7 @@ test "repository source syntax uses neutral styles below the search overlay" {
     try drawSource(&search_surface.surface, &document, &spans, null, .{ .focus = .source }, .{
         .match = .{ .line = 0, .start = 0, .end = 5 },
     }, null, palette);
-    const match_cell = search_surface.surface.readCell(3, 2) orelse return error.ExpectedMatchCell;
+    const match_cell = search_surface.surface.readCell(3, first) orelse return error.ExpectedMatchCell;
     try std.testing.expectEqual(palette.color(.warning), match_cell.style.fg);
 }
 
