@@ -105,6 +105,7 @@ test {
     _ = @import("git/compare.zig");
     _ = @import("git/operations.zig");
     _ = @import("git/read.zig");
+    _ = @import("git/repository_locator.zig");
     _ = @import("git/refs.zig");
     _ = @import("git/status.zig");
     _ = @import("keymap");

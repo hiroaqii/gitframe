@@ -9,11 +9,16 @@ pub const codec = @import("committed_review/codec.zig");
 const anchor = @import("committed_review/anchor.zig");
 const artifact = @import("committed_review/artifact.zig");
 const identity = @import("committed_review/identity.zig");
+const repository_binding = @import("committed_review/repository_binding.zig");
 const target = @import("committed_review/target.zig");
 
 pub const ReviewId = identity.ReviewId;
 pub const ReviewRepositoryId = identity.ReviewRepositoryId;
 pub const Sha256Digest = identity.Sha256Digest;
+
+pub const GitCommonDirectoryLocator = repository_binding.GitCommonDirectoryLocator;
+pub const RepositoryBindingResult = repository_binding.RepositoryBindingResult;
+pub const RepositoryBindingRegistry = repository_binding.RepositoryBindingRegistry;
 
 pub const ObjectFormat = target.ObjectFormat;
 pub const SourceKind = target.SourceKind;
@@ -44,4 +49,5 @@ test {
     _ = @import("committed_review/artifact.zig");
     _ = @import("committed_review/strict_json.zig");
     _ = @import("committed_review/codec.zig");
+    _ = @import("committed_review/repository_binding.zig");
 }
