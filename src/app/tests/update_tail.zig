@@ -499,11 +499,11 @@ test "Review completion defers as one bundle during drag and applies afterward" 
     ) } } }, &ctx);
 
     try std.testing.expect(app.pages.review.deferred_load_apply != null);
-    try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.review.basis.?.head_oid.slice());
+    try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.review.basis.?.target.head_oid.slice());
     app.pages.review.selection_owner = .none;
     try app.update(.focus_lost, &ctx);
     try std.testing.expect(app.pages.review.deferred_load_apply == null);
-    try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.review.basis.?.head_oid.slice());
+    try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.review.basis.?.target.head_oid.slice());
 }
 
 test "repository commitment resets Review and refreshes the new physical root" {
@@ -963,11 +963,15 @@ fn reviewAppLoadedFinished(
                     .full_ref = full_ref,
                     .display_name = display_name,
                     .kind = .local,
-                    .oid = reviewAppTestOid(base_byte),
                 },
                 .head_display = head_display,
-                .merge_base_oid = reviewAppTestOid(base_byte),
-                .head_oid = reviewAppTestOid(head_byte),
+                .target = .{
+                    .object_format = .sha1,
+                    .source_kind = .branch_range,
+                    .base_oid = reviewAppTestOid(base_byte),
+                    .head_oid = reviewAppTestOid(head_byte),
+                    .diff_base_oid = reviewAppTestOid(base_byte),
+                },
                 .ahead_count = 1,
             },
             .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, review_app_test_diff) },

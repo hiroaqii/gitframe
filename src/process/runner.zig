@@ -4,6 +4,8 @@ const builtin = @import("builtin");
 pub const Error = error{
     EmptyArgv,
     StreamTooLong,
+    StdoutLimitExceeded,
+    StderrLimitExceeded,
     WriteFailed,
 } || std.process.SpawnError || std.process.Child.WaitError || std.Io.ConcurrentError || std.Io.File.MultiReader.UnendingError || std.Io.Timeout.Error || std.Io.File.Writer.Error;
 
@@ -199,6 +201,25 @@ pub const DetailedResult = union(enum) {
     }
 };
 
+/// Captured process result which preserves which bounded output stream crossed
+/// its limit. Overflow never exposes partial bytes; all other lifecycle and IO
+/// failures retain the existing detailed failure ownership.
+pub const BoundedCaptureResult = union(enum) {
+    completed: Result,
+    stdout_limit_exceeded,
+    stderr_limit_exceeded,
+    failed: Failure,
+
+    pub fn deinit(self: *BoundedCaptureResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .completed => |result| result.deinit(allocator),
+            .failed => |*failure| failure.deinit(allocator),
+            .stdout_limit_exceeded, .stderr_limit_exceeded => {},
+        }
+        self.* = .{ .failed = .empty_argv };
+    }
+};
+
 const FailurePhase = enum {
     capture,
     wait,
@@ -227,6 +248,19 @@ pub fn runCaptured(allocator: std.mem.Allocator, io: std.Io, options: Options) E
     return runWithStdin(allocator, io, captured_options);
 }
 
+/// Bounded counterpart to `runCaptured` which keeps stdout and stderr limit
+/// terminals distinct for domains whose public failure taxonomy depends on
+/// the overflowing stream.
+pub fn runCapturedBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+) std.mem.Allocator.Error!BoundedCaptureResult {
+    var captured_options = options;
+    captured_options.stdin = &.{};
+    return runWithStdinBounded(allocator, io, captured_options);
+}
+
 /// Run a child process with structured argv and captured stdout/stderr.
 ///
 /// This is shared by Git commands and ExternalAction so process ownership,
@@ -236,12 +270,39 @@ pub fn runWithStdin(allocator: std.mem.Allocator, io: std.Io, options: Options) 
     return resultFromDetailed(allocator, detailed);
 }
 
+/// Bounded counterpart to `runWithStdin`. The implementation shares the same
+/// spawn, pump, capture, kill/reap, and allocation owner as the legacy API.
+pub fn runWithStdinBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+) std.mem.Allocator.Error!BoundedCaptureResult {
+    const detailed = try runWithStdinDetailedInternal(allocator, io, options, .distinct);
+    return switch (detailed) {
+        .ok => |result| .{ .completed = result },
+        .failed => |failure| switch (failure) {
+            .capture => |err| if (err == error.StdoutLimitExceeded)
+                .stdout_limit_exceeded
+            else if (err == error.StderrLimitExceeded)
+                .stderr_limit_exceeded
+            else
+                .{ .failed = failure },
+            else => .{ .failed = failure },
+        },
+    };
+}
+
 fn resultFromDetailed(allocator: std.mem.Allocator, detailed: DetailedResult) Error!Result {
     return switch (detailed) {
         .ok => |result| result,
         .failed => |failure_value| {
             var failure = failure_value;
             defer failure.deinit(allocator);
+            if (failure == .capture and
+                (failure.capture == error.StdoutLimitExceeded or failure.capture == error.StderrLimitExceeded))
+            {
+                return error.StreamTooLong;
+            }
             return failure.toError();
         },
     };
@@ -252,6 +313,17 @@ fn resultFromDetailed(allocator: std.mem.Allocator, detailed: DetailedResult) Er
 /// Consumers which need failure evidence use this to distinguish "could not
 /// start command" from "command started, but runner IO/capture/wait failed".
 pub fn runWithStdinDetailed(allocator: std.mem.Allocator, io: std.Io, options: Options) std.mem.Allocator.Error!DetailedResult {
+    return runWithStdinDetailedInternal(allocator, io, options, .coalesced);
+}
+
+const LimitClassification = enum { coalesced, distinct };
+
+fn runWithStdinDetailedInternal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    limit_classification: LimitClassification,
+) std.mem.Allocator.Error!DetailedResult {
     if (options.argv.len == 0) return .{ .failed = .empty_argv };
 
     var child = std.process.spawn(io, .{
@@ -296,13 +368,19 @@ pub fn runWithStdinDetailed(allocator: std.mem.Allocator, io: std.Io, options: O
     while (multi_reader.fill(64, .none)) |_| {
         if (options.stdout_limit.toInt()) |limit| {
             if (stdout_reader.buffered().len > limit) {
-                capture_error = error.StreamTooLong;
+                capture_error = if (limit_classification == .distinct)
+                    error.StdoutLimitExceeded
+                else
+                    error.StreamTooLong;
                 break;
             }
         }
         if (options.stderr_limit.toInt()) |limit| {
             if (stderr_reader.buffered().len > limit) {
-                capture_error = error.StreamTooLong;
+                capture_error = if (limit_classification == .distinct)
+                    error.StderrLimitExceeded
+                else
+                    error.StreamTooLong;
                 break;
             }
         }
@@ -1154,6 +1232,72 @@ test "runCaptured enforces output caps" {
         .stdout_limit = .limited(3),
         .stderr_limit = .limited(64),
     }));
+}
+
+test "bounded capture distinguishes stdout and stderr overflow while legacy mapping stays stable" {
+    const stdout_argv = [_][]const u8{ "sh", "-c", "printf abcdef" };
+    var stdout_result = try runCapturedBounded(std.testing.allocator, std.testing.io, .{
+        .argv = &stdout_argv,
+        .stdout_limit = .limited(3),
+        .stderr_limit = .limited(64),
+    });
+    defer stdout_result.deinit(std.testing.allocator);
+    try std.testing.expect(stdout_result == .stdout_limit_exceeded);
+
+    const stderr_argv = [_][]const u8{ "sh", "-c", "printf abcdef >&2" };
+    var stderr_result = try runCapturedBounded(std.testing.allocator, std.testing.io, .{
+        .argv = &stderr_argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(3),
+    });
+    defer stderr_result.deinit(std.testing.allocator);
+    try std.testing.expect(stderr_result == .stderr_limit_exceeded);
+
+    try std.testing.expectError(error.StreamTooLong, runCaptured(std.testing.allocator, std.testing.io, .{
+        .argv = &stderr_argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(3),
+    }));
+}
+
+test "bounded stdout and stderr overflow kill and reap their direct child" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const stdout_command = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "printf %d $$ > '{s}/stdout.pid'; printf abcdef; exec sleep 60",
+        .{root},
+    );
+    defer std.testing.allocator.free(stdout_command);
+    const stdout_argv = [_][]const u8{ "sh", "-c", stdout_command };
+    var stdout_result = try runCapturedBounded(std.testing.allocator, std.testing.io, .{
+        .argv = &stdout_argv,
+        .stdout_limit = .limited(3),
+        .stderr_limit = .limited(64),
+    });
+    defer stdout_result.deinit(std.testing.allocator);
+    try std.testing.expect(stdout_result == .stdout_limit_exceeded);
+    try expectProcessGone(std.testing.io, try readTestPid(tmp.dir, std.testing.io, "stdout.pid"));
+
+    const stderr_command = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "printf %d $$ > '{s}/stderr.pid'; printf abcdef >&2; exec sleep 60",
+        .{root},
+    );
+    defer std.testing.allocator.free(stderr_command);
+    const stderr_argv = [_][]const u8{ "sh", "-c", stderr_command };
+    var stderr_result = try runCapturedBounded(std.testing.allocator, std.testing.io, .{
+        .argv = &stderr_argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(3),
+    });
+    defer stderr_result.deinit(std.testing.allocator);
+    try std.testing.expect(stderr_result == .stderr_limit_exceeded);
+    try expectProcessGone(std.testing.io, try readTestPid(tmp.dir, std.testing.io, "stderr.pid"));
 }
 
 test "runCaptured rejects empty argv" {

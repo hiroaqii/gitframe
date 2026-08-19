@@ -7,6 +7,7 @@ const auto_reload = @import("auto_reload.zig");
 const actions = @import("actions.zig");
 const diff_basis = @import("diff_basis.zig");
 const page = @import("page.zig");
+const diff_file = @import("../diff/file.zig");
 const diff_parser = @import("../diff/parser.zig");
 const diff_hunk_projection = @import("../diff/hunk_projection.zig");
 const diff_presentation_identity = @import("../diff/presentation_identity.zig");
@@ -16,6 +17,7 @@ const diff_syntax_view = @import("../diff/syntax_view.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
 const git_command = @import("../git/command.zig");
+const git_committed_review = @import("../git/committed_review.zig");
 const git_compare = @import("../git/compare.zig");
 const git_read = @import("../git/read.zig");
 const git_refs = @import("../git/refs.zig");
@@ -1372,8 +1374,9 @@ pub fn runReviewBranchListLoad(
     };
 }
 
-/// Run the single structured Review domain operation and translate its raw
-/// owned values into the page-independent, validated diff-basis vocabulary.
+/// Resolve the Branch Review caller policy, then run the target, ahead, and
+/// projection operations separately. Only a fully parsed candidate is
+/// published as one accepted Review bundle.
 pub fn runReviewLoad(
     cwd: std.Io.Dir,
     target: ?diff_basis.BaseTarget,
@@ -1381,88 +1384,126 @@ pub fn runReviewLoad(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) ReviewLoadTaskResult {
-    var raw = git_compare.loadCompareSnapshot(allocator, io, .{
-        .cwd = cwd,
-        .environment = environment,
-        .target = if (target) |value| .{
+    const context: git_command.DirectoryContext = .{ .cwd = cwd, .environment = environment };
+    var selected = if (target) |value|
+        git_compare.cloneTarget(allocator, .{
             .full_ref = value.full_ref,
             .display_name = value.display_name,
             .kind = value.kind,
-        } else null,
-    }) catch |err| {
-        return reviewLoadError(allocator, "Review load failed", err);
+        }) catch |err| return reviewLoadError(allocator, "Review base policy failed", err)
+    else selected: {
+        var policy = git_compare.selectDefaultTarget(allocator, io, context) catch |err|
+            return reviewLoadError(allocator, "Review base policy failed", err);
+        defer policy.deinit(allocator);
+        break :selected switch (policy) {
+            .target => |selected_target| value: {
+                policy = .failed;
+                break :value selected_target;
+            },
+            .missing => |attempted| {
+                return translateReviewBasisFailure(allocator, .missing_base_ref, .{
+                    .full_ref = attempted.full_ref,
+                    .display_name = attempted.display_name,
+                    .kind = attempted.kind,
+                });
+            },
+            .failed => return .{ .failed_static = "Review base policy failed" },
+        };
     };
-    defer raw.deinit(allocator);
+    defer selected.deinit(allocator);
 
-    return switch (raw) {
-        .snapshot => |snapshot| translateReviewSnapshot(allocator, io, snapshot),
-        .basis_failed => |failure| translateReviewBasisFailure(allocator, failure.kind, failure.attempted),
-        .failed => |message| duplicateReviewFailure(allocator, message),
-        .failed_static => |message| .{ .failed_static = message },
+    var head_name = git_compare.readHeadName(allocator, io, context) catch |err|
+        return reviewLoadError(allocator, "Review head display failed", err);
+    defer head_name.deinit(allocator);
+    if (head_name == .failed) return .{ .failed_static = "Review head display failed" };
+
+    const target_result = git_committed_review.resolveTarget(allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = selected.full_ref,
+        .head = "HEAD",
+    }) catch |err| return reviewLoadError(allocator, "Review target resolution failed", err);
+    const committed_target = switch (target_result) {
+        .target => |resolved| resolved,
+        .failure => |failure| return translateTargetResolutionFailure(allocator, failure, selected),
     };
-}
 
-fn translateReviewSnapshot(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    snapshot: git_compare.CompareSnapshot,
-) ReviewLoadTaskResult {
-    const base_oid = parseReviewOid(snapshot.base_oid) orelse
-        return .{ .failed_static = "Review load returned an invalid base oid" };
-    const head_oid = parseReviewOid(snapshot.head_oid) orelse
-        return .{ .failed_static = "Review load returned an invalid head oid" };
-    const merge_base_oid = parseReviewOid(snapshot.merge_base_oid) orelse
-        return .{ .failed_static = "Review load returned an invalid merge-base oid" };
-    const ahead_count = parseReviewAheadCount(snapshot.ahead_count) orelse
-        return .{ .failed_static = "Review load returned an invalid ahead count" };
+    const ahead_result = git_committed_review.computeAheadDisplay(allocator, io, context, committed_target) catch |err|
+        return reviewLoadError(allocator, "Review ahead display failed", err);
+    const ahead_count_u64 = switch (ahead_result) {
+        .count => |count| count,
+        .failure => |failure| return reviewOperationFailure(allocator, "Review ahead display failed", @tagName(failure)),
+    };
+    const ahead_count = std.math.cast(usize, ahead_count_u64) orelse
+        return .{ .failed_static = "Review ahead display returned an invalid count" };
 
-    var diff: ReviewDiffBundle = if (snapshot.diff.len == 0)
+    var projection_result = git_committed_review.materializeCommittedProjection(allocator, io, context, committed_target) catch |err|
+        return reviewLoadError(allocator, "Review projection failed", err);
+    defer projection_result.deinit(allocator);
+    const patch = switch (projection_result) {
+        .projection => |*projection| projection.patch_bytes,
+        .failure => |failure| return reviewOperationFailure(allocator, "Review projection failed", @tagName(failure)),
+    };
+
+    var diff: ReviewDiffBundle = if (patch.len == 0)
         .empty
     else
-        .{ .loaded = buildLoadedBundleWithIo(allocator, io, snapshot.diff) catch |err| {
+        .{ .loaded = buildLoadedBundleWithIo(allocator, io, patch) catch |err| {
             return reviewLoadError(allocator, "Review diff parse failed", err);
         } };
     var diff_owned = true;
     defer if (diff_owned) diff.deinit();
 
-    const full_ref = allocator.dupe(u8, snapshot.target.full_ref) catch
+    const full_ref = allocator.dupe(u8, selected.full_ref) catch
         return .{ .failed_static = "Review load failed: OutOfMemory" };
     var full_ref_owned = true;
     defer if (full_ref_owned) allocator.free(full_ref);
-    const display_name = allocator.dupe(u8, snapshot.target.display_name) catch
+    const display_name = allocator.dupe(u8, selected.display_name) catch
         return .{ .failed_static = "Review load failed: OutOfMemory" };
     var display_name_owned = true;
     defer if (display_name_owned) allocator.free(display_name);
-    const head_display = if (snapshot.head_name) |name|
+    const head_display = if (head_name.name) |name|
         allocator.dupe(u8, name) catch return .{ .failed_static = "Review load failed: OutOfMemory" }
     else
-        std.fmt.allocPrint(allocator, "HEAD@{s}", .{head_oid.short()}) catch
+        std.fmt.allocPrint(allocator, "HEAD@{s}", .{committed_target.head_oid.short()}) catch
             return .{ .failed_static = "Review load failed: OutOfMemory" };
+    var head_display_owned = true;
+    defer if (head_display_owned) allocator.free(head_display);
 
     diff_owned = false;
     full_ref_owned = false;
     display_name_owned = false;
-
+    head_display_owned = false;
     return .{ .loaded = .{
         .basis = .{
             .base = .{
                 .full_ref = full_ref,
                 .display_name = display_name,
-                .kind = snapshot.target.kind,
-                .oid = base_oid,
+                .kind = selected.kind,
             },
             .head_display = head_display,
-            .merge_base_oid = merge_base_oid,
-            .head_oid = head_oid,
+            .target = committed_target,
             .ahead_count = ahead_count,
         },
         .diff = diff,
     } };
 }
 
+fn translateTargetResolutionFailure(
+    allocator: std.mem.Allocator,
+    failure: git_committed_review.TargetResolutionFailure,
+    attempted: git_compare.CompareTarget,
+) ReviewLoadTaskResult {
+    return switch (failure) {
+        .base_unresolved => translateReviewBasisFailure(allocator, .missing_base_ref, attempted),
+        .head_unresolved => translateReviewBasisFailure(allocator, .head_unresolved, attempted),
+        .no_merge_base => translateReviewBasisFailure(allocator, .no_merge_base, attempted),
+        else => reviewOperationFailure(allocator, "Review target resolution failed", @tagName(failure)),
+    };
+}
+
 fn translateReviewBasisFailure(
     allocator: std.mem.Allocator,
-    kind: git_compare.CompareBasisFailure,
+    kind: diff_basis.BasisFailure,
     attempted: git_compare.CompareTarget,
 ) ReviewLoadTaskResult {
     const full_ref = allocator.dupe(u8, attempted.full_ref) catch
@@ -1473,11 +1514,7 @@ fn translateReviewBasisFailure(
         return .{ .failed_static = "Review load failed: OutOfMemory" };
     full_ref_owned = false;
     return .{ .basis_failed = .{
-        .kind = switch (kind) {
-            .missing_base_ref => .missing_base_ref,
-            .no_merge_base => .no_merge_base,
-            .head_unresolved => .head_unresolved,
-        },
+        .kind = kind,
         .attempted = .{
             .full_ref = full_ref,
             .display_name = display_name,
@@ -1486,9 +1523,9 @@ fn translateReviewBasisFailure(
     } };
 }
 
-fn duplicateReviewFailure(allocator: std.mem.Allocator, message: []const u8) ReviewLoadTaskResult {
+fn reviewOperationFailure(allocator: std.mem.Allocator, prefix: []const u8, code: []const u8) ReviewLoadTaskResult {
     return .{
-        .failed = allocator.dupe(u8, message) catch
+        .failed = std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, code }) catch
             return .{ .failed_static = "Review load failed: OutOfMemory" },
     };
 }
@@ -1498,21 +1535,6 @@ fn reviewLoadError(allocator: std.mem.Allocator, prefix: []const u8, err: anyerr
         .failed = std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, @errorName(err) }) catch
             return .{ .failed_static = "Review load failed: OutOfMemory" },
     };
-}
-
-pub fn parseReviewOid(text: []const u8) ?diff_basis.Oid {
-    if (text.len != 40 and text.len != 64) return null;
-    for (text) |byte| if (!std.ascii.isHex(byte)) return null;
-    var oid: diff_basis.Oid = .{};
-    @memcpy(oid.bytes[0..text.len], text);
-    oid.len = @intCast(text.len);
-    return oid;
-}
-
-pub fn parseReviewAheadCount(text: []const u8) ?usize {
-    if (text.len == 0) return null;
-    for (text) |byte| if (!std.ascii.isDigit(byte)) return null;
-    return std.fmt.parseInt(usize, text, 10) catch null;
 }
 
 pub fn runLoad(
@@ -3228,20 +3250,6 @@ fn runTestGit(io: std.Io, argv: []const []const u8, cwd: std.Io.Dir) !void {
     return error.GitCommandFailed;
 }
 
-test "Review oid and ahead parsers reject malformed backend output" {
-    const sha1 = "0123456789abcdef0123456789abcdef01234567";
-    const sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    try std.testing.expectEqualStrings(sha1, parseReviewOid(sha1).?.slice());
-    try std.testing.expectEqualStrings(sha256, parseReviewOid(sha256).?.slice());
-    try std.testing.expect(parseReviewOid("0123456") == null);
-    try std.testing.expect(parseReviewOid("z123456789abcdef0123456789abcdef01234567") == null);
-    try std.testing.expectEqual(@as(?usize, 42), parseReviewAheadCount("42"));
-    try std.testing.expect(parseReviewAheadCount("") == null);
-    try std.testing.expect(parseReviewAheadCount(" 42") == null);
-    try std.testing.expect(parseReviewAheadCount("42\n") == null);
-    try std.testing.expect(parseReviewAheadCount("+42") == null);
-}
-
 test "runReviewLoad returns an atomic validated basis and diff bundle" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -3274,6 +3282,92 @@ test "runReviewLoad returns an atomic validated basis and diff bundle" {
             try std.testing.expect(bundle.diff == .loaded);
         },
         else => return error.ExpectedReviewLoad,
+    }
+}
+
+test "runReviewLoad clean committed projection preserves text binary add delete and rename model" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitattributes", .data = "*.bin -diff\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "text.txt", .data = "old text\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary.bin", .data = "old\x00binary" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "delete.txt", .data = "delete me\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "rename-old.txt", .data = "rename unchanged\n" });
+    try runTestGit(io, &.{ "git", "add", "." }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "switch", "-c", "feature/model" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "text.txt", .data = "new text\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary.bin", .data = "new\x00binary" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "add.txt", .data = "added\n" });
+    try runTestGit(io, &.{ "git", "rm", "delete.txt" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "mv", "rename-old.txt", "rename-new.txt" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "add", "." }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "head" }, tmp.dir);
+
+    var result = runReviewLoad(tmp.dir, .{
+        .full_ref = @constCast("refs/heads/main"),
+        .display_name = @constCast("main"),
+        .kind = .local,
+    }, &environment, allocator, io);
+    defer result.deinit(allocator);
+    const loaded = switch (result) {
+        .loaded => |*bundle| switch (bundle.diff) {
+            .loaded => |*diff| diff,
+            .empty => return error.ExpectedReviewDiff,
+        },
+        else => return error.ExpectedReviewLoad,
+    };
+
+    var statuses = [_]bool{false} ** 5;
+    for (loaded.loaded.document.files) |file| switch (diff_file.status(file)) {
+        .modified => statuses[0] = true,
+        .binary => statuses[1] = true,
+        .added => statuses[2] = true,
+        .deleted => statuses[3] = true,
+        .renamed => statuses[4] = true,
+    };
+    for (statuses) |present| try std.testing.expect(present);
+
+    const target = result.loaded.basis.target;
+    const legacy_range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{
+        target.diff_base_oid.slice(),
+        target.head_oid.slice(),
+    });
+    defer allocator.free(legacy_range);
+    const legacy_argv = [_][]const u8{
+        "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", legacy_range,
+    };
+    const legacy_result = try git_command.runCaptured(allocator, io, .{ .cwd = tmp.dir, .environment = &environment }, .{
+        .argv = &legacy_argv,
+        .stdout_limit = .limited(16 * 1024 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    defer legacy_result.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, legacy_result.term);
+    var legacy = try buildLoadedBundle(allocator, legacy_result.stdout);
+    defer legacy.deinit();
+    try std.testing.expectEqual(legacy.loaded.document.files.len, loaded.loaded.document.files.len);
+    for (legacy.loaded.document.files, loaded.loaded.document.files) |old_file, new_file| {
+        try std.testing.expect(diff_presentation_identity.exactEqual(old_file, new_file));
+    }
+
+    try runTestGit(io, &.{ "git", "config", "diff.algorithm", "definitely-invalid" }, tmp.dir);
+    var failed = runReviewLoad(tmp.dir, .{
+        .full_ref = @constCast("refs/heads/main"),
+        .display_name = @constCast("main"),
+        .kind = .local,
+    }, &environment, allocator, io);
+    defer failed.deinit(allocator);
+    switch (failed) {
+        .failed => |message| try std.testing.expect(std.mem.startsWith(u8, message, "Review projection failed: projection_git_command_failed")),
+        else => return error.ExpectedProjectionFailure,
     }
 }
 
@@ -3484,15 +3578,14 @@ test "ReviewBranchListLoadTask keeps physical root and controlled environment af
 test "Review task translation keeps basis failure kinds and attempted target" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
-        backend: git_compare.CompareBasisFailure,
-        expected: diff_basis.BasisFailure,
+        kind: diff_basis.BasisFailure,
     }{
-        .{ .backend = .missing_base_ref, .expected = .missing_base_ref },
-        .{ .backend = .no_merge_base, .expected = .no_merge_base },
-        .{ .backend = .head_unresolved, .expected = .head_unresolved },
+        .{ .kind = .missing_base_ref },
+        .{ .kind = .no_merge_base },
+        .{ .kind = .head_unresolved },
     };
     for (cases) |case| {
-        var result = translateReviewBasisFailure(allocator, case.backend, .{
+        var result = translateReviewBasisFailure(allocator, case.kind, .{
             .full_ref = @constCast("refs/heads/base"),
             .display_name = @constCast("base"),
             .kind = .local,
@@ -3500,7 +3593,7 @@ test "Review task translation keeps basis failure kinds and attempted target" {
         defer result.deinit(allocator);
         switch (result) {
             .basis_failed => |failure| {
-                try std.testing.expectEqual(case.expected, failure.kind);
+                try std.testing.expectEqual(case.kind, failure.kind);
                 try std.testing.expectEqualStrings("refs/heads/base", failure.attempted.full_ref);
             },
             else => return error.ExpectedBasisFailure,

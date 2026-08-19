@@ -1,8 +1,8 @@
 //! Page-independent identity and ownership types for read-only committed diffs.
 //!
-//! Review v1 constructs branch bases. The tagged `DiffBasis` is defined now
-//! so later History work can add its lossless commit-detail payload without
-//! changing consumers back to an untagged branch-only contract.
+//! Review v1 constructs branch bases. Future History source kinds are added to
+//! the versioned committed-review contract when their semantics exist; this
+//! module does not reserve a lossy placeholder authority.
 
 const std = @import("std");
 const committed_review = @import("../committed_review.zig");
@@ -41,7 +41,6 @@ pub const BaseSelection = struct {
     full_ref: []u8,
     display_name: []u8,
     kind: BaseKind,
-    oid: Oid,
 
     pub fn clone(self: BaseSelection, allocator: std.mem.Allocator) !BaseSelection {
         const full_ref = try allocator.dupe(u8, self.full_ref);
@@ -50,7 +49,6 @@ pub const BaseSelection = struct {
             .full_ref = full_ref,
             .display_name = try allocator.dupe(u8, self.display_name),
             .kind = self.kind,
-            .oid = self.oid,
         };
     }
 
@@ -65,8 +63,7 @@ pub const BaseSelection = struct {
 pub const BranchDiffBasis = struct {
     base: BaseSelection,
     head_display: []u8,
-    merge_base_oid: Oid,
-    head_oid: Oid,
+    target: committed_review.CommittedReviewTarget,
     ahead_count: usize,
 
     pub fn clone(self: BranchDiffBasis, allocator: std.mem.Allocator) !BranchDiffBasis {
@@ -75,8 +72,7 @@ pub const BranchDiffBasis = struct {
         return .{
             .base = base,
             .head_display = try allocator.dupe(u8, self.head_display),
-            .merge_base_oid = self.merge_base_oid,
-            .head_oid = self.head_oid,
+            .target = self.target,
             .ahead_count = self.ahead_count,
         };
     }
@@ -84,26 +80,6 @@ pub const BranchDiffBasis = struct {
     pub fn deinit(self: *BranchDiffBasis, allocator: std.mem.Allocator) void {
         self.base.deinit(allocator);
         allocator.free(self.head_display);
-        self.* = undefined;
-    }
-};
-
-/// Reserved for a future lossless History payload with selected parent/root,
-/// merge policy, and ordered parents. Review never constructs this minimal
-/// identity placeholder.
-pub const CommitDiffBasis = struct {
-    selected_commit_oid: Oid,
-};
-
-pub const DiffBasis = union(enum) {
-    branch: BranchDiffBasis,
-    commit: CommitDiffBasis,
-
-    pub fn deinit(self: *DiffBasis, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .branch => |*branch| branch.deinit(allocator),
-            .commit => {},
-        }
         self.* = undefined;
     }
 };
@@ -131,11 +107,15 @@ test "branch basis clone owns every display and authority slice" {
             .full_ref = try allocator.dupe(u8, "refs/remotes/origin/main"),
             .display_name = try allocator.dupe(u8, "origin/main"),
             .kind = .remote_tracking,
-            .oid = .{},
         },
         .head_display = try allocator.dupe(u8, "feature/compare"),
-        .merge_base_oid = .{},
-        .head_oid = .{},
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = .{},
+            .head_oid = .{},
+            .diff_base_oid = .{},
+        },
         .ahead_count = 3,
     };
     defer original.deinit(allocator);
@@ -149,17 +129,4 @@ test "branch basis clone owns every display and authority slice" {
     try std.testing.expect(original.base.display_name.ptr != cloned.base.display_name.ptr);
     try std.testing.expectEqualStrings(original.head_display, cloned.head_display);
     try std.testing.expect(original.head_display.ptr != cloned.head_display.ptr);
-}
-
-test "diff basis retains a distinct future commit tag" {
-    const branch: DiffBasis = .{ .branch = .{
-        .base = .{ .full_ref = &.{}, .display_name = &.{}, .kind = .local, .oid = .{} },
-        .head_display = &.{},
-        .merge_base_oid = .{},
-        .head_oid = .{},
-        .ahead_count = 0,
-    } };
-    const commit: DiffBasis = .{ .commit = .{ .selected_commit_oid = .{} } };
-    try std.testing.expect(branch == .branch);
-    try std.testing.expect(commit == .commit);
 }

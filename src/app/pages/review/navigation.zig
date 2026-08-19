@@ -326,11 +326,15 @@ test "Review selection release installs pinned retained actions" {
                 .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                 .display_name = try allocator.dupe(u8, "main"),
                 .kind = .local,
-                .oid = .{},
             },
             .head_display = try allocator.dupe(u8, "topic"),
-            .merge_base_oid = .{},
-            .head_oid = .{},
+            .target = .{
+                .object_format = .sha1,
+                .source_kind = .branch_range,
+                .base_oid = .{},
+                .head_oid = .{},
+                .diff_base_oid = .{},
+            },
             .ahead_count = 1,
         },
     };
@@ -435,11 +439,15 @@ test "Review keyboard line selection completes with exact pin and retries alloca
                 .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                 .display_name = try allocator.dupe(u8, "main"),
                 .kind = .local,
-                .oid = .{},
             },
             .head_display = try allocator.dupe(u8, "topic"),
-            .merge_base_oid = .{},
-            .head_oid = .{},
+            .target = .{
+                .object_format = .sha1,
+                .source_kind = .branch_range,
+                .base_oid = .{},
+                .head_oid = .{},
+                .diff_base_oid = .{},
+            },
             .ahead_count = 1,
         },
         .viewer = .{
@@ -516,11 +524,15 @@ test "Review retained candidate and pin replace transactionally and survive reje
                 .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                 .display_name = try allocator.dupe(u8, "main"),
                 .kind = .local,
-                .oid = .{},
             },
             .head_display = try allocator.dupe(u8, "topic"),
-            .merge_base_oid = .{},
-            .head_oid = .{},
+            .target = .{
+                .object_format = .sha1,
+                .source_kind = .branch_range,
+                .base_oid = .{},
+                .head_oid = .{},
+                .diff_base_oid = .{},
+            },
             .ahead_count = 1,
         },
     };
@@ -555,8 +567,8 @@ test "Review retained candidate and pin replace transactionally and survive reje
     // A newly accepted basis must replace both halves of the retained owner.
     // The candidate is built before the prior allocation is retired, so the
     // new fragment cannot alias the old allocation.
-    page.basis.?.head_oid.len = 1;
-    page.basis.?.head_oid.bytes[0] = 'c';
+    page.basis.?.target.head_oid.len = 1;
+    page.basis.?.target.head_oid.bytes[0] = 'c';
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .side = .new,

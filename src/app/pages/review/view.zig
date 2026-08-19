@@ -378,11 +378,15 @@ test "Review page header binds the accepted pair to repository and target" {
             .full_ref = try allocator.dupe(u8, "refs/remotes/origin/main"),
             .display_name = try allocator.dupe(u8, "origin/main"),
             .kind = .remote_tracking,
-            .oid = .{},
         },
         .head_display = try allocator.dupe(u8, "HEAD@0123456"),
-        .merge_base_oid = .{},
-        .head_oid = .{},
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = .{},
+            .head_oid = .{},
+            .diff_base_oid = .{},
+        },
         .ahead_count = 2,
     };
     state.base_target = .{

@@ -56,6 +56,8 @@ pub const CapturedOptions = struct {
     stderr_limit: std.Io.Limit,
 };
 
+pub const BoundedCaptureResult = process_runner.BoundedCaptureResult;
+
 pub const StdinOptions = struct {
     argv: []const []const u8,
     stdin: []const u8,
@@ -83,6 +85,23 @@ pub fn runCaptured(
     }) catch |err| return fromRunnerError(err);
 }
 
+/// Preserve stdout/stderr overflow as separate terminals while retaining the
+/// shared runner's child and buffer ownership.
+pub fn runCapturedBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: DirectoryContext,
+    options: CapturedOptions,
+) std.mem.Allocator.Error!BoundedCaptureResult {
+    return process_runner.runCapturedBounded(allocator, io, .{
+        .argv = options.argv,
+        .cwd = .{ .dir = context.cwd },
+        .environ_map = context.environment.borrow(),
+        .stdout_limit = options.stdout_limit,
+        .stderr_limit = options.stderr_limit,
+    });
+}
+
 pub fn runWithStdin(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -97,6 +116,22 @@ pub fn runWithStdin(
         .stdout_limit = options.stdout_limit,
         .stderr_limit = options.stderr_limit,
     }) catch |err| return fromRunnerError(err);
+}
+
+pub fn runWithStdinBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: DirectoryContext,
+    options: StdinOptions,
+) std.mem.Allocator.Error!BoundedCaptureResult {
+    return process_runner.runWithStdinBounded(allocator, io, .{
+        .argv = options.argv,
+        .cwd = .{ .dir = context.cwd },
+        .environ_map = context.environment.borrow(),
+        .stdin = options.stdin,
+        .stdout_limit = options.stdout_limit,
+        .stderr_limit = options.stderr_limit,
+    });
 }
 
 /// Captured helper for an explicitly non-repository command such as external
@@ -174,4 +209,27 @@ test "controlled Git environment removes inherited repository authority" {
     try std.testing.expect(environment.borrow().get("gIt_Custom_Selector") == null);
     for (git_keys) |key| try std.testing.expect(environment.borrow().get(key) == null);
     try std.testing.expectEqualStrings("redirect", parent.get("GIT_DIR").?);
+}
+
+test "bounded Git adapter preserves stdout and stderr overflow terminals" {
+    var environment = try LocalGitEnvironment.initFromParent(std.testing.allocator, null);
+    defer environment.deinit();
+    const context: DirectoryContext = .{ .cwd = std.Io.Dir.cwd(), .environment = &environment };
+    const stdout_argv = [_][]const u8{ "sh", "-c", "printf abcdef" };
+    var stdout = try runCapturedBounded(std.testing.allocator, std.testing.io, context, .{
+        .argv = &stdout_argv,
+        .stdout_limit = .limited(3),
+        .stderr_limit = .limited(64),
+    });
+    defer stdout.deinit(std.testing.allocator);
+    try std.testing.expect(stdout == .stdout_limit_exceeded);
+
+    const stderr_argv = [_][]const u8{ "sh", "-c", "printf abcdef >&2" };
+    var stderr = try runCapturedBounded(std.testing.allocator, std.testing.io, context, .{
+        .argv = &stderr_argv,
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(3),
+    });
+    defer stderr.deinit(std.testing.allocator);
+    try std.testing.expect(stderr == .stderr_limit_exceeded);
 }

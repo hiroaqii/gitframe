@@ -275,9 +275,13 @@ test "Review retained selection survives page transitions and clears on reposito
         } },
     };
     app.pages.review.pinned_selection_basis = .{
-        .base_oid = .{},
-        .head_oid = .{},
-        .diff_base_oid = .{},
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = .{},
+            .head_oid = .{},
+            .diff_base_oid = .{},
+        },
     };
     const retained_token = app.pages.review.completed_selection.?.token;
     const retained_pin = app.pages.review.pinned_selection_basis.?;

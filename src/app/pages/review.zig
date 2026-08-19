@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const ui = @import("chasen_ui");
+const committed_review = @import("../../committed_review.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const app_state = @import("../state.zig");
 const app_prompt = @import("../prompt.zig");
@@ -315,25 +316,17 @@ pub const BasisFailureState = struct {
 };
 
 /// Immutable Review authority captured when a completed selection is
-/// installed. Copy/Clear admission requires all three object ids to remain
-/// equal to the currently accepted Review snapshot.
+/// installed. Copy/Clear admission uses the portable target's structural
+/// equality instead of a second three-OID authority.
 pub const PinnedSelectionBasis = struct {
-    base_oid: diff_basis.Oid,
-    head_oid: diff_basis.Oid,
-    diff_base_oid: diff_basis.Oid,
+    target: committed_review.CommittedReviewTarget,
 
     pub fn init(basis: diff_basis.BranchDiffBasis) PinnedSelectionBasis {
-        return .{
-            .base_oid = basis.base.oid,
-            .head_oid = basis.head_oid,
-            .diff_base_oid = basis.merge_base_oid,
-        };
+        return .{ .target = basis.target };
     }
 
     pub fn eql(self: PinnedSelectionBasis, other: PinnedSelectionBasis) bool {
-        return self.base_oid.eql(&other.base_oid) and
-            self.head_oid.eql(&other.head_oid) and
-            self.diff_base_oid.eql(&other.diff_base_oid);
+        return self.target.eql(&other.target);
     }
 };
 
@@ -608,9 +601,7 @@ pub const ReviewPageState = struct {
             &bundle.diff,
         );
         const pair_changed = if (self.basis) |current|
-            !current.base.oid.eql(&bundle.basis.base.oid) or
-                !current.merge_base_oid.eql(&bundle.basis.merge_base_oid) or
-                !current.head_oid.eql(&bundle.basis.head_oid)
+            !current.target.eql(&bundle.basis.target)
         else
             true;
 
@@ -931,11 +922,15 @@ fn loadedFinished(
                     .full_ref = full_ref,
                     .display_name = display_name,
                     .kind = .local,
-                    .oid = .{},
                 },
                 .head_display = try allocator.dupe(u8, "feature"),
-                .merge_base_oid = .{},
-                .head_oid = .{},
+                .target = .{
+                    .object_format = .sha1,
+                    .source_kind = .branch_range,
+                    .base_oid = .{},
+                    .head_oid = .{},
+                    .diff_base_oid = .{},
+                },
                 .ahead_count = 1,
             },
             .diff = .empty,
@@ -1081,11 +1076,15 @@ fn loadedDiffFinished(
                     .full_ref = full_ref,
                     .display_name = display_name,
                     .kind = .local,
-                    .oid = testOid(base_byte),
                 },
                 .head_display = head_display,
-                .merge_base_oid = testOid(base_byte),
-                .head_oid = testOid(head_byte),
+                .target = .{
+                    .object_format = .sha1,
+                    .source_kind = .branch_range,
+                    .base_oid = testOid(base_byte),
+                    .head_oid = testOid(head_byte),
+                    .diff_base_oid = testOid(base_byte),
+                },
                 .ahead_count = 1,
             },
             .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, path_diff) },
@@ -1190,9 +1189,9 @@ test "Review reload transfers retained selection only across the exact repositor
             state.viewer.sidebar_horizontal_scroll = 3;
             state.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } };
         }
-        second_finished.result.loaded.basis.base.oid = testOid(case.base);
-        second_finished.result.loaded.basis.merge_base_oid = testOid(case.diff_base);
-        second_finished.result.loaded.basis.head_oid = testOid(case.head);
+        second_finished.result.loaded.basis.target.base_oid = testOid(case.base);
+        second_finished.result.loaded.basis.target.diff_base_oid = testOid(case.diff_base);
+        second_finished.result.loaded.basis.target.head_oid = testOid(case.head);
         try std.testing.expectEqual(
             LoadAcceptance.loaded,
             try state.applyLoadFinished(allocator, 11, "/repo", case.root, &second_finished),
