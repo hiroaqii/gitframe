@@ -6,6 +6,12 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
+    if (helperCommand(args)) |command| {
+        const exit_code = runHelper(command, init, args[2..]) catch 70;
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (wantsHelp(args)) {
         try printHelp(init.io);
         return;
@@ -112,6 +118,38 @@ pub fn main(init: std.process.Init) !void {
         .keymap = effective_keymap,
         .theme = palette,
     });
+}
+
+const HelperCommand = enum {
+    review_target,
+    review_projection,
+};
+
+fn helperCommand(args: []const []const u8) ?HelperCommand {
+    if (args.len < 2) return null;
+    if (std.mem.eql(u8, args[1], "review-target")) return .review_target;
+    if (std.mem.eql(u8, args[1], "review-projection")) return .review_projection;
+    return null;
+}
+
+fn runHelper(command: HelperCommand, init: std.process.Init, arguments: []const []const u8) !u8 {
+    return switch (command) {
+        .review_target => gitframe.review_target_command.run(
+            init.gpa,
+            init.io,
+            init.environ_map,
+            arguments,
+            .stdout(),
+        ),
+        .review_projection => gitframe.review_projection_command.run(
+            init.gpa,
+            init.io,
+            init.environ_map,
+            arguments,
+            .stdin(),
+            .stdout(),
+        ),
+    };
 }
 
 fn startupDiagnosticWriter(file: std.Io.File, io: std.Io, buffer: []u8) std.Io.File.Writer {
@@ -323,6 +361,17 @@ fn printCliError(io: std.Io, err: gitframe.ParseArgsError) !void {
 test "wantsHelp detects help flags" {
     const args = [_][]const u8{ "gitframe", "--help" };
     try std.testing.expect(wantsHelp(args[0..]));
+}
+
+test "helper first-token dispatch precedes global help scanning" {
+    const target_args = [_][]const u8{ "gitframe", "review-target", "--help" };
+    try std.testing.expectEqual(HelperCommand.review_target, helperCommand(&target_args).?);
+    try std.testing.expect(wantsHelp(&target_args));
+    const projection_args = [_][]const u8{ "gitframe", "review-projection", "--help" };
+    try std.testing.expectEqual(HelperCommand.review_projection, helperCommand(&projection_args).?);
+    try std.testing.expect(wantsHelp(&projection_args));
+    const global_args = [_][]const u8{ "gitframe", "--help" };
+    try std.testing.expect(helperCommand(&global_args) == null);
 }
 
 test "config startup borrows a successful result-owned config" {

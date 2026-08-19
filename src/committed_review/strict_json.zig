@@ -1,6 +1,13 @@
+//! Bounded JSON token admission shared by committed-review artifacts and
+//! process requests.
+//!
+//! The scanner allocates decoded token bytes from the caller-supplied owner;
+//! this layer adds depth, duplicate-field, canonical scalar, and text policy.
+
 const std = @import("std");
 const limits = @import("limits.zig");
 
+/// Strict syntax, schema, value, collection, and allocation terminals.
 pub const ParseError = error{
     ArtifactTooLarge,
     InvalidJson,
@@ -16,11 +23,14 @@ pub const ParseError = error{
     DuplicateRelatedFindingId,
 } || std.mem.Allocator.Error;
 
+/// Stateful complete-input scanner. Returned string/number slices borrow
+/// `allocator`; the containing artifact/request owner controls their lifetime.
 pub const Parser = struct {
     scanner: std.json.Scanner,
     allocator: std.mem.Allocator,
     depth: usize = 0,
 
+    /// Begin scanning one complete input buffer.
     pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Parser {
         return .{
             .scanner = std.json.Scanner.initCompleteInput(allocator, bytes),
@@ -28,15 +38,18 @@ pub const Parser = struct {
         };
     }
 
+    /// Release scanner-owned token allocations; not the caller's input buffer.
     pub fn deinit(self: *Parser) void {
         self.scanner.deinit();
         self.* = undefined;
     }
 
+    /// Consume an object begin while enforcing the shared depth cap.
     pub fn beginObject(self: *Parser) ParseError!void {
         if ((try self.next()) != .object_begin) return error.InvalidType;
     }
 
+    /// Consume an array begin while enforcing the shared depth cap.
     pub fn beginArray(self: *Parser) ParseError!void {
         if ((try self.next()) != .array_begin) return error.InvalidType;
     }
@@ -60,6 +73,7 @@ pub const Parser = struct {
         };
     }
 
+    /// Consume one decoded JSON string value.
     pub fn string(self: *Parser) ParseError![]const u8 {
         return switch (try self.next()) {
             .allocated_string => |value| value,
@@ -77,6 +91,7 @@ pub const Parser = struct {
         };
     }
 
+    /// Consume a canonical non-negative base-10 integer into `T`.
     pub fn unsigned(self: *Parser, comptime T: type) ParseError!T {
         const bytes = switch (try self.next()) {
             .allocated_number => |value| value,
@@ -88,6 +103,7 @@ pub const Parser = struct {
         return std.fmt.parseInt(T, bytes, 10) catch error.InvalidValue;
     }
 
+    /// Require complete input consumption and balanced containers.
     pub fn endDocument(self: *Parser) ParseError!void {
         if ((try self.next()) != .end_of_document or self.depth != 0) return error.InvalidJson;
     }
@@ -118,20 +134,24 @@ pub const Parser = struct {
     }
 };
 
+/// Mark one field bit and reject a duplicate occurrence.
 pub fn markSeen(seen: *u32, bit: u5) ParseError!void {
     const mask = @as(u32, 1) << bit;
     if ((seen.* & mask) != 0) return error.DuplicateField;
     seen.* |= mask;
 }
 
+/// Require every bit in `required` after an object is consumed.
 pub fn requireFields(seen: u32, required: u32) ParseError!void {
     if ((seen & required) != required) return error.MissingField;
 }
 
+/// Admit exactly the independent committed-review schema version.
 pub fn validateSchemaVersion(value: u64) ParseError!void {
     if (value != limits.schema_version) return error.UnsupportedSchemaVersion;
 }
 
+/// Admit one bounded run-local finding identifier.
 pub fn validateFindingId(text: []const u8) ParseError!void {
     if (text.len == 0 or text.len > limits.max_finding_id_bytes) return error.InvalidValue;
     if (!std.ascii.isAlphanumeric(text[0])) return error.InvalidValue;
@@ -142,6 +162,7 @@ pub fn validateFindingId(text: []const u8) ParseError!void {
     }
 }
 
+/// Validate safe UTF-8 and the single-line/multiline control policy.
 pub fn validateText(text: []const u8, maximum: usize, multiline: bool) ParseError!void {
     if (text.len == 0 or text.len > maximum) return error.LimitExceeded;
     var iterator = (std.unicode.Utf8View.init(text) catch return error.InvalidValue).iterator();
@@ -158,6 +179,7 @@ pub fn validateText(text: []const u8, maximum: usize, multiline: bool) ParseErro
     }
 }
 
+/// Validate the fixed UTC-seconds timestamp grammar and calendar date.
 pub fn validateTimestamp(text: []const u8) ParseError!void {
     if (text.len != 20 or text[4] != '-' or text[7] != '-' or text[10] != 'T' or
         text[13] != ':' or text[16] != ':' or text[19] != 'Z')
@@ -177,6 +199,8 @@ pub fn validateTimestamp(text: []const u8) ParseError!void {
     if (day == 0 or day > days[month - 1]) return error.InvalidValue;
 }
 
+/// Allocate lossless raw path bytes from canonical unpadded base64url.
+/// The returned slice belongs to `allocator` and need not be UTF-8.
 pub fn decodeRawPath(allocator: std.mem.Allocator, encoded: []const u8) ParseError![]const u8 {
     if (encoded.len == 0 or encoded.len > limits.max_raw_path_encoded_bytes) return error.LimitExceeded;
     for (encoded) |byte| {

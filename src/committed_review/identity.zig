@@ -1,15 +1,25 @@
+//! Nominal run/repository identities and exact-byte SHA-256 digests.
+//!
+//! Review and repository IDs intentionally remain distinct Zig types even
+//! though both use canonical UUIDv4 bytes.
+
 const std = @import("std");
 
+/// Canonical UUIDv4 admission failure for either nominal identity domain.
 pub const IdentityError = error{InvalidUuid};
+/// Canonical `sha256:<lowercase hex>` admission failure.
 pub const DigestError = error{InvalidDigest};
 
+/// Immutable identity of one review run; reruns receive a new value.
 pub const ReviewId = struct {
     bytes: [16]u8,
 
+    /// Admit only lowercase canonical RFC 4122 UUIDv4 text.
     pub fn parse(text: []const u8) IdentityError!ReviewId {
         return .{ .bytes = try parseUuidV4(text) };
     }
 
+    /// Generate UUIDv4 bytes from caller-owned randomness.
     pub fn generate(random: std.Random) ReviewId {
         var value: ReviewId = undefined;
         random.bytes(&value.bytes);
@@ -18,22 +28,28 @@ pub const ReviewId = struct {
         return value;
     }
 
+    /// Return the fixed-width lowercase wire representation by value.
     pub fn canonical(self: ReviewId) [36]u8 {
         return formatUuid(self.bytes);
     }
 
+    /// Compare the complete 128-bit nominal identity.
     pub fn eql(self: ReviewId, other: ReviewId) bool {
         return std.mem.eql(u8, &self.bytes, &other.bytes);
     }
 };
 
+/// Local Store namespace for one repository binding, nominally distinct from
+/// `ReviewId` and never inferred from remote URL or serialized in a target.
 pub const ReviewRepositoryId = struct {
     bytes: [16]u8,
 
+    /// Admit only lowercase canonical RFC 4122 UUIDv4 text.
     pub fn parse(text: []const u8) IdentityError!ReviewRepositoryId {
         return .{ .bytes = try parseUuidV4(text) };
     }
 
+    /// Generate an ID for the durable binding owner; lookup code never calls it.
     pub fn generate(random: std.Random) ReviewRepositoryId {
         var value: ReviewRepositoryId = undefined;
         random.bytes(&value.bytes);
@@ -42,18 +58,22 @@ pub const ReviewRepositoryId = struct {
         return value;
     }
 
+    /// Return the fixed-width lowercase wire representation by value.
     pub fn canonical(self: ReviewRepositoryId) [36]u8 {
         return formatUuid(self.bytes);
     }
 
+    /// Compare the complete 128-bit nominal identity.
     pub fn eql(self: ReviewRepositoryId, other: ReviewRepositoryId) bool {
         return std.mem.eql(u8, &self.bytes, &other.bytes);
     }
 };
 
+/// Owned SHA-256 value with an algorithm-qualified wire spelling.
 pub const Sha256Digest = struct {
     bytes: [32]u8,
 
+    /// Parse exactly `sha256:` plus 64 lowercase hexadecimal digits.
     pub fn parse(text: []const u8) DigestError!Sha256Digest {
         if (text.len != 71 or !std.mem.eql(u8, text[0..7], "sha256:")) return error.InvalidDigest;
         var value: Sha256Digest = undefined;
@@ -65,12 +85,14 @@ pub const Sha256Digest = struct {
         return value;
     }
 
+    /// Hash the caller-selected exact byte preimage without normalization.
     pub fn hash(bytes: []const u8) Sha256Digest {
         var value: Sha256Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &value.bytes, .{});
         return value;
     }
 
+    /// Return the fixed-width algorithm-qualified representation by value.
     pub fn canonical(self: Sha256Digest) [71]u8 {
         var out: [71]u8 = undefined;
         @memcpy(out[0..7], "sha256:");
@@ -81,6 +103,7 @@ pub const Sha256Digest = struct {
         return out;
     }
 
+    /// Compare all digest bytes with timing-safe equality.
     pub fn eql(self: Sha256Digest, other: Sha256Digest) bool {
         return std.crypto.timing_safe.eql([32]u8, self.bytes, other.bytes);
     }

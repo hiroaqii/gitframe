@@ -1,17 +1,29 @@
+//! Read-only boundary from a machine-local physical Git repository locator to
+//! an already-issued durable `ReviewRepositoryId`.
+//!
+//! This module defines no registry path, storage, locking, or ID issuance.
+
 const std = @import("std");
 const identity = @import("identity.zig");
 
+/// Nominal durable Store namespace returned only by a successful lookup.
 pub const ReviewRepositoryId = identity.ReviewRepositoryId;
 
+/// Machine-local identity copied from the opened Git common-directory
+/// descriptor. It is neither portable nor serialized and owns no path or fd.
 pub const GitCommonDirectoryLocator = struct {
+    /// Platform filesystem device identity, meaningful only on this machine.
     device: u64,
+    /// Inode of the common directory on `device` at descriptor-open time.
     inode: u64,
 
+    /// Compare both physical descriptor identity components.
     pub fn eql(self: GitCommonDirectoryLocator, other: GitCommonDirectoryLocator) bool {
         return self.device == other.device and self.inode == other.inode;
     }
 };
 
+/// Complete result of one registry lookup; failures never issue a replacement ID.
 pub const RepositoryBindingResult = union(enum) {
     bound: ReviewRepositoryId,
     unbound,
@@ -19,14 +31,20 @@ pub const RepositoryBindingResult = union(enum) {
     registry_unavailable,
 };
 
+/// Borrowed synchronous lookup interface implemented by the durable Store owner.
 pub const RepositoryBindingRegistry = struct {
+    /// Opaque implementation state borrowed for each `resolve` call.
     context: *anyopaque,
+    /// Static or otherwise caller-lived dispatch table borrowed with `context`.
     vtable: *const VTable,
 
+    /// Read-only implementation contract; returning malformed bound bytes is
+    /// converted to `registry_invalid` by the outer interface.
     pub const VTable = struct {
         resolve: *const fn (context: *anyopaque, locator: GitCommonDirectoryLocator) RepositoryBindingResult,
     };
 
+    /// Look up an already-issued nominal repository ID and fail closed.
     pub fn resolve(self: RepositoryBindingRegistry, locator: GitCommonDirectoryLocator) RepositoryBindingResult {
         const result = self.vtable.resolve(self.context, locator);
         return switch (result) {

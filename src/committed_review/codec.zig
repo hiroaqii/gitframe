@@ -1,3 +1,8 @@
+//! Strict parser, cross-artifact validator, and canonical writer for v1.
+//!
+//! Parsers reject unknown/duplicate/missing fields and return one arena owner
+//! for every borrowed slice. Writers fix compact field order and final-LF bytes.
+
 const std = @import("std");
 const anchor_mod = @import("anchor.zig");
 const artifact = @import("artifact.zig");
@@ -6,8 +11,10 @@ const limits = @import("limits.zig");
 const strict = @import("strict_json.zig");
 const target_mod = @import("target.zig");
 
+/// Unified bounded syntax/value/allocation failure set for v1 artifacts.
 pub const ParseError = strict.ParseError;
 
+/// Construct the owned parse result type for an artifact value `T`.
 pub fn Parsed(comptime T: type) type {
     return struct {
         arena: std.heap.ArenaAllocator,
@@ -15,6 +22,7 @@ pub fn Parsed(comptime T: type) type {
 
         const Self = @This();
 
+        /// Release the arena backing every slice in `value`.
         pub fn deinit(self: *Self) void {
             self.arena.deinit();
             self.* = undefined;
@@ -22,18 +30,22 @@ pub fn Parsed(comptime T: type) type {
     };
 }
 
+/// Strictly parse a bounded immutable producer findings payload.
 pub fn parseFindingSet(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Parsed(artifact.FindingSet) {
     return parseArtifact(artifact.FindingSet, allocator, bytes, limits.max_artifact_bytes, parseFindingSetValue);
 }
 
+/// Strictly parse a bounded immutable run manifest.
 pub fn parseManifest(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Parsed(artifact.ReviewRunManifest) {
     return parseArtifact(artifact.ReviewRunManifest, allocator, bytes, limits.max_manifest_bytes, parseManifestValue);
 }
 
+/// Strictly parse bounded mutable draft state.
 pub fn parseDraft(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Parsed(artifact.ReviewDraftState) {
     return parseArtifact(artifact.ReviewDraftState, allocator, bytes, limits.max_artifact_bytes, parseDraftValue);
 }
 
+/// Strictly parse a bounded immutable terminal result.
 pub fn parseResult(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Parsed(artifact.RevisionReviewResult) {
     return parseArtifact(artifact.RevisionReviewResult, allocator, bytes, limits.max_artifact_bytes, parseResultValue);
 }
@@ -278,7 +290,9 @@ fn parseResultValue(parser: *strict.Parser) ParseError!artifact.RevisionReviewRe
     };
 }
 
-fn parseTarget(parser: *strict.Parser) ParseError!target_mod.CommittedReviewTarget {
+/// Parse the shared five-field target object from the current strict parser.
+/// Command requests and durable artifacts use this same structural admission.
+pub fn parseTarget(parser: *strict.Parser) ParseError!target_mod.CommittedReviewTarget {
     try parser.beginObject();
     var seen: u32 = 0;
     var object_format: ?target_mod.ObjectFormat = null;
@@ -625,6 +639,7 @@ fn parseResultEnum(text: []const u8) ParseError!artifact.ReviewResultValue {
     return error.InvalidValue;
 }
 
+/// Cross-artifact mismatch; distinct from standalone JSON/value admission.
 pub const ValidationError = error{
     SchemaMismatch,
     ReviewIdMismatch,
@@ -641,6 +656,7 @@ pub const ValidationError = error{
     NeedsChangesEvidenceMissing,
 };
 
+/// Bind a manifest to the exact findings bytes and decoded finding set.
 pub fn validateManifestFindingSet(
     manifest: *const artifact.ReviewRunManifest,
     exact_findings_bytes: []const u8,
@@ -658,6 +674,7 @@ pub fn validateManifestFindingSet(
     }
 }
 
+/// Bind draft state to one admitted immutable finding set and exact digest.
 pub fn validateDraftAgainst(
     draft: *const artifact.ReviewDraftState,
     finding_set: *const artifact.FindingSet,
@@ -674,6 +691,7 @@ pub fn validateDraftAgainst(
     try validateDispositionSnapshot(draft.finding_dispositions, finding_set);
 }
 
+/// Bind a terminal result to one admitted immutable finding set and digest.
 pub fn validateResultAgainst(
     result: *const artifact.RevisionReviewResult,
     finding_set: *const artifact.FindingSet,
@@ -749,6 +767,7 @@ fn hasAcceptedFinding(dispositions: []const artifact.FindingDisposition) bool {
     return false;
 }
 
+/// Allocate canonical FindingSet JSON including its final LF.
 pub fn writeFindingSetAlloc(allocator: std.mem.Allocator, value: *const artifact.FindingSet) ParseError![]u8 {
     try validateFindingSetValue(value);
     const buffer = try allocator.alloc(u8, limits.max_artifact_bytes);
@@ -763,6 +782,7 @@ pub fn writeFindingSetAlloc(allocator: std.mem.Allocator, value: *const artifact
     return try allocator.realloc(buffer, writer.buffered().len);
 }
 
+/// Allocate canonical manifest JSON including its final LF.
 pub fn writeManifestAlloc(allocator: std.mem.Allocator, value: *const artifact.ReviewRunManifest) ParseError![]u8 {
     try validateManifestValue(value);
     const buffer = try allocator.alloc(u8, limits.max_manifest_bytes);
@@ -774,6 +794,7 @@ pub fn writeManifestAlloc(allocator: std.mem.Allocator, value: *const artifact.R
     return try allocator.realloc(buffer, writer.buffered().len);
 }
 
+/// Allocate canonical draft JSON including its final LF.
 pub fn writeDraftAlloc(allocator: std.mem.Allocator, value: *const artifact.ReviewDraftState) ParseError![]u8 {
     try validateDraftValue(value);
     const buffer = try allocator.alloc(u8, limits.max_artifact_bytes);
@@ -785,6 +806,7 @@ pub fn writeDraftAlloc(allocator: std.mem.Allocator, value: *const artifact.Revi
     return try allocator.realloc(buffer, writer.buffered().len);
 }
 
+/// Allocate canonical result JSON including its final LF.
 pub fn writeResultAlloc(allocator: std.mem.Allocator, value: *const artifact.RevisionReviewResult) ParseError![]u8 {
     try validateResultValue(value);
     const buffer = try allocator.alloc(u8, limits.max_artifact_bytes);
@@ -1000,7 +1022,9 @@ fn writeResult(
     try stringify.endObject();
 }
 
-fn writeTarget(stringify: *std.json.Stringify, value: *const target_mod.CommittedReviewTarget) !void {
+/// Write the shared canonical target object into an enclosing JSON writer.
+/// This emits no surrounding field name or final LF.
+pub fn writeTarget(stringify: *std.json.Stringify, value: *const target_mod.CommittedReviewTarget) !void {
     try stringify.beginObject();
     try fieldString(stringify, "object_format", objectFormatName(value.object_format));
     try fieldString(stringify, "source_kind", sourceKindName(value.source_kind));

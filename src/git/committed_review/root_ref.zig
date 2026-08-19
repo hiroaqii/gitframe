@@ -1,3 +1,9 @@
+//! Bounded descriptor read for one-level `$GIT_DIR/<atom>` root/pseudo-refs.
+//!
+//! Callers may probe only a single atom without `/`. Slash-containing names
+//! belong to explicitly admitted `refs/*` namespaces and are never translated
+//! into an arbitrary path beneath `$GIT_DIR`.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const root_capability = @import("../../repo/root_capability.zig");
@@ -5,6 +11,7 @@ const root_capability = @import("../../repo/root_capability.zig");
 const max_record_bytes: usize = 8 * 1024;
 const max_root_ref_bytes: usize = 2 * (max_record_bytes + 1);
 
+/// Owned interpretation of one root-ref record.
 pub const Candidate = union(enum) {
     oid: []u8,
     symbolic_ref: []u8,
@@ -17,22 +24,27 @@ pub const Candidate = union(enum) {
     }
 };
 
+/// At most two owned candidates from one bounded probe. A third logical record
+/// closes as `ambiguous` instead of growing an unbounded collection.
 pub const CandidateList = struct {
     items: [2]Candidate = undefined,
     len: usize = 0,
 
+    /// Release all candidate byte allocations.
     pub fn deinit(self: *CandidateList, allocator: std.mem.Allocator) void {
         for (self.items[0..self.len]) |*item| item.deinit(allocator);
         self.len = 0;
     }
 };
 
+/// Complete root-ref read terminal, separate from later object resolution.
 pub const ProbeResult = union(enum) {
     absent,
     candidates: CandidateList,
     ambiguous,
     failed,
 
+    /// Release candidate allocations, if any, and reset to an empty terminal.
     pub fn deinit(self: *ProbeResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .candidates => |*list| list.deinit(allocator),
@@ -45,7 +57,8 @@ pub const ProbeResult = union(enum) {
 /// Read one `$GIT_DIR/<atom>` candidate through a no-follow, regular-file-only
 /// descriptor path. The caller obtains `absolute_path` from bounded
 /// `git rev-parse --path-format=absolute --git-path <atom>` and only calls this
-/// for a one-level atom.
+/// for a one-level atom. This function does not accept or derive a slash path
+/// from an endpoint name; `absolute_path` is only the already-bounded file.
 pub fn probe(
     allocator: std.mem.Allocator,
     io: std.Io,

@@ -1,14 +1,21 @@
+//! Descriptor-authorized discovery of a Git common-directory physical identity.
+//!
+//! Git supplies a bounded canonical absolute path; this module opens it with
+//! no-follow component traversal and returns only copied device/inode values.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const binding = @import("../committed_review/repository_binding.zig");
 const git_command = @import("command.zig");
 const root_capability = @import("../repo/root_capability.zig");
 
+/// Machine-local value returned after descriptor-authorized discovery.
 pub const GitCommonDirectoryLocator = binding.GitCommonDirectoryLocator;
 
 const stdout_capture_bytes: usize = std.Io.Dir.max_path_bytes + 1;
 const stderr_capture_bytes: usize = 8 * 1024;
 
+/// Operation-specific locator terminals; no failure contains a partial locator.
 pub const RepositoryLocatorFailure = enum {
     invalid_repository,
     invalid_common_directory,
@@ -17,11 +24,14 @@ pub const RepositoryLocatorFailure = enum {
     unsupported_platform,
 };
 
+/// Complete physical locator or one locator-specific terminal.
 pub const RepositoryLocatorResult = union(enum) {
     locator: GitCommonDirectoryLocator,
     failure: RepositoryLocatorFailure,
 };
 
+/// Resolve and open the common directory for the borrowed repository context.
+/// Child captures and descriptors are released before the value result escapes.
 pub fn locate(
     allocator: std.mem.Allocator,
     io: std.Io,

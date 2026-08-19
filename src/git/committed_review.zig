@@ -17,7 +17,9 @@ pub const SourceKind = wire.SourceKind;
 pub const CommittedReviewTarget = wire.CommittedReviewTarget;
 pub const CodeAnchor = wire.CodeAnchor;
 
+/// All-or-nothing stdout cap for one local non-authoritative patch projection.
 pub const max_projection_bytes: usize = wire.limits.max_projection_bytes;
+/// Maximum committed blob bytes admitted before anchor range selection.
 pub const max_anchor_blob_bytes: usize = wire.limits.max_projection_bytes;
 const stderr_capture_bytes: usize = 8 * 1024;
 const oid_record_slack: usize = 2;
@@ -29,12 +31,16 @@ const strict_prefix = [_][]const u8{
     "--no-optional-locks",
 };
 
+/// Borrowed caller policy for the target-only resolver. Both endpoints use the
+/// closed commit-ish grammar and are pinned before merge-base calculation.
 pub const TargetInput = struct {
     source_kind: SourceKind,
     base: []const u8,
     head: []const u8,
 };
 
+/// Target-resolution-only terminals. Projection, ahead, and anchor failures
+/// cannot appear here, and no variant carries a partial target.
 pub const TargetResolutionFailure = enum {
     invalid_repository,
     unsupported_object_format,
@@ -54,40 +60,51 @@ pub const TargetResolutionFailure = enum {
     git_command_failed,
 };
 
+/// Complete pinned target or one target-resolution-specific terminal.
 pub const TargetResolutionResult = union(enum) {
     target: CommittedReviewTarget,
     failure: TargetResolutionFailure,
 };
 
+/// Display-only graph-count terminals for a previously pinned target.
 pub const AheadDisplayFailure = enum {
     ahead_graph_unavailable,
     ahead_git_command_failed,
 };
 
+/// Ahead count or one operation-specific graph terminal.
 pub const AheadDisplayResult = union(enum) {
     count: u64,
     failure: AheadDisplayFailure,
 };
 
+/// Local, non-authoritative materialization for one exact target.
 pub const CommittedDiffProjection = struct {
     target: CommittedReviewTarget,
+    /// Allocator-owned exact Git stdout bytes. The owner transfers across the
+    /// process adapter unchanged and releases them with `deinit`.
     patch_bytes: []u8,
 
+    /// Release the complete patch allocation.
     pub fn deinit(self: *CommittedDiffProjection, allocator: std.mem.Allocator) void {
         allocator.free(self.patch_bytes);
         self.* = undefined;
     }
 };
 
+/// Stable projection taxonomy: stdout overflow alone is `too_large`; every
+/// other Git/process/materialization failure is `git_command_failed`.
 pub const ProjectionFailure = enum {
     projection_too_large,
     projection_git_command_failed,
 };
 
+/// Complete owned projection or one projection-specific terminal.
 pub const ProjectionResult = union(enum) {
     projection: CommittedDiffProjection,
     failure: ProjectionFailure,
 
+    /// Release projection bytes when present.
     pub fn deinit(self: *ProjectionResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .projection => |*projection| projection.deinit(allocator),
@@ -97,6 +114,8 @@ pub const ProjectionResult = union(enum) {
     }
 };
 
+/// Exact committed-blob anchor terminals, deliberately separate from target
+/// and projection failure vocabularies.
 pub const CodeAnchorFailure = enum {
     invalid_anchor,
     path_not_found,
@@ -109,20 +128,26 @@ pub const CodeAnchorFailure = enum {
     anchor_git_command_failed,
 };
 
+/// Blob identity and exact selected preimage for a validated `CodeAnchor`.
 pub const ResolvedCodeAnchor = struct {
     blob_oid: ObjectId,
+    /// Allocator-owned exact committed bytes whose SHA-256 equals the anchor's
+    /// `content_digest`; release them with `deinit`.
     selected_bytes: []u8,
 
+    /// Release the selected-byte allocation.
     pub fn deinit(self: *ResolvedCodeAnchor, allocator: std.mem.Allocator) void {
         allocator.free(self.selected_bytes);
         self.* = undefined;
     }
 };
 
+/// Complete owned anchor read or one anchor-specific terminal.
 pub const CodeAnchorResolution = union(enum) {
     resolved: ResolvedCodeAnchor,
     failure: CodeAnchorFailure,
 
+    /// Release selected bytes when the anchor resolved.
     pub fn deinit(self: *CodeAnchorResolution, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .resolved => |*resolved| resolved.deinit(allocator),
@@ -170,6 +195,8 @@ const CandidateSet = struct {
     }
 };
 
+/// Pin base, head, and their exact-one best merge base, then stop. No ahead,
+/// diff, tree, or blob materialization occurs in this operation.
 pub fn resolveTarget(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -242,6 +269,7 @@ fn resolveTargetWithHooks(
     return .{ .target = target };
 }
 
+/// Compute a display-only ahead count from the already pinned target graph.
 pub fn computeAheadDisplay(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -280,6 +308,8 @@ pub fn computeAheadDisplay(
     return .{ .count = count };
 }
 
+/// Materialize the shared checkout-independent committed patch. Versioned
+/// attributes come from `target.head_oid`; worktree/index content is excluded.
 pub fn materializeCommittedProjection(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -331,6 +361,8 @@ fn materializeCommittedProjectionWithGit(
     }
 }
 
+/// Read and validate one anchor against exact committed blob bytes selected by
+/// target side, raw path, 1-based inclusive range, and content digest.
 pub fn resolveCodeAnchor(
     allocator: std.mem.Allocator,
     io: std.Io,

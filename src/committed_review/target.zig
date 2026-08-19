@@ -1,9 +1,16 @@
+//! Portable identity of the committed Git revision pair under review.
+//!
+//! These values describe authority, not a materialized patch or a display
+//! selection. They contain no repository, ref, worktree, or process identity.
+
 const std = @import("std");
 
+/// Object-id width used by every OID in one target.
 pub const ObjectFormat = enum {
     sha1,
     sha256,
 
+    /// Exact lowercase hexadecimal width for this Git object format.
     pub fn oidHexLength(self: ObjectFormat) usize {
         return switch (self) {
             .sha1 => 40,
@@ -12,14 +19,20 @@ pub const ObjectFormat = enum {
     }
 };
 
+/// Versioned origin semantics for a target. `branch_range` means an explicit
+/// base and head resolved to commits plus their exact-one best merge base.
 pub const SourceKind = enum {
     branch_range,
 };
 
+/// Inline-owned canonical lowercase hexadecimal Git object ID.
 pub const ObjectId = struct {
+    /// Fixed-capacity storage; only `bytes[0..len]` is initialized authority.
     bytes: [64]u8 = [_]u8{0} ** 64,
+    /// Number of authoritative hexadecimal bytes, fixed by `ObjectFormat`.
     len: u8 = 0,
 
+    /// Parse one full OID; abbreviations are never portable target authority.
     pub fn parse(format: ObjectFormat, text: []const u8) error{InvalidObjectId}!ObjectId {
         if (text.len != format.oidHexLength()) return error.InvalidObjectId;
         var result: ObjectId = .{};
@@ -31,19 +44,23 @@ pub const ObjectId = struct {
         return result;
     }
 
+    /// Borrow the initialized canonical OID bytes from this value.
     pub fn slice(self: *const ObjectId) []const u8 {
         std.debug.assert(self.len <= self.bytes.len);
         return self.bytes[0..self.len];
     }
 
+    /// Borrow at most seven leading bytes for non-authoritative display only.
     pub fn short(self: *const ObjectId) []const u8 {
         return self.slice()[0..@min(@as(usize, self.len), 7)];
     }
 
+    /// Compare the complete initialized hexadecimal representation.
     pub fn eql(self: *const ObjectId, other: *const ObjectId) bool {
         return std.mem.eql(u8, self.slice(), other.slice());
     }
 
+    /// Check both canonical spelling and the exact width of `format`.
     pub fn validFor(self: *const ObjectId, format: ObjectFormat) bool {
         if (self.len != format.oidHexLength()) return false;
         for (self.slice()) |byte| if (!isLowerHex(byte)) return false;
@@ -51,19 +68,29 @@ pub const ObjectId = struct {
     }
 };
 
+/// Complete portable authority for one committed branch-range review.
+/// Equality is exactly these five fields; patch bytes, labels, ahead counts,
+/// repository identity, and provider state are deliberately absent.
 pub const CommittedReviewTarget = struct {
     object_format: ObjectFormat,
+    /// Determines how the OIDs were pinned, not which UI mode displays them.
     source_kind: SourceKind,
+    /// Commit selected by caller base policy before merge-base calculation.
     base_oid: ObjectId,
+    /// Exact reviewed commit; committed attributes are read from this tree.
     head_oid: ObjectId,
+    /// Exact-one best merge base used as the left endpoint of the projection.
+    /// It may differ from `base_oid` when the selected base is not an ancestor.
     diff_base_oid: ObjectId,
 
+    /// Enforce format-width and lowercase invariants for all three OIDs.
     pub fn validate(self: *const CommittedReviewTarget) error{InvalidTarget}!void {
         if (!self.base_oid.validFor(self.object_format) or
             !self.head_oid.validFor(self.object_format) or
             !self.diff_base_oid.validFor(self.object_format)) return error.InvalidTarget;
     }
 
+    /// Structural portable equality; no local projection data participates.
     pub fn eql(self: *const CommittedReviewTarget, other: *const CommittedReviewTarget) bool {
         return self.object_format == other.object_format and
             self.source_kind == other.source_kind and

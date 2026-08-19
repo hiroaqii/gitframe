@@ -1,18 +1,32 @@
+//! Closed v1 grammar for commit-ish endpoints admitted by strict resolution.
+//!
+//! The parser recognizes a bounded base token followed only by enumerated
+//! ancestry/commit-peel suffixes; it does not delegate arbitrary extended SHA
+//! syntax to Git.
+
 const std = @import("std");
 
+/// Maximum raw bytes in one admitted endpoint expression.
 pub const max_input_bytes: usize = 4096;
+/// Maximum number of explicitly parsed ancestry/peel suffix operations.
 pub const max_suffixes: usize = 64;
 
+/// The input is outside the closed grammar; it is not a Git resolution result.
 pub const ParseError = error{UnsupportedCommitish};
 
 /// A fully preflighted member of the v1 closed commit-ish language. `base`
 /// and `suffix_text` borrow the caller's input; no unvalidated bytes are ever
 /// passed to an object command.
 pub const Parsed = struct {
+    /// Borrowed initial atom/OID/ref candidate before any suffix operation.
     base: []const u8,
+    /// Borrowed, fully validated concatenation of suffix operations.
     suffix_text: []const u8,
+    /// Number of suffix operations, bounded by `max_suffixes`.
     suffix_count: usize,
 
+    /// Whether the entire base token could be an OID candidate. Width and
+    /// ambiguity are checked later against the repository object format.
     pub fn baseIsHex(self: Parsed) bool {
         if (self.base.len == 0) return false;
         for (self.base) |byte| if (!std.ascii.isHex(byte)) return false;
@@ -20,6 +34,7 @@ pub const Parsed = struct {
     }
 };
 
+/// Fully consume one expression or reject it before any Git object command.
 pub fn parse(input: []const u8) ParseError!Parsed {
     if (input.len == 0 or input.len > max_input_bytes) return error.UnsupportedCommitish;
     if (input[0] == '-') return error.UnsupportedCommitish;
