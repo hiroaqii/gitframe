@@ -111,9 +111,16 @@ pub fn sourceFooterLabel(source: diff_source.SourceMode) ?[]const u8 {
         .stdin => "stdin",
         .pager => "pager",
         .patch_file => "patch",
-        .range => "range",
+        .range => |range| range,
         .no_index => "difftool",
     };
+}
+
+test "source footer label keeps the explicit commit range" {
+    try std.testing.expectEqualStrings(
+        "main...HEAD",
+        sourceFooterLabel(.{ .range = "main...HEAD" }).?,
+    );
 }
 
 pub const StateTone = enum {

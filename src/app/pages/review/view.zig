@@ -27,11 +27,15 @@ pub const Context = struct {
     pub fn footer(self: Context) diff_surface.view.FooterView {
         const navigation = navigationView(self);
         var resolver = navigation.resolver();
-        return diff_surface.view.footer(.{
+        var result = diff_surface.view.footer(.{
             .surface = self.page.readSurface(.{ .range = "review" }, self.layout),
             .auto_reload_enabled = false,
             .selection_action_visible = navigation.bodyView(&resolver).retainedSelectionActionAvailable(),
         });
+        // Review's BASE … HEAD header already identifies the comparison.
+        // Do not expose its internal `.range = "review"` surface as footer UI.
+        result.source_label = null;
+        return result;
     }
 };
 
@@ -406,6 +410,7 @@ test "Review page header binds the accepted pair to repository and target" {
         .layout = .{ .width = 80, .height = 12 },
     };
 
+    try std.testing.expect(context.footer().source_label == null);
     const accepted = pageHeaderPresentation(context).?;
     const text = (try page_header.formatAlloc(allocator, accepted, 80)).?;
     defer allocator.free(text);
