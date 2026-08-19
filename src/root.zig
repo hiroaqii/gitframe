@@ -1,6 +1,7 @@
 const app = @import("app.zig");
 const build_options = @import("build_options");
 pub const config = @import("config.zig");
+pub const committed_review = @import("committed_review.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
 pub const theme = @import("theme");
@@ -84,6 +85,7 @@ test {
     _ = @import("app/view_primitives.zig");
     _ = @import("config.zig");
     _ = @import("content_fingerprint.zig");
+    _ = @import("committed_review.zig");
     _ = @import("context.zig");
     _ = @import("context_export.zig");
     _ = @import("draw");

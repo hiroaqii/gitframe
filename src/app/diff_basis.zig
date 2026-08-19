@@ -5,26 +5,11 @@
 //! changing consumers back to an untagged branch-only contract.
 
 const std = @import("std");
+const committed_review = @import("../committed_review.zig");
 const git_ref = @import("../git/ref.zig");
 
 /// Git object id storage for SHA-1 (40 hex) and SHA-256 (64 hex) repositories.
-pub const Oid = struct {
-    bytes: [64]u8 = [_]u8{0} ** 64,
-    len: u8 = 0,
-
-    pub fn slice(self: *const Oid) []const u8 {
-        std.debug.assert(self.len <= self.bytes.len);
-        return self.bytes[0..self.len];
-    }
-
-    pub fn short(self: *const Oid) []const u8 {
-        return self.slice()[0..@min(@as(usize, self.len), 7)];
-    }
-
-    pub fn eql(self: *const Oid, other: *const Oid) bool {
-        return std.mem.eql(u8, self.slice(), other.slice());
-    }
-};
+pub const Oid = committed_review.ObjectId;
 
 pub const BaseKind = git_ref.BranchKind;
 

@@ -1,0 +1,318 @@
+const std = @import("std");
+const limits = @import("limits.zig");
+
+pub const ParseError = error{
+    ArtifactTooLarge,
+    InvalidJson,
+    UnsupportedSchemaVersion,
+    UnknownField,
+    DuplicateField,
+    MissingField,
+    InvalidType,
+    InvalidValue,
+    LimitExceeded,
+    DuplicateFindingId,
+    DuplicateDispositionId,
+    DuplicateRelatedFindingId,
+} || std.mem.Allocator.Error;
+
+pub const Parser = struct {
+    scanner: std.json.Scanner,
+    allocator: std.mem.Allocator,
+    depth: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Parser {
+        return .{
+            .scanner = std.json.Scanner.initCompleteInput(allocator, bytes),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Parser) void {
+        self.scanner.deinit();
+        self.* = undefined;
+    }
+
+    pub fn beginObject(self: *Parser) ParseError!void {
+        if ((try self.next()) != .object_begin) return error.InvalidType;
+    }
+
+    pub fn beginArray(self: *Parser) ParseError!void {
+        if ((try self.next()) != .array_begin) return error.InvalidType;
+    }
+
+    /// Returns null after consuming the matching object end.
+    pub fn nextObjectKey(self: *Parser) ParseError!?[]const u8 {
+        return switch (try self.next()) {
+            .allocated_string => |value| value,
+            .object_end => null,
+            else => error.InvalidType,
+        };
+    }
+
+    /// Returns false after consuming the matching array end. A true result
+    /// means the next object begin was already consumed.
+    pub fn nextArrayObject(self: *Parser) ParseError!bool {
+        return switch (try self.next()) {
+            .object_begin => true,
+            .array_end => false,
+            else => error.InvalidType,
+        };
+    }
+
+    pub fn string(self: *Parser) ParseError![]const u8 {
+        return switch (try self.next()) {
+            .allocated_string => |value| value,
+            else => error.InvalidType,
+        };
+    }
+
+    /// Returns null after consuming the matching array end; otherwise returns
+    /// one complete decoded string element.
+    pub fn stringOrArrayEnd(self: *Parser) ParseError!?[]const u8 {
+        return switch (try self.next()) {
+            .allocated_string => |value| value,
+            .array_end => null,
+            else => error.InvalidType,
+        };
+    }
+
+    pub fn unsigned(self: *Parser, comptime T: type) ParseError!T {
+        const bytes = switch (try self.next()) {
+            .allocated_number => |value| value,
+            else => return error.InvalidType,
+        };
+        if (bytes.len == 0) return error.InvalidValue;
+        if (bytes.len > 1 and bytes[0] == '0') return error.InvalidValue;
+        for (bytes) |byte| if (byte < '0' or byte > '9') return error.InvalidValue;
+        return std.fmt.parseInt(T, bytes, 10) catch error.InvalidValue;
+    }
+
+    pub fn endDocument(self: *Parser) ParseError!void {
+        if ((try self.next()) != .end_of_document or self.depth != 0) return error.InvalidJson;
+    }
+
+    fn next(self: *Parser) ParseError!std.json.Token {
+        const token = self.scanner.nextAllocMax(
+            self.allocator,
+            .alloc_always,
+            limits.max_json_token_bytes,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ValueTooLong => return error.LimitExceeded,
+            error.SyntaxError, error.UnexpectedEndOfInput => return error.InvalidJson,
+        };
+
+        switch (token) {
+            .object_begin, .array_begin => {
+                self.depth += 1;
+                if (self.depth > limits.max_json_depth) return error.LimitExceeded;
+            },
+            .object_end, .array_end => {
+                if (self.depth == 0) return error.InvalidJson;
+                self.depth -= 1;
+            },
+            else => {},
+        }
+        return token;
+    }
+};
+
+pub fn markSeen(seen: *u32, bit: u5) ParseError!void {
+    const mask = @as(u32, 1) << bit;
+    if ((seen.* & mask) != 0) return error.DuplicateField;
+    seen.* |= mask;
+}
+
+pub fn requireFields(seen: u32, required: u32) ParseError!void {
+    if ((seen & required) != required) return error.MissingField;
+}
+
+pub fn validateSchemaVersion(value: u64) ParseError!void {
+    if (value != limits.schema_version) return error.UnsupportedSchemaVersion;
+}
+
+pub fn validateFindingId(text: []const u8) ParseError!void {
+    if (text.len == 0 or text.len > limits.max_finding_id_bytes) return error.InvalidValue;
+    if (!std.ascii.isAlphanumeric(text[0])) return error.InvalidValue;
+    for (text[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and byte != '-') {
+            return error.InvalidValue;
+        }
+    }
+}
+
+pub fn validateText(text: []const u8, maximum: usize, multiline: bool) ParseError!void {
+    if (text.len == 0 or text.len > maximum) return error.LimitExceeded;
+    var iterator = (std.unicode.Utf8View.init(text) catch return error.InvalidValue).iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (codepoint == 0x00 or codepoint == 0x1b or codepoint == 0x0d or
+            codepoint == 0x7f or (codepoint >= 0x80 and codepoint <= 0x9f))
+        {
+            return error.InvalidValue;
+        }
+        if (codepoint < 0x20) {
+            if (multiline and (codepoint == '\n' or codepoint == '\t')) continue;
+            return error.InvalidValue;
+        }
+    }
+}
+
+pub fn validateTimestamp(text: []const u8) ParseError!void {
+    if (text.len != 20 or text[4] != '-' or text[7] != '-' or text[10] != 'T' or
+        text[13] != ':' or text[16] != ':' or text[19] != 'Z')
+    {
+        return error.InvalidValue;
+    }
+    const year = try fixedDecimal(u16, text[0..4]);
+    const month = try fixedDecimal(u8, text[5..7]);
+    const day = try fixedDecimal(u8, text[8..10]);
+    const hour = try fixedDecimal(u8, text[11..13]);
+    const minute = try fixedDecimal(u8, text[14..16]);
+    const second = try fixedDecimal(u8, text[17..19]);
+    if (year == 0 or month == 0 or month > 12 or hour > 23 or minute > 59 or second > 59) {
+        return error.InvalidValue;
+    }
+    const days = [_]u8{ 31, if (isLeapYear(year)) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (day == 0 or day > days[month - 1]) return error.InvalidValue;
+}
+
+pub fn decodeRawPath(allocator: std.mem.Allocator, encoded: []const u8) ParseError![]const u8 {
+    if (encoded.len == 0 or encoded.len > limits.max_raw_path_encoded_bytes) return error.LimitExceeded;
+    for (encoded) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidValue;
+    }
+    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(encoded) catch return error.InvalidValue;
+    if (decoded_len == 0 or decoded_len > limits.max_raw_path_bytes) return error.LimitExceeded;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(decoded);
+    std.base64.url_safe_no_pad.Decoder.decode(decoded, encoded) catch return error.InvalidValue;
+    if (std.mem.indexOfScalar(u8, decoded, 0) != null) return error.InvalidValue;
+
+    const canonical_len = std.base64.url_safe_no_pad.Encoder.calcSize(decoded.len);
+    if (canonical_len != encoded.len) return error.InvalidValue;
+    const canonical = try allocator.alloc(u8, canonical_len);
+    defer allocator.free(canonical);
+    const written = std.base64.url_safe_no_pad.Encoder.encode(canonical, decoded);
+    if (!std.mem.eql(u8, written, encoded)) return error.InvalidValue;
+    return decoded;
+}
+
+fn fixedDecimal(comptime T: type, bytes: []const u8) ParseError!T {
+    for (bytes) |byte| if (byte < '0' or byte > '9') return error.InvalidValue;
+    return std.fmt.parseInt(T, bytes, 10) catch error.InvalidValue;
+}
+
+fn isLeapYear(year: u16) bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
+}
+
+test "strict JSON parser rejects non-integer JSON numbers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator(), "{\"n\":1e0}");
+    defer parser.deinit();
+    try parser.beginObject();
+    try std.testing.expectEqualStrings("n", (try parser.nextObjectKey()).?);
+    try std.testing.expectError(error.InvalidValue, parser.unsigned(u64));
+}
+
+test "text policy preserves Unicode and multiline LF TAB but rejects terminal controls" {
+    try validateText("東京\n\tbody", limits.max_body_bytes, true);
+    try std.testing.expectError(error.InvalidValue, validateText("single\nline", limits.max_short_text_bytes, false));
+    try std.testing.expectError(error.InvalidValue, validateText("escape\x1b[31m", limits.max_body_bytes, true));
+    try std.testing.expectError(error.InvalidValue, validateText("C1\xc2\x9b", limits.max_body_bytes, true));
+}
+
+test "timestamp validator enforces Gregorian UTC seconds" {
+    try validateTimestamp("2024-02-29T23:59:59Z");
+    try std.testing.expectError(error.InvalidValue, validateTimestamp("2023-02-29T23:59:59Z"));
+    try std.testing.expectError(error.InvalidValue, validateTimestamp("2024-01-01T00:00:60Z"));
+    try std.testing.expectError(error.InvalidValue, validateTimestamp("0000-01-01T00:00:00Z"));
+}
+
+test "raw paths round trip canonical unpadded base64url losslessly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const path = try decodeRawPath(arena.allocator(), "c3JjL_8uemln");
+    try std.testing.expectEqualSlices(u8, "src/\xff.zig", path);
+    try std.testing.expectError(error.InvalidValue, decodeRawPath(arena.allocator(), "c3JjL_8uemln="));
+}
+
+test "JSON depth and unsigned integers accept exact limits and reject plus one" {
+    var exact_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer exact_arena.deinit();
+    var exact = Parser.init(exact_arena.allocator(), "[[[[[[[[4294967295]]]]]]]]");
+    defer exact.deinit();
+    for (0..limits.max_json_depth) |_| try exact.beginArray();
+    try std.testing.expectEqual(std.math.maxInt(u32), try exact.unsigned(u32));
+    for (0..limits.max_json_depth) |_| try std.testing.expect((try exact.next()) == .array_end);
+    try exact.endDocument();
+
+    var deep_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer deep_arena.deinit();
+    var deep = Parser.init(deep_arena.allocator(), "[[[[[[[[[0]]]]]]]]]");
+    defer deep.deinit();
+    for (0..limits.max_json_depth) |_| try deep.beginArray();
+    try std.testing.expectError(error.LimitExceeded, deep.beginArray());
+
+    var overflow_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer overflow_arena.deinit();
+    var overflow = Parser.init(overflow_arena.allocator(), "4294967296");
+    defer overflow.deinit();
+    try std.testing.expectError(error.InvalidValue, overflow.unsigned(u32));
+}
+
+test "finite decoded text and raw path bounds accept exact and reject plus one" {
+    const allocator = std.testing.allocator;
+    const short_exact = try allocator.alloc(u8, limits.max_short_text_bytes);
+    defer allocator.free(short_exact);
+    @memset(short_exact, 'a');
+    try validateText(short_exact, limits.max_short_text_bytes, false);
+    const short_plus_one = try allocator.alloc(u8, limits.max_short_text_bytes + 1);
+    defer allocator.free(short_plus_one);
+    @memset(short_plus_one, 'a');
+    try std.testing.expectError(error.LimitExceeded, validateText(short_plus_one, limits.max_short_text_bytes, false));
+
+    const body_exact = try allocator.alloc(u8, limits.max_body_bytes);
+    defer allocator.free(body_exact);
+    @memset(body_exact, 'b');
+    try validateText(body_exact, limits.max_body_bytes, true);
+    const body_plus_one = try allocator.alloc(u8, limits.max_body_bytes + 1);
+    defer allocator.free(body_plus_one);
+    @memset(body_plus_one, 'b');
+    try std.testing.expectError(error.LimitExceeded, validateText(body_plus_one, limits.max_body_bytes, true));
+
+    const path_exact = try allocator.alloc(u8, limits.max_raw_path_bytes);
+    defer allocator.free(path_exact);
+    @memset(path_exact, 0xff);
+    const encoded_exact = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(path_exact.len));
+    defer allocator.free(encoded_exact);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded_exact, path_exact);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const decoded = try decodeRawPath(arena.allocator(), encoded_exact);
+    try std.testing.expectEqualSlices(u8, path_exact, decoded);
+
+    const path_plus_one = try allocator.alloc(u8, limits.max_raw_path_bytes + 1);
+    defer allocator.free(path_plus_one);
+    @memset(path_plus_one, 0xff);
+    const encoded_plus_one = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(path_plus_one.len));
+    defer allocator.free(encoded_plus_one);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded_plus_one, path_plus_one);
+    try std.testing.expectError(error.LimitExceeded, decodeRawPath(arena.allocator(), encoded_plus_one));
+}
+
+test "JSON Unicode escapes decode to validated UTF-8 without accepting lone surrogates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var valid = Parser.init(arena.allocator(), "\"\\ud83d\\ude00\"");
+    defer valid.deinit();
+    try std.testing.expectEqualStrings("😀", try valid.string());
+    try valid.endDocument();
+
+    var invalid = Parser.init(arena.allocator(), "\"\\ud83d\"");
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidJson, invalid.string());
+}
