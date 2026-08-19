@@ -5,6 +5,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const actions = @import("actions.zig");
+const command_line = @import("command_line.zig");
 const load = @import("load.zig");
 const page = @import("page.zig");
 const push_retry = @import("push_retry.zig");
@@ -81,6 +82,7 @@ pub const Msg = union(enum) {
     changes: changes_message.Msg,
     review: review_input.Msg,
     repository: repository_page.Msg,
+    command_line: command_line.Msg,
     mouse_selection_drag: MouseSelectionContinuation,
     mouse_selection_release: MouseSelectionContinuation,
     drag_auto_scroll_tick: u64,
@@ -213,6 +215,7 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         // The copy handler must resolve and queue the currently visible text
         // before clearing its ephemeral status owner.
         .copy_footer_status,
+        .command_line,
         => true,
         .repository => |repository_msg| switch (repository_msg) {
             .manifest_finished, .branch_finished, .path_history_finished => true,
@@ -234,6 +237,11 @@ test "Repository path history completion preserves root diagnostics while naviga
 
 test "footer status copy preserves its ephemeral payload until update" {
     try std.testing.expect(keepsEphemeralStatus(.copy_footer_status));
+}
+
+test "command line input preserves status until its own terminal decides it" {
+    try std.testing.expect(keepsEphemeralStatus(.{ .command_line = .submit }));
+    try std.testing.expect(keepsEphemeralStatus(.{ .command_line = .{ .insert = '1' } }));
 }
 
 test "undelivered action result releases owned payloads" {

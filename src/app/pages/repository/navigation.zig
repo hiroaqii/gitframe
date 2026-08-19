@@ -114,6 +114,26 @@ pub fn lastSource(viewer: *model.ViewerState, document: *const source.Document, 
     clampSource(viewer, document, geometry);
 }
 
+/// Move to one already-range-checked real source row and center it when the
+/// viewport permits. Horizontal position is preserved except for the same
+/// document/geometry clamp used by every other source navigation path.
+pub fn gotoSourceLine(
+    viewer: *model.ViewerState,
+    document: *const source.Document,
+    line_index: usize,
+    geometry: source_geometry.SourceGeometry,
+) void {
+    std.debug.assert(line_index < document.contentLineCount());
+    viewer.focus = .source;
+    viewer.source_cursor = line_index;
+    clampSource(viewer, document, geometry);
+    viewer.source_vertical_scroll = cursor_viewport.centerCursor(
+        sourceBounds(document, geometry),
+        viewer.source_vertical_scroll,
+        viewer.source_cursor,
+    );
+}
+
 pub fn scrollSourceHorizontal(viewer: *model.ViewerState, document: *const source.Document, delta: isize, geometry: source_geometry.SourceGeometry) void {
     if (delta < 0)
         viewer.source_horizontal_scroll -|= @intCast(-delta)
@@ -277,6 +297,32 @@ test "repository source comfort centers pages and places explicit search in band
     revealMatch(&viewer, &document, .{ .line = 50, .start = 0, .end = 0 }, geometry);
     try std.testing.expectEqual(@as(usize, 50), viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 44), viewer.source_vertical_scroll);
+}
+
+test "repository source line jump centers real rows and preserves horizontal scroll" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(
+        u8,
+        "0123456789abcdef\n" ** 20,
+    );
+    var document = try source.Document.initOwnedOrFree(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const geometry = source_geometry.SourceGeometry.init(.{ .width = 8, .height = 8 }, &document, false);
+    var viewer: model.ViewerState = .{
+        .focus = .source,
+        .source_cursor = 1,
+        .source_vertical_scroll = 0,
+        .source_horizontal_scroll = 5,
+    };
+
+    gotoSourceLine(&viewer, &document, 14, geometry);
+
+    try std.testing.expectEqual(@as(usize, 14), viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 5), viewer.source_horizontal_scroll);
+    try std.testing.expectEqual(
+        cursor_viewport.centerCursor(sourceBounds(&document, geometry), 0, 14),
+        viewer.source_vertical_scroll,
+    );
 }
 
 test "repository source comfort keeps reconciliation minimal and handles tiny viewports" {

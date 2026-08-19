@@ -77,6 +77,8 @@ pub const View = struct {
     repo_picker_mode: bool,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode,
     remote_action_cancelable: bool = false,
+    command_line_active: bool = false,
+    repository_command_available: bool = false,
     keymap: keymap.Effective,
     overlay: *const app_state.OverlayState,
     layout: app_shell_layout.Layout,
@@ -107,11 +109,14 @@ pub const View = struct {
             .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
             .remote_action_cancelable = self.remote_action_cancelable,
+            .command_line_active = self.command_line_active,
+            .repository_command_available = self.repository_command_available,
             .keymap = self.keymap,
         };
     }
 
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
+        if (self.command_line_active) return null;
         if (self.activeDiffSelectionOwner()) |selection| {
             if (selection.active()) switch (selection) {
                 .changes => switch (mouse.type) {

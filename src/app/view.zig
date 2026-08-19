@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const chasen = @import("chasen");
 const ui = @import("chasen_ui");
+const command_line = @import("command_line.zig");
 const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
 const app_actions = @import("actions.zig");
@@ -93,6 +94,7 @@ pub const Context = struct {
     /// Shell notifications temporarily win over the active page diagnostic.
     status: *const app_state.StatusMessage,
     page_status: ?*const app_state.StatusMessage = null,
+    command_line: ?*const command_line.Active = null,
     commit_panel: *const app_commit_panel.State,
     repo_picker: *const app_prompt.RepoPickerState,
     repo_picker_pending_workspace_root: ?[]const u8,
@@ -514,6 +516,7 @@ const FooterProjection = struct {
 /// this projection too, so responsive segment dropping and clipped text cannot
 /// drift away from the mouse hit target.
 pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
+    if (app.command_line != null) return null;
     if (width == 0 or app.active_page == .config) return null;
     if (app.action.spinnerPresentation() != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
@@ -538,6 +541,10 @@ pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
 fn viewFooter(app: Context, surface: *chasen.Surface) void {
     const width = surface.size().width;
     if (width == 0) return;
+    if (app.command_line) |active| {
+        viewCommandLineFooter(active, app.theme, surface);
+        return;
+    }
 
     var footer_key_buffers: [footer_hint_capacity][16]u8 = undefined;
     const hints = footerHints(app, &footer_key_buffers);
@@ -566,6 +573,24 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
         });
         _ = ui.key_hint.draw(&hint_area, 0, 0, hint_items, footerKeyHintOptions(app.theme)) catch {};
     }
+}
+
+fn viewCommandLineFooter(active: *const command_line.Active, palette: theme.Palette, surface: *chasen.Surface) void {
+    const width = surface.size().width;
+    if (width == 0 or surface.size().height == 0) return;
+    const colon_col: u16 = if (width > 1) 1 else 0;
+    draw.copyClippedTextAt(surface, colon_col, 0, ":", palette.style(.prompt)) catch {};
+    const input_col = colon_col + 1;
+    if (input_col >= width) {
+        surface.showCursor(colon_col, 0);
+        return;
+    }
+
+    var input_area = surface.child(.{ .col = input_col, .row = 0, .width = width - input_col, .height = 1 });
+    const text = active.input.slice();
+    const visible = text[view_primitives.inputVisibleStart(text, active.input.cursor, input_area.size().width)..];
+    draw.copyClippedTextAt(&input_area, 0, 0, visible, palette.style(.prompt)) catch {};
+    view_primitives.showInputCursor(&input_area, 0, 0, text, active.input.cursor);
 }
 
 fn projectFooter(
@@ -2047,6 +2072,26 @@ test "footer status target is absent while spinner owns footer" {
     try std.testing.expect(footerStatusTarget(app.context(), 80) == null);
 }
 
+test "footer command input exclusively renders its UTF-8 cursor window" {
+    var app: ShellViewTestHarness = .{ .terminal_size = .{ .width = 8, .height = 8 } };
+    app.status.set("hidden status", .{});
+    try app.command_input.input.insertSlice("12🐈3456789");
+    app.command_line_active = true;
+    const context = app.context();
+    try std.testing.expect(footerStatusTarget(context, 8) == null);
+
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(8, 1);
+    defer ts.deinit();
+    viewFooter(context, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(snapshot[1] == ':');
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "hidden") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "6789") != null);
+}
+
 test "footer shows pending spinner with current status label" {
     var app: ShellViewTestHarness = .{};
     app.remote_cancelable = true;
@@ -2179,6 +2224,8 @@ const ShellViewTestHarness = struct {
     branch_switch: app_state.BranchSwitchState = .{},
     push_confirmation: ?app_state.PushConfirmation = null,
     remote_cancelable: bool = false,
+    command_input: command_line.Active = .{},
+    command_line_active: bool = false,
 
     fn context(self: *const ShellViewTestHarness) Context {
         const navigation: @import("pages/changes/navigation.zig").View = .{
@@ -2214,6 +2261,7 @@ const ShellViewTestHarness = struct {
             .remote_cancelable = self.remote_cancelable,
             .status = &self.status,
             .page_status = &self.changes.status,
+            .command_line = if (self.command_line_active) &self.command_input else null,
             .commit_panel = &self.commit_panel,
             .repo_picker = &self.repo_picker,
             .repo_picker_pending_workspace_root = null,

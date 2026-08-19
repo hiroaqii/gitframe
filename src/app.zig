@@ -9,6 +9,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const initial_selection = @import("app/initial_selection.zig");
+const command_line = @import("app/command_line.zig");
 const app_load = @import("app/load.zig");
 const app_message = @import("app/message.zig");
 const drag_auto_scroll = @import("app/drag_auto_scroll.zig");
@@ -63,6 +64,23 @@ const PageStates = struct {
     config: page.LazyPlaceholder = .{},
 };
 
+const ExecutionContext = union(enum) {
+    repository_source: repository_page.SourceTarget,
+};
+
+const CommandSession = union(enum) {
+    inactive,
+    active: struct {
+        input: command_line.Active,
+        context: ExecutionContext,
+    },
+};
+
+const PendingCommand = struct {
+    submission: command_line.Submission,
+    context: ExecutionContext,
+};
+
 /// Composition of redraw intent for one update cycle: a required frame
 /// always wins over any number of skip requests, and silence means redraw
 /// (the runtime default).
@@ -109,6 +127,7 @@ pub const App = struct {
     overlay: app_state.OverlayState = .{},
     shell_effects_state: shell_effects.State = .{},
     drag_auto_scroll: drag_auto_scroll.State = .{},
+    command_session: CommandSession = .inactive,
 
     const PopupCopyTarget = struct {
         label: []const u8,
@@ -439,6 +458,7 @@ pub const App = struct {
         switch (msg) {
             .switch_page => |target| {
                 self.drag_auto_scroll.clear();
+                self.command_session = .inactive;
                 try self.applyPageCoordinationIntent(
                     ctx,
                     self.pageCoordinator().requestSwitch(self.allocator orelse ctx.allocator(), target),
@@ -509,6 +529,7 @@ pub const App = struct {
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
             .review => |review_msg| _ = try self.updateReview(ctx, review_msg),
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
+            .command_line => |command_msg| self.updateCommandLine(command_msg),
             .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
             .mouse_selection_release => |continuation| try self.updateMouseSelectionRelease(ctx, continuation),
             .drag_auto_scroll_tick => |generation| try self.updateDragAutoScrollTick(ctx, generation),
@@ -615,6 +636,7 @@ pub const App = struct {
             .auto_reload_tick => try self.changesRead().autoReloadTick(ctx),
             .focus_lost => {
                 self.drag_auto_scroll.clear();
+                self.command_session = .inactive;
                 switch (self.active_page) {
                     .changes => self.changesNavigation().clearDiffSelection(),
                     .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
@@ -635,6 +657,7 @@ pub const App = struct {
         if (try self.reviewCoordinator().applyDeferred(ctx) == .skip) self.redraw_plan.requestSkip();
         try self.changesRead().maybeStartQueuedRevalidation(ctx);
         try self.repositoryCoordinator().startPending(ctx);
+        self.reconcileCommandLine();
         const revalidation_queued_before_projection = self.changesRead().hasQueuedFullRevalidation();
         if (self.active_page == .changes) try self.changesRead().ensureProjection(ctx);
         // Boundary inert retention queues its repair revalidation inside
@@ -1026,6 +1049,134 @@ pub const App = struct {
         );
     }
 
+    fn commandLineView(self: *const App) ?*const command_line.Active {
+        return switch (self.command_session) {
+            .inactive => null,
+            .active => |*active| &active.input,
+        };
+    }
+
+    fn commandLineInput(self: *App) ?*command_line.Active {
+        return switch (self.command_session) {
+            .inactive => null,
+            .active => |*active| &active.input,
+        };
+    }
+
+    fn repositoryCommandAvailable(self: *const App) bool {
+        if (self.active_page != .repository or self.commandLineView() != null) return false;
+        if (self.teardown_requested or
+            self.actionLifecycleView().hasPending() or
+            self.localWorkflowView().commitPanelOpen() or
+            self.repoSessionView().picker().model.mode or
+            self.overlay.kind != .none or
+            self.remoteWorkflowView().hasForeground() or
+            self.shellEffectsView().hasEditorForeground())
+        {
+            return false;
+        }
+        return self.pages.repository.commandSourceTarget() != null;
+    }
+
+    fn updateCommandLine(self: *App, msg: command_line.Msg) void {
+        switch (msg) {
+            .open => {
+                if (self.commandLineView() != null) return;
+                if (!self.repositoryCommandAvailable()) {
+                    self.pages.repository.status.set("command source is no longer available", .{});
+                    return;
+                }
+                const target = self.pages.repository.commandSourceTarget() orelse {
+                    self.pages.repository.status.set("command source is no longer available", .{});
+                    return;
+                };
+                self.command_session = .{ .active = .{
+                    .input = .{},
+                    .context = .{ .repository_source = target },
+                } };
+            },
+            .cancel => self.command_session = .inactive,
+            .submit => self.submitCommandLine(),
+            .insert => |codepoint| {
+                const active = self.commandLineInput() orelse return;
+                active.input.insert(codepoint) catch {};
+            },
+            .paste => |text| {
+                const active = self.commandLineInput() orelse return;
+                if (std.unicode.utf8ValidateSlice(text)) active.input.insertSlice(text) catch {};
+            },
+            .backspace => if (self.commandLineInput()) |active| active.input.backspace(),
+            .move_left => if (self.commandLineInput()) |active| active.input.moveLeft(),
+            .move_right => if (self.commandLineInput()) |active| active.input.moveRight(),
+            .owned_noop => {},
+        }
+    }
+
+    fn submitCommandLine(self: *App) void {
+        const pending: PendingCommand = switch (self.command_session) {
+            .inactive => return,
+            .active => |active| .{
+                .submission = active.input.submission(),
+                .context = active.context,
+            },
+        };
+        self.command_session = .inactive;
+
+        switch (pending.submission.parse()) {
+            .empty => {},
+            .invalid_line_number => self.commandStatus(pending.context).set("invalid line number", .{}),
+            .unknown_command => |raw| self.commandStatus(pending.context).set("unknown command: {s}", .{raw}),
+            .command => |command| self.executeCommand(pending.context, command),
+        }
+    }
+
+    fn executeCommand(self: *App, execution: ExecutionContext, command: command_line.Command) void {
+        switch (execution) {
+            .repository_source => |target| switch (command) {
+                .goto_line => |line| switch (self.pages.repository.applySourceLineCommand(
+                    target,
+                    line,
+                    self.shellLayout().bodySize(),
+                )) {
+                    .moved => self.pages.repository.status.clearIfEphemeral(),
+                    .stale_target => self.pages.repository.status.set("command source is no longer available", .{}),
+                    .empty_source => self.pages.repository.status.set("source is empty", .{}),
+                    .out_of_range => |line_count| self.pages.repository.status.set(
+                        "line {d} out of range (1-{d})",
+                        .{ line, line_count },
+                    ),
+                },
+            },
+        }
+    }
+
+    fn commandStatus(self: *App, execution: ExecutionContext) *app_state.StatusMessage {
+        return switch (execution) {
+            .repository_source => &self.pages.repository.status,
+        };
+    }
+
+    /// Async source publication and repository replacement can invalidate an
+    /// otherwise idle command between input events. Close it at the common
+    /// update tail before any later Enter can reuse the stale target.
+    fn reconcileCommandLine(self: *App) void {
+        const execution = switch (self.command_session) {
+            .inactive => return,
+            .active => |active| active.context,
+        };
+        switch (execution) {
+            .repository_source => |target| {
+                if (self.active_page != .repository) {
+                    self.command_session = .inactive;
+                    return;
+                }
+                if (self.pages.repository.commandSourceTargetMatches(target)) return;
+                self.command_session = .inactive;
+                self.pages.repository.status.set("command source is no longer available", .{});
+            },
+        }
+    }
+
     fn clearEphemeralStatusForUserAction(self: *App, msg: Msg) void {
         if (app_message.keepsEphemeralStatus(msg)) return;
         self.status.clearIfEphemeral();
@@ -1071,6 +1222,7 @@ pub const App = struct {
             .remote_canceling = remote.canceling(),
             .status = &self.status,
             .page_status = self.activePageStatus(),
+            .command_line = self.commandLineView(),
             .commit_panel = local.commitPanel(),
             .repo_picker = picker.model,
             .repo_picker_pending_workspace_root = picker.pending_workspace_root,
@@ -1193,6 +1345,8 @@ pub const App = struct {
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
             .remote_action_cancelable = self.remoteWorkflowView().canCancel(self.actionLifecycleView().acceptedPending()),
+            .command_line_active = self.commandLineView() != null,
+            .repository_command_available = self.repositoryCommandAvailable(),
             .keymap = self.keymap,
             .overlay = &self.overlay,
             .layout = layout,
@@ -1485,4 +1639,146 @@ fn diffAutoScrollViewport(
         .first_row = diff_render.body_start_row,
         .last_row = @intCast(last_row_value),
     };
+}
+
+fn commandSessionForTest(text: []const u8) !CommandSession {
+    var input: command_line.Active = .{};
+    try input.input.insertSlice(text);
+    return .{ .active = .{
+        .input = input,
+        .context = .{ .repository_source = .{
+            .repo_epoch = 3,
+            .activation_id = 2,
+            .manifest_revision = 6,
+            .source_revision = 7,
+        } },
+    } };
+}
+
+fn installCommandSourceForTest(app: *App, content: []const u8) !void {
+    const source_document = @import("repository/source.zig");
+    const content_fingerprint = @import("content_fingerprint.zig");
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, content);
+    var document = try source_document.Document.initOwnedOrFree(
+        allocator,
+        bytes,
+        content_fingerprint.Fingerprint.init(bytes),
+    );
+    errdefer document.deinit(allocator);
+    const path = try allocator.dupe(u8, "command_demo.zig");
+    errdefer allocator.free(path);
+
+    app.active_page = .repository;
+    app.terminal_size = .{ .width = 8, .height = 6 };
+    app.pages.repository = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 3,
+        .root_identity = .{ .device = 4, .inode = 5 },
+        .freshness = .fresh,
+        .load_state = .loaded,
+        .manifest_revision = 6,
+        .source_revision = 7,
+        .selected_path = path,
+        .displayed_document = .{
+            .path = path,
+            .manifest_revision = 6,
+            .source_revision = 7,
+            .authority = .accepted,
+            .value = .{ .source = document },
+        },
+        .viewer = .{
+            .focus = .source,
+            .tree_hidden = true,
+            .source_horizontal_scroll = 2,
+        },
+    };
+}
+
+test "command line submission snapshots diagnostics and empty submit preserves status" {
+    var app: App = .{};
+    app.pages.repository.status.set("preserved", .{});
+    app.command_session = try commandSessionForTest("");
+    app.submitCommandLine();
+    try std.testing.expect(app.commandLineView() == null);
+    try std.testing.expectEqualStrings("preserved", app.pages.repository.status.text());
+
+    app.command_session = try commandSessionForTest("0");
+    app.submitCommandLine();
+    try std.testing.expectEqualStrings("invalid line number", app.pages.repository.status.text());
+
+    app.command_session = try commandSessionForTest("hoge");
+    app.submitCommandLine();
+    try std.testing.expectEqualStrings("unknown command: hoge", app.pages.repository.status.text());
+}
+
+test "command line stale target reconciliation closes without execution" {
+    var app: App = .{ .active_page = .repository };
+    app.command_session = try commandSessionForTest("20");
+
+    app.reconcileCommandLine();
+
+    try std.testing.expect(app.commandLineView() == null);
+    try std.testing.expectEqualStrings(
+        "command source is no longer available",
+        app.pages.repository.status.text(),
+    );
+}
+
+test "command line root input reaches exact Repository jump and blocks mouse" {
+    const allocator = std.testing.allocator;
+    var app: App = .{};
+    try installCommandSourceForTest(&app, "0123456789abcdef\n" ** 30);
+    defer app.pages.repository.deinit(allocator);
+
+    const open = app.handleEvent(.{ .key_press = .{ .codepoint = ':' } }) orelse
+        return error.ExpectedCommandOpen;
+    try std.testing.expect(open.command_line == .open);
+    app.updateCommandLine(open.command_line);
+    try std.testing.expect(app.commandLineView() != null);
+
+    const mouse = chasen.Event{ .mouse = .{
+        .col = 1,
+        .row = 1,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } };
+    try std.testing.expect(app.handleEvent(mouse) == null);
+
+    for ("20") |digit| {
+        const insert = app.handleEvent(.{ .key_press = .{ .codepoint = digit } }) orelse
+            return error.ExpectedCommandInsert;
+        app.updateCommandLine(insert.command_line);
+    }
+    const submit = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.enter } }) orelse
+        return error.ExpectedCommandSubmit;
+    app.updateCommandLine(submit.command_line);
+
+    try std.testing.expect(app.commandLineView() == null);
+    try std.testing.expectEqual(@as(usize, 19), app.pages.repository.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.repository.viewer.source_horizontal_scroll);
+}
+
+test "command line keeps input across resize and cancels on focus or page transition" {
+    const allocator = std.testing.allocator;
+    var app: App = .{};
+    try installCommandSourceForTest(&app, "one\ntwo\nthree\n");
+    defer app.pages.repository.deinit(allocator);
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    app.updateCommandLine(.open);
+    app.updateCommandLine(.{ .paste = "2🐈" });
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &tc.ctx);
+    try std.testing.expectEqualStrings("2🐈", app.commandLineView().?.input.slice());
+
+    try app.update(.focus_lost, &tc.ctx);
+    try std.testing.expect(app.commandLineView() == null);
+
+    app.updateCommandLine(.open);
+    try std.testing.expect(app.commandLineView() != null);
+    try app.update(.{ .switch_page = .config }, &tc.ctx);
+    try std.testing.expect(app.commandLineView() == null);
 }

@@ -8,6 +8,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const keymap = @import("keymap");
 const app_message = @import("message.zig");
+const command_line = @import("command_line.zig");
 const key_input = @import("key_input.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
@@ -37,6 +38,8 @@ pub const KeyContext = struct {
     branch_switch_mode: bool = false,
     push_error_mode: bool = false,
     remote_action_cancelable: bool = false,
+    command_line_active: bool = false,
+    repository_command_available: bool = false,
     keymap: keymap.Effective = .{},
 };
 
@@ -103,6 +106,10 @@ pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
 }
 
 fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
+    if (context.command_line_active) return .{ .command_line = if (text.len > 0 and std.unicode.utf8ValidateSlice(text))
+        .{ .paste = text }
+    else
+        .owned_noop };
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
     // Review base search v1 is key-event-only. The modal owns this event even
     // if an underlying diff/file search flag is retained, so pasted bytes can
@@ -131,6 +138,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 }
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
+    if (context.command_line_active) return .{ .command_line = commandLineKeyToMsg(key) };
     if (context.remote_action_cancelable and key.matches(chasen.Key.escape, .{}))
         return app_message.Msg.cancel_remote_action;
     if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
@@ -157,27 +165,62 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.push_error_mode) return pushErrorKeyToMsg(key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
     if (selectionKeyToMsg(context, key)) |msg| return msg;
-    if (pageForKey(context.keymap, key)) |target| return .{ .switch_page = target };
-    if (context.keymap.spec(.help)) |spec| if (spec.matches(key)) return app_message.Msg.open_help;
-    if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(key)) return app_message.Msg.enter_repo_picker;
-    if (context.keymap.spec(.reload)) |spec| if (spec.matches(key)) return app_message.Msg.reload;
+    const routing_key = normalRoutingKey(key);
+    if (pageForKey(context.keymap, routing_key)) |target| return .{ .switch_page = target };
+    if (context.keymap.spec(.help)) |spec| if (spec.matches(routing_key)) return app_message.Msg.open_help;
+    if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(routing_key)) return app_message.Msg.enter_repo_picker;
+    if (context.keymap.spec(.reload)) |spec| if (spec.matches(routing_key)) return app_message.Msg.reload;
+
+    // Repository configured actions claim the canonical logical key even
+    // when their current precondition or page handler returns no message.
+    // Only a truly unclaimed colon may open the local command session.
+    if (context.active_page == .repository and context.repository.keymap.actionForKey(routing_key) != null) {
+        if (repository_input.keyToMsg(repository_page.Msg, context.repository, routing_key)) |repository_msg| {
+            return .{ .repository = repository_msg };
+        }
+        return .{ .command_line = .owned_noop };
+    }
+    if (context.active_page == .repository and
+        context.repository_command_available and
+        isLogicalColon(key))
+    {
+        return .{ .command_line = .open };
+    }
     if (context.active_page == .changes) {
-        if (changes_input.keyToMsg(context.changes, key)) |changes_msg| {
+        if (changes_input.keyToMsg(context.changes, routing_key)) |changes_msg| {
             return translateChangesMsg(changes_msg);
         }
     }
     if (context.active_page == .repository) {
-        if (repository_input.keyToMsg(repository_page.Msg, context.repository, key)) |repository_msg| {
+        if (repository_input.keyToMsg(repository_page.Msg, context.repository, routing_key)) |repository_msg| {
             return .{ .repository = repository_msg };
         }
     }
     if (context.active_page == .review) {
-        if (review_input.keyToMsg(context.review, key)) |review_msg| {
+        if (review_input.keyToMsg(context.review, routing_key)) |review_msg| {
             return .{ .review = review_msg };
         }
     }
-    if (key.codepoint == 'q' and !key_input.hasCommandModifier(key)) return app_message.Msg.quit;
+    if (routing_key.codepoint == 'q' and !key_input.hasCommandModifier(routing_key)) return app_message.Msg.quit;
     return null;
+}
+
+fn commandLineKeyToMsg(key: chasen.Key) command_line.Msg {
+    if (key.matches(chasen.Key.escape, .{})) return .cancel;
+    if (key.matches(chasen.Key.enter, .{})) return .submit;
+    if (key.matches(chasen.Key.backspace, .{})) return .backspace;
+    if (key.matches(chasen.Key.left, .{})) return .move_left;
+    if (key.matches(chasen.Key.right, .{})) return .move_right;
+    if (key_input.textInputCodepoint(key)) |codepoint| return .{ .insert = codepoint };
+    return .owned_noop;
+}
+
+fn isLogicalColon(key: chasen.Key) bool {
+    return key_input.textInputCodepoint(key) == ':';
+}
+
+fn normalRoutingKey(key: chasen.Key) chasen.Key {
+    return if (isLogicalColon(key)) .{ .codepoint = ':' } else key;
 }
 
 fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
@@ -431,6 +474,84 @@ test "normal page keys map after text and overlay precedence" {
     const remapped = keymap.Effective.fromConfig(config);
     try expectMsg(.{ .switch_page = .repository }, keyToMsg(.{ .keymap = remapped }, .{ .codepoint = 'w' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .keymap = remapped }, .{ .codepoint = '2' }));
+}
+
+test "command line owns key and paste input before every normal route" {
+    const context: KeyContext = .{
+        .active_page = .repository,
+        .command_line_active = true,
+        .repository_command_available = true,
+    };
+    try expectMsg(.{ .command_line = .cancel }, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try expectMsg(.{ .command_line = .submit }, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
+    try expectMsg(.{ .command_line = .backspace }, keyToMsg(context, .{ .codepoint = chasen.Key.backspace }).?);
+    try expectMsg(.{ .command_line = .move_left }, keyToMsg(context, .{ .codepoint = chasen.Key.left }).?);
+    try expectMsg(.{ .command_line = .move_right }, keyToMsg(context, .{ .codepoint = chasen.Key.right }).?);
+    try expectMsg(.{ .command_line = .{ .insert = '2' } }, keyToMsg(context, .{ .codepoint = '2' }).?);
+    try expectMsg(.{ .command_line = .owned_noop }, keyToMsg(context, .{ .codepoint = chasen.Key.up }).?);
+    try expectMsg(.{ .command_line = .{ .paste = "20🐈" } }, pasteToMsg(context, "20🐈").?);
+    try expectMsg(.{ .command_line = .owned_noop }, pasteToMsg(context, "").?);
+}
+
+test "repository logical colon preserves configured claims before command open" {
+    const keys = [_]chasen.Key{
+        .{ .codepoint = ':' },
+        shiftedAscii(';', ':'),
+    };
+
+    var root_config: keymap.Config = .{};
+    root_config.set(.page_changes, .{ .plain_codepoint = ':' });
+    const root_keymap = keymap.Effective.fromConfig(root_config);
+    for (keys) |key| try expectMsg(
+        .{ .switch_page = .changes },
+        keyToMsg(.{
+            .active_page = .repository,
+            .repository_command_available = true,
+            .keymap = root_keymap,
+            .repository = .{ .focus = .source, .source_available = true, .keymap = root_keymap },
+        }, key).?,
+    );
+
+    var page_config: keymap.Config = .{};
+    page_config.set(.toggle_line_numbers, .{ .plain_codepoint = ':' });
+    const page_keymap = keymap.Effective.fromConfig(page_config);
+    for (keys) |key| try expectMsg(
+        .{ .repository = .toggle_line_numbers },
+        keyToMsg(.{
+            .active_page = .repository,
+            .repository_command_available = true,
+            .keymap = page_keymap,
+            .repository = .{ .focus = .source, .source_available = true, .keymap = page_keymap },
+        }, key).?,
+    );
+
+    var unsupported_config: keymap.Config = .{};
+    unsupported_config.set(.open_editor, .{ .plain_codepoint = ':' });
+    const unsupported_keymap = keymap.Effective.fromConfig(unsupported_config);
+    for (keys) |key| try expectMsg(
+        .{ .command_line = .owned_noop },
+        keyToMsg(.{
+            .active_page = .repository,
+            .repository_command_available = true,
+            .keymap = unsupported_keymap,
+            .repository = .{ .focus = .source, .source_available = true, .keymap = unsupported_keymap },
+        }, key).?,
+    );
+}
+
+test "repository unclaimed literal and shifted colon open the same command line" {
+    const context: KeyContext = .{
+        .active_page = .repository,
+        .repository_command_available = true,
+        .repository = .{ .focus = .source, .source_available = true },
+    };
+    try expectMsg(.{ .command_line = .open }, keyToMsg(context, .{ .codepoint = ':' }).?);
+    try expectMsg(.{ .command_line = .open }, keyToMsg(context, shiftedAscii(';', ':')).?);
+    try std.testing.expect(keyToMsg(.{
+        .active_page = .repository,
+        .repository_command_available = false,
+        .repository = context.repository,
+    }, .{ .codepoint = ':' }) == null);
 }
 
 test "root selection preflight preserves modal and configured V precedence" {

@@ -85,6 +85,29 @@ pub const DisplayedDocument = struct {
     }
 };
 
+/// Allocation-free identity for one accepted Repository source document.
+/// Display labels and source bytes are deliberately not part of the token.
+pub const SourceTarget = struct {
+    repo_epoch: u64,
+    activation_id: u64,
+    manifest_revision: u64,
+    source_revision: u64,
+
+    pub fn eql(self: SourceTarget, other: SourceTarget) bool {
+        return self.repo_epoch == other.repo_epoch and
+            self.activation_id == other.activation_id and
+            self.manifest_revision == other.manifest_revision and
+            self.source_revision == other.source_revision;
+    }
+};
+
+pub const SourceLineJump = union(enum) {
+    moved,
+    stale_target,
+    empty_source,
+    out_of_range: usize,
+};
+
 /// Explicit async decoration state. `eligible` means the accepted source still
 /// needs exactly one comparison; `terminal_plain` is a deliberate fail-closed
 /// result, not an invitation to retry on every unrelated event.
@@ -1959,6 +1982,61 @@ pub const RepositoryPageState = struct {
         const displayed = if (self.displayed_document) |*document| document else return null;
         if (displayed.authority != .accepted) return null;
         return self.currentSource();
+    }
+
+    /// Capture command admission independently from the root input session.
+    /// Only accepted source normal mode can mint this authority value.
+    pub fn commandSourceTarget(self: *const RepositoryPageState) ?SourceTarget {
+        if (self.source_search.mode or self.file_search.mode or
+            self.selection_owner != .none or self.retainedSourceSelection() != null)
+        {
+            return null;
+        }
+        _ = self.acceptedCurrentSourceForSelection() orelse return null;
+        const effective_focus: repository_model.Focus = if (self.viewer.tree_hidden)
+            .source
+        else
+            self.viewer.focus;
+        if (effective_focus != .source) return null;
+        const displayed = if (self.displayed_document) |*document| document else return null;
+        if (displayed.manifest_revision != self.manifest_revision or
+            displayed.source_revision != self.source_revision)
+        {
+            return null;
+        }
+        return .{
+            .repo_epoch = self.repo_epoch,
+            .activation_id = self.activation_id,
+            .manifest_revision = displayed.manifest_revision,
+            .source_revision = displayed.source_revision,
+        };
+    }
+
+    pub fn commandSourceTargetMatches(self: *const RepositoryPageState, target: SourceTarget) bool {
+        const current = self.commandSourceTarget() orelse return false;
+        return current.eql(target);
+    }
+
+    /// Apply a typed 1-based line command only to the exact accepted source
+    /// which admitted the command session.
+    pub fn applySourceLineCommand(
+        self: *RepositoryPageState,
+        target: SourceTarget,
+        line: usize,
+        body_size: chasen.Size,
+    ) SourceLineJump {
+        if (!self.commandSourceTargetMatches(target)) return .stale_target;
+        const document = self.acceptedCurrentSourceForSelection() orelse return .stale_target;
+        const line_count = document.contentLineCount();
+        if (line_count == 0) return .empty_source;
+        if (line == 0 or line > line_count) return .{ .out_of_range = line_count };
+        repository_navigation.gotoSourceLine(
+            &self.viewer,
+            document,
+            line - 1,
+            self.sourceGeometry(body_size, document),
+        );
+        return .moved;
     }
 
     /// Keep raw page focus valid even when a selected document becomes an
@@ -3924,6 +4002,77 @@ fn selectionStateForTest(paths: []const u8, content: []const u8) !RepositoryPage
         .value = .{ .source = document },
     };
     return state;
+}
+
+test "repository command target admits only exact accepted source normal mode" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00", "one\ntwo\nthree\n");
+    defer state.deinit(allocator);
+    state.viewer.focus = .source;
+
+    const target = state.commandSourceTarget() orelse return error.ExpectedCommandTarget;
+    try std.testing.expectEqual(@as(u64, 3), target.repo_epoch);
+    try std.testing.expectEqual(@as(u64, 2), target.activation_id);
+    try std.testing.expectEqual(@as(u64, 6), target.manifest_revision);
+    try std.testing.expectEqual(@as(u64, 7), target.source_revision);
+    try std.testing.expect(state.commandSourceTargetMatches(target));
+
+    state.viewer.focus = .tree;
+    try std.testing.expect(state.commandSourceTarget() == null);
+    state.viewer.focus = .source;
+    state.source_search.mode = true;
+    try std.testing.expect(state.commandSourceTarget() == null);
+    state.source_search.mode = false;
+    try installFirstLineCandidateForTest(&state, allocator);
+    try std.testing.expect(state.commandSourceTarget() == null);
+    state.clearCompletedSelection(allocator);
+    state.displayed_document.?.source_revision +%= 1;
+    try std.testing.expect(!state.commandSourceTargetMatches(target));
+}
+
+test "repository source line jump is 1 based bounded centered and target fenced" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 8, .height = 6 };
+    var state = try selectionStateForTest(
+        "main.zig\x00",
+        "0123456789abcdef\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+    );
+    defer state.deinit(allocator);
+    state.viewer.focus = .source;
+    state.viewer.tree_hidden = true;
+    state.viewer.source_horizontal_scroll = 3;
+    const target = state.commandSourceTarget() orelse return error.ExpectedCommandTarget;
+
+    try std.testing.expect(state.applySourceLineCommand(target, 1, size) == .moved);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
+    state.viewer.line_numbers = false;
+    try std.testing.expect(state.applySourceLineCommand(target, 11, size) == .moved);
+    try std.testing.expectEqual(@as(usize, 10), state.viewer.source_cursor);
+
+    try std.testing.expect(state.applySourceLineCommand(target, 8, size) == .moved);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 3), state.viewer.source_horizontal_scroll);
+    try std.testing.expect(state.viewer.source_vertical_scroll > 0);
+
+    const before = state.viewer;
+    const out_of_range = state.applySourceLineCommand(target, 99, size);
+    try std.testing.expectEqual(@as(usize, 11), out_of_range.out_of_range);
+    try std.testing.expectEqual(before, state.viewer);
+
+    state.source_revision +%= 1;
+    try std.testing.expect(state.applySourceLineCommand(target, 1, size) == .stale_target);
+    try std.testing.expectEqual(before, state.viewer);
+}
+
+test "repository source line jump reports empty accepted source without moving" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("empty.zig\x00", "");
+    defer state.deinit(allocator);
+    state.viewer.focus = .source;
+    const target = state.commandSourceTarget() orelse return error.ExpectedCommandTarget;
+
+    try std.testing.expect(state.applySourceLineCommand(target, 1, .{ .width = 30, .height = 6 }) == .empty_source);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
 }
 
 fn installFirstLineCandidateForTest(
