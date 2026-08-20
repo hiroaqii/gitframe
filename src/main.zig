@@ -212,6 +212,10 @@ fn configForStartup(
                     "gitframe: cannot load config {s}: multiple external actions use the same stdin\n",
                     .{display_path},
                 ),
+                .invalid_ai_review_store_root => try stderr.print(
+                    "gitframe: cannot load config {s}: invalid AI review Store root\n",
+                    .{display_path},
+                ),
                 .unsupported_schema_version => try stderr.print(
                     "gitframe: cannot load config {s}: unsupported schema version\n",
                     .{display_path},
@@ -400,6 +404,7 @@ test "config startup rejects every failure reason before runtime setup" {
         .{ .failure = .invalid_action_config, .reason = "invalid external action configuration" },
         .{ .failure = .missing_action_input, .reason = "external action is missing required stdin" },
         .{ .failure = .duplicate_action_input, .reason = "multiple external actions use the same stdin" },
+        .{ .failure = .invalid_ai_review_store_root, .reason = "invalid AI review Store root" },
         .{ .failure = .unsupported_schema_version, .reason = "unsupported schema version" },
         .{ .failure = .unsupported_action_schema, .reason = "unsupported external action schema" },
     };

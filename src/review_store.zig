@@ -1,0 +1,28 @@
+//! Public composition boundary for local Review Store read authority.
+//! Portable artifact vocabulary remains in `committed_review.zig`.
+
+pub const path = @import("review_store/path.zig");
+pub const capability = @import("review_store/capability.zig");
+pub const registry = @import("review_store/registry.zig");
+pub const run = @import("review_store/run.zig");
+pub const history = @import("review_store/history.zig");
+
+pub const ResolvedPath = path.Resolved;
+pub const NamespaceTempKind = path.NamespaceTempKind;
+pub const NamespaceTempName = path.NamespaceTempName;
+pub const StoreRootCapability = capability.StoreRootCapability;
+pub const DirectoryCapability = capability.DirectoryCapability;
+pub const ParsedRegistry = registry.ParsedRegistry;
+pub const LoadedRunArtifacts = run.LoadedRunArtifacts;
+pub const ArtifactSnapshot = run.ArtifactSnapshot;
+pub const History = history.History;
+pub const ScanResult = history.ScanResult;
+pub const SelectedRunRead = history.SelectedRunRead;
+
+test {
+    _ = @import("review_store/path.zig");
+    _ = @import("review_store/capability.zig");
+    _ = @import("review_store/registry.zig");
+    _ = @import("review_store/run.zig");
+    _ = @import("review_store/history.zig");
+}

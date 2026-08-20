@@ -2,6 +2,7 @@ const app = @import("app.zig");
 const build_options = @import("build_options");
 pub const config = @import("config.zig");
 pub const committed_review = @import("committed_review.zig");
+pub const review_store = @import("review_store.zig");
 /// Installed process adapter for exact-target committed patch transport.
 pub const review_projection_command = @import("committed_review/projection_command.zig");
 /// Installed process adapter for target-only committed revision resolution.
@@ -90,6 +91,7 @@ test {
     _ = @import("config.zig");
     _ = @import("content_fingerprint.zig");
     _ = @import("committed_review.zig");
+    _ = @import("review_store.zig");
     _ = @import("committed_review/projection_command.zig");
     _ = @import("committed_review/target_command.zig");
     _ = @import("context.zig");

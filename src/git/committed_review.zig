@@ -114,6 +114,36 @@ pub const ProjectionResult = union(enum) {
     }
 };
 
+/// Provisional availability for one exact target. Missing is not a Git
+/// process failure and never triggers ref resolution or fetch.
+pub const TargetAvailability = enum { available, missing };
+
+pub const AvailabilityFailure = enum {
+    invalid_repository,
+    unsupported_object_format,
+    invalid_target,
+    object_format_drift,
+    git_command_failed,
+};
+
+pub const AvailabilityBatchResult = union(enum) {
+    available: []TargetAvailability,
+    failure: AvailabilityFailure,
+
+    pub fn deinit(self: *AvailabilityBatchResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .available => |values| allocator.free(values),
+            .failure => {},
+        }
+        self.* = .{ .failure = .git_command_failed };
+    }
+};
+
+pub const AvailabilityResult = union(enum) {
+    availability: TargetAvailability,
+    failure: AvailabilityFailure,
+};
+
 /// Exact committed-blob anchor terminals, deliberately separate from target
 /// and projection failure vocabularies.
 pub const CodeAnchorFailure = enum {
@@ -317,6 +347,103 @@ pub fn materializeCommittedProjection(
     target: CommittedReviewTarget,
 ) std.mem.Allocator.Error!ProjectionResult {
     return materializeCommittedProjectionWithGit(allocator, io, context, target, strict_prefix[0]);
+}
+
+/// Probe up to 512 targets with one no-lazy-fetch `cat-file` transaction.
+/// Any framing/type/process failure discards every partial classification.
+pub fn checkTargetsAvailability(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    targets: []const CommittedReviewTarget,
+) std.mem.Allocator.Error!AvailabilityBatchResult {
+    if (targets.len > 512) return .{ .failure = .invalid_target };
+    const format_result = try readObjectFormat(allocator, io, context);
+    const format = switch (format_result) {
+        .format => |value| value,
+        .invalid_repository => return .{ .failure = .invalid_repository },
+        .unsupported => return .{ .failure = .unsupported_object_format },
+        .failed => return .{ .failure = .git_command_failed },
+    };
+    for (targets) |target| {
+        target.validate() catch return .{ .failure = .invalid_target };
+        if (target.object_format != format) return .{ .failure = .object_format_drift };
+    }
+    if (targets.len == 0) return .{ .available = try allocator.alloc(TargetAvailability, 0) };
+
+    var stdin: std.ArrayList(u8) = .empty;
+    defer stdin.deinit(allocator);
+    for (targets) |target| {
+        for ([_]*const ObjectId{ &target.base_oid, &target.head_oid, &target.diff_base_oid }) |oid| {
+            try stdin.appendSlice(allocator, oid.slice());
+            try stdin.append(allocator, '\n');
+        }
+    }
+    if (stdin.items.len > 100 * 1024) return .{ .failure = .invalid_target };
+
+    const argv = [_][]const u8{
+        strict_prefix[0], strict_prefix[1],                            strict_prefix[2], strict_prefix[3],
+        "cat-file",       "--batch-check=%(objectname) %(objecttype)",
+    };
+    var command = try git_command.runWithStdinBounded(allocator, io, context, .{
+        .argv = &argv,
+        .stdin = stdin.items,
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(stderr_capture_bytes),
+    });
+    defer command.deinit(allocator);
+    const completed = switch (command) {
+        .completed => |value| value,
+        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return .{ .failure = .git_command_failed },
+    };
+    if (!termExited(completed.term, 0)) return .{ .failure = .git_command_failed };
+    const statuses = parseAvailabilityRecords(allocator, targets, completed.stdout) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = .git_command_failed };
+    };
+    return .{ .available = statuses };
+}
+
+pub fn checkTargetAvailability(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    target: CommittedReviewTarget,
+) std.mem.Allocator.Error!AvailabilityResult {
+    var batch = try checkTargetsAvailability(allocator, io, context, &.{target});
+    defer batch.deinit(allocator);
+    return switch (batch) {
+        .available => |values| .{ .availability = values[0] },
+        .failure => |failure| .{ .failure = failure },
+    };
+}
+
+fn parseAvailabilityRecords(
+    allocator: std.mem.Allocator,
+    targets: []const CommittedReviewTarget,
+    stdout: []const u8,
+) ![]TargetAvailability {
+    const statuses = try allocator.alloc(TargetAvailability, targets.len);
+    errdefer allocator.free(statuses);
+    @memset(statuses, .available);
+    var lines = std.mem.splitScalar(u8, stdout, '\n');
+    for (targets, 0..) |target, target_index| {
+        for ([_]*const ObjectId{ &target.base_oid, &target.head_oid, &target.diff_base_oid }) |oid| {
+            const line = lines.next() orelse return error.InvalidAvailabilityOutput;
+            const suffix = if (std.mem.endsWith(u8, line, " commit"))
+                " commit"
+            else if (std.mem.endsWith(u8, line, " missing"))
+                " missing"
+            else
+                return error.InvalidAvailabilityOutput;
+            const oid_text = line[0 .. line.len - suffix.len];
+            if (!std.mem.eql(u8, oid_text, oid.slice())) return error.InvalidAvailabilityOutput;
+            if (suffix[1] == 'm') statuses[target_index] = .missing;
+        }
+    }
+    const terminal = lines.next() orelse return error.InvalidAvailabilityOutput;
+    if (terminal.len != 0 or lines.next() != null) return error.InvalidAvailabilityOutput;
+    return statuses;
 }
 
 fn materializeCommittedProjectionWithGit(
@@ -1065,6 +1192,32 @@ fn testObjectId(format: ObjectFormat, byte: u8) ObjectId {
     var oid: ObjectId = .{ .len = @intCast(format.oidHexLength()) };
     @memset(oid.bytes[0..format.oidHexLength()], byte);
     return oid;
+}
+
+test "review history backend availability parser requires exact three ordered commit records" {
+    const target: CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = testObjectId(.sha1, '1'),
+        .head_oid = testObjectId(.sha1, '2'),
+        .diff_base_oid = testObjectId(.sha1, '3'),
+    };
+    const output = try std.fmt.allocPrint(std.testing.allocator, "{s} commit\n{s} missing\n{s} commit\n", .{ target.base_oid.slice(), target.head_oid.slice(), target.diff_base_oid.slice() });
+    defer std.testing.allocator.free(output);
+    const statuses = try parseAvailabilityRecords(std.testing.allocator, &.{target}, output);
+    defer std.testing.allocator.free(statuses);
+    try std.testing.expectEqual(TargetAvailability.missing, statuses[0]);
+
+    const wrong_type = try std.fmt.allocPrint(std.testing.allocator, "{s} commit\n{s} tree\n{s} commit\n", .{ target.base_oid.slice(), target.head_oid.slice(), target.diff_base_oid.slice() });
+    defer std.testing.allocator.free(wrong_type);
+    try std.testing.expectError(
+        error.InvalidAvailabilityOutput,
+        parseAvailabilityRecords(std.testing.allocator, &.{target}, wrong_type),
+    );
+    try std.testing.expectError(
+        error.InvalidAvailabilityOutput,
+        parseAvailabilityRecords(std.testing.allocator, &.{target}, output[0 .. output.len - 1]),
+    );
 }
 
 fn inventoryLineLessThan(_: void, left: []u8, right: []u8) bool {

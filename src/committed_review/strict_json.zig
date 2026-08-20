@@ -199,6 +199,31 @@ pub fn validateTimestamp(text: []const u8) ParseError!void {
     if (day == 0 or day > days[month - 1]) return error.InvalidValue;
 }
 
+/// Convert the already-fixed UTC-second grammar without normalizing or
+/// accepting another timestamp spelling. History sort and display share this
+/// exact value-preserving seam.
+pub fn timestampToUnixSeconds(text: []const u8) ParseError!i64 {
+    try validateTimestamp(text);
+    const year: i64 = try fixedDecimal(u16, text[0..4]);
+    const month: i64 = try fixedDecimal(u8, text[5..7]);
+    const day: i64 = try fixedDecimal(u8, text[8..10]);
+    const hour: i64 = try fixedDecimal(u8, text[11..13]);
+    const minute: i64 = try fixedDecimal(u8, text[14..16]);
+    const second: i64 = try fixedDecimal(u8, text[17..19]);
+
+    // Proleptic Gregorian civil date to days since 1970-01-01. The admitted
+    // year range is 0001...9999, so every intermediate is comfortably i64.
+    const adjusted_year = year - @intFromBool(month <= 2);
+    const era = @divFloor(adjusted_year, 400);
+    const year_of_era = adjusted_year - era * 400;
+    const shifted_month = month + (if (month > 2) @as(i64, -3) else 9);
+    const day_of_year = @divFloor(153 * shifted_month + 2, 5) + day - 1;
+    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) -
+        @divFloor(year_of_era, 100) + day_of_year;
+    const days_since_epoch = era * 146_097 + day_of_era - 719_468;
+    return days_since_epoch * 86_400 + hour * 3_600 + minute * 60 + second;
+}
+
 /// Allocate lossless raw path bytes from canonical unpadded base64url.
 /// The returned slice belongs to `allocator` and need not be UTF-8.
 pub fn decodeRawPath(allocator: std.mem.Allocator, encoded: []const u8) ParseError![]const u8 {
@@ -254,6 +279,13 @@ test "timestamp validator enforces Gregorian UTC seconds" {
     try std.testing.expectError(error.InvalidValue, validateTimestamp("2023-02-29T23:59:59Z"));
     try std.testing.expectError(error.InvalidValue, validateTimestamp("2024-01-01T00:00:60Z"));
     try std.testing.expectError(error.InvalidValue, validateTimestamp("0000-01-01T00:00:00Z"));
+}
+
+test "review history backend timestamp seam preserves exact UTC-second ordering" {
+    try std.testing.expectEqual(@as(i64, 0), try timestampToUnixSeconds("1970-01-01T00:00:00Z"));
+    try std.testing.expectEqual(@as(i64, -1), try timestampToUnixSeconds("1969-12-31T23:59:59Z"));
+    try std.testing.expectEqual(@as(i64, 1_709_251_199), try timestampToUnixSeconds("2024-02-29T23:59:59Z"));
+    try std.testing.expectError(error.InvalidValue, timestampToUnixSeconds("2024-02-29T23:59:59+00:00"));
 }
 
 test "raw paths round trip canonical unpadded base64url losslessly" {

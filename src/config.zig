@@ -1,6 +1,7 @@
 const std = @import("std");
 const keymap = @import("keymap");
 const theme = @import("theme");
+const review_store_path = @import("review_store/path.zig");
 
 const max_config_bytes = 64 * 1024;
 pub const supported_schema_version = 1;
@@ -17,6 +18,13 @@ pub const Config = struct {
     actions: ExternalActionsConfig = .{},
     remote: RemoteWorkflowConfig = .{},
     reload: ReloadConfig = .{},
+    ai_review: AiReviewConfig = .{},
+};
+
+pub const AiReviewConfig = struct {
+    /// The Review Store root itself. This slice borrows TOML source bytes;
+    /// resolution later copies one immutable startup/helper snapshot.
+    store_root: ?[]const u8 = null,
 };
 
 pub const ReloadConfig = struct {
@@ -125,6 +133,7 @@ pub const ConfigLoadFailure = enum {
     invalid_action_config,
     missing_action_input,
     duplicate_action_input,
+    invalid_ai_review_store_root,
     unsupported_schema_version,
     unsupported_action_schema,
 };
@@ -282,6 +291,7 @@ fn classifyConfigReadError(err: anyerror) ConfigLoadFailure {
 
 fn classifyConfigParseError(err: TomlParseError) ConfigLoadFailure {
     return switch (err) {
+        error.InvalidAiReviewStoreRoot => .invalid_ai_review_store_root,
         error.UnsupportedSchemaVersion => .unsupported_schema_version,
         error.UnsupportedActionSchema => .unsupported_action_schema,
         error.MissingActionInput => .missing_action_input,
@@ -308,6 +318,7 @@ const TomlParseError = error{
     InvalidInteger,
     InvalidBoolean,
     InvalidReloadInterval,
+    InvalidAiReviewStoreRoot,
     InvalidString,
     InvalidArray,
     UnsupportedEscape,
@@ -343,6 +354,7 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
     var saw_actions_array = false;
     var saw_reload_auto = false;
     var saw_reload_interval = false;
+    var saw_ai_review_store_root = false;
 
     var lines = std.mem.splitScalar(u8, input, '\n');
     while (lines.next()) |raw_line| {
@@ -408,6 +420,15 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                     return error.UnknownKey;
                 }
             },
+            .ai_review => {
+                if (!std.mem.eql(u8, key, "store_root")) return error.UnknownKey;
+                if (saw_ai_review_store_root) return error.DuplicateKey;
+                const store_root = try parseTomlString(value);
+                review_store_path.validateAbsoluteCanonical(store_root) catch
+                    return error.InvalidAiReviewStoreRoot;
+                config.ai_review.store_root = store_root;
+                saw_ai_review_store_root = true;
+            },
             .action_entry => {
                 if (action_state) |*state| {
                     try parseExternalActionField(state, key, value);
@@ -436,6 +457,7 @@ const ConfigSection = enum {
     action_entry,
     remote,
     reload,
+    ai_review,
 };
 
 fn trimTomlLine(line: []const u8) []const u8 {
@@ -466,6 +488,7 @@ fn parseConfigSection(line: []const u8) TomlParseError!ConfigSection {
     if (std.mem.eql(u8, name, "actions")) return .actions;
     if (std.mem.eql(u8, name, "remote")) return .remote;
     if (std.mem.eql(u8, name, "reload")) return .reload;
+    if (std.mem.eql(u8, name, "ai_review")) return .ai_review;
     return error.UnknownSection;
 }
 
@@ -920,6 +943,7 @@ test "loadConfig accepts reserved empty TOML sections" {
         \\[keymap]
         \\[actions]
         \\[remote]
+        \\[ai_review]
         \\
     });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -934,6 +958,47 @@ test "loadConfig accepts reserved empty TOML sections" {
     try std.testing.expect(loaded.value.reload.auto);
     try std.testing.expectEqual(@as(u8, 3), loaded.value.reload.interval_seconds);
     try std.testing.expect(loaded.source_bytes != null);
+}
+
+test "review history backend config admits one canonical Store root" {
+    const parsed = try parseConfigToml(
+        \\schema_version = 1
+        \\[ai_review]
+        \\store_root = "/srv/gitframe/ai-reviews"
+        \\
+    );
+    try std.testing.expectEqualStrings("/srv/gitframe/ai-reviews", parsed.ai_review.store_root.?);
+    try std.testing.expectError(error.DuplicateKey, parseConfigToml(
+        \\[ai_review]
+        \\store_root = "/one"
+        \\store_root = "/two"
+        \\
+    ));
+    try std.testing.expectError(error.UnknownKey, parseConfigToml(
+        \\[ai_review]
+        \\root = "/one"
+        \\
+    ));
+}
+
+test "review history backend config reports invalid Store root distinctly" {
+    const allocator = std.testing.allocator;
+    const path = "zig-cache/tmp/gitframe-invalid-ai-review-root.toml";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data =
+        \\[ai_review]
+        \\store_root = "relative/store"
+        \\
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var result = loadConfig(allocator, std.testing.io, path);
+    defer result.deinit();
+    const failure = switch (result) {
+        .failure => |value| value,
+        .success => return error.ExpectedConfigFailure,
+    };
+    try std.testing.expectEqual(ConfigLoadFailure.invalid_ai_review_store_root, failure);
 }
 
 test "parse config accepts reload policy" {
