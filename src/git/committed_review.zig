@@ -1226,6 +1226,25 @@ test "CodeAnchor reads exact committed bytes and keeps path blob range digest an
         .head = "HEAD",
     }));
 
+    const foreign_draft_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "testdata/committed-review-v1/negative/draft-note-foreign-anchor.json",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(foreign_draft_bytes);
+    var foreign_draft = try wire.ReviewDraftState.parseStrict(std.testing.allocator, foreign_draft_bytes);
+    defer foreign_draft.deinit();
+    var foreign_note = try resolveCodeAnchor(
+        std.testing.allocator,
+        io,
+        context,
+        target,
+        foreign_draft.value.anchored_notes[0].anchor,
+    );
+    defer foreign_note.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CodeAnchorFailure.path_not_found, foreign_note.failure);
+
     var crlf = try resolveCodeAnchor(std.testing.allocator, io, context, target, .{
         .path_bytes = "text.txt",
         .side = .after,

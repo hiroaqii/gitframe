@@ -103,6 +103,59 @@ All four v1 artifacts use strict JSON: unknown or duplicate fields, missing requ
 
 All findings remain in draft and result state regardless of whether a provider can place them inline.
 
+### Final v1 artifact fields
+
+This is a pre-release correction to schema version 1. Readers accept only the final field model below. They do not default missing fields, accept compatibility aliases, migrate older private artifacts, or expose a dual writer.
+
+Canonical top-level writer order is fixed:
+
+| Artifact | Fields |
+| --- | --- |
+| `findings.json` | `schema_version`, `review_id`, `created_at`, optional `timing`, `target`, `producer`, `findings` |
+| `manifest.json` | `schema_version`, `review_id`, `review_repository_id`, `target`, `created_at`, optional `display`, `finding_count`, `producer`, `findings_digest` |
+| `review_state.json` | `schema_version`, `review_id`, `target`, `findings_digest`, `revision`, optional `summary`, `finding_dispositions`, `anchored_notes` |
+| `result.json` | `schema_version`, `review_id`, `target`, `findings_digest`, `result`, `completed_at`, optional `summary`, `finding_dispositions`, `anchored_notes` |
+
+`FindingSet.created_at` is required. It is the UTC second at which the producer completed one immutable FindingSet, in the exact RFC 3339 form `YYYY-MM-DDTHH:MM:SSZ`. The producer obtains it once and writes the same string to `findings.json` and `manifest.json`. The manifest copy is a lightweight history-index projection; cross-artifact admission requires byte-for-byte equality and reports a projection mismatch separately from a digest mismatch. A publish retry for one immutable Run retains the original findings bytes and timestamp. Rerunning review creates a new review ID and timestamp.
+
+`created_at` is provenance and display metadata. It is not review-request time, Store publication time, human decision time, target identity, anchor placement, or authorization authority. History ordering remains based on manifest `created_at`.
+
+`FindingSet.timing` is optional. Its only v1 field is required `duration_ms`, an unsigned canonical JSON integer in `0...4294967295`. Absence means measurement is unavailable; zero is a valid measured duration and is never an unavailable sentinel. The value is producer-observed workflow provenance. It is not model self-report, a timeout or billing authority, or a value inferred from timestamps or filesystem metadata. Timing is not projected into the manifest. When present, its exact bytes are naturally covered by `findings_digest`.
+
+Both `FindingSet.created_at` and `RevisionReviewResult.completed_at` use the same strict Gregorian UTC-seconds validator. Missing values, explicit `null`, wrong JSON types, timezone offsets, fractional seconds, leap seconds, year zero, and impossible calendar dates are invalid. The codec validates caller-supplied values and never reads a clock or repairs a timestamp.
+
+`ReviewDraftState.anchored_notes` is required, including the canonical empty array when no note exists. Notes are mutable human work under the same positive draft `revision` as summary and dispositions. Draft parsing and canonical writing preserve the complete array across resume; no note-specific revision or frozen flag exists.
+
+`RevisionReviewResult.completed_at` is required and is the human terminal-decision completion time. The future Store mutation owner supplies it from a trusted clock only after admitting an explicit submit attempt. It is not derived from manifest time, directory names, or filesystem mtime, and it does not change history ordering. A failed publication creates no valid result; a later admitted retry may use a new completion timestamp.
+
+### Draft, result, and note admission
+
+Draft and result notes share the same structural validation: at most 4,096 notes, a structurally valid `CodeAnchor`, a non-empty bounded body, and at most 256 unique bounded related Finding IDs per note. Cross-artifact validation additionally requires the artifact review ID, complete target, and exact findings digest to match the admitted FindingSet, and every related ID to exist in that FindingSet. Invalid notes reject the complete artifact; readers do not drop individual notes.
+
+Wire validation deliberately does not read Git. A consumer admits each structurally valid note anchor by calling the existing `resolveCodeAnchor(target, anchor)` operation. That operation alone proves the raw path, selected side, committed blob, inclusive line range, and content digest against the already bound exact target. A foreign but structurally valid anchor therefore passes JSON decoding and fails Git-backed admission without retargeting.
+
+A terminal result is a self-contained immutable snapshot. Submit validation first admits both draft and result against the same FindingSet and exact digest, then requires exact equality of:
+
+- optional summary presence and bytes;
+- disposition array length, order, Finding IDs, and values;
+- anchored-note array length and order, every complete anchor, body bytes, and related-ID sequence.
+
+`result` and `completed_at` are terminal fields and are not part of draft equality. Summary, disposition, and anchored-note loss have distinct typed snapshot failures. Interpreting a result never requires reopening the retained draft file.
+
+### Store-neutral run state
+
+The artifact domain exposes only a pure admission state derived from already validated artifact evidence:
+
+| Valid draft | Valid result | Derived state | Draft create/update | Result create |
+| --- | --- | --- | --- | --- |
+| no | no | `new` | admitted | `DraftRequired` |
+| yes | no | `draft` | admitted | admitted after snapshot validation |
+| no or yes | yes | `completed` | `AlreadyCompleted` | `AlreadyCompleted` |
+
+A submit owner must save and validate the latest draft before create-once result publication. Valid result presence is the terminal authority even when the frozen draft remains stored. Raw invalid-file presence is not valid result evidence. A failed publication leaves the prior valid draft editable and does not serialize cancellation or completion. `canceled` is produced only by an explicit terminal submit and follows the same snapshot and create-once rules. Normal Review return, picker close, page or repository transition, and quit do not synthesize a result.
+
+Filesystem scanning, regular-file/no-follow admission, locking, draft CAS, atomic save, create-once publication, clock acquisition, mutation serialization, and crash recovery are outside this wire contract.
+
 ## Installed target command
 
 The target-only command is part of the normal `gitframe` executable:

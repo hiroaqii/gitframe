@@ -72,6 +72,8 @@ fn parseFindingSetValue(parser: *strict.Parser) ParseError!artifact.FindingSet {
     var seen: u32 = 0;
     var schema_version: ?u64 = null;
     var review_id: ?identity.ReviewId = null;
+    var created_at: ?[]const u8 = null;
+    var timing: ?artifact.FindingTiming = null;
     var target: ?target_mod.CommittedReviewTarget = null;
     var producer: ?artifact.Producer = null;
     var findings: ?[]const artifact.Finding = null;
@@ -83,28 +85,58 @@ fn parseFindingSetValue(parser: *strict.Parser) ParseError!artifact.FindingSet {
         } else if (std.mem.eql(u8, key, "review_id")) {
             try strict.markSeen(&seen, 1);
             review_id = identity.ReviewId.parse(try parser.string()) catch return error.InvalidValue;
-        } else if (std.mem.eql(u8, key, "target")) {
+        } else if (std.mem.eql(u8, key, "created_at")) {
             try strict.markSeen(&seen, 2);
+            const value = try parser.string();
+            try strict.validateTimestamp(value);
+            created_at = value;
+        } else if (std.mem.eql(u8, key, "timing")) {
+            try strict.markSeen(&seen, 3);
+            timing = try parseFindingTiming(parser);
+        } else if (std.mem.eql(u8, key, "target")) {
+            try strict.markSeen(&seen, 4);
             target = try parseTarget(parser);
         } else if (std.mem.eql(u8, key, "producer")) {
-            try strict.markSeen(&seen, 3);
+            try strict.markSeen(&seen, 5);
             producer = try parseProducer(parser);
         } else if (std.mem.eql(u8, key, "findings")) {
-            try strict.markSeen(&seen, 4);
+            try strict.markSeen(&seen, 6);
             findings = try parseFindings(parser);
         } else {
             return error.UnknownField;
         }
     }
-    try strict.requireFields(seen, 0b1_1111);
+    const required = (@as(u32, 1) << 0) | (@as(u32, 1) << 1) | (@as(u32, 1) << 2) |
+        (@as(u32, 1) << 4) | (@as(u32, 1) << 5) | (@as(u32, 1) << 6);
+    try strict.requireFields(seen, required);
     try strict.validateSchemaVersion(schema_version.?);
     return .{
         .schema_version = schema_version.?,
         .review_id = review_id.?,
+        .created_at = created_at.?,
+        .timing = timing,
         .target = target.?,
         .producer = producer.?,
         .findings = findings.?,
     };
+}
+
+fn parseFindingTiming(parser: *strict.Parser) ParseError!artifact.FindingTiming {
+    try parser.beginObject();
+    var seen: u32 = 0;
+    var duration_ms: ?u64 = null;
+    while (try parser.nextObjectKey()) |key| {
+        if (std.mem.eql(u8, key, "duration_ms")) {
+            try strict.markSeen(&seen, 0);
+            const value = try parser.unsigned(u64);
+            if (value > limits.max_duration_ms) return error.LimitExceeded;
+            duration_ms = value;
+        } else {
+            return error.UnknownField;
+        }
+    }
+    try strict.requireFields(seen, 1);
+    return .{ .duration_ms = duration_ms.? };
 }
 
 fn parseManifestValue(parser: *strict.Parser) ParseError!artifact.ReviewRunManifest {
@@ -184,6 +216,7 @@ fn parseDraftValue(parser: *strict.Parser) ParseError!artifact.ReviewDraftState 
     var revision: ?u64 = null;
     var summary: ?[]const u8 = null;
     var dispositions: ?[]const artifact.FindingDisposition = null;
+    var notes: ?[]const artifact.AnchoredNote = null;
 
     while (try parser.nextObjectKey()) |key| {
         if (std.mem.eql(u8, key, "schema_version")) {
@@ -211,12 +244,16 @@ fn parseDraftValue(parser: *strict.Parser) ParseError!artifact.ReviewDraftState 
         } else if (std.mem.eql(u8, key, "finding_dispositions")) {
             try strict.markSeen(&seen, 6);
             dispositions = try parseDispositions(parser);
+        } else if (std.mem.eql(u8, key, "anchored_notes")) {
+            try strict.markSeen(&seen, 7);
+            notes = try parseAnchoredNotes(parser);
         } else {
             return error.UnknownField;
         }
     }
     const required = (@as(u32, 1) << 0) | (@as(u32, 1) << 1) | (@as(u32, 1) << 2) |
-        (@as(u32, 1) << 3) | (@as(u32, 1) << 4) | (@as(u32, 1) << 6);
+        (@as(u32, 1) << 3) | (@as(u32, 1) << 4) | (@as(u32, 1) << 6) |
+        (@as(u32, 1) << 7);
     try strict.requireFields(seen, required);
     try strict.validateSchemaVersion(schema_version.?);
     return .{
@@ -227,6 +264,7 @@ fn parseDraftValue(parser: *strict.Parser) ParseError!artifact.ReviewDraftState 
         .revision = revision.?,
         .summary = summary,
         .finding_dispositions = dispositions.?,
+        .anchored_notes = notes.?,
     };
 }
 
@@ -238,6 +276,7 @@ fn parseResultValue(parser: *strict.Parser) ParseError!artifact.RevisionReviewRe
     var target: ?target_mod.CommittedReviewTarget = null;
     var digest: ?identity.Sha256Digest = null;
     var result_value: ?artifact.ReviewResultValue = null;
+    var completed_at: ?[]const u8 = null;
     var summary: ?[]const u8 = null;
     var dispositions: ?[]const artifact.FindingDisposition = null;
     var notes: ?[]const artifact.AnchoredNote = null;
@@ -258,24 +297,29 @@ fn parseResultValue(parser: *strict.Parser) ParseError!artifact.RevisionReviewRe
         } else if (std.mem.eql(u8, key, "result")) {
             try strict.markSeen(&seen, 4);
             result_value = try parseResultEnum(try parser.string());
-        } else if (std.mem.eql(u8, key, "summary")) {
+        } else if (std.mem.eql(u8, key, "completed_at")) {
             try strict.markSeen(&seen, 5);
+            const value = try parser.string();
+            try strict.validateTimestamp(value);
+            completed_at = value;
+        } else if (std.mem.eql(u8, key, "summary")) {
+            try strict.markSeen(&seen, 6);
             const value = try parser.string();
             try strict.validateText(value, limits.max_body_bytes, true);
             summary = value;
         } else if (std.mem.eql(u8, key, "finding_dispositions")) {
-            try strict.markSeen(&seen, 6);
+            try strict.markSeen(&seen, 7);
             dispositions = try parseDispositions(parser);
         } else if (std.mem.eql(u8, key, "anchored_notes")) {
-            try strict.markSeen(&seen, 7);
+            try strict.markSeen(&seen, 8);
             notes = try parseAnchoredNotes(parser);
         } else {
             return error.UnknownField;
         }
     }
     const required = (@as(u32, 1) << 0) | (@as(u32, 1) << 1) | (@as(u32, 1) << 2) |
-        (@as(u32, 1) << 3) | (@as(u32, 1) << 4) | (@as(u32, 1) << 6) |
-        (@as(u32, 1) << 7);
+        (@as(u32, 1) << 3) | (@as(u32, 1) << 4) | (@as(u32, 1) << 5) |
+        (@as(u32, 1) << 7) | (@as(u32, 1) << 8);
     try strict.requireFields(seen, required);
     try strict.validateSchemaVersion(schema_version.?);
     return .{
@@ -284,6 +328,7 @@ fn parseResultValue(parser: *strict.Parser) ParseError!artifact.RevisionReviewRe
         .target = target.?,
         .findings_digest = digest.?,
         .result = result_value.?,
+        .completed_at = completed_at.?,
         .summary = summary,
         .finding_dispositions = dispositions.?,
         .anchored_notes = notes.?,
@@ -645,6 +690,7 @@ pub const ValidationError = error{
     ReviewIdMismatch,
     TargetMismatch,
     ProducerMismatch,
+    CreatedAtMismatch,
     FindingCountMismatch,
     FindingsDigestMismatch,
     DispositionCountMismatch,
@@ -654,6 +700,9 @@ pub const ValidationError = error{
     DuplicateRelatedFindingId,
     RelatedFindingIdNotFound,
     NeedsChangesEvidenceMissing,
+    SummarySnapshotMismatch,
+    DispositionSnapshotMismatch,
+    AnchoredNotesSnapshotMismatch,
 };
 
 /// Bind a manifest to the exact findings bytes and decoded finding set.
@@ -668,6 +717,7 @@ pub fn validateManifestFindingSet(
     if (!manifest.review_id.eql(finding_set.review_id)) return error.ReviewIdMismatch;
     if (!manifest.target.eql(&finding_set.target)) return error.TargetMismatch;
     if (!manifest.producer.eql(finding_set.producer)) return error.ProducerMismatch;
+    if (!std.mem.eql(u8, manifest.created_at, finding_set.created_at)) return error.CreatedAtMismatch;
     if (manifest.finding_count != finding_set.findings.len) return error.FindingCountMismatch;
     if (!manifest.findings_digest.eql(identity.Sha256Digest.hash(exact_findings_bytes))) {
         return error.FindingsDigestMismatch;
@@ -689,6 +739,7 @@ pub fn validateDraftAgainst(
         findings_digest,
     );
     try validateDispositionSnapshot(draft.finding_dispositions, finding_set);
+    try validateAnchoredNotesAgainst(draft.anchored_notes, finding_set);
 }
 
 /// Bind a terminal result to one admitted immutable finding set and digest.
@@ -706,7 +757,21 @@ pub fn validateResultAgainst(
         findings_digest,
     );
     try validateDispositionSnapshot(result.finding_dispositions, finding_set);
-    for (result.anchored_notes) |note| {
+    try validateAnchoredNotesAgainst(result.anchored_notes, finding_set);
+    if (result.result == .needs_changes and
+        result.summary == null and
+        result.anchored_notes.len == 0 and
+        !hasAcceptedFinding(result.finding_dispositions))
+    {
+        return error.NeedsChangesEvidenceMissing;
+    }
+}
+
+fn validateAnchoredNotesAgainst(
+    notes: []const artifact.AnchoredNote,
+    finding_set: *const artifact.FindingSet,
+) ValidationError!void {
+    for (notes) |note| {
         for (note.related_finding_ids, 0..) |related, index| {
             if (finding_set.findingIndex(related) == null) return error.RelatedFindingIdNotFound;
             for (note.related_finding_ids[0..index]) |prior| {
@@ -714,12 +779,23 @@ pub fn validateResultAgainst(
             }
         }
     }
-    if (result.result == .needs_changes and
-        result.summary == null and
-        result.anchored_notes.len == 0 and
-        !hasAcceptedFinding(result.finding_dispositions))
-    {
-        return error.NeedsChangesEvidenceMissing;
+}
+
+/// Validate a terminal result as the exact immutable snapshot of a latest draft.
+pub fn validateSubmitSnapshot(
+    result: *const artifact.RevisionReviewResult,
+    draft: *const artifact.ReviewDraftState,
+    finding_set: *const artifact.FindingSet,
+    findings_digest: identity.Sha256Digest,
+) ValidationError!void {
+    try validateDraftAgainst(draft, finding_set, findings_digest);
+    try validateResultAgainst(result, finding_set, findings_digest);
+    if (!optionalTextEql(result.summary, draft.summary)) return error.SummarySnapshotMismatch;
+    if (!dispositionsEql(result.finding_dispositions, draft.finding_dispositions)) {
+        return error.DispositionSnapshotMismatch;
+    }
+    if (!anchoredNotesEql(result.anchored_notes, draft.anchored_notes)) {
+        return error.AnchoredNotesSnapshotMismatch;
     }
 }
 
@@ -767,6 +843,47 @@ fn hasAcceptedFinding(dispositions: []const artifact.FindingDisposition) bool {
     return false;
 }
 
+fn optionalTextEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn dispositionsEql(
+    left: []const artifact.FindingDisposition,
+    right: []const artifact.FindingDisposition,
+) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_value, right_value| {
+        if (!left_value.finding_id.eql(right_value.finding_id) or
+            left_value.disposition != right_value.disposition)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn anchoredNotesEql(left: []const artifact.AnchoredNote, right: []const artifact.AnchoredNote) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_note, right_note| {
+        if (!left_note.anchor.eql(right_note.anchor) or
+            !std.mem.eql(u8, left_note.body, right_note.body) or
+            !findingIdsEql(left_note.related_finding_ids, right_note.related_finding_ids))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn findingIdsEql(left: []const artifact.FindingId, right: []const artifact.FindingId) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_id, right_id| {
+        if (!left_id.eql(right_id)) return false;
+    }
+    return true;
+}
+
 /// Allocate canonical FindingSet JSON including its final LF.
 pub fn writeFindingSetAlloc(allocator: std.mem.Allocator, value: *const artifact.FindingSet) ParseError![]u8 {
     try validateFindingSetValue(value);
@@ -801,7 +918,10 @@ pub fn writeDraftAlloc(allocator: std.mem.Allocator, value: *const artifact.Revi
     errdefer allocator.free(buffer);
     var writer: std.Io.Writer = .fixed(buffer);
     var stringify: std.json.Stringify = .{ .writer = &writer, .options = .{} };
-    writeDraft(&stringify, value) catch return error.ArtifactTooLarge;
+    writeDraft(&stringify, allocator, value) catch |err| switch (err) {
+        error.WriteFailed => return error.ArtifactTooLarge,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     writer.writeByte('\n') catch return error.ArtifactTooLarge;
     return try allocator.realloc(buffer, writer.buffered().len);
 }
@@ -824,6 +944,8 @@ pub fn writeResultAlloc(allocator: std.mem.Allocator, value: *const artifact.Rev
 fn validateFindingSetValue(value: *const artifact.FindingSet) ParseError!void {
     try strict.validateSchemaVersion(value.schema_version);
     try validateReviewId(value.review_id);
+    try strict.validateTimestamp(value.created_at);
+    if (value.timing) |timing| try validateFindingTiming(timing);
     try validateTarget(&value.target);
     try validateProducer(value.producer);
     if (value.findings.len > limits.max_findings) return error.LimitExceeded;
@@ -833,6 +955,10 @@ fn validateFindingSetValue(value: *const artifact.FindingSet) ParseError!void {
             if (prior.finding_id.eql(finding.finding_id)) return error.DuplicateFindingId;
         }
     }
+}
+
+fn validateFindingTiming(value: artifact.FindingTiming) ParseError!void {
+    if (value.duration_ms > limits.max_duration_ms) return error.LimitExceeded;
 }
 
 fn validateManifestValue(value: *const artifact.ReviewRunManifest) ParseError!void {
@@ -857,16 +983,28 @@ fn validateDraftValue(value: *const artifact.ReviewDraftState) ParseError!void {
     if (value.revision == 0) return error.InvalidValue;
     if (value.summary) |summary| try strict.validateText(summary, limits.max_body_bytes, true);
     try validateDispositionsStandalone(value.finding_dispositions);
+    try validateAnchoredNotesStandalone(value.anchored_notes);
 }
 
 fn validateResultValue(value: *const artifact.RevisionReviewResult) ParseError!void {
     try strict.validateSchemaVersion(value.schema_version);
     try validateReviewId(value.review_id);
     try validateTarget(&value.target);
+    try strict.validateTimestamp(value.completed_at);
     if (value.summary) |summary| try strict.validateText(summary, limits.max_body_bytes, true);
     try validateDispositionsStandalone(value.finding_dispositions);
-    if (value.anchored_notes.len > limits.max_anchored_notes) return error.LimitExceeded;
-    for (value.anchored_notes) |note| {
+    try validateAnchoredNotesStandalone(value.anchored_notes);
+    if (value.result == .needs_changes and
+        value.summary == null and value.anchored_notes.len == 0 and
+        !hasAcceptedFinding(value.finding_dispositions))
+    {
+        return error.InvalidValue;
+    }
+}
+
+fn validateAnchoredNotesStandalone(notes: []const artifact.AnchoredNote) ParseError!void {
+    if (notes.len > limits.max_anchored_notes) return error.LimitExceeded;
+    for (notes) |note| {
         try validateAnchor(note.anchor);
         try strict.validateText(note.body, limits.max_body_bytes, true);
         if (note.related_finding_ids.len > limits.max_related_finding_ids) return error.LimitExceeded;
@@ -876,12 +1014,6 @@ fn validateResultValue(value: *const artifact.RevisionReviewResult) ParseError!v
                 if (prior.eql(related)) return error.DuplicateRelatedFindingId;
             }
         }
-    }
-    if (value.result == .needs_changes and
-        value.summary == null and value.anchored_notes.len == 0 and
-        !hasAcceptedFinding(value.finding_dispositions))
-    {
-        return error.InvalidValue;
     }
 }
 
@@ -943,6 +1075,13 @@ fn writeFindingSet(
     try stringify.beginObject();
     try fieldUnsigned(stringify, "schema_version", value.schema_version);
     try fieldReviewId(stringify, "review_id", value.review_id);
+    try fieldString(stringify, "created_at", value.created_at);
+    if (value.timing) |timing| {
+        try stringify.objectField("timing");
+        try stringify.beginObject();
+        try fieldUnsigned(stringify, "duration_ms", timing.duration_ms);
+        try stringify.endObject();
+    }
     try stringify.objectField("target");
     try writeTarget(stringify, &value.target);
     try stringify.objectField("producer");
@@ -976,7 +1115,11 @@ fn writeManifest(stringify: *std.json.Stringify, value: *const artifact.ReviewRu
     try stringify.endObject();
 }
 
-fn writeDraft(stringify: *std.json.Stringify, value: *const artifact.ReviewDraftState) !void {
+fn writeDraft(
+    stringify: *std.json.Stringify,
+    allocator: std.mem.Allocator,
+    value: *const artifact.ReviewDraftState,
+) !void {
     try stringify.beginObject();
     try fieldUnsigned(stringify, "schema_version", value.schema_version);
     try fieldReviewId(stringify, "review_id", value.review_id);
@@ -987,6 +1130,8 @@ fn writeDraft(stringify: *std.json.Stringify, value: *const artifact.ReviewDraft
     if (value.summary) |text| try fieldString(stringify, "summary", text);
     try stringify.objectField("finding_dispositions");
     try writeDispositions(stringify, value.finding_dispositions);
+    try stringify.objectField("anchored_notes");
+    try writeAnchoredNotes(stringify, allocator, value.anchored_notes);
     try stringify.endObject();
 }
 
@@ -1002,12 +1147,22 @@ fn writeResult(
     try writeTarget(stringify, &value.target);
     try fieldDigest(stringify, "findings_digest", value.findings_digest);
     try fieldString(stringify, "result", resultName(value.result));
+    try fieldString(stringify, "completed_at", value.completed_at);
     if (value.summary) |text| try fieldString(stringify, "summary", text);
     try stringify.objectField("finding_dispositions");
     try writeDispositions(stringify, value.finding_dispositions);
     try stringify.objectField("anchored_notes");
+    try writeAnchoredNotes(stringify, allocator, value.anchored_notes);
+    try stringify.endObject();
+}
+
+fn writeAnchoredNotes(
+    stringify: *std.json.Stringify,
+    allocator: std.mem.Allocator,
+    values: []const artifact.AnchoredNote,
+) !void {
     try stringify.beginArray();
-    for (value.anchored_notes) |note| {
+    for (values) |note| {
         try stringify.beginObject();
         try stringify.objectField("anchor");
         try writeAnchor(stringify, allocator, note.anchor);
@@ -1019,7 +1174,6 @@ fn writeResult(
         try stringify.endObject();
     }
     try stringify.endArray();
-    try stringify.endObject();
 }
 
 /// Write the shared canonical target object into an enclosing JSON writer.
@@ -1197,6 +1351,7 @@ fn testFindingSet() !artifact.FindingSet {
     return .{
         .schema_version = 1,
         .review_id = try identity.ReviewId.parse("123e4567-e89b-42d3-a456-426614174000"),
+        .created_at = "2026-08-19T05:00:00Z",
         .target = try testTarget(),
         .producer = .{ .name = "codex", .model = "gpt-x" },
         .findings = findings,
@@ -1205,6 +1360,24 @@ fn testFindingSet() !artifact.FindingSet {
 
 fn readFixture(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1024 * 1024));
+}
+
+fn expectFindingSetFixtureError(expected: anyerror, path: []const u8) !void {
+    const bytes = try readFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectError(expected, artifact.FindingSet.parseStrict(std.testing.allocator, bytes));
+}
+
+fn expectDraftFixtureError(expected: anyerror, path: []const u8) !void {
+    const bytes = try readFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectError(expected, artifact.ReviewDraftState.parseStrict(std.testing.allocator, bytes));
+}
+
+fn expectResultFixtureError(expected: anyerror, path: []const u8) !void {
+    const bytes = try readFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectError(expected, artifact.RevisionReviewResult.parseStrict(std.testing.allocator, bytes));
 }
 
 test "committed review v1 golden fixtures round trip and bind as exact bytes" {
@@ -1220,6 +1393,8 @@ test "committed review v1 golden fixtures round trip and bind as exact bytes" {
 
     var findings = try artifact.FindingSet.parseStrict(allocator, findings_bytes);
     defer findings.deinit();
+    try std.testing.expectEqualStrings("2026-08-19T05:00:00Z", findings.value.created_at);
+    try std.testing.expectEqual(@as(u64, 1250), findings.value.timing.?.duration_ms);
     const rewritten_findings = try findings.value.writeCanonical(allocator);
     defer allocator.free(rewritten_findings);
     try std.testing.expectEqualSlices(u8, findings_bytes, rewritten_findings);
@@ -1234,6 +1409,7 @@ test "committed review v1 golden fixtures round trip and bind as exact bytes" {
     const digest = identity.Sha256Digest.hash(findings_bytes);
     var draft = try artifact.ReviewDraftState.parseStrict(allocator, draft_bytes);
     defer draft.deinit();
+    try std.testing.expectEqual(@as(usize, 1), draft.value.anchored_notes.len);
     try draft.value.validateAgainst(&findings.value, digest);
     const rewritten_draft = try draft.value.writeCanonical(allocator);
     defer allocator.free(rewritten_draft);
@@ -1241,10 +1417,96 @@ test "committed review v1 golden fixtures round trip and bind as exact bytes" {
 
     var result = try artifact.RevisionReviewResult.parseStrict(allocator, result_bytes);
     defer result.deinit();
+    try std.testing.expectEqualStrings("2026-08-19T06:00:00Z", result.value.completed_at);
     try result.value.validateAgainst(&findings.value, digest);
+    try result.value.validateSubmitSnapshot(&draft.value, &findings.value, digest);
     const rewritten_result = try result.value.writeCanonical(allocator);
     defer allocator.free(rewritten_result);
     try std.testing.expectEqualSlices(u8, result_bytes, rewritten_result);
+
+    try testFindingSetTimestampAndTiming();
+    try testResultCompletionTimestamp();
+}
+
+fn testFindingSetTimestampAndTiming() !void {
+    const allocator = std.testing.allocator;
+    var finding_set = try testFindingSet();
+
+    finding_set.created_at = "2024-02-29T23:59:59Z";
+    const leap_day_bytes = try finding_set.writeCanonical(allocator);
+    defer allocator.free(leap_day_bytes);
+    var leap_day = try artifact.FindingSet.parseStrict(allocator, leap_day_bytes);
+    defer leap_day.deinit();
+    try std.testing.expectEqualStrings(finding_set.created_at, leap_day.value.created_at);
+
+    finding_set.timing = null;
+    const omitted_bytes = try finding_set.writeCanonical(allocator);
+    defer allocator.free(omitted_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, omitted_bytes, "\"timing\"") == null);
+    var omitted = try artifact.FindingSet.parseStrict(allocator, omitted_bytes);
+    defer omitted.deinit();
+    try std.testing.expect(omitted.value.timing == null);
+
+    finding_set.timing = .{ .duration_ms = 0 };
+    const zero_bytes = try finding_set.writeCanonical(allocator);
+    defer allocator.free(zero_bytes);
+    var zero = try artifact.FindingSet.parseStrict(allocator, zero_bytes);
+    defer zero.deinit();
+    try std.testing.expectEqual(@as(u64, 0), zero.value.timing.?.duration_ms);
+
+    finding_set.timing = .{ .duration_ms = limits.max_duration_ms };
+    const maximum_bytes = try finding_set.writeCanonical(allocator);
+    defer allocator.free(maximum_bytes);
+    var maximum = try artifact.FindingSet.parseStrict(allocator, maximum_bytes);
+    defer maximum.deinit();
+    try std.testing.expectEqual(limits.max_duration_ms, maximum.value.timing.?.duration_ms);
+
+    finding_set.timing = .{ .duration_ms = limits.max_duration_ms + 1 };
+    try std.testing.expectError(error.LimitExceeded, finding_set.writeCanonical(allocator));
+
+    const cases = [_]struct { path: []const u8, expected: anyerror }{
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-created-at-missing.json", .expected = error.MissingField },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-created-at-null.json", .expected = error.InvalidType },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-created-at-offset.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-created-at-fractional.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-created-at-leap-second.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-created-at-oversized.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-created-at-invalid-calendar.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-created-at-wrong-type.json", .expected = error.InvalidType },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-timing-null.json", .expected = error.InvalidType },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-timing-missing-duration.json", .expected = error.MissingField },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-timing-wrong-type.json", .expected = error.InvalidType },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-timing-unknown-field.json", .expected = error.UnknownField },
+        .{ .path = "testdata/committed-review-v1/negative/finding-set-timing-overflow.json", .expected = error.LimitExceeded },
+    };
+    for (cases) |case| try expectFindingSetFixtureError(case.expected, case.path);
+}
+
+fn testResultCompletionTimestamp() !void {
+    const allocator = std.testing.allocator;
+    const result_bytes = try readFixture(allocator, "testdata/committed-review-v1/result/canonical.json");
+    defer allocator.free(result_bytes);
+    var parsed = try artifact.RevisionReviewResult.parseStrict(allocator, result_bytes);
+    defer parsed.deinit();
+    var leap_day = parsed.value;
+    leap_day.completed_at = "2024-02-29T23:59:59Z";
+    const leap_bytes = try leap_day.writeCanonical(allocator);
+    defer allocator.free(leap_bytes);
+    var reparsed = try artifact.RevisionReviewResult.parseStrict(allocator, leap_bytes);
+    defer reparsed.deinit();
+    try std.testing.expectEqualStrings(leap_day.completed_at, reparsed.value.completed_at);
+
+    const cases = [_]struct { path: []const u8, expected: anyerror }{
+        .{ .path = "testdata/committed-review-v1/negative/result-completed-at-missing.json", .expected = error.MissingField },
+        .{ .path = "testdata/committed-review-v1/negative/result-completed-at-null.json", .expected = error.InvalidType },
+        .{ .path = "testdata/committed-review-v1/negative/result-completed-at-offset.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/result-completed-at-fractional.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/result-completed-at-leap-second.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/result-completed-at-oversized.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/result-completed-at-invalid-calendar.json", .expected = error.InvalidValue },
+        .{ .path = "testdata/committed-review-v1/negative/result-completed-at-wrong-type.json", .expected = error.InvalidType },
+    };
+    for (cases) |case| try expectResultFixtureError(case.expected, case.path);
 }
 
 test "fixtures preserve separate Runs on one target and reject structural aliases" {
@@ -1311,6 +1573,7 @@ test "strict artifact parsing rejects unknown duplicate nullable and noncanonica
 
     const duplicate =
         "{\"schema_version\":1,\"schema_version\":1,\"review_id\":\"123e4567-e89b-42d3-a456-426614174000\"," ++
+        "\"created_at\":\"2026-08-19T05:00:00Z\"," ++
         "\"target\":{\"object_format\":\"sha1\",\"source_kind\":\"branch_range\",\"base_oid\":\"0000000000000000000000000000000000000000\"," ++
         "\"head_oid\":\"1111111111111111111111111111111111111111\",\"diff_base_oid\":\"0000000000000000000000000000000000000000\"}," ++
         "\"producer\":{\"name\":\"codex\"},\"findings\":[]}";
@@ -1318,6 +1581,7 @@ test "strict artifact parsing rejects unknown duplicate nullable and noncanonica
 
     const unknown =
         "{\"schema_version\":1,\"review_id\":\"123e4567-e89b-42d3-a456-426614174000\"," ++
+        "\"created_at\":\"2026-08-19T05:00:00Z\"," ++
         "\"target\":{\"object_format\":\"sha1\",\"source_kind\":\"branch_range\",\"base_oid\":\"0000000000000000000000000000000000000000\"," ++
         "\"head_oid\":\"1111111111111111111111111111111111111111\",\"diff_base_oid\":\"0000000000000000000000000000000000000000\"}," ++
         "\"producer\":{\"name\":\"codex\"},\"findings\":[],\"capabilities\":[]}";
@@ -1325,6 +1589,7 @@ test "strict artifact parsing rejects unknown duplicate nullable and noncanonica
 
     const nullable =
         "{\"schema_version\":1,\"review_id\":\"123e4567-e89b-42d3-a456-426614174000\"," ++
+        "\"created_at\":\"2026-08-19T05:00:00Z\"," ++
         "\"target\":{\"object_format\":\"sha1\",\"source_kind\":\"branch_range\",\"base_oid\":\"0000000000000000000000000000000000000000\"," ++
         "\"head_oid\":\"1111111111111111111111111111111111111111\",\"diff_base_oid\":\"0000000000000000000000000000000000000000\"}," ++
         "\"producer\":{\"name\":\"codex\",\"model\":null},\"findings\":[]}";
@@ -1374,6 +1639,7 @@ test "manifest draft and result bind one exact FindingSet without digest aliases
         .revision = 1,
         .summary = null,
         .finding_dispositions = dispositions,
+        .anchored_notes = &.{},
     };
     try draft.validateAgainst(&finding_set, digest);
     const draft_bytes = try draft.writeCanonical(allocator);
@@ -1388,6 +1654,7 @@ test "manifest draft and result bind one exact FindingSet without digest aliases
         .target = finding_set.target,
         .findings_digest = digest,
         .result = .needs_changes,
+        .completed_at = "2026-08-19T06:00:00Z",
         .summary = null,
         .finding_dispositions = dispositions,
         .anchored_notes = &.{},
@@ -1405,6 +1672,7 @@ test "manifest draft and result bind one exact FindingSet without digest aliases
         error.FindingsDigestMismatch,
         changed_manifest.validateFindingSet(findings_bytes, &finding_set),
     );
+    try testSubmitSnapshot();
 }
 
 test "disposition and related Finding references are complete unique and Run local" {
@@ -1422,6 +1690,7 @@ test "disposition and related Finding references are complete unique and Run loc
         .revision = 1,
         .summary = null,
         .finding_dispositions = duplicate,
+        .anchored_notes = &.{},
     };
     try std.testing.expectError(error.DispositionCountMismatch, draft.validateAgainst(&finding_set, digest));
 
@@ -1441,11 +1710,134 @@ test "disposition and related Finding references are complete unique and Run loc
         .target = finding_set.target,
         .findings_digest = digest,
         .result = .needs_changes,
+        .completed_at = "2026-08-19T06:00:00Z",
         .summary = null,
         .finding_dispositions = one,
         .anchored_notes = notes,
     };
     try std.testing.expectError(error.RelatedFindingIdNotFound, result.validateAgainst(&finding_set, digest));
+    try testDraftAnchoredNotes();
+}
+
+fn testDraftAnchoredNotes() !void {
+    const allocator = std.testing.allocator;
+    const findings_bytes = try readFixture(allocator, "testdata/committed-review-v1/finding-set/canonical.json");
+    defer allocator.free(findings_bytes);
+    var findings = try artifact.FindingSet.parseStrict(allocator, findings_bytes);
+    defer findings.deinit();
+    const digest = identity.Sha256Digest.hash(findings_bytes);
+
+    const draft_bytes = try readFixture(allocator, "testdata/committed-review-v1/draft/canonical.json");
+    defer allocator.free(draft_bytes);
+    var draft = try artifact.ReviewDraftState.parseStrict(allocator, draft_bytes);
+    defer draft.deinit();
+    try draft.value.validateAgainst(&findings.value, digest);
+
+    try expectDraftFixtureError(
+        error.MissingField,
+        "testdata/committed-review-v1/negative/draft-anchored-notes-missing.json",
+    );
+    try expectDraftFixtureError(
+        error.InvalidType,
+        "testdata/committed-review-v1/negative/draft-anchored-notes-null.json",
+    );
+    try expectDraftFixtureError(
+        error.InvalidValue,
+        "testdata/committed-review-v1/negative/draft-note-invalid-anchor.json",
+    );
+
+    const foreign_finding_bytes = try readFixture(
+        allocator,
+        "testdata/committed-review-v1/negative/draft-note-foreign-finding.json",
+    );
+    defer allocator.free(foreign_finding_bytes);
+    var foreign_finding = try artifact.ReviewDraftState.parseStrict(allocator, foreign_finding_bytes);
+    defer foreign_finding.deinit();
+    try std.testing.expectError(
+        error.RelatedFindingIdNotFound,
+        foreign_finding.value.validateAgainst(&findings.value, digest),
+    );
+
+    const foreign_anchor_bytes = try readFixture(
+        allocator,
+        "testdata/committed-review-v1/negative/draft-note-foreign-anchor.json",
+    );
+    defer allocator.free(foreign_anchor_bytes);
+    var foreign_anchor = try artifact.ReviewDraftState.parseStrict(allocator, foreign_anchor_bytes);
+    defer foreign_anchor.deinit();
+    // Structural/cross-artifact validation deliberately leaves committed Git
+    // membership to resolveCodeAnchor at the consumer boundary.
+    try foreign_anchor.value.validateAgainst(&findings.value, digest);
+
+    var duplicate_note = draft.value.anchored_notes[0];
+    const duplicate_ids = [_]artifact.FindingId{
+        .{ .bytes = "F-1" },
+        .{ .bytes = "F-1" },
+    };
+    duplicate_note.related_finding_ids = &duplicate_ids;
+    var duplicate_draft = draft.value;
+    duplicate_draft.anchored_notes = &.{duplicate_note};
+    try std.testing.expectError(error.DuplicateRelatedFindingId, duplicate_draft.writeCanonical(allocator));
+
+    const oversized_body = try allocator.alloc(u8, limits.max_body_bytes + 1);
+    defer allocator.free(oversized_body);
+    @memset(oversized_body, 'x');
+    var oversized_note = draft.value.anchored_notes[0];
+    oversized_note.body = oversized_body;
+    var oversized_draft = draft.value;
+    oversized_draft.anchored_notes = &.{oversized_note};
+    try std.testing.expectError(error.LimitExceeded, oversized_draft.writeCanonical(allocator));
+}
+
+fn testSubmitSnapshot() !void {
+    const allocator = std.testing.allocator;
+    const findings_bytes = try readFixture(allocator, "testdata/committed-review-v1/finding-set/canonical.json");
+    defer allocator.free(findings_bytes);
+    var findings = try artifact.FindingSet.parseStrict(allocator, findings_bytes);
+    defer findings.deinit();
+    const digest = identity.Sha256Digest.hash(findings_bytes);
+    const draft_bytes = try readFixture(allocator, "testdata/committed-review-v1/draft/canonical.json");
+    defer allocator.free(draft_bytes);
+    var draft = try artifact.ReviewDraftState.parseStrict(allocator, draft_bytes);
+    defer draft.deinit();
+    const result_bytes = try readFixture(allocator, "testdata/committed-review-v1/result/canonical.json");
+    defer allocator.free(result_bytes);
+    var result = try artifact.RevisionReviewResult.parseStrict(allocator, result_bytes);
+    defer result.deinit();
+
+    try result.value.validateSubmitSnapshot(&draft.value, &findings.value, digest);
+
+    var changed = result.value;
+    changed.summary = "different summary";
+    try std.testing.expectError(
+        error.SummarySnapshotMismatch,
+        changed.validateSubmitSnapshot(&draft.value, &findings.value, digest),
+    );
+
+    var changed_dispositions = try allocator.dupe(artifact.FindingDisposition, result.value.finding_dispositions);
+    defer allocator.free(changed_dispositions);
+    changed_dispositions[0].disposition = .dismissed;
+    changed = result.value;
+    changed.finding_dispositions = changed_dispositions;
+    try std.testing.expectError(
+        error.DispositionSnapshotMismatch,
+        changed.validateSubmitSnapshot(&draft.value, &findings.value, digest),
+    );
+
+    var changed_notes = try allocator.dupe(artifact.AnchoredNote, result.value.anchored_notes);
+    defer allocator.free(changed_notes);
+    changed_notes[0].body = "different note";
+    changed = result.value;
+    changed.anchored_notes = changed_notes;
+    try std.testing.expectError(
+        error.AnchoredNotesSnapshotMismatch,
+        changed.validateSubmitSnapshot(&draft.value, &findings.value, digest),
+    );
+
+    changed = result.value;
+    changed.result = .canceled;
+    changed.completed_at = "2026-08-19T06:01:00Z";
+    try changed.validateSubmitSnapshot(&draft.value, &findings.value, digest);
 }
 
 test "zero Finding results are valid and needs_changes requires explicit evidence" {
@@ -1458,6 +1850,7 @@ test "zero Finding results are valid and needs_changes requires explicit evidenc
         .target = finding_set.target,
         .findings_digest = digest,
         .result = .approved,
+        .completed_at = "2026-08-19T06:00:00Z",
         .summary = null,
         .finding_dispositions = &.{},
         .anchored_notes = &.{},
@@ -1535,6 +1928,31 @@ test "manifest digest binds one-byte whitespace and final-LF differences" {
     defer manifest.deinit();
     try manifest.value.validateFindingSet(findings_bytes, &findings.value);
 
+    var wrong_findings = findings.value;
+    wrong_findings.created_at = "2026-08-19T05:00:01Z";
+    try std.testing.expectError(
+        error.CreatedAtMismatch,
+        manifest.value.validateFindingSet(findings_bytes, &wrong_findings),
+    );
+
+    const timestamp_changed = try allocator.dupe(u8, findings_bytes);
+    defer allocator.free(timestamp_changed);
+    const timestamp_offset = std.mem.indexOf(u8, timestamp_changed, "05:00:00Z") orelse unreachable;
+    timestamp_changed[timestamp_offset + "05:00:0".len] = '1';
+    try std.testing.expectError(
+        error.FindingsDigestMismatch,
+        manifest.value.validateFindingSet(timestamp_changed, &findings.value),
+    );
+
+    const timing_changed = try allocator.dupe(u8, findings_bytes);
+    defer allocator.free(timing_changed);
+    const timing_offset = std.mem.indexOf(u8, timing_changed, "\"duration_ms\":1250") orelse unreachable;
+    timing_changed[timing_offset + "\"duration_ms\":125".len] = '1';
+    try std.testing.expectError(
+        error.FindingsDigestMismatch,
+        manifest.value.validateFindingSet(timing_changed, &findings.value),
+    );
+
     const changed = try allocator.dupe(u8, findings_bytes);
     defer allocator.free(changed);
     changed[changed.len - 2] = if (changed[changed.len - 2] == '}') ' ' else '}';
@@ -1554,7 +1972,7 @@ test "manifest digest binds one-byte whitespace and final-LF differences" {
         manifest.value.validateFindingSet(findings_bytes[0 .. findings_bytes.len - 1], &findings.value),
     );
 
-    var wrong_findings = findings.value;
+    wrong_findings = findings.value;
     wrong_findings.review_id = try identity.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
     try std.testing.expectError(error.ReviewIdMismatch, manifest.value.validateFindingSet(findings_bytes, &wrong_findings));
     wrong_findings = findings.value;
@@ -1582,6 +2000,7 @@ test "closed artifact enums reject every unlisted spelling" {
 test "strict artifact parse and canonical write release every failed allocation" {
     const input =
         "{\"schema_version\":1,\"review_id\":\"123e4567-e89b-42d3-a456-426614174000\"," ++
+        "\"created_at\":\"2026-08-19T05:00:00Z\"," ++
         "\"target\":{\"object_format\":\"sha1\",\"source_kind\":\"branch_range\"," ++
         "\"base_oid\":\"0000000000000000000000000000000000000000\"," ++
         "\"head_oid\":\"1111111111111111111111111111111111111111\"," ++
@@ -1599,6 +2018,45 @@ test "strict artifact parse and canonical write release every failed allocation"
             var value = try testFindingSet();
             value.findings = &.{};
             const bytes = try value.writeCanonical(allocator);
+            defer allocator.free(bytes);
+        }
+    }.write, .{});
+
+    const draft_fixture = try readFixture(
+        std.testing.allocator,
+        "testdata/committed-review-v1/draft/canonical.json",
+    );
+    defer std.testing.allocator.free(draft_fixture);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn parse(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var parsed = try artifact.ReviewDraftState.parseStrict(allocator, bytes);
+            defer parsed.deinit();
+        }
+    }.parse, .{draft_fixture});
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn write(allocator: std.mem.Allocator) !void {
+            const finding_set = try testFindingSet();
+            const dispositions = &[_]artifact.FindingDisposition{.{
+                .finding_id = .{ .bytes = "F-1" },
+                .disposition = .accepted,
+            }};
+            const notes = &[_]artifact.AnchoredNote{.{
+                .anchor = finding_set.findings[0].anchor,
+                .body = "note",
+                .related_finding_ids = &.{.{ .bytes = "F-1" }},
+            }};
+            const draft: artifact.ReviewDraftState = .{
+                .schema_version = 1,
+                .review_id = finding_set.review_id,
+                .target = finding_set.target,
+                .findings_digest = identity.Sha256Digest.hash("fixture"),
+                .revision = 1,
+                .summary = null,
+                .finding_dispositions = dispositions,
+                .anchored_notes = notes,
+            };
+            const bytes = try draft.writeCanonical(allocator);
             defer allocator.free(bytes);
         }
     }.write, .{});
@@ -1644,6 +2102,7 @@ test "collection caps accept exact cardinality and reject plus one" {
         .revision = 1,
         .summary = null,
         .finding_dispositions = dispositions[0..limits.max_dispositions],
+        .anchored_notes = &.{},
     };
     const exact_draft = try draft.writeCanonical(allocator);
     allocator.free(exact_draft);
@@ -1663,6 +2122,7 @@ test "collection caps accept exact cardinality and reject plus one" {
         .target = finding_set.target,
         .findings_digest = identity.Sha256Digest.hash("fixture"),
         .result = .approved,
+        .completed_at = "2026-08-19T06:00:00Z",
         .summary = null,
         .finding_dispositions = &.{},
         .anchored_notes = notes[0..limits.max_anchored_notes],

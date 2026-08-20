@@ -32,6 +32,7 @@ pub const FindingId = artifact.FindingId;
 pub const Producer = artifact.Producer;
 pub const Severity = artifact.Severity;
 pub const Finding = artifact.Finding;
+pub const FindingTiming = artifact.FindingTiming;
 pub const FindingSet = artifact.FindingSet;
 pub const DisplayMetadata = artifact.DisplayMetadata;
 pub const ReviewRunManifest = artifact.ReviewRunManifest;
@@ -41,6 +42,8 @@ pub const ReviewDraftState = artifact.ReviewDraftState;
 pub const ReviewResultValue = artifact.ReviewResultValue;
 pub const AnchoredNote = artifact.AnchoredNote;
 pub const RevisionReviewResult = artifact.RevisionReviewResult;
+pub const ReviewRunState = artifact.ReviewRunState;
+pub const MutationAdmissionError = artifact.MutationAdmissionError;
 
 test {
     _ = @import("committed_review/identity.zig");

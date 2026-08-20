@@ -19,6 +19,9 @@ pub const max_dispositions: usize = 4096;
 pub const max_anchored_notes: usize = 4096;
 pub const max_related_finding_ids: usize = 256;
 
+/// Largest portable producer-observed duration in milliseconds.
+pub const max_duration_ms: u64 = 4_294_967_295;
+
 // Maximum decoded text/path byte counts; paths need not be UTF-8.
 pub const max_finding_id_bytes: usize = 64;
 pub const max_short_text_bytes: usize = 256;

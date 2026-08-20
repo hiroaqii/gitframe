@@ -52,10 +52,18 @@ pub const Finding = struct {
     suggestion: ?[]const u8 = null,
 };
 
+/// Optional producer-observed timing provenance for one immutable FindingSet.
+pub const FindingTiming = struct {
+    duration_ms: u64,
+};
+
 /// Producer-owned immutable findings payload for one run and exact target.
 pub const FindingSet = struct {
     schema_version: u64,
     review_id: identity.ReviewId,
+    /// UTC second at which the producer finalized this immutable payload.
+    created_at: []const u8,
+    timing: ?FindingTiming = null,
     target: target_mod.CommittedReviewTarget,
     producer: Producer,
     findings: []const Finding,
@@ -151,6 +159,7 @@ pub const ReviewDraftState = struct {
     revision: u64,
     summary: ?[]const u8,
     finding_dispositions: []const FindingDisposition,
+    anchored_notes: []const AnchoredNote,
 
     /// Parse with one owner for all returned borrowed fields.
     pub fn parseStrict(
@@ -197,6 +206,8 @@ pub const RevisionReviewResult = struct {
     /// Digest of the exact immutable findings payload admitted by this result.
     findings_digest: identity.Sha256Digest,
     result: ReviewResultValue,
+    /// UTC second at which the human terminal decision was admitted.
+    completed_at: []const u8,
     summary: ?[]const u8,
     finding_dispositions: []const FindingDisposition,
     anchored_notes: []const AnchoredNote,
@@ -222,6 +233,49 @@ pub const RevisionReviewResult = struct {
     ) @import("codec.zig").ValidationError!void {
         return @import("codec.zig").validateResultAgainst(self, finding_set, findings_digest);
     }
+
+    /// Require this terminal value to be a lossless snapshot of `draft`.
+    pub fn validateSubmitSnapshot(
+        self: *const RevisionReviewResult,
+        draft: *const ReviewDraftState,
+        finding_set: *const FindingSet,
+        findings_digest: identity.Sha256Digest,
+    ) @import("codec.zig").ValidationError!void {
+        return @import("codec.zig").validateSubmitSnapshot(self, draft, finding_set, findings_digest);
+    }
+};
+
+/// Store-neutral state derived only from already validated artifact presence.
+pub const ReviewRunState = enum {
+    new,
+    draft,
+    completed,
+
+    /// A valid result has precedence over a retained valid draft.
+    pub fn derive(valid_draft_present: bool, valid_result_present: bool) ReviewRunState {
+        if (valid_result_present) return .completed;
+        if (valid_draft_present) return .draft;
+        return .new;
+    }
+
+    /// Admit creation or replacement of mutable draft state.
+    pub fn admitDraftMutation(self: ReviewRunState) MutationAdmissionError!void {
+        if (self == .completed) return error.AlreadyCompleted;
+    }
+
+    /// Admit create-once terminal result publication only after a valid draft.
+    pub fn admitResultCreation(self: ReviewRunState) MutationAdmissionError!void {
+        return switch (self) {
+            .new => error.DraftRequired,
+            .draft => {},
+            .completed => error.AlreadyCompleted,
+        };
+    }
+};
+
+pub const MutationAdmissionError = error{
+    DraftRequired,
+    AlreadyCompleted,
 };
 
 fn optionalTextEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -234,4 +288,22 @@ test "finding IDs remain scoped values instead of review identities" {
     const b: FindingId = .{ .bytes = "finding-2" };
     try std.testing.expect(a.eql(a));
     try std.testing.expect(!a.eql(b));
+    try testReviewRunStateAdmission();
+}
+
+fn testReviewRunStateAdmission() !void {
+    try std.testing.expectEqual(ReviewRunState.new, ReviewRunState.derive(false, false));
+    try std.testing.expectEqual(ReviewRunState.draft, ReviewRunState.derive(true, false));
+    try std.testing.expectEqual(ReviewRunState.completed, ReviewRunState.derive(false, true));
+    try std.testing.expectEqual(ReviewRunState.completed, ReviewRunState.derive(true, true));
+
+    try ReviewRunState.new.admitDraftMutation();
+    try ReviewRunState.draft.admitDraftMutation();
+    try std.testing.expectError(error.AlreadyCompleted, ReviewRunState.completed.admitDraftMutation());
+    try std.testing.expectError(error.DraftRequired, ReviewRunState.new.admitResultCreation());
+    try ReviewRunState.draft.admitResultCreation();
+    try std.testing.expectError(error.AlreadyCompleted, ReviewRunState.completed.admitResultCreation());
+
+    // A failed future result publication leaves valid-result evidence absent.
+    try std.testing.expectEqual(ReviewRunState.draft, ReviewRunState.derive(true, false));
 }
