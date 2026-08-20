@@ -57,6 +57,29 @@ pub const KeyboardLineHit = struct {
     hit: diff_surface.DiffMouseHit,
 };
 
+pub const KeyboardLineStart = union(enum) {
+    unavailable,
+    direct: diff_surface.DiffMouseHit,
+    choose: diff_selection.KeyboardSideChoice,
+};
+
+pub const BeginKeyboardLineSelectionTerminal = enum {
+    started,
+    choosing_side,
+    unavailable,
+};
+
+const KeyboardSideCandidate = struct {
+    point: diff_selection.Point,
+    text: []const u8,
+};
+
+const KeyboardSideCandidates = struct {
+    identity: diff_selection.Identity,
+    before: ?KeyboardSideCandidate,
+    after: ?KeyboardSideCandidate,
+};
+
 const KeyboardLine = struct {
     side: diff_selection.Side,
     line_index: usize,
@@ -399,9 +422,16 @@ pub const BodyView = struct {
     }
 
     pub fn selectionStatusPresentation(self: BodyView) ?selection_action.StatusPresentation {
-        var status = (self.selectionPresentation() orelse return null).status();
-        if (self.view.effectiveDisplayMode() == .side_by_side) status.side = .none;
+        const active_keyboard = self.activeKeyboardSelectionPresentation();
+        const presentation = active_keyboard orelse (self.retainedSelectionPresentation() orelse return null);
+        var status = presentation.status();
+        if (self.view.effectiveDisplayMode() == .side_by_side and active_keyboard == null) status.side = .none;
         return status;
+    }
+
+    pub fn keyboardSideChoiceActive(self: BodyView) bool {
+        const choice = self.view.surface.selection_owner.activeKeyboardSideChoice() orelse return false;
+        return self.keyboardSideChoiceHit(choice, .old) != null and self.keyboardSideChoiceHit(choice, .new) != null;
     }
 
     pub fn retainedSelectionActionAvailable(self: BodyView) bool {
@@ -557,6 +587,92 @@ pub const BodyView = struct {
             .mode = .line,
             .point = diff_selection.pointFromLine(rows.currentHunkIndex() orelse return null, selected.line_index),
         };
+    }
+
+    pub fn keyboardLineStartAtOffset(self: BodyView, source_offset: usize) KeyboardLineStart {
+        const candidates = self.keyboardSideCandidatesAtOffset(source_offset) orelse return .unavailable;
+        const before = candidates.before;
+        const after = candidates.after;
+        if (before == null and after == null) return .unavailable;
+        if (before == null) return .{ .direct = keyboardCandidateHit(candidates.identity, .new, after.?) };
+        if (after == null) return .{ .direct = keyboardCandidateHit(candidates.identity, .old, before.?) };
+        if (std.mem.eql(u8, before.?.text, after.?.text)) {
+            return .{ .direct = keyboardCandidateHit(candidates.identity, .new, after.?) };
+        }
+        return .{ .choose = .{
+            .identity = candidates.identity,
+            .before = before.?.point,
+            .after = after.?.point,
+        } };
+    }
+
+    fn keyboardSideCandidatesAtOffset(self: BodyView, source_offset: usize) ?KeyboardSideCandidates {
+        if (self.view.effectiveDisplayMode() != .side_by_side) return null;
+        if (self.generatedBody()) |body| {
+            if (source_offset >= body.source.rowCount()) return null;
+            const text = body.source.lineBody(source_offset) orelse return null;
+            return .{
+                .identity = .{ .generated_file = .{ .path_key = body.path } },
+                .before = null,
+                .after = .{ .point = diff_selection.pointFromLine(0, source_offset), .text = text },
+            };
+        }
+
+        const target = self.parsedSelectionTarget(null) orelse return null;
+        const has_index = target.line_index.mode == .side_by_side and target.line_index.hunk_offsets.len == target.file.hunks.len;
+        var rows = if (has_index)
+            diff_view_model.BodyRowIterator.initAtWithFolded(
+                target.file,
+                .side_by_side,
+                target.line_index,
+                source_offset,
+                target.folded_hunks,
+            )
+        else
+            diff_view_model.BodyRowIterator.initWithFolded(target.file, .side_by_side, target.folded_hunks);
+        var skipped: usize = if (has_index) source_offset else 0;
+        var row = rows.next() orelse return null;
+        while (skipped < source_offset) : (skipped += 1) row = rows.next() orelse return null;
+        switch (row) {
+            .side_by_side => {},
+            .metadata, .binary_marker, .hunk_header, .unified_line => return null,
+        }
+        const indexed = rows.currentSideBySideRow() orelse return null;
+        const hunk_index = rows.currentHunkIndex() orelse return null;
+        return .{
+            .identity = target.identity,
+            .before = keyboardSideCandidate(indexed, hunk_index, .old),
+            .after = keyboardSideCandidate(indexed, hunk_index, .new),
+        };
+    }
+
+    pub fn keyboardSideChoiceHit(
+        self: BodyView,
+        choice: diff_selection.KeyboardSideChoice,
+        side: diff_selection.Side,
+    ) ?diff_surface.DiffMouseHit {
+        const target = self.parsedSelectionTarget(choice.identity) orelse return null;
+        if (self.view.effectiveDisplayMode() != .side_by_side) return null;
+        const offset = diff_view_model.renderedOffsetForCoordinate(
+            target.file,
+            .side_by_side,
+            .{ .hunk_line = .{
+                .hunk_index = choice.before.hunk_index,
+                .line_index = choice.before.line_index,
+            } },
+            target.folded_hunks,
+            target.line_index,
+        ) orelse return null;
+        const candidates = self.keyboardSideCandidatesAtOffset(offset) orelse return null;
+        if (!choice.identity.eql(candidates.identity)) return null;
+        const before = candidates.before orelse return null;
+        const after = candidates.after orelse return null;
+        if (!before.point.eql(choice.before) or !after.point.eql(choice.after)) return null;
+        return keyboardCandidateHit(
+            candidates.identity,
+            side,
+            if (side == .old) before else after,
+        );
     }
 
     pub fn keyboardLineHitNearOffset(
@@ -957,6 +1073,17 @@ pub const Controller = struct {
         if (self.surface.selection_owner.activeMouseSelection()) self.clearDiffSelection();
     }
 
+    pub fn clearKeyboardSideChoice(self: Controller) void {
+        if (self.surface.selection_owner.activeKeyboardSideChoice() != null) self.clearDiffSelection();
+    }
+
+    pub fn focusSidebar(self: Controller) bool {
+        if (self.surface.viewer.sidebar_hidden) return false;
+        self.surface.viewer.focus = .sidebar;
+        self.clearKeyboardSideChoice();
+        return true;
+    }
+
     pub fn advanceSelectionLayoutRevision(self: Controller) void {
         self.surface.selection_layout_revision.* +%= 1;
         if (self.surface.selection_layout_revision.* == 0) self.surface.selection_layout_revision.* = 1;
@@ -1030,8 +1157,9 @@ pub const Controller = struct {
 
     pub fn enterFileSearchMode(self: Controller, allocator: std.mem.Allocator) void {
         self.clearMouseDiffSelection();
+        self.clearKeyboardSideChoice();
         self.surface.file_search_return_focus.* = if (self.surface.viewer.sidebar_hidden) .diff else self.surface.viewer.focus;
-        if (!self.surface.viewer.sidebar_hidden) self.surface.viewer.focus = .sidebar;
+        _ = self.focusSidebar();
         self.surface.file_search.mode = true;
         self.surface.file_search.input = .{};
         self.surface.file_search.resetNoMatch();
@@ -1469,6 +1597,7 @@ pub const BodyController = struct {
         self.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         if (previous_mode != self.controller.view().effectiveDisplayMode()) {
             self.controller.clearMouseDiffSelection();
+            self.controller.clearKeyboardSideChoice();
             self.controller.advanceSelectionLayoutRevision();
         }
         if (selection_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
@@ -1495,6 +1624,7 @@ pub const BodyController = struct {
         self.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         if (previous_mode != self.controller.view().effectiveDisplayMode()) {
             self.controller.clearMouseDiffSelection();
+            self.controller.clearKeyboardSideChoice();
             self.controller.advanceSelectionLayoutRevision();
         }
         if (selection_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
@@ -1523,27 +1653,61 @@ pub const BodyController = struct {
         ) };
     }
 
-    pub fn selectKeyboardSelectionSide(self: BodyController, side: diff_selection.Side) void {
-        if (self.controller.surface.viewer.focus != .diff or self.controller.view().effectiveDisplayMode() != .side_by_side) {
-            self.controller.setStatus("Keyboard side selection requires a side-by-side diff", .{});
-            return;
-        }
-        self.controller.surface.viewer.keyboard_selection_side = side;
-        self.controller.setStatus(
-            "Keyboard selection side: {s}",
-            .{if (side == .old) "Before" else "After"},
-        );
+    pub fn chooseKeyboardSelectionSide(self: BodyController, side: diff_selection.Side) bool {
+        const choice = self.controller.surface.selection_owner.activeKeyboardSideChoice() orelse return false;
+        const hit = self.view().keyboardSideChoiceHit(choice, side) orelse {
+            self.controller.clearDiffSelection();
+            return false;
+        };
+        self.controller.surface.selection_owner.* = .{ .diff = diff_selection.DragSelection.initKeyboardLine(
+            hit.identity,
+            hit.side,
+            hit.point,
+        ) };
+        return true;
     }
 
-    pub fn beginKeyboardLineSelection(self: BodyController) bool {
-        if (self.controller.surface.viewer.focus != .diff or self.controller.surface.selection_owner.* != .none) return false;
+    pub fn switchKeyboardSelectionSide(self: BodyController, side: diff_selection.Side) bool {
+        const active = self.controller.surface.selection_owner.activeDiff() orelse return false;
+        if (active.origin != .keyboard_line or active.selected_line_count != 1 or active.side == side) return false;
+        const offset = self.view().keyboardLineSourceOffset(active) orelse return false;
+        const candidates = self.view().keyboardSideCandidatesAtOffset(offset) orelse return false;
+        if (!active.identity.eql(candidates.identity)) return false;
+        const candidate = (if (side == .old) candidates.before else candidates.after) orelse return false;
+        self.controller.surface.selection_owner.* = .{ .diff = diff_selection.DragSelection.initKeyboardLine(
+            candidates.identity,
+            side,
+            candidate.point,
+        ) };
+        self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(offset) orelse
+            self.controller.surface.viewer.diff_cursor;
+        self.keepDiffCursorVisible();
+        return true;
+    }
+
+    pub fn beginKeyboardLineSelection(self: BodyController) BeginKeyboardLineSelectionTerminal {
+        if (self.controller.surface.viewer.focus != .diff or self.controller.surface.selection_owner.* != .none) return .unavailable;
         if (self.view().selectedDiffCursorOffset() == null) self.initializeDiffCursorForSelectedFile();
-        const current = self.view().selectedDiffCursorOffset() orelse return false;
-        const requested_side: ?diff_selection.Side = if (self.controller.view().effectiveDisplayMode() == .side_by_side)
-            self.controller.surface.viewer.keyboard_selection_side
-        else
-            null;
-        const resolved = self.view().keyboardLineHitNearOffset(current, requested_side) orelse return false;
+        const current = self.view().selectedDiffCursorOffset() orelse return .unavailable;
+        if (self.controller.view().effectiveDisplayMode() == .side_by_side) {
+            switch (self.view().keyboardLineStartAtOffset(current)) {
+                .unavailable => return .unavailable,
+                .choose => |choice| {
+                    self.controller.surface.selection_owner.* = .{ .keyboard_side_choice = choice };
+                    return .choosing_side;
+                },
+                .direct => |hit| {
+                    self.controller.surface.selection_owner.* = .{ .diff = diff_selection.DragSelection.initKeyboardLine(
+                        hit.identity,
+                        hit.side,
+                        hit.point,
+                    ) };
+                    self.keepDiffCursorVisible();
+                    return .started;
+                },
+            }
+        }
+        const resolved = self.view().keyboardLineHitNearOffset(current, null) orelse return .unavailable;
         self.controller.surface.selection_owner.* = .{ .diff = diff_selection.DragSelection.initKeyboardLine(
             resolved.hit.identity,
             resolved.hit.side,
@@ -1552,7 +1716,7 @@ pub const BodyController = struct {
         self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(resolved.source_offset) orelse
             self.controller.surface.viewer.diff_cursor;
         self.keepDiffCursorVisible();
-        return true;
+        return .started;
     }
 
     pub fn moveKeyboardLineSelection(self: BodyController, direction: VerticalDirection) bool {
@@ -1584,7 +1748,7 @@ pub const BodyController = struct {
 
             switch (self.controller.surface.selection_owner.*) {
                 .diff => |*selection| selection.updateKeyboardLine(hit.point, next_count),
-                .none, .diff_header => return false,
+                .none, .diff_header, .keyboard_side_choice => return false,
             }
             self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(offset) orelse
                 self.controller.surface.viewer.diff_cursor;
@@ -1614,7 +1778,7 @@ pub const BodyController = struct {
     pub fn dragDiffMouse(self: BodyController, point_opt: ?diff_surface.MousePoint) void {
         const point = point_opt orelse return;
         switch (self.controller.surface.selection_owner.*) {
-            .none => return,
+            .none, .keyboard_side_choice => return,
             .diff_header => |*selection| selection.update(),
             .diff => |*selection| {
                 if (selection.origin != .mouse) return;
@@ -1658,7 +1822,7 @@ pub const BodyController = struct {
                 hit.point,
                 .{ .col = endpoint.col, .row = endpoint.row },
             ),
-            .none, .diff_header => {
+            .none, .diff_header, .keyboard_side_choice => {
                 self.controller.clearDiffSelection();
                 return .stale_owner;
             },
@@ -1753,7 +1917,7 @@ pub const BodyController = struct {
         const loaded = self.controller.activeLoadedDiff() orelse return;
         if (node_index >= loaded.tree.nodes.len) return;
 
-        self.controller.surface.viewer.focus = .sidebar;
+        _ = self.controller.focusSidebar();
         self.selectSidebarNode(loaded, node_index);
 
         const node = loaded.tree.nodes[node_index];
@@ -2324,6 +2488,31 @@ pub fn indexedLineForSide(row: diff_view_model.SideBySideIndexedRow, side: diff_
             .old => pair.removed,
             .new => pair.added,
         },
+    };
+}
+
+fn keyboardSideCandidate(
+    row: diff_view_model.SideBySideIndexedRow,
+    hunk_index: usize,
+    side: diff_selection.Side,
+) ?KeyboardSideCandidate {
+    const indexed = indexedLineForSide(row, side) orelse return null;
+    return .{
+        .point = diff_selection.pointFromLine(hunk_index, indexed.line_index),
+        .text = indexed.line.text,
+    };
+}
+
+fn keyboardCandidateHit(
+    identity: diff_selection.Identity,
+    side: diff_selection.Side,
+    candidate: KeyboardSideCandidate,
+) diff_surface.DiffMouseHit {
+    return .{
+        .identity = identity,
+        .side = side,
+        .mode = .line,
+        .point = candidate.point,
     };
 }
 

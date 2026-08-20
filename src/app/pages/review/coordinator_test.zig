@@ -101,9 +101,7 @@ test "Review document navigation and diff wheel share rendered cursor authority"
     );
 
     app.pages.review.viewer.display_mode = .side_by_side;
-    app.pages.review.viewer.keyboard_selection_side = .old;
     try app.update(.{ .review = .{ .shared = .page_diff_down } }, &ctx);
-    try std.testing.expect(app.pages.review.viewer.keyboard_selection_side == .old);
     app.pages.review.viewer.display_mode = .unified;
     app.pages.review.viewer.diff_scroll = old_scroll;
     app.pages.review.viewer.diff_cursor = body.view().selectedCoordinateAtOffset(old_scroll) orelse

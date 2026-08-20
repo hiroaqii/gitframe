@@ -466,8 +466,7 @@ test "Review keyboard line selection completes with exact pin and retries alloca
     };
     var adapter = controller.updateAdapter();
 
-    var choose = try adapter.shared().apply(null, .{ .keyboard_select_side = .new });
-    choose.deinit(null);
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
     var begin = try adapter.shared().apply(null, .begin_keyboard_line_selection);
     begin.deinit(null);
     for (0..2) |_| {
@@ -495,6 +494,8 @@ test "Review keyboard line selection completes with exact pin and retries alloca
 
     var second_begin = try adapter.shared().apply(null, .begin_keyboard_line_selection);
     second_begin.deinit(null);
+    var second_choose = try adapter.shared().apply(null, .{ .choose_keyboard_selection_side = .new });
+    second_choose.deinit(null);
     var second_move = try adapter.shared().apply(null, .{ .keyboard_line_selection_move = .down });
     second_move.deinit(null);
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
@@ -513,6 +514,17 @@ test "Review keyboard line selection completes with exact pin and retries alloca
     try std.testing.expect(page.selection_owner == .none);
     try std.testing.expect(page.completed_selection == null);
     try std.testing.expect(page.pinned_selection_basis == null);
+
+    page.viewer.sidebar_hidden = false;
+    page.viewer.focus = .diff;
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
+    var focus_choice = try adapter.shared().apply(null, .begin_keyboard_line_selection);
+    focus_choice.deinit(null);
+    try std.testing.expect(page.selection_owner.activeKeyboardSideChoice() != null);
+    var wheel_focus = try adapter.shared().apply(null, .mouse_sidebar_wheel_up);
+    wheel_focus.deinit(null);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expectEqual(diff_surface.Focus.sidebar, page.viewer.focus);
 }
 
 test "Review retained candidate and pin replace transactionally and survive rejected installs" {

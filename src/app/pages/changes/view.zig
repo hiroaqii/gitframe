@@ -366,6 +366,7 @@ fn drawProjectedHeaderDetail(app: Context, pane: *chasen.Surface, active: bool) 
     diff_surface_view.drawDiffHeaderDetailRow(
         pane,
         app.page.readSurface(app.source, app.navigation.layout),
+        app.navigation.keyboardSideChoiceActive(),
         app.navigation.selectionStatusPresentation(),
         active,
         app.theme,

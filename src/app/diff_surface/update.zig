@@ -118,22 +118,23 @@ pub const Controller = struct {
             .toggle_focus => {
                 if (!self.navigation.controller.surface.viewer.sidebar_hidden) {
                     self.navigation.controller.surface.viewer.focus = self.navigation.controller.surface.viewer.focus.toggled();
+                    if (self.navigation.controller.surface.viewer.focus != .diff) {
+                        self.navigation.controller.clearKeyboardSideChoice();
+                    }
                 }
             },
             .toggle_sidebar_visibility => self.navigation.toggleSidebarVisibility(),
             .decrease_sidebar_width => self.navigation.adjustSidebarWidth(.shrink),
             .increase_sidebar_width => self.navigation.adjustSidebarWidth(.grow),
-            .focus_sidebar => {
-                if (!self.navigation.controller.surface.viewer.sidebar_hidden) self.navigation.controller.surface.viewer.focus = .sidebar;
-            },
+            .focus_sidebar => _ = self.navigation.controller.focusSidebar(),
             .focus_diff => self.navigation.controller.surface.viewer.focus = .diff,
             .sidebar_click_node => |node_index| try self.navigation.clickSidebarNode(node_index),
             .mouse_sidebar_wheel_up => {
-                if (!self.navigation.controller.surface.viewer.sidebar_hidden) self.navigation.controller.surface.viewer.focus = .sidebar;
+                _ = self.navigation.controller.focusSidebar();
                 self.navigation.selectFileDelta(-1);
             },
             .mouse_sidebar_wheel_down => {
-                if (!self.navigation.controller.surface.viewer.sidebar_hidden) self.navigation.controller.surface.viewer.focus = .sidebar;
+                _ = self.navigation.controller.focusSidebar();
                 self.navigation.selectFileDelta(1);
             },
             .mouse_diff_wheel_up => {
@@ -177,9 +178,21 @@ pub const Controller = struct {
                 &result,
             ),
             .selection_owned_noop => {},
-            .keyboard_select_side => |side| self.navigation.selectKeyboardSelectionSide(side),
-            .begin_keyboard_line_selection => if (!self.navigation.beginKeyboardLineSelection()) {
+            .choose_keyboard_selection_side => |side| if (!self.navigation.chooseKeyboardSelectionSide(side)) {
                 self.navigation.controller.setStatus("No selectable code line for keyboard selection", .{});
+            },
+            .switch_keyboard_selection_side => |side| {
+                const active = self.navigation.controller.surface.selection_owner.activeDiff();
+                if (!self.navigation.switchKeyboardSelectionSide(side) and
+                    active != null and active.?.origin == .keyboard_line and
+                    active.?.selected_line_count == 1 and active.?.side != side)
+                {
+                    self.navigation.controller.setStatus("No matching line on that selection side", .{});
+                }
+            },
+            .begin_keyboard_line_selection => switch (self.navigation.beginKeyboardLineSelection()) {
+                .started, .choosing_side => {},
+                .unavailable => self.navigation.controller.setStatus("No selectable code line for keyboard selection", .{}),
             },
             .keyboard_line_selection_move => |direction| _ = self.navigation.moveKeyboardLineSelection(direction),
             .selection_action_unavailable => self.navigation.controller.setStatus("Ask is not available for this selection", .{}),
@@ -294,6 +307,7 @@ pub const Controller = struct {
         const owner = self.navigation.controller.surface.selection_owner.*;
         return switch (owner) {
             .none => .{},
+            .keyboard_side_choice => .{},
             .diff => |drag| blk: {
                 if (drag.origin != .mouse) break :blk .{};
                 if (!drag.moved) {

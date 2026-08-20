@@ -448,6 +448,11 @@ pub const View = struct {
         return self.sharedBodyView(&adapter).selectionStatusPresentation();
     }
 
+    pub fn keyboardSideChoiceActive(self: View) bool {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).keyboardSideChoiceActive();
+    }
+
     pub fn renderDiffScroll(self: View) usize {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyView(&adapter).renderDiffScroll();
@@ -1294,6 +1299,10 @@ pub const Controller = struct {
 
     pub fn clearMouseDiffSelection(self: Controller) void {
         self.sharedController().clearMouseDiffSelection();
+    }
+
+    pub fn clearKeyboardSideChoice(self: Controller) void {
+        self.sharedController().clearKeyboardSideChoice();
     }
 
     pub fn clearCompletedSelectionWithViewport(self: Controller, allocator: std.mem.Allocator) void {
@@ -2670,9 +2679,7 @@ test "document navigation applies first last half and full page on rendered rows
     }
     harness.terminal_size.height = 15;
     harness.pages.changes.viewer.display_mode = .side_by_side;
-    harness.pages.changes.viewer.keyboard_selection_side = .old;
     _ = try applySharedNavigation(&harness, .document_last);
-    try std.testing.expectEqual(diff_selection.Side.old, harness.pages.changes.viewer.keyboard_selection_side);
     _ = try applySharedNavigation(&harness, .document_first);
     harness.pages.changes.viewer.display_mode = .unified;
 
@@ -3237,6 +3244,20 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
     try std.testing.expect(generated_selection.identity == .generated_file);
     try std.testing.expectEqual(diff_selection.Mode.character, generated_selection.mode);
     try std.testing.expectEqual(@as(usize, 3), generated_selection.anchor.leading);
+
+    generated_harness.controller().clearDiffSelection();
+    generated_harness.pages.changes.viewer.display_mode = .side_by_side;
+    generated_harness.pages.changes.viewer.focus = .diff;
+    generated_harness.pages.changes.viewer.diff_cursor = .{ .metadata = 0 };
+    var generated_adapter = generated_harness.controller().updateAdapter();
+    var generated_keyboard = try generated_adapter.shared().apply(null, .begin_keyboard_line_selection);
+    generated_keyboard.deinit(null);
+    const generated_keyboard_selection = generated_harness.pages.changes.selection_owner.activeDiff() orelse
+        return error.ExpectedDiffSelection;
+    try std.testing.expect(generated_keyboard_selection.identity == .generated_file);
+    try std.testing.expectEqual(diff_selection.Side.new, generated_keyboard_selection.side);
+    try std.testing.expectEqual(diff_selection.Origin.keyboard_line, generated_keyboard_selection.origin);
+    try std.testing.expectEqual(@as(usize, 0), generated_keyboard_selection.focus.line_index);
 }
 
 test "Changes navigation snapshot and reload restore share the page owner" {
@@ -4180,12 +4201,10 @@ test "folded coordinate offset uses display folds without a cached index" {
     } };
     try std.testing.expect(app.changesNavigationView().selectedDiffCursorOffset() == null);
 
-    app.pages.changes.viewer.keyboard_selection_side = .old;
     _ = try applySharedNavigation(&app, .document_last);
     const line_count = app.changesNavigationView().displayedDiffLineCount();
     try std.testing.expectEqual(@as(?usize, line_count - 1), app.changesNavigationView().selectedDiffCursorOffset());
     try std.testing.expect(loaded.collapsed_hunks[0]);
-    try std.testing.expectEqual(diff_selection.Side.old, app.pages.changes.viewer.keyboard_selection_side);
 }
 
 test "projection hunk fold authority preserves primary fold behavior" {

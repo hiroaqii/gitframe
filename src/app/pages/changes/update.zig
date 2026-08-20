@@ -11,6 +11,7 @@ const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const diff_surface_update = @import("../../diff_surface/update.zig");
 const diff_surface_navigation = @import("../../diff_surface/navigation.zig");
+const selection_action = @import("../../selection_action.zig");
 const message = @import("message.zig");
 const navigation = @import("navigation.zig");
 const context = @import("../../../context.zig");
@@ -619,12 +620,12 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     } };
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
 
-    var side = try controller.apply(null, .{ .keyboard_select_side = .old });
-    side.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.old, page.viewer.keyboard_selection_side);
-
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
     var begin = try controller.apply(failing.allocator(), .begin_keyboard_line_selection);
     begin.deinit(failing.allocator());
+    try std.testing.expect(page.selection_owner.activeKeyboardSideChoice() != null);
+    var choose_before = try controller.apply(null, .{ .choose_keyboard_selection_side = .old });
+    choose_before.deinit(null);
     const started = page.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Origin.keyboard_line, started.origin);
     try std.testing.expectEqual(diff_selection.Side.old, started.side);
@@ -639,13 +640,15 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     var cancel_search = try controller.apply(null, .cancel_search);
     cancel_search.deinit(null);
     try std.testing.expect(!page.search.mode);
-    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
     var restart_after_search = try controller.apply(failing.allocator(), .begin_keyboard_line_selection);
     restart_after_search.deinit(failing.allocator());
+    var choose_after_search = try controller.apply(null, .{ .choose_keyboard_selection_side = .old });
+    choose_after_search.deinit(null);
     try std.testing.expect(page.selection_owner.activeKeyboardLineSelection());
 
     for (0..2) |_| {
-        var moved = try controller.apply(failing.allocator(), .{ .keyboard_line_selection_move = .down });
+        var moved = try controller.apply(failing.allocator(), .{ .keyboard_line_selection_move = .up });
         moved.deinit(failing.allocator());
     }
     const extended = page.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
@@ -674,8 +677,6 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     try std.testing.expect(page.completed_selection != null);
     try std.testing.expectEqual(@as(usize, 3), page.completed_selection.?.lineCount());
 
-    var new_side = try controller.apply(null, .{ .keyboard_select_side = .new });
-    new_side.deinit(null);
     page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
     var cross_hunks = try controller.apply(null, .begin_keyboard_line_selection);
     cross_hunks.deinit(null);
@@ -696,7 +697,7 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
         else => return error.ExpectedCopyCommand,
     }
 
-    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } };
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 4 } };
     var crossing = try controller.apply(null, .begin_keyboard_line_selection);
     crossing.deinit(null);
     var crossing_down = try controller.apply(null, .{ .keyboard_line_selection_move = .down });
@@ -715,6 +716,10 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
 
     var restart = try controller.apply(null, .begin_keyboard_line_selection);
     restart.deinit(null);
+    if (page.selection_owner.activeKeyboardSideChoice() != null) {
+        var restart_choose = try controller.apply(null, .{ .choose_keyboard_selection_side = .new });
+        restart_choose.deinit(null);
+    }
     try std.testing.expect(page.selection_owner.activeKeyboardLineSelection());
     var retain_restart = try controller.apply(allocator, .{ .selection_action = .copy });
     defer retain_restart.deinit(allocator);
@@ -722,10 +727,30 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     defer restart_command.deinit(allocator);
     var active_before_mode = try controller.apply(null, .begin_keyboard_line_selection);
     active_before_mode.deinit(null);
+    try std.testing.expect(page.selection_owner != .none);
+    controller.navigation.clearDiffSelection();
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
+    var choice_before_mode = try controller.apply(null, .begin_keyboard_line_selection);
+    choice_before_mode.deinit(null);
+    try std.testing.expect(page.selection_owner.activeKeyboardSideChoice() != null);
     var mode_change = try controller.apply(null, .toggle_display_mode);
     mode_change.deinit(null);
     try std.testing.expect(page.selection_owner == .none);
     try std.testing.expect(page.completed_selection != null);
+
+    page.viewer.diff_cursor = .{ .metadata = 0 };
+    var unified_nearby = try controller.apply(null, .begin_keyboard_line_selection);
+    unified_nearby.deinit(null);
+    try std.testing.expect(page.selection_owner.activeKeyboardLineSelection());
+    switch (page.viewer.diff_cursor) {
+        .hunk_line => |line| {
+            try std.testing.expectEqual(@as(usize, 0), line.hunk_index);
+            try std.testing.expectEqual(@as(usize, 0), line.line_index);
+        },
+        else => return error.ExpectedHunkLineCursor,
+    }
+    var clear_nearby = try controller.apply(allocator, .{ .selection_action = .clear });
+    clear_nearby.deinit(allocator);
 
     page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
     var removed_begin = try controller.apply(null, .begin_keyboard_line_selection);
@@ -733,6 +758,206 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     try std.testing.expectEqual(diff_selection.Side.old, page.selection_owner.activeDiff().?.side);
     var final_clear = try controller.apply(allocator, .{ .selection_action = .clear });
     final_clear.deinit(allocator);
+}
+
+test "Changes side-by-side keyboard selection chooses and switches one semantic row" {
+    const allocator = std.testing.allocator;
+    var page: changes_page.ChangesPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .viewer = .{
+            .focus = .diff,
+            .sidebar_hidden = true,
+            .display_mode = .side_by_side,
+        },
+    };
+    defer page.deinit(allocator);
+    const controller: Controller = .{ .navigation = .{
+        .page = &page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 120, .height = 20 },
+        .diagnostics = .{ .target = &page.status },
+    } };
+
+    page.viewer.diff_cursor = .{ .metadata = 0 };
+    var unavailable = try controller.apply(null, .begin_keyboard_line_selection);
+    unavailable.deinit(null);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expectEqualStrings("No selectable code line for keyboard selection", page.status.text());
+
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
+    var equal_context = try controller.apply(null, .begin_keyboard_line_selection);
+    equal_context.deinit(null);
+    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.side);
+    var clear_context = try controller.apply(allocator, .{ .selection_action = .clear });
+    clear_context.deinit(allocator);
+
+    page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
+    var begin = try controller.apply(null, .begin_keyboard_line_selection);
+    begin.deinit(null);
+    try std.testing.expect(page.selection_owner.activeKeyboardSideChoice() != null);
+    try std.testing.expect(controller.navigation.view().keyboardSideChoiceActive());
+
+    var stale_choice = page.selection_owner.activeKeyboardSideChoice().?;
+    stale_choice.identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "stale" } };
+    page.selection_owner = .{ .keyboard_side_choice = stale_choice };
+    var reject_stale = try controller.apply(null, .{ .choose_keyboard_selection_side = .old });
+    reject_stale.deinit(null);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expectEqualStrings("No selectable code line for keyboard selection", page.status.text());
+
+    var restart_choice = try controller.apply(null, .begin_keyboard_line_selection);
+    restart_choice.deinit(null);
+    var enter_file_search = try controller.apply(allocator, .enter_file_search);
+    enter_file_search.deinit(allocator);
+    try std.testing.expect(page.selection_owner == .none);
+    try std.testing.expect(page.file_search.mode);
+    var cancel_file_search = try controller.apply(allocator, .cancel_file_search);
+    cancel_file_search.deinit(allocator);
+
+    var choice_for_cancel = try controller.apply(null, .begin_keyboard_line_selection);
+    choice_for_cancel.deinit(null);
+    var cancel_choice = try controller.apply(allocator, .{ .selection_action = .clear });
+    cancel_choice.deinit(allocator);
+    try std.testing.expect(page.selection_owner == .none);
+
+    var begin_after_cancel = try controller.apply(null, .begin_keyboard_line_selection);
+    begin_after_cancel.deinit(null);
+
+    var choose = try controller.apply(null, .{ .choose_keyboard_selection_side = .old });
+    choose.deinit(null);
+    try std.testing.expectEqual(diff_selection.Side.old, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(selection_action.StatusSide.before, controller.navigation.view().selectionStatusPresentation().?.side);
+
+    var switch_after = try controller.apply(null, .{ .switch_keyboard_selection_side = .new });
+    switch_after.deinit(null);
+    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(@as(usize, 3), page.selection_owner.activeDiff().?.focus.line_index);
+    try std.testing.expectEqual(selection_action.StatusSide.after, controller.navigation.view().selectionStatusPresentation().?.side);
+
+    var extend = try controller.apply(null, .{ .keyboard_line_selection_move = .up });
+    extend.deinit(null);
+    try std.testing.expectEqual(@as(usize, 2), page.selection_owner.activeDiff().?.selected_line_count);
+    var locked = try controller.apply(null, .{ .switch_keyboard_selection_side = .old });
+    locked.deinit(null);
+    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(@as(usize, 2), page.selection_owner.activeDiff().?.selected_line_count);
+
+    var shrink = try controller.apply(null, .{ .keyboard_line_selection_move = .down });
+    shrink.deinit(null);
+    try std.testing.expectEqual(@as(usize, 1), page.selection_owner.activeDiff().?.selected_line_count);
+    var switch_before = try controller.apply(null, .{ .switch_keyboard_selection_side = .old });
+    switch_before.deinit(null);
+    try std.testing.expectEqual(diff_selection.Side.old, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(@as(usize, 2), page.selection_owner.activeDiff().?.focus.line_index);
+
+    var copied = try controller.apply(allocator, .{ .selection_action = .copy });
+    defer copied.deinit(allocator);
+    var copy_command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
+    defer copy_command.deinit(allocator);
+    switch (copy_command) {
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings("old", copy.text),
+        else => return error.ExpectedCopyCommand,
+    }
+    try std.testing.expect(page.selection_owner == .none);
+
+    const OneSided = struct {
+        const removed_lines = [_]diff_parser.DiffLine{.{ .kind = .removed, .text = "before only", .old_line = 1 }};
+        const added_lines = [_]diff_parser.DiffLine{.{ .kind = .added, .text = "after only", .new_line = 1 }};
+        const hunks = [_]diff_parser.Hunk{
+            .{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 0, .section = "removed", .lines = &removed_lines },
+            .{ .old_start = 2, .old_count = 0, .new_start = 1, .new_count = 1, .section = "added", .lines = &added_lines },
+        };
+        const files = [_]diff_parser.FileDiff{.{
+            .header = "diff --git a/one b/one",
+            .old_path = "a/one",
+            .new_path = "b/one",
+            .metadata = &.{ "--- a/one", "+++ b/one" },
+            .hunks = &hunks,
+        }};
+        const eligibility = [_]loaded_diff.FileTextEligibility{.selectable_utf8};
+        const nodes = [_]file_tree.Node{.{ .kind = .file, .name = "one", .path = "one", .depth = 0, .target = .{ .diff_file = 0 } }};
+    };
+    const one_sided_loaded: loaded_diff.LoadedDiff = .{
+        .text = "",
+        .document = .{ .files = &OneSided.files },
+        .file_text_eligibility = &OneSided.eligibility,
+        .tree = .{ .nodes = &OneSided.nodes },
+        .bytes = 0,
+        .lines = 0,
+    };
+    var one_sided_page: changes_page.ChangesPageState = .{
+        .load = test_support.loadState(one_sided_loaded),
+        .viewer = .{ .focus = .diff, .sidebar_hidden = true, .display_mode = .side_by_side },
+    };
+    defer one_sided_page.deinit(allocator);
+    const one_sided: Controller = .{ .navigation = .{
+        .page = &one_sided_page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 120, .height = 20 },
+        .diagnostics = .{ .target = &one_sided_page.status },
+    } };
+
+    one_sided_page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
+    var removed_direct = try one_sided.apply(null, .begin_keyboard_line_selection);
+    removed_direct.deinit(null);
+    try std.testing.expectEqual(diff_selection.Side.old, one_sided_page.selection_owner.activeDiff().?.side);
+    var missing_after = try one_sided.apply(null, .{ .switch_keyboard_selection_side = .new });
+    missing_after.deinit(null);
+    try std.testing.expectEqual(diff_selection.Side.old, one_sided_page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqualStrings("No matching line on that selection side", one_sided_page.status.text());
+    var clear_removed = try one_sided.apply(allocator, .{ .selection_action = .clear });
+    clear_removed.deinit(allocator);
+
+    one_sided_page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } };
+    var added_direct = try one_sided.apply(null, .begin_keyboard_line_selection);
+    added_direct.deinit(null);
+    try std.testing.expectEqual(diff_selection.Side.new, one_sided_page.selection_owner.activeDiff().?.side);
+
+    var focus_page: changes_page.ChangesPageState = .{
+        .load = test_support.loadState(test_support.loadedDiffRootedNested()),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_node = 2,
+            .focus = .diff,
+            .display_mode = .side_by_side,
+        },
+    };
+    defer focus_page.deinit(allocator);
+    const focus_controller: Controller = .{ .navigation = .{
+        .page = &focus_page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 120, .height = 20 },
+        .diagnostics = .{ .target = &focus_page.status },
+    } };
+
+    focus_page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
+    var same_file_choice = try focus_controller.apply(null, .begin_keyboard_line_selection);
+    same_file_choice.deinit(null);
+    try std.testing.expect(focus_page.selection_owner.activeKeyboardSideChoice() != null);
+    var same_file_click = try focus_controller.apply(null, .{ .sidebar_click_node = 2 });
+    same_file_click.deinit(null);
+    try std.testing.expect(focus_page.selection_owner == .none);
+    try std.testing.expectEqual(diff_surface.Focus.sidebar, focus_page.viewer.focus);
+
+    focus_page.viewer.focus = .diff;
+    var directory_choice = try focus_controller.apply(null, .begin_keyboard_line_selection);
+    directory_choice.deinit(null);
+    var directory_click = try focus_controller.apply(null, .{ .sidebar_click_node = 1 });
+    directory_click.deinit(null);
+    try std.testing.expect(focus_page.selection_owner == .none);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, focus_page.viewer.selected_target.?);
+
+    focus_page.viewer.selected_node = 0;
+    focus_page.viewer.focus = .diff;
+    var boundary_choice = try focus_controller.apply(null, .begin_keyboard_line_selection);
+    boundary_choice.deinit(null);
+    var boundary_wheel = try focus_controller.apply(null, .mouse_sidebar_wheel_up);
+    boundary_wheel.deinit(null);
+    try std.testing.expect(focus_page.selection_owner == .none);
+    try std.testing.expectEqual(@as(usize, 0), focus_page.viewer.selected_node);
 }
 
 test "Changes keyboard line selection clipboard preparation failure installs a retryable candidate" {

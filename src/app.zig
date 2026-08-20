@@ -488,6 +488,7 @@ pub const App = struct {
                 self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
                     self.changesNavigation().clearMouseDiffSelection();
+                    self.changesNavigation().clearKeyboardSideChoice();
                     self.pages.changes.advanceSelectionLayoutRevision();
                 }
                 if (changes_selection_anchor) |anchor| self.changesNavigation().restoreSelectionViewportAnchor(anchor);
@@ -502,6 +503,7 @@ pub const App = struct {
                 review_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_review_width);
                 if (previous_review_display_mode != review_body.controller.view().effectiveDisplayMode()) {
                     review_body.controller.clearMouseDiffSelection();
+                    review_body.controller.clearKeyboardSideChoice();
                     self.pages.review.advanceSelectionLayoutRevision();
                 }
                 if (review_selection_anchor) |anchor| review_body.restoreSelectionViewportAnchor(anchor);

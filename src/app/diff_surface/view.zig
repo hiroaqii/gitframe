@@ -522,7 +522,14 @@ pub fn viewDiffPane(
             });
         },
     }
-    drawDiffHeaderDetailRow(surface, state, body.selectionStatusPresentation(), active, palette);
+    drawDiffHeaderDetailRow(
+        surface,
+        state,
+        body.keyboardSideChoiceActive(),
+        body.selectionStatusPresentation(),
+        active,
+        palette,
+    );
     drawSearchMatchMarkerAt(surface, state, palette, if (state.search.match_offset) |offset| body.sourceToPresentationOffset(offset) else null);
 }
 
@@ -769,6 +776,7 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
 pub fn drawDiffHeaderDetailRow(
     surface: *chasen.Surface,
     state: diff_surface.ReadSurface,
+    keyboard_side_choice_active: bool,
     selection_status: ?selection_action.StatusPresentation,
     active: bool,
     palette: theme.Palette,
@@ -787,6 +795,11 @@ pub fn drawDiffHeaderDetailRow(
             drawInputLine(surface, input_col, 1, state.search.input.slice(), state.search.input.cursor, style) catch {};
             view_primitives.showInputCursor(surface, input_col, 1, state.search.input.slice(), state.search.input.cursor);
         }
+        return;
+    }
+
+    if (keyboard_side_choice_active) {
+        drawKeyboardSideChoiceLine(surface, 1, active, palette);
         return;
     }
 
@@ -814,6 +827,84 @@ pub fn drawDiffHeaderDetailRow(
     }
 
     drawPaneHeaderRule(surface, active, palette);
+}
+
+fn drawKeyboardSideChoiceLine(surface: *chasen.Surface, row: u16, active: bool, palette: theme.Palette) void {
+    const size = surface.size();
+    if (row >= size.height or size.width <= 1) return;
+    const region_width = size.width - 1;
+    const prompt = "Choose side  ";
+    const items = [_][]const u8{ "h/← Before", "l/→ After", "Esc Cancel" };
+    const separator = "  ";
+    const prompt_width = chasen.text.displayWidth(prompt);
+    var items_width: usize = 0;
+    for (items, 0..) |item, index| {
+        if (index != 0) items_width += chasen.text.displayWidth(separator);
+        items_width += chasen.text.displayWidth(item);
+    }
+    const show_prompt = prompt_width + items_width <= region_width;
+    const base_style = paneSearchStyle(active, palette);
+    surface.fill(.{ .col = 1, .row = row, .width = region_width, .height = 1 }, .{ .style = base_style });
+
+    var col: u16 = 1;
+    if (show_prompt) {
+        draw.copyClippedTextAt(surface, col, row, prompt, base_style) catch {};
+        col +|= @intCast(prompt_width);
+    }
+    var action_style = base_style;
+    action_style.fg = palette.color(.selection_action_fg);
+    action_style.bg = palette.color(.selection_action_bg);
+    for (items, 0..) |item, index| {
+        const separator_width: u16 = if (index == 0) 0 else @intCast(chasen.text.displayWidth(separator));
+        const item_width: u16 = @intCast(chasen.text.displayWidth(item));
+        if (col +| separator_width +| item_width > size.width) break;
+        if (separator_width != 0) {
+            draw.copyClippedTextAt(surface, col, row, separator, base_style) catch {};
+            col +|= separator_width;
+        }
+        draw.copyClippedTextAt(surface, col, row, item, action_style) catch {};
+        col +|= item_width;
+    }
+}
+
+test "keyboard side chooser fixed row keeps complete actions across responsive layouts" {
+    const palette: theme.Palette = .default();
+
+    var full: chasen.testing.TestSurface = undefined;
+    try full.init(64, 4);
+    defer full.deinit();
+    _ = full.surface.borrowTextAt(1, 2, "body-sentinel", .{});
+    drawKeyboardSideChoiceLine(&full.surface, 1, true, palette);
+    const full_snapshot = try full.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(full_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, full_snapshot, "Choose side") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_snapshot, "h/← Before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_snapshot, "l/→ After") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_snapshot, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_snapshot, "body-sentinel") != null);
+
+    var compact: chasen.testing.TestSurface = undefined;
+    try compact.init(40, 4);
+    defer compact.deinit();
+    _ = compact.surface.borrowTextAt(1, 2, "body-sentinel", .{});
+    drawKeyboardSideChoiceLine(&compact.surface, 1, true, palette);
+    const compact_snapshot = try compact.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(compact_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "Choose side") == null);
+    try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "h/← Before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "l/→ After") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "body-sentinel") != null);
+
+    var narrow: chasen.testing.TestSurface = undefined;
+    try narrow.init(22, 4);
+    defer narrow.deinit();
+    drawKeyboardSideChoiceLine(&narrow.surface, 1, true, palette);
+    const narrow_snapshot = try narrow.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(narrow_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "h/← Before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "l/→ After") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "Esc") == null);
 }
 
 pub fn drawInputLine(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, cursor: usize, style: chasen.TextStyle) !void {

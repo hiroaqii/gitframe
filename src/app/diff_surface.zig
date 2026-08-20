@@ -77,7 +77,6 @@ pub const ViewerState = struct {
     diff_horizontal_scroll: usize = 0,
     diff_cursor: diff_view_model.BodyCoordinate = .{ .metadata = 0 },
     display_mode: diff_render.DisplayMode = .side_by_side,
-    keyboard_selection_side: diff_selection.Side = .new,
     view_options: ViewOptions = .{},
 };
 

@@ -124,6 +124,12 @@ pub const HeaderPathSelection = struct {
     }
 };
 
+pub const KeyboardSideChoice = struct {
+    identity: Identity,
+    before: Point,
+    after: Point,
+};
+
 pub const DragSelection = struct {
     identity: Identity,
     side: Side,
@@ -226,25 +232,33 @@ pub const Owner = union(enum) {
     none,
     diff: DragSelection,
     diff_header: HeaderPathSelection,
+    keyboard_side_choice: KeyboardSideChoice,
 
     pub fn activeDiff(self: Owner) ?DragSelection {
         return switch (self) {
             .none => null,
             .diff => |selection| selection,
-            .diff_header => null,
+            .diff_header, .keyboard_side_choice => null,
         };
     }
 
     pub fn activeHeader(self: Owner) ?HeaderPathSelection {
         return switch (self) {
-            .none, .diff => null,
+            .none, .diff, .keyboard_side_choice => null,
             .diff_header => |selection| selection,
+        };
+    }
+
+    pub fn activeKeyboardSideChoice(self: Owner) ?KeyboardSideChoice {
+        return switch (self) {
+            .keyboard_side_choice => |choice| choice,
+            .none, .diff, .diff_header => null,
         };
     }
 
     pub fn activeMouseSelection(self: Owner) bool {
         return switch (self) {
-            .none => false,
+            .none, .keyboard_side_choice => false,
             .diff => |selection| selection.origin == .mouse,
             .diff_header => true,
         };
@@ -253,7 +267,7 @@ pub const Owner = union(enum) {
     pub fn activeKeyboardLineSelection(self: Owner) bool {
         return switch (self) {
             .diff => |selection| selection.origin == .keyboard_line,
-            .none, .diff_header => false,
+            .none, .diff_header, .keyboard_side_choice => false,
         };
     }
 };

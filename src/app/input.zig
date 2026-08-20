@@ -612,6 +612,22 @@ test "root selection preflight preserves modal and configured V precedence" {
     try std.testing.expectEqual(changesMsg(.{ .selection_action = .clear }), keyToMsg(active, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(changesMsg(.scroll_diff_left), keyToMsg(active, .{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(
+        changesMsg(.{ .switch_keyboard_selection_side = .old }),
+        keyToMsg(.{ .changes = .{
+            .focus = .diff,
+            .side_by_side = true,
+            .selection_owner = .keyboard_line,
+        } }, .{ .codepoint = chasen.Key.left }).?,
+    );
+    try std.testing.expectEqual(
+        changesMsg(.{ .choose_keyboard_selection_side = .new }),
+        keyToMsg(.{ .changes = .{
+            .focus = .diff,
+            .side_by_side = true,
+            .selection_owner = .keyboard_side_choice,
+        } }, .{ .codepoint = 'l' }).?,
+    );
+    try std.testing.expectEqual(
         app_message.Msg{ .review = .{ .shared = .scroll_diff_right } },
         keyToMsg(.{
             .active_page = .review,

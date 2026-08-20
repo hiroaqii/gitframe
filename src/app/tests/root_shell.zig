@@ -539,13 +539,26 @@ test "terminal resize preserves semantic keyboard line selection while focus los
     try std.testing.expect(app.pages.changes.selection_owner == .none);
     try std.testing.expect(app.pages.review.selection_owner.activeKeyboardLineSelection());
 
+    const resize_choice: diff_selection.KeyboardSideChoice = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .before = .{ .hunk_index = 0, .line_index = 2 },
+        .after = .{ .hunk_index = 0, .line_index = 3 },
+    };
+    app.pages.changes.viewer.sidebar_hidden = false;
+    app.pages.review.viewer.sidebar_hidden = false;
+    app.pages.changes.selection_owner = .{ .keyboard_side_choice = resize_choice };
+    app.pages.review.selection_owner = .{ .keyboard_side_choice = resize_choice };
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &tc.ctx);
+    try std.testing.expect(app.pages.changes.selection_owner == .none);
+    try std.testing.expect(app.pages.review.selection_owner == .none);
+
     app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(.{
         .repo_epoch = 1,
         .root_identity = .{ .device = 2, .inode = 3 },
         .path = "main.zig",
         .source_fingerprint = content_fingerprint.Fingerprint.init("source"),
     }, 0) };
-    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &tc.ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &tc.ctx);
     try std.testing.expect(app.pages.repository.activeKeyboardLineSelection());
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 

@@ -29,6 +29,7 @@ pub const Context = struct {
         return .{
             .search_mode = self.search_mode,
             .file_search_mode = self.file_search_mode,
+            .side_by_side = self.side_by_side,
             .selection_owner = self.selection_owner,
             .retained_selection_action_available = self.retained_selection_action_available,
             .keymap = self.keymap,
@@ -61,8 +62,6 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return .scroll_diff_left;
     if (context.focus == .sidebar and key.matches('h', .{})) return .scroll_sidebar_left;
     if (context.focus == .sidebar and key.matches('l', .{})) return .scroll_sidebar_right;
-    if (context.focus == .diff and context.side_by_side and key.matches('h', .{})) return .{ .keyboard_select_side = .old };
-    if (context.focus == .diff and context.side_by_side and key.matches('l', .{})) return .{ .keyboard_select_side = .new };
     if (key.matches(chasen.Key.home, .{})) return .select_first_file;
     if (key.matches(chasen.Key.end, .{})) return .select_last_file;
 
@@ -157,13 +156,18 @@ test "retained selection actions override line copy and empty escape fallback" {
 
 test "Changes keyboard line selection maps side start movement and unavailable Ask" {
     const normal: Context = .{ .focus = .diff, .side_by_side = true };
-    try std.testing.expectEqual(Msg{ .keyboard_select_side = .old }, keyToMsg(normal, .{ .codepoint = 'h' }).?);
-    try std.testing.expectEqual(Msg{ .keyboard_select_side = .new }, keyToMsg(normal, .{ .codepoint = 'l' }).?);
+    try std.testing.expect(keyToMsg(normal, .{ .codepoint = 'h' }) == null);
+    try std.testing.expect(keyToMsg(normal, .{ .codepoint = 'l' }) == null);
     try std.testing.expectEqual(Msg.begin_keyboard_line_selection, keyToMsg(normal, .{ .codepoint = 'V' }).?);
 
     const active: Context = .{ .selection_owner = .keyboard_line, .retained_selection_action_available = true };
     try std.testing.expectEqual(Msg{ .keyboard_line_selection_move = .down }, keyToMsg(active, .{ .codepoint = 'j' }).?);
     try std.testing.expectEqual(Msg.selection_action_unavailable, keyToMsg(active, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(Msg{ .switch_keyboard_selection_side = .old }, keyToMsg(.{
+        .focus = .diff,
+        .side_by_side = true,
+        .selection_owner = .keyboard_line,
+    }, .{ .codepoint = chasen.Key.left }).?);
     try std.testing.expectEqual(Msg.scroll_diff_left, keyToMsg(.{
         .focus = .diff,
         .selection_owner = .keyboard_line,
@@ -176,6 +180,12 @@ test "Changes keyboard line selection maps side start movement and unavailable A
         .focus = .sidebar,
         .selection_owner = .header,
     }, .{ .codepoint = chasen.Key.left }).?);
+
+    try std.testing.expectEqual(Msg{ .choose_keyboard_selection_side = .new }, keyToMsg(.{
+        .focus = .diff,
+        .side_by_side = true,
+        .selection_owner = .keyboard_side_choice,
+    }, .{ .codepoint = 'l' }).?);
 }
 
 test "shell-owned configured commands are not duplicated by Changes" {

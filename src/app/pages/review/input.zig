@@ -41,6 +41,7 @@ pub const Context = struct {
         return .{
             .search_mode = self.search_mode,
             .file_search_mode = self.file_search_mode,
+            .side_by_side = self.side_by_side,
             .selection_owner = self.selection_owner,
             .retained_selection_action_available = self.retained_selection_action_available,
             .keymap = self.keymap,
@@ -95,8 +96,6 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (context.focus == .diff and key.matches(chasen.Key.left, .{})) return shared(.scroll_diff_left);
     if (context.focus == .sidebar and key.matches('h', .{})) return shared(.scroll_sidebar_left);
     if (context.focus == .sidebar and key.matches('l', .{})) return shared(.scroll_sidebar_right);
-    if (context.focus == .diff and context.side_by_side and key.matches('h', .{})) return shared(.{ .keyboard_select_side = .old });
-    if (context.focus == .diff and context.side_by_side and key.matches('l', .{})) return shared(.{ .keyboard_select_side = .new });
     if (key.matches(chasen.Key.home, .{})) return shared(.select_first_file);
     if (key.matches(chasen.Key.end, .{})) return shared(.select_last_file);
 
@@ -209,12 +208,17 @@ test "Review routes admitted retained actions through shared input" {
 
 test "Review keyboard line selection maps side start and movement" {
     const normal: Context = .{ .focus = .diff, .side_by_side = true };
-    try std.testing.expectEqual(Msg{ .shared = .{ .keyboard_select_side = .old } }, keyToMsg(normal, .{ .codepoint = 'h' }).?);
+    try std.testing.expect(keyToMsg(normal, .{ .codepoint = 'h' }) == null);
     try std.testing.expectEqual(Msg{ .shared = .begin_keyboard_line_selection }, keyToMsg(normal, .{ .codepoint = 'V' }).?);
 
     const active: Context = .{ .selection_owner = .keyboard_line, .retained_selection_action_available = true };
     try std.testing.expectEqual(Msg{ .shared = .{ .keyboard_line_selection_move = .up } }, keyToMsg(active, .{ .codepoint = 'k' }).?);
     try std.testing.expectEqual(Msg{ .shared = .selection_action_unavailable }, keyToMsg(active, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .{ .switch_keyboard_selection_side = .new } }, keyToMsg(.{
+        .focus = .diff,
+        .side_by_side = true,
+        .selection_owner = .keyboard_line,
+    }, .{ .codepoint = chasen.Key.right }).?);
     try std.testing.expectEqual(Msg{ .shared = .scroll_diff_right }, keyToMsg(.{
         .focus = .diff,
         .selection_owner = .keyboard_line,
@@ -227,6 +231,12 @@ test "Review keyboard line selection maps side start and movement" {
         .focus = .sidebar,
         .selection_owner = .header,
     }, .{ .codepoint = chasen.Key.left }).?);
+
+    try std.testing.expectEqual(Msg{ .shared = .{ .choose_keyboard_selection_side = .old } }, keyToMsg(.{
+        .focus = .diff,
+        .side_by_side = true,
+        .selection_owner = .keyboard_side_choice,
+    }, .{ .codepoint = 'h' }).?);
 }
 
 test "base picker owns its modal grammar" {

@@ -444,7 +444,11 @@ pub const ReviewPageState = struct {
 
     pub fn beginBasePicker(self: *ReviewPageState, allocator: std.mem.Allocator) ?BasePickerRequest {
         const identity = self.activation.currentIdentity() orelse return null;
-        if (self.selection_owner.activeMouseSelection()) self.selection_owner = .none;
+        if (self.selection_owner.activeMouseSelection() or
+            self.selection_owner.activeKeyboardSideChoice() != null)
+        {
+            self.selection_owner = .none;
+        }
         return self.base_picker.begin(allocator, identity);
     }
 
@@ -1192,10 +1196,16 @@ test "Review reload transfers retained selection only across the exact repositor
         second_finished.result.loaded.basis.target.base_oid = testOid(case.base);
         second_finished.result.loaded.basis.target.diff_base_oid = testOid(case.diff_base);
         second_finished.result.loaded.basis.target.head_oid = testOid(case.head);
+        state.selection_owner = .{ .keyboard_side_choice = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/old.zig" } },
+            .before = .{ .hunk_index = 0, .line_index = 0 },
+            .after = .{ .hunk_index = 0, .line_index = 1 },
+        } };
         try std.testing.expectEqual(
             LoadAcceptance.loaded,
             try state.applyLoadFinished(allocator, 11, "/repo", case.root, &second_finished),
         );
+        try std.testing.expect(state.selection_owner == .none);
         try std.testing.expectEqual(case.transfers, state.completed_selection != null);
         try std.testing.expectEqual(case.transfers, state.pinned_selection_basis != null);
         if (case.transfers) {
@@ -1385,7 +1395,13 @@ test "Review base picker replacement close and selection have one owner" {
     defer state.deinit(allocator);
     _ = state.activate(11);
 
+    state.selection_owner = .{ .keyboard_side_choice = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .before = .{ .hunk_index = 0, .line_index = 0 },
+        .after = .{ .hunk_index = 0, .line_index = 1 },
+    } };
     const first = state.beginBasePicker(allocator).?;
+    try std.testing.expect(state.selection_owner == .none);
     var first_finished: app_load.ReviewBranchListFinished = .{
         .identity = first.identity,
         .generation = first.generation,
