@@ -33,10 +33,20 @@ pub const StoreSnapshot = struct {
     review_repository_id: committed_review.ReviewRepositoryId,
 };
 
+/// Display-safe lifecycle projection for one validated Run. Terminal values
+/// preserve the exact human decision instead of collapsing it to `completed`.
+pub const RunSummaryStatus = enum {
+    new,
+    draft,
+    approved,
+    needs_changes,
+    canceled,
+};
+
 pub const RunSummary = struct {
     review_id: committed_review.ReviewId,
     target: committed_review.CommittedReviewTarget,
-    state: committed_review.ReviewRunState,
+    status: RunSummaryStatus,
     created_at: [20]u8,
     created_at_unix: i64,
     producer_name: []u8,
@@ -285,7 +295,7 @@ fn summaryFromLoaded(
     var summary: RunSummary = .{
         .review_id = manifest.review_id,
         .target = manifest.target,
-        .state = loaded.state,
+        .status = summaryStatus(loaded),
         .created_at = undefined,
         .created_at_unix = loaded.created_at_unix,
         .producer_name = try allocator.dupe(u8, manifest.producer.name),
@@ -304,6 +314,23 @@ fn summaryFromLoaded(
         if (display.head_label) |value| summary.head_label = try allocator.dupe(u8, value);
     }
     return summary;
+}
+
+fn summaryStatus(loaded: *const run.LoadedRunArtifacts) RunSummaryStatus {
+    if (loaded.result) |result| {
+        return switch (result.value.result) {
+            .approved => .approved,
+            .needs_changes => .needs_changes,
+            .canceled => .canceled,
+        };
+    }
+    return switch (loaded.state) {
+        .new => .new,
+        .draft => .draft,
+        // `ReviewRunState.completed` is derived from a validated result, so
+        // the branch above must have returned its exact terminal decision.
+        .completed => unreachable,
+    };
 }
 
 fn summaryLessThan(_: void, left: RunSummary, right: RunSummary) bool {
@@ -537,6 +564,8 @@ const TestRunMode = enum {
     new,
     draft,
     completed,
+    completed_needs_changes,
+    completed_canceled,
     completed_invalid_draft,
     completed_unsafe_draft,
     invalid_result,
@@ -637,15 +666,24 @@ fn seedTestRun(
             try writePrivate(io, directory, "review_state.json", draft_bytes);
             if (mode == .invalid_result) try writePrivate(io, directory, "result.json", "{}\n");
         },
-        .completed, .completed_invalid_draft, .completed_unsafe_draft => {
+        .completed,
+        .completed_needs_changes,
+        .completed_canceled,
+        .completed_invalid_draft,
+        .completed_unsafe_draft,
+        => {
             const result: committed_review.RevisionReviewResult = .{
                 .schema_version = 1,
                 .review_id = review_id,
                 .target = target,
                 .findings_digest = manifest.findings_digest,
-                .result = .approved,
+                .result = switch (mode) {
+                    .completed_needs_changes => .needs_changes,
+                    .completed_canceled => .canceled,
+                    else => .approved,
+                },
                 .completed_at = "2026-08-20T09:00:00Z",
-                .summary = null,
+                .summary = if (mode == .completed_needs_changes) "Changes required." else null,
                 .finding_dispositions = &.{},
                 .anchored_notes = &.{},
             };
@@ -669,7 +707,7 @@ fn testSummary(history: *const History, review_id: committed_review.ReviewId) !*
     return error.ExpectedReviewSummary;
 }
 
-test "review history backend scan and selection preserve result precedence and exact Git target" {
+test "review history backend AI Reviews picker scan and selection preserve every status result precedence and exact Git target" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -737,9 +775,13 @@ test "review history backend scan and selection preserve result precedence and e
     const new_id = try committed_review.ReviewId.parse("a23e4567-e89b-42d3-a456-426614174000");
     const draft_id = try committed_review.ReviewId.parse("b23e4567-e89b-42d3-a456-426614174000");
     const completed_id = try committed_review.ReviewId.parse("c23e4567-e89b-42d3-a456-426614174000");
+    const needs_changes_id = try committed_review.ReviewId.parse("923e4567-e89b-42d3-a456-426614174000");
+    const canceled_id = try committed_review.ReviewId.parse("f23e4567-e89b-42d3-a456-426614174000");
     try seedTestRun(allocator, io, namespace, repository_id, new_id, target, "2026-08-20T11:00:00Z", .new);
     try seedTestRun(allocator, io, namespace, repository_id, draft_id, target, "2026-08-20T10:00:00Z", .draft);
     try seedTestRun(allocator, io, namespace, repository_id, completed_id, target, "2026-08-20T09:00:00Z", .completed);
+    try seedTestRun(allocator, io, namespace, repository_id, needs_changes_id, target, "2026-08-20T08:30:00Z", .completed_needs_changes);
+    try seedTestRun(allocator, io, namespace, repository_id, canceled_id, target, "2026-08-20T08:15:00Z", .completed_canceled);
     try seedTestRun(allocator, io, namespace, repository_id, valid_id, target, "2026-08-20T08:00:00Z", .completed_invalid_draft);
     try seedTestRun(allocator, io, namespace, repository_id, invalid_result_id, target, "2026-08-20T07:00:00Z", .invalid_result);
     try seedTestRun(allocator, io, namespace, repository_id, unknown_entry_id, target, "2026-08-20T06:00:00Z", .unknown_entry);
@@ -768,18 +810,20 @@ test "review history backend scan and selection preserve result precedence and e
         .history => |*value| value,
         else => return error.ExpectedReviewHistory,
     };
-    try std.testing.expectEqual(@as(usize, 5), history.rows.len);
-    try std.testing.expectEqual(committed_review.ReviewRunState.new, (try testSummary(history, new_id)).state);
-    try std.testing.expectEqual(committed_review.ReviewRunState.draft, (try testSummary(history, draft_id)).state);
-    try std.testing.expectEqual(committed_review.ReviewRunState.completed, (try testSummary(history, completed_id)).state);
+    try std.testing.expectEqual(@as(usize, 7), history.rows.len);
+    try std.testing.expectEqual(RunSummaryStatus.new, (try testSummary(history, new_id)).status);
+    try std.testing.expectEqual(RunSummaryStatus.draft, (try testSummary(history, draft_id)).status);
+    try std.testing.expectEqual(RunSummaryStatus.approved, (try testSummary(history, completed_id)).status);
+    try std.testing.expectEqual(RunSummaryStatus.needs_changes, (try testSummary(history, needs_changes_id)).status);
+    try std.testing.expectEqual(RunSummaryStatus.canceled, (try testSummary(history, canceled_id)).status);
     const valid_row = try testSummary(history, valid_id);
-    try std.testing.expectEqual(committed_review.ReviewRunState.completed, valid_row.state);
+    try std.testing.expectEqual(RunSummaryStatus.approved, valid_row.status);
     try std.testing.expectEqual(git_review.TargetAvailability.available, valid_row.availability);
     try std.testing.expectEqual(@as(u32, 0), valid_row.finding_count);
     try std.testing.expectEqual(run.DraftSnapshotState.invalid, valid_row.artifact_snapshot.draft_state);
     try std.testing.expectEqual(@as(usize, 3), history.orphan_count);
     try std.testing.expect(history.skipped_count >= 6);
-    try std.testing.expectEqual(committed_review.ReviewRunState.completed, (try testSummary(history, unsafe_draft_id)).state);
+    try std.testing.expectEqual(RunSummaryStatus.approved, (try testSummary(history, unsafe_draft_id)).status);
 
     var selected = try loadSelection(
         allocator,
