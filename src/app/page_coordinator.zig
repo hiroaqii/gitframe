@@ -167,6 +167,7 @@ pub const Controller = struct {
             .confirmation = self.shell_blockers.confirmation,
             .branch_switch = self.shell_blockers.branch_switch,
             .review_base_picker = self.review.base_picker.open,
+            .review_ai_picker = self.review.ai_reviews.isOpen(),
             .push_error = self.shell_blockers.push_error,
             .git_action = self.shell_blockers.git_action,
             .foreground_command = self.shell_blockers.foreground_command,

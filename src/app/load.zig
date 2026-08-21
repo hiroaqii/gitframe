@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const committed_review = @import("../committed_review.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const chasen = @import("chasen");
 const auto_reload = @import("auto_reload.zig");
@@ -30,6 +31,7 @@ const changes_projection = @import("changes_projection.zig");
 const changes_read_epoch = @import("changes_read_epoch.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
+const review_store = @import("../review_store.zig");
 const selected_document = @import("../repository/document.zig");
 const repository_source = @import("../repository/source.zig");
 const source_syntax = @import("../syntax/source.zig");
@@ -209,6 +211,86 @@ pub const ReviewBranchListFinished = struct {
     }
 };
 
+pub const ReviewHistoryScanTaskResult = union(enum) {
+    empty,
+    scanned: review_store.ScanResult,
+    failed_static: []const u8,
+
+    pub fn deinit(self: *ReviewHistoryScanTaskResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .scanned => |*result| result.deinit(allocator),
+            .empty, .failed_static => {},
+        }
+        self.* = .empty;
+    }
+};
+
+pub const ReviewHistoryScanFinished = struct {
+    identity: page.RequestIdentity,
+    generation: u64,
+    store_root: []u8,
+    result: ReviewHistoryScanTaskResult,
+
+    pub fn deinit(self: *ReviewHistoryScanFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.store_root);
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const PinnedReviewLoadedBundle = struct {
+    selection: review_store.SelectedRunRead,
+    diff: ReviewDiffBundle,
+
+    pub fn deinit(self: *PinnedReviewLoadedBundle, allocator: std.mem.Allocator) void {
+        self.diff.deinit();
+        self.selection.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const ReviewHistorySelectionTaskResult = union(enum) {
+    empty,
+    loaded: PinnedReviewLoadedBundle,
+    selection_failed: review_store.history.SelectionFailure,
+    failed_static: []const u8,
+
+    pub fn deinit(self: *ReviewHistorySelectionTaskResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .loaded => |*bundle| bundle.deinit(allocator),
+            .empty, .selection_failed, .failed_static => {},
+        }
+        self.* = .empty;
+    }
+};
+
+pub const ReviewHistorySelectionFinished = struct {
+    identity: page.RequestIdentity,
+    generation: u64,
+    store_root: []u8,
+    review_id: committed_review.ReviewId,
+    result: ReviewHistorySelectionTaskResult,
+
+    pub fn deinit(self: *ReviewHistorySelectionFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.store_root);
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const ReviewHistoryNormalReturnFinished = struct {
+    identity: page.RequestIdentity,
+    generation: u64,
+    store_root: []u8,
+    result: ReviewLoadTaskResult,
+
+    pub fn deinit(self: *ReviewHistoryNormalReturnFinished, allocator: std.mem.Allocator) void {
+        allocator.free(self.store_root);
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const ChangesProjectionFinished = changes_projection.Finished;
 
 /// Read results whose acceptance and retained state belong to the Changes page.
@@ -233,6 +315,9 @@ pub const ChangesReadFinished = union(enum) {
 pub const ReviewReadFinished = union(enum) {
     source: ReviewLoadFinished,
     branch_list: ReviewBranchListFinished,
+    history_scan: ReviewHistoryScanFinished,
+    history_selection: ReviewHistorySelectionFinished,
+    history_normal_return: ReviewHistoryNormalReturnFinished,
 
     pub fn deinit(self: *ReviewReadFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -931,6 +1016,286 @@ pub fn ReviewBranchListLoadTask(comptime Msg: type) type {
                 .generation = task.generation,
                 .result = result,
             } } });
+        }
+    };
+}
+
+/// Explicit-open Review history scan. Every input needed by the worker is
+/// duplicated before spawn; the completion carries the exact Store path
+/// snapshot used by the read for event-loop admission.
+pub fn ReviewHistoryScanTask(comptime Msg: type) type {
+    return struct {
+        identity: page.RequestIdentity,
+        generation: u64,
+        store_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn init(
+            identity: page.RequestIdentity,
+            generation: u64,
+            store_root: []const u8,
+            root: root_capability.RootCapability,
+            env_map: ?*const std.process.Environ.Map,
+            allocator: std.mem.Allocator,
+        ) !@This() {
+            const owned_store_root = try allocator.dupe(u8, store_root);
+            errdefer allocator.free(owned_store_root);
+            var owned_root = try root.duplicate();
+            errdefer owned_root.deinit();
+            return .{
+                .identity = identity,
+                .generation = generation,
+                .store_root = owned_store_root,
+                .root = owned_root,
+                .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map),
+            };
+        }
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const scanned = review_store.history.scan(allocator, io, task.store_root, .{
+                .capability = &task.root,
+                .environment = &task.environment,
+            }) catch return task.finish(allocator, .{ .failed_static = "Could not load AI reviews: out of memory" });
+            return task.finish(allocator, .{ .scanned = scanned });
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.deinitOwned(allocator);
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: ReviewHistoryScanTaskResult) Msg {
+            defer {
+                task.environment.deinit();
+                task.root.deinit();
+                allocator.destroy(task);
+            }
+            const store_root = task.store_root;
+            task.store_root = &.{};
+            return Msg.loadFinished(.{ .review = .{ .history_scan = .{
+                .identity = task.identity,
+                .generation = task.generation,
+                .store_root = store_root,
+                .result = result,
+            } } });
+        }
+
+        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.free(task.store_root);
+        }
+    };
+}
+
+/// Selection-time revalidation and exact projection parse for one scanned Run.
+pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
+    return struct {
+        identity: page.RequestIdentity,
+        generation: u64,
+        store_root: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
+        expected_store: review_store.history.StoreSnapshot,
+        review_id: committed_review.ReviewId,
+        expected_artifacts: review_store.ArtifactSnapshot,
+
+        pub fn init(
+            identity: page.RequestIdentity,
+            generation: u64,
+            store_root: []const u8,
+            root: root_capability.RootCapability,
+            env_map: ?*const std.process.Environ.Map,
+            expected_store: review_store.history.StoreSnapshot,
+            review_id: committed_review.ReviewId,
+            expected_artifacts: review_store.ArtifactSnapshot,
+            allocator: std.mem.Allocator,
+        ) !@This() {
+            const owned_store_root = try allocator.dupe(u8, store_root);
+            errdefer allocator.free(owned_store_root);
+            var owned_root = try root.duplicate();
+            errdefer owned_root.deinit();
+            return .{
+                .identity = identity,
+                .generation = generation,
+                .store_root = owned_store_root,
+                .root = owned_root,
+                .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map),
+                .expected_store = expected_store,
+                .review_id = review_id,
+                .expected_artifacts = expected_artifacts,
+            };
+        }
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runReviewHistorySelection(
+                allocator,
+                io,
+                task.store_root,
+                .{ .capability = &task.root, .environment = &task.environment },
+                task.expected_store,
+                task.review_id,
+                task.expected_artifacts,
+            ));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.deinitOwned(allocator);
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: ReviewHistorySelectionTaskResult) Msg {
+            defer {
+                task.environment.deinit();
+                task.root.deinit();
+                allocator.destroy(task);
+            }
+            const store_root = task.store_root;
+            task.store_root = &.{};
+            return Msg.loadFinished(.{ .review = .{ .history_selection = .{
+                .identity = task.identity,
+                .generation = task.generation,
+                .store_root = store_root,
+                .review_id = task.review_id,
+                .result = result,
+            } } });
+        }
+
+        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.free(task.store_root);
+        }
+    };
+}
+
+pub fn runReviewHistorySelection(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_root: []const u8,
+    repository: review_store.history.RepositoryContext,
+    expected_store: review_store.history.StoreSnapshot,
+    review_id: committed_review.ReviewId,
+    expected_artifacts: review_store.ArtifactSnapshot,
+) ReviewHistorySelectionTaskResult {
+    var selected = review_store.history.loadSelection(
+        allocator,
+        io,
+        store_root,
+        repository,
+        expected_store,
+        review_id,
+        expected_artifacts,
+    ) catch return .{ .failed_static = "Could not load AI review: out of memory" };
+    defer selected.deinit(allocator);
+    switch (selected) {
+        .failure => |failure| return .{ .selection_failed = failure },
+        .selected => |*read| {
+            var diff: ReviewDiffBundle = if (read.projection.patch_bytes.len == 0)
+                .empty
+            else
+                .{ .loaded = buildLoadedBundleWithIo(allocator, io, read.projection.patch_bytes) catch
+                    return .{ .failed_static = "Could not parse AI review diff" } };
+            errdefer diff.deinit();
+            const owned_read = read.*;
+            selected = .{ .failure = .run_invalid };
+            return .{ .loaded = .{ .selection = owned_read, .diff = diff } };
+        },
+    }
+}
+
+/// Pinned-to-normal uses the ordinary pure branch load core but a distinct
+/// completion tag, preventing cross-admission with a page refresh.
+pub fn ReviewHistoryNormalReturnTask(comptime Msg: type) type {
+    return struct {
+        identity: page.RequestIdentity,
+        generation: u64,
+        store_root: []u8,
+        root: root_capability.RootCapability,
+        target: ?diff_basis.BaseTarget,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn init(
+            identity: page.RequestIdentity,
+            generation: u64,
+            store_root: []const u8,
+            root: root_capability.RootCapability,
+            target: ?diff_basis.BaseTarget,
+            env_map: ?*const std.process.Environ.Map,
+            allocator: std.mem.Allocator,
+        ) !@This() {
+            const owned_store_root = try allocator.dupe(u8, store_root);
+            errdefer allocator.free(owned_store_root);
+            var owned_root = try root.duplicate();
+            errdefer owned_root.deinit();
+            var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map);
+            errdefer environment.deinit();
+            return .{
+                .identity = identity,
+                .generation = generation,
+                .store_root = owned_store_root,
+                .root = owned_root,
+                .target = if (target) |value| try value.clone(allocator) else null,
+                .environment = environment,
+            };
+        }
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, runReviewLoad(
+                task.root.dir(),
+                task.target,
+                &task.environment,
+                allocator,
+                io,
+            ));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.deinitOwned(allocator);
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: ReviewLoadTaskResult) Msg {
+            defer {
+                task.environment.deinit();
+                task.root.deinit();
+                if (task.target) |*target| target.deinit(allocator);
+                allocator.destroy(task);
+            }
+            const store_root = task.store_root;
+            task.store_root = &.{};
+            return Msg.loadFinished(.{ .review = .{ .history_normal_return = .{
+                .identity = task.identity,
+                .generation = task.generation,
+                .store_root = store_root,
+                .result = result,
+            } } });
+        }
+
+        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.target) |*target| target.deinit(allocator);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.free(task.store_root);
         }
     };
 }
@@ -3430,7 +3795,7 @@ test "ReviewLoadTask owns cloned target and routes failed terminal to Review" {
     var finished = switch (message.load) {
         .review => |review| switch (review) {
             .source => |payload| payload,
-            .branch_list => return error.UnexpectedReadRoute,
+            else => return error.UnexpectedReadRoute,
         },
         else => return error.UnexpectedReadRoute,
     };
@@ -3498,7 +3863,7 @@ test "ReviewBranchListLoadTask routes its terminal and destroy closes descriptor
     var finished = switch (message.load) {
         .review => |review| switch (review) {
             .branch_list => |payload| payload,
-            .source => return error.UnexpectedReadRoute,
+            else => return error.UnexpectedReadRoute,
         },
         else => return error.UnexpectedReadRoute,
     };
@@ -3556,7 +3921,7 @@ test "ReviewBranchListLoadTask keeps physical root and controlled environment af
     var finished = switch (message.load) {
         .review => |review| switch (review) {
             .branch_list => |payload| payload,
-            .source => return error.UnexpectedReadRoute,
+            else => return error.UnexpectedReadRoute,
         },
         else => return error.UnexpectedReadRoute,
     };
@@ -3669,7 +4034,7 @@ test "ReviewLoadTask duplicate retains physical root after path replacement" {
     var finished = switch (message.load) {
         .review => |review| switch (review) {
             .source => |payload| payload,
-            .branch_list => return error.UnexpectedReadRoute,
+            else => return error.UnexpectedReadRoute,
         },
         else => return error.UnexpectedReadRoute,
     };

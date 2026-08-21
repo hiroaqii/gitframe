@@ -104,7 +104,7 @@ test "Review entry resolves default and picker selection queues its full ref" {
         'a',
         'b',
     ) } } }, &ctx);
-    try std.testing.expectEqualStrings("main", app.pages.review.basis.?.base.display_name);
+    try std.testing.expectEqualStrings("main", app.pages.review.normalBasisConst().?.base.display_name);
     try std.testing.expect(app.pages.review.load.state == .loaded);
     try std.testing.expectEqual(@as(usize, 17), app.pages.changes.viewer.diff_scroll);
 

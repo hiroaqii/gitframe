@@ -1,6 +1,6 @@
 # AI Review Store v1: read contract
 
-This document describes the side-effect-free read boundary implemented by the `review-history-read` slice. Publication, binding creation, draft/result mutation, App async ownership, and the AI Reviews picker are intentionally not implemented by this slice.
+This document describes the side-effect-free read boundary and its read-only `Review` page consumer. Publication, binding creation, and draft/result mutation remain separate responsibilities.
 
 ## Authority
 
@@ -101,8 +101,16 @@ Only an ordered `<oid> commit` or `<oid> missing` record is accepted. Wrong coun
 
 Selection treats scan rows as provisional. It owns a duplicated repository capability, controlled environment, Store-root path, fresh Store descriptor, parsed artifacts, and projection bytes. Before returning it revalidates physical repository locator, Store root device/inode, registry binding, namespace, exact Run artifacts, and object availability, then materializes the existing checkout-independent exact committed projection once. Any drift or missing object returns a typed failure without substituting a scan snapshot, current ref, or similar revision.
 
+## Review page history picker
+
+On the `Review` page, `a` opens the keyboard-only `Reviews` picker and starts one fresh asynchronous scan. GitFrame does not scan at startup and does not create a missing Store, registry, binding, namespace, or Run. The fixed `Normal Review` row is always first and is never filtered; valid Run rows remain newest-first and show their artifact-derived `new`, `draft`, `approved`, `needs changes`, or `canceled` status. Missing Git objects are shown independently as `target unavailable`.
+
+Use `/` to filter, `j`/`k` or arrow keys to move, Enter to activate, `r` to refresh or retry, and Esc/`q` to close. Query mode accepts printable command letters; Esc clears a non-empty query, then returns to command mode, and a further Esc closes. Invalid-only and unavailable states remain typed, bounded, and retryable.
+
+Selecting a Run revalidates the exact IDs and artifacts before replacing the visible diff atomically. A failed or stale selection leaves the previous normal or pinned presentation intact. In pinned mode, `r` reloads the exact Run and `m` returns through a fresh normal branch-comparison load; it never retargets the pinned OIDs through the base picker. Bare Esc outside the picker does not leave pinned mode.
+
 ## Resource ownership and current non-goals
 
 Every success/failure/skip terminal frees parsed arenas, raw artifact bytes, diagnostics, projection buffers, environments, and descriptors exactly once. The focused suite covers success and drift/failure union terminals with `std.testing.allocator`.
 
-This slice creates nothing during config resolution, scan, or selection. It exports no Store writer/helper, App message, page state, key, footer hint, modal, or pinned Review presentation. Those responsibilities belong to later independently reviewed slices.
+Config resolution, scan, selection, picker use, pinned refresh, and return-to-normal create no Store content. The App owns only ephemeral task results, picker snapshots, and the currently accepted normal or pinned presentation. No Store writer/helper or mutation UI is exported; those responsibilities belong to later independently reviewed slices.

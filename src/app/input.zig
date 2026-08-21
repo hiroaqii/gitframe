@@ -114,7 +114,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     // Review base search v1 is key-event-only. The modal owns this event even
     // if an underlying diff/file search flag is retained, so pasted bytes can
     // never leak through to that hidden input.
-    if (context.active_page == .review and context.review.base_picker_open) return null;
+    if (context.active_page == .review and (context.review.base_picker_open or context.review.ai_reviews_open)) return null;
     if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
         const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
         return translateChangesMsg(changes_msg);
@@ -150,7 +150,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         return .{ .repository = repository_msg };
     }
     if (context.active_page == .review and
-        (context.review.search_mode or context.review.file_search_mode or context.review.base_picker_open))
+        (context.review.search_mode or context.review.file_search_mode or context.review.base_picker_open or context.review.ai_reviews_open))
     {
         const review_msg = review_input.keyToMsg(context.review, key) orelse return null;
         return .{ .review = review_msg };

@@ -14,6 +14,8 @@ const file_tree = @import("../../../file_tree.zig");
 const keymap = @import("keymap");
 const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
+const committed_review = @import("../../../committed_review.zig");
+const review_store = @import("../../../review_store.zig");
 
 pub const Context = struct {
     page: *const review_page.ReviewPageState,
@@ -52,22 +54,31 @@ pub fn pageHeaderPresentation(app: Context) ?page_header.Presentation {
     if (!identity.matches(app.repo_epoch, app.root_identity))
         return reviewTerminal(pending, failed);
 
-    const basis = app.page.basis orelse return reviewTerminal(pending, failed);
-    const target = app.page.base_target orelse return reviewTerminal(pending, failed);
-    if (!std.mem.eql(u8, target.full_ref, basis.base.full_ref))
-        return reviewTerminal(pending, failed);
     if (!app.page.hasAcceptedDisplay()) return reviewTerminal(pending, failed);
-
-    return .{ .review = .{
-        .base_display_name = basis.base.display_name,
-        .head_display_name = basis.head_display,
-        .freshness = if (pending)
-            .refreshing
-        else if (failed)
-            .stale
-        else
-            .fresh,
-    } };
+    const presentation = app.page.presentation orelse return reviewTerminal(pending, failed);
+    const freshness: page_header.Freshness = if (pending)
+        .refreshing
+    else if (failed)
+        .stale
+    else
+        .fresh;
+    return switch (presentation) {
+        .normal => |normal| result: {
+            const target = app.page.base_target orelse break :result reviewTerminal(pending, failed);
+            if (!std.mem.eql(u8, target.full_ref, normal.basis.base.full_ref))
+                break :result reviewTerminal(pending, failed);
+            break :result .{ .review = .{
+                .base_display_name = normal.basis.base.display_name,
+                .head_display_name = normal.basis.head_display,
+                .freshness = freshness,
+            } };
+        },
+        .pinned_ai => |pinned| .{ .review = .{
+            .base_display_name = pinned.base_display,
+            .head_display_name = pinned.head_display,
+            .freshness = freshness,
+        } },
+    };
 }
 
 pub fn pageHeaderLineStats(app: Context) ?file_tree.Stats {
@@ -105,8 +116,11 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .palette = app.palette,
         .mode_toggle_key = displayModeToggleKey(app, mode_key_buffer[0..]),
     };
-    const empty_message: ?diff_surface.view.StateMessage = if (app.page.basis) |basis|
-        try emptyStateMessage(surface.frameAllocator(), basis.base.display_name, basis.ahead_count)
+    const empty_message: ?diff_surface.view.StateMessage = if (app.page.presentation) |presentation|
+        switch (presentation) {
+            .normal => |normal| try emptyStateMessage(surface.frameAllocator(), normal.basis.base.display_name, normal.basis.ahead_count),
+            .pinned_ai => pinnedEmptyStateMessage(),
+        }
     else
         null;
 
@@ -159,7 +173,7 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     // current-base is omitted before selected detail, and selected detail is
     // omitted before the final candidate/status row.
     if (show_current) {
-        const current = if (app.page.basis) |basis|
+        const current = if (app.page.normalBasisConst()) |basis|
             try std.fmt.allocPrint(content.frameAllocator(), "Current base: {s}", .{basis.base.display_name})
         else
             "Current base: resolving default";
@@ -265,6 +279,294 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.palette.style(.accent));
 }
 
+pub fn viewAiReviews(app: Context, surface: *chasen.Surface) !void {
+    const picker = &app.page.ai_reviews;
+    if (!picker.isOpen()) return;
+
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, 112),
+        .dialog_height = @min(surface.size().height, 24),
+        .title = "Reviews",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = app.palette.boldStyle(.accent),
+        .border_style = app.palette.style(.accent),
+    };
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    var dialog = frame.dialogSurface();
+    dialog.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
+    frame.view();
+    var content = frame.contentSurface();
+    const size = content.size();
+    if (size.height == 0) return;
+    const footer_row = size.height - 1;
+    var next_row: u16 = 0;
+
+    if (next_row < footer_row) {
+        const filter_prefix = if (picker.queryMode()) "Filter: /" else "Filter: ";
+        try draw.copyClippedTextAt(&content, 0, next_row, filter_prefix, app.palette.style(.prompt));
+        const prefix_width = content.displayWidth(filter_prefix);
+        if (prefix_width < size.width) {
+            var query_surface = content.child(.{
+                .col = prefix_width,
+                .row = next_row,
+                .width = size.width - prefix_width,
+                .height = 1,
+            });
+            try draw.copyClippedTextAt(&query_surface, 0, 0, picker.query.slice(), chasen.TextStyle{});
+        }
+        if (picker.queryMode() and size.width > 0) {
+            const cursor = @min(size.width - 1, prefix_width + content.displayWidth(picker.query.slice()));
+            content.showCursor(cursor, next_row);
+        }
+        next_row += 1;
+    }
+
+    const capabilities = picker.interactionCapabilities();
+    const retained_list = capabilities.list;
+    const mixed_invalid = retained_list and picker.rows().len > 0 and picker.skippedCount() > 0;
+    const available_rows = footer_row -| next_row;
+    const detail_rows: u16 = if (!retained_list)
+        0
+    else if (mixed_invalid)
+        if (available_rows >= 7) 3 else if (available_rows >= 4) 1 else 0
+    else if (available_rows >= 6)
+        2
+    else
+        0;
+    const list_end = footer_row -| detail_rows;
+
+    if (retained_list and next_row < list_end) {
+        try drawAiNormalRow(app, &content, next_row, picker.focus == 0);
+        next_row += 1;
+        if (next_row < list_end) {
+            try draw.copyClippedTextAt(&content, 0, next_row, "────────────────────────────────────────", app.palette.style(.muted));
+            next_row += 1;
+        }
+
+        const visible_runs = picker.filter.source_indexes.len;
+        const run_rows = list_end -| next_row;
+        if (visible_runs == 0 and run_rows > 0) {
+            if (try aiReviewsStateMessage(app, content.frameAllocator())) |message| {
+                try draw.copyClippedTextAt(&content, 0, next_row, message.text, messageStyle(app, message.failure));
+            } else if (picker.query.len > 0) {
+                const message = try std.fmt.allocPrint(content.frameAllocator(), "No AI reviews match \"{s}\"", .{picker.query.slice()});
+                try draw.copyClippedTextAt(&content, 0, next_row, message, app.palette.style(.muted));
+            }
+        } else if (run_rows > 0) {
+            const selected_run = picker.focus -| 1;
+            const start = listWindowStart(selected_run, visible_runs, run_rows);
+            var row_offset: u16 = 0;
+            while (row_offset < run_rows and start + row_offset < visible_runs) : (row_offset += 1) {
+                const visible_index = start + row_offset;
+                const source_index = picker.filter.sourceIndex(visible_index) orelse continue;
+                const rows = picker.rows();
+                if (source_index >= rows.len) continue;
+                try drawAiReviewRow(
+                    app,
+                    &content,
+                    next_row + row_offset,
+                    rows[source_index],
+                    picker.focus == visible_index + 1,
+                );
+            }
+        }
+
+        if (detail_rows > 0) {
+            const detail_start = footer_row - detail_rows;
+            var detail_row = detail_start;
+            if (mixed_invalid) {
+                const message = try aiReviewsSkippedMessage(picker, content.frameAllocator());
+                try draw.copyClippedTextAt(&content, 0, detail_row, message, app.palette.style(.muted));
+                detail_row += 1;
+            }
+            if (detail_row < footer_row) {
+                if (try aiReviewsStateMessage(app, content.frameAllocator())) |message| {
+                    try draw.copyClippedTextAt(&content, 0, detail_row, message.text, messageStyle(app, message.failure));
+                } else if (picker.selectedRow()) |selected| {
+                    try drawAiReviewDetail(app, &content, detail_row, selected);
+                } else {
+                    const detail = if (app.page.isPinnedAi())
+                        "Return to the current branch comparison"
+                    else
+                        "Current branch comparison";
+                    try draw.copyClippedTextAt(&content, 0, detail_row, detail, app.palette.style(.muted));
+                }
+            }
+        }
+    } else if (next_row < footer_row) {
+        if (try aiReviewsStateMessage(app, content.frameAllocator())) |message| {
+            try draw.copyClippedTextAt(&content, 0, next_row, message.text, messageStyle(app, message.failure));
+        }
+        if (next_row + 1 < footer_row) {
+            if (picker.selectedRow()) |selected| try drawAiReviewDetail(app, &content, next_row + 1, selected);
+        }
+    }
+
+    const footer = aiReviewsFooterText(picker);
+    try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.palette.style(.accent));
+}
+
+const AiReviewsStateMessage = struct {
+    text: []const u8,
+    failure: bool = false,
+};
+
+fn aiReviewsStateMessage(
+    app: Context,
+    allocator: std.mem.Allocator,
+) !?AiReviewsStateMessage {
+    const picker = &app.page.ai_reviews;
+    return switch (picker.phase) {
+        .closed, .ready => null,
+        .scan_loading => .{ .text = "Loading AI reviews..." },
+        .selection_loading => if (picker.selectedRow()) |selected|
+            .{ .text = try std.fmt.allocPrint(allocator, "Loading review... {s}  {s}@{s} -> {s}@{s}", .{
+                selected.producer_name,
+                selected.base_label orelse "base",
+                selected.target.base_oid.short(),
+                selected.head_label orelse "head",
+                selected.target.head_oid.short(),
+            }) }
+        else if (app.page.pinnedAiConst()) |pinned|
+            .{ .text = try directPinnedLoadingText(
+                allocator,
+                pinned.selection.artifacts.manifest.value.producer.name,
+                pinned.base_display,
+                pinned.head_display,
+            ) }
+        else
+            .{ .text = "Loading review..." },
+        .return_loading => if (app.page.base_target) |base|
+            .{ .text = try std.fmt.allocPrint(allocator, "Loading normal review... {s} -> current branch", .{base.display_name}) }
+        else
+            .{ .text = "Loading normal review..." },
+        .scan_failed => |message| .{ .text = firstLine(message), .failure = true },
+        .selection_failed => |failure| .{ .text = firstLine(failure.message), .failure = true },
+        .return_failed => |failure| .{ .text = firstLine(failure.message), .failure = true },
+        .empty => |kind| switch (kind) {
+            .no_reviews => .{ .text = "No AI reviews for this repository" },
+            .invalid_only => if (picker.firstDiagnostic()) |reason|
+                .{ .text = try std.fmt.allocPrint(allocator, "No valid AI reviews ({d} skipped: {s})", .{ picker.skippedCount(), firstLine(reason) }) }
+            else
+                .{ .text = try std.fmt.allocPrint(allocator, "No valid AI reviews ({d} skipped)", .{picker.skippedCount()}) },
+        },
+    };
+}
+
+fn aiReviewsSkippedMessage(
+    picker: *const review_page.AiReviewsPickerState,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    return if (picker.firstDiagnostic()) |reason|
+        try std.fmt.allocPrint(allocator, "{d} invalid reviews skipped: {s}", .{ picker.skippedCount(), firstLine(reason) })
+    else
+        try std.fmt.allocPrint(allocator, "{d} invalid reviews skipped", .{picker.skippedCount()});
+}
+
+fn messageStyle(app: Context, failure: bool) chasen.TextStyle {
+    return if (failure) app.palette.style(.danger) else app.palette.style(.muted);
+}
+
+fn drawAiNormalRow(app: Context, surface: *chasen.Surface, row: u16, focused: bool) !void {
+    const focus_marker: []const u8 = if (focused) ">" else " ";
+    const current_marker: []const u8 = if (!app.page.isPinnedAi()) "*" else " ";
+    const summary = if (app.page.normalBasisConst()) |basis|
+        try std.fmt.allocPrint(surface.frameAllocator(), "{s}@{s} -> {s}@{s}", .{
+            basis.base.display_name,
+            basis.target.base_oid.short(),
+            basis.head_display,
+            basis.target.head_oid.short(),
+        })
+    else if (app.page.base_target) |base|
+        try std.fmt.allocPrint(surface.frameAllocator(), "{s} -> current branch", .{base.display_name})
+    else
+        "current branch comparison";
+    const text = try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} Normal Review  {s}", .{ focus_marker, current_marker, summary });
+    try draw.copyClippedTextAt(
+        surface,
+        0,
+        row,
+        text,
+        if (focused) app.palette.boldStyle(.accent) else chasen.TextStyle{},
+    );
+}
+
+fn drawAiReviewRow(
+    app: Context,
+    surface: *chasen.Surface,
+    row_index: u16,
+    item: @import("../../../review_store/history.zig").RunSummary,
+    focused: bool,
+) !void {
+    const focus_marker: []const u8 = if (focused) ">" else " ";
+    const current_marker: []const u8 = if (app.page.isCurrentReviewTarget(&item.target)) "*" else " ";
+    const status = if (item.availability == .missing) "target unavailable" else review_page.runSummaryStatusText(item.status);
+    const relative = commit_time.formatRelative(item.created_at_unix, app.page.ai_reviews.render_now_unix);
+    const finding_label: []const u8 = if (item.finding_count == 1) "finding" else "findings";
+    const width = surface.size().width;
+    const text = if (width >= 96 and item.producer_model != null)
+        try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s}  {s}  {d} {s}  {s}  {s}", .{
+            focus_marker, current_marker, item.producer_name, item.producer_model.?, item.finding_count, finding_label, status, relative.text(),
+        })
+    else if (width >= 68)
+        try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s}  {d} {s}  {s}  {s}", .{
+            focus_marker, current_marker, item.producer_name, item.finding_count, finding_label, status, relative.text(),
+        })
+    else if (width >= 42)
+        try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s}  {d} {s}  {s}", .{
+            focus_marker, current_marker, item.producer_name, item.finding_count, finding_label, status,
+        })
+    else
+        try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s}  {s}", .{ focus_marker, current_marker, item.producer_name, status });
+    try draw.copyClippedTextAt(
+        surface,
+        0,
+        row_index,
+        text,
+        if (focused) app.palette.boldStyle(.accent) else chasen.TextStyle{},
+    );
+}
+
+fn drawAiReviewDetail(
+    app: Context,
+    surface: *chasen.Surface,
+    start_row: u16,
+    item: *const @import("../../../review_store/history.zig").RunSummary,
+) !void {
+    const base_label = item.base_label orelse "base";
+    const head_label = item.head_label orelse "head";
+    const target = try std.fmt.allocPrint(surface.frameAllocator(), "{s}@{s} -> {s}@{s}", .{
+        base_label, item.target.base_oid.short(), head_label, item.target.head_oid.short(),
+    });
+    try draw.copyClippedTextAt(surface, 0, start_row, target, app.palette.style(.muted));
+    if (start_row + 1 >= surface.size().height -| 1) return;
+    const review_id = item.review_id.canonical();
+    const detail = try std.fmt.allocPrint(surface.frameAllocator(), "created {s}  review {s}", .{ &item.created_at, review_id[0..8] });
+    try draw.copyClippedTextAt(surface, 0, start_row + 1, detail, app.palette.style(.muted));
+}
+
+fn aiReviewsFooterText(picker: *const review_page.AiReviewsPickerState) []const u8 {
+    const capabilities = picker.interactionCapabilities();
+    if (picker.queryMode()) return "Type: filter  Up/Down: move  Tab: command  Esc: clear/list";
+    if (capabilities.cancel) return "r: retry  Esc: cancel";
+    if (capabilities.list) return "/: filter  j/k: move  Enter: open  r: refresh/retry  Esc/q: close";
+    return "r: retry  Esc/q: close";
+}
+
+fn directPinnedLoadingText(
+    allocator: std.mem.Allocator,
+    producer: []const u8,
+    base_display: []const u8,
+    head_display: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "Loading review... {s}  {s} -> {s}", .{
+        producer,
+        base_display,
+        head_display,
+    });
+}
+
 const DiffPaneAdapter = struct {
     context: review_navigation.View,
     palette: theme.Palette,
@@ -303,7 +605,7 @@ fn navigationView(app: Context) review_navigation.View {
 }
 
 fn displayModeToggleKey(app: Context, buffer: []u8) ?[]const u8 {
-    if (app.page.search.mode or app.page.file_search.mode or app.page.base_picker.open) return null;
+    if (app.page.search.mode or app.page.file_search.mode or app.page.base_picker.open or app.page.ai_reviews.isOpen()) return null;
     return app.keymap.display(.toggle_display_mode, buffer);
 }
 
@@ -355,6 +657,14 @@ fn emptyStateMessage(
     };
 }
 
+fn pinnedEmptyStateMessage() diff_surface.view.StateMessage {
+    return .{
+        .title = "No file changes in AI review",
+        .body = "The selected AI review has an empty net file diff.",
+        .hint = "Press a to choose another review or m to return to normal Review.",
+    };
+}
+
 fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
     if (rows == 0 or len == 0) return 0;
     const visible: usize = @intCast(rows);
@@ -377,7 +687,7 @@ test "Review page header binds the accepted pair to repository and target" {
     defer state.deinit(allocator);
     _ = state.activate(7);
     state.activation.state.active.members.source = .fresh;
-    state.basis = .{
+    state.presentation = .{ .normal = .{ .basis = .{
         .base = .{
             .full_ref = try allocator.dupe(u8, "refs/remotes/origin/main"),
             .display_name = try allocator.dupe(u8, "origin/main"),
@@ -392,7 +702,7 @@ test "Review page header binds the accepted pair to repository and target" {
             .diff_base_oid = .{},
         },
         .ahead_count = 2,
-    };
+    } } };
     state.base_target = .{
         .full_ref = try allocator.dupe(u8, "refs/remotes/origin/main"),
         .display_name = try allocator.dupe(u8, "origin/main"),
@@ -437,6 +747,170 @@ test "Review page header binds the accepted pair to repository and target" {
 
     state.base_target.?.full_ref[0] = 'x';
     try std.testing.expect(pageHeaderPresentation(context).? == .terminal);
+}
+
+test "AI Reviews picker renders bounded 120 80 56 loading and empty modal states" {
+    const sizes = [_]chasen.Size{
+        .{ .width = 120, .height = 32 },
+        .{ .width = 80, .height = 24 },
+        .{ .width = 56, .height = 16 },
+    };
+    var state: review_page.ReviewPageState = .{};
+    defer state.deinit(std.testing.allocator);
+    state.ai_reviews.phase = .scan_loading;
+    for (sizes) |size| {
+        var ts: chasen.testing.TestSurface = undefined;
+        try ts.init(size.width, size.height);
+        defer ts.deinit();
+        try viewAiReviews(.{
+            .page = &state,
+            .palette = .default(),
+            .repo_root = "/repo",
+            .repo_epoch = 1,
+            .root_identity = null,
+            .layout = .{ .width = size.width, .height = size.height },
+        }, &ts.surface);
+        const snapshot = try ts.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Reviews") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Loading AI reviews...") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "r: retry") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc: cancel") != null);
+    }
+
+    state.ai_reviews.phase = .{ .scan_failed = "scan failed" };
+    try std.testing.expectEqualStrings("r: retry  Esc/q: close", aiReviewsFooterText(&state.ai_reviews));
+    const direct_id = try committed_review.ReviewId.parse("723e4567-e89b-42d3-a456-426614174000");
+    state.ai_reviews.phase = .{ .selection_failed = .{ .review_id = direct_id, .direct = true, .message = "selection failed" } };
+    try std.testing.expectEqualStrings("r: retry  Esc/q: close", aiReviewsFooterText(&state.ai_reviews));
+    state.ai_reviews.phase = .{ .return_failed = .{ .direct = true, .message = "return failed" } };
+    try std.testing.expectEqualStrings("r: retry  Esc/q: close", aiReviewsFooterText(&state.ai_reviews));
+
+    const labeled_loading = try directPinnedLoadingText(
+        std.testing.allocator,
+        "reviewer",
+        "AI main@aaaaaaa",
+        "topic@bbbbbbb",
+    );
+    defer std.testing.allocator.free(labeled_loading);
+    try std.testing.expectEqualStrings(
+        "Loading review... reviewer  AI main@aaaaaaa -> topic@bbbbbbb",
+        labeled_loading,
+    );
+    const oid_loading = try directPinnedLoadingText(
+        std.testing.allocator,
+        "reviewer",
+        "AI aaaaaaa",
+        "bbbbbbb",
+    );
+    defer std.testing.allocator.free(oid_loading);
+    try std.testing.expectEqualStrings(
+        "Loading review... reviewer  AI aaaaaaa -> bbbbbbb",
+        oid_loading,
+    );
+
+    state.ai_reviews.phase = .{ .empty = .no_reviews };
+    state.ai_reviews.scan_result = .unbound;
+    state.base_target = .{
+        .full_ref = try std.testing.allocator.dupe(u8, "refs/heads/main"),
+        .display_name = try std.testing.allocator.dupe(u8, "main"),
+        .kind = .local,
+    };
+    var empty_surface: chasen.testing.TestSurface = undefined;
+    try empty_surface.init(80, 24);
+    defer empty_surface.deinit();
+    try viewAiReviews(.{
+        .page = &state,
+        .palette = .default(),
+        .repo_root = "/repo",
+        .repo_epoch = 1,
+        .root_identity = null,
+        .layout = .{ .width = 80, .height = 24 },
+    }, &empty_surface.surface);
+    const empty_snapshot = try empty_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(empty_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, empty_snapshot, "Normal Review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_snapshot, "main -> current branch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_snapshot, "No AI reviews for this repository") != null);
+
+    const target: committed_review.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = try committed_review.ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .head_oid = try committed_review.ObjectId.parse(.sha1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        .diff_base_oid = try committed_review.ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    };
+    const rows = try std.testing.allocator.alloc(review_store.history.RunSummary, 1);
+    rows[0] = .{
+        .review_id = try committed_review.ReviewId.parse("923e4567-e89b-42d3-a456-426614174000"),
+        .target = target,
+        .status = .approved,
+        .created_at = "2026-08-20T00:00:00Z".*,
+        .created_at_unix = 1,
+        .producer_name = try std.testing.allocator.dupe(u8, "reviewer"),
+        .producer_model = null,
+        .base_label = null,
+        .head_label = null,
+        .finding_count = 7,
+        .availability = .available,
+        .artifact_snapshot = .{
+            .manifest_digest = committed_review.Sha256Digest.hash("manifest"),
+            .findings_digest = committed_review.Sha256Digest.hash("findings"),
+            .draft_state = .absent,
+            .draft_digest = null,
+            .result_digest = null,
+        },
+    };
+    const diagnostics = try std.testing.allocator.alloc(review_store.history.Diagnostic, 1);
+    diagnostics[0] = .{ .kind = .invalid_run, .text = try std.testing.allocator.dupe(u8, "invalid manifest") };
+    state.ai_reviews.scan_result = .{ .history = .{
+        .snapshot = undefined,
+        .rows = rows,
+        .diagnostics = diagnostics,
+        .skipped_count = 1,
+        .orphan_count = 0,
+    } };
+    const labels = [_][]const u8{"reviewer"};
+    try state.ai_reviews.filter.apply(std.testing.allocator, &labels, "");
+    state.ai_reviews.focus = 1;
+    state.ai_reviews.phase = .{ .selection_loading = .{ .review_id = rows[0].review_id, .direct = false } };
+    var loading_surface: chasen.testing.TestSurface = undefined;
+    try loading_surface.init(80, 24);
+    defer loading_surface.deinit();
+    try viewAiReviews(.{
+        .page = &state,
+        .palette = .default(),
+        .repo_root = "/repo",
+        .repo_epoch = 1,
+        .root_identity = null,
+        .layout = .{ .width = 80, .height = 24 },
+    }, &loading_surface.surface);
+    const selected_loading = try loading_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(selected_loading);
+    try std.testing.expect(std.mem.indexOf(u8, selected_loading, "Loading review... reviewer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, selected_loading, "base@aaaaaaa -> head@bbbbbbb") != null);
+
+    state.ai_reviews.phase = .ready;
+    var mixed_surface: chasen.testing.TestSurface = undefined;
+    try mixed_surface.init(80, 24);
+    defer mixed_surface.deinit();
+    try viewAiReviews(.{
+        .page = &state,
+        .palette = .default(),
+        .repo_root = "/repo",
+        .repo_epoch = 1,
+        .root_identity = null,
+        .layout = .{ .width = 80, .height = 24 },
+    }, &mixed_surface.surface);
+    const mixed_snapshot = try mixed_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(mixed_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_snapshot, "1 invalid reviews skipped: invalid manifest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_snapshot, "7 findings") != null);
+    state.ai_reviews.phase = .{ .return_failed = .{ .direct = false, .message = "return failed" } };
+    try std.testing.expectEqualStrings(
+        "/: filter  j/k: move  Enter: open  r: refresh/retry  Esc/q: close",
+        aiReviewsFooterText(&state.ai_reviews),
+    );
 }
 
 test "empty Review state describes one ahead commit accurately" {

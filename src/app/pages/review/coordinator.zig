@@ -18,9 +18,14 @@ const diff_selection = @import("../../../diff/selection.zig");
 const review_page = @import("../review.zig");
 const review_input = @import("input.zig");
 const review_navigation = @import("navigation.zig");
+const review_store = @import("../../../review_store.zig");
 
 const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
 const BranchListTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
+const HistoryScanTask = app_load.ReviewHistoryScanTask(app_message.Msg);
+const HistorySelectionTask = app_load.ReviewHistorySelectionTask(app_message.Msg);
+const HistoryNormalReturnTask = app_load.ReviewHistoryNormalReturnTask(app_message.Msg);
+const unavailable_store_path: review_store.ResolvedPath = .{ .unavailable = .no_state_home };
 
 pub const Redraw = enum {
     default,
@@ -64,6 +69,7 @@ pub const Controller = struct {
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
     env_map: ?*std.process.Environ.Map,
+    store_path: *const review_store.ResolvedPath = &unavailable_store_path,
 
     pub fn navigation(self: Controller) review_navigation.Controller {
         return .{
@@ -132,6 +138,22 @@ pub const Controller = struct {
             .base_picker_previous => self.page_state.base_picker.moveSelection(-1),
             .base_picker_next => self.page_state.base_picker.moveSelection(1),
             .choose_base => if (try self.page_state.chooseBasePickerTarget(ctx.allocator())) try self.refresh(ctx),
+            .open_ai_reviews => try self.startHistoryScan(ctx, false),
+            .close_ai_reviews => self.page_state.ai_reviews.close(ctx.allocator()),
+            .ai_reviews_cancel_loading => self.page_state.ai_reviews.cancelLoading(ctx.allocator()),
+            .ai_reviews_enter_query => self.page_state.ai_reviews.enterQuery(),
+            .ai_reviews_leave_query => self.page_state.ai_reviews.leaveQuery(),
+            .ai_reviews_clear_query_or_leave => self.page_state.ai_reviews.clearQueryOrLeave(ctx.allocator()) catch
+                self.page_state.status.set("Could not update AI review filter", .{}),
+            .ai_reviews_insert => |codepoint| self.page_state.ai_reviews.insertQuery(ctx.allocator(), codepoint) catch
+                self.page_state.status.set("Could not update AI review filter", .{}),
+            .ai_reviews_backspace => self.page_state.ai_reviews.backspaceQuery(ctx.allocator()) catch
+                self.page_state.status.set("Could not update AI review filter", .{}),
+            .ai_reviews_previous => self.page_state.ai_reviews.moveSelection(-1),
+            .ai_reviews_next => self.page_state.ai_reviews.moveSelection(1),
+            .ai_reviews_activate => try self.activateAiReviewSelection(ctx),
+            .ai_reviews_refresh_or_retry => try self.retryAiReviews(ctx),
+            .return_to_normal_review => try self.startNormalReturn(ctx, true),
             .copy_current_line => return self.copyCurrentLine(),
             .copy_current_hunk => return try self.copyCurrentHunk(ctx.allocator()),
             .branch_switch_unavailable => self.page_state.status.set("branch switching is not available in Review", .{}),
@@ -140,6 +162,7 @@ pub const Controller = struct {
     }
 
     pub fn refresh(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        if (self.page_state.isPinnedAi()) return self.startPinnedRefresh(ctx);
         const capability = self.repo.activeCapability() orelse {
             self.page_state.markNoRepository(ctx.allocator());
             return;
@@ -252,6 +275,104 @@ pub const Controller = struct {
         return if (accepted) .default else .skip;
     }
 
+    pub fn finishHistoryScan(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        result: app_load.ReviewHistoryScanFinished,
+    ) Redraw {
+        var finished = result;
+        defer finished.deinit(allocator);
+        const store_root = self.storeRoot() orelse return .skip;
+        const accepted = self.page_state.ai_reviews.acceptScan(
+            allocator,
+            self.repo.epoch(),
+            self.repo.activeIdentity(),
+            store_root,
+            &self.page_state.activation,
+            &finished,
+        );
+        return if (accepted) .default else .skip;
+    }
+
+    pub fn finishHistorySelection(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        result: app_load.ReviewHistorySelectionFinished,
+    ) !Redraw {
+        var finished = result;
+        defer finished.deinit(ctx.allocator());
+        const store_root = self.storeRoot() orelse return .skip;
+        if (!self.page_state.ai_reviews.acceptsSelection(
+            self.repo.epoch(),
+            self.repo.activeIdentity(),
+            store_root,
+            &self.page_state.activation,
+            finished,
+        )) return .skip;
+
+        switch (finished.result) {
+            .loaded => |*bundle| {
+                self.page_state.commitPinnedAi(
+                    ctx.allocator(),
+                    self.repo.epoch(),
+                    self.repo.activeRoot(),
+                    self.repo.activeIdentity(),
+                    bundle,
+                ) catch |err| {
+                    self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "Could not apply AI review");
+                    return err;
+                };
+                finished.result = .empty;
+                self.page_state.ai_reviews.close(ctx.allocator());
+                self.initializeAcceptedBody(ctx.allocator());
+            },
+            .selection_failed => |failure| self.page_state.ai_reviews.failSelection(finished.review_id, failure),
+            .failed_static => |message| self.page_state.ai_reviews.failSelectionStatic(finished.review_id, message),
+            .empty => self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "Could not load AI review"),
+        }
+        return .default;
+    }
+
+    pub fn finishHistoryNormalReturn(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        result: app_load.ReviewHistoryNormalReturnFinished,
+    ) !Redraw {
+        var finished = result;
+        defer finished.deinit(ctx.allocator());
+        const store_root = self.storeRoot() orelse return .skip;
+        if (!self.page_state.ai_reviews.acceptsNormalReturn(
+            self.repo.epoch(),
+            self.repo.activeIdentity(),
+            store_root,
+            &self.page_state.activation,
+            finished,
+        )) return .skip;
+
+        switch (finished.result) {
+            .loaded => |*bundle| {
+                self.page_state.commitNormalReturn(
+                    ctx.allocator(),
+                    self.repo.epoch(),
+                    self.repo.activeRoot(),
+                    self.repo.activeIdentity(),
+                    bundle,
+                ) catch |err| {
+                    self.page_state.ai_reviews.failNormalReturn("Could not apply normal Review");
+                    return err;
+                };
+                finished.result = .empty;
+                self.page_state.ai_reviews.close(ctx.allocator());
+                self.initializeAcceptedBody(ctx.allocator());
+            },
+            .basis_failed => self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review: base unavailable"),
+            .failed => |message| self.page_state.ai_reviews.failNormalReturn(message),
+            .failed_static => |message| self.page_state.ai_reviews.failNormalReturn(message),
+            .empty => self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review"),
+        }
+        return .default;
+    }
+
     pub fn applyDeferred(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !Redraw {
         if (self.page_state.selection_owner.activeMouseSelection()) return .default;
         const deferred = self.page_state.deferred_load_apply orelse return .default;
@@ -261,6 +382,210 @@ pub const Controller = struct {
 
     pub fn prepareModalRedraw(self: Controller, io: std.Io) void {
         self.page_state.base_picker.prepareModalRedraw(io);
+        self.page_state.ai_reviews.prepareModalRedraw(io);
+    }
+
+    fn startHistoryScan(self: Controller, ctx: *chasen.Ctx(app_message.Msg), retain_query: bool) !void {
+        const identity = self.page_state.activation.currentIdentity() orelse return;
+        const root_identity = self.repo.activeIdentity() orelse {
+            self.page_state.status.set("AI reviews require a repository", .{});
+            return;
+        };
+        const preferred = if (retain_query)
+            if (self.page_state.ai_reviews.selectedRow()) |row| row.review_id else self.page_state.activeAiReviewId()
+        else
+            self.page_state.activeAiReviewId();
+        const request = self.page_state.ai_reviews.beginScan(
+            ctx.allocator(),
+            identity,
+            root_identity,
+            preferred,
+            retain_query,
+        );
+        const store_root = self.storeRoot() orelse {
+            self.page_state.ai_reviews.markScanFailure("Could not load AI reviews: Store unavailable");
+            return;
+        };
+        const capability = self.repo.activeCapability() orelse {
+            self.page_state.ai_reviews.markScanFailure("Could not load AI reviews: repository unavailable");
+            return;
+        };
+        const task = ctx.allocator().create(HistoryScanTask) catch |err| {
+            self.page_state.ai_reviews.markScanFailure("Could not allocate AI review scan");
+            return err;
+        };
+        task.* = HistoryScanTask.init(
+            request.identity,
+            request.generation,
+            store_root,
+            capability.*,
+            self.env_map,
+            ctx.allocator(),
+        ) catch |err| {
+            ctx.allocator().destroy(task);
+            self.page_state.ai_reviews.markScanFailure("Could not prepare AI review scan");
+            return err;
+        };
+        ctx.task().spawnWith(.{ .ctx = task, .run = HistoryScanTask.run, .failed = HistoryScanTask.failed }) catch |err| {
+            task.destroy(ctx.allocator());
+            self.page_state.ai_reviews.markScanFailure("Could not start AI review scan");
+            return err;
+        };
+    }
+
+    fn activateAiReviewSelection(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        if (self.page_state.ai_reviews.selectedIsNormal()) {
+            if (!self.page_state.isPinnedAi()) {
+                self.page_state.ai_reviews.close(ctx.allocator());
+                return;
+            }
+            return self.startNormalReturn(ctx, false);
+        }
+        switch (self.page_state.ai_reviews.beginSelectedRun()) {
+            .none => {},
+            .unavailable => self.page_state.status.set("Review target unavailable; restore objects and press r", .{}),
+            .request => |request| try self.spawnSelection(ctx, request),
+        }
+    }
+
+    fn startPinnedRefresh(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        const pinned = self.page_state.pinnedAi() orelse return;
+        const identity = self.page_state.activation.currentIdentity() orelse return;
+        const root_identity = self.repo.activeIdentity() orelse return;
+        const request = self.page_state.ai_reviews.beginDirectSelection(
+            ctx.allocator(),
+            identity,
+            root_identity,
+            pinned.selection.snapshot,
+            pinned.reviewId(),
+            review_store.ArtifactSnapshot.fromLoaded(&pinned.selection.artifacts),
+        );
+        try self.spawnSelection(ctx, request);
+    }
+
+    fn spawnSelection(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        request: review_page.AiReviewSelectionRequest,
+    ) !void {
+        const store_root = self.storeRoot() orelse {
+            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not load AI review: Store unavailable");
+            return;
+        };
+        const capability = self.repo.activeCapability() orelse {
+            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not load AI review: repository unavailable");
+            return;
+        };
+        const task = ctx.allocator().create(HistorySelectionTask) catch |err| {
+            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not allocate AI review load");
+            return err;
+        };
+        task.* = HistorySelectionTask.init(
+            request.request.identity,
+            request.request.generation,
+            store_root,
+            capability.*,
+            self.env_map,
+            request.store,
+            request.review_id,
+            request.artifacts,
+            ctx.allocator(),
+        ) catch |err| {
+            ctx.allocator().destroy(task);
+            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not prepare AI review load");
+            return err;
+        };
+        ctx.task().spawnWith(.{ .ctx = task, .run = HistorySelectionTask.run, .failed = HistorySelectionTask.failed }) catch |err| {
+            task.destroy(ctx.allocator());
+            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not start AI review load");
+            return err;
+        };
+    }
+
+    fn startNormalReturn(self: Controller, ctx: *chasen.Ctx(app_message.Msg), direct: bool) !void {
+        if (!self.page_state.isPinnedAi()) {
+            if (!direct) self.page_state.ai_reviews.close(ctx.allocator());
+            if (direct) try self.startBasePicker(ctx);
+            return;
+        }
+        const identity = self.page_state.activation.currentIdentity() orelse return;
+        const root_identity = self.repo.activeIdentity() orelse return;
+        const request = if (direct)
+            self.page_state.ai_reviews.beginDirectNormalReturn(ctx.allocator(), identity, root_identity)
+        else
+            self.page_state.ai_reviews.beginNormalReturn(false) orelse return;
+        const store_root = self.storeRoot() orelse {
+            self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review: Store unavailable");
+            return;
+        };
+        const capability = self.repo.activeCapability() orelse {
+            self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review: repository unavailable");
+            return;
+        };
+        const task = ctx.allocator().create(HistoryNormalReturnTask) catch |err| {
+            self.page_state.ai_reviews.failNormalReturn("Could not allocate normal Review load");
+            return err;
+        };
+        task.* = HistoryNormalReturnTask.init(
+            request.identity,
+            request.generation,
+            store_root,
+            capability.*,
+            self.page_state.base_target,
+            self.env_map,
+            ctx.allocator(),
+        ) catch |err| {
+            ctx.allocator().destroy(task);
+            self.page_state.ai_reviews.failNormalReturn("Could not prepare normal Review load");
+            return err;
+        };
+        ctx.task().spawnWith(.{ .ctx = task, .run = HistoryNormalReturnTask.run, .failed = HistoryNormalReturnTask.failed }) catch |err| {
+            task.destroy(ctx.allocator());
+            self.page_state.ai_reviews.failNormalReturn("Could not start normal Review load");
+            return err;
+        };
+    }
+
+    fn retryAiReviews(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        switch (self.page_state.ai_reviews.phase) {
+            .scan_loading => try self.startHistoryScan(ctx, true),
+            .selection_loading => |loading| {
+                if (loading.direct) return self.startPinnedRefresh(ctx);
+                switch (self.page_state.ai_reviews.retrySelectedRun()) {
+                    .request => |request| try self.spawnSelection(ctx, request),
+                    .unavailable => self.page_state.status.set("Review target unavailable; restore objects and press r", .{}),
+                    .none => try self.startHistoryScan(ctx, true),
+                }
+            },
+            .return_loading => |loading| try self.startNormalReturn(ctx, loading.direct),
+            .ready, .empty, .scan_failed => try self.startHistoryScan(ctx, true),
+            .selection_failed => |failure| {
+                if (failure.direct) return self.startPinnedRefresh(ctx);
+                try self.startHistoryScan(ctx, true);
+            },
+            .return_failed => |failure| try self.startNormalReturn(ctx, failure.direct),
+            else => {},
+        }
+    }
+
+    fn initializeAcceptedBody(self: Controller, allocator: std.mem.Allocator) void {
+        const navigation_controller = self.navigation();
+        var update_adapter = navigation_controller.updateAdapter();
+        var body = update_adapter.bodyController();
+        if (body.controller.activeLoadedDiff()) |loaded| {
+            body.controller.syncSidebarNodeToSelectedFile(loaded);
+            body.initializeDiffCursorForSelectedFile();
+            body.clampDiffNavigation();
+            body.refreshSearchForSelectedFile();
+            body.controller.rebuildFileSearchProjection(allocator);
+        }
+    }
+
+    fn storeRoot(self: Controller) ?[]const u8 {
+        return switch (self.store_path.*) {
+            .available => |path_value| path_value,
+            .unavailable => null,
+        };
     }
 
     fn startBasePicker(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {

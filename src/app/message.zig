@@ -360,6 +360,36 @@ test "undelivered remaining read routes release owned payloads" {
     review_msg.deinitUndelivered(allocator);
 }
 
+test "AI Reviews picker undelivered task terminals release every owned store path" {
+    const allocator = std.testing.allocator;
+    const identity = page.RequestIdentity.review(3, 5);
+
+    var scan = Msg.loadFinished(.{ .review = .{ .history_scan = .{
+        .identity = identity,
+        .generation = 1,
+        .store_root = try allocator.dupe(u8, "/store"),
+        .result = .{ .failed_static = "scan failed" },
+    } } });
+    scan.deinitUndelivered(allocator);
+
+    var selection = Msg.loadFinished(.{ .review = .{ .history_selection = .{
+        .identity = identity,
+        .generation = 2,
+        .store_root = try allocator.dupe(u8, "/store"),
+        .review_id = undefined,
+        .result = .{ .failed_static = "selection failed" },
+    } } });
+    selection.deinitUndelivered(allocator);
+
+    var normal = Msg.loadFinished(.{ .review = .{ .history_normal_return = .{
+        .identity = identity,
+        .generation = 3,
+        .store_root = try allocator.dupe(u8, "/store"),
+        .result = .{ .failed_static = "normal failed" },
+    } } });
+    normal.deinitUndelivered(allocator);
+}
+
 test "undelivered plain root message is a no-op" {
     var msg: Msg = .quit;
     msg.deinitUndelivered(std.testing.allocator);

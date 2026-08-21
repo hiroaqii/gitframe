@@ -91,7 +91,7 @@ fn retainedReviewAppForViewTest(
         .pages = .{ .review = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{ .sidebar_hidden = true, .display_mode = mode },
-            .basis = .{
+            .presentation = .{ .normal = .{ .basis = .{
                 .base = .{
                     .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                     .display_name = try allocator.dupe(u8, "main"),
@@ -106,7 +106,7 @@ fn retainedReviewAppForViewTest(
                     .diff_base_oid = .{},
                 },
                 .ahead_count = 1,
-            },
+            } } },
         } },
     };
     errdefer app.pages.review.deinit(allocator);

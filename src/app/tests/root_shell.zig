@@ -415,7 +415,7 @@ test "terminal resize cancels live drag before geometry and retains completed se
             },
             .review = .{
                 .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-                .basis = .{
+                .presentation = .{ .normal = .{ .basis = .{
                     .base = .{
                         .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                         .display_name = try allocator.dupe(u8, "main"),
@@ -430,7 +430,7 @@ test "terminal resize cancels live drag before geometry and retains completed se
                         .diff_base_oid = .{},
                     },
                     .ahead_count = 1,
-                },
+                } } },
             },
         },
         .allocator = allocator,
@@ -580,7 +580,7 @@ test "Review retained actions route keyboard and mouse through App after narrow 
                 .focus = .diff,
                 .display_mode = .side_by_side,
             },
-            .basis = .{
+            .presentation = .{ .normal = .{ .basis = .{
                 .base = .{
                     .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                     .display_name = try allocator.dupe(u8, "main"),
@@ -595,7 +595,7 @@ test "Review retained actions route keyboard and mouse through App after narrow 
                     .diff_base_oid = .{},
                 },
                 .ahead_count = 1,
-            },
+            } } },
         } },
     };
     defer app.pages.review.deinit(allocator);

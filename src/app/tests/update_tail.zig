@@ -499,11 +499,11 @@ test "Review completion defers as one bundle during drag and applies afterward" 
     ) } } }, &ctx);
 
     try std.testing.expect(app.pages.review.deferred_load_apply != null);
-    try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.review.basis.?.target.head_oid.slice());
+    try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.review.normalBasisConst().?.target.head_oid.slice());
     app.pages.review.selection_owner = .none;
     try app.update(.focus_lost, &ctx);
     try std.testing.expect(app.pages.review.deferred_load_apply == null);
-    try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.review.basis.?.target.head_oid.slice());
+    try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.review.normalBasisConst().?.target.head_oid.slice());
 }
 
 test "repository commitment resets Review and refreshes the new physical root" {
@@ -532,7 +532,7 @@ test "repository commitment resets Review and refreshes the new physical root" {
         'a',
         'b',
     ) } } }, &ctx);
-    try std.testing.expect(app.pages.review.basis != null);
+    try std.testing.expect(app.pages.review.normalBasisConst() != null);
 
     const changes_activation = app.pages.changes.activation.activate(0, .pending, .unavailable, .unavailable);
     const discovery_generation = app.pages.changes.load.beginRepoDiscovery();
@@ -545,7 +545,7 @@ test "repository commitment resets Review and refreshes the new physical root" {
 
     try std.testing.expectEqual(@as(u64, 1), app.repo_session.view().epoch());
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
-    try std.testing.expect(app.pages.review.basis == null);
+    try std.testing.expect(app.pages.review.normalBasisConst() == null);
     try std.testing.expect(app.pages.review.base_target == null);
     try std.testing.expect(app.pages.review.activation.state == .active);
     try std.testing.expectEqual(@as(u64, 1), app.pages.review.activation.state.active.repo_epoch);

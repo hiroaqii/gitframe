@@ -169,7 +169,8 @@ pub const View = struct {
         }
 
         if ((self.active_page == .changes and (self.changes.key.search_mode or self.changes.key.file_search_mode)) or
-            (self.active_page == .review and (self.review.key.search_mode or self.review.key.file_search_mode or self.review.key.base_picker_open)) or
+            (self.active_page == .review and (self.review.key.search_mode or self.review.key.file_search_mode or
+                self.review.key.base_picker_open or self.review.key.ai_reviews_open)) or
             (self.active_page == .repository and (self.repository.key.source_search_mode or self.repository.key.file_search_mode)) or
             self.commit_panel_mode or self.repo_picker_mode) return null;
         if (mouse.type != .press) return null;

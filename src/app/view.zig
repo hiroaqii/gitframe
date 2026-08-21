@@ -156,8 +156,10 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     var body = surface.child(sections.body);
     try viewBody(app, &body);
 
-    var footer = surface.child(sections.footer);
-    viewFooter(app, &footer);
+    if (!(app.active_page == .review and app.review.page.ai_reviews.isOpen())) {
+        var footer = surface.child(sections.footer);
+        viewFooter(app, &footer);
+    }
 
     if (app.repo_picker.mode) {
         try viewRepoPicker(app, surface);
@@ -188,6 +190,9 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     }
     if (app.active_page == .review and app.review.page.base_picker.open) {
         try review_view.viewBasePicker(app.review, surface);
+    }
+    if (app.active_page == .review and app.review.page.ai_reviews.isOpen()) {
+        try review_view.viewAiReviews(app.review, surface);
     }
 }
 
@@ -456,7 +461,9 @@ const footer_hint_capacity: usize = 8;
 
 const FooterHintPriority = enum {
     repository_switch,
+    review_ai,
     primary,
+    review_mode,
     help,
     focus,
     secondary,
@@ -517,6 +524,7 @@ const FooterProjection = struct {
 /// drift away from the mouse hit target.
 pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     if (app.command_line != null) return null;
+    if (app.active_page == .review and app.review.page.ai_reviews.isOpen()) return null;
     if (width == 0 or app.active_page == .config) return null;
     if (app.action.spinnerPresentation() != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
@@ -703,7 +711,9 @@ fn projectFooterHints(
 
     const priority_order = [_]FooterHintPriority{
         .repository_switch,
+        .review_ai,
         .primary,
+        .review_mode,
         .help,
         .focus,
         .secondary,
@@ -1736,8 +1746,16 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         },
         .review => {
             const footer = app.review.footer();
-            if (!footer.normal_action_hints_enabled or app.review.page.base_picker.open) return result;
-            appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "base", .primary);
+            if (!footer.normal_action_hints_enabled or app.review.page.base_picker.open or app.review.page.ai_reviews.isOpen()) return result;
+            result.append(ui.key_hint.item("a", "AI reviews"), .review_ai);
+            appendUnclaimedFooterItem(
+                app,
+                &result,
+                .{ .codepoint = 'm' },
+                "m",
+                if (app.review.page.isPinnedAi()) "normal" else "base",
+                .review_mode,
+            );
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
             result.append(ui.key_hint.item("q", "quit"), .quit);
@@ -2350,6 +2368,7 @@ test "footer normal-mode hints match the decided page lists" {
     context.active_page = .review;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("a", "AI reviews"),
         ui.key_hint.item("m", "base"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2387,6 +2406,7 @@ test "footer normal-mode hints follow state and local key ownership" {
     context.active_page = .review;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("a", "AI reviews"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
         ui.key_hint.item("q", "quit"),
@@ -2443,6 +2463,39 @@ test "footer hint projection keeps priority items and original display order" {
     });
 
     projected = projectFooterHints(&hints, 200, .{});
+    try expectProjectedFooterHintItems(&projected, hints.slice());
+}
+
+test "AI Reviews picker footer retention is R then a then m while display order stays a m R help q" {
+    var hints: FooterHints = .{};
+    hints.append(ui.key_hint.item("a", "AI reviews"), .review_ai);
+    hints.append(ui.key_hint.item("m", "base"), .review_mode);
+    hints.append(ui.key_hint.item("R", "switch repo"), .repository_switch);
+    hints.append(ui.key_hint.item("?", "help"), .help);
+    hints.append(ui.key_hint.item("q", "quit"), .quit);
+    const opts: ui.key_hint.DrawOptions = .{};
+    const separator_width = chasen.text.displayWidth(opts.separator);
+    const r_width = ui.key_hint.width(hints.items[2..3], opts);
+    const a_width = ui.key_hint.width(hints.items[0..1], opts);
+    const m_width = ui.key_hint.width(hints.items[1..2], opts);
+
+    var projected = projectFooterHints(&hints, r_width, opts);
+    try expectProjectedFooterHintItems(&projected, &.{ui.key_hint.item("R", "switch repo")});
+
+    projected = projectFooterHints(&hints, r_width + separator_width + a_width, opts);
+    try expectProjectedFooterHintItems(&projected, &.{
+        ui.key_hint.item("a", "AI reviews"),
+        ui.key_hint.item("R", "switch repo"),
+    });
+
+    projected = projectFooterHints(&hints, r_width + a_width + m_width + separator_width * 2, opts);
+    try expectProjectedFooterHintItems(&projected, &.{
+        ui.key_hint.item("a", "AI reviews"),
+        ui.key_hint.item("m", "base"),
+        ui.key_hint.item("R", "switch repo"),
+    });
+
+    projected = projectFooterHints(&hints, 200, opts);
     try expectProjectedFooterHintItems(&projected, hints.slice());
 }
 
@@ -3067,8 +3120,9 @@ const help_placeholder_sections = [_]HelpSection{
 };
 
 const help_review_items = [_]HelpItem{
-    .{ .key = .{ .text = "m" }, .description = "choose comparison base (user assignment wins)" },
-    .{ .key = .{ .action = .reload }, .description = "refresh comparison against selected base" },
+    .{ .key = .{ .text = "a" }, .description = "choose normal or AI review" },
+    .{ .key = .{ .text = "m" }, .description = "choose base / return from pinned AI review" },
+    .{ .key = .{ .action = .reload }, .description = "refresh normal base or exact pinned AI review" },
     .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },

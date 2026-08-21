@@ -20,6 +20,7 @@ const file_tree = @import("../../file_tree.zig");
 const git_refs = @import("../../git/refs.zig");
 const reviewed_files = @import("../../reviewed_files.zig");
 const root_capability = @import("../../repo/root_capability.zig");
+const review_store = @import("../../review_store.zig");
 const commit_time = @import("../branch_commit_time.zig");
 
 pub const selection_source: diff_source.SourceMode = .{ .range = "review" };
@@ -281,6 +282,579 @@ pub const BasePickerState = struct {
     }
 };
 
+pub const AiReviewsRequest = struct {
+    identity: page.RequestIdentity,
+    generation: u64,
+    root_identity: root_capability.Identity,
+};
+
+pub const AiReviewSelectionRequest = struct {
+    request: AiReviewsRequest,
+    store: review_store.history.StoreSnapshot,
+    review_id: committed_review.ReviewId,
+    artifacts: review_store.ArtifactSnapshot,
+};
+
+pub const AiReviewSelectionAdmission = union(enum) {
+    none,
+    unavailable,
+    request: AiReviewSelectionRequest,
+};
+
+/// One keyboard-only history modal. The phase is the operation discriminator;
+/// the optional scan snapshot is retained only across selection/return states
+/// that must restore the ready list after cancellation or failure.
+pub const AiReviewsPickerState = struct {
+    pub const InputMode = enum { command, query };
+    pub const EmptyKind = enum { no_reviews, invalid_only };
+    pub const InteractionCapabilities = struct {
+        list: bool = false,
+        retry: bool = false,
+        cancel: bool = false,
+        close: bool = false,
+    };
+    pub const Phase = union(enum) {
+        closed,
+        scan_loading,
+        ready,
+        empty: EmptyKind,
+        scan_failed: []const u8,
+        selection_loading: struct { review_id: committed_review.ReviewId, direct: bool },
+        selection_failed: struct { review_id: committed_review.ReviewId, direct: bool, message: []const u8 },
+        return_loading: struct { direct: bool },
+        return_failed: struct { direct: bool, message: []const u8 },
+    };
+
+    phase: Phase = .closed,
+    generation: u64 = 0,
+    identity: ?page.RequestIdentity = null,
+    root_identity: ?root_capability.Identity = null,
+    scan_result: ?review_store.ScanResult = null,
+    search_labels: [][]u8 = &.{},
+    filter: ui.ListFilter = .{},
+    query: app_prompt.TextInput = .{},
+    input_mode: InputMode = .command,
+    focus: usize = 0,
+    refocus_review_id: ?committed_review.ReviewId = null,
+    render_now_unix: ?i64 = null,
+
+    pub fn isOpen(self: *const AiReviewsPickerState) bool {
+        return self.phase != .closed;
+    }
+
+    pub fn queryMode(self: *const AiReviewsPickerState) bool {
+        return self.input_mode == .query;
+    }
+
+    pub fn loading(self: *const AiReviewsPickerState) bool {
+        return switch (self.phase) {
+            .scan_loading, .selection_loading, .return_loading => true,
+            else => false,
+        };
+    }
+
+    /// The phase and retained snapshot together are the single authority for
+    /// both rendered commands and state admission.
+    pub fn interactionCapabilities(self: *const AiReviewsPickerState) InteractionCapabilities {
+        const retained_list = self.scan_result != null;
+        return switch (self.phase) {
+            .closed => .{},
+            .scan_loading, .selection_loading, .return_loading => .{ .retry = true, .cancel = true },
+            .ready, .empty => .{ .list = retained_list, .retry = true, .close = true },
+            .scan_failed => .{ .retry = true, .close = true },
+            .selection_failed, .return_failed => .{ .list = retained_list, .retry = true, .close = true },
+        };
+    }
+
+    pub fn beginScan(
+        self: *AiReviewsPickerState,
+        allocator: std.mem.Allocator,
+        identity: page.RequestIdentity,
+        root_identity: root_capability.Identity,
+        preferred: ?committed_review.ReviewId,
+        retain_query: bool,
+    ) AiReviewsRequest {
+        const retained_query = if (retain_query) self.query else app_prompt.TextInput{};
+        self.clearSnapshot(allocator);
+        self.query = retained_query;
+        self.input_mode = .command;
+        self.focus = 0;
+        self.refocus_review_id = preferred;
+        self.render_now_unix = null;
+        self.identity = identity;
+        self.root_identity = root_identity;
+        self.advanceGeneration();
+        self.phase = .scan_loading;
+        return self.currentRequest();
+    }
+
+    pub fn markScanFailure(self: *AiReviewsPickerState, message: []const u8) void {
+        if (self.phase != .scan_loading) return;
+        self.phase = .{ .scan_failed = message };
+    }
+
+    pub fn acceptScan(
+        self: *AiReviewsPickerState,
+        allocator: std.mem.Allocator,
+        repo_epoch: u64,
+        root_identity: ?root_capability.Identity,
+        store_root: []const u8,
+        activation: *const diff_surface.authority.Lifecycle,
+        finished: *app_load.ReviewHistoryScanFinished,
+    ) bool {
+        if (self.phase != .scan_loading or
+            !self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_root, finished.store_root, activation)) return false;
+
+        switch (finished.result) {
+            .failed_static => |message| self.phase = .{ .scan_failed = message },
+            .scanned => |*result| {
+                switch (result.*) {
+                    .failure => |failure| {
+                        self.phase = .{ .scan_failed = scanFailureText(failure) };
+                        return true;
+                    },
+                    else => {},
+                }
+                self.scan_result = result.*;
+                finished.result = .empty;
+                self.rebuildSearch(allocator) catch {
+                    self.clearSnapshot(allocator);
+                    self.phase = .{ .scan_failed = "Could not prepare AI review filter" };
+                    return true;
+                };
+                const visible_rows = self.rows();
+                if (visible_rows.len == 0) {
+                    self.phase = .{ .empty = if (self.skippedCount() > 0) .invalid_only else .no_reviews };
+                    self.focus = 0;
+                } else {
+                    self.phase = .ready;
+                    self.focusPreferred();
+                }
+            },
+            .empty => self.phase = .{ .scan_failed = "Could not load AI reviews" },
+        }
+        return true;
+    }
+
+    pub fn beginSelectedRun(self: *AiReviewsPickerState) AiReviewSelectionAdmission {
+        if (!self.interactionCapabilities().list) return .none;
+        const row = self.selectedRow() orelse return .none;
+        if (row.availability == .missing) return .unavailable;
+        self.input_mode = .command;
+        self.advanceGeneration();
+        self.phase = .{ .selection_loading = .{ .review_id = row.review_id, .direct = false } };
+        const history_value = self.history() orelse return .none;
+        return .{ .request = .{
+            .request = self.currentRequest(),
+            .store = history_value.snapshot,
+            .review_id = row.review_id,
+            .artifacts = row.artifact_snapshot,
+        } };
+    }
+
+    pub fn retrySelectedRun(self: *AiReviewsPickerState) AiReviewSelectionAdmission {
+        const selection_loading = switch (self.phase) {
+            .selection_loading => |value| value,
+            else => return .none,
+        };
+        if (selection_loading.direct or self.scan_result == null) return .none;
+        const review_id = selection_loading.review_id;
+        self.restoreListPhase();
+        self.focusReviewId(review_id);
+        return self.beginSelectedRun();
+    }
+
+    pub fn beginDirectSelection(
+        self: *AiReviewsPickerState,
+        allocator: std.mem.Allocator,
+        identity: page.RequestIdentity,
+        root_identity: root_capability.Identity,
+        store: review_store.history.StoreSnapshot,
+        review_id: committed_review.ReviewId,
+        artifacts: review_store.ArtifactSnapshot,
+    ) AiReviewSelectionRequest {
+        self.clearSnapshot(allocator);
+        self.query = .{};
+        self.input_mode = .command;
+        self.identity = identity;
+        self.root_identity = root_identity;
+        self.advanceGeneration();
+        self.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = true } };
+        return .{
+            .request = self.currentRequest(),
+            .store = store,
+            .review_id = review_id,
+            .artifacts = artifacts,
+        };
+    }
+
+    pub fn beginNormalReturn(self: *AiReviewsPickerState, direct: bool) ?AiReviewsRequest {
+        if (self.identity == null or self.root_identity == null) return null;
+        self.input_mode = .command;
+        self.advanceGeneration();
+        self.phase = .{ .return_loading = .{ .direct = direct } };
+        return self.currentRequest();
+    }
+
+    pub fn beginDirectNormalReturn(
+        self: *AiReviewsPickerState,
+        allocator: std.mem.Allocator,
+        identity: page.RequestIdentity,
+        root_identity: root_capability.Identity,
+    ) AiReviewsRequest {
+        self.clearSnapshot(allocator);
+        self.query = .{};
+        self.input_mode = .command;
+        self.identity = identity;
+        self.root_identity = root_identity;
+        self.advanceGeneration();
+        self.phase = .{ .return_loading = .{ .direct = true } };
+        return self.currentRequest();
+    }
+
+    pub fn acceptsSelection(
+        self: *const AiReviewsPickerState,
+        repo_epoch: u64,
+        root_identity: ?root_capability.Identity,
+        store_root: []const u8,
+        activation: *const diff_surface.authority.Lifecycle,
+        finished: app_load.ReviewHistorySelectionFinished,
+    ) bool {
+        const phase_loading = switch (self.phase) {
+            .selection_loading => |value| value,
+            else => return false,
+        };
+        return phase_loading.review_id.eql(finished.review_id) and
+            self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_root, finished.store_root, activation);
+    }
+
+    pub fn failSelection(
+        self: *AiReviewsPickerState,
+        review_id: committed_review.ReviewId,
+        failure: review_store.history.SelectionFailure,
+    ) void {
+        const phase_loading = switch (self.phase) {
+            .selection_loading => |value| value,
+            else => return,
+        };
+        if (failure == .target_unavailable) {
+            if (self.history()) |history_value| for (history_value.rows) |*row| {
+                if (row.review_id.eql(review_id)) row.availability = .missing;
+            };
+        }
+        self.phase = .{ .selection_failed = .{
+            .review_id = review_id,
+            .direct = phase_loading.direct,
+            .message = selectionFailureText(failure),
+        } };
+    }
+
+    pub fn failSelectionStatic(self: *AiReviewsPickerState, review_id: committed_review.ReviewId, message: []const u8) void {
+        const phase_loading = switch (self.phase) {
+            .selection_loading => |value| value,
+            else => return,
+        };
+        self.phase = .{ .selection_failed = .{ .review_id = review_id, .direct = phase_loading.direct, .message = message } };
+    }
+
+    pub fn acceptsNormalReturn(
+        self: *const AiReviewsPickerState,
+        repo_epoch: u64,
+        root_identity: ?root_capability.Identity,
+        store_root: []const u8,
+        activation: *const diff_surface.authority.Lifecycle,
+        finished: app_load.ReviewHistoryNormalReturnFinished,
+    ) bool {
+        if (self.phase != .return_loading) return false;
+        return self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_root, finished.store_root, activation);
+    }
+
+    pub fn failNormalReturn(self: *AiReviewsPickerState, message: []const u8) void {
+        const phase_loading = switch (self.phase) {
+            .return_loading => |value| value,
+            else => return,
+        };
+        self.phase = .{ .return_failed = .{ .direct = phase_loading.direct, .message = message } };
+    }
+
+    pub fn cancelLoading(self: *AiReviewsPickerState, allocator: std.mem.Allocator) void {
+        const restore = switch (self.phase) {
+            .selection_loading => |value| !value.direct,
+            .return_loading => |value| !value.direct,
+            else => false,
+        };
+        self.advanceGeneration();
+        if (restore and self.scan_result != null) {
+            self.restoreListPhase();
+        } else {
+            self.close(allocator);
+        }
+    }
+
+    pub fn close(self: *AiReviewsPickerState, allocator: std.mem.Allocator) void {
+        self.clearSnapshot(allocator);
+        self.phase = .closed;
+        self.identity = null;
+        self.root_identity = null;
+        self.query = .{};
+        self.input_mode = .command;
+        self.focus = 0;
+        self.refocus_review_id = null;
+        self.render_now_unix = null;
+        self.advanceGeneration();
+    }
+
+    pub fn moveSelection(self: *AiReviewsPickerState, delta: isize) void {
+        if (!self.listInteractive()) return;
+        const count = self.filter.source_indexes.len + 1;
+        if (delta < 0) self.focus = if (self.focus == 0) count - 1 else self.focus - 1;
+        if (delta > 0) self.focus = if (self.focus + 1 == count) 0 else self.focus + 1;
+        self.syncFilterFocus();
+    }
+
+    pub fn enterQuery(self: *AiReviewsPickerState) void {
+        if (!self.listInteractive()) return;
+        self.input_mode = .query;
+    }
+
+    pub fn leaveQuery(self: *AiReviewsPickerState) void {
+        self.input_mode = .command;
+    }
+
+    pub fn insertQuery(self: *AiReviewsPickerState, allocator: std.mem.Allocator, codepoint: u21) !void {
+        var next = self.query;
+        try next.insert(codepoint);
+        try self.publishQuery(allocator, next);
+    }
+
+    pub fn backspaceQuery(self: *AiReviewsPickerState, allocator: std.mem.Allocator) !void {
+        var next = self.query;
+        next.backspace();
+        try self.publishQuery(allocator, next);
+    }
+
+    pub fn clearQueryOrLeave(self: *AiReviewsPickerState, allocator: std.mem.Allocator) !void {
+        if (self.query.len > 0) {
+            try self.publishQuery(allocator, .{});
+        } else {
+            self.input_mode = .command;
+        }
+    }
+
+    pub fn selectedRow(self: *const AiReviewsPickerState) ?*const review_store.history.RunSummary {
+        if (self.focus == 0) return null;
+        const history_value = self.historyConst() orelse return null;
+        const source_index = self.filter.sourceIndex(self.focus - 1) orelse return null;
+        if (source_index >= history_value.rows.len) return null;
+        return &history_value.rows[source_index];
+    }
+
+    pub fn selectedIsNormal(self: *const AiReviewsPickerState) bool {
+        return self.focus == 0 and self.listInteractive();
+    }
+
+    pub fn rows(self: *const AiReviewsPickerState) []const review_store.history.RunSummary {
+        const history_value = self.historyConst() orelse return &.{};
+        return history_value.rows;
+    }
+
+    pub fn skippedCount(self: *const AiReviewsPickerState) usize {
+        const history_value = self.historyConst() orelse return 0;
+        return history_value.skipped_count;
+    }
+
+    pub fn firstDiagnostic(self: *const AiReviewsPickerState) ?[]const u8 {
+        const history_value = self.historyConst() orelse return null;
+        if (history_value.diagnostics.len == 0) return null;
+        return history_value.diagnostics[0].text;
+    }
+
+    pub fn prepareModalRedraw(self: *AiReviewsPickerState, io: std.Io) void {
+        if (self.isOpen()) {
+            self.render_now_unix = commit_time.sampleUnixSeconds(io);
+        } else {
+            self.render_now_unix = null;
+        }
+    }
+
+    pub fn deinit(self: *AiReviewsPickerState, allocator: std.mem.Allocator) void {
+        self.clearSnapshot(allocator);
+        self.* = .{};
+    }
+
+    fn currentRequest(self: *const AiReviewsPickerState) AiReviewsRequest {
+        return .{
+            .identity = self.identity.?,
+            .generation = self.generation,
+            .root_identity = self.root_identity.?,
+        };
+    }
+
+    fn accepts(
+        self: *const AiReviewsPickerState,
+        identity: page.RequestIdentity,
+        generation: u64,
+        repo_epoch: u64,
+        root_identity: ?root_capability.Identity,
+        expected_store_root: []const u8,
+        finished_store_root: []const u8,
+        activation: *const diff_surface.authority.Lifecycle,
+    ) bool {
+        if (generation != self.generation or self.identity == null or self.root_identity == null) return false;
+        if (!std.meta.eql(self.identity.?, identity) or !self.root_identity.?.eql(root_identity orelse return false)) return false;
+        if (!std.mem.eql(u8, expected_store_root, finished_store_root)) return false;
+        if (!activation.acceptsRepoEpoch(identity, repo_epoch)) return false;
+        const current = activation.currentIdentity() orelse return false;
+        return std.meta.eql(current, identity);
+    }
+
+    fn listInteractive(self: *const AiReviewsPickerState) bool {
+        return self.interactionCapabilities().list;
+    }
+
+    fn restoreListPhase(self: *AiReviewsPickerState) void {
+        self.phase = if (self.rows().len == 0)
+            .{ .empty = if (self.skippedCount() > 0) .invalid_only else .no_reviews }
+        else
+            .ready;
+    }
+
+    fn history(self: *AiReviewsPickerState) ?*review_store.History {
+        const result = if (self.scan_result) |*value| value else return null;
+        return switch (result.*) {
+            .history => |*history_value| history_value,
+            else => null,
+        };
+    }
+
+    fn historyConst(self: *const AiReviewsPickerState) ?*const review_store.History {
+        const result = if (self.scan_result) |*value| value else return null;
+        return switch (result.*) {
+            .history => |*history_value| history_value,
+            else => null,
+        };
+    }
+
+    fn publishQuery(self: *AiReviewsPickerState, allocator: std.mem.Allocator, next: app_prompt.TextInput) !void {
+        const preferred = if (self.focus == 0) null else if (self.selectedRow()) |row| row.review_id else null;
+        var next_filter: ui.ListFilter = .{};
+        errdefer next_filter.deinit(allocator);
+        const labels: []const []const u8 = self.search_labels;
+        try next_filter.apply(allocator, labels, next.slice());
+        self.filter.deinit(allocator);
+        self.filter = next_filter;
+        self.query = next;
+        self.focus = 0;
+        if (preferred) |review_id| self.focusReviewId(review_id);
+    }
+
+    fn rebuildSearch(self: *AiReviewsPickerState, allocator: std.mem.Allocator) !void {
+        self.clearSearch(allocator);
+        const rows_value = self.rows();
+        const labels = try allocator.alloc([]u8, rows_value.len);
+        errdefer allocator.free(labels);
+        var initialized: usize = 0;
+        errdefer for (labels[0..initialized]) |label| allocator.free(label);
+        for (rows_value, labels) |row, *label| {
+            const review_id = row.review_id.canonical();
+            label.* = try std.fmt.allocPrint(allocator, "{s} {s} {s} {s} {s} {s} {s} {s}", .{
+                row.producer_name,
+                row.producer_model orelse "",
+                runSummaryStatusText(row.status),
+                row.base_label orelse "",
+                row.target.base_oid.short(),
+                row.head_label orelse "",
+                row.target.head_oid.short(),
+                &review_id,
+            });
+            initialized += 1;
+        }
+        self.search_labels = labels;
+        const borrowed: []const []const u8 = labels;
+        try self.filter.apply(allocator, borrowed, self.query.slice());
+    }
+
+    fn clearSnapshot(self: *AiReviewsPickerState, allocator: std.mem.Allocator) void {
+        self.clearSearch(allocator);
+        if (self.scan_result) |*result| result.deinit(allocator);
+        self.scan_result = null;
+    }
+
+    fn clearSearch(self: *AiReviewsPickerState, allocator: std.mem.Allocator) void {
+        self.filter.deinit(allocator);
+        self.filter = .{};
+        for (self.search_labels) |label| allocator.free(label);
+        allocator.free(self.search_labels);
+        self.search_labels = &.{};
+    }
+
+    fn focusPreferred(self: *AiReviewsPickerState) void {
+        self.focus = 0;
+        if (self.refocus_review_id) |review_id| self.focusReviewId(review_id);
+        self.refocus_review_id = null;
+    }
+
+    fn focusReviewId(self: *AiReviewsPickerState, review_id: committed_review.ReviewId) void {
+        const history_value = self.historyConst() orelse return;
+        for (self.filter.source_indexes, 0..) |source_index, visible_index| {
+            if (source_index < history_value.rows.len and history_value.rows[source_index].review_id.eql(review_id)) {
+                self.focus = visible_index + 1;
+                self.syncFilterFocus();
+                return;
+            }
+        }
+    }
+
+    fn syncFilterFocus(self: *AiReviewsPickerState) void {
+        if (self.focus == 0 or self.filter.source_indexes.len == 0) return;
+        self.filter.list.focus.index = @min(self.focus - 1, self.filter.source_indexes.len - 1);
+    }
+
+    fn advanceGeneration(self: *AiReviewsPickerState) void {
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+    }
+};
+
+pub fn runSummaryStatusText(status: review_store.history.RunSummaryStatus) []const u8 {
+    return switch (status) {
+        .new => "new",
+        .draft => "draft",
+        .approved => "approved",
+        .needs_changes => "needs changes",
+        .canceled => "canceled",
+    };
+}
+
+fn scanFailureText(failure: review_store.history.ScanFailure) []const u8 {
+    return switch (failure) {
+        .repository_invalid => "Could not load AI reviews: repository invalid",
+        .store_invalid => "Could not load AI reviews: Store invalid",
+        .store_unavailable => "Could not load AI reviews: Store unavailable",
+        .unsupported_platform => "Could not load AI reviews: unsupported platform",
+        .unsupported_filesystem => "Could not load AI reviews: unsupported filesystem",
+        .registry_invalid => "Could not load AI reviews: registry invalid",
+        .registry_unavailable => "Could not load AI reviews: registry unavailable",
+        .namespace_invalid => "Could not load AI reviews: namespace invalid",
+        .enumeration_failed => "Could not load AI reviews: scan failed",
+        .scan_limit_exceeded => "Could not load AI reviews: scan limit exceeded",
+        .git_failed => "Could not load AI reviews: Git read failed",
+    };
+}
+
+fn selectionFailureText(failure: review_store.history.SelectionFailure) []const u8 {
+    return switch (failure) {
+        .repository_unavailable => "Could not load AI review: repository unavailable",
+        .root_drift => "Could not load AI review: Store changed",
+        .binding_drift => "Could not load AI review: repository binding changed",
+        .run_invalid => "Could not load AI review: Run invalid",
+        .artifact_drift => "Could not load AI review: artifacts changed",
+        .target_unavailable => "Review target unavailable; restore objects and press r",
+        .git_failed => "Could not load AI review: Git read failed",
+        .projection_failed => "Could not load AI review: projection failed",
+    };
+}
+
 /// A live drag may defer an entire atomic Review completion. This owner never
 /// splits basis from diff; replacement and page teardown release both through
 /// the normal undelivered-completion contract.
@@ -346,6 +920,55 @@ pub const AcceptedRepositoryIdentity = struct {
     }
 };
 
+pub const NormalPresentation = struct {
+    basis: diff_basis.BranchDiffBasis,
+
+    pub fn deinit(self: *NormalPresentation, allocator: std.mem.Allocator) void {
+        self.basis.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const PinnedAiPresentation = struct {
+    selection: review_store.SelectedRunRead,
+    base_display: []u8,
+    head_display: []u8,
+
+    pub fn deinit(self: *PinnedAiPresentation, allocator: std.mem.Allocator) void {
+        allocator.free(self.head_display);
+        allocator.free(self.base_display);
+        self.selection.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn reviewId(self: *const PinnedAiPresentation) committed_review.ReviewId {
+        return self.selection.artifacts.manifest.value.review_id;
+    }
+
+    pub fn target(self: *const PinnedAiPresentation) committed_review.CommittedReviewTarget {
+        return self.selection.artifacts.manifest.value.target;
+    }
+};
+
+pub const Presentation = union(enum) {
+    normal: NormalPresentation,
+    pinned_ai: PinnedAiPresentation,
+
+    pub fn deinit(self: *Presentation, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*value| value.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+
+    pub fn target(self: *const Presentation) committed_review.CommittedReviewTarget {
+        return switch (self.*) {
+            .normal => |*normal| normal.basis.target,
+            .pinned_ai => |*pinned| pinned.target(),
+        };
+    }
+};
+
 pub const ReviewPageState = struct {
     // Independently owned fields exposed through DiffSurface.
     activation: diff_surface.authority.Lifecycle = .init(.review),
@@ -369,12 +992,13 @@ pub const ReviewPageState = struct {
     pinned_selection_basis: ?PinnedSelectionBasis = null,
 
     // Review-owned basis and refresh state.
-    basis: ?diff_basis.BranchDiffBasis = null,
+    presentation: ?Presentation = null,
     accepted_repository_identity: ?AcceptedRepositoryIdentity = null,
     base_target: ?diff_basis.BaseTarget = null,
     basis_failure: ?BasisFailureState = null,
     load_failure: ?[]u8 = null,
     base_picker: BasePickerState = .{},
+    ai_reviews: AiReviewsPickerState = .{},
     refresh_generation: u64 = 0,
     deferred_load_apply: ?DeferredLoadApply = null,
     refresh_anchor: ?diff_surface.ReloadAnchor = null,
@@ -389,6 +1013,57 @@ pub const ReviewPageState = struct {
     pub fn deactivate(self: *ReviewPageState) void {
         self.selection_owner = .none;
         self.activation.deactivate();
+    }
+
+    pub fn isPinnedAi(self: *const ReviewPageState) bool {
+        const presentation = self.presentation orelse return false;
+        return presentation == .pinned_ai;
+    }
+
+    pub fn activeAiReviewId(self: *const ReviewPageState) ?committed_review.ReviewId {
+        const presentation = if (self.presentation) |*value| value else return null;
+        return switch (presentation.*) {
+            .pinned_ai => |*pinned| pinned.reviewId(),
+            .normal => null,
+        };
+    }
+
+    pub fn isCurrentReviewTarget(self: *const ReviewPageState, target: *const committed_review.CommittedReviewTarget) bool {
+        const presentation = if (self.presentation) |*value| value else return false;
+        const active_target = presentation.target();
+        return active_target.eql(target);
+    }
+
+    pub fn normalBasis(self: *ReviewPageState) ?*diff_basis.BranchDiffBasis {
+        const presentation = if (self.presentation) |*value| value else return null;
+        return switch (presentation.*) {
+            .normal => |*normal| &normal.basis,
+            .pinned_ai => null,
+        };
+    }
+
+    pub fn normalBasisConst(self: *const ReviewPageState) ?*const diff_basis.BranchDiffBasis {
+        const presentation = if (self.presentation) |*value| value else return null;
+        return switch (presentation.*) {
+            .normal => |*normal| &normal.basis,
+            .pinned_ai => null,
+        };
+    }
+
+    pub fn pinnedAi(self: *ReviewPageState) ?*PinnedAiPresentation {
+        const presentation = if (self.presentation) |*value| value else return null;
+        return switch (presentation.*) {
+            .pinned_ai => |*pinned| pinned,
+            .normal => null,
+        };
+    }
+
+    pub fn pinnedAiConst(self: *const ReviewPageState) ?*const PinnedAiPresentation {
+        const presentation = if (self.presentation) |*value| value else return null;
+        return switch (presentation.*) {
+            .pinned_ai => |*pinned| pinned,
+            .normal => null,
+        };
     }
 
     pub fn advanceSelectionLayoutRevision(self: *ReviewPageState) void {
@@ -420,7 +1095,8 @@ pub const ReviewPageState = struct {
     }
 
     fn currentPinnedBasis(self: *const ReviewPageState) ?PinnedSelectionBasis {
-        return .init(self.basis orelse return null);
+        const presentation = if (self.presentation) |*value| value else return null;
+        return .{ .target = presentation.target() };
     }
 
     pub fn beginRefresh(self: *ReviewPageState) ?RefreshRequest {
@@ -433,6 +1109,24 @@ pub const ReviewPageState = struct {
             self.load.state = .loading;
         }
         return .{ .identity = identity, .generation = self.refresh_generation };
+    }
+
+    /// A fully prepared pinned presentation supersedes every older ordinary
+    /// source refresh. Retire both in-flight authority and any completion
+    /// deferred behind a live selection before installing the pinned bundle.
+    pub fn retireOrdinaryRefreshForPinnedAcceptance(
+        self: *ReviewPageState,
+        allocator: std.mem.Allocator,
+    ) void {
+        self.refresh_generation +%= 1;
+        if (self.refresh_generation == 0) self.refresh_generation = 1;
+        if (self.activation.currentIdentity()) |identity| {
+            _ = self.activation.finishMember(identity, .source, .fresh);
+        }
+        if (self.deferred_load_apply) |*deferred| deferred.deinit(allocator);
+        self.deferred_load_apply = null;
+        if (self.refresh_anchor) |*anchor| anchor.deinit(allocator);
+        self.refresh_anchor = null;
     }
 
     /// A new request supersedes the previous terminal diagnostic while the
@@ -527,7 +1221,7 @@ pub const ReviewPageState = struct {
     }
 
     pub fn hasAcceptedDisplay(self: *const ReviewPageState) bool {
-        if (self.basis == null) return false;
+        if (self.presentation == null) return false;
         return switch (self.load.state) {
             .loaded, .empty => true,
             .idle, .loading, .failed => false,
@@ -604,8 +1298,8 @@ pub const ReviewPageState = struct {
             &bundle.basis,
             &bundle.diff,
         );
-        const pair_changed = if (self.basis) |current|
-            !current.target.eql(&bundle.basis.target)
+        const pair_changed = if (self.presentation) |*current|
+            !current.target().eql(&bundle.basis.target)
         else
             true;
 
@@ -665,8 +1359,8 @@ pub const ReviewPageState = struct {
             self.reviewed_store.deinit(allocator);
             self.tree_order.reset(allocator);
         }
-        if (self.basis) |*basis| basis.deinit(allocator);
-        self.basis = bundle.basis;
+        if (self.presentation) |*presentation| presentation.deinit(allocator);
+        self.presentation = .{ .normal = .{ .basis = bundle.basis } };
         bundle.basis = undefined;
 
         self.load.clearCurrent(allocator);
@@ -694,8 +1388,110 @@ pub const ReviewPageState = struct {
                 .source_session_revision = self.source_session_revision,
                 .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
             };
-            self.pinned_selection_basis = PinnedSelectionBasis.init(self.basis.?);
+            self.pinned_selection_basis = self.currentPinnedBasis();
         }
+        self.accepted_repository_identity = .{
+            .repo_epoch = repo_epoch,
+            .root_identity = root_identity,
+        };
+        self.clearBasisFailure(allocator);
+        self.clearLoadFailure(allocator);
+    }
+
+    pub fn commitNormalReturn(
+        self: *ReviewPageState,
+        allocator: std.mem.Allocator,
+        repo_epoch: u64,
+        repo_root: ?[]const u8,
+        root_identity: ?root_capability.Identity,
+        bundle: *app_load.ReviewLoadedBundle,
+    ) !void {
+        try self.commitLoaded(allocator, repo_epoch, repo_root, root_identity, bundle);
+    }
+
+    pub fn commitPinnedAi(
+        self: *ReviewPageState,
+        allocator: std.mem.Allocator,
+        repo_epoch: u64,
+        repo_root: ?[]const u8,
+        root_identity: ?root_capability.Identity,
+        bundle: *app_load.PinnedReviewLoadedBundle,
+    ) !void {
+        const manifest = &bundle.selection.artifacts.manifest.value;
+        const target = manifest.target;
+        const pair_changed = if (self.presentation) |*current| !current.target().eql(&target) else true;
+
+        const base_label = if (manifest.display) |display| display.base_label else null;
+        const head_label = if (manifest.display) |display| display.head_label else null;
+        const base_display = if (base_label) |label|
+            try std.fmt.allocPrint(allocator, "AI {s}@{s}", .{ label, target.base_oid.short() })
+        else
+            try std.fmt.allocPrint(allocator, "AI {s}", .{target.base_oid.short()});
+        errdefer allocator.free(base_display);
+        const head_display = if (head_label) |label|
+            try std.fmt.allocPrint(allocator, "{s}@{s}", .{ label, target.head_oid.short() })
+        else
+            try allocator.dupe(u8, target.head_oid.short());
+        errdefer allocator.free(head_display);
+
+        var prepared_session: ?load_state.LoadedSession = null;
+        switch (bundle.diff) {
+            .empty => {},
+            .loaded => |*diff_bundle| {
+                const arena_allocator = diff_bundle.arena.?.allocator();
+                if (repo_root) |root| {
+                    diff_bundle.loaded.tree = try file_tree.buildWithOptions(
+                        arena_allocator,
+                        diff_bundle.loaded.document,
+                        null,
+                        .{ .root = .{ .name = std.fs.path.basename(root) } },
+                    );
+                }
+                const reviewed = try arena_allocator.alloc(bool, diff_bundle.loaded.document.files.len);
+                for (diff_bundle.loaded.document.files, 0..) |file, index| {
+                    reviewed[index] = if (pair_changed)
+                        false
+                    else
+                        try self.reviewed_store.containsFile(allocator, repo_root, file);
+                }
+                diff_bundle.loaded.reviewed_files = reviewed;
+                try diff_bundle.loaded.rebuildVisibleNodes(
+                    arena_allocator,
+                    self.review_display.hide_reviewed_files,
+                    self.review_display.changed_file_filter,
+                );
+                prepared_session = .{
+                    .arena = diff_bundle.takeArena(),
+                    .loaded = diff_bundle.loaded,
+                };
+            },
+        }
+        errdefer if (prepared_session) |*session| session.deinit(null);
+
+        self.retireOrdinaryRefreshForPinnedAcceptance(allocator);
+        self.file_search.deinit(allocator);
+        self.clearRetainedSelection(allocator);
+        if (pair_changed) {
+            self.reviewed_store.deinit(allocator);
+            self.tree_order.reset(allocator);
+        }
+        if (self.presentation) |*presentation| presentation.deinit(allocator);
+        self.presentation = .{ .pinned_ai = .{
+            .selection = bundle.selection,
+            .base_display = base_display,
+            .head_display = head_display,
+        } };
+        bundle.selection = undefined;
+
+        self.load.clearCurrent(allocator);
+        if (prepared_session) |session| {
+            self.load.state = .{ .loaded = session };
+            prepared_session = null;
+        } else {
+            self.load.state = .{ .empty = .no_changes };
+            self.resetAcceptedDisplayNavigation();
+        }
+        self.source_session_revision +%= 1;
         self.accepted_repository_identity = .{
             .repo_epoch = repo_epoch,
             .root_identity = root_identity,
@@ -725,8 +1521,8 @@ pub const ReviewPageState = struct {
     ) bool {
         const completed = self.completed_selection orelse return false;
         const pinned = self.pinned_selection_basis orelse return false;
-        const current_basis = self.basis orelse return false;
-        if (!pinned.eql(PinnedSelectionBasis.init(current_basis)) or
+        const current_basis = self.normalBasisConst() orelse return false;
+        if (!pinned.eql(PinnedSelectionBasis.init(current_basis.*)) or
             !pinned.eql(PinnedSelectionBasis.init(incoming_basis.*))) return false;
         if (completed.token.repo_epoch != repo_epoch or
             !optionalRootIdentityEql(completed.token.root_identity, root_identity) or
@@ -769,11 +1565,12 @@ pub const ReviewPageState = struct {
         self.tree_order.deinit(allocator);
         if (self.tree_order_scope) |scope| allocator.free(scope);
         if (self.refresh_anchor) |*anchor| anchor.deinit(allocator);
-        if (self.basis) |*basis| basis.deinit(allocator);
+        if (self.presentation) |*presentation| presentation.deinit(allocator);
         if (self.base_target) |*target| target.deinit(allocator);
         if (self.basis_failure) |*failure| failure.deinit(allocator);
         if (self.load_failure) |message| allocator.free(message);
         self.base_picker.deinit(allocator);
+        self.ai_reviews.deinit(allocator);
         if (self.deferred_load_apply) |*deferred| deferred.deinit(allocator);
         self.* = .{};
     }
@@ -1022,7 +1819,7 @@ test "Review moves attempted failure, replaces it, and clears it on success" {
     try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 6, null, null, &success));
     try std.testing.expect(state.basis_failure == null);
     try std.testing.expect(success.result == .empty);
-    try std.testing.expect(state.basis != null);
+    try std.testing.expect(state.normalBasisConst() != null);
 }
 
 test "Review deferred completion replacement and page deinit release exactly once" {
@@ -1121,7 +1918,7 @@ fn installTestRetainedSelection(
         .source_session_revision = state.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
     }, loaded.document.files[0], drag);
-    state.pinned_selection_basis = PinnedSelectionBasis.init(state.basis.?);
+    state.pinned_selection_basis = PinnedSelectionBasis.init(state.normalBasisConst().?.*);
 }
 
 test "Review loaded acceptance atomically installs matching basis and diff" {
@@ -1134,7 +1931,7 @@ test "Review loaded acceptance atomically installs matching basis and diff" {
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(LoadAcceptance.loaded, try state.applyLoadFinished(allocator, 5, "/work/gitframe", null, &finished));
-    try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
+    try std.testing.expectEqualStrings("main", state.normalBasisConst().?.base.display_name);
     try std.testing.expectEqualStrings("refs/heads/main", state.base_target.?.full_ref);
     try std.testing.expect(state.accepted_repository_identity.?.matches(5, null));
     const loaded = switch (state.load.state) {
@@ -1334,7 +2131,7 @@ test "Review failed replacement preserves accepted display and attempted intent"
     defer failure.deinit(allocator);
     try std.testing.expectEqual(LoadAcceptance.basis_failed, try state.applyLoadFinished(allocator, 9, "/repo", null, &failure));
 
-    try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
+    try std.testing.expectEqualStrings("main", state.normalBasisConst().?.base.display_name);
     try std.testing.expect(state.load.state == .loaded);
     try std.testing.expectEqualStrings("topic", state.basis_failure.?.attempted.display_name);
     try std.testing.expectEqualStrings("topic", state.base_target.?.display_name);
@@ -1536,7 +2333,7 @@ test "Review picker and failed chosen-basis refresh retain the accepted selectio
     try std.testing.expect(state.pinned_selection_basis.?.eql(retained_pin));
     try std.testing.expect(state.retainedSelectionAdmitted());
     try std.testing.expectEqual(retained_revision, state.source_session_revision);
-    try std.testing.expectEqualStrings("main", state.basis.?.base.display_name);
+    try std.testing.expectEqualStrings("main", state.normalBasisConst().?.base.display_name);
 }
 
 test "Review base picker owns recency order filter projection and full-ref activation" {
@@ -1593,6 +2390,205 @@ test "Review base picker owns recency order filter projection and full-ref activ
     for ("no-such-branch") |byte| try state.base_picker.insertQuery(allocator, byte);
     try std.testing.expectEqual(@as(usize, 0), state.base_picker.visibleCount());
     try std.testing.expect((try state.base_picker.selectedTarget(allocator)) == null);
+}
+
+test "AI Reviews picker rejects stale scan completion and admits exact generation root and store" {
+    const allocator = std.testing.allocator;
+    var state: ReviewPageState = .{};
+    defer state.deinit(allocator);
+    _ = state.activate(7);
+    const identity = state.activation.currentIdentity().?;
+    const root_identity: root_capability.Identity = .{ .device = 11, .inode = 13 };
+    const request = state.ai_reviews.beginScan(allocator, identity, root_identity, null, false);
+
+    var stale: app_load.ReviewHistoryScanFinished = .{
+        .identity = request.identity,
+        .generation = request.generation + 1,
+        .store_root = try allocator.dupe(u8, "/store"),
+        .result = .{ .failed_static = "stale" },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expect(!state.ai_reviews.acceptScan(
+        allocator,
+        7,
+        root_identity,
+        "/store",
+        &state.activation,
+        &stale,
+    ));
+    try std.testing.expect(state.ai_reviews.phase == .scan_loading);
+
+    var exact: app_load.ReviewHistoryScanFinished = .{
+        .identity = request.identity,
+        .generation = request.generation,
+        .store_root = try allocator.dupe(u8, "/store"),
+        .result = .{ .failed_static = "Could not load AI reviews: test" },
+    };
+    defer exact.deinit(allocator);
+    try std.testing.expect(state.ai_reviews.acceptScan(
+        allocator,
+        7,
+        root_identity,
+        "/store",
+        &state.activation,
+        &exact,
+    ));
+    try std.testing.expect(state.ai_reviews.phase == .scan_failed);
+    try std.testing.expect(!state.ai_reviews.interactionCapabilities().list);
+    state.ai_reviews.moveSelection(1);
+    state.ai_reviews.enterQuery();
+    try std.testing.expect(!state.ai_reviews.queryMode());
+    try std.testing.expect(state.ai_reviews.beginSelectedRun() == .none);
+}
+
+test "AI Reviews picker direct normal return cancellation closes without leaving retained state" {
+    const allocator = std.testing.allocator;
+    var picker: AiReviewsPickerState = .{};
+    defer picker.deinit(allocator);
+    _ = picker.beginDirectNormalReturn(
+        allocator,
+        page.RequestIdentity.review(5, 9),
+        .{ .device = 2, .inode = 3 },
+    );
+    try std.testing.expect(picker.phase == .return_loading);
+    picker.cancelLoading(allocator);
+    try std.testing.expect(!picker.isOpen());
+    try std.testing.expect(picker.scan_result == null);
+
+    _ = picker.beginDirectNormalReturn(
+        allocator,
+        page.RequestIdentity.review(5, 10),
+        .{ .device = 2, .inode = 3 },
+    );
+    picker.failNormalReturn("direct return failed");
+    try std.testing.expect(!picker.interactionCapabilities().list);
+    try std.testing.expect(picker.beginSelectedRun() == .none);
+
+    _ = picker.beginDirectSelection(
+        allocator,
+        page.RequestIdentity.review(5, 11),
+        .{ .device = 2, .inode = 3 },
+        undefined,
+        try committed_review.ReviewId.parse("823e4567-e89b-42d3-a456-426614174000"),
+        undefined,
+    );
+    picker.failSelectionStatic(
+        try committed_review.ReviewId.parse("823e4567-e89b-42d3-a456-426614174000"),
+        "direct selection failed",
+    );
+    try std.testing.expect(!picker.interactionCapabilities().list);
+    picker.moveSelection(1);
+    picker.enterQuery();
+    try std.testing.expect(!picker.queryMode());
+}
+
+test "AI Reviews picker failed Run B and normal return preserve accepted presentation A" {
+    const allocator = std.testing.allocator;
+    var state: ReviewPageState = .{};
+    defer state.deinit(allocator);
+    state.presentation = .{ .normal = .{ .basis = .{
+        .base = .{
+            .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+            .display_name = try allocator.dupe(u8, "main"),
+            .kind = .local,
+        },
+        .head_display = try allocator.dupe(u8, "topic"),
+        .target = .{ .object_format = .sha1, .source_kind = .branch_range, .base_oid = testOid('a'), .head_oid = testOid('b'), .diff_base_oid = testOid('a') },
+        .ahead_count = 1,
+    } } };
+    _ = state.activate(9);
+    const identity = state.activation.currentIdentity().?;
+    const root_identity: root_capability.Identity = .{ .device = 4, .inode = 8 };
+    const review_id = try committed_review.ReviewId.parse("923e4567-e89b-42d3-a456-426614174000");
+    const rows = try allocator.alloc(review_store.history.RunSummary, 1);
+    rows[0] = .{
+        .review_id = review_id,
+        .target = .{ .object_format = .sha1, .source_kind = .branch_range, .base_oid = testOid('c'), .head_oid = testOid('d'), .diff_base_oid = testOid('c') },
+        .status = .approved,
+        .created_at = "2026-08-20T00:00:00Z".*,
+        .created_at_unix = 1,
+        .producer_name = try allocator.dupe(u8, "reviewer"),
+        .producer_model = null,
+        .base_label = null,
+        .head_label = null,
+        .finding_count = 0,
+        .availability = .available,
+        .artifact_snapshot = .{
+            .manifest_digest = committed_review.Sha256Digest.hash("manifest"),
+            .findings_digest = committed_review.Sha256Digest.hash("findings"),
+            .draft_state = .absent,
+            .draft_digest = null,
+            .result_digest = null,
+        },
+    };
+    state.ai_reviews.identity = identity;
+    state.ai_reviews.root_identity = root_identity;
+    state.ai_reviews.phase = .ready;
+    state.ai_reviews.scan_result = .{ .history = .{
+        .snapshot = undefined,
+        .rows = rows,
+        .diagnostics = try allocator.alloc(review_store.history.Diagnostic, 0),
+        .skipped_count = 0,
+        .orphan_count = 0,
+    } };
+    try state.ai_reviews.rebuildSearch(allocator);
+    state.ai_reviews.focus = 1;
+    try std.testing.expect(std.mem.indexOf(u8, state.ai_reviews.search_labels[0], "ccccccc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.ai_reviews.search_labels[0], "ddddddd") != null);
+    try std.testing.expect(!state.isCurrentReviewTarget(&rows[0].target));
+    const normal_target = state.normalBasisConst().?.target;
+    try std.testing.expect(state.isCurrentReviewTarget(&normal_target));
+
+    const status_cases = [_]struct { status: review_store.history.RunSummaryStatus, query: []const u8 }{
+        .{ .status = .new, .query = "new" },
+        .{ .status = .draft, .query = "draft" },
+        .{ .status = .approved, .query = "approved" },
+        .{ .status = .needs_changes, .query = "needs changes" },
+        .{ .status = .canceled, .query = "canceled" },
+    };
+    for (status_cases) |case| {
+        rows[0].status = case.status;
+        rows[0].availability = if (case.status == .needs_changes) .missing else .available;
+        try state.ai_reviews.publishQuery(allocator, .{});
+        try state.ai_reviews.rebuildSearch(allocator);
+        state.ai_reviews.enterQuery();
+        for (case.query) |byte| try state.ai_reviews.insertQuery(allocator, byte);
+        try std.testing.expectEqual(@as(usize, 1), state.ai_reviews.filter.source_indexes.len);
+        try state.ai_reviews.clearQueryOrLeave(allocator);
+        state.ai_reviews.leaveQuery();
+    }
+    rows[0].status = .approved;
+    rows[0].availability = .available;
+    try state.ai_reviews.rebuildSearch(allocator);
+    state.ai_reviews.focus = 1;
+
+    const request = switch (state.ai_reviews.beginSelectedRun()) {
+        .request => |value| value,
+        else => return error.ExpectedAiReviewSelection,
+    };
+    try std.testing.expect(request.review_id.eql(review_id));
+    const retried = switch (state.ai_reviews.retrySelectedRun()) {
+        .request => |value| value,
+        else => return error.ExpectedAiReviewSelectionRetry,
+    };
+    try std.testing.expect(retried.review_id.eql(review_id));
+    try std.testing.expect(retried.request.generation != request.request.generation);
+    state.ai_reviews.failSelectionStatic(review_id, "Run B failed");
+    try std.testing.expect(state.ai_reviews.interactionCapabilities().list);
+    try std.testing.expectEqualStrings("main", state.normalBasisConst().?.base.display_name);
+    const accepted_head = testOid('b');
+    try std.testing.expectEqualStrings(accepted_head.slice(), state.normalBasisConst().?.target.head_oid.slice());
+
+    _ = state.ai_reviews.beginNormalReturn(false).?;
+    state.ai_reviews.failNormalReturn("normal return failed");
+    try std.testing.expectEqualStrings("main", state.normalBasisConst().?.base.display_name);
+    try std.testing.expect(state.ai_reviews.phase == .return_failed);
+    try std.testing.expect(state.ai_reviews.interactionCapabilities().list);
+    const retained_retry = switch (state.ai_reviews.beginSelectedRun()) {
+        .request => |value| value,
+        else => return error.ExpectedRetainedSelectionAfterReturnFailure,
+    };
+    try std.testing.expect(retained_retry.review_id.eql(review_id));
 }
 
 test "Review base picker publication allocation failure is terminal without partial ownership" {

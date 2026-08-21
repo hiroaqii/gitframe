@@ -321,7 +321,7 @@ test "Review selection release installs pinned retained actions" {
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
-        .basis = .{
+        .presentation = .{ .normal = .{ .basis = .{
             .base = .{
                 .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                 .display_name = try allocator.dupe(u8, "main"),
@@ -336,7 +336,7 @@ test "Review selection release installs pinned retained actions" {
                 .diff_base_oid = .{},
             },
             .ahead_count = 1,
-        },
+        } } },
     };
     defer page.deinit(allocator);
     page.selection_owner = .{ .diff = .{
@@ -434,7 +434,7 @@ test "Review keyboard line selection completes with exact pin and retries alloca
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
-        .basis = .{
+        .presentation = .{ .normal = .{ .basis = .{
             .base = .{
                 .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                 .display_name = try allocator.dupe(u8, "main"),
@@ -449,7 +449,7 @@ test "Review keyboard line selection completes with exact pin and retries alloca
                 .diff_base_oid = .{},
             },
             .ahead_count = 1,
-        },
+        } } },
         .viewer = .{
             .focus = .diff,
             .sidebar_hidden = true,
@@ -479,7 +479,7 @@ test "Review keyboard line selection completes with exact pin and retries alloca
     var copied = try adapter.shared().apply(allocator, .{ .selection_action = .copy });
     defer copied.deinit(allocator);
     try std.testing.expectEqual(diff_surface.update.RetentionTransition.installed, copied.retention_transition);
-    try std.testing.expect(page.pinned_selection_basis.?.eql(review_page.PinnedSelectionBasis.init(page.basis.?)));
+    try std.testing.expect(page.pinned_selection_basis.?.eql(review_page.PinnedSelectionBasis.init(page.normalBasisConst().?.*)));
     var effect = copied.takeEffect() orelse return error.ExpectedSelectionEffect;
     defer effect.deinit(allocator);
     switch (effect) {
@@ -531,7 +531,7 @@ test "Review retained candidate and pin replace transactionally and survive reje
     const allocator = std.testing.allocator;
     var page: review_page.ReviewPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
-        .basis = .{
+        .presentation = .{ .normal = .{ .basis = .{
             .base = .{
                 .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                 .display_name = try allocator.dupe(u8, "main"),
@@ -546,7 +546,7 @@ test "Review retained candidate and pin replace transactionally and survive reje
                 .diff_base_oid = .{},
             },
             .ahead_count = 1,
-        },
+        } } },
     };
     defer page.deinit(allocator);
     const controller: Controller = .{
@@ -579,8 +579,8 @@ test "Review retained candidate and pin replace transactionally and survive reje
     // A newly accepted basis must replace both halves of the retained owner.
     // The candidate is built before the prior allocation is retired, so the
     // new fragment cannot alias the old allocation.
-    page.basis.?.target.head_oid.len = 1;
-    page.basis.?.target.head_oid.bytes[0] = 'c';
+    page.normalBasis().?.target.head_oid.len = 1;
+    page.normalBasis().?.target.head_oid.bytes[0] = 'c';
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .side = .new,
@@ -602,7 +602,7 @@ test "Review retained candidate and pin replace transactionally and survive reje
     try std.testing.expect(replacement_fragment_ptr != initial_fragment_ptr);
     try std.testing.expect(replacement_token.eql(initial_token));
     try std.testing.expect(!replacement_pin.eql(initial_pin));
-    try std.testing.expect(replacement_pin.eql(review_page.PinnedSelectionBasis.init(page.basis.?)));
+    try std.testing.expect(replacement_pin.eql(review_page.PinnedSelectionBasis.init(page.normalBasisConst().?.*)));
 
     // Candidate construction failure must leave the prior candidate and pin
     // byte-for-byte authoritative while ending only the live drag.
@@ -629,10 +629,10 @@ test "Review retained candidate and pin replace transactionally and survive reje
 
     // The shared pre-admission gate also rejects an impossible selectable
     // state without publishing a candidate ahead of its missing basis pin.
-    const detached_basis = page.basis.?;
-    page.basis = null;
-    defer if (page.basis == null) {
-        page.basis = detached_basis;
+    const detached_presentation = page.presentation.?;
+    page.presentation = null;
+    defer if (page.presentation == null) {
+        page.presentation = detached_presentation;
     };
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
@@ -653,5 +653,5 @@ test "Review retained candidate and pin replace transactionally and survive reje
     defer allocator.free(after_pin_rejection);
     try std.testing.expectEqualStrings(replacement_text, after_pin_rejection);
     try std.testing.expectEqualStrings("Could not retain selected text", page.status.text());
-    page.basis = detached_basis;
+    page.presentation = detached_presentation;
 }

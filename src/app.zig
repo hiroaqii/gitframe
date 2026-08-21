@@ -48,6 +48,7 @@ const diff_selection = @import("diff/selection.zig");
 const diff_source = @import("diff/source.zig");
 const keymap = @import("keymap");
 const theme = @import("theme");
+const review_store = @import("review_store.zig");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
 const CliConfig = diff_source.CliConfig;
@@ -107,6 +108,7 @@ pub const App = struct {
     pages: PageStates = .{},
     config: CliConfig = .{},
     user_config: config_mod.Config = .{},
+    review_store_path: review_store.ResolvedPath = .{ .unavailable = .no_state_home },
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     env_map: ?*std.process.Environ.Map = null,
@@ -138,6 +140,11 @@ pub const App = struct {
 
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
+        self.review_store_path = try review_store.path.resolveFromEnvironment(
+            ctx.allocator(),
+            self.user_config.ai_review.store_root,
+            self.env_map,
+        );
         self.local_workflow = workflow_local.LocalState.init(ctx.allocator());
         self.pages.changes.init(self.config.auto_reload, self.user_config.reload, self.config.source);
         _ = self.pageCoordinator().activateChanges();
@@ -156,6 +163,7 @@ pub const App = struct {
         self.pages.changes.deinit(deinit_ctx.allocator);
         self.pages.repository.deinit(deinit_ctx.allocator);
         self.pages.review.deinit(deinit_ctx.allocator);
+        self.review_store_path.deinit(deinit_ctx.allocator);
         self.repo_session.deinit(deinit_ctx.allocator);
         self.local_workflow.deinit(deinit_ctx.allocator);
         self.remote_workflow.deinit(deinit_ctx.allocator);
@@ -204,6 +212,7 @@ pub const App = struct {
             .layout = .{ .width = body_size.width, .height = body_size.height },
             .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
             .env_map = self.env_map,
+            .store_path = &self.review_store_path,
         };
     }
 
@@ -280,7 +289,8 @@ pub const App = struct {
             .changes => !self.pages.changes.search.mode and !self.pages.changes.file_search.mode,
             .review => !self.pages.review.search.mode and
                 !self.pages.review.file_search.mode and
-                !self.pages.review.base_picker.open,
+                !self.pages.review.base_picker.open and
+                !self.pages.review.ai_reviews.isOpen(),
             .repository, .config => false,
         };
         if (!reachable) return 0;
@@ -675,7 +685,7 @@ pub const App = struct {
         self.actionLifecycle().reconcileSpinner(ctx);
         if (!self.redraw_plan.resolvesToSkip() and
             self.active_page == .review and
-            self.pages.review.base_picker.open)
+            (self.pages.review.base_picker.open or self.pages.review.ai_reviews.isOpen()))
         {
             self.reviewCoordinator().prepareModalRedraw(ctx.io());
         }
@@ -942,6 +952,21 @@ pub const App = struct {
                 },
                 .branch_list => |result| {
                     if (self.reviewCoordinator().finishBranchList(ctx.allocator(), result) == .skip) {
+                        self.redraw_plan.requestSkip();
+                    }
+                },
+                .history_scan => |result| {
+                    if (self.reviewCoordinator().finishHistoryScan(ctx.allocator(), result) == .skip) {
+                        self.redraw_plan.requestSkip();
+                    }
+                },
+                .history_selection => |result| {
+                    if (try self.reviewCoordinator().finishHistorySelection(ctx, result) == .skip) {
+                        self.redraw_plan.requestSkip();
+                    }
+                },
+                .history_normal_return => |result| {
+                    if (try self.reviewCoordinator().finishHistoryNormalReturn(ctx, result) == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
@@ -1329,6 +1354,11 @@ pub const App = struct {
                     .base_picker_open = self.pages.review.base_picker.open,
                     .base_picker_query_mode = self.pages.review.base_picker.input_mode == .query,
                     .base_picker_query_len = self.pages.review.base_picker.query.len,
+                    .ai_reviews_open = self.pages.review.ai_reviews.isOpen(),
+                    .ai_reviews_query_mode = self.pages.review.ai_reviews.queryMode(),
+                    .ai_reviews_query_len = self.pages.review.ai_reviews.query.len,
+                    .ai_reviews_loading = self.pages.review.ai_reviews.loading(),
+                    .pinned_ai = self.pages.review.isPinnedAi(),
                     .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.review.selection_owner),
                     .retained_selection_action_available = review_body_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,

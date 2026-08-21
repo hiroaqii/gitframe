@@ -18,6 +18,19 @@ pub const Msg = union(enum) {
     base_picker_previous,
     base_picker_next,
     choose_base,
+    open_ai_reviews,
+    close_ai_reviews,
+    ai_reviews_cancel_loading,
+    ai_reviews_enter_query,
+    ai_reviews_leave_query,
+    ai_reviews_clear_query_or_leave,
+    ai_reviews_insert: u21,
+    ai_reviews_backspace,
+    ai_reviews_previous,
+    ai_reviews_next,
+    ai_reviews_activate,
+    ai_reviews_refresh_or_retry,
+    return_to_normal_review,
     copy_current_line,
     copy_current_hunk,
     branch_switch_unavailable,
@@ -33,6 +46,11 @@ pub const Context = struct {
     base_picker_open: bool = false,
     base_picker_query_mode: bool = false,
     base_picker_query_len: usize = 0,
+    ai_reviews_open: bool = false,
+    ai_reviews_query_mode: bool = false,
+    ai_reviews_query_len: usize = 0,
+    ai_reviews_loading: bool = false,
+    pinned_ai: bool = false,
     selection_owner: diff_surface.input.SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
     keymap: keymap.Effective = .{},
@@ -54,6 +72,28 @@ pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
 }
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
+    if (context.ai_reviews_open) {
+        if (key.matches(chasen.Key.escape, .{})) {
+            if (context.ai_reviews_query_mode or context.ai_reviews_query_len > 0)
+                return .ai_reviews_clear_query_or_leave;
+            return if (context.ai_reviews_loading) .ai_reviews_cancel_loading else .close_ai_reviews;
+        }
+        if (key.matches(chasen.Key.enter, .{})) return .ai_reviews_activate;
+        if (key.matches(chasen.Key.up, .{})) return .ai_reviews_previous;
+        if (key.matches(chasen.Key.down, .{})) return .ai_reviews_next;
+        if (context.ai_reviews_query_mode) {
+            if (key.matches(chasen.Key.tab, .{})) return .ai_reviews_leave_query;
+            if (key.matches(chasen.Key.backspace, .{})) return .ai_reviews_backspace;
+            if (key_input.textInputCodepoint(key)) |codepoint| return .{ .ai_reviews_insert = codepoint };
+            return null;
+        }
+        if (key.codepoint == '/') return .ai_reviews_enter_query;
+        if (key.codepoint == 'q') return .close_ai_reviews;
+        if (key.codepoint == 'r') return .ai_reviews_refresh_or_retry;
+        if (key.codepoint == 'k') return .ai_reviews_previous;
+        if (key.codepoint == 'j') return .ai_reviews_next;
+        return null;
+    }
     if (context.base_picker_open) {
         if (key.matches(chasen.Key.escape, .{})) {
             return if (context.base_picker_query_mode or context.base_picker_query_len > 0)
@@ -82,6 +122,7 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
 }
 
 pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?Msg {
+    if (!key_input.hasCommandModifier(key) and key.codepoint == 'a') return .open_ai_reviews;
     return .{ .shared = diff_surface.input.selectionKeyToMsg(context.shared(), key) orelse return null };
 }
 
@@ -99,6 +140,8 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.home, .{})) return shared(.select_first_file);
     if (key.matches(chasen.Key.end, .{})) return shared(.select_last_file);
 
+    if (!key_input.hasCommandModifier(key) and key.codepoint == 'a') return .open_ai_reviews;
+
     // A user binding consumes the key even when it names an operation Review
     // intentionally does not expose. This is what lets a user-bound `m` win
     // over the page-local picker mnemonic.
@@ -114,7 +157,7 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key_input.hasCommandModifier(key)) return null;
 
     return switch (key.codepoint) {
-        'm' => .open_base_picker,
+        'm' => if (context.pinned_ai) .return_to_normal_review else .open_base_picker,
         'k', chasen.Key.up => if (context.focus == .diff) shared(.scroll_diff_up) else shared(.select_previous_file),
         'j', chasen.Key.down => if (context.focus == .diff) shared(.scroll_diff_down) else shared(.select_next_file),
         'n' => if (context.search_query_len > 0) shared(.select_next_search_match) else shared(.select_next_hunk),
@@ -263,4 +306,32 @@ test "base picker query accepts printable command letters and uses two-step esca
 
     const retained_query: Context = .{ .base_picker_open = true, .base_picker_query_len = 2 };
     try std.testing.expectEqual(Msg.base_picker_clear_query, keyToMsg(retained_query, .{ .codepoint = chasen.Key.escape }).?);
+}
+
+test "AI Reviews picker fixed a precedence and normal versus pinned m semantics" {
+    const retained: Context = .{ .selection_owner = .keyboard_line, .retained_selection_action_available = true };
+    try std.testing.expectEqual(Msg.open_ai_reviews, selectionKeyToMsg(retained, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(Msg.open_ai_reviews, keyToMsg(.{}, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(Msg.open_base_picker, keyToMsg(.{}, .{ .codepoint = 'm' }).?);
+    try std.testing.expectEqual(Msg.return_to_normal_review, keyToMsg(.{ .pinned_ai = true }, .{ .codepoint = 'm' }).?);
+}
+
+test "AI Reviews picker owns command query loading and two-step escape grammar" {
+    const command: Context = .{ .ai_reviews_open = true };
+    try std.testing.expectEqual(Msg.ai_reviews_next, keyToMsg(command, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(Msg.ai_reviews_previous, keyToMsg(command, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(Msg.ai_reviews_activate, keyToMsg(command, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(Msg.ai_reviews_refresh_or_retry, keyToMsg(command, .{ .codepoint = 'r' }).?);
+    try std.testing.expectEqual(Msg.ai_reviews_enter_query, keyToMsg(command, .{ .codepoint = '/' }).?);
+    try std.testing.expectEqual(Msg.close_ai_reviews, keyToMsg(command, .{ .codepoint = chasen.Key.escape }).?);
+
+    const query: Context = .{ .ai_reviews_open = true, .ai_reviews_query_mode = true, .ai_reviews_query_len = 2 };
+    try std.testing.expectEqual(Msg{ .ai_reviews_insert = 'r' }, keyToMsg(query, .{ .codepoint = 'r' }).?);
+    try std.testing.expectEqual(Msg.ai_reviews_backspace, keyToMsg(query, .{ .codepoint = chasen.Key.backspace }).?);
+    try std.testing.expectEqual(Msg.ai_reviews_leave_query, keyToMsg(query, .{ .codepoint = chasen.Key.tab }).?);
+    try std.testing.expectEqual(Msg.ai_reviews_clear_query_or_leave, keyToMsg(query, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(Msg.ai_reviews_cancel_loading, keyToMsg(.{
+        .ai_reviews_open = true,
+        .ai_reviews_loading = true,
+    }, .{ .codepoint = chasen.Key.escape }).?);
 }
