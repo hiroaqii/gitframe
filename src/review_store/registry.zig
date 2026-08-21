@@ -16,6 +16,16 @@ pub const DiagnosticPath = struct {
     bytes: []const u8,
 };
 
+/// Choose the one canonical lossless registry representation for diagnostic
+/// path bytes. The returned slice continues to borrow `bytes`.
+pub fn diagnosticPath(bytes: []const u8) strict.ParseError!DiagnosticPath {
+    store_path.validateAbsoluteCanonical(bytes) catch return error.InvalidValue;
+    return .{
+        .encoding = if (isPrintableUtf8(bytes)) .utf8 else .base64,
+        .bytes = bytes,
+    };
+}
+
 pub const Binding = struct {
     review_repository_id: committed_review.ReviewRepositoryId,
     locator: committed_review.GitCommonDirectoryLocator,

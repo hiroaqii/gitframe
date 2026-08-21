@@ -123,12 +123,16 @@ pub fn main(init: std.process.Init) !void {
 const HelperCommand = enum {
     review_target,
     review_projection,
+    review_store_prepare,
+    review_store_publish,
 };
 
 fn helperCommand(args: []const []const u8) ?HelperCommand {
     if (args.len < 2) return null;
     if (std.mem.eql(u8, args[1], "review-target")) return .review_target;
     if (std.mem.eql(u8, args[1], "review-projection")) return .review_projection;
+    if (std.mem.eql(u8, args[1], "review-store-prepare")) return .review_store_prepare;
+    if (std.mem.eql(u8, args[1], "review-store-publish")) return .review_store_publish;
     return null;
 }
 
@@ -142,6 +146,22 @@ fn runHelper(command: HelperCommand, init: std.process.Init, arguments: []const 
             .stdout(),
         ),
         .review_projection => gitframe.review_projection_command.run(
+            init.gpa,
+            init.io,
+            init.environ_map,
+            arguments,
+            .stdin(),
+            .stdout(),
+        ),
+        .review_store_prepare => gitframe.review_store_prepare_command.run(
+            init.gpa,
+            init.io,
+            init.environ_map,
+            arguments,
+            .stdin(),
+            .stdout(),
+        ),
+        .review_store_publish => gitframe.review_store_publish_command.run(
             init.gpa,
             init.io,
             init.environ_map,
@@ -374,6 +394,12 @@ test "helper first-token dispatch precedes global help scanning" {
     const projection_args = [_][]const u8{ "gitframe", "review-projection", "--help" };
     try std.testing.expectEqual(HelperCommand.review_projection, helperCommand(&projection_args).?);
     try std.testing.expect(wantsHelp(&projection_args));
+    const prepare_args = [_][]const u8{ "gitframe", "review-store-prepare", "--help" };
+    try std.testing.expectEqual(HelperCommand.review_store_prepare, helperCommand(&prepare_args).?);
+    try std.testing.expect(wantsHelp(&prepare_args));
+    const publish_args = [_][]const u8{ "gitframe", "review-store-publish", "--help" };
+    try std.testing.expectEqual(HelperCommand.review_store_publish, helperCommand(&publish_args).?);
+    try std.testing.expect(wantsHelp(&publish_args));
     const global_args = [_][]const u8{ "gitframe", "--help" };
     try std.testing.expect(helperCommand(&global_args) == null);
 }

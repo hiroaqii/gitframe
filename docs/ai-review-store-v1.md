@@ -1,6 +1,6 @@
-# AI Review Store v1: read contract
+# AI Review Store v1
 
-This document describes the side-effect-free read boundary and its read-only `Review` page consumer. Publication, binding creation, and draft/result mutation remain separate responsibilities.
+This document describes the side-effect-free read boundary, its read-only `Review` page consumer, and the installed binding/publication helpers. Draft/result mutation remains a separate responsibility.
 
 ## Authority
 
@@ -62,6 +62,41 @@ A name becomes inert orphan evidence only after its expected file/directory meta
 
 Bindings are sorted by `(device, inode)`. A duplicate locator, duplicate `ReviewRepositoryId`, unknown/duplicate field, unsupported schema, malformed path, unsorted entry, or noncanonical byte spelling invalidates the complete registry. Read-only lookup never issues an ID and never updates `last_seen_path`.
 
+## Installed prepare helper
+
+`gitframe review-store-prepare` is dispatched by its exact first token before global help, TUI argument parsing, terminal setup, or App startup. It accepts no arguments (`--help` is a structured `invalid_arguments` terminal) and reads at most 8 KiB of strict JSON with one optional final LF:
+
+```json
+{"schema_version":1,"repository":{"path_bytes_b64":"L2Nhbm9uaWNhbC9yZXBvc2l0b3J5"}}
+```
+
+The repository field uses the same canonical unpadded base64url/raw absolute POSIX path decoder as `review-projection`. Empty, relative, NUL-containing, padded, malformed, and over-4096-byte paths fail before Store mutation.
+
+Prepare opens the repository and its physical Git common directory, resolves config and Store root independently of a running TUI, admits a supported local filesystem, and takes the exclusive `.locks/registry.lock`. Under that lock it freshly reads the complete registry. An existing physical locator retains its repository ID and may update only `last_seen_path`; a new locator receives one CSPRNG UUIDv4 binding. Every successful request receives a fresh CSPRNG `ReviewId`:
+
+```json
+{"status":"ok","schema_version":1,"review_repository_id":"<uuid-v4>","review_id":"<uuid-v4>"}
+```
+
+Concurrent first prepare requests converge on the winner's binding. Registry replacement is exact canonical bytes through an exclusive owner-only temporary file, file sync, atomic replacement, and Store-root sync. Existing invalid/unreadable registry authority is never treated as empty. Prepare creates no repository namespace or Run directory; an abandoned producer leaves only its binding and unused Review ID.
+
+## Installed immutable publication helper
+
+`gitframe review-store-publish` has the same first-token/no-argument dispatch. Its stdin is one header of at most 16 KiB, a mandatory LF, exactly the declared raw payloads, and EOF:
+
+```text
+{"schema_version":1,"repository":{"path_bytes_b64":"<base64url>"},"review_repository_id":"<uuid-v4>","review_id":"<uuid-v4>","manifest_size":N,"findings_size":N}\n
+<exact manifest.json bytes><exact findings.json bytes><EOF>
+```
+
+The manifest is capped at 256 KiB and findings at 16 MiB. Truncation, extra bytes, overflow, invalid sizes, and a second document fail before Store mutation. Publication strictly parses both artifacts, checks caller/artifact IDs, validates the manifest against the exact findings-byte digest and decoded FindingSet, and preserves both caller byte sequences without canonical rewriting.
+
+Before taking the per-repository `publish.lock`, the helper freshly opens the repository, resolves the physical locator and active Store root, validates the registry mapping to the expected repository ID, and checks all three exact target OIDs as local commit objects with no fetch, replacement, or ref resolution. Under the lock it revalidates Store identity/binding and rejects any existing final review name without comparing or replacing content.
+
+Publication writes only one `.tmp-publish-<review-id>-<128-bit-lower-hex>` owner-only directory in the bound namespace. It exclusively creates and syncs exact `manifest.json` and `findings.json`, syncs the staging directory and namespace, atomically renames without replacement to `<review-id>`, and syncs the namespace again. Before rename, every failure exposes no canonical Run. Cleanup unlinks only the two expected files and then the exact operation-owned empty staging directory; it never recursively deletes or touches another temporary/final entry. A failure after the no-replace rename may leave the complete byte-valid Run visible and a retry returns `duplicate_review_id`.
+
+Both helpers emit one canonical JSON terminal plus LF/EOF. Exit groups are: `0` success; `64` request/schema/artifact errors; `66` unavailable target objects; `69` unavailable/unsupported Store platform or filesystem; `73` duplicate review ID; `74` invalid Store/repository, Git, or I/O failure; `75` binding/concurrent conflict; and `70` allocation or unclassified internal failure. Stderr text and Store paths are never machine authority.
+
 ## Run admission and result precedence
 
 A canonical Run directory must contain required `manifest.json` and `findings.json`, plus at most optional `review_state.json` and `result.json`. Any other Run-internal entry invalidates that Run.
@@ -113,4 +148,4 @@ Selecting a Run revalidates the exact IDs and artifacts before replacing the vis
 
 Every success/failure/skip terminal frees parsed arenas, raw artifact bytes, diagnostics, projection buffers, environments, and descriptors exactly once. The focused suite covers success and drift/failure union terminals with `std.testing.allocator`.
 
-Config resolution, scan, selection, picker use, pinned refresh, and return-to-normal create no Store content. The App owns only ephemeral task results, picker snapshots, and the currently accepted normal or pinned presentation. No Store writer/helper or mutation UI is exported; those responsibilities belong to later independently reviewed slices.
+Config resolution, scan, selection, picker use, pinned refresh, and return-to-normal create no Store content. The App owns only ephemeral task results, picker snapshots, and the currently accepted normal or pinned presentation. Only the two installed explicit producer helpers create bindings or immutable Run pairs. No draft/result writer, mutation UI, or App-level Store mutation owner is exported; those responsibilities belong to the later `review-state-persistence` slice.

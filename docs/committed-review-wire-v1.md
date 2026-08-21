@@ -2,6 +2,8 @@
 
 This document defines GitFrame's provider-neutral contract for reviewing an exact committed revision pair. It covers portable artifacts, local Git materialization, and the two installed process commands consumed by downstream automation. It does not define durable Store mechanics, provider-specific publication payloads, or AI Review, Stream, or History UI.
 
+Machine-local binding, immutable Run publication, and history admission are defined separately by [`ai-review-store-v1.md`](./ai-review-store-v1.md); they do not add path or repository identity to this portable wire authority.
+
 ## Authority model
 
 The portable authorities are:

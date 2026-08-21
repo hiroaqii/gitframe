@@ -6,6 +6,7 @@ pub const capability = @import("review_store/capability.zig");
 pub const registry = @import("review_store/registry.zig");
 pub const run = @import("review_store/run.zig");
 pub const history = @import("review_store/history.zig");
+pub const publication = @import("review_store/publication.zig");
 
 pub const ResolvedPath = path.Resolved;
 pub const NamespaceTempKind = path.NamespaceTempKind;
@@ -18,6 +19,9 @@ pub const ArtifactSnapshot = run.ArtifactSnapshot;
 pub const History = history.History;
 pub const ScanResult = history.ScanResult;
 pub const SelectedRunRead = history.SelectedRunRead;
+pub const PreparePublicationResult = publication.PrepareResult;
+pub const PublishRequest = publication.PublishRequest;
+pub const PublishResult = publication.PublishResult;
 
 test {
     _ = @import("review_store/path.zig");
@@ -25,4 +29,5 @@ test {
     _ = @import("review_store/registry.zig");
     _ = @import("review_store/run.zig");
     _ = @import("review_store/history.zig");
+    _ = @import("review_store/publication.zig");
 }

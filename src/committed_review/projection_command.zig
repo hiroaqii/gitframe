@@ -307,7 +307,9 @@ fn successFromProjection(
     };
 }
 
-fn parseRepository(parser: *strict.Parser) RequestParseError![]const u8 {
+/// Shared lossless absolute repository-path decoder used by every installed
+/// helper whose request carries `repository.path_bytes_b64`.
+pub fn parseRepository(parser: *strict.Parser) RequestParseError![]const u8 {
     parser.beginObject() catch |err| return mapRequestError(err);
     var seen: u32 = 0;
     var encoded: ?[]const u8 = null;

@@ -7,6 +7,10 @@ pub const review_store = @import("review_store.zig");
 pub const review_projection_command = @import("committed_review/projection_command.zig");
 /// Installed process adapter for target-only committed revision resolution.
 pub const review_target_command = @import("committed_review/target_command.zig");
+/// Installed process adapter for explicit Review Store binding preparation.
+pub const review_store_prepare_command = @import("review_store/prepare_command.zig");
+/// Installed process adapter for exact immutable Review Run publication.
+pub const review_store_publish_command = @import("review_store/publish_command.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
 pub const theme = @import("theme");
@@ -94,6 +98,8 @@ test {
     _ = @import("review_store.zig");
     _ = @import("committed_review/projection_command.zig");
     _ = @import("committed_review/target_command.zig");
+    _ = @import("review_store/prepare_command.zig");
+    _ = @import("review_store/publish_command.zig");
     _ = @import("context.zig");
     _ = @import("context_export.zig");
     _ = @import("draw");

@@ -110,6 +110,64 @@ pub const DirectoryCapability = struct {
         };
     }
 
+    /// Open one private child directory, creating only that exact component
+    /// when absent. A concurrent creator is admitted through the same
+    /// descriptor-relative policy before the capability is returned.
+    pub fn getOrCreateDirectory(
+        self: DirectoryCapability,
+        io: std.Io,
+        name: []const u8,
+    ) !DirectoryCapability {
+        return self.openDirectory(name) catch |err| switch (err) {
+            error.FileNotFound => {
+                self.dir().createDir(io, name, .fromMode(0o700)) catch |create_err| switch (create_err) {
+                    error.PathAlreadyExists => {},
+                    else => return create_err,
+                };
+                try self.sync(io);
+                return self.openDirectory(name);
+            },
+            else => return err,
+        };
+    }
+
+    /// Open or create one owner-only regular file without following a link.
+    /// Existing contents are preserved; callers use this for advisory locks.
+    pub fn openOrCreateRegularFile(
+        self: DirectoryCapability,
+        name: []const u8,
+    ) !std.Io.File {
+        return self.openRegularFile(name, false);
+    }
+
+    /// Exclusively create one owner-only regular file. No existing entry is
+    /// truncated or otherwise modified.
+    pub fn createRegularFileExclusive(
+        self: DirectoryCapability,
+        name: []const u8,
+    ) !std.Io.File {
+        return self.openRegularFile(name, true);
+    }
+
+    fn openRegularFile(
+        self: DirectoryCapability,
+        name: []const u8,
+        exclusive: bool,
+    ) !std.Io.File {
+        try validateChildName(name);
+        const handle = try std.posix.openat(self.handle, name, writableRegularFileFlags(exclusive), 0o600);
+        errdefer closeRaw(handle);
+        const metadata = try metadataForHandle(handle);
+        try admitMetadata(metadata, .regular_file, self.root_device, self.effective_uid);
+        return .{ .handle = handle, .flags = .{ .nonblocking = true } };
+    }
+
+    /// Durably order prior child-directory metadata operations.
+    pub fn sync(self: DirectoryCapability, io: std.Io) !void {
+        const file: std.Io.File = .{ .handle = self.handle, .flags = .{ .nonblocking = true } };
+        try file.sync(io);
+    }
+
     /// Admit an expected child without consuming its contents.
     pub fn admitChild(self: DirectoryCapability, name: []const u8, expected: ExpectedKind) !Metadata {
         try validateChildName(name);
@@ -183,6 +241,49 @@ pub const StoreRootCapability = struct {
         }, .filesystem = filesystem };
     }
 
+    /// Component-wise no-follow create walk used only by explicit prepare.
+    /// Existing ancestors above the final Store root need not be private;
+    /// every component created by this operation is owner-only.
+    pub fn openOrCreateCanonical(io: std.Io, path: []const u8) !StoreRootCapability {
+        try store_path.validateAbsoluteCanonical(path);
+        if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
+
+        var current = try std.posix.openat(std.posix.AT.FDCWD, "/", directoryFlags(), 0);
+        errdefer closeRaw(current);
+        var components = std.mem.splitScalar(u8, path[1..], '/');
+        while (components.next()) |component| {
+            const child = std.posix.openat(current, component, directoryFlags(), 0) catch |err| switch (err) {
+                error.FileNotFound => blk: {
+                    const parent: std.Io.Dir = .{ .handle = current };
+                    parent.createDir(io, component, .fromMode(0o700)) catch |create_err| switch (create_err) {
+                        error.PathAlreadyExists => {},
+                        else => return create_err,
+                    };
+                    const parent_file: std.Io.File = .{
+                        .handle = current,
+                        .flags = .{ .nonblocking = true },
+                    };
+                    try parent_file.sync(io);
+                    break :blk try std.posix.openat(current, component, directoryFlags(), 0);
+                },
+                else => return err,
+            };
+            closeRaw(current);
+            current = child;
+        }
+        const metadata = try metadataForHandle(current);
+        const uid = effectiveUid();
+        try admitMetadata(metadata, .directory, metadata.device, uid);
+        const filesystem = try filesystemForHandle(current);
+        if (filesystem != .local_supported) return error.UnsupportedFilesystem;
+        return .{ .directory = .{
+            .handle = current,
+            .metadata = metadata,
+            .effective_uid = uid,
+            .root_device = metadata.device,
+        }, .filesystem = filesystem };
+    }
+
     pub fn deinit(self: *StoreRootCapability) void {
         self.directory.deinit();
         self.* = undefined;
@@ -208,6 +309,18 @@ fn directoryFlags() std.posix.O {
 fn regularFileFlags() std.posix.O {
     return .{
         .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+        .NOCTTY = true,
+    };
+}
+
+fn writableRegularFileFlags(exclusive: bool) std.posix.O {
+    return .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .EXCL = exclusive,
         .CLOEXEC = true,
         .NOFOLLOW = true,
         .NONBLOCK = true,
