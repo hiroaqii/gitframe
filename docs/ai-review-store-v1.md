@@ -1,6 +1,6 @@
 # AI Review Store v1
 
-This document describes the side-effect-free read boundary, its read-only `Review` page consumer, and the installed binding/publication helpers. Draft/result mutation remains a separate responsibility.
+This document describes the side-effect-free read boundary, its read-only `Review` page consumer, the installed binding/publication helpers, and the Store-owned draft/result lifecycle.
 
 ## Authority
 
@@ -144,8 +144,77 @@ Use `/` to filter, `j`/`k` or arrow keys to move, Enter to activate, `r` to refr
 
 Selecting a Run revalidates the exact IDs and artifacts before replacing the visible diff atomically. A failed or stale selection leaves the previous normal or pinned presentation intact. In pinned mode, `r` reloads the exact Run and `m` returns through a fresh normal branch-comparison load; it never retargets the pinned OIDs through the base picker. Bare Esc outside the picker does not leave pinned mode.
 
+## Draft and result persistence
+
+Mutation requests contain an exact repository ID, review ID, committed target,
+and findings digest; callers never select a draft/result pathname. Draft input
+is one complete snapshot: expected revision (`0` means absent), optional
+summary, every finding disposition, and every anchored note. Existing notes are
+therefore retained only when the caller includes them in the next snapshot.
+
+Under the per-Run lock, the writer freshly validates registry binding and the
+complete Run. A valid result returns `already_completed` before draft
+inspection, including when a retained draft is missing or invalid. Without a
+result, the actual draft revision must exactly equal the request. GitFrame
+assigns revision `1` or the checked next revision, validates the constructed
+artifact, and never auto-merges or overwrites a conflicting snapshot.
+
+Draft bytes are exclusively created as one shared-grammar
+`.tmp-draft-<review-id>-<token>` namespace sibling with mode `0600`. The write
+order is complete bytes, file sync, namespace sync, atomic replacement rename
+to `<review-id>/review_state.json`, Run-directory sync, then namespace sync.
+Before-rename failure leaves the old draft authoritative; post-rename sync
+failure may leave the new complete draft authoritative. Retry always reopens
+the Run instead of rolling back.
+
+A result request carries only the expected latest draft revision and decision.
+After reloading that draft, GitFrame samples the real clock exactly once,
+formats one UTC-second RFC 3339 `completed_at`, and copies the exact latest
+summary, dispositions, and notes into the terminal result. Result staging uses
+the corresponding `.tmp-result-...` file and sync order, followed by an atomic
+no-replace rename. A concurrent winner is reloaded under the same lock: a valid
+winner returns `already_completed`, an invalid winner returns `run_invalid`,
+and existing bytes are never replaced.
+
+Normal pre-rename cleanup removes only the exact temporary file created by the
+operation and syncs the namespace after successful removal. Cleanup failure or
+external termination may leave that safe inert sibling; it cannot hide a
+canonical Run. Filesystem terminals are `conflict`, `draft_required`,
+`already_completed`, `binding_changed`, `run_invalid`, `clock_unavailable`,
+`unsupported`, and `io_failed`.
+
+## App operation ownership and quit
+
+`ReviewStoreOperationOwner` is independent of Git action lifecycle. It keys
+work by repository ID plus review ID, runs at most one filesystem task per Run,
+and permits different Runs to execute independently. The bounded owner admits
+at most 64 active Runs, with one in-flight operation, one pending draft, and one
+pending result per Run. A compatible newer unstarted draft replaces the prior
+pending draft; in-flight input is immutable. A result waits behind the accepted
+draft revision and is never coalesced.
+
+Task completion is matched by operation ID and full Run binding, not the
+current page. The App clones request bytes before admission, so conflict,
+failure, page switch, and repository switch cannot discard or mutate the
+caller's dirty editor state. A matching pinned Review receives its bounded
+completion notification; every mismatched, stale, or runtime-undelivered
+payload is still deinitialized exactly once.
+
+If an in-flight mutation fails, every accepted dependent draft or result is
+retired with the same typed terminal and its operation ID remains observable;
+the owner never retains an unstartable blocked queue. After those clones are
+released, the Run admits a fresh explicit retry or reconciliation request.
+
+Quit closes new Store-mutation admission and invalidates outstanding Store read
+generations. With no accepted mutation it follows normal teardown. Otherwise
+the TUI remains responsive while all accepted per-Run queues drain. Complete
+success returns to the existing quit coordinator, which rechecks any Git action
+admitted during the responsive drain before teardown. Any Store failure cancels
+quit, reopens admission, reports the typed terminal, and leaves caller-owned
+dirty state available for explicit reload/reconciliation.
+
 ## Resource ownership and current non-goals
 
 Every success/failure/skip terminal frees parsed arenas, raw artifact bytes, diagnostics, projection buffers, environments, and descriptors exactly once. The focused suite covers success and drift/failure union terminals with `std.testing.allocator`.
 
-Config resolution, scan, selection, picker use, pinned refresh, and return-to-normal create no Store content. The App owns only ephemeral task results, picker snapshots, and the currently accepted normal or pinned presentation. Only the two installed explicit producer helpers create bindings or immutable Run pairs. No draft/result writer, mutation UI, or App-level Store mutation owner is exported; those responsibilities belong to the later `review-state-persistence` slice.
+Config resolution, scan, selection, picker use, pinned refresh, and return-to-normal create no Store content. Only the two installed explicit producer helpers create bindings or immutable Run pairs; only the mutation owner writes GitFrame-owned draft/result artifacts. No disposition, anchored-note, or terminal-decision UI is introduced by this storage slice. Those consumer surfaces remain follow-up responsibilities.

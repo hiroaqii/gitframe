@@ -51,6 +51,7 @@ test {
     _ = @import("app/key_input.zig");
     _ = @import("app/load.zig");
     _ = @import("app/load_state.zig");
+    _ = @import("app/review_store_operations.zig");
     _ = @import("app/page.zig");
     _ = @import("app/page_header.zig");
     _ = @import("app/page_link.zig");
@@ -100,6 +101,7 @@ test {
     _ = @import("committed_review/target_command.zig");
     _ = @import("review_store/prepare_command.zig");
     _ = @import("review_store/publish_command.zig");
+    _ = @import("review_store/mutation.zig");
     _ = @import("context.zig");
     _ = @import("context_export.zig");
     _ = @import("draw");

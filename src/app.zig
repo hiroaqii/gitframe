@@ -40,6 +40,7 @@ const action_lifecycle = @import("app/workflow/action_lifecycle.zig");
 const workflow_local = @import("app/workflow/local.zig");
 const workflow_remote = @import("app/workflow/remote.zig");
 const shell_effects = @import("app/shell_effects.zig");
+const review_store_operations_mod = @import("app/review_store_operations.zig");
 const context = @import("context.zig");
 const config_mod = @import("config.zig");
 const diff_surface = @import("app/diff_surface.zig");
@@ -128,6 +129,10 @@ pub const App = struct {
     remote_workflow: workflow_remote.State = .{},
     overlay: app_state.OverlayState = .{},
     shell_effects_state: shell_effects.State = .{},
+    review_store_operations: review_store_operations_mod.Owner = .{},
+    /// Retains the user's quit intent after Store drain success until the
+    /// existing Git action lifecycle is also terminal.
+    quit_after_store_drain: bool = false,
     drag_auto_scroll: drag_auto_scroll.State = .{},
     command_session: CommandSession = .inactive,
 
@@ -168,6 +173,46 @@ pub const App = struct {
         self.local_workflow.deinit(deinit_ctx.allocator);
         self.remote_workflow.deinit(deinit_ctx.allocator);
         self.shell_effects_state.deinit(deinit_ctx.allocator);
+        self.review_store_operations.deinit(deinit_ctx.allocator);
+    }
+
+    /// Clone and admit one full draft snapshot for page-independent Store
+    /// persistence. The caller retains its editable state on every terminal.
+    pub fn persistReviewDraft(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        request: review_store.mutation.DraftRequest,
+    ) !review_store_operations_mod.Admission {
+        const store_root = switch (self.review_store_path) {
+            .available => |value| value,
+            .unavailable => return .{ .rejected = .store_unavailable },
+        };
+        const admission = try self.review_store_operations.enqueueDraft(
+            ctx.allocator(),
+            store_root,
+            request,
+        );
+        self.pumpReviewStoreOperations(ctx);
+        return admission;
+    }
+
+    /// Admit create-once completion behind any accepted draft for the Run.
+    pub fn persistReviewResult(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        request: review_store.mutation.ResultRequest,
+    ) !review_store_operations_mod.Admission {
+        const store_root = switch (self.review_store_path) {
+            .available => |value| value,
+            .unavailable => return .{ .rejected = .store_unavailable },
+        };
+        const admission = try self.review_store_operations.enqueueResult(
+            ctx.allocator(),
+            store_root,
+            request,
+        );
+        self.pumpReviewStoreOperations(ctx);
+        return admission;
     }
 
     fn repoSessionView(self: *const App) repo_session.View {
@@ -538,6 +583,7 @@ pub const App = struct {
                 self.remoteWorkflow().finishPushUpstreamFinalize(ctx.allocator(), finished),
             ),
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
+            .review_store_operation_finished => |finished| self.finishReviewStoreOperation(ctx, finished),
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
             .review => |review_msg| _ = try self.updateReview(ctx, review_msg),
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
@@ -683,6 +729,8 @@ pub const App = struct {
             try self.changesRead().maybeStartQueuedRevalidation(ctx);
         }
         self.actionLifecycle().reconcileSpinner(ctx);
+        self.pumpReviewStoreOperations(ctx);
+        self.resumeQuitAfterStoreDrain(ctx);
         if (!self.redraw_plan.resolvesToSkip() and
             self.active_page == .review and
             (self.pages.review.base_picker.open or self.pages.review.ai_reviews.isOpen()))
@@ -700,8 +748,100 @@ pub const App = struct {
             self.setStatus("finish current git action before quitting", .{});
             return;
         }
+        switch (self.review_store_operations.requestQuit()) {
+            .ready => {
+                self.quit_after_store_drain = false;
+                self.teardown_requested = true;
+                ctx.quit();
+            },
+            .draining => {
+                self.quit_after_store_drain = true;
+                // Store scans/selections are read generations, not accepted
+                // mutations. Invalidate them while retaining any pinned
+                // presentation and keep the event loop responsive.
+                self.pages.review.ai_reviews.close(ctx.allocator());
+                self.setStatus("finishing AI review save before quitting", .{});
+            },
+            .failed => |failure| {
+                self.quit_after_store_drain = false;
+                self.setStatus(
+                    "cannot quit while AI review save needs reconciliation: {s}",
+                    .{@tagName(failure)},
+                );
+            },
+        }
+    }
+
+    fn pumpReviewStoreOperations(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (!self.review_store_operations.hasWork()) return;
+        _ = self.review_store_operations.pump(ctx) catch {
+            if (self.review_store_operations.isDraining()) {
+                self.review_store_operations.cancelDrain(.io_failed);
+                self.quit_after_store_drain = false;
+                self.setStatus("AI review save failed: io_failed", .{});
+                return;
+            }
+            self.setStatus("could not start AI review save", .{});
+        };
+    }
+
+    fn finishReviewStoreOperation(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        completion: app_message.ReviewStoreOperationFinished,
+    ) void {
+        var finished = completion;
+        const presentation_matches = self.reviewStorePresentationMatches(finished.binding);
+        const kind = finished.kind;
+        const outcome = self.review_store_operations.finish(
+            ctx.allocator(),
+            &finished,
+            presentation_matches,
+        );
+        if (!outcome.accepted) return;
+        if (outcome.quit_canceled) self.quit_after_store_drain = false;
+        if (outcome.failure) |failure| {
+            if (outcome.dependent_terminal_count == 0) {
+                self.setStatus("AI review save failed: {s}", .{@tagName(failure)});
+            } else {
+                self.setStatus(
+                    "AI review save failed: {s}; canceled {d} dependent save(s)",
+                    .{ @tagName(failure), outcome.dependent_terminal_count },
+                );
+            }
+        } else if (presentation_matches) {
+            switch (kind) {
+                .draft => self.pages.review.status.set("AI review draft saved", .{}),
+                .result => self.pages.review.status.set("AI review result saved", .{}),
+            }
+        }
+        if (outcome.quit_ready) self.resumeQuitAfterStoreDrain(ctx);
+    }
+
+    fn resumeQuitAfterStoreDrain(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (!self.quit_after_store_drain or
+            self.review_store_operations.isDraining() or
+            self.review_store_operations.hasWork()) return;
+        if (self.actionLifecycleView().hasPending()) {
+            self.setStatus("finish current git action before quitting", .{});
+            return;
+        }
+        self.quit_after_store_drain = false;
         self.teardown_requested = true;
         ctx.quit();
+    }
+
+    fn reviewStorePresentationMatches(
+        self: *const App,
+        binding: review_store.mutation.RunBinding,
+    ) bool {
+        if (self.active_page != .review) return false;
+        const pinned = self.pages.review.pinnedAiConst() orelse return false;
+        const manifest = &pinned.selection.artifacts.manifest.value;
+        return manifest.review_repository_id.eql(binding.review_repository_id) and
+            manifest.review_id.eql(binding.review_id) and
+            manifest.target.eql(&binding.target) and
+            manifest.findings_digest.eql(binding.findings_digest);
     }
 
     fn updateMouseSelectionDrag(
@@ -1030,8 +1170,7 @@ pub const App = struct {
             try self.changesRead().applyEffectReload(ctx, outcome.reload);
         }
         if (outcome.quit_after_terminal) {
-            self.teardown_requested = true;
-            ctx.quit();
+            self.requestQuit(ctx);
         }
     }
 
@@ -1813,4 +1952,98 @@ test "command line keeps input across resize and cancels on focus or page transi
     try std.testing.expect(app.commandLineView() != null);
     try app.update(.{ .switch_page = .config }, &tc.ctx);
     try std.testing.expect(app.commandLineView() == null);
+}
+
+test "review state persistence App quit drains accepted mutation and reopens after failure" {
+    const allocator = std.testing.allocator;
+    const committed = @import("committed_review.zig");
+    const repository_id = try committed.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
+    const review_id = try committed.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
+    const oid = try committed.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const binding: review_store.mutation.RunBinding = .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = oid,
+            .head_oid = oid,
+            .diff_base_oid = oid,
+        },
+        .findings_digest = committed.Sha256Digest.hash("findings\n"),
+    };
+    var app: App = .{
+        .review_store_path = .{ .available = try allocator.dupe(u8, "/unused") },
+        .allocator = allocator,
+    };
+    defer app.review_store_path.deinit(allocator);
+    defer app.review_store_operations.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const admission = try app.persistReviewDraft(&ctx, .{
+        .binding = binding,
+        .expected_revision = 0,
+        .summary = "dirty caller-owned draft",
+        .finding_dispositions = &.{},
+        .anchored_notes = &.{},
+    });
+    try std.testing.expect(admission == .accepted);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+
+    try app.update(.quit, &ctx);
+    try std.testing.expect(app.review_store_operations.isDraining());
+    try std.testing.expect(!ctx.shouldQuit());
+    const queued = ctx.takePendingTasksWith();
+    const completion = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+    try app.update(completion, &ctx);
+
+    try std.testing.expect(!app.review_store_operations.isDraining());
+    try std.testing.expect(app.review_store_operations.admissionsOpen());
+    try std.testing.expect(!ctx.shouldQuit());
+    try std.testing.expectEqualStrings("AI review save failed: io_failed", app.status.text());
+
+    const saved = try app.persistReviewDraft(&ctx, .{
+        .binding = binding,
+        .expected_revision = 0,
+        .summary = "retry after reconciliation",
+        .finding_dispositions = &.{},
+        .anchored_notes = &.{},
+    });
+    try app.update(.quit, &ctx);
+    try std.testing.expect(app.quit_after_store_drain);
+    const store_tasks = ctx.takePendingTasksWith();
+    var abandoned = store_tasks[0].failed(store_tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+
+    // Admit an exact existing Git lifecycle owner after Store drain began.
+    // Store success must return through the common quit coordinator instead
+    // of bypassing this later owner.
+    const prepared = app.actionLifecycle().prepare(.stage_file);
+    const accepted_action = app.actionLifecycle().acceptSpawn(allocator, prepared);
+    try std.testing.expect(app.actionLifecycleView().isAccepted(accepted_action.pending));
+
+    try app.update(.{ .review_store_operation_finished = .{
+        .operation_id = saved.accepted.operation_id,
+        .binding = binding,
+        .kind = .draft,
+        .result = .{ .draft = .{ .committed = .{
+            .revision = 1,
+            .canonical_bytes = try allocator.dupe(u8, "draft\n"),
+        } } },
+    } }, &ctx);
+    try std.testing.expect(!ctx.shouldQuit());
+    try std.testing.expect(app.quit_after_store_drain);
+    try std.testing.expect(app.actionLifecycleView().isAccepted(accepted_action.pending));
+    try std.testing.expectEqualStrings("finish current git action before quitting", app.status.text());
+
+    try app.update(App.Msg.actionFinished(.{ .stage_file = .{
+        .pending = accepted_action.pending,
+        .path = try allocator.dupe(u8, "late-action"),
+        .result = .{ .failed_static = "fixture terminal" },
+    } }), &ctx);
+    try std.testing.expect(!app.actionLifecycleView().hasPending());
+    try std.testing.expect(ctx.shouldQuit());
+    try std.testing.expect(app.teardown_requested);
+    try std.testing.expect(!app.quit_after_store_drain);
 }

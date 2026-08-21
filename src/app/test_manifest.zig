@@ -8,6 +8,7 @@ pub fn include() void {
     _ = @import("initial_selection.zig");
     _ = @import("load_test.zig");
     _ = @import("message.zig");
+    _ = @import("review_store_operations.zig");
     _ = @import("shell_effects_test.zig");
     _ = @import("repo_session.zig");
     _ = @import("workflow/action_lifecycle_test.zig");
