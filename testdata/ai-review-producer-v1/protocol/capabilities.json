@@ -1,0 +1,1 @@
+{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"committed-review.artifact","versions":[1]},{"name":"committed-review.projection","versions":[1]},{"name":"committed-review.target","versions":[1]},{"name":"review-store.prepare","versions":[1]},{"name":"review-store.publish","versions":[1]}]}

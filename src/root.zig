@@ -1,6 +1,7 @@
 const app = @import("app.zig");
 const build_options = @import("build_options");
 pub const config = @import("config.zig");
+pub const ai_review = @import("ai_review.zig");
 pub const committed_review = @import("committed_review.zig");
 pub const review_store = @import("review_store.zig");
 /// Installed process adapter for exact-target committed patch transport.
@@ -11,6 +12,8 @@ pub const review_target_command = @import("committed_review/target_command.zig")
 pub const review_store_prepare_command = @import("review_store/prepare_command.zig");
 /// Installed process adapter for exact immutable Review Run publication.
 pub const review_store_publish_command = @import("review_store/publish_command.zig");
+/// Installed side-effect-free AI review capability handshake.
+pub const review_capabilities_command = @import("ai_review/capabilities_command.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
 pub const theme = @import("theme");
@@ -94,6 +97,8 @@ test {
     _ = @import("app/view.zig");
     _ = @import("app/view_primitives.zig");
     _ = @import("config.zig");
+    _ = @import("ai_review.zig");
+    _ = @import("ai_review/capabilities_command.zig");
     _ = @import("content_fingerprint.zig");
     _ = @import("committed_review.zig");
     _ = @import("review_store.zig");

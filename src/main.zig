@@ -121,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const HelperCommand = enum {
+    review_capabilities,
     review_target,
     review_projection,
     review_store_prepare,
@@ -129,6 +130,7 @@ const HelperCommand = enum {
 
 fn helperCommand(args: []const []const u8) ?HelperCommand {
     if (args.len < 2) return null;
+    if (std.mem.eql(u8, args[1], "review-capabilities")) return .review_capabilities;
     if (std.mem.eql(u8, args[1], "review-target")) return .review_target;
     if (std.mem.eql(u8, args[1], "review-projection")) return .review_projection;
     if (std.mem.eql(u8, args[1], "review-store-prepare")) return .review_store_prepare;
@@ -138,6 +140,12 @@ fn helperCommand(args: []const []const u8) ?HelperCommand {
 
 fn runHelper(command: HelperCommand, init: std.process.Init, arguments: []const []const u8) !u8 {
     return switch (command) {
+        .review_capabilities => gitframe.review_capabilities_command.run(
+            init.gpa,
+            init.io,
+            arguments,
+            .stdout(),
+        ),
         .review_target => gitframe.review_target_command.run(
             init.gpa,
             init.io,
@@ -388,6 +396,9 @@ test "wantsHelp detects help flags" {
 }
 
 test "helper first-token dispatch precedes global help scanning" {
+    const capability_args = [_][]const u8{ "gitframe", "review-capabilities", "--help" };
+    try std.testing.expectEqual(HelperCommand.review_capabilities, helperCommand(&capability_args).?);
+    try std.testing.expect(wantsHelp(&capability_args));
     const target_args = [_][]const u8{ "gitframe", "review-target", "--help" };
     try std.testing.expectEqual(HelperCommand.review_target, helperCommand(&target_args).?);
     try std.testing.expect(wantsHelp(&target_args));
