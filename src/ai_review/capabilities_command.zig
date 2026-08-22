@@ -10,9 +10,11 @@ pub const gitframe_version = "0.0.0";
 
 const v1 = [_]u16{1};
 
-/// Exact cumulative list for the protocol-foundation slice.
-pub const foundation_capabilities = [_]protocol.Capability{
+/// Exact cumulative list after deterministic input materialization exists.
+pub const capabilities = [_]protocol.Capability{
+    .{ .name = "ai-review.input", .versions = &v1 },
     .{ .name = "committed-review.artifact", .versions = &v1 },
+    .{ .name = "committed-review.instructions", .versions = &v1 },
     .{ .name = "committed-review.projection", .versions = &v1 },
     .{ .name = "committed-review.target", .versions = &v1 },
     .{ .name = "review-store.prepare", .versions = &v1 },
@@ -44,7 +46,7 @@ pub fn executeAlloc(allocator: std.mem.Allocator, arguments: []const []const u8)
         .schema_version = limits.schema_version,
         .status = .ok,
         .gitframe_version = gitframe_version,
-        .capabilities = &foundation_capabilities,
+        .capabilities = &capabilities,
     };
     const bytes = codec.writeCapabilityResponseAlloc(allocator, &response) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -81,7 +83,7 @@ fn readFixture(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(limits.max_capabilities_bytes));
 }
 
-test "AI review protocol capabilities command emits the exact honest foundation list" {
+test "AI review protocol capabilities command emits the exact honest input-materialization list" {
     var output = try executeAlloc(std.testing.allocator, &.{});
     defer output.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 0), output.exit_code);
@@ -94,16 +96,15 @@ test "AI review protocol capabilities command emits the exact honest foundation 
     var parsed = try protocol.CapabilityResponse.parseStrict(std.testing.allocator, output.bytes);
     defer parsed.deinit();
     try protocol.requireCapabilities(&parsed.value, &.{
+        .{ .name = "ai-review.input", .version = 1 },
         .{ .name = "committed-review.artifact", .version = 1 },
+        .{ .name = "committed-review.instructions", .version = 1 },
         .{ .name = "committed-review.projection", .version = 1 },
         .{ .name = "committed-review.target", .version = 1 },
         .{ .name = "review-store.prepare", .version = 1 },
         .{ .name = "review-store.publish", .version = 1 },
     });
-    try std.testing.expectError(
-        error.IncompatibleCapabilities,
-        protocol.requireCapabilities(&parsed.value, &.{.{ .name = "ai-review.input", .version = 1 }}),
-    );
+    try std.testing.expectError(error.IncompatibleCapabilities, protocol.requireCapabilities(&parsed.value, &.{.{ .name = "ai-review.producer", .version = 1 }}));
 }
 
 test "AI review protocol capabilities command rejects every argument without fallback" {

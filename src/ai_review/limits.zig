@@ -47,6 +47,19 @@ pub const max_capability_name_bytes: usize = 128;
 pub const max_capability_versions: usize = 16;
 pub const max_gitframe_version_bytes: usize = 256;
 
+/// One path-free finite-limit observation propagated to the command adapter.
+/// `observed` is the exact count available at the rejecting boundary; bounded
+/// readers intentionally stop after observing `allowed + 1`.
+pub const Violation = struct {
+    resource: []const u8,
+    observed: usize,
+    allowed: usize,
+};
+
+pub fn record(slot: *?Violation, resource: []const u8, observed: usize, allowed: usize) void {
+    slot.* = .{ .resource = resource, .observed = observed, .allowed = allowed };
+}
+
 /// One diagnostic limit echoed in every plan summary.
 pub const PlanLimit = struct {
     name: []const u8,

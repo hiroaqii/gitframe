@@ -1,9 +1,9 @@
 # AI review producer protocol v1
 
-This document defines the provider-neutral protocol foundation used by the
-portable `gitframe-ai-review` Skill. The foundation does not invoke an AI,
-materialize a projection, mutate the Review Store, publish a Run, install a
-Skill, or read a human result.
+This document defines the provider-neutral protocol and deterministic input
+materializer used by the portable `gitframe-ai-review` Skill. The current
+input materializer does not invoke an AI, mutate the Review Store, publish a
+Run, install a Skill, or read a human result.
 
 ## Authority boundary
 
@@ -20,9 +20,10 @@ followed by exactly one LF and EOF. Parsers reject unknown, duplicate, missing,
 unsupported-schema input. Raw Git paths use canonical unpadded base64url and
 need not be UTF-8. Digests use `sha256:` plus 64 lowercase hexadecimal digits.
 
-The fixture directory
+The fixture directories
 [`testdata/ai-review-producer-v1/protocol`](../testdata/ai-review-producer-v1/protocol)
-contains exact canonical documents.
+and [`testdata/ai-review-producer-v1/input`](../testdata/ai-review-producer-v1/input)
+contain exact canonical documents and bounded patch cases.
 
 ## Capability handshake
 
@@ -31,7 +32,7 @@ does not open a repository, config, Store, TUI, or installation state. Success
 is one `CapabilityResponse`:
 
 ```json
-{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"committed-review.artifact","versions":[1]}]}
+{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"ai-review.input","versions":[1]},{"name":"committed-review.artifact","versions":[1]},{"name":"committed-review.instructions","versions":[1]},{"name":"committed-review.projection","versions":[1]},{"name":"committed-review.target","versions":[1]},{"name":"review-store.prepare","versions":[1]},{"name":"review-store.publish","versions":[1]}]}
 ```
 
 Capability names are strictly increasing by unsigned UTF-8 bytes. Each
@@ -39,17 +40,18 @@ versions array is non-empty, positive, strictly increasing, and unique.
 Compatibility is exact name/version membership; GitFrame semver is diagnostic
 only and a future-only `[2]` does not satisfy a v1 requirement.
 
-The protocol-foundation release advertises exactly, in order:
+The input-materialization release advertises exactly, in order:
 
-1. `committed-review.artifact@1`
-2. `committed-review.projection@1`
-3. `committed-review.target@1`
-4. `review-store.prepare@1`
-5. `review-store.publish@1`
+1. `ai-review.input@1`
+2. `committed-review.artifact@1`
+3. `committed-review.instructions@1`
+4. `committed-review.projection@1`
+5. `committed-review.target@1`
+6. `review-store.prepare@1`
+7. `review-store.publish@1`
 
-No `ai-review.*`, `committed-review.instructions`, `review-store.verify`, or
-installation capability is advertised before its owning later slice exists
-and passes its contract tests.
+No candidate, producer, Store verification, or installation capability is
+advertised before its owning later slice exists and passes its contract tests.
 
 Any argument, including `--help`, returns exit 2 and a bounded canonical error
 line. Allocation/internal failure returns exit 70. Successful output is capped
@@ -82,7 +84,7 @@ line, 256 KiB unit, 32 MiB complete input output, committed-guidance limits,
 limits. The canonical fixture is [`plan.json`](../testdata/ai-review-producer-v1/protocol/plan.json).
 
 The guidance file ceiling is 64 unique `(head_oid, raw AGENTS.md path)` keys
-across the complete plan. The later input materializer owns that global union,
+across the complete plan. The input materializer owns that global union,
 its 256 KiB unique-content aggregate, and one exact source record per key. A
 repeated key in any unit must carry the same blob OID, content digest, and exact
 content bytes.
@@ -140,7 +142,7 @@ a strict directory ancestor of that side's file path. Target parent-directory
 depth is at most 32 (so a chain may contain root plus 32 nested entries), with
 at most 64 unique keys in the union of this unit's before/after chains. The
 unit codec rejects conflicting records for a repeated key. This local check
-does not claim the complete-plan limit owned by the later materializer. The
+is complemented by the complete-plan limit owned by `review-input`. The
 96 KiB per-unit content bound counts the bytes serialized in both chains,
 including repeated occurrences, because it bounds the actual unit input.
 
@@ -189,7 +191,151 @@ helper records/finalizes the batch. Candidate and batch fixtures are
 [`candidate.json`](../testdata/ai-review-producer-v1/protocol/candidate.json)
 and [`batch.json`](../testdata/ai-review-producer-v1/protocol/batch.json).
 
-This foundation deliberately does not assign finding IDs, resolve anchors,
+This protocol/input slice deliberately does not assign finding IDs, resolve anchors,
 construct committed-review artifacts, or publish. Those operations remain in
 the ordered artifact-finalization and publication slices; partial publication
 is never a protocol terminal.
+
+## Deterministic review input
+
+`gitframe review-input` is a first-token, no-argument helper. It reads exactly:
+
+```text
+<outer JSON header, including LF, at most 16 KiB>
+<exact review-projection success frame, at most 16 MiB + 2 KiB>
+<EOF>
+```
+
+The outer fields are `schema_version`, lossless absolute `repository`, the
+complete expected `target`, and `projection_frame_size`. The nested frame is
+independently admitted with its 2 KiB success-header cap, exact equal target,
+`patch_size`, payload length, and EOF. Failure frames, unknown or duplicate
+fields, mismatched targets, and short or extra bytes produce only a typed error
+line. `review-input` never resolves refs or runs `git diff`.
+
+Both fixed headers are bound to the exact compact bytes emitted by their
+canonical writers, including every nested `repository` and `target` object.
+Semantically equivalent field reordering, whitespace, or JSON escape aliases
+are malformed input (exit 2); this strict admission does not change the
+separate, existing `review-projection` request contract.
+
+The span-preserving patch planner admits an empty patch or a sequence of
+`diff --git` file records. It decodes Git C-quoted paths without requiring raw
+paths to be UTF-8, validates repository-relative paths, regular-file modes,
+file identity/status, complete hunk counts, UTF-8 content, CRLF and missing
+final-LF markers, and accounts for every projection byte. Combined diffs,
+binary/non-UTF-8 content, symlink/gitlink modes, metadata-only changes,
+unknown/trailing syntax, or any incomplete count reject the complete plan.
+No file or hunk can be silently omitted.
+
+Each regular file record is one closed Git metadata state machine. Modified,
+added, deleted, renamed, and copied records bind both `diff --git` paths,
+`---`/`+++` markers, zero/nonzero index sides, regular mode evidence, unique
+metadata and canonical order to the derived status. Added hunks consume only
+the after side and deleted hunks only the before side. Missing or contradictory
+evidence is malformed (exit 2); an explicitly non-regular mode remains an
+unsupported projection (exit 5).
+
+For a rename or copy with both a regular-file mode change and content hunks,
+Git's canonical order is `old mode`, `new mode`, `similarity index`, identity
+`from`/`to`, `index`, then the two file markers. Similarity lines admit only
+their exact prefix followed by one canonical unsigned decimal from 0 through
+100 and `%`; a lexically recognized dissimilarity line does not complete any
+v1 metadata path and therefore fails the record. Every hunk-bearing record requires distinct
+nonzero index OIDs when both sides exist, and each nonempty hunk range must end
+at a representable `u32` location (`start + count - 1`) before materialization.
+
+Lexical admission is a forward byte grammar, not whitespace normalization.
+Every fixed word, ASCII space, marker, OID separator, hunk delimiter, optional
+section transition, and LF is consumed at its exact position; no parser trims,
+skips repeated spaces, or searches for a later closing marker. Hunk ranges use
+canonical unsigned decimals: count 1 is omitted, while every other count is
+explicit. A section is either absent immediately after the closing `@@`, or
+starts after exactly one delimiter space and contains at least one safe byte.
+
+Git's C-style path writer does not quote an ordinary space by itself, so the
+`diff --git` header is not split at a guessed space. The planner derives the
+old/new raw paths from the record's markers and rename/copy identity, rebuilds
+the complete header with the one writer separator, and requires exact byte
+equality. Every path spelling must also be the canonical Git encoding of its
+decoded bytes. One patch-wide `core.quotePath` choice controls whether
+non-ASCII bytes remain literal or use three-digit octal escapes; mixing the two
+policies, unnecessary quotes, printable-byte octal aliases, and malformed
+escapes are invalid.
+
+For `---` and `+++` only, Git appends exactly one horizontal tab after a
+non-`/dev/null` label iff that exact emitted path spelling contains a literal
+space. The planner validates and removes only this conditional writer suffix
+before decoding; a missing, extra, unconditional, or `/dev/null` tab is
+invalid. No other whitespace is trimmed.
+
+Index OID admission is bound to the already validated projection-frame
+`target.object_format`. Both sides must use the same lowercase hexadecimal
+width. SHA-1 admits 4 through 40 hex digits and SHA-256 admits 4 through 64
+hex digits; there is no unbound/default-format parser entrypoint. Zero/nonzero
+semantics remain status-specific.
+
+Tests treat the grammar as a table-driven finite proof inventory rather than
+a list of reviewer examples:
+
+| Inventory | Complete finite dimensions |
+| --- | --- |
+| Lexical productions | diff header, markers, mode/index/percent/identity metadata, hunk header, three content kinds, no-final-LF marker, and every fixed delimiter mutation |
+| Canonical values | both quote policies, path escape/space classes, conditional marker HT, percent/range/mode/OID spelling and exact/plus-one boundaries |
+| Target OID boundary | SHA-1 and SHA-256 crossed with modified, added, deleted, renamed and copied; widths 3, 4, format maximum and maximum plus one; unequal old/new widths |
+| Metadata state | modified simple/mode, added, deleted, renamed simple/mode and copied simple/mode, including deletion/duplication/reordering/substitution |
+| Hunk and coverage state | exact line consumption, no-final-LF placement, adjacent ranges and one complete adjacent byte-span union |
+| Actual writer controls | SHA-1/SHA-256 `core.abbrev` exact/plus-one clamping plus modify/add/delete/rename/copy/mode, both quotePath policies, path/marker/section forms |
+
+The public boundary explicitly proves SHA-1 40/41 and SHA-256 64/65. The
+named double path separator, missing hunk-close separator, missing section
+separator, and target/OID mismatch regressions are ordinary cells in this
+inventory. Every successful parse proves one adjacent span partition of the
+complete patch, and every rejected variant produces no plan or unit.
+
+One unit contains one file and consecutive whole hunks. Packing is in patch
+order and stops at the 64 KiB raw-fragment, 9,999-location-per-side, or 19,998
+line boundary; a single hunk that cannot fit is `review_unit_too_large`.
+Metadata may repeat as model context, but the unit coverage spans form one
+gapless, non-overlapping partition of the exact patch. Unit IDs and all
+before/after location IDs are assigned only by the helper.
+
+For each old and new file path, the helper constructs `AGENTS.md`, then each
+root-to-parent `<directory>/AGENTS.md` candidate. Both labelled chains are
+read only from the exact target head tree using controlled `ls-tree` and
+`cat-file` calls with replace refs, lazy fetch and optional locks disabled.
+The worktree, index, untracked files, filesystem file content, commands in the
+documents, and any other filename are not guidance authority. Missing regular
+files are normal; unavailable objects, non-regular entries, invalid UTF-8,
+ambiguous output, and finite-limit overflow discard the complete plan.
+
+The complete-plan guidance validator counts each unique `(head_oid,path)` once
+across all before/after chains, caps that union at 64 and its unique exact
+content at 256 KiB, and requires every repeated key to have identical blob
+OID, content digest, and bytes. `instruction_set_digest` hashes ASCII
+`gitframe-ai-review-instructions-v1`, one NUL, then the unique records sorted
+by unsigned head-OID bytes and raw path bytes.
+Each head OID, raw path, blob OID, and content field is prefixed by its unsigned
+64-bit little-endian byte length; the content digest contributes its fixed 32
+raw bytes between blob OID and content. `projection_digest` hashes the exact
+patch bytes.
+
+`plan_digest` hashes ASCII `gitframe-ai-review-plan-v1`, one NUL, the canonical
+summary and each ordered canonical unit while every `plan_digest` field is the
+all-zero SHA-256 value. The canonical component documents retain their final
+LF in this preimage. The resulting digest is then inserted into the summary
+and every unit. This avoids circular authority while binding the target, both
+input digests, paths, guidance, locations, coverage, unit order, and complete
+v1 limit set.
+
+Success is one compact canonical JSON line with fields `schema_version`,
+`status=ok`, `summary`, and ordered `units`, capped at 32 MiB. An empty patch
+returns `unit_count=0` and an empty unit array; it performs no Store operation
+and cannot issue a Review ID. Every failure is all-or-nothing and output-only:
+exit 2 covers malformed input/arguments, exit 3 an invalid repository, exit 4
+finite input/unit/line limits, exit 5 unsupported projection or guidance,
+exit 6 an exact-head guidance read failure, and exit 70 an internal failure.
+Every exit-4 limit error appends `resource`, `observed`, and `allowed` after
+`code` and `message`. The resource token is fixed and path-free; bounded reads
+stop after observing `allowed + 1`, so diagnostics never need to echo a source
+or Store path or consume an unbounded payload merely to report its full size.

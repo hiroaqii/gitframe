@@ -14,6 +14,8 @@ pub const review_store_prepare_command = @import("review_store/prepare_command.z
 pub const review_store_publish_command = @import("review_store/publish_command.zig");
 /// Installed side-effect-free AI review capability handshake.
 pub const review_capabilities_command = @import("ai_review/capabilities_command.zig");
+/// Installed side-effect-free deterministic review input materializer.
+pub const review_input_command = @import("ai_review/input_command.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
 pub const theme = @import("theme");
@@ -99,6 +101,7 @@ test {
     _ = @import("config.zig");
     _ = @import("ai_review.zig");
     _ = @import("ai_review/capabilities_command.zig");
+    _ = @import("ai_review/input_command.zig");
     _ = @import("content_fingerprint.zig");
     _ = @import("committed_review.zig");
     _ = @import("review_store.zig");
@@ -123,6 +126,7 @@ test {
     _ = @import("git/branch_status.zig");
     _ = @import("git/command.zig");
     _ = @import("git/committed_review.zig");
+    _ = @import("git/committed_review/instructions.zig");
     _ = @import("git/compare.zig");
     _ = @import("git/operations.zig");
     _ = @import("git/read.zig");

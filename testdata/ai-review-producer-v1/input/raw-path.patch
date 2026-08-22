@@ -1,0 +1,7 @@
+diff --git "a/raw\377.txt" "b/raw\377.txt"
+index 1111111..2222222 100644
+--- "a/raw\377.txt"
++++ "b/raw\377.txt"
+@@ -1 +1 @@
+-old
++new
