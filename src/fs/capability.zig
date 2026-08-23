@@ -161,10 +161,10 @@ pub fn validateChildName(name: []const u8) !void {
 pub fn metadataForHandle(descriptor: Descriptor) !Metadata {
     return metadataForRawHandle(descriptor.handle);
 }
-pub fn filesystemMetadataForHandle(descriptor: Descriptor) !FilesystemMetadata {
+pub fn filesystemMetadata(directory: Directory) !FilesystemMetadata {
     return switch (builtin.os.tag) {
-        .linux => filesystemMetadataForHandleLinux(descriptor.handle),
-        .macos => filesystemMetadataForHandleDarwin(descriptor.handle),
+        .linux => filesystemMetadataForHandleLinux(directory.descriptor.handle),
+        .macos => filesystemMetadataForHandleDarwin(directory.descriptor.handle),
         else => error.UnsupportedPlatform,
     };
 }

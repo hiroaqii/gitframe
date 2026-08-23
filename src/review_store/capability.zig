@@ -3,12 +3,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fs = @import("../fs/capability.zig");
+const durable = @import("../fs/durable.zig");
 const store_path = @import("path.zig");
 
 pub const ObjectKind = fs.ObjectKind;
 pub const Metadata = fs.Metadata;
 pub const ExpectedKind = fs.ExpectedKind;
 pub const PolicyError = fs.AdmissionError;
+pub const DirectoryAcquisition = struct { disposition: durable.AcquisitionDisposition, directory: ?DirectoryCapability };
+
+pub const Iterator = struct {
+    neutral: fs.Iterator = .{},
+
+    pub fn next(self: *Iterator, directory: DirectoryCapability, io: std.Io) std.Io.Dir.Iterator.Error!?std.Io.Dir.Entry {
+        return self.neutral.next(directory.neutral, io);
+    }
+};
 
 /// Review Store policy seam. Directory link counts intentionally never participate.
 pub fn admitMetadata(metadata: Metadata, expected: ExpectedKind, root_device: u64, effective_uid: u32) PolicyError!void {
@@ -21,15 +31,7 @@ pub const FilesystemPolicy = enum {
 
     pub fn fromLinuxMagic(magic: u64) FilesystemPolicy {
         return switch (magic) {
-            0x0000ef53,
-            0x58465342,
-            0x9123683e,
-            0xf2f52010,
-            0x2fc12fc1,
-            0x01021994,
-            0x858458f6,
-            0x794c7630,
-            => .local_supported,
+            0x0000ef53, 0x58465342, 0x9123683e, 0xf2f52010, 0x2fc12fc1, 0x01021994, 0x858458f6, 0x794c7630 => .local_supported,
             else => .unsupported,
         };
     }
@@ -56,11 +58,6 @@ pub const DirectoryCapability = struct {
     effective_uid: u32,
     root_device: u64,
 
-    /// Transitional raw Store mutation/cwd compatibility; removed in slice 2.
-    pub fn dir(self: DirectoryCapability) std.Io.Dir {
-        return .{ .handle = self.neutral.descriptor.handle };
-    }
-
     pub fn duplicate(self: DirectoryCapability) !DirectoryCapability {
         return self.wrap(try self.neutral.duplicate());
     }
@@ -77,42 +74,12 @@ pub const DirectoryCapability = struct {
         return self.wrap(neutral);
     }
 
-    pub fn getOrCreateDirectory(self: DirectoryCapability, io: std.Io, name: []const u8) !DirectoryCapability {
-        return self.openDirectory(name) catch |err| switch (err) {
-            error.FileNotFound => {
-                self.dir().createDir(io, name, .fromMode(0o700)) catch |create_err| switch (create_err) {
-                    error.PathAlreadyExists => {},
-                    else => return create_err,
-                };
-                try self.sync(io);
-                return self.openDirectory(name);
-            },
-            else => return err,
-        };
-    }
-
-    pub fn openOrCreateRegularFile(self: DirectoryCapability, name: []const u8) !std.Io.File {
-        return self.openRegularFile(name, false);
-    }
-
-    pub fn createRegularFileExclusive(self: DirectoryCapability, name: []const u8) !std.Io.File {
-        return self.openRegularFile(name, true);
-    }
-
-    fn openRegularFile(self: DirectoryCapability, name: []const u8, exclusive: bool) !std.Io.File {
-        try fs.validateChildName(name);
-        const handle = try std.posix.openat(self.neutral.descriptor.handle, name, writableRegularFileFlags(exclusive), 0o600);
-        errdefer closeRaw(handle);
-        try fs.admitMetadata(try fs.metadataForHandle(.{ .handle = handle }), self.admission(.regular_file));
-        return .{ .handle = handle, .flags = .{ .nonblocking = true } };
-    }
-
-    pub fn sync(self: DirectoryCapability, io: std.Io) !void {
-        try (std.Io.File{ .handle = self.neutral.descriptor.handle, .flags = .{ .nonblocking = true } }).sync(io);
-    }
-
     pub fn admitChild(self: DirectoryCapability, name: []const u8, expected: ExpectedKind) !Metadata {
         return self.neutral.admitChild(name, self.admission(expected));
+    }
+
+    pub fn iterate(_: DirectoryCapability) Iterator {
+        return .{};
     }
 
     pub fn readRegularAlloc(self: DirectoryCapability, allocator: std.mem.Allocator, io: std.Io, name: []const u8, maximum: usize) ![]u8 {
@@ -127,6 +94,51 @@ pub const DirectoryCapability = struct {
         return .{ .neutral = neutral, .metadata = neutral.metadata, .effective_uid = self.effective_uid, .root_device = self.root_device };
     }
 };
+
+pub fn acquireDirectory(io: std.Io, parent: DirectoryCapability, name: []const u8, observer: durable.Observer) durable.Outcome(DirectoryAcquisition) {
+    return switch (durable.acquireDirectory(io, parent.neutral, name, parent.admission(.directory), .fromMode(0o700), observer)) {
+        .not_completed => |err| .{ .not_completed = err },
+        .completed => |result| .{ .completed = .{
+            .value = .{
+                .disposition = result.value.disposition,
+                .directory = if (result.value.directory) |neutral| parent.wrap(neutral) else null,
+            },
+            .after_error = result.after_error,
+        } },
+    };
+}
+
+pub fn acquireRegularFile(parent: DirectoryCapability, name: []const u8, observer: durable.Observer) durable.Outcome(durable.FileAcquisition) {
+    return durable.acquireRegularFile(parent.neutral, name, parent.admission(.regular_file), .fromMode(0o600), observer);
+}
+
+pub fn createDirectory(io: std.Io, parent: DirectoryCapability, name: []const u8, observer: durable.Observer) durable.Outcome([]const u8) {
+    return durable.createDirectory(io, parent.neutral, name, .fromMode(0o700), observer);
+}
+
+pub fn createFile(parent: DirectoryCapability, name: []const u8, observer: durable.Observer) durable.Outcome(fs.File) {
+    return durable.createFile(parent.neutral, name, .fromMode(0o600), observer);
+}
+
+pub fn syncDirectory(io: std.Io, directory: DirectoryCapability, observer: durable.Observer) durable.Outcome(void) {
+    return durable.syncDirectory(io, directory.neutral, observer);
+}
+
+pub fn movePreserving(io: std.Io, source: DirectoryCapability, source_name: []const u8, target: DirectoryCapability, target_name: []const u8, observer: durable.Observer) durable.Outcome(void) {
+    return durable.movePreserving(io, source.neutral, source_name, target.neutral, target_name, observer);
+}
+
+pub fn moveReplacing(io: std.Io, source: DirectoryCapability, source_name: []const u8, target: DirectoryCapability, target_name: []const u8, observer: durable.Observer) durable.Outcome(void) {
+    return durable.moveReplacing(io, source.neutral, source_name, target.neutral, target_name, observer);
+}
+
+pub fn removeFile(io: std.Io, directory: DirectoryCapability, name: []const u8, observer: durable.Observer) durable.Outcome(void) {
+    return durable.removeFile(io, directory.neutral, name, observer);
+}
+
+pub fn removeDirectory(io: std.Io, directory: DirectoryCapability, name: []const u8, observer: durable.Observer) durable.Outcome(void) {
+    return durable.removeDirectory(io, directory.neutral, name, observer);
+}
 
 pub const StoreRootCapability = struct {
     directory: DirectoryCapability,
@@ -156,12 +168,11 @@ fn openCanonicalPath(io: ?std.Io, path: []const u8) !StoreRootCapability {
         const child = current.openDirectory(component) catch |err| switch (err) {
             error.FileNotFound => blk: {
                 const create_io = io orelse return err;
-                const parent: std.Io.Dir = .{ .handle = current.descriptor.handle };
-                parent.createDir(create_io, component, .fromMode(0o700)) catch |create_err| switch (create_err) {
-                    error.PathAlreadyExists => {},
-                    else => return create_err,
-                };
-                try (std.Io.File{ .handle = current.descriptor.handle, .flags = .{ .nonblocking = true } }).sync(create_io);
+                switch (durable.createDirectory(create_io, current, component, .fromMode(0o700), .{})) {
+                    .not_completed => |create_err| if (create_err != error.PathAlreadyExists) return create_err,
+                    .completed => |result| if (result.after_error) |after_err| return after_err,
+                }
+                try completedVoid(durable.syncDirectory(create_io, current, .{}));
                 break :blk try current.openDirectory(component);
             },
             else => return err,
@@ -171,28 +182,13 @@ fn openCanonicalPath(io: ?std.Io, path: []const u8) !StoreRootCapability {
     }
     const uid = effectiveUid();
     try fs.admitMetadata(current.metadata, storeAdmission(.directory, current.metadata.device, uid));
-    const filesystem = FilesystemPolicy.fromMetadata(try fs.filesystemMetadataForHandle(current.descriptor));
+    const filesystem = FilesystemPolicy.fromMetadata(try fs.filesystemMetadata(current));
     if (filesystem != .local_supported) return error.UnsupportedFilesystem;
-    return .{ .directory = .{
-        .neutral = current,
-        .metadata = current.metadata,
-        .effective_uid = uid,
-        .root_device = current.metadata.device,
-    }, .filesystem = filesystem };
+    return .{ .directory = .{ .neutral = current, .metadata = current.metadata, .effective_uid = uid, .root_device = current.metadata.device }, .filesystem = filesystem };
 }
 
 fn storeAdmission(expected: ExpectedKind, device: u64, uid: u32) fs.Admission {
-    return .{
-        .expected = expected,
-        .device = device,
-        .uid = uid,
-        .mode = if (expected == .directory) 0o700 else 0o600,
-        .require_single_link = expected == .regular_file,
-    };
-}
-
-fn writableRegularFileFlags(exclusive: bool) std.posix.O {
-    return .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = exclusive, .CLOEXEC = true, .NOFOLLOW = true, .NONBLOCK = true, .NOCTTY = true };
+    return .{ .expected = expected, .device = device, .uid = uid, .mode = if (expected == .directory) 0o700 else 0o600, .require_single_link = expected == .regular_file };
 }
 
 fn effectiveUid() u32 {
@@ -203,8 +199,11 @@ fn effectiveUid() u32 {
     };
 }
 
-fn closeRaw(handle: std.posix.fd_t) void {
-    _ = std.posix.system.close(handle);
+fn completedVoid(outcome: durable.Outcome(void)) !void {
+    switch (outcome) {
+        .not_completed => |err| return err,
+        .completed => |result| if (result.after_error) |err| return err,
+    }
 }
 
 test "neutral filesystem capability keeps Review Store policy in its facade" {
@@ -309,10 +308,11 @@ test "neutral filesystem capability keeps canonical Store descriptor pinned acro
     try std.testing.expectEqualStrings("accepted-ancestor", ancestor_marker);
 }
 
-test "neutral filesystem ownership proof transitional closes permitted Store consumers and preserves repository cwd" {
-    try expectTypedTransitionalSurfaces();
+test "neutral filesystem ownership proof final closes permitted Store consumers and preserves repository cwd" {
+    try expectTypedFinalSurfaces();
     try expectClosedProductionConsumers(std.testing.allocator, std.testing.io);
     try expectRepositoryCwdAuthority(std.testing.allocator, std.testing.io);
+    try expectProductionLineCeilings(std.testing.allocator, std.testing.io);
 }
 
 const direct_consumers = [_][]const u8{
@@ -325,7 +325,7 @@ const direct_consumers = [_][]const u8{
     "src/review_store/mutation.zig",
 };
 
-fn expectTypedTransitionalSurfaces() !void {
+fn expectTypedFinalSurfaces() !void {
     const neutral_fields = @typeInfo(fs.Directory).@"struct".fields;
     try std.testing.expectEqual(@as(usize, 2), neutral_fields.len);
     try std.testing.expectEqualStrings("descriptor", neutral_fields[0].name);
@@ -372,8 +372,8 @@ fn expectTypedTransitionalSurfaces() !void {
     try std.testing.expect(iterator_next.params[2].type.? == std.Io);
     try std.testing.expect(iterator_next.return_type.? == std.Io.Dir.Iterator.Error!?std.Io.Dir.Entry);
     inline for (.{
-        "dir",            "rawHandle",     "createDirectory", "createFile",      "writeAll", "syncFile", "syncDirectory",
-        "movePreserving", "moveReplacing", "removeFile",      "removeDirectory",
+        "dir",            "rawHandle",     "createDirectory", "createFile",      "writeAll",         "syncFile",           "syncDirectory",
+        "movePreserving", "moveReplacing", "removeFile",      "removeDirectory", "acquireDirectory", "acquireRegularFile",
     }) |name| try std.testing.expect(!@hasDecl(fs.Directory, name));
 
     const facade_fields = @typeInfo(DirectoryCapability).@"struct".fields;
@@ -385,17 +385,45 @@ fn expectTypedTransitionalSurfaces() !void {
         try std.testing.expect(field.type != std.Io.File);
     }
     try std.testing.expectEqual(@as(usize, 1), neutral_fields_found);
-    inline for (.{
-        "createDirectory", "createFile", "writeAll",        "syncFile",         "syncDirectory",      "movePreserving",
-        "moveReplacing",   "removeFile", "removeDirectory", "acquireDirectory", "acquireRegularFile",
-    }) |name| {
-        try std.testing.expect(!@hasDecl(fs, name));
-        try std.testing.expect(!@hasDecl(fs.Directory, name));
-    }
+    const facade_operations = [_][]const u8{ "duplicate", "deinit", "openDirectory", "admitChild", "iterate", "readRegularAlloc" };
+    inline for (@typeInfo(DirectoryCapability).@"struct".decls) |decl| try std.testing.expect(nameIn(decl.name, &facade_operations));
+    inline for (.{ "dir", "rawHandle", "getOrCreateDirectory", "openOrCreateRegularFile", "createRegularFileExclusive", "sync" }) |name|
+        try std.testing.expect(!@hasDecl(DirectoryCapability, name));
+    const facade_iterator = @typeInfo(@TypeOf(DirectoryCapability.iterate)).@"fn".return_type.?;
+    try std.testing.expect(facade_iterator == Iterator);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(Iterator).@"struct".fields.len);
+    try std.testing.expect(@FieldType(Iterator, "neutral") == fs.Iterator);
+    const facade_next = @typeInfo(@TypeOf(Iterator.next)).@"fn";
+    try std.testing.expect(facade_next.params[0].type.? == *Iterator);
+    try std.testing.expect(facade_next.params[1].type.? == DirectoryCapability);
+    try std.testing.expect(facade_next.params[2].type.? == std.Io);
+
+    const durable_declarations = [_][]const u8{
+        "Operation",       "Edge",                   "Step",                 "Observer",
+        "Outcome",         "AcquisitionDisposition", "DirectoryAcquisition", "FileAcquisition",
+        "createDirectory", "createFile",             "writeAll",             "syncFile",
+        "syncDirectory",   "movePreserving",         "moveReplacing",        "removeFile",
+        "removeDirectory", "acquireDirectory",       "acquireRegularFile",
+    };
+    inline for (@typeInfo(durable).@"struct".decls) |decl| try std.testing.expect(nameIn(decl.name, &durable_declarations));
+    inline for (durable_declarations) |name| try std.testing.expect(@hasDecl(durable, name));
+    const operation_names = [_][]const u8{
+        "create_directory", "create_file",    "write",       "sync_file",        "sync_directory",
+        "rename_preserve",  "rename_replace", "unlink_file", "unlink_directory",
+    };
+    inline for (@typeInfo(durable.Operation).@"enum".fields, operation_names) |field, expected|
+        try std.testing.expectEqualStrings(expected, field.name);
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(durable.Edge).@"enum".fields.len);
+    try std.testing.expect(@FieldType(durable.Step, "operation") == durable.Operation);
+    try std.testing.expect(@FieldType(durable.Step, "edge") == durable.Edge);
+    const outcome_fields = @typeInfo(durable.Outcome(void)).@"union".fields;
+    try std.testing.expectEqual(@as(usize, 2), outcome_fields.len);
+    try std.testing.expectEqualStrings("not_completed", outcome_fields[0].name);
+    try std.testing.expectEqualStrings("completed", outcome_fields[1].name);
     try std.testing.expect(hasDirectCapabilityMarker("src/unexpected.zig", "const capability = @import(\"review_store/capability.zig\");"));
-    try std.testing.expect(hasLegacyRawStoreAccess("const handle = store.neutral.descriptor.handle;"));
-    try std.testing.expect(hasLegacyRawStoreAccess("const descriptor = @field(store, \"neutral\");"));
-    try std.testing.expect(hasLegacyRawStoreAccess("const dir = store.iterate().reader.dir;"));
+    try std.testing.expect(hasForbiddenStoreAccess("const handle = store.neutral.descriptor.handle;", false));
+    try std.testing.expect(hasForbiddenStoreAccess("const descriptor = @field(store, \"neutral\");", false));
+    try std.testing.expect(hasForbiddenStoreAccess("const dir = store.iterate().reader.dir;", false));
 }
 
 fn expectClosedProductionConsumers(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -423,16 +451,24 @@ fn expectClosedProductionConsumers(allocator: std.mem.Allocator, io: std.Io) !vo
 
         const imports_neutral = std.mem.indexOf(u8, prefix, "fs/capability.zig\")") != null;
         if (imports_neutral and !std.mem.eql(u8, path, direct_consumers[0])) return ownershipFailure("unknown-neutral-importer", path);
+        const imports_durable = std.mem.indexOf(u8, prefix, "fs/durable.zig\")") != null;
+        if (imports_durable != durableOwner(path)) return ownershipFailure("durable-import-owner-mismatch", path);
         const facade_only = std.mem.indexOf(u8, prefix, "review_store.zig\")") != null and consumerIndex(path) == null;
         if (facade_only and (imports_neutral or std.mem.indexOf(u8, prefix, "StoreRootCapability") != null or
-            std.mem.indexOf(u8, prefix, "DirectoryCapability") != null or std.mem.indexOf(u8, prefix, "fs/durable.zig") != null))
+            std.mem.indexOf(u8, prefix, "DirectoryCapability") != null or imports_durable or
+            std.mem.indexOf(u8, prefix, ".neutral") != null or std.mem.indexOf(u8, prefix, ".descriptor") != null or
+            std.mem.indexOf(u8, prefix, "durable.") != null))
         {
             return ownershipFailure("facade-importer-owns-capability", path);
         }
-        if (consumerIndex(path) != null and hasLegacyRawStoreAccess(prefix) and !legacyTransitionalOwner(path)) {
-            return ownershipFailure("raw-store-access-outside-transitional-owner", path);
+        if (consumerIndex(path) != null) {
+            const facade_owner = std.mem.eql(u8, path, direct_consumers[0]);
+            if (hasForbiddenStoreAccess(prefix, facade_owner)) return ownershipFailure("forbidden-store-access", path);
+            if (std.mem.count(u8, prefix, ".dir()") != expectedRepositoryDirCount(path))
+                return ownershipFailure("repository-cwd-conversion-count", path);
         }
         if (std.mem.eql(u8, path, "src/fs/capability.zig")) try expectNeutralProductionPrefix(prefix);
+        if (std.mem.eql(u8, path, "src/fs/durable.zig")) try expectDurableProductionPrefix(prefix);
     }
     for (seen, direct_consumers) |found, path| if (!found) return ownershipFailure("missing-consumer", path);
 }
@@ -468,6 +504,31 @@ fn expectRepositoryCwdAuthority(allocator: std.mem.Allocator, io: std.Io) !void 
     std.debug.print("ownership-proof cwd conversions: history=1 publication-context=1 publication-discovery=1\n", .{});
 }
 
+fn expectProductionLineCeilings(allocator: std.mem.Allocator, io: std.Io) !void {
+    const core_paths = [_][]const u8{
+        "src/fs/capability.zig",            "src/fs/durable.zig",            "src/review_store/capability.zig",
+        "src/review_store/publication.zig", "src/review_store/mutation.zig",
+    };
+    const supporting_paths = [_][]const u8{
+        "src/review_store/history.zig", "src/review_store/registry.zig",
+        "src/review_store/run.zig",     "src/review_store.zig",
+    };
+    var core: usize = 0;
+    for (core_paths) |path| core += try productionLineCount(allocator, io, path);
+    var complete = core;
+    for (supporting_paths) |path| complete += try productionLineCount(allocator, io, path);
+    std.debug.print("ownership-proof production-prefix LOC: core={d}/1841 complete={d}/3066\n", .{ core, complete });
+    try std.testing.expect(core <= 1841);
+    try std.testing.expect(complete <= 3066);
+}
+
+fn productionLineCount(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !usize {
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
+    defer allocator.free(source);
+    const prefix = productionPrefix(source);
+    return std.mem.count(u8, prefix, "\n") + @intFromBool(prefix.len != 0 and prefix[prefix.len - 1] != '\n');
+}
+
 fn hasDirectCapabilityMarker(path: []const u8, source: []const u8) bool {
     if (std.mem.eql(u8, path, "src/review_store/capability.zig")) return std.mem.indexOf(u8, source, "../fs/capability.zig") != null;
     if (std.mem.eql(u8, path, "src/review_store.zig")) return std.mem.indexOf(u8, source, "review_store/capability.zig") != null;
@@ -476,19 +537,30 @@ fn hasDirectCapabilityMarker(path: []const u8, source: []const u8) bool {
         std.mem.indexOf(u8, source, "StoreRootCapability") != null or std.mem.indexOf(u8, source, "DirectoryCapability") != null;
 }
 
-fn hasLegacyRawStoreAccess(source: []const u8) bool {
-    inline for (.{ ".dir()", ".neutral", ".descriptor", ".handle", ".reader.dir", "@field(", "std.posix.openat", "createDir(", "writeStreamingAll(", ".sync(", ".rename(", ".renamePreserve(", ".deleteFile(", ".deleteDir(" }) |marker| {
+fn hasForbiddenStoreAccess(source: []const u8, allow_facade_neutral: bool) bool {
+    if (!allow_facade_neutral and std.mem.indexOf(u8, source, ".neutral") != null) return true;
+    inline for (.{
+        ".descriptor",          ".handle",                 ".reader.dir",                "@field(",
+        "std.posix.openat",     "createDir(",              "writeStreamingAll(",         ".sync(",
+        ".rename(",             ".renamePreserve(",        ".deleteFile(",               ".deleteDir(",
+        ".CREAT =",             ".TRUNC =",                ".EXCL =",                    ".RDWR",
+        "getOrCreateDirectory", "openOrCreateRegularFile", "createRegularFileExclusive",
+    }) |marker| {
         if (std.mem.indexOf(u8, source, marker) != null) return true;
     }
     return false;
 }
 
-fn legacyTransitionalOwner(path: []const u8) bool {
-    inline for (.{
-        "src/review_store/capability.zig",  "src/review_store/history.zig",  "src/review_store/run.zig",
-        "src/review_store/publication.zig", "src/review_store/mutation.zig",
-    }) |permitted| if (std.mem.eql(u8, path, permitted)) return true;
-    return false;
+fn durableOwner(path: []const u8) bool {
+    return std.mem.eql(u8, path, "src/review_store/capability.zig") or
+        std.mem.eql(u8, path, "src/review_store/publication.zig") or
+        std.mem.eql(u8, path, "src/review_store/mutation.zig");
+}
+
+fn expectedRepositoryDirCount(path: []const u8) usize {
+    if (std.mem.eql(u8, path, "src/review_store/history.zig")) return 1;
+    if (std.mem.eql(u8, path, "src/review_store/publication.zig")) return 2;
+    return 0;
 }
 
 fn expectNeutralProductionPrefix(source: []const u8) !void {
@@ -497,6 +569,13 @@ fn expectNeutralProductionPrefix(source: []const u8) !void {
         ".sync(",       ".rename(",  ".renamePreserve(", ".deleteFile(", ".deleteDir(", ".CREAT =",
         ".TRUNC =",     ".EXCL =",
     }) |marker| if (std.mem.indexOf(u8, source, marker) != null) return ownershipFailure("neutral-capability-forbidden-marker", marker);
+}
+
+fn expectDurableProductionPrefix(source: []const u8) !void {
+    inline for (.{ "review_store", "ai_review", "committed_review", "../repo", "transaction", "journal", "recovery" }) |marker|
+        if (std.mem.indexOf(u8, source, marker) != null) return ownershipFailure("neutral-durable-forbidden-marker", marker);
+    inline for (.{ "std.posix.openat", "writeStreamingAll(", ".sync(", ".rename(", ".renamePreserve(", ".deleteFile(", ".deleteDir(" }) |marker|
+        if (std.mem.count(u8, source, marker) == 0) return ownershipFailure("neutral-durable-missing-operation", marker);
 }
 
 fn consumerIndex(path: []const u8) ?usize {

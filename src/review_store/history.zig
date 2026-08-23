@@ -178,8 +178,8 @@ pub fn scan(
     var name_bytes: usize = 0;
     var skipped_count: usize = 0;
     var orphan_count: usize = 0;
-    var iterator = namespace.dir().iterate();
-    while (iterator.next(io) catch return .{ .failure = .enumeration_failed }) |entry| {
+    var iterator = namespace.iterate();
+    while (iterator.next(namespace, io) catch return .{ .failure = .enumeration_failed }) |entry| {
         entry_count += 1;
         name_bytes = std.math.add(usize, name_bytes, entry.name.len) catch
             return .{ .failure = .scan_limit_exceeded };

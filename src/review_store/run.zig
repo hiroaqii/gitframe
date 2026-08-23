@@ -272,8 +272,8 @@ const AuthorityEntries = struct {
 
 fn enumerateAuthorityEntries(io: std.Io, run_dir: capability.DirectoryCapability) !AuthorityEntries {
     var result: AuthorityEntries = .{};
-    var iterator = run_dir.dir().iterate();
-    while (try iterator.next(io)) |entry| {
+    var iterator = run_dir.iterate();
+    while (try iterator.next(run_dir, io)) |entry| {
         if (std.mem.eql(u8, entry.name, "manifest.json")) {
             result.manifest = true;
         } else if (std.mem.eql(u8, entry.name, "findings.json")) {

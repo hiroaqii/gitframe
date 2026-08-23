@@ -123,6 +123,7 @@ test {
     _ = @import("editor.zig");
     _ = @import("external/action.zig");
     _ = @import("fs/capability.zig");
+    _ = @import("fs/durable.zig");
     _ = @import("git/remote.zig");
     _ = @import("git/branch_status.zig");
     _ = @import("git/command.zig");

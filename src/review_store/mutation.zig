@@ -7,21 +7,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const committed_review = @import("../committed_review.zig");
+const durable = @import("../fs/durable.zig");
 const capability = @import("capability.zig");
 const registry = @import("registry.zig");
 const run_artifacts = @import("run.zig");
 const store_path = @import("path.zig");
 
-pub const Failure = enum {
-    conflict,
-    draft_required,
-    already_completed,
-    binding_changed,
-    run_invalid,
-    clock_unavailable,
-    unsupported,
-    io_failed,
-};
+pub const Failure = enum { conflict, draft_required, already_completed, binding_changed, run_invalid, clock_unavailable, unsupported, io_failed };
 
 pub const RunBinding = struct {
     review_repository_id: committed_review.ReviewRepositoryId,
@@ -46,11 +38,7 @@ pub const DraftRequest = struct {
     anchored_notes: []const committed_review.AnchoredNote,
 };
 
-pub const ResultRequest = struct {
-    binding: RunBinding,
-    expected_revision: u64,
-    decision: committed_review.ReviewResultValue,
-};
+pub const ResultRequest = struct { binding: RunBinding, expected_revision: u64, decision: committed_review.ReviewResultValue };
 
 pub const DraftCommit = struct {
     revision: u64,
@@ -100,13 +88,13 @@ pub const ResultResult = union(enum) {
 };
 
 const HeldLock = struct {
-    file: std.Io.File,
+    file: @FieldType(durable.FileAcquisition, "file"),
     io: std.Io,
     root_metadata: capability.Metadata,
 
     fn deinit(self: *HeldLock) void {
         self.file.unlock(self.io);
-        self.file.close(self.io);
+        self.file.deinit();
         self.* = undefined;
     }
 };
@@ -126,34 +114,7 @@ const LockedRun = struct {
     }
 };
 
-const OpenResult = union(enum) {
-    opened: LockedRun,
-    failure: Failure,
-};
-
-const FaultPoint = enum {
-    before_file_sync,
-    after_file_sync,
-    before_staging_namespace_sync,
-    after_staging_namespace_sync,
-    before_rename,
-    after_rename,
-    before_run_sync,
-    after_run_sync,
-    before_final_namespace_sync,
-    after_final_namespace_sync,
-};
-
-const Faults = struct {
-    context: ?*anyopaque = null,
-    check_fn: *const fn (?*anyopaque, FaultPoint) anyerror!void = noFault,
-
-    fn check(self: Faults, point: FaultPoint) !void {
-        try self.check_fn(self.context, point);
-    }
-
-    fn noFault(_: ?*anyopaque, _: FaultPoint) !void {}
-};
+const OpenResult = union(enum) { opened: LockedRun, failure: Failure };
 
 const Clock = struct {
     context: ?*anyopaque = null,
@@ -165,12 +126,7 @@ const Clock = struct {
 };
 
 /// Persist one complete draft snapshot with revision compare-and-swap.
-pub fn saveDraft(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    resolved_store: *const store_path.Resolved,
-    request: DraftRequest,
-) std.mem.Allocator.Error!DraftResult {
+pub fn saveDraft(allocator: std.mem.Allocator, io: std.Io, resolved_store: *const store_path.Resolved, request: DraftRequest) std.mem.Allocator.Error!DraftResult {
     const store_root = switch (resolved_store.*) {
         .available => |value| value,
         .unavailable => return .{ .failure = .io_failed },
@@ -178,13 +134,7 @@ pub fn saveDraft(
     return saveDraftWith(allocator, io, store_root, request, .{});
 }
 
-fn saveDraftWith(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    store_root: []const u8,
-    request: DraftRequest,
-    faults: Faults,
-) std.mem.Allocator.Error!DraftResult {
+fn saveDraftWith(allocator: std.mem.Allocator, io: std.Io, store_root: []const u8, request: DraftRequest, observer: durable.Observer) std.mem.Allocator.Error!DraftResult {
     var lock = switch (acquireRunLock(io, store_root, request.binding)) {
         .lock => |value| value,
         .failure => |failure| return .{ .failure = failure },
@@ -230,7 +180,7 @@ fn saveDraftWith(
         "review_state.json",
         bytes,
         .replace,
-        faults,
+        observer,
     ) catch |err| return .{ .failure = mapMutationError(err) };
     bytes_owned = false;
     return .{ .committed = .{ .revision = next_revision, .canonical_bytes = bytes } };
@@ -238,12 +188,7 @@ fn saveDraftWith(
 
 /// Create the terminal result from the exact latest draft and one real-clock
 /// sample. Existing result authority is never replaced.
-pub fn createResult(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    resolved_store: *const store_path.Resolved,
-    request: ResultRequest,
-) std.mem.Allocator.Error!ResultResult {
+pub fn createResult(allocator: std.mem.Allocator, io: std.Io, resolved_store: *const store_path.Resolved, request: ResultRequest) std.mem.Allocator.Error!ResultResult {
     const store_root = switch (resolved_store.*) {
         .available => |value| value,
         .unavailable => return .{ .failure = .io_failed },
@@ -251,23 +196,7 @@ pub fn createResult(
     return createResultWith(allocator, io, store_root, request, .{}, .{});
 }
 
-fn saveDraftAt(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    store_root: []const u8,
-    request: DraftRequest,
-) std.mem.Allocator.Error!DraftResult {
-    return saveDraftWith(allocator, io, store_root, request, .{});
-}
-
-fn createResultWith(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    store_root: []const u8,
-    request: ResultRequest,
-    clock: Clock,
-    faults: Faults,
-) std.mem.Allocator.Error!ResultResult {
+fn createResultWith(allocator: std.mem.Allocator, io: std.Io, store_root: []const u8, request: ResultRequest, clock: Clock, observer: durable.Observer) std.mem.Allocator.Error!ResultResult {
     var lock = switch (acquireRunLock(io, store_root, request.binding)) {
         .lock => |value| value,
         .failure => |failure| return .{ .failure = failure },
@@ -321,7 +250,7 @@ fn createResultWith(
         "result.json",
         bytes,
         .no_replace,
-        faults,
+        observer,
     ) catch |err| {
         if (err == error.PathAlreadyExists) {
             var reconciliation = try reopenRun(allocator, io, run.namespace, request.binding);
@@ -361,10 +290,17 @@ fn acquireRunLock(io: std.Io, store_root: []const u8, binding: RunBinding) LockR
     var lock_name_buffer: [41]u8 = undefined;
     const lock_name = std.fmt.bufPrint(&lock_name_buffer, "{s}.lock", .{review_text}) catch
         return .{ .failure = .io_failed };
-    const file = repository_locks.openOrCreateRegularFile(lock_name) catch |err|
+    const acquired = switch (capability.acquireRegularFile(repository_locks, lock_name, .{})) {
+        .not_completed => |err| return .{ .failure = mapMutationError(err) },
+        .completed => |result| result,
+    };
+    var file = acquired.value.file;
+    if (acquired.after_error) |err| {
+        file.deinit();
         return .{ .failure = mapMutationError(err) };
+    }
     file.lock(io, .exclusive) catch |err| {
-        file.close(io);
+        file.deinit();
         return .{ .failure = mapMutationError(err) };
     };
     return .{ .lock = .{
@@ -481,10 +417,11 @@ fn writeMutationFile(
     final_name: []const u8,
     bytes: []const u8,
     rename_mode: RenameMode,
-    faults: Faults,
+    observer: durable.Observer,
 ) !void {
     var formatted: store_path.NamespaceTempName.Formatted = undefined;
-    var file_value: ?std.Io.File = null;
+    var file_value: ?@FieldType(durable.FileAcquisition, "file") = null;
+    var create_after_error: ?anyerror = null;
     for (0..8) |_| {
         var token: [16]u8 = undefined;
         try io.randomSecure(&token);
@@ -493,43 +430,53 @@ fn writeMutationFile(
             .review_id = review_id,
             .token = token,
         }).format();
-        file_value = namespace.createRegularFileExclusive(formatted.slice()) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
-            else => return err,
-        };
+        switch (capability.createFile(namespace, formatted.slice(), observer)) {
+            .not_completed => |err| if (err == error.PathAlreadyExists) continue else return err,
+            .completed => |result| {
+                file_value = result.value;
+                create_after_error = result.after_error;
+            },
+        }
         break;
     }
-    const file = file_value orelse return error.ConcurrentStagingConflict;
+    var file = file_value orelse return error.ConcurrentStagingConflict;
     const temp_name = formatted.slice();
     var renamed = false;
     defer if (!renamed) cleanupOwnTemp(io, namespace, temp_name);
-    defer file.close(io);
+    defer file.deinit();
+    if (create_after_error) |err| return err;
 
-    try file.writeStreamingAll(io, bytes);
-    try faults.check(.before_file_sync);
-    try file.sync(io);
-    try faults.check(.after_file_sync);
-    try faults.check(.before_staging_namespace_sync);
-    try namespace.sync(io);
-    try faults.check(.after_staging_namespace_sync);
-    try faults.check(.before_rename);
-    switch (rename_mode) {
-        .replace => try namespace.dir().rename(temp_name, run.dir(), final_name, io),
-        .no_replace => try namespace.dir().renamePreserve(temp_name, run.dir(), final_name, io),
+    try completedVoid(durable.writeAll(io, file, bytes, observer));
+    try completedVoid(durable.syncFile(io, file, observer));
+    try completedVoid(capability.syncDirectory(io, namespace, observer));
+    const moved = switch (rename_mode) {
+        .replace => capability.moveReplacing(io, namespace, temp_name, run, final_name, observer),
+        .no_replace => capability.movePreserving(io, namespace, temp_name, run, final_name, observer),
+    };
+    switch (moved) {
+        .not_completed => |err| return err,
+        .completed => |result| {
+            renamed = true;
+            if (result.after_error) |err| return err;
+        },
     }
-    renamed = true;
-    try faults.check(.after_rename);
-    try faults.check(.before_run_sync);
-    try run.sync(io);
-    try faults.check(.after_run_sync);
-    try faults.check(.before_final_namespace_sync);
-    try namespace.sync(io);
-    try faults.check(.after_final_namespace_sync);
+    try completedVoid(capability.syncDirectory(io, run, observer));
+    try completedVoid(capability.syncDirectory(io, namespace, observer));
 }
 
 fn cleanupOwnTemp(io: std.Io, namespace: capability.DirectoryCapability, name: []const u8) void {
-    namespace.dir().deleteFile(io, name) catch return;
-    namespace.sync(io) catch {};
+    switch (capability.removeFile(io, namespace, name, .{})) {
+        .not_completed => return,
+        .completed => {},
+    }
+    _ = capability.syncDirectory(io, namespace, .{});
+}
+
+fn completedVoid(outcome: durable.Outcome(void)) !void {
+    switch (outcome) {
+        .not_completed => |err| return err,
+        .completed => |result| if (result.after_error) |err| return err,
+    }
 }
 
 fn sampleRealClock(_: ?*anyopaque, io: std.Io) ?i64 {
@@ -671,44 +618,54 @@ test "review state persistence draft CAS and trusted-clock result round trip" {
     try std.testing.expectEqual(Failure.already_completed, frozen.failure);
 }
 
+fn saveDraftAt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_root: []const u8,
+    request: DraftRequest,
+) std.mem.Allocator.Error!DraftResult {
+    return saveDraftWith(allocator, io, store_root, request, .{});
+}
+
 test "review state persistence fault boundaries leave old or new byte-complete authority" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const points = [_]FaultPoint{
-        .before_file_sync,
-        .after_file_sync,
-        .before_staging_namespace_sync,
-        .after_staging_namespace_sync,
-        .before_rename,
-        .after_rename,
-        .before_run_sync,
-        .after_run_sync,
-        .before_final_namespace_sync,
-        .after_final_namespace_sync,
+    const cases = [_]MutationFaultCase{
+        .{ .operation = .create_file, .edge = .after },
+        .{ .operation = .sync_file, .edge = .before },
+        .{ .operation = .sync_file, .edge = .after },
+        .{ .operation = .sync_directory, .edge = .before, .occurrence = 0 },
+        .{ .operation = .sync_directory, .edge = .after, .occurrence = 0 },
+        .{ .operation = .rename_replace, .edge = .before, .rename = true },
+        .{ .operation = .rename_replace, .edge = .after, .rename = true, .committed = true },
+        .{ .operation = .sync_directory, .edge = .before, .occurrence = 1, .committed = true },
+        .{ .operation = .sync_directory, .edge = .after, .occurrence = 1, .committed = true },
+        .{ .operation = .sync_directory, .edge = .before, .occurrence = 2, .committed = true },
+        .{ .operation = .sync_directory, .edge = .after, .occurrence = 2, .committed = true },
     };
-    for (points, 0..) |point, index| {
+    for (cases, 0..) |case, index| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var name_buffer: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buffer, "store-{d}", .{index});
         var fixture = try TestFixture.init(allocator, io, tmp.dir, name);
         defer fixture.deinit(allocator);
-        var injected = InjectedFault{ .point = point };
+        var injected = TestStepObserver{ .selected = case.step(.rename_replace), .occurrence = case.occurrence };
         var result = try saveDraftWith(
             allocator,
             io,
             fixture.store_root,
             fixture.draftRequest(0, "faulted"),
-            .{ .context = &injected, .check_fn = &InjectedFault.check },
+            injected.observer(),
         );
         defer result.deinit(allocator);
         try std.testing.expectEqual(Failure.io_failed, result.failure);
 
         var reopened = try fixture.reopen(allocator, io);
         defer reopened.deinit(allocator);
-        const after_rename = @intFromEnum(point) >= @intFromEnum(FaultPoint.after_rename);
-        if (after_rename) {
+        try std.testing.expect(injected.fired);
+        if (case.committed) {
             try std.testing.expectEqual(committed_review.ReviewRunState.draft, reopened.loaded.state);
             try std.testing.expectEqualStrings("faulted", reopened.loaded.draft.?.value.summary.?);
         } else {
@@ -717,7 +674,7 @@ test "review state persistence fault boundaries leave old or new byte-complete a
         try fixture.expectNoOwnTemp(io, .draft);
     }
 
-    for (points, 0..) |point, index| {
+    for (cases, 0..) |case, index| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var name_buffer: [32]u8 = undefined;
@@ -726,7 +683,7 @@ test "review state persistence fault boundaries leave old or new byte-complete a
         defer fixture.deinit(allocator);
         var draft = try saveDraftAt(allocator, io, fixture.store_root, fixture.draftRequest(0, "terminal"));
         defer draft.deinit(allocator);
-        var injected = InjectedFault{ .point = point };
+        var injected = TestStepObserver{ .selected = case.step(.rename_preserve), .occurrence = case.occurrence };
         var clock_value = try committed_review.strict_json.timestampToUnixSeconds("2026-05-03T00:00:00Z");
         var result = try createResultWith(
             allocator,
@@ -734,15 +691,15 @@ test "review state persistence fault boundaries leave old or new byte-complete a
             fixture.store_root,
             fixture.resultRequest(1, .approved),
             .{ .context = &clock_value, .sample_fn = &fixedClock },
-            .{ .context = &injected, .check_fn = &InjectedFault.check },
+            injected.observer(),
         );
         defer result.deinit(allocator);
         try std.testing.expectEqual(Failure.io_failed, result.failure);
 
         var reopened = try fixture.reopen(allocator, io);
         defer reopened.deinit(allocator);
-        const after_rename = @intFromEnum(point) >= @intFromEnum(FaultPoint.after_rename);
-        if (after_rename) {
+        try std.testing.expect(injected.fired);
+        if (case.committed) {
             try std.testing.expectEqual(committed_review.ReviewRunState.completed, reopened.loaded.state);
             try std.testing.expectEqual(committed_review.ReviewResultValue.approved, reopened.loaded.result.?.value.result);
             try std.testing.expectEqualStrings("terminal", reopened.loaded.result.?.value.summary.?);
@@ -802,7 +759,7 @@ test "review state persistence result no-replace reconciles winner and preserves
         fixture.store_root,
         fixture.resultRequest(1, .needs_changes),
         .{ .context = &clock_value, .sample_fn = &fixedClock },
-        .{ .context = &race, .check_fn = &ResultRace.check },
+        .{ .context = &race, .observe_fn = &ResultRace.observe },
     );
     defer result.deinit(allocator);
     try std.testing.expectEqual(Failure.already_completed, result.failure);
@@ -835,7 +792,7 @@ test "review state persistence result no-replace reconciles winner and preserves
         invalid_fixture.store_root,
         invalid_fixture.resultRequest(1, .approved),
         .{ .context = &invalid_clock, .sample_fn = &fixedClock },
-        .{ .context = &invalid_race, .check_fn = &ResultRace.check },
+        .{ .context = &invalid_race, .observe_fn = &ResultRace.observe },
     );
     defer invalid_result.deinit(allocator);
     try std.testing.expectEqual(Failure.run_invalid, invalid_result.failure);
@@ -854,16 +811,35 @@ fn missingClock(_: ?*anyopaque, _: std.Io) ?i64 {
     return null;
 }
 
-const InjectedFault = struct {
-    point: FaultPoint,
+const MutationFaultCase = struct {
+    operation: durable.Operation,
+    edge: durable.Edge,
+    occurrence: usize = 0,
+    rename: bool = false,
+    committed: bool = false,
+
+    fn step(self: @This(), rename_operation: durable.Operation) durable.Step {
+        return .{ .operation = if (self.rename) rename_operation else self.operation, .edge = self.edge };
+    }
+};
+
+const TestStepObserver = struct {
+    selected: durable.Step,
+    occurrence: usize,
+    seen: usize = 0,
     fired: bool = false,
 
-    fn check(context: ?*anyopaque, point: FaultPoint) !void {
-        const self: *InjectedFault = @ptrCast(@alignCast(context.?));
-        if (!self.fired and self.point == point) {
-            self.fired = true;
-            return error.InjectedFault;
-        }
+    fn observe(context: ?*anyopaque, step: durable.Step) !void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.selected.operation != step.operation or self.selected.edge != step.edge) return;
+        defer self.seen += 1;
+        if (self.seen != self.occurrence) return;
+        self.fired = true;
+        return error.InjectedFault;
+    }
+
+    fn observer(self: *@This()) durable.Observer {
+        return .{ .context = self, .observe_fn = observe };
     }
 };
 
@@ -873,9 +849,9 @@ const ResultRace = struct {
     winner_bytes: []const u8,
     fired: bool = false,
 
-    fn check(context: ?*anyopaque, point: FaultPoint) !void {
+    fn observe(context: ?*anyopaque, step: durable.Step) !void {
         const self: *ResultRace = @ptrCast(@alignCast(context.?));
-        if (self.fired or point != .before_rename) return;
+        if (self.fired or step.operation != .rename_preserve or step.edge != .before) return;
         self.fired = true;
         try self.run.writeFile(self.io, .{
             .sub_path = "result.json",

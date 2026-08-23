@@ -11,48 +11,18 @@ const git_command = @import("../git/command.zig");
 const git_review = @import("../git/committed_review.zig");
 const repository_locator = @import("../git/repository_locator.zig");
 const root_capability = @import("../repo/root_capability.zig");
+const durable = @import("../fs/durable.zig");
 const capability = @import("capability.zig");
 const registry = @import("registry.zig");
 const run_artifacts = @import("run.zig");
 const store_path = @import("path.zig");
 
-pub const Failure = enum {
-    invalid_artifact,
-    target_unavailable,
-    store_unavailable,
-    unsupported_platform,
-    unsupported_filesystem,
-    duplicate_review_id,
-    store_invalid,
-    repository_invalid,
-    git_failed,
-    io_failed,
-    binding_mismatch,
-    concurrent_conflict,
-};
+pub const Failure = enum { invalid_artifact, target_unavailable, store_unavailable, unsupported_platform, unsupported_filesystem, duplicate_review_id, store_invalid, repository_invalid, git_failed, io_failed, binding_mismatch, concurrent_conflict };
 
-pub const PrepareSuccess = struct {
-    review_repository_id: committed_review.ReviewRepositoryId,
-    review_id: committed_review.ReviewId,
-};
-
-pub const PrepareResult = union(enum) {
-    success: PrepareSuccess,
-    failure: Failure,
-};
-
-pub const PublishRequest = struct {
-    repository_path: []const u8,
-    review_repository_id: committed_review.ReviewRepositoryId,
-    review_id: committed_review.ReviewId,
-    manifest_bytes: []const u8,
-    findings_bytes: []const u8,
-};
-
-pub const PublishResult = union(enum) {
-    success,
-    failure: Failure,
-};
+pub const PrepareSuccess = struct { review_repository_id: committed_review.ReviewRepositoryId, review_id: committed_review.ReviewId };
+pub const PrepareResult = union(enum) { success: PrepareSuccess, failure: Failure };
+pub const PublishRequest = struct { repository_path: []const u8, review_repository_id: committed_review.ReviewRepositoryId, review_id: committed_review.ReviewId, manifest_bytes: []const u8, findings_bytes: []const u8 };
+pub const PublishResult = union(enum) { success, failure: Failure };
 
 const RepositoryContext = struct {
     root: root_capability.RootCapability,
@@ -70,10 +40,7 @@ const RepositoryContext = struct {
     }
 };
 
-const RepositoryOpenResult = union(enum) {
-    context: RepositoryContext,
-    failure: Failure,
-};
+const RepositoryOpenResult = union(enum) { context: RepositoryContext, failure: Failure };
 
 const ResolvedStore = union(enum) {
     path: []u8,
@@ -89,40 +56,14 @@ const ResolvedStore = union(enum) {
 };
 
 const HeldLock = struct {
-    file: std.Io.File,
+    file: @FieldType(durable.FileAcquisition, "file"),
     io: std.Io,
 
     fn deinit(self: *HeldLock) void {
         self.file.unlock(self.io);
-        self.file.close(self.io);
+        self.file.deinit();
         self.* = undefined;
     }
-};
-
-const PublicationFaultPoint = enum {
-    before_manifest_sync,
-    after_manifest_sync,
-    before_findings_sync,
-    after_findings_sync,
-    before_staging_directory_sync,
-    after_staging_directory_sync,
-    before_staging_namespace_sync,
-    after_staging_namespace_sync,
-    before_rename,
-    after_rename,
-    before_final_namespace_sync,
-    after_final_namespace_sync,
-};
-
-const PublicationFaults = struct {
-    context: ?*anyopaque = null,
-    check_fn: *const fn (?*anyopaque, PublicationFaultPoint) anyerror!void = noFault,
-
-    fn check(self: PublicationFaults, point: PublicationFaultPoint) !void {
-        try self.check_fn(self.context, point);
-    }
-
-    fn noFault(_: ?*anyopaque, _: PublicationFaultPoint) !void {}
 };
 
 /// Resolve one physical repository and durably get-or-create its machine-local
@@ -151,7 +92,7 @@ pub fn prepare(
         return .{ .failure = mapStoreCreateError(err) };
     };
     defer root.deinit();
-    var locks = root.directory.getOrCreateDirectory(io, ".locks") catch |err| {
+    var locks = acquireDirectory(io, root.directory, ".locks", .{}) catch |err| {
         return .{ .failure = mapStoreMutationError(err) };
     };
     defer locks.deinit();
@@ -317,7 +258,7 @@ pub fn publish(
     };
     defer locks.deinit();
     const repository_id_text = request.review_repository_id.canonical();
-    var repository_locks = locks.getOrCreateDirectory(io, &repository_id_text) catch |err| {
+    var repository_locks = acquireDirectory(io, locks, &repository_id_text, .{}) catch |err| {
         return .{ .failure = mapStoreMutationError(err) };
     };
     defer repository_locks.deinit();
@@ -341,7 +282,7 @@ pub fn publish(
         request.review_repository_id,
     )) |failure| return .{ .failure = failure };
 
-    var namespace = fresh_root.directory.getOrCreateDirectory(io, &repository_id_text) catch |err| {
+    var namespace = acquireDirectory(io, fresh_root.directory, &repository_id_text, .{}) catch |err| {
         return .{ .failure = mapStoreMutationError(err) };
     };
     defer namespace.deinit();
@@ -428,10 +369,27 @@ fn acquireLock(
     directory: capability.DirectoryCapability,
     name: []const u8,
 ) !HeldLock {
-    const file = try directory.openOrCreateRegularFile(name);
-    errdefer file.close(io);
+    const acquired = switch (capability.acquireRegularFile(directory, name, .{})) {
+        .not_completed => |err| return err,
+        .completed => |result| result,
+    };
+    var file = acquired.value.file;
+    errdefer file.deinit();
+    if (acquired.after_error) |err| return err;
     try file.lock(io, .exclusive);
     return .{ .file = file, .io = io };
+}
+
+fn acquireDirectory(io: std.Io, parent: capability.DirectoryCapability, name: []const u8, observer: durable.Observer) !capability.DirectoryCapability {
+    const acquired = switch (capability.acquireDirectory(io, parent, name, observer)) {
+        .not_completed => |err| return err,
+        .completed => |result| result,
+    };
+    if (acquired.value.directory == null) return acquired.after_error orelse error.MetadataUnavailable;
+    var directory = acquired.value.directory.?;
+    errdefer directory.deinit();
+    if (acquired.after_error) |err| return err;
+    return directory;
 }
 
 fn bindingFailure(
@@ -461,36 +419,49 @@ fn atomicReplaceRegistry(
 ) !void {
     var name_buffer: [46]u8 = undefined;
     var name: []const u8 = undefined;
-    var file_value: ?std.Io.File = null;
+    var file_value: ?@FieldType(durable.FileAcquisition, "file") = null;
+    var create_after_error: ?anyerror = null;
     for (0..8) |_| {
         var token: [16]u8 = undefined;
         try io.randomSecure(&token);
         name = try formatTokenName(&name_buffer, ".tmp-registry-", token);
-        file_value = root.createRegularFileExclusive(name) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
-            else => return err,
-        };
+        switch (capability.createFile(root, name, .{})) {
+            .not_completed => |err| if (err == error.PathAlreadyExists) continue else return err,
+            .completed => |result| {
+                file_value = result.value;
+                create_after_error = result.after_error;
+            },
+        }
         break;
     }
-    const file = file_value orelse return error.ConcurrentStagingConflict;
-    defer file.close(io);
+    var file = file_value orelse return error.ConcurrentStagingConflict;
+    defer file.deinit();
     var renamed = false;
-    defer if (!renamed) root.dir().deleteFile(io, name) catch {};
-    try file.writeStreamingAll(io, bytes);
-    try file.sync(io);
-    try root.dir().rename(name, root.dir(), "registry.json", io);
-    renamed = true;
-    try root.sync(io);
+    defer if (!renamed) {
+        _ = capability.removeFile(io, root, name, .{});
+    };
+    if (create_after_error) |err| return err;
+    try completedVoid(durable.writeAll(io, file, bytes, .{}));
+    try completedVoid(durable.syncFile(io, file, .{}));
+    switch (capability.moveReplacing(io, root, name, root, "registry.json", .{})) {
+        .not_completed => |err| return err,
+        .completed => |result| {
+            renamed = true;
+            if (result.after_error) |err| return err;
+        },
+    }
+    try completedVoid(capability.syncDirectory(io, root, .{}));
 }
 
 fn publishIntoNamespace(
     io: std.Io,
     namespace: capability.DirectoryCapability,
     request: PublishRequest,
-    faults: PublicationFaults,
+    observer: durable.Observer,
 ) !PublishResult {
     var temp_name_storage: store_path.NamespaceTempName.Formatted = undefined;
     var staging_created = false;
+    var create_after_error: ?anyerror = null;
     for (0..8) |_| {
         var token: [16]u8 = undefined;
         try io.randomSecure(&token);
@@ -500,17 +471,20 @@ fn publishIntoNamespace(
             .token = token,
         };
         temp_name_storage = temp_value.format();
-        namespace.dir().createDir(io, temp_name_storage.slice(), .fromMode(0o700)) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
-            else => return err,
-        };
-        staging_created = true;
+        switch (capability.createDirectory(io, namespace, temp_name_storage.slice(), observer)) {
+            .not_completed => |err| if (err == error.PathAlreadyExists) continue else return err,
+            .completed => |result| {
+                staging_created = true;
+                create_after_error = result.after_error;
+            },
+        }
         break;
     }
     if (!staging_created) return error.ConcurrentStagingConflict;
     const temp_name = temp_name_storage.slice();
     var published = false;
     defer if (!published) cleanupStaging(io, namespace, temp_name);
+    if (create_after_error) |err| return err;
     var staging = try namespace.openDirectory(temp_name);
     defer staging.deinit();
 
@@ -519,36 +493,26 @@ fn publishIntoNamespace(
         staging,
         "manifest.json",
         request.manifest_bytes,
-        faults,
-        .before_manifest_sync,
-        .after_manifest_sync,
+        observer,
     );
     try writeExactFile(
         io,
         staging,
         "findings.json",
         request.findings_bytes,
-        faults,
-        .before_findings_sync,
-        .after_findings_sync,
+        observer,
     );
-    try faults.check(.before_staging_directory_sync);
-    try staging.sync(io);
-    try faults.check(.after_staging_directory_sync);
-    try faults.check(.before_staging_namespace_sync);
-    try namespace.sync(io);
-    try faults.check(.after_staging_namespace_sync);
+    try completedVoid(capability.syncDirectory(io, staging, observer));
+    try completedVoid(capability.syncDirectory(io, namespace, observer));
     const review_id_text = request.review_id.canonical();
-    try faults.check(.before_rename);
-    namespace.dir().renamePreserve(temp_name, namespace.dir(), &review_id_text, io) catch |err| switch (err) {
-        error.PathAlreadyExists => return error.DuplicateReviewId,
-        else => return err,
-    };
-    published = true;
-    try faults.check(.after_rename);
-    try faults.check(.before_final_namespace_sync);
-    try namespace.sync(io);
-    try faults.check(.after_final_namespace_sync);
+    switch (capability.movePreserving(io, namespace, temp_name, namespace, &review_id_text, observer)) {
+        .not_completed => |err| return if (err == error.PathAlreadyExists) error.DuplicateReviewId else err,
+        .completed => |result| {
+            published = true;
+            if (result.after_error) |err| return err;
+        },
+    }
+    try completedVoid(capability.syncDirectory(io, namespace, observer));
     return .success;
 }
 
@@ -557,16 +521,17 @@ fn writeExactFile(
     directory: capability.DirectoryCapability,
     name: []const u8,
     bytes: []const u8,
-    faults: PublicationFaults,
-    before_sync: PublicationFaultPoint,
-    after_sync: PublicationFaultPoint,
+    observer: durable.Observer,
 ) !void {
-    const file = try directory.createRegularFileExclusive(name);
-    defer file.close(io);
-    try file.writeStreamingAll(io, bytes);
-    try faults.check(before_sync);
-    try file.sync(io);
-    try faults.check(after_sync);
+    const created = switch (capability.createFile(directory, name, observer)) {
+        .not_completed => |err| return err,
+        .completed => |result| result,
+    };
+    var file = created.value;
+    defer file.deinit();
+    if (created.after_error) |err| return err;
+    try completedVoid(durable.writeAll(io, file, bytes, observer));
+    try completedVoid(durable.syncFile(io, file, observer));
 }
 
 fn cleanupStaging(
@@ -576,10 +541,20 @@ fn cleanupStaging(
 ) void {
     var staging = namespace.openDirectory(temp_name) catch return;
     defer staging.deinit();
-    staging.dir().deleteFile(io, "manifest.json") catch {};
-    staging.dir().deleteFile(io, "findings.json") catch {};
-    namespace.dir().deleteDir(io, temp_name) catch return;
-    namespace.sync(io) catch {};
+    _ = capability.removeFile(io, staging, "manifest.json", .{});
+    _ = capability.removeFile(io, staging, "findings.json", .{});
+    switch (capability.removeDirectory(io, namespace, temp_name, .{})) {
+        .not_completed => return,
+        .completed => {},
+    }
+    _ = capability.syncDirectory(io, namespace, .{});
+}
+
+fn completedVoid(outcome: durable.Outcome(void)) !void {
+    switch (outcome) {
+        .not_completed => |err| return err,
+        .completed => |result| if (result.after_error) |err| return err,
+    }
 }
 
 fn generateRepositoryId(io: std.Io) !committed_review.ReviewRepositoryId {
@@ -673,6 +648,101 @@ fn isUnsafeStoreError(err: anyerror) bool {
     };
 }
 
+test "review run publication prepare creates one durable binding and no Run namespace" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "repo", .fromMode(0o700));
+    var repo = try tmp.dir.openDir(io, "repo", .{});
+    defer repo.close(io);
+    try runTestGit(io, repo, &.{ "git", "init", "--initial-branch=main" });
+    try repo.writeFile(io, .{ .sub_path = "file", .data = "base\n" });
+    try runTestGit(io, repo, &.{ "git", "add", "file" });
+    try runTestGit(io, repo, &.{
+        "git",    "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "-m", "base",
+    });
+    try tmp.dir.createDir(io, "state", .fromMode(0o700));
+    const repository_path = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repository_path);
+    const state_path = try tmp.dir.realPathFileAlloc(io, "state", allocator);
+    defer allocator.free(state_path);
+    const config_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(config_path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("XDG_STATE_HOME", state_path);
+    try environment.put("XDG_CONFIG_HOME", config_path);
+
+    var concurrent = [_]ConcurrentPrepare{
+        .{ .io = io, .environment = &environment, .repository_path = repository_path },
+        .{ .io = io, .environment = &environment, .repository_path = repository_path },
+    };
+    const first_thread = try std.Thread.spawn(.{}, ConcurrentPrepare.execute, .{&concurrent[0]});
+    const second_thread = try std.Thread.spawn(.{}, ConcurrentPrepare.execute, .{&concurrent[1]});
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expect(!concurrent[0].failed and !concurrent[1].failed);
+    const first_success = switch (concurrent[0].result) {
+        .success => |value| value,
+        .failure => return error.ExpectedPrepareSuccess,
+    };
+    const concurrent_success = switch (concurrent[1].result) {
+        .success => |value| value,
+        .failure => return error.ExpectedPrepareSuccess,
+    };
+    try std.testing.expect(first_success.review_repository_id.eql(concurrent_success.review_repository_id));
+    try std.testing.expect(!first_success.review_id.eql(concurrent_success.review_id));
+    const later = try prepare(allocator, io, &environment, repository_path);
+    const second_success = switch (later) {
+        .success => |value| value,
+        .failure => return error.ExpectedPrepareSuccess,
+    };
+    try std.testing.expect(first_success.review_repository_id.eql(second_success.review_repository_id));
+    try std.testing.expect(!first_success.review_id.eql(second_success.review_id));
+
+    const store_root = try std.fs.path.join(allocator, &.{ state_path, "gitframe", "ai-reviews" });
+    defer allocator.free(store_root);
+    var root = try capability.StoreRootCapability.openCanonical(store_root);
+    defer root.deinit();
+    var parsed = try registry.read(allocator, io, root.directory);
+    defer parsed.deinit();
+    const value = switch (parsed) {
+        .registry => |*owned| owned,
+        else => return error.ExpectedRegistry,
+    };
+    try std.testing.expectEqual(@as(usize, 1), value.bindings.len);
+    try std.testing.expect(value.bindings[0].review_repository_id.eql(first_success.review_repository_id));
+    try std.testing.expectEqualSlices(u8, repository_path, value.bindings[0].canonical_path.bytes);
+    const repository_id_text = first_success.review_repository_id.canonical();
+    if (root.directory.openDirectory(&repository_id_text)) |unexpected| {
+        var owned = unexpected;
+        owned.deinit();
+        return error.UnexpectedRunNamespace;
+    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
+
+    const invalid_registry = "{invalid-registry\n";
+    var raw_root = try tmp.dir.openDir(io, "state/gitframe/ai-reviews", .{});
+    defer raw_root.close(io);
+    try raw_root.writeFile(io, .{
+        .sub_path = "registry.json",
+        .data = invalid_registry,
+    });
+    const invalid_prepare = try prepare(allocator, io, &environment, repository_path);
+    try std.testing.expect(invalid_prepare == .failure);
+    try std.testing.expectEqual(Failure.store_invalid, invalid_prepare.failure);
+    const preserved_invalid = try root.directory.readRegularAlloc(
+        allocator,
+        io,
+        "registry.json",
+        registry.max_registry_bytes,
+    );
+    defer allocator.free(preserved_invalid);
+    try std.testing.expectEqualSlices(u8, invalid_registry, preserved_invalid);
+}
+
 fn runTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !void {
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = argv,
@@ -751,112 +821,6 @@ const ConcurrentPublish = struct {
         };
     }
 };
-
-const TestPublicationFault = struct {
-    selected: PublicationFaultPoint,
-
-    fn check(context: ?*anyopaque, point: PublicationFaultPoint) !void {
-        const self: *@This() = @ptrCast(@alignCast(context.?));
-        if (self.selected == point) return error.InjectedPublicationFault;
-    }
-
-    fn interface(self: *@This()) PublicationFaults {
-        return .{ .context = self, .check_fn = check };
-    }
-};
-
-test "review run publication prepare creates one durable binding and no Run namespace" {
-    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(io, "repo", .fromMode(0o700));
-    var repo = try tmp.dir.openDir(io, "repo", .{});
-    defer repo.close(io);
-    try runTestGit(io, repo, &.{ "git", "init", "--initial-branch=main" });
-    try repo.writeFile(io, .{ .sub_path = "file", .data = "base\n" });
-    try runTestGit(io, repo, &.{ "git", "add", "file" });
-    try runTestGit(io, repo, &.{
-        "git",    "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-        "commit", "-m", "base",
-    });
-    try tmp.dir.createDir(io, "state", .fromMode(0o700));
-    const repository_path = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
-    defer allocator.free(repository_path);
-    const state_path = try tmp.dir.realPathFileAlloc(io, "state", allocator);
-    defer allocator.free(state_path);
-    const config_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(config_path);
-    var environment = std.process.Environ.Map.init(allocator);
-    defer environment.deinit();
-    try environment.put("XDG_STATE_HOME", state_path);
-    try environment.put("XDG_CONFIG_HOME", config_path);
-
-    var concurrent = [_]ConcurrentPrepare{
-        .{ .io = io, .environment = &environment, .repository_path = repository_path },
-        .{ .io = io, .environment = &environment, .repository_path = repository_path },
-    };
-    const first_thread = try std.Thread.spawn(.{}, ConcurrentPrepare.execute, .{&concurrent[0]});
-    const second_thread = try std.Thread.spawn(.{}, ConcurrentPrepare.execute, .{&concurrent[1]});
-    first_thread.join();
-    second_thread.join();
-    try std.testing.expect(!concurrent[0].failed and !concurrent[1].failed);
-    const first_success = switch (concurrent[0].result) {
-        .success => |value| value,
-        .failure => return error.ExpectedPrepareSuccess,
-    };
-    const concurrent_success = switch (concurrent[1].result) {
-        .success => |value| value,
-        .failure => return error.ExpectedPrepareSuccess,
-    };
-    try std.testing.expect(first_success.review_repository_id.eql(concurrent_success.review_repository_id));
-    try std.testing.expect(!first_success.review_id.eql(concurrent_success.review_id));
-    const later = try prepare(allocator, io, &environment, repository_path);
-    const second_success = switch (later) {
-        .success => |value| value,
-        .failure => return error.ExpectedPrepareSuccess,
-    };
-    try std.testing.expect(first_success.review_repository_id.eql(second_success.review_repository_id));
-    try std.testing.expect(!first_success.review_id.eql(second_success.review_id));
-
-    const store_root = try std.fs.path.join(allocator, &.{ state_path, "gitframe", "ai-reviews" });
-    defer allocator.free(store_root);
-    var root = try capability.StoreRootCapability.openCanonical(store_root);
-    defer root.deinit();
-    var parsed = try registry.read(allocator, io, root.directory);
-    defer parsed.deinit();
-    const value = switch (parsed) {
-        .registry => |*owned| owned,
-        else => return error.ExpectedRegistry,
-    };
-    try std.testing.expectEqual(@as(usize, 1), value.bindings.len);
-    try std.testing.expect(value.bindings[0].review_repository_id.eql(first_success.review_repository_id));
-    try std.testing.expectEqualSlices(u8, repository_path, value.bindings[0].canonical_path.bytes);
-    const repository_id_text = first_success.review_repository_id.canonical();
-    if (root.directory.openDirectory(&repository_id_text)) |unexpected| {
-        var owned = unexpected;
-        owned.deinit();
-        return error.UnexpectedRunNamespace;
-    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
-
-    const invalid_registry = "{invalid-registry\n";
-    try root.directory.dir().writeFile(io, .{
-        .sub_path = "registry.json",
-        .data = invalid_registry,
-    });
-    const invalid_prepare = try prepare(allocator, io, &environment, repository_path);
-    try std.testing.expect(invalid_prepare == .failure);
-    try std.testing.expectEqual(Failure.store_invalid, invalid_prepare.failure);
-    const preserved_invalid = try root.directory.readRegularAlloc(
-        allocator,
-        io,
-        "registry.json",
-        registry.max_registry_bytes,
-    );
-    defer allocator.free(preserved_invalid);
-    try std.testing.expectEqualSlices(u8, invalid_registry, preserved_invalid);
-}
 
 test "review run publication preserves exact bytes rejects duplicates and reopens through the reader" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
@@ -1165,24 +1129,27 @@ test "review run publication fault boundaries expose all-or-nothing final direct
         "123e4567-e89b-42d3-a456-426614174000",
     );
     const repository_id_text = repository_id.canonical();
-    var namespace = try root.directory.getOrCreateDirectory(io, &repository_id_text);
+    var namespace = try acquireDirectory(io, root.directory, &repository_id_text, .{});
     defer namespace.deinit();
 
-    const points = [_]PublicationFaultPoint{
-        .before_manifest_sync,
-        .after_manifest_sync,
-        .before_findings_sync,
-        .after_findings_sync,
-        .before_staging_directory_sync,
-        .after_staging_directory_sync,
-        .before_staging_namespace_sync,
-        .after_staging_namespace_sync,
-        .before_rename,
-        .after_rename,
-        .before_final_namespace_sync,
-        .after_final_namespace_sync,
+    const cases = [_]PublicationFaultCase{
+        .{ .step = .{ .operation = .create_directory, .edge = .after } },
+        .{ .step = .{ .operation = .create_file, .edge = .after }, .occurrence = 0 },
+        .{ .step = .{ .operation = .create_file, .edge = .after }, .occurrence = 1 },
+        .{ .step = .{ .operation = .sync_file, .edge = .before }, .occurrence = 0 },
+        .{ .step = .{ .operation = .sync_file, .edge = .after }, .occurrence = 0 },
+        .{ .step = .{ .operation = .sync_file, .edge = .before }, .occurrence = 1 },
+        .{ .step = .{ .operation = .sync_file, .edge = .after }, .occurrence = 1 },
+        .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 0 },
+        .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 0 },
+        .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 1 },
+        .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 1 },
+        .{ .step = .{ .operation = .rename_preserve, .edge = .before } },
+        .{ .step = .{ .operation = .rename_preserve, .edge = .after }, .published = true },
+        .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 2, .published = true },
+        .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 2, .published = true },
     };
-    for (points, 0..) |point, index| {
+    for (cases, 0..) |case, index| {
         var id_bytes = [_]u8{0} ** 16;
         id_bytes[0] = @intCast(index + 1);
         id_bytes[6] = 0x40;
@@ -1195,19 +1162,16 @@ test "review run publication fault boundaries expose all-or-nothing final direct
             .manifest_bytes = "manifest-exact\n",
             .findings_bytes = "findings-exact\x00\n",
         };
-        var fault: TestPublicationFault = .{ .selected = point };
+        var fault: TestStepObserver = .{ .selected = case.step, .occurrence = case.occurrence };
         try std.testing.expectError(
             error.InjectedPublicationFault,
-            publishIntoNamespace(io, namespace, request, fault.interface()),
+            publishIntoNamespace(io, namespace, request, fault.observer()),
         );
         const review_id_text = review_id.canonical();
-        const renamed = point == .after_rename or
-            point == .before_final_namespace_sync or
-            point == .after_final_namespace_sync;
         if (namespace.openDirectory(&review_id_text)) |final| {
             var owned = final;
             defer owned.deinit();
-            try std.testing.expect(renamed);
+            try std.testing.expect(case.published);
             const manifest = try owned.readRegularAlloc(allocator, io, "manifest.json", 64);
             defer allocator.free(manifest);
             const findings = try owned.readRegularAlloc(allocator, io, "findings.json", 64);
@@ -1215,16 +1179,39 @@ test "review run publication fault boundaries expose all-or-nothing final direct
             try std.testing.expectEqualSlices(u8, request.manifest_bytes, manifest);
             try std.testing.expectEqualSlices(u8, request.findings_bytes, findings);
         } else |err| {
-            try std.testing.expect(!renamed);
+            try std.testing.expect(!case.published);
             try std.testing.expectEqual(error.FileNotFound, err);
         }
     }
 
-    var iterator = namespace.dir().iterate();
+    var iterator = namespace.iterate();
     var canonical_count: usize = 0;
-    while (try iterator.next(io)) |entry| {
+    while (try iterator.next(namespace, io)) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".tmp-publish-"));
         canonical_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), canonical_count);
 }
+
+const PublicationFaultCase = struct {
+    step: durable.Step,
+    occurrence: usize = 0,
+    published: bool = false,
+};
+
+const TestStepObserver = struct {
+    selected: durable.Step,
+    occurrence: usize,
+    seen: usize = 0,
+
+    fn observe(context: ?*anyopaque, step: durable.Step) !void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.selected.operation != step.operation or self.selected.edge != step.edge) return;
+        defer self.seen += 1;
+        if (self.seen == self.occurrence) return error.InjectedPublicationFault;
+    }
+
+    fn observer(self: *@This()) durable.Observer {
+        return .{ .context = self, .observe_fn = observe };
+    }
+};
