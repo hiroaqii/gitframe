@@ -4,8 +4,13 @@ const std = @import("std");
 const committed_review = @import("../committed_review.zig");
 const limits = @import("../committed_review/limits.zig");
 const projection_command = @import("../committed_review/projection_command.zig");
-const strict = @import("../committed_review/strict_json.zig");
+const strict_data = @import("../data/strict_json.zig");
 const publication = @import("publication.zig");
+
+const StrictParser = strict_data.Parser(.{
+    .max_token_bytes = limits.max_json_token_bytes,
+    .max_depth = limits.max_json_depth,
+});
 
 pub const max_header_bytes: usize = 16 * 1024;
 pub const max_terminal_bytes: usize = 4 * 1024;
@@ -60,7 +65,7 @@ pub fn parseFrame(allocator: std.mem.Allocator, frame: []const u8) ParseError!Pa
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
-    var parser = strict.Parser.init(arena.allocator(), frame[0..lf]);
+    var parser = StrictParser.init(arena.allocator(), frame[0..lf]);
     defer parser.deinit();
     parser.beginObject() catch |err| return mapParseError(err);
     var seen: u32 = 0;
@@ -72,33 +77,33 @@ pub fn parseFrame(allocator: std.mem.Allocator, frame: []const u8) ParseError!Pa
     var findings_size: ?usize = null;
     while (parser.nextObjectKey() catch |err| return mapParseError(err)) |key| {
         if (std.mem.eql(u8, key, "schema_version")) {
-            strict.markSeen(&seen, 0) catch |err| return mapParseError(err);
+            strict_data.markSeen(&seen, 0) catch |err| return mapParseError(err);
             schema_version = parser.unsigned(u64) catch |err| return mapParseError(err);
         } else if (std.mem.eql(u8, key, "repository")) {
-            strict.markSeen(&seen, 1) catch |err| return mapParseError(err);
+            strict_data.markSeen(&seen, 1) catch |err| return mapParseError(err);
             repository_path = projection_command.parseRepository(&parser) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.InvalidRequest,
             };
         } else if (std.mem.eql(u8, key, "review_repository_id")) {
-            strict.markSeen(&seen, 2) catch |err| return mapParseError(err);
+            strict_data.markSeen(&seen, 2) catch |err| return mapParseError(err);
             repository_id = committed_review.ReviewRepositoryId.parse(
                 parser.string() catch |err| return mapParseError(err),
             ) catch return error.InvalidRequest;
         } else if (std.mem.eql(u8, key, "review_id")) {
-            strict.markSeen(&seen, 3) catch |err| return mapParseError(err);
+            strict_data.markSeen(&seen, 3) catch |err| return mapParseError(err);
             review_id = committed_review.ReviewId.parse(
                 parser.string() catch |err| return mapParseError(err),
             ) catch return error.InvalidRequest;
         } else if (std.mem.eql(u8, key, "manifest_size")) {
-            strict.markSeen(&seen, 4) catch |err| return mapParseError(err);
+            strict_data.markSeen(&seen, 4) catch |err| return mapParseError(err);
             manifest_size = parser.unsigned(usize) catch |err| return mapParseError(err);
         } else if (std.mem.eql(u8, key, "findings_size")) {
-            strict.markSeen(&seen, 5) catch |err| return mapParseError(err);
+            strict_data.markSeen(&seen, 5) catch |err| return mapParseError(err);
             findings_size = parser.unsigned(usize) catch |err| return mapParseError(err);
         } else return error.InvalidRequest;
     }
-    strict.requireFields(seen, 0b11_1111) catch |err| return mapParseError(err);
+    strict_data.requireFields(seen, 0b11_1111) catch |err| return mapParseError(err);
     parser.endDocument() catch |err| return mapParseError(err);
     if (schema_version.? != limits.schema_version) return error.UnsupportedSchema;
     if (manifest_size.? == 0 or manifest_size.? > limits.max_manifest_bytes or
@@ -257,7 +262,7 @@ fn failureTerminal(failure: publication.Failure) Failure {
     };
 }
 
-fn mapParseError(err: strict.ParseError) ParseError {
+fn mapParseError(err: strict_data.ParseError) ParseError {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidRequest;
 }
 

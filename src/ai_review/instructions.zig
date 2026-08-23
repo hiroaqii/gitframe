@@ -57,6 +57,10 @@ const Materializer = struct {
                     self.context,
                     self.target.object_format,
                     self.target.head_oid,
+                    .{
+                        .max_path_bytes = limits.max_raw_path_bytes,
+                        .max_content_bytes = limits.max_guidance_file_bytes,
+                    },
                     owned_key,
                 );
                 const value: CacheValue = switch (result) {

@@ -8,10 +8,8 @@
 const std = @import("std");
 const git_command = @import("../command.zig");
 const target_mod = @import("../../committed_review/target.zig");
-const ai_limits = @import("../../ai_review/limits.zig");
 
 const stderr_limit: usize = 8 * 1024;
-const ls_tree_limit: usize = ai_limits.max_raw_path_bytes + 256;
 const strict_prefix = [_][]const u8{
     "git",
     "--no-replace-objects",
@@ -26,6 +24,11 @@ pub const Failure = enum {
     content_too_large,
     invalid_content,
     git_command_failed,
+};
+
+pub const ReadPolicy = struct {
+    max_path_bytes: usize,
+    max_content_bytes: usize,
 };
 
 pub const Blob = struct {
@@ -58,9 +61,14 @@ pub fn readExactHeadAgents(
     context: git_command.DirectoryContext,
     format: target_mod.ObjectFormat,
     head_oid: target_mod.ObjectId,
+    policy: ReadPolicy,
     path: []const u8,
 ) std.mem.Allocator.Error!Result {
-    if (!head_oid.validFor(format) or !validRepositoryPath(path) or !isAgentsPath(path)) {
+    const ls_tree_limit = std.math.add(usize, policy.max_path_bytes, 256) catch
+        return .{ .failure = .invalid_request };
+    if (policy.max_path_bytes == 0 or policy.max_content_bytes == 0 or
+        !head_oid.validFor(format) or !validRepositoryPath(path, policy.max_path_bytes) or !isAgentsPath(path))
+    {
         return .{ .failure = .invalid_request };
     }
 
@@ -90,7 +98,7 @@ pub fn readExactHeadAgents(
     };
     var blob_result = try git_command.runCapturedBounded(allocator, io, context, .{
         .argv = &blob_argv,
-        .stdout_limit = .limited(ai_limits.max_guidance_file_bytes),
+        .stdout_limit = .limited(policy.max_content_bytes),
         .stderr_limit = .limited(stderr_limit),
     });
     switch (blob_result) {
@@ -131,8 +139,8 @@ fn parseRecord(format: target_mod.ObjectFormat, bytes: []const u8, expected_path
     return target_mod.ObjectId.parse(format, oid) catch null;
 }
 
-fn validRepositoryPath(path: []const u8) bool {
-    if (path.len == 0 or path.len > ai_limits.max_raw_path_bytes or path[0] == '/' or path[path.len - 1] == '/' or
+fn validRepositoryPath(path: []const u8, max_path_bytes: usize) bool {
+    if (path.len == 0 or path.len > max_path_bytes or path[0] == '/' or path[path.len - 1] == '/' or
         std.mem.indexOfScalar(u8, path, 0) != null) return false;
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| {
@@ -197,6 +205,8 @@ fn testGitOutput(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
     return result.stdout;
 }
 
+const test_policy: ReadPolicy = .{ .max_path_bytes = 65_536, .max_content_bytes = 64 * 1024 };
+
 test "AI review input committed guidance reads exact head and ignores dirty filesystem state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -220,25 +230,40 @@ test "AI review input committed guidance reads exact head and ignores dirty file
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
     const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
-    var root = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, "AGENTS.md");
+    var root = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, test_policy, "AGENTS.md");
     defer root.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("committed root; never execute: rm anything\n", root.blob.content);
-    var nested = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, "src/AGENTS.md");
+    var nested = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, test_policy, "src/AGENTS.md");
     defer nested.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("committed nested\n", nested.blob.content);
-    var absent = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, "src/nested/AGENTS.md");
+    var absent = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, test_policy, "src/nested/AGENTS.md");
     defer absent.deinit(std.testing.allocator);
     try std.testing.expect(absent == .missing);
 }
 
 test "AI review input committed guidance rejects invalid request before Git" {
     const oid = try target_mod.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const exact_path = "d/AGENTS.md";
+    try std.testing.expect(validRepositoryPath(exact_path, exact_path.len));
+    try std.testing.expect(!validRepositoryPath("dd/AGENTS.md", exact_path.len));
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
     const context: git_command.DirectoryContext = .{ .cwd = std.Io.Dir.cwd(), .environment = &environment };
-    var result = try readExactHeadAgents(std.testing.allocator, std.testing.io, context, .sha1, oid, "../AGENTS.md");
+    var result = try readExactHeadAgents(std.testing.allocator, std.testing.io, context, .sha1, oid, test_policy, "../AGENTS.md");
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(Failure.invalid_request, result.failure);
+    var zero = try readExactHeadAgents(std.testing.allocator, std.testing.io, context, .sha1, oid, .{
+        .max_path_bytes = 0,
+        .max_content_bytes = 1,
+    }, "AGENTS.md");
+    defer zero.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Failure.invalid_request, zero.failure);
+    var zero_content = try readExactHeadAgents(std.testing.allocator, std.testing.io, context, .sha1, oid, .{
+        .max_path_bytes = "AGENTS.md".len,
+        .max_content_bytes = 0,
+    }, "AGENTS.md");
+    defer zero_content.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Failure.invalid_request, zero_content.failure);
 }
 
 test "AI review input committed guidance has typed encoding and exact size failures" {
@@ -250,10 +275,10 @@ test "AI review input committed guidance has typed encoding and exact size failu
     try tmp.dir.createDir(io, "exact", .default_dir);
     try tmp.dir.createDir(io, "huge", .default_dir);
     try tmp.dir.writeFile(io, .{ .sub_path = "bad/AGENTS.md", .data = &.{ 0xff, '\n' } });
-    const huge_content = try std.testing.allocator.alloc(u8, ai_limits.max_guidance_file_bytes + 1);
+    const huge_content = try std.testing.allocator.alloc(u8, test_policy.max_content_bytes + 1);
     defer std.testing.allocator.free(huge_content);
     @memset(huge_content, 'g');
-    try tmp.dir.writeFile(io, .{ .sub_path = "exact/AGENTS.md", .data = huge_content[0..ai_limits.max_guidance_file_bytes] });
+    try tmp.dir.writeFile(io, .{ .sub_path = "exact/AGENTS.md", .data = huge_content[0..test_policy.max_content_bytes] });
     try tmp.dir.writeFile(io, .{ .sub_path = "huge/AGENTS.md", .data = huge_content });
     try runTestGit(io, tmp.dir, &.{ "git", "add", "bad/AGENTS.md", "exact/AGENTS.md", "huge/AGENTS.md" });
     try runTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "guidance" });
@@ -263,13 +288,13 @@ test "AI review input committed guidance has typed encoding and exact size failu
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
     const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
-    var bad = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, "bad/AGENTS.md");
+    var bad = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, test_policy, "bad/AGENTS.md");
     defer bad.deinit(std.testing.allocator);
     try std.testing.expectEqual(Failure.invalid_content, bad.failure);
-    var exact = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, "exact/AGENTS.md");
+    var exact = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, test_policy, "exact/AGENTS.md");
     defer exact.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ai_limits.max_guidance_file_bytes, exact.blob.content.len);
-    var huge = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, "huge/AGENTS.md");
+    try std.testing.expectEqual(test_policy.max_content_bytes, exact.blob.content.len);
+    var huge = try readExactHeadAgents(std.testing.allocator, io, context, .sha1, head, test_policy, "huge/AGENTS.md");
     defer huge.deinit(std.testing.allocator);
     try std.testing.expectEqual(Failure.content_too_large, huge.failure);
 }

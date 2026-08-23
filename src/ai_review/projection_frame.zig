@@ -4,9 +4,15 @@
 const std = @import("std");
 const limits = @import("limits.zig");
 const committed_codec = @import("../committed_review/codec.zig");
+const committed_limits = @import("../committed_review/limits.zig");
 const projection_command = @import("../committed_review/projection_command.zig");
-const strict = @import("../committed_review/strict_json.zig");
+const strict_data = @import("../data/strict_json.zig");
 const target_mod = @import("../committed_review/target.zig");
+
+const StrictParser = strict_data.Parser(.{
+    .max_token_bytes = committed_limits.max_json_token_bytes,
+    .max_depth = committed_limits.max_json_depth,
+});
 
 pub const Error = std.mem.Allocator.Error || error{
     InvalidFrame,
@@ -47,7 +53,7 @@ pub fn parseWithLimit(allocator: std.mem.Allocator, input: []const u8, violation
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
-    var outer = strict.Parser.init(arena_allocator, input[0..outer_lf]);
+    var outer = StrictParser.init(arena_allocator, input[0..outer_lf]);
     defer outer.deinit();
 
     outer.beginObject() catch |err| return mapOuterError(err);
@@ -58,22 +64,22 @@ pub fn parseWithLimit(allocator: std.mem.Allocator, input: []const u8, violation
     var projection_frame_size: ?usize = null;
     while (outer.nextObjectKey() catch |err| return mapOuterError(err)) |key| {
         if (std.mem.eql(u8, key, "schema_version")) {
-            strict.markSeen(&seen, 0) catch |err| return mapOuterError(err);
+            strict_data.markSeen(&seen, 0) catch |err| return mapOuterError(err);
             schema_version = outer.unsigned(u64) catch |err| return mapOuterError(err);
         } else if (std.mem.eql(u8, key, "repository")) {
-            strict.markSeen(&seen, 1) catch |err| return mapOuterError(err);
+            strict_data.markSeen(&seen, 1) catch |err| return mapOuterError(err);
             repository_path = projection_command.parseRepository(&outer) catch |err| return mapProjectionRequestError(err);
         } else if (std.mem.eql(u8, key, "target")) {
-            strict.markSeen(&seen, 2) catch |err| return mapOuterError(err);
+            strict_data.markSeen(&seen, 2) catch |err| return mapOuterError(err);
             target = committed_codec.parseTarget(&outer) catch |err| return mapTargetError(err);
         } else if (std.mem.eql(u8, key, "projection_frame_size")) {
-            strict.markSeen(&seen, 3) catch |err| return mapOuterError(err);
+            strict_data.markSeen(&seen, 3) catch |err| return mapOuterError(err);
             projection_frame_size = outer.unsigned(usize) catch |err| return mapOuterError(err);
         } else {
             return error.InvalidFrame;
         }
     }
-    strict.requireFields(seen, 0b1111) catch |err| return mapOuterError(err);
+    strict_data.requireFields(seen, 0b1111) catch |err| return mapOuterError(err);
     outer.endDocument() catch |err| return mapOuterError(err);
     if (schema_version.? != limits.schema_version) return error.UnsupportedSchemaVersion;
     target.?.validate() catch return error.InvalidTarget;
@@ -97,7 +103,7 @@ pub fn parseWithLimit(allocator: std.mem.Allocator, input: []const u8, violation
         limits.record(violation, "projection_header_bytes", inner_lf + 1, projection_command.max_success_header_bytes);
         return error.LimitExceeded;
     }
-    var inner = strict.Parser.init(arena_allocator, nested[0..inner_lf]);
+    var inner = StrictParser.init(arena_allocator, nested[0..inner_lf]);
     defer inner.deinit();
     inner.beginObject() catch |err| return mapOuterError(err);
     seen = 0;
@@ -107,22 +113,22 @@ pub fn parseWithLimit(allocator: std.mem.Allocator, input: []const u8, violation
     var patch_size: ?usize = null;
     while (inner.nextObjectKey() catch |err| return mapOuterError(err)) |key| {
         if (std.mem.eql(u8, key, "schema_version")) {
-            strict.markSeen(&seen, 0) catch |err| return mapOuterError(err);
+            strict_data.markSeen(&seen, 0) catch |err| return mapOuterError(err);
             schema_version = inner.unsigned(u64) catch |err| return mapOuterError(err);
         } else if (std.mem.eql(u8, key, "status")) {
-            strict.markSeen(&seen, 1) catch |err| return mapOuterError(err);
+            strict_data.markSeen(&seen, 1) catch |err| return mapOuterError(err);
             status_ok = std.mem.eql(u8, inner.string() catch |err| return mapOuterError(err), "ok");
         } else if (std.mem.eql(u8, key, "target")) {
-            strict.markSeen(&seen, 2) catch |err| return mapOuterError(err);
+            strict_data.markSeen(&seen, 2) catch |err| return mapOuterError(err);
             inner_target = committed_codec.parseTarget(&inner) catch |err| return mapTargetError(err);
         } else if (std.mem.eql(u8, key, "patch_size")) {
-            strict.markSeen(&seen, 3) catch |err| return mapOuterError(err);
+            strict_data.markSeen(&seen, 3) catch |err| return mapOuterError(err);
             patch_size = inner.unsigned(usize) catch |err| return mapOuterError(err);
         } else {
             return error.InvalidFrame;
         }
     }
-    strict.requireFields(seen, 0b1111) catch |err| return mapOuterError(err);
+    strict_data.requireFields(seen, 0b1111) catch |err| return mapOuterError(err);
     inner.endDocument() catch |err| return mapOuterError(err);
     if (schema_version.? != limits.schema_version) return error.UnsupportedSchemaVersion;
     inner_target.?.validate() catch return error.InvalidTarget;
@@ -194,13 +200,8 @@ fn successHeaderAlloc(
     return storage[0..writer.buffered().len];
 }
 
-fn mapOuterError(err: strict.ParseError) Error {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.UnsupportedSchemaVersion => error.UnsupportedSchemaVersion,
-        error.LimitExceeded, error.ArtifactTooLarge => error.InvalidFrame,
-        else => error.InvalidFrame,
-    };
+fn mapOuterError(err: strict_data.ParseError) Error {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidFrame;
 }
 
 fn mapTargetError(err: committed_codec.ParseError) Error {

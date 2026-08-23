@@ -1,150 +1,24 @@
-//! Bounded JSON token admission shared by committed-review artifacts and
-//! process requests.
-//!
-//! The scanner allocates decoded token bytes from the caller-supplied owner;
-//! this layer adds depth, duplicate-field, canonical scalar, and text policy.
+//! Committed-review strict-data compatibility facade and domain policy.
 
 const std = @import("std");
 const limits = @import("limits.zig");
+const neutral = @import("../data/strict_json.zig");
 
-/// Strict syntax, schema, value, collection, and allocation terminals.
-pub const ParseError = error{
+const parser_policy: neutral.Policy = .{
+    .max_token_bytes = limits.max_json_token_bytes,
+    .max_depth = limits.max_json_depth,
+};
+pub const Parser = neutral.Parser(parser_policy);
+pub const ParseError = neutral.ParseError || error{
     ArtifactTooLarge,
-    InvalidJson,
     UnsupportedSchemaVersion,
     UnknownField,
-    DuplicateField,
-    MissingField,
-    InvalidType,
-    InvalidValue,
-    LimitExceeded,
     DuplicateFindingId,
     DuplicateDispositionId,
     DuplicateRelatedFindingId,
-} || std.mem.Allocator.Error;
-
-/// Stateful complete-input scanner. Returned string/number slices borrow
-/// `allocator`; the containing artifact/request owner controls their lifetime.
-pub const Parser = struct {
-    scanner: std.json.Scanner,
-    allocator: std.mem.Allocator,
-    depth: usize = 0,
-
-    /// Begin scanning one complete input buffer.
-    pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Parser {
-        return .{
-            .scanner = std.json.Scanner.initCompleteInput(allocator, bytes),
-            .allocator = allocator,
-        };
-    }
-
-    /// Release scanner-owned token allocations; not the caller's input buffer.
-    pub fn deinit(self: *Parser) void {
-        self.scanner.deinit();
-        self.* = undefined;
-    }
-
-    /// Consume an object begin while enforcing the shared depth cap.
-    pub fn beginObject(self: *Parser) ParseError!void {
-        if ((try self.next()) != .object_begin) return error.InvalidType;
-    }
-
-    /// Consume an array begin while enforcing the shared depth cap.
-    pub fn beginArray(self: *Parser) ParseError!void {
-        if ((try self.next()) != .array_begin) return error.InvalidType;
-    }
-
-    /// Returns null after consuming the matching object end.
-    pub fn nextObjectKey(self: *Parser) ParseError!?[]const u8 {
-        return switch (try self.next()) {
-            .allocated_string => |value| value,
-            .object_end => null,
-            else => error.InvalidType,
-        };
-    }
-
-    /// Returns false after consuming the matching array end. A true result
-    /// means the next object begin was already consumed.
-    pub fn nextArrayObject(self: *Parser) ParseError!bool {
-        return switch (try self.next()) {
-            .object_begin => true,
-            .array_end => false,
-            else => error.InvalidType,
-        };
-    }
-
-    /// Consume one decoded JSON string value.
-    pub fn string(self: *Parser) ParseError![]const u8 {
-        return switch (try self.next()) {
-            .allocated_string => |value| value,
-            else => error.InvalidType,
-        };
-    }
-
-    /// Returns null after consuming the matching array end; otherwise returns
-    /// one complete decoded string element.
-    pub fn stringOrArrayEnd(self: *Parser) ParseError!?[]const u8 {
-        return switch (try self.next()) {
-            .allocated_string => |value| value,
-            .array_end => null,
-            else => error.InvalidType,
-        };
-    }
-
-    /// Consume a canonical non-negative base-10 integer into `T`.
-    pub fn unsigned(self: *Parser, comptime T: type) ParseError!T {
-        const bytes = switch (try self.next()) {
-            .allocated_number => |value| value,
-            else => return error.InvalidType,
-        };
-        if (bytes.len == 0) return error.InvalidValue;
-        if (bytes.len > 1 and bytes[0] == '0') return error.InvalidValue;
-        for (bytes) |byte| if (byte < '0' or byte > '9') return error.InvalidValue;
-        return std.fmt.parseInt(T, bytes, 10) catch error.InvalidValue;
-    }
-
-    /// Require complete input consumption and balanced containers.
-    pub fn endDocument(self: *Parser) ParseError!void {
-        if ((try self.next()) != .end_of_document or self.depth != 0) return error.InvalidJson;
-    }
-
-    fn next(self: *Parser) ParseError!std.json.Token {
-        const token = self.scanner.nextAllocMax(
-            self.allocator,
-            .alloc_always,
-            limits.max_json_token_bytes,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ValueTooLong => return error.LimitExceeded,
-            error.SyntaxError, error.UnexpectedEndOfInput => return error.InvalidJson,
-        };
-
-        switch (token) {
-            .object_begin, .array_begin => {
-                self.depth += 1;
-                if (self.depth > limits.max_json_depth) return error.LimitExceeded;
-            },
-            .object_end, .array_end => {
-                if (self.depth == 0) return error.InvalidJson;
-                self.depth -= 1;
-            },
-            else => {},
-        }
-        return token;
-    }
 };
-
-/// Mark one field bit and reject a duplicate occurrence.
-pub fn markSeen(seen: *u32, bit: u5) ParseError!void {
-    const mask = @as(u32, 1) << bit;
-    if ((seen.* & mask) != 0) return error.DuplicateField;
-    seen.* |= mask;
-}
-
-/// Require every bit in `required` after an object is consumed.
-pub fn requireFields(seen: u32, required: u32) ParseError!void {
-    if ((seen & required) != required) return error.MissingField;
-}
+pub const markSeen = neutral.markSeen;
+pub const requireFields = neutral.requireFields;
 
 /// Admit exactly the independent committed-review schema version.
 pub fn validateSchemaVersion(value: u64) ParseError!void {
@@ -256,17 +130,6 @@ fn isLeapYear(year: u16) bool {
     return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
 }
 
-test "strict JSON parser rejects non-integer JSON numbers" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var parser = Parser.init(arena.allocator(), "{\"n\":1e0}");
-    defer parser.deinit();
-    try parser.beginObject();
-    try std.testing.expectEqualStrings("n", (try parser.nextObjectKey()).?);
-    try std.testing.expectError(error.InvalidValue, parser.unsigned(u64));
-}
-
 test "text policy preserves Unicode and multiline LF TAB but rejects terminal controls" {
     try validateText("東京\n\tbody", limits.max_body_bytes, true);
     try std.testing.expectError(error.InvalidValue, validateText("single\nline", limits.max_short_text_bytes, false));
@@ -294,30 +157,6 @@ test "raw paths round trip canonical unpadded base64url losslessly" {
     const path = try decodeRawPath(arena.allocator(), "c3JjL_8uemln");
     try std.testing.expectEqualSlices(u8, "src/\xff.zig", path);
     try std.testing.expectError(error.InvalidValue, decodeRawPath(arena.allocator(), "c3JjL_8uemln="));
-}
-
-test "JSON depth and unsigned integers accept exact limits and reject plus one" {
-    var exact_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer exact_arena.deinit();
-    var exact = Parser.init(exact_arena.allocator(), "[[[[[[[[4294967295]]]]]]]]");
-    defer exact.deinit();
-    for (0..limits.max_json_depth) |_| try exact.beginArray();
-    try std.testing.expectEqual(std.math.maxInt(u32), try exact.unsigned(u32));
-    for (0..limits.max_json_depth) |_| try std.testing.expect((try exact.next()) == .array_end);
-    try exact.endDocument();
-
-    var deep_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer deep_arena.deinit();
-    var deep = Parser.init(deep_arena.allocator(), "[[[[[[[[[0]]]]]]]]]");
-    defer deep.deinit();
-    for (0..limits.max_json_depth) |_| try deep.beginArray();
-    try std.testing.expectError(error.LimitExceeded, deep.beginArray());
-
-    var overflow_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer overflow_arena.deinit();
-    var overflow = Parser.init(overflow_arena.allocator(), "4294967296");
-    defer overflow.deinit();
-    try std.testing.expectError(error.InvalidValue, overflow.unsigned(u32));
 }
 
 test "finite decoded text and raw path bounds accept exact and reject plus one" {
@@ -358,17 +197,4 @@ test "finite decoded text and raw path bounds accept exact and reject plus one" 
     defer allocator.free(encoded_plus_one);
     _ = std.base64.url_safe_no_pad.Encoder.encode(encoded_plus_one, path_plus_one);
     try std.testing.expectError(error.LimitExceeded, decodeRawPath(arena.allocator(), encoded_plus_one));
-}
-
-test "JSON Unicode escapes decode to validated UTF-8 without accepting lone surrogates" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var valid = Parser.init(arena.allocator(), "\"\\ud83d\\ude00\"");
-    defer valid.deinit();
-    try std.testing.expectEqualStrings("😀", try valid.string());
-    try valid.endDocument();
-
-    var invalid = Parser.init(arena.allocator(), "\"\\ud83d\"");
-    defer invalid.deinit();
-    try std.testing.expectError(error.InvalidJson, invalid.string());
 }
