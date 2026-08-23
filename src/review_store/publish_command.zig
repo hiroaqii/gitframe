@@ -4,6 +4,7 @@ const std = @import("std");
 const committed_review = @import("../committed_review.zig");
 const limits = @import("../committed_review/limits.zig");
 const projection_command = @import("../committed_review/projection_command.zig");
+const length_frame = @import("../data/length_frame.zig");
 const strict_data = @import("../data/strict_json.zig");
 const publication = @import("publication.zig");
 
@@ -59,13 +60,14 @@ pub const CommandOutput = struct {
 const Failure = struct { exit_code: u8, code: []const u8, message: []const u8 };
 
 pub fn parseFrame(allocator: std.mem.Allocator, frame: []const u8) ParseError!ParsedFrame {
-    if (frame.len == 0 or frame.len > max_frame_bytes) return error.InvalidRequest;
-    const lf = std.mem.indexOfScalar(u8, frame, '\n') orelse return error.InvalidRequest;
-    if (lf == 0 or lf + 1 > max_header_bytes) return error.InvalidRequest;
-
+    if (frame.len > max_frame_bytes) return error.InvalidRequest;
+    const parts = length_frame.split(frame, .{
+        .max_header_bytes = max_header_bytes,
+        .max_payload_bytes = std.math.maxInt(usize),
+    }) catch return error.InvalidRequest;
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
-    var parser = StrictParser.init(arena.allocator(), frame[0..lf]);
+    var parser = StrictParser.init(arena.allocator(), parts.header);
     defer parser.deinit();
     parser.beginObject() catch |err| return mapParseError(err);
     var seen: u32 = 0;
@@ -111,18 +113,15 @@ pub fn parseFrame(allocator: std.mem.Allocator, frame: []const u8) ParseError!Pa
     {
         return error.InvalidRequest;
     }
-    const payload_size = std.math.add(usize, manifest_size.?, findings_size.?) catch
+    const payloads = length_frame.exactPayloadPair(parts, manifest_size.?, findings_size.?) catch
         return error.InvalidRequest;
-    if (frame.len - (lf + 1) != payload_size) return error.InvalidRequest;
-    const manifest_start = lf + 1;
-    const findings_start = manifest_start + manifest_size.?;
     return .{
         .arena = arena,
         .repository_path = repository_path.?,
         .review_repository_id = repository_id.?,
         .review_id = review_id.?,
-        .manifest_bytes = frame[manifest_start..findings_start],
-        .findings_bytes = frame[findings_start..],
+        .manifest_bytes = payloads.first,
+        .findings_bytes = payloads.second,
     };
 }
 

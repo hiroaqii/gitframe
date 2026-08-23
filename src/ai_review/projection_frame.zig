@@ -6,6 +6,7 @@ const limits = @import("limits.zig");
 const committed_codec = @import("../committed_review/codec.zig");
 const committed_limits = @import("../committed_review/limits.zig");
 const projection_command = @import("../committed_review/projection_command.zig");
+const length_frame = @import("../data/length_frame.zig");
 const strict_data = @import("../data/strict_json.zig");
 const target_mod = @import("../committed_review/target.zig");
 
@@ -44,16 +45,12 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) Error!Frame {
 
 pub fn parseWithLimit(allocator: std.mem.Allocator, input: []const u8, violation: *?limits.Violation) Error!Frame {
     violation.* = null;
-    const outer_lf = std.mem.indexOfScalar(u8, input, '\n') orelse return error.InvalidFrame;
-    if (outer_lf + 1 > limits.max_input_header_bytes) {
-        limits.record(violation, "input_header_bytes", outer_lf + 1, limits.max_input_header_bytes);
-        return error.LimitExceeded;
-    }
+    const outer_parts = try admitParts(input, limits.max_input_header_bytes, "input_header_bytes", violation);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
-    var outer = StrictParser.init(arena_allocator, input[0..outer_lf]);
+    var outer = StrictParser.init(arena_allocator, outer_parts.header);
     defer outer.deinit();
 
     outer.beginObject() catch |err| return mapOuterError(err);
@@ -89,21 +86,16 @@ pub fn parseWithLimit(allocator: std.mem.Allocator, input: []const u8, violation
         &target.?,
         projection_frame_size.?,
     );
-    if (!std.mem.eql(u8, input[0..outer_lf], canonical_outer)) return error.InvalidFrame;
+    if (!std.mem.eql(u8, outer_parts.header, canonical_outer)) return error.InvalidFrame;
     if (projection_frame_size.? == 0) return error.InvalidFrame;
     if (projection_frame_size.? > limits.max_projection_frame_bytes) {
         limits.record(violation, "projection_frame_bytes", projection_frame_size.?, limits.max_projection_frame_bytes);
         return error.LimitExceeded;
     }
-    const nested = input[outer_lf + 1 ..];
-    if (nested.len != projection_frame_size.?) return error.InvalidFrame;
+    const nested = length_frame.exactPayload(outer_parts, projection_frame_size.?) catch return error.InvalidFrame;
 
-    const inner_lf = std.mem.indexOfScalar(u8, nested, '\n') orelse return error.InvalidFrame;
-    if (inner_lf + 1 > projection_command.max_success_header_bytes) {
-        limits.record(violation, "projection_header_bytes", inner_lf + 1, projection_command.max_success_header_bytes);
-        return error.LimitExceeded;
-    }
-    var inner = StrictParser.init(arena_allocator, nested[0..inner_lf]);
+    const inner_parts = try admitParts(nested, projection_command.max_success_header_bytes, "projection_header_bytes", violation);
+    var inner = StrictParser.init(arena_allocator, inner_parts.header);
     defer inner.deinit();
     inner.beginObject() catch |err| return mapOuterError(err);
     seen = 0;
@@ -134,13 +126,12 @@ pub fn parseWithLimit(allocator: std.mem.Allocator, input: []const u8, violation
     inner_target.?.validate() catch return error.InvalidTarget;
     if (!status_ok or !inner_target.?.eql(&target.?)) return error.InvalidFrame;
     const canonical_inner = try successHeaderAlloc(arena_allocator, &inner_target.?, patch_size.?);
-    if (!std.mem.eql(u8, nested[0..inner_lf], canonical_inner)) return error.InvalidFrame;
+    if (!std.mem.eql(u8, inner_parts.header, canonical_inner)) return error.InvalidFrame;
     if (patch_size.? > limits.max_projection_bytes) {
         limits.record(violation, "projection_bytes", patch_size.?, limits.max_projection_bytes);
         return error.LimitExceeded;
     }
-    const patch = nested[inner_lf + 1 ..];
-    if (patch.len != patch_size.?) return error.InvalidFrame;
+    const patch = length_frame.exactPayload(inner_parts, patch_size.?) catch return error.InvalidFrame;
 
     return .{
         .arena = arena,
@@ -202,6 +193,23 @@ fn successHeaderAlloc(
 
 fn mapOuterError(err: strict_data.ParseError) Error {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidFrame;
+}
+
+fn admitParts(
+    input: []const u8,
+    max_header_bytes: usize,
+    header_resource: []const u8,
+    violation: *?limits.Violation,
+) Error!length_frame.Parts {
+    return length_frame.split(input, .{
+        .max_header_bytes = max_header_bytes,
+        .max_payload_bytes = std.math.maxInt(usize),
+    }) catch |err| {
+        if (err != error.HeaderTooLarge) return error.InvalidFrame;
+        const lf = std.mem.indexOfScalar(u8, input, '\n') orelse unreachable;
+        limits.record(violation, header_resource, lf + 1, max_header_bytes);
+        return error.LimitExceeded;
+    };
 }
 
 fn mapTargetError(err: committed_codec.ParseError) Error {

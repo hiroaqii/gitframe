@@ -8,6 +8,7 @@ const std = @import("std");
 const codec = @import("codec.zig");
 const limits = @import("limits.zig");
 const strict = @import("strict_json.zig");
+const length_frame = @import("../data/length_frame.zig");
 const target_mod = @import("target.zig");
 const target_command = @import("target_command.zig");
 const git_command = @import("../git/command.zig");
@@ -338,125 +339,6 @@ fn mapTargetError(err: codec.ParseError) RequestParseError {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidTarget,
     };
-}
-
-fn admitSuccessFrame(
-    allocator: std.mem.Allocator,
-    request_target: target_mod.CommittedReviewTarget,
-    exit_code: u8,
-    frame: []const u8,
-) FrameAdmissionError![]const u8 {
-    if (exit_code != 0) return error.InvalidFrame;
-    const lf = std.mem.indexOfScalar(u8, frame, '\n') orelse return error.InvalidFrame;
-    if (lf + 1 > max_success_header_bytes) return error.InvalidFrame;
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var parser = strict.Parser.init(arena.allocator(), frame[0..lf]);
-    defer parser.deinit();
-    parser.beginObject() catch |err| return mapFrameError(err);
-    var seen: u32 = 0;
-    var schema_version: ?u64 = null;
-    var status_ok = false;
-    var target: ?target_mod.CommittedReviewTarget = null;
-    var patch_size: ?usize = null;
-    while (parser.nextObjectKey() catch |err| return mapFrameError(err)) |key| {
-        if (std.mem.eql(u8, key, "schema_version")) {
-            strict.markSeen(&seen, 0) catch |err| return mapFrameError(err);
-            schema_version = parser.unsigned(u64) catch |err| return mapFrameError(err);
-        } else if (std.mem.eql(u8, key, "status")) {
-            strict.markSeen(&seen, 1) catch |err| return mapFrameError(err);
-            status_ok = std.mem.eql(u8, parser.string() catch |err| return mapFrameError(err), "ok");
-        } else if (std.mem.eql(u8, key, "target")) {
-            strict.markSeen(&seen, 2) catch |err| return mapFrameError(err);
-            target = codec.parseTarget(&parser) catch |err| return mapFrameError(err);
-        } else if (std.mem.eql(u8, key, "patch_size")) {
-            strict.markSeen(&seen, 3) catch |err| return mapFrameError(err);
-            patch_size = parser.unsigned(usize) catch |err| return mapFrameError(err);
-        } else {
-            return error.InvalidFrame;
-        }
-    }
-    strict.requireFields(seen, 0b1111) catch |err| return mapFrameError(err);
-    parser.endDocument() catch |err| return mapFrameError(err);
-    strict.validateSchemaVersion(schema_version.?) catch return error.InvalidFrame;
-    if (!status_ok or !target.?.eql(&request_target)) return error.InvalidFrame;
-    if (patch_size.? > limits.max_projection_bytes) return error.InvalidFrame;
-    const payload = frame[lf + 1 ..];
-    if (payload.len != patch_size.?) return error.InvalidFrame;
-    return payload;
-}
-
-fn admitErrorFrame(allocator: std.mem.Allocator, exit_code: u8, frame: []const u8) FrameAdmissionError!void {
-    if (exit_code == 0 or frame.len == 0 or frame.len > max_error_header_bytes) return error.InvalidFrame;
-    if (frame[frame.len - 1] != '\n' or std.mem.indexOfScalar(u8, frame[0 .. frame.len - 1], '\n') != null) {
-        return error.InvalidFrame;
-    }
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var parser = strict.Parser.init(arena.allocator(), frame[0 .. frame.len - 1]);
-    defer parser.deinit();
-    parser.beginObject() catch |err| return mapFrameError(err);
-    var seen: u32 = 0;
-    var schema_version: ?u64 = null;
-    var status_error = false;
-    var code: ?[]const u8 = null;
-    while (parser.nextObjectKey() catch |err| return mapFrameError(err)) |key| {
-        if (std.mem.eql(u8, key, "schema_version")) {
-            strict.markSeen(&seen, 0) catch |err| return mapFrameError(err);
-            schema_version = parser.unsigned(u64) catch |err| return mapFrameError(err);
-        } else if (std.mem.eql(u8, key, "status")) {
-            strict.markSeen(&seen, 1) catch |err| return mapFrameError(err);
-            status_error = std.mem.eql(u8, parser.string() catch |err| return mapFrameError(err), "error");
-        } else if (std.mem.eql(u8, key, "error")) {
-            strict.markSeen(&seen, 2) catch |err| return mapFrameError(err);
-            code = try parseFrameErrorObject(&parser);
-        } else {
-            return error.InvalidFrame;
-        }
-    }
-    strict.requireFields(seen, 0b111) catch |err| return mapFrameError(err);
-    parser.endDocument() catch |err| return mapFrameError(err);
-    strict.validateSchemaVersion(schema_version.?) catch return error.InvalidFrame;
-    if (!status_error or projectionErrorExit(code.?) != exit_code) return error.InvalidFrame;
-}
-
-fn parseFrameErrorObject(parser: *strict.Parser) FrameAdmissionError![]const u8 {
-    parser.beginObject() catch |err| return mapFrameError(err);
-    var seen: u32 = 0;
-    var code: ?[]const u8 = null;
-    var message: ?[]const u8 = null;
-    while (parser.nextObjectKey() catch |err| return mapFrameError(err)) |key| {
-        if (std.mem.eql(u8, key, "code")) {
-            strict.markSeen(&seen, 0) catch |err| return mapFrameError(err);
-            code = parser.string() catch |err| return mapFrameError(err);
-        } else if (std.mem.eql(u8, key, "message")) {
-            strict.markSeen(&seen, 1) catch |err| return mapFrameError(err);
-            message = parser.string() catch |err| return mapFrameError(err);
-        } else {
-            return error.InvalidFrame;
-        }
-    }
-    strict.requireFields(seen, 0b11) catch |err| return mapFrameError(err);
-    strict.validateText(message.?, 512, false) catch return error.InvalidFrame;
-    return code.?;
-}
-
-fn projectionErrorExit(code: []const u8) u8 {
-    if (std.mem.eql(u8, code, "invalid_arguments") or
-        std.mem.eql(u8, code, "invalid_request") or
-        std.mem.eql(u8, code, "unsupported_schema_version") or
-        std.mem.eql(u8, code, "invalid_target")) return 2;
-    if (std.mem.eql(u8, code, "invalid_repository")) return 3;
-    if (std.mem.eql(u8, code, "projection_too_large")) return 4;
-    if (std.mem.eql(u8, code, "projection_git_command_failed")) return 5;
-    if (std.mem.eql(u8, code, "internal_error")) return 70;
-    return 0;
-}
-
-fn mapFrameError(err: anyerror) FrameAdmissionError {
-    return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidFrame;
 }
 
 fn successHeaderAlloc(
@@ -1150,6 +1032,118 @@ test "projection frame admits exact sixteen MiB and keeps overflow error-only" {
     );
     defer std.testing.allocator.free(fixture);
     try std.testing.expectEqualStrings(fixture, overflow.header_bytes);
+}
+
+fn admitSuccessFrame(
+    allocator: std.mem.Allocator,
+    request_target: target_mod.CommittedReviewTarget,
+    exit_code: u8,
+    frame: []const u8,
+) FrameAdmissionError![]const u8 {
+    if (exit_code != 0) return error.InvalidFrame;
+    const parts = length_frame.split(frame, .{
+        .max_header_bytes = max_success_header_bytes,
+        .max_payload_bytes = limits.max_projection_bytes,
+    }) catch return error.InvalidFrame;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var parser = strict.Parser.init(arena.allocator(), parts.header);
+    defer parser.deinit();
+    parser.beginObject() catch |err| return mapFrameError(err);
+    var seen: u32 = 0;
+    var schema_version: ?u64 = null;
+    var status_ok = false;
+    var target: ?target_mod.CommittedReviewTarget = null;
+    var patch_size: ?usize = null;
+    while (parser.nextObjectKey() catch |err| return mapFrameError(err)) |key| {
+        if (std.mem.eql(u8, key, "schema_version")) {
+            strict.markSeen(&seen, 0) catch |err| return mapFrameError(err);
+            schema_version = parser.unsigned(u64) catch |err| return mapFrameError(err);
+        } else if (std.mem.eql(u8, key, "status")) {
+            strict.markSeen(&seen, 1) catch |err| return mapFrameError(err);
+            status_ok = std.mem.eql(u8, parser.string() catch |err| return mapFrameError(err), "ok");
+        } else if (std.mem.eql(u8, key, "target")) {
+            strict.markSeen(&seen, 2) catch |err| return mapFrameError(err);
+            target = codec.parseTarget(&parser) catch |err| return mapFrameError(err);
+        } else if (std.mem.eql(u8, key, "patch_size")) {
+            strict.markSeen(&seen, 3) catch |err| return mapFrameError(err);
+            patch_size = parser.unsigned(usize) catch |err| return mapFrameError(err);
+        } else return error.InvalidFrame;
+    }
+    strict.requireFields(seen, 0b1111) catch |err| return mapFrameError(err);
+    parser.endDocument() catch |err| return mapFrameError(err);
+    strict.validateSchemaVersion(schema_version.?) catch return error.InvalidFrame;
+    if (!status_ok or !target.?.eql(&request_target)) return error.InvalidFrame;
+    if (patch_size.? > limits.max_projection_bytes) return error.InvalidFrame;
+    return length_frame.exactPayload(parts, patch_size.?) catch return error.InvalidFrame;
+}
+
+fn admitErrorFrame(allocator: std.mem.Allocator, exit_code: u8, frame: []const u8) FrameAdmissionError!void {
+    if (exit_code == 0 or frame.len > max_error_header_bytes) return error.InvalidFrame;
+    const parts = length_frame.split(frame, .{
+        .max_header_bytes = max_error_header_bytes,
+        .max_payload_bytes = 0,
+    }) catch return error.InvalidFrame;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var parser = strict.Parser.init(arena.allocator(), parts.header);
+    defer parser.deinit();
+    parser.beginObject() catch |err| return mapFrameError(err);
+    var seen: u32 = 0;
+    var schema_version: ?u64 = null;
+    var status_error = false;
+    var code: ?[]const u8 = null;
+    while (parser.nextObjectKey() catch |err| return mapFrameError(err)) |key| {
+        if (std.mem.eql(u8, key, "schema_version")) {
+            strict.markSeen(&seen, 0) catch |err| return mapFrameError(err);
+            schema_version = parser.unsigned(u64) catch |err| return mapFrameError(err);
+        } else if (std.mem.eql(u8, key, "status")) {
+            strict.markSeen(&seen, 1) catch |err| return mapFrameError(err);
+            status_error = std.mem.eql(u8, parser.string() catch |err| return mapFrameError(err), "error");
+        } else if (std.mem.eql(u8, key, "error")) {
+            strict.markSeen(&seen, 2) catch |err| return mapFrameError(err);
+            code = try parseFrameErrorObject(&parser);
+        } else return error.InvalidFrame;
+    }
+    strict.requireFields(seen, 0b111) catch |err| return mapFrameError(err);
+    parser.endDocument() catch |err| return mapFrameError(err);
+    strict.validateSchemaVersion(schema_version.?) catch return error.InvalidFrame;
+    if (!status_error or projectionErrorExit(code.?) != exit_code) return error.InvalidFrame;
+}
+
+fn parseFrameErrorObject(parser: *strict.Parser) FrameAdmissionError![]const u8 {
+    parser.beginObject() catch |err| return mapFrameError(err);
+    var seen: u32 = 0;
+    var code: ?[]const u8 = null;
+    var message: ?[]const u8 = null;
+    while (parser.nextObjectKey() catch |err| return mapFrameError(err)) |key| {
+        if (std.mem.eql(u8, key, "code")) {
+            strict.markSeen(&seen, 0) catch |err| return mapFrameError(err);
+            code = parser.string() catch |err| return mapFrameError(err);
+        } else if (std.mem.eql(u8, key, "message")) {
+            strict.markSeen(&seen, 1) catch |err| return mapFrameError(err);
+            message = parser.string() catch |err| return mapFrameError(err);
+        } else return error.InvalidFrame;
+    }
+    strict.requireFields(seen, 0b11) catch |err| return mapFrameError(err);
+    strict.validateText(message.?, 512, false) catch return error.InvalidFrame;
+    return code.?;
+}
+
+fn projectionErrorExit(code: []const u8) u8 {
+    if (std.mem.eql(u8, code, "invalid_arguments") or
+        std.mem.eql(u8, code, "invalid_request") or
+        std.mem.eql(u8, code, "unsupported_schema_version") or
+        std.mem.eql(u8, code, "invalid_target")) return 2;
+    if (std.mem.eql(u8, code, "invalid_repository")) return 3;
+    if (std.mem.eql(u8, code, "projection_too_large")) return 4;
+    if (std.mem.eql(u8, code, "projection_git_command_failed")) return 5;
+    if (std.mem.eql(u8, code, "internal_error")) return 70;
+    return 0;
+}
+
+fn mapFrameError(err: anyerror) FrameAdmissionError {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidFrame;
 }
 
 test "projection frame admission rejects truncated extra and mismatched transport" {

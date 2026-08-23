@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(
         usize,
         "expected_package_root_test_count",
-        if (!provider_enabled and test_filters.len == 0) 2045 else 0,
+        if (!provider_enabled and test_filters.len == 0) 2049 else 0,
     );
 
     const mod = mod: {
