@@ -496,7 +496,7 @@ fn drawAiReviewRow(
     app: Context,
     surface: *chasen.Surface,
     row_index: u16,
-    item: @import("../../../review_store/history.zig").RunSummary,
+    item: review_store.RunSummary,
     focused: bool,
 ) !void {
     const focus_marker: []const u8 = if (focused) ">" else " ";
@@ -532,7 +532,7 @@ fn drawAiReviewDetail(
     app: Context,
     surface: *chasen.Surface,
     start_row: u16,
-    item: *const @import("../../../review_store/history.zig").RunSummary,
+    item: *const review_store.RunSummary,
 ) !void {
     const base_label = item.base_label orelse "base";
     const head_label = item.head_label orelse "head";
@@ -840,7 +840,7 @@ test "AI Reviews picker renders bounded 120 80 56 loading and empty modal states
         .head_oid = try committed_review.ObjectId.parse(.sha1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         .diff_base_oid = try committed_review.ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     };
-    const rows = try std.testing.allocator.alloc(review_store.history.RunSummary, 1);
+    const rows = try std.testing.allocator.alloc(review_store.RunSummary, 1);
     rows[0] = .{
         .review_id = try committed_review.ReviewId.parse("923e4567-e89b-42d3-a456-426614174000"),
         .target = target,
@@ -861,7 +861,7 @@ test "AI Reviews picker renders bounded 120 80 56 loading and empty modal states
             .result_digest = null,
         },
     };
-    const diagnostics = try std.testing.allocator.alloc(review_store.history.Diagnostic, 1);
+    const diagnostics = try std.testing.allocator.alloc(review_store.Diagnostic, 1);
     diagnostics[0] = .{ .kind = .invalid_run, .text = try std.testing.allocator.dupe(u8, "invalid manifest") };
     state.ai_reviews.scan_result = .{ .history = .{
         .snapshot = undefined,

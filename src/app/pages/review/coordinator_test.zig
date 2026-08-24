@@ -11,7 +11,6 @@ const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const app_test_support = @import("../../test_support.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
-const git_command = @import("../../../git/command.zig");
 const git_review = @import("../../../git/committed_review.zig");
 const git_refs = @import("../../../git/refs.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
@@ -683,8 +682,6 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     };
     var pinned_bundle = try reviewHistoryPinnedBundle(
         allocator,
-        repo_root,
-        store_root,
         store_snapshot,
         repository_id,
         review_id,
@@ -754,8 +751,6 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
 
 fn reviewHistoryPinnedBundle(
     allocator: std.mem.Allocator,
-    repo_root: []const u8,
-    store_root: []const u8,
     snapshot: review_store.history.StoreSnapshot,
     repository_id: committed_review.ReviewRepositoryId,
     review_id: committed_review.ReviewId,
@@ -790,23 +785,11 @@ fn reviewHistoryPinnedBundle(
     errdefer allocator.free(manifest_bytes);
     var manifest = try committed_review.ReviewRunManifest.parseStrict(allocator, manifest_bytes);
     errdefer manifest.deinit();
-    const owned_store_root = try allocator.dupe(u8, store_root);
-    errdefer allocator.free(owned_store_root);
-    var store = try review_store.StoreRootCapability.openCanonical(store_root);
-    errdefer store.deinit();
-    var repository = try repo_root_capability.RootCapability.openCanonical(repo_root);
-    errdefer repository.deinit();
-    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
-    errdefer environment.deinit();
     const patch_bytes = try allocator.dupe(u8, "");
     errdefer allocator.free(patch_bytes);
 
     return .{
         .selection = .{
-            .store_root_path = owned_store_root,
-            .store = store,
-            .repository = repository,
-            .environment = environment,
             .snapshot = snapshot,
             .artifacts = .{
                 .manifest_bytes = manifest_bytes,

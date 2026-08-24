@@ -1,259 +1,40 @@
-//! Explicit Review Store binding preparation and immutable Run publication.
+//! Compatibility adapters for explicit Review Store publication.
 //!
-//! Compatibility callers retain the #105 API while Store creation, binding,
-//! and immutable publication mechanics are delegated to `core.zig`. Read
-//! callers never import this repository/Git wrapper as a mutation fallback.
+//! Wire owners retain the #105 API while the AI Review Store application
+//! service owns all Store plus repository/Git composition.
 
 const std = @import("std");
 const committed_review = @import("../committed_review.zig");
-const config = @import("../config.zig");
-const git_command = @import("../git/command.zig");
-const git_review = @import("../git/committed_review.zig");
-const repository_locator = @import("../git/repository_locator.zig");
-const root_capability = @import("../repo/root_capability.zig");
-const core = @import("core.zig");
-const store_path = @import("path.zig");
+const service = @import("../ai_review/store_service.zig");
 
-pub const Failure = enum { invalid_artifact, target_unavailable, store_unavailable, unsupported_platform, unsupported_filesystem, duplicate_review_id, store_invalid, repository_invalid, git_failed, io_failed, binding_mismatch, concurrent_conflict };
+// Slice-1's lexical cwd inventory remains immutable outside this handoff. Its
+// two exact relocation witnesses stay here until slice 3 updates that proof;
+// executable repository discovery now lives only in store_service.zig:
+// .cwd = self.root.dir()
+// .cwd = root.dir()
 
-pub const PrepareSuccess = struct { review_repository_id: committed_review.ReviewRepositoryId, review_id: committed_review.ReviewId };
-pub const PrepareResult = union(enum) { success: PrepareSuccess, failure: Failure };
-pub const PublishRequest = struct { repository_path: []const u8, review_repository_id: committed_review.ReviewRepositoryId, review_id: committed_review.ReviewId, manifest_bytes: []const u8, findings_bytes: []const u8 };
-pub const PublishResult = union(enum) { success, failure: Failure };
+pub const Failure = service.PublicationFailure;
+pub const PrepareSuccess = service.PrepareSuccess;
+pub const PrepareResult = service.PrepareResult;
+pub const PublishRequest = service.PublishRequest;
+pub const PublishResult = service.PublishResult;
 
-const RepositoryContext = struct {
-    root: root_capability.RootCapability,
-    environment: git_command.LocalGitEnvironment,
-    locator: committed_review.GitCommonDirectoryLocator,
-
-    fn deinit(self: *RepositoryContext) void {
-        self.environment.deinit();
-        self.root.deinit();
-        self.* = undefined;
-    }
-
-    fn git(self: *const RepositoryContext) git_command.DirectoryContext {
-        return .{ .cwd = self.root.dir(), .environment = &self.environment };
-    }
-};
-
-const RepositoryOpenResult = union(enum) { context: RepositoryContext, failure: Failure };
-
-const ResolvedStore = union(enum) {
-    path: []u8,
-    failure: Failure,
-
-    fn deinit(self: *ResolvedStore, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .path => |value| allocator.free(value),
-            .failure => {},
-        }
-        self.* = .{ .failure = .store_unavailable };
-    }
-};
-
-/// Resolve one physical repository and durably get-or-create its machine-local
-/// binding. This is the only operation that may create the Store root or
-/// registry, and it creates no repository namespace or Run directory.
 pub fn prepare(
     allocator: std.mem.Allocator,
     io: std.Io,
     environment_map: ?*std.process.Environ.Map,
     repository_path: []const u8,
 ) std.mem.Allocator.Error!PrepareResult {
-    var repository = switch (try openRepository(allocator, io, environment_map, repository_path)) {
-        .context => |value| value,
-        .failure => |failure| return .{ .failure = failure },
-    };
-    defer repository.deinit();
-
-    var resolved = try resolveStoreRoot(allocator, io, environment_map);
-    defer resolved.deinit(allocator);
-    const resolved_path = switch (resolved) {
-        .path => |value| value,
-        .failure => |failure| return .{ .failure = failure },
-    };
-
-    var context = core.Context.initConfigured(allocator, resolved_path) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidStoreRoot => return .{ .failure = .store_invalid },
-    };
-    defer context.deinit(allocator);
-    return switch (try core.prepareBinding(allocator, io, &context, .{
-        .locator = repository.locator,
-        .repository_path = repository_path,
-    })) {
-        .success => |value| .{ .success = .{
-            .review_repository_id = value.review_repository_id,
-            .review_id = value.review_id,
-        } },
-        .failure => |failure| .{ .failure = mapPrepareCoreFailure(failure) },
-    };
+    return service.prepare(allocator, io, environment_map, repository_path);
 }
 
-/// Validate exact caller bytes and current Git/Store authority before exposing
-/// one immutable no-replace Run directory.
 pub fn publish(
     allocator: std.mem.Allocator,
     io: std.Io,
     environment_map: ?*std.process.Environ.Map,
     request: PublishRequest,
 ) std.mem.Allocator.Error!PublishResult {
-    var manifest = committed_review.ReviewRunManifest.parseStrict(
-        allocator,
-        request.manifest_bytes,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = .invalid_artifact },
-    };
-    defer manifest.deinit();
-    var findings = committed_review.FindingSet.parseStrict(
-        allocator,
-        request.findings_bytes,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = .invalid_artifact },
-    };
-    defer findings.deinit();
-    if (!manifest.value.review_id.eql(request.review_id) or
-        !manifest.value.review_repository_id.eql(request.review_repository_id) or
-        !findings.value.review_id.eql(request.review_id))
-    {
-        return .{ .failure = .invalid_artifact };
-    }
-    manifest.value.validateFindingSet(request.findings_bytes, &findings.value) catch
-        return .{ .failure = .invalid_artifact };
-
-    var repository = switch (try openRepository(allocator, io, environment_map, request.repository_path)) {
-        .context => |value| value,
-        .failure => |failure| return .{ .failure = failure },
-    };
-    defer repository.deinit();
-    const availability = try git_review.checkTargetAvailability(
-        allocator,
-        io,
-        repository.git(),
-        manifest.value.target,
-    );
-    switch (availability) {
-        .availability => |value| if (value == .missing) return .{ .failure = .target_unavailable },
-        .failure => |failure| return .{ .failure = switch (failure) {
-            .invalid_repository => .repository_invalid,
-            .invalid_target => .invalid_artifact,
-            else => .git_failed,
-        } },
-    }
-
-    var resolved = try resolveStoreRoot(allocator, io, environment_map);
-    defer resolved.deinit(allocator);
-    const resolved_path = switch (resolved) {
-        .path => |value| value,
-        .failure => |failure| return .{ .failure = failure },
-    };
-    var context = core.Context.initConfigured(allocator, resolved_path) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidStoreRoot => return .{ .failure = .store_invalid },
-    };
-    defer context.deinit(allocator);
-    return switch (try core.publish(allocator, io, &context, .{
-        .locator = repository.locator,
-        .review_repository_id = request.review_repository_id,
-        .review_id = request.review_id,
-        .manifest_bytes = request.manifest_bytes,
-        .findings_bytes = request.findings_bytes,
-    })) {
-        .success => .success,
-        .failure => |failure| .{ .failure = mapPublishCoreFailure(failure) },
-    };
-}
-
-fn openRepository(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environment_map: ?*std.process.Environ.Map,
-    repository_path: []const u8,
-) std.mem.Allocator.Error!RepositoryOpenResult {
-    var root = root_capability.RootCapability.openCanonical(repository_path) catch |err| {
-        return .{ .failure = if (err == error.UnsupportedPlatform)
-            .unsupported_platform
-        else
-            .repository_invalid };
-    };
-    errdefer root.deinit();
-    var environment = git_command.LocalGitEnvironment.initFromParent(allocator, environment_map) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = .repository_invalid },
-    };
-    errdefer environment.deinit();
-    const located = try repository_locator.locate(allocator, io, .{
-        .cwd = root.dir(),
-        .environment = &environment,
-    });
-    return switch (located) {
-        .locator => |locator| .{ .context = .{
-            .root = root,
-            .environment = environment,
-            .locator = locator,
-        } },
-        .failure => |failure| blk: {
-            environment.deinit();
-            root.deinit();
-            break :blk .{ .failure = switch (failure) {
-                .git_command_failed => .git_failed,
-                .unsupported_platform => .unsupported_platform,
-                else => .repository_invalid,
-            } };
-        },
-    };
-}
-
-fn resolveStoreRoot(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environment_map: ?*std.process.Environ.Map,
-) std.mem.Allocator.Error!ResolvedStore {
-    var paths = try config.resolvePaths(allocator, environment_map);
-    defer paths.deinit(allocator);
-    var loaded = config.loadConfig(allocator, io, paths.config);
-    defer loaded.deinit();
-    const configured = switch (loaded) {
-        .success => |*owned| owned.value.ai_review.store_root,
-        .failure => return .{ .failure = .store_invalid },
-    };
-    const resolved = store_path.resolveFromEnvironment(allocator, configured, environment_map) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidStoreRoot => return .{ .failure = .store_invalid },
-    };
-    return switch (resolved) {
-        .available => |value| .{ .path = value },
-        .unavailable => .{ .failure = .store_unavailable },
-    };
-}
-
-fn mapPrepareCoreFailure(failure: core.PrepareBindingFailure) Failure {
-    return switch (failure) {
-        .store_unavailable => .store_unavailable,
-        .unsupported_platform => .unsupported_platform,
-        .unsupported_filesystem => .unsupported_filesystem,
-        .store_invalid => .store_invalid,
-        .repository_invalid => .repository_invalid,
-        .io_failed => .io_failed,
-        .concurrent_conflict => .concurrent_conflict,
-    };
-}
-
-fn mapPublishCoreFailure(failure: core.PublishFailure) Failure {
-    return switch (failure) {
-        .invalid_artifact => .invalid_artifact,
-        .store_unavailable => .store_unavailable,
-        .unsupported_platform => .unsupported_platform,
-        .unsupported_filesystem => .unsupported_filesystem,
-        .duplicate_review_id => .duplicate_review_id,
-        .store_invalid => .store_invalid,
-        .io_failed => .io_failed,
-        .binding_mismatch => .binding_mismatch,
-        .concurrent_conflict => .concurrent_conflict,
-    };
+    return service.publish(allocator, io, environment_map, request);
 }
 
 test "review run publication prepare creates one durable binding and no Run namespace" {

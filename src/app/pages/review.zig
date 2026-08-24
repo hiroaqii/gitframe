@@ -290,7 +290,7 @@ pub const AiReviewsRequest = struct {
 
 pub const AiReviewSelectionRequest = struct {
     request: AiReviewsRequest,
-    store: review_store.history.StoreSnapshot,
+    store: review_store.StoreSnapshot,
     review_id: committed_review.ReviewId,
     artifacts: review_store.ArtifactSnapshot,
 };
@@ -469,7 +469,7 @@ pub const AiReviewsPickerState = struct {
         allocator: std.mem.Allocator,
         identity: page.RequestIdentity,
         root_identity: root_capability.Identity,
-        store: review_store.history.StoreSnapshot,
+        store: review_store.StoreSnapshot,
         review_id: committed_review.ReviewId,
         artifacts: review_store.ArtifactSnapshot,
     ) AiReviewSelectionRequest {
@@ -531,7 +531,7 @@ pub const AiReviewsPickerState = struct {
     pub fn failSelection(
         self: *AiReviewsPickerState,
         review_id: committed_review.ReviewId,
-        failure: review_store.history.SelectionFailure,
+        failure: review_store.SelectionFailure,
     ) void {
         const phase_loading = switch (self.phase) {
             .selection_loading => |value| value,
@@ -641,7 +641,7 @@ pub const AiReviewsPickerState = struct {
         }
     }
 
-    pub fn selectedRow(self: *const AiReviewsPickerState) ?*const review_store.history.RunSummary {
+    pub fn selectedRow(self: *const AiReviewsPickerState) ?*const review_store.RunSummary {
         if (self.focus == 0) return null;
         const history_value = self.historyConst() orelse return null;
         const source_index = self.filter.sourceIndex(self.focus - 1) orelse return null;
@@ -653,7 +653,7 @@ pub const AiReviewsPickerState = struct {
         return self.focus == 0 and self.listInteractive();
     }
 
-    pub fn rows(self: *const AiReviewsPickerState) []const review_store.history.RunSummary {
+    pub fn rows(self: *const AiReviewsPickerState) []const review_store.RunSummary {
         const history_value = self.historyConst() orelse return &.{};
         return history_value.rows;
     }
@@ -816,7 +816,7 @@ pub const AiReviewsPickerState = struct {
     }
 };
 
-pub fn runSummaryStatusText(status: review_store.history.RunSummaryStatus) []const u8 {
+pub fn runSummaryStatusText(status: review_store.RunSummaryStatus) []const u8 {
     return switch (status) {
         .new => "new",
         .draft => "draft",
@@ -826,7 +826,7 @@ pub fn runSummaryStatusText(status: review_store.history.RunSummaryStatus) []con
     };
 }
 
-fn scanFailureText(failure: review_store.history.ScanFailure) []const u8 {
+fn scanFailureText(failure: review_store.ScanFailure) []const u8 {
     return switch (failure) {
         .repository_invalid => "Could not load AI reviews: repository invalid",
         .store_invalid => "Could not load AI reviews: Store invalid",
@@ -842,7 +842,7 @@ fn scanFailureText(failure: review_store.history.ScanFailure) []const u8 {
     };
 }
 
-fn selectionFailureText(failure: review_store.history.SelectionFailure) []const u8 {
+fn selectionFailureText(failure: review_store.SelectionFailure) []const u8 {
     return switch (failure) {
         .repository_unavailable => "Could not load AI review: repository unavailable",
         .root_drift => "Could not load AI review: Store changed",
@@ -2500,7 +2500,7 @@ test "AI Reviews picker failed Run B and normal return preserve accepted present
     const identity = state.activation.currentIdentity().?;
     const root_identity: root_capability.Identity = .{ .device = 4, .inode = 8 };
     const review_id = try committed_review.ReviewId.parse("923e4567-e89b-42d3-a456-426614174000");
-    const rows = try allocator.alloc(review_store.history.RunSummary, 1);
+    const rows = try allocator.alloc(review_store.RunSummary, 1);
     rows[0] = .{
         .review_id = review_id,
         .target = .{ .object_format = .sha1, .source_kind = .branch_range, .base_oid = testOid('c'), .head_oid = testOid('d'), .diff_base_oid = testOid('c') },
@@ -2527,7 +2527,7 @@ test "AI Reviews picker failed Run B and normal return preserve accepted present
     state.ai_reviews.scan_result = .{ .history = .{
         .snapshot = undefined,
         .rows = rows,
-        .diagnostics = try allocator.alloc(review_store.history.Diagnostic, 0),
+        .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
         .skipped_count = 0,
         .orphan_count = 0,
     } };
@@ -2539,7 +2539,7 @@ test "AI Reviews picker failed Run B and normal return preserve accepted present
     const normal_target = state.normalBasisConst().?.target;
     try std.testing.expect(state.isCurrentReviewTarget(&normal_target));
 
-    const status_cases = [_]struct { status: review_store.history.RunSummaryStatus, query: []const u8 }{
+    const status_cases = [_]struct { status: review_store.RunSummaryStatus, query: []const u8 }{
         .{ .status = .new, .query = "new" },
         .{ .status = .draft, .query = "draft" },
         .{ .status = .approved, .query = "approved" },

@@ -252,7 +252,7 @@ pub const PinnedReviewLoadedBundle = struct {
 pub const ReviewHistorySelectionTaskResult = union(enum) {
     empty,
     loaded: PinnedReviewLoadedBundle,
-    selection_failed: review_store.history.SelectionFailure,
+    selection_failed: review_store.SelectionFailure,
     failed_static: []const u8,
 
     pub fn deinit(self: *ReviewHistorySelectionTaskResult, allocator: std.mem.Allocator) void {
@@ -1028,6 +1028,7 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
         identity: page.RequestIdentity,
         generation: u64,
         store_root: []u8,
+        store: review_store.ConfiguredStore,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
 
@@ -1041,12 +1042,15 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
         ) !@This() {
             const owned_store_root = try allocator.dupe(u8, store_root);
             errdefer allocator.free(owned_store_root);
+            var owned_store = try review_store.ConfiguredStore.initConfigured(allocator, store_root);
+            errdefer owned_store.deinit(allocator);
             var owned_root = try root.duplicate();
             errdefer owned_root.deinit();
             return .{
                 .identity = identity,
                 .generation = generation,
                 .store_root = owned_store_root,
+                .store = owned_store,
                 .root = owned_root,
                 .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map),
             };
@@ -1054,7 +1058,7 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
 
         pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            const scanned = review_store.history.scan(allocator, io, task.store_root, .{
+            const scanned = review_store.scan(allocator, io, &task.store, .{
                 .capability = &task.root,
                 .environment = &task.environment,
             }) catch return task.finish(allocator, .{ .failed_static = "Could not load AI reviews: out of memory" });
@@ -1075,6 +1079,7 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
             defer {
                 task.environment.deinit();
                 task.root.deinit();
+                task.store.deinit(allocator);
                 allocator.destroy(task);
             }
             const store_root = task.store_root;
@@ -1090,6 +1095,7 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
         fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
             task.environment.deinit();
             task.root.deinit();
+            task.store.deinit(allocator);
             allocator.free(task.store_root);
         }
     };
@@ -1101,9 +1107,10 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
         identity: page.RequestIdentity,
         generation: u64,
         store_root: []u8,
+        store: review_store.ConfiguredStore,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
-        expected_store: review_store.history.StoreSnapshot,
+        expected_store: review_store.StoreSnapshot,
         review_id: committed_review.ReviewId,
         expected_artifacts: review_store.ArtifactSnapshot,
 
@@ -1113,19 +1120,22 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
             store_root: []const u8,
             root: root_capability.RootCapability,
             env_map: ?*const std.process.Environ.Map,
-            expected_store: review_store.history.StoreSnapshot,
+            expected_store: review_store.StoreSnapshot,
             review_id: committed_review.ReviewId,
             expected_artifacts: review_store.ArtifactSnapshot,
             allocator: std.mem.Allocator,
         ) !@This() {
             const owned_store_root = try allocator.dupe(u8, store_root);
             errdefer allocator.free(owned_store_root);
+            var owned_store = try review_store.ConfiguredStore.initConfigured(allocator, store_root);
+            errdefer owned_store.deinit(allocator);
             var owned_root = try root.duplicate();
             errdefer owned_root.deinit();
             return .{
                 .identity = identity,
                 .generation = generation,
                 .store_root = owned_store_root,
+                .store = owned_store,
                 .root = owned_root,
                 .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map),
                 .expected_store = expected_store,
@@ -1139,7 +1149,7 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
             return task.finish(allocator, runReviewHistorySelection(
                 allocator,
                 io,
-                task.store_root,
+                &task.store,
                 .{ .capability = &task.root, .environment = &task.environment },
                 task.expected_store,
                 task.review_id,
@@ -1161,6 +1171,7 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
             defer {
                 task.environment.deinit();
                 task.root.deinit();
+                task.store.deinit(allocator);
                 allocator.destroy(task);
             }
             const store_root = task.store_root;
@@ -1177,6 +1188,7 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
         fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
             task.environment.deinit();
             task.root.deinit();
+            task.store.deinit(allocator);
             allocator.free(task.store_root);
         }
     };
@@ -1185,16 +1197,16 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
 pub fn runReviewHistorySelection(
     allocator: std.mem.Allocator,
     io: std.Io,
-    store_root: []const u8,
-    repository: review_store.history.RepositoryContext,
-    expected_store: review_store.history.StoreSnapshot,
+    configured_store: *const review_store.ConfiguredStore,
+    repository: review_store.RepositoryContext,
+    expected_store: review_store.StoreSnapshot,
     review_id: committed_review.ReviewId,
     expected_artifacts: review_store.ArtifactSnapshot,
 ) ReviewHistorySelectionTaskResult {
-    var selected = review_store.history.loadSelection(
+    var selected = review_store.selectExact(
         allocator,
         io,
-        store_root,
+        configured_store,
         repository,
         expected_store,
         review_id,
