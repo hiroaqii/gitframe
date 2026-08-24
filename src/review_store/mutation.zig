@@ -131,6 +131,11 @@ pub fn saveDraft(allocator: std.mem.Allocator, io: std.Io, resolved_store: *cons
         .available => |value| value,
         .unavailable => return .{ .failure = .io_failed },
     };
+    return saveDraftAt(allocator, io, store_root, request);
+}
+
+/// Internal semantic-core entrypoint after configuration has been resolved.
+pub fn saveDraftAt(allocator: std.mem.Allocator, io: std.Io, store_root: []const u8, request: DraftRequest) std.mem.Allocator.Error!DraftResult {
     return saveDraftWith(allocator, io, store_root, request, .{});
 }
 
@@ -193,6 +198,11 @@ pub fn createResult(allocator: std.mem.Allocator, io: std.Io, resolved_store: *c
         .available => |value| value,
         .unavailable => return .{ .failure = .io_failed },
     };
+    return createResultAt(allocator, io, store_root, request);
+}
+
+/// Internal semantic-core entrypoint after configuration has been resolved.
+pub fn createResultAt(allocator: std.mem.Allocator, io: std.Io, store_root: []const u8, request: ResultRequest) std.mem.Allocator.Error!ResultResult {
     return createResultWith(allocator, io, store_root, request, .{}, .{});
 }
 
@@ -616,15 +626,6 @@ test "review state persistence draft CAS and trusted-clock result round trip" {
     var frozen = try saveDraftAt(allocator, io, fixture.store_root, fixture.draftRequest(2, "third"));
     defer frozen.deinit(allocator);
     try std.testing.expectEqual(Failure.already_completed, frozen.failure);
-}
-
-fn saveDraftAt(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    store_root: []const u8,
-    request: DraftRequest,
-) std.mem.Allocator.Error!DraftResult {
-    return saveDraftWith(allocator, io, store_root, request, .{});
 }
 
 test "review state persistence fault boundaries leave old or new byte-complete authority" {

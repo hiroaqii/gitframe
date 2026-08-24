@@ -33,6 +33,8 @@ test {
     _ = @import("review_store/capability.zig");
     _ = @import("review_store/registry.zig");
     _ = @import("review_store/run.zig");
+    _ = @import("review_store/core.zig");
+    _ = @import("review_store/catalog.zig");
     _ = @import("review_store/history.zig");
     _ = @import("review_store/publication.zig");
     _ = @import("review_store/mutation.zig");

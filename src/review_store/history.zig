@@ -7,15 +7,16 @@ const git_review = @import("../git/committed_review.zig");
 const repository_locator = @import("../git/repository_locator.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const capability = @import("capability.zig");
-const registry = @import("registry.zig");
+const catalog_store = @import("catalog.zig");
+const core = @import("core.zig");
 const run = @import("run.zig");
 const store_path = @import("path.zig");
 
-pub const max_namespace_entries: usize = 1024;
-pub const max_run_candidates: usize = 512;
-pub const max_enumerated_name_bytes: usize = 256 * 1024;
-pub const max_diagnostics: usize = 8;
-pub const max_diagnostic_bytes: usize = 256;
+pub const max_namespace_entries = catalog_store.max_namespace_entries;
+pub const max_run_candidates = catalog_store.max_run_candidates;
+pub const max_enumerated_name_bytes = catalog_store.max_enumerated_name_bytes;
+pub const max_diagnostics = catalog_store.max_diagnostics;
+pub const max_diagnostic_bytes = catalog_store.max_diagnostic_bytes;
 
 pub const RepositoryContext = struct {
     capability: *const root_capability.RootCapability,
@@ -26,22 +27,11 @@ pub const RepositoryContext = struct {
     }
 };
 
-pub const StoreSnapshot = struct {
-    root_device: u64,
-    root_inode: u64,
-    repository_locator: committed_review.GitCommonDirectoryLocator,
-    review_repository_id: committed_review.ReviewRepositoryId,
-};
+pub const StoreSnapshot = catalog_store.StoreSnapshot;
 
 /// Display-safe lifecycle projection for one validated Run. Terminal values
 /// preserve the exact human decision instead of collapsing it to `completed`.
-pub const RunSummaryStatus = enum {
-    new,
-    draft,
-    approved,
-    needs_changes,
-    canceled,
-};
+pub const RunSummaryStatus = catalog_store.RunStatus;
 
 pub const RunSummary = struct {
     review_id: committed_review.ReviewId,
@@ -66,12 +56,7 @@ pub const RunSummary = struct {
     }
 };
 
-pub const DiagnosticKind = enum {
-    invalid_run,
-    orphan_temp,
-    unsafe_or_unknown_entry,
-    retained_draft_invalid,
-};
+pub const DiagnosticKind = catalog_store.DiagnosticKind;
 
 pub const Diagnostic = struct {
     kind: DiagnosticKind,
@@ -141,108 +126,30 @@ pub fn scan(
         .locator => |value| value,
         .failure => return .{ .failure = .repository_invalid },
     };
-
-    var root = capability.StoreRootCapability.openCanonical(store_root) catch |err|
-        return classifyRootOpenError(err);
-    defer root.deinit();
-
-    var registry_result = try registry.read(allocator, io, root.directory);
-    defer registry_result.deinit();
-    const parsed_registry = switch (registry_result) {
-        .missing => return .unbound,
-        .registry => |*value| value,
-        .invalid => return .{ .failure = .registry_invalid },
-        .unavailable => return .{ .failure = .registry_unavailable },
+    var context = core.Context.initConfigured(allocator, store_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidStoreRoot => return .{ .failure = .store_invalid },
     };
-    const repository_id = parsed_registry.lookup(locator) orelse return .unbound;
-    const snapshot: StoreSnapshot = .{
-        .root_device = root.directory.metadata.device,
-        .root_inode = root.directory.metadata.inode,
-        .repository_locator = locator,
-        .review_repository_id = repository_id,
+    defer context.deinit(allocator);
+    var scanned = try catalog_store.scan(allocator, io, &context, locator);
+    defer scanned.deinit(allocator);
+    const catalog_value = switch (scanned) {
+        .unbound => return .unbound,
+        .bound_empty => |value| return .{ .bound_empty = .{ .snapshot = value.snapshot } },
+        .failure => |failure| return .{ .failure = mapCatalogScanFailure(failure) },
+        .catalog => |*value| value,
     };
-    const repository_text = repository_id.canonical();
-    var namespace = root.directory.openDirectory(&repository_text) catch |err| {
-        return if (err == error.FileNotFound)
-            .{ .bound_empty = .{ .snapshot = snapshot } }
-        else
-            .{ .failure = .namespace_invalid };
-    };
-    defer namespace.deinit();
-
-    var candidates: std.ArrayList(committed_review.ReviewId) = .empty;
-    defer candidates.deinit(allocator);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
-    defer deinitDiagnostics(allocator, &diagnostics);
-    var entry_count: usize = 0;
-    var name_bytes: usize = 0;
-    var skipped_count: usize = 0;
-    var orphan_count: usize = 0;
-    var iterator = namespace.iterate();
-    while (iterator.next(namespace, io) catch return .{ .failure = .enumeration_failed }) |entry| {
-        entry_count += 1;
-        name_bytes = std.math.add(usize, name_bytes, entry.name.len) catch
-            return .{ .failure = .scan_limit_exceeded };
-        if (entry_count > max_namespace_entries or name_bytes > max_enumerated_name_bytes) {
-            return .{ .failure = .scan_limit_exceeded };
-        }
-        if (committed_review.ReviewId.parse(entry.name)) |review_id| {
-            if (candidates.items.len == max_run_candidates) return .{ .failure = .scan_limit_exceeded };
-            try candidates.append(allocator, review_id);
-            continue;
-        } else |_| {}
-
-        if (store_path.NamespaceTempName.parse(entry.name)) |temp| {
-            const expected: capability.ExpectedKind = if (temp.kind == .publish) .directory else .regular_file;
-            if (namespace.admitChild(entry.name, expected)) |_| {
-                orphan_count += 1;
-                try appendDiagnostic(allocator, &diagnostics, .orphan_temp, entry.name);
-            } else |_| {
-                skipped_count += 1;
-                try appendDiagnostic(allocator, &diagnostics, .unsafe_or_unknown_entry, entry.name);
-            }
-        } else |_| {
-            skipped_count += 1;
-            try appendDiagnostic(allocator, &diagnostics, .unsafe_or_unknown_entry, entry.name);
-        }
-    }
-    if (entry_count == 0) return .{ .bound_empty = .{ .snapshot = snapshot } };
 
     var rows: std.ArrayList(RunSummary) = .empty;
     defer deinitRows(allocator, &rows);
-    var artifact_budget: run.ArtifactBudget = .{};
-    for (candidates.items) |review_id| {
-        var loaded_result = try run.loadValidated(
-            allocator,
-            io,
-            namespace,
-            repository_id,
-            review_id,
-            &artifact_budget,
-        );
-        defer loaded_result.deinit(allocator);
-        switch (loaded_result) {
-            .loaded => |*loaded| {
-                const summary = try summaryFromLoaded(allocator, loaded);
-                rows.append(allocator, summary) catch |err| {
-                    var owned = summary;
-                    owned.deinit(allocator);
-                    return err;
-                };
-                if (loaded.retained_draft_diagnostic != null) {
-                    const text = review_id.canonical();
-                    try appendDiagnostic(allocator, &diagnostics, .retained_draft_invalid, &text);
-                }
-            },
-            .invalid => |reason| {
-                if (reason == .scan_artifact_bytes_exceeded) return .{ .failure = .scan_limit_exceeded };
-                skipped_count += 1;
-                const text = review_id.canonical();
-                try appendDiagnostic(allocator, &diagnostics, .invalid_run, &text);
-            },
-        }
+    for (catalog_value.rows) |*row| {
+        const summary = try summaryFromCatalogRow(allocator, row);
+        rows.append(allocator, summary) catch |err| {
+            var owned = summary;
+            owned.deinit(allocator);
+            return err;
+        };
     }
-
     if (rows.items.len != 0) {
         const targets = try allocator.alloc(committed_review.CommittedReviewTarget, rows.items.len);
         defer allocator.free(targets);
@@ -257,6 +164,11 @@ pub fn scan(
     }
     std.mem.sort(RunSummary, rows.items, {}, summaryLessThan);
 
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer deinitDiagnostics(allocator, &diagnostics);
+    for (catalog_value.diagnostics) |diagnostic| {
+        try appendDiagnostic(allocator, &diagnostics, diagnostic.kind, diagnostic.text);
+    }
     const owned_rows = try rows.toOwnedSlice(allocator);
     errdefer {
         for (owned_rows) |*row| row.deinit(allocator);
@@ -268,69 +180,51 @@ pub fn scan(
         allocator.free(owned_diagnostics);
     }
     return .{ .history = .{
-        .snapshot = snapshot,
+        .snapshot = catalog_value.snapshot,
         .rows = owned_rows,
         .diagnostics = owned_diagnostics,
-        .skipped_count = skipped_count,
-        .orphan_count = orphan_count,
+        .skipped_count = catalog_value.skipped_count,
+        .orphan_count = catalog_value.orphan_count,
     } };
 }
 
-fn classifyRootOpenError(err: anyerror) ScanResult {
-    const name = @errorName(err);
-    if (std.mem.eql(u8, name, "FileNotFound")) return .unbound;
-    if (std.mem.eql(u8, name, "UnsupportedPlatform")) return .{ .failure = .unsupported_platform };
-    if (std.mem.eql(u8, name, "UnsupportedFilesystem")) return .{ .failure = .unsupported_filesystem };
-    if (std.mem.eql(u8, name, "AccessDenied") or std.mem.eql(u8, name, "PermissionDenied")) {
-        return .{ .failure = .store_unavailable };
-    }
-    return .{ .failure = .store_invalid };
+fn mapCatalogScanFailure(failure: catalog_store.ScanFailure) ScanFailure {
+    return switch (failure) {
+        .store_invalid => .store_invalid,
+        .store_unavailable => .store_unavailable,
+        .unsupported_platform => .unsupported_platform,
+        .unsupported_filesystem => .unsupported_filesystem,
+        .registry_invalid => .registry_invalid,
+        .registry_unavailable => .registry_unavailable,
+        .namespace_invalid => .namespace_invalid,
+        .enumeration_failed => .enumeration_failed,
+        .scan_limit_exceeded => .scan_limit_exceeded,
+    };
 }
 
-fn summaryFromLoaded(
+fn summaryFromCatalogRow(
     allocator: std.mem.Allocator,
-    loaded: *const run.LoadedRunArtifacts,
+    row: *const catalog_store.CatalogRow,
 ) std.mem.Allocator.Error!RunSummary {
-    const manifest = &loaded.manifest.value;
     var summary: RunSummary = .{
-        .review_id = manifest.review_id,
-        .target = manifest.target,
-        .status = summaryStatus(loaded),
-        .created_at = undefined,
-        .created_at_unix = loaded.created_at_unix,
-        .producer_name = try allocator.dupe(u8, manifest.producer.name),
+        .review_id = row.review_id,
+        .target = row.target,
+        .status = row.status,
+        .created_at = row.created_at,
+        .created_at_unix = row.created_at_unix,
+        .producer_name = try allocator.dupe(u8, row.producer_name),
         .producer_model = null,
         .base_label = null,
         .head_label = null,
-        .finding_count = manifest.finding_count,
+        .finding_count = row.finding_count,
         .availability = .available,
-        .artifact_snapshot = run.ArtifactSnapshot.fromLoaded(loaded),
+        .artifact_snapshot = row.artifact_snapshot,
     };
     errdefer summary.deinit(allocator);
-    @memcpy(&summary.created_at, manifest.created_at);
-    if (manifest.producer.model) |value| summary.producer_model = try allocator.dupe(u8, value);
-    if (manifest.display) |display| {
-        if (display.base_label) |value| summary.base_label = try allocator.dupe(u8, value);
-        if (display.head_label) |value| summary.head_label = try allocator.dupe(u8, value);
-    }
+    if (row.producer_model) |value| summary.producer_model = try allocator.dupe(u8, value);
+    if (row.base_label) |value| summary.base_label = try allocator.dupe(u8, value);
+    if (row.head_label) |value| summary.head_label = try allocator.dupe(u8, value);
     return summary;
-}
-
-fn summaryStatus(loaded: *const run.LoadedRunArtifacts) RunSummaryStatus {
-    if (loaded.result) |result| {
-        return switch (result.value.result) {
-            .approved => .approved,
-            .needs_changes => .needs_changes,
-            .canceled => .canceled,
-        };
-    }
-    return switch (loaded.state) {
-        .new => .new,
-        .draft => .draft,
-        // `ReviewRunState.completed` is derived from a validated result, so
-        // the branch above must have returned its exact terminal decision.
-        .completed => unreachable,
-    };
 }
 
 fn summaryLessThan(_: void, left: RunSummary, right: RunSummary) bool {
@@ -452,51 +346,32 @@ pub fn loadSelection(
     };
     if (!locator.eql(expected.repository_locator)) return .{ .failure = .binding_drift };
 
-    var store = capability.StoreRootCapability.openCanonical(owned_path) catch
-        return .{ .failure = .root_drift };
-    defer if (!transferred) store.deinit();
-    if (store.directory.metadata.device != expected.root_device or
-        store.directory.metadata.inode != expected.root_inode)
-    {
-        return .{ .failure = .root_drift };
-    }
-
-    var registry_result = try registry.read(allocator, io, store.directory);
-    defer registry_result.deinit();
-    const parsed_registry = switch (registry_result) {
-        .registry => |*value| value,
-        else => return .{ .failure = .binding_drift },
+    var store_context = core.Context.initConfigured(allocator, owned_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidStoreRoot => return .{ .failure = .root_drift },
     };
-    const current_id = parsed_registry.lookup(locator) orelse return .{ .failure = .binding_drift };
-    if (!current_id.eql(expected.review_repository_id)) return .{ .failure = .binding_drift };
-
-    const repository_text = current_id.canonical();
-    var namespace = store.directory.openDirectory(&repository_text) catch
-        return .{ .failure = .run_invalid };
-    defer namespace.deinit();
-    var budget: run.ArtifactBudget = .{};
-    var loaded_result = try run.loadValidated(
+    defer store_context.deinit(allocator);
+    var exact_result = try catalog_store.readExact(
         allocator,
         io,
-        namespace,
-        current_id,
+        &store_context,
+        locator,
         review_id,
-        &budget,
+        expected,
+        expected_artifacts,
     );
-    defer loaded_result.deinit(allocator);
-    const loaded = switch (loaded_result) {
-        .loaded => |*value| value,
-        .invalid => return .{ .failure = .run_invalid },
+    defer exact_result.deinit(allocator);
+    const exact = switch (exact_result) {
+        .exact => |*value| value,
+        .absent => return .{ .failure = .run_invalid },
+        .failure => |failure| return .{ .failure = mapExactReadFailure(failure) },
     };
-    if (!run.ArtifactSnapshot.fromLoaded(loaded).eql(expected_artifacts)) {
-        return .{ .failure = .artifact_drift };
-    }
 
     const availability = try git_review.checkTargetAvailability(
         allocator,
         io,
         owned_context.git(),
-        loaded.manifest.value.target,
+        exact.artifacts.manifest.value.target,
     );
     switch (availability) {
         .availability => |value| if (value == .missing) return .{ .failure = .target_unavailable },
@@ -506,7 +381,7 @@ pub fn loadSelection(
         allocator,
         io,
         owned_context.git(),
-        loaded.manifest.value.target,
+        exact.artifacts.manifest.value.target,
     );
     defer projection_result.deinit(allocator);
     const projection = switch (projection_result) {
@@ -514,8 +389,9 @@ pub fn loadSelection(
         .failure => return .{ .failure = .projection_failed },
     };
 
-    const artifacts = loaded.*;
-    loaded_result = .{ .invalid = .artifact_invalid };
+    const store = exact.root.root;
+    const artifacts = exact.artifacts;
+    exact_result = .absent;
     projection_result = .{ .failure = .projection_git_command_failed };
     transferred = true;
     return .{ .selected = .{
@@ -527,6 +403,17 @@ pub fn loadSelection(
         .artifacts = artifacts,
         .projection = projection,
     } };
+}
+
+fn mapExactReadFailure(failure: catalog_store.ReadFailure) SelectionFailure {
+    return switch (failure) {
+        .root_changed => .root_drift,
+        .binding_changed => .binding_drift,
+        .artifact_changed => .artifact_drift,
+        .registry_invalid, .registry_unavailable => .binding_drift,
+        .artifact_invalid, .namespace_invalid, .concurrent_conflict => .run_invalid,
+        .store_unavailable, .unsupported_platform, .unsupported_filesystem, .store_invalid => .root_drift,
+    };
 }
 
 test "review history backend summary sorting ignores filesystem and completion time" {

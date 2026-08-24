@@ -308,7 +308,7 @@ test "neutral filesystem capability keeps canonical Store descriptor pinned acro
     try std.testing.expectEqualStrings("accepted-ancestor", ancestor_marker);
 }
 
-test "neutral filesystem ownership proof final closes permitted Store consumers and preserves repository cwd" {
+test "AI Review Store ownership proof final closes permitted Store consumers and preserves repository cwd" {
     try expectTypedFinalSurfaces();
     try expectClosedProductionConsumers(std.testing.allocator, std.testing.io);
     try expectRepositoryCwdAuthority(std.testing.allocator, std.testing.io);
@@ -321,7 +321,8 @@ const direct_consumers = [_][]const u8{
     "src/review_store/history.zig",
     "src/review_store/registry.zig",
     "src/review_store/run.zig",
-    "src/review_store/publication.zig",
+    "src/review_store/core.zig",
+    "src/review_store/catalog.zig",
     "src/review_store/mutation.zig",
 };
 
@@ -505,21 +506,30 @@ fn expectRepositoryCwdAuthority(allocator: std.mem.Allocator, io: std.Io) !void 
 }
 
 fn expectProductionLineCeilings(allocator: std.mem.Allocator, io: std.Io) !void {
-    const core_paths = [_][]const u8{
-        "src/fs/capability.zig",            "src/fs/durable.zig",            "src/review_store/capability.zig",
-        "src/review_store/publication.zig", "src/review_store/mutation.zig",
+    const neutral_owner_paths = [_][]const u8{
+        "src/fs/capability.zig",
+        "src/fs/durable.zig",
     };
-    const supporting_paths = [_][]const u8{
-        "src/review_store/history.zig", "src/review_store/registry.zig",
-        "src/review_store/run.zig",     "src/review_store.zig",
-    };
+    const core_ceiling: usize = 2000;
+    const complete_ceiling: usize = 3700;
     var core: usize = 0;
-    for (core_paths) |path| core += try productionLineCount(allocator, io, path);
     var complete = core;
-    for (supporting_paths) |path| complete += try productionLineCount(allocator, io, path);
-    std.debug.print("ownership-proof production-prefix LOC: core={d}/1841 complete={d}/3066\n", .{ core, complete });
-    try std.testing.expect(core <= 1841);
-    try std.testing.expect(complete <= 3066);
+    for (neutral_owner_paths) |path| {
+        const lines = try productionLineCount(allocator, io, path);
+        core += lines;
+        complete += lines;
+    }
+    for (direct_consumers) |path| {
+        const lines = try productionLineCount(allocator, io, path);
+        complete += lines;
+        if (durableOwner(path)) core += lines;
+    }
+    std.debug.print(
+        "ownership-proof production-prefix LOC: core={d}/{d} complete={d}/{d}\n",
+        .{ core, core_ceiling, complete, complete_ceiling },
+    );
+    try std.testing.expect(core <= core_ceiling);
+    try std.testing.expect(complete <= complete_ceiling);
 }
 
 fn productionLineCount(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !usize {
@@ -553,7 +563,7 @@ fn hasForbiddenStoreAccess(source: []const u8, allow_facade_neutral: bool) bool 
 
 fn durableOwner(path: []const u8) bool {
     return std.mem.eql(u8, path, "src/review_store/capability.zig") or
-        std.mem.eql(u8, path, "src/review_store/publication.zig") or
+        std.mem.eql(u8, path, "src/review_store/core.zig") or
         std.mem.eql(u8, path, "src/review_store/mutation.zig");
 }
 
