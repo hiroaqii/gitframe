@@ -25,7 +25,6 @@ const BranchListTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
 const HistoryScanTask = app_load.ReviewHistoryScanTask(app_message.Msg);
 const HistorySelectionTask = app_load.ReviewHistorySelectionTask(app_message.Msg);
 const HistoryNormalReturnTask = app_load.ReviewHistoryNormalReturnTask(app_message.Msg);
-const unavailable_store_path: review_store.ResolvedPath = .{ .unavailable = .no_state_home };
 
 pub const Redraw = enum {
     default,
@@ -69,7 +68,7 @@ pub const Controller = struct {
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
     env_map: ?*std.process.Environ.Map,
-    store_path: *const review_store.ResolvedPath = &unavailable_store_path,
+    store: ?*const review_store.ConfiguredStore = null,
 
     pub fn navigation(self: Controller) review_navigation.Controller {
         return .{
@@ -282,12 +281,12 @@ pub const Controller = struct {
     ) Redraw {
         var finished = result;
         defer finished.deinit(allocator);
-        const store_root = self.storeRoot() orelse return .skip;
+        const store = self.configuredStore() orelse return .skip;
         const accepted = self.page_state.ai_reviews.acceptScan(
             allocator,
             self.repo.epoch(),
             self.repo.activeIdentity(),
-            store_root,
+            store.identity(),
             &self.page_state.activation,
             &finished,
         );
@@ -301,11 +300,11 @@ pub const Controller = struct {
     ) !Redraw {
         var finished = result;
         defer finished.deinit(ctx.allocator());
-        const store_root = self.storeRoot() orelse return .skip;
+        const store = self.configuredStore() orelse return .skip;
         if (!self.page_state.ai_reviews.acceptsSelection(
             self.repo.epoch(),
             self.repo.activeIdentity(),
-            store_root,
+            store.identity(),
             &self.page_state.activation,
             finished,
         )) return .skip;
@@ -340,11 +339,11 @@ pub const Controller = struct {
     ) !Redraw {
         var finished = result;
         defer finished.deinit(ctx.allocator());
-        const store_root = self.storeRoot() orelse return .skip;
+        const store = self.configuredStore() orelse return .skip;
         if (!self.page_state.ai_reviews.acceptsNormalReturn(
             self.repo.epoch(),
             self.repo.activeIdentity(),
-            store_root,
+            store.identity(),
             &self.page_state.activation,
             finished,
         )) return .skip;
@@ -402,7 +401,7 @@ pub const Controller = struct {
             preferred,
             retain_query,
         );
-        const store_root = self.storeRoot() orelse {
+        const store = self.configuredStore() orelse {
             self.page_state.ai_reviews.markScanFailure("Could not load AI reviews: Store unavailable");
             return;
         };
@@ -417,7 +416,7 @@ pub const Controller = struct {
         task.* = HistoryScanTask.init(
             request.identity,
             request.generation,
-            store_root,
+            store,
             capability.*,
             self.env_map,
             ctx.allocator(),
@@ -468,7 +467,7 @@ pub const Controller = struct {
         ctx: *chasen.Ctx(app_message.Msg),
         request: review_page.AiReviewSelectionRequest,
     ) !void {
-        const store_root = self.storeRoot() orelse {
+        const store = self.configuredStore() orelse {
             self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not load AI review: Store unavailable");
             return;
         };
@@ -483,7 +482,7 @@ pub const Controller = struct {
         task.* = HistorySelectionTask.init(
             request.request.identity,
             request.request.generation,
-            store_root,
+            store,
             capability.*,
             self.env_map,
             request.store,
@@ -514,7 +513,7 @@ pub const Controller = struct {
             self.page_state.ai_reviews.beginDirectNormalReturn(ctx.allocator(), identity, root_identity)
         else
             self.page_state.ai_reviews.beginNormalReturn(false) orelse return;
-        const store_root = self.storeRoot() orelse {
+        const store = self.configuredStore() orelse {
             self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review: Store unavailable");
             return;
         };
@@ -529,7 +528,7 @@ pub const Controller = struct {
         task.* = HistoryNormalReturnTask.init(
             request.identity,
             request.generation,
-            store_root,
+            store,
             capability.*,
             self.page_state.base_target,
             self.env_map,
@@ -581,11 +580,9 @@ pub const Controller = struct {
         }
     }
 
-    fn storeRoot(self: Controller) ?[]const u8 {
-        return switch (self.store_path.*) {
-            .available => |path_value| path_value,
-            .unavailable => null,
-        };
+    fn configuredStore(self: Controller) ?*const review_store.ConfiguredStore {
+        const store = self.store orelse return null;
+        return if (store.isConfigured()) store else null;
     }
 
     fn startBasePicker(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {

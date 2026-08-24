@@ -109,7 +109,7 @@ pub const App = struct {
     pages: PageStates = .{},
     config: CliConfig = .{},
     user_config: config_mod.Config = .{},
-    review_store_path: review_store.ResolvedPath = .{ .unavailable = .no_state_home },
+    configured_review_store: ?review_store.ConfiguredStore = null,
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     env_map: ?*std.process.Environ.Map = null,
@@ -145,7 +145,7 @@ pub const App = struct {
 
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
-        self.review_store_path = try review_store.path.resolveFromEnvironment(
+        self.configured_review_store = try review_store.ConfiguredStore.init(
             ctx.allocator(),
             self.user_config.ai_review.store_root,
             self.env_map,
@@ -168,7 +168,7 @@ pub const App = struct {
         self.pages.changes.deinit(deinit_ctx.allocator);
         self.pages.repository.deinit(deinit_ctx.allocator);
         self.pages.review.deinit(deinit_ctx.allocator);
-        self.review_store_path.deinit(deinit_ctx.allocator);
+        if (self.configured_review_store) |*store| store.deinit(deinit_ctx.allocator);
         self.repo_session.deinit(deinit_ctx.allocator);
         self.local_workflow.deinit(deinit_ctx.allocator);
         self.remote_workflow.deinit(deinit_ctx.allocator);
@@ -181,15 +181,13 @@ pub const App = struct {
     pub fn persistReviewDraft(
         self: *App,
         ctx: *chasen.Ctx(Msg),
-        request: review_store.mutation.DraftRequest,
+        request: review_store.DraftSaveRequest,
     ) !review_store_operations_mod.Admission {
-        const store_root = switch (self.review_store_path) {
-            .available => |value| value,
-            .unavailable => return .{ .rejected = .store_unavailable },
-        };
+        const store = if (self.configured_review_store) |*value| value else return .{ .rejected = .store_unavailable };
+        if (!store.isConfigured()) return .{ .rejected = .store_unavailable };
         const admission = try self.review_store_operations.enqueueDraft(
             ctx.allocator(),
-            store_root,
+            store,
             request,
         );
         self.pumpReviewStoreOperations(ctx);
@@ -200,15 +198,13 @@ pub const App = struct {
     pub fn persistReviewResult(
         self: *App,
         ctx: *chasen.Ctx(Msg),
-        request: review_store.mutation.ResultRequest,
+        request: review_store.ReviewResultCreateRequest,
     ) !review_store_operations_mod.Admission {
-        const store_root = switch (self.review_store_path) {
-            .available => |value| value,
-            .unavailable => return .{ .rejected = .store_unavailable },
-        };
+        const store = if (self.configured_review_store) |*value| value else return .{ .rejected = .store_unavailable };
+        if (!store.isConfigured()) return .{ .rejected = .store_unavailable };
         const admission = try self.review_store_operations.enqueueResult(
             ctx.allocator(),
-            store_root,
+            store,
             request,
         );
         self.pumpReviewStoreOperations(ctx);
@@ -257,7 +253,7 @@ pub const App = struct {
             .layout = .{ .width = body_size.width, .height = body_size.height },
             .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
             .env_map = self.env_map,
-            .store_path = &self.review_store_path,
+            .store = if (self.configured_review_store) |*value| value else null,
         };
     }
 
@@ -833,7 +829,7 @@ pub const App = struct {
 
     fn reviewStorePresentationMatches(
         self: *const App,
-        binding: review_store.mutation.RunBinding,
+        binding: review_store.ReviewRunBinding,
     ) bool {
         if (self.active_page != .review) return false;
         const pinned = self.pages.review.pinnedAiConst() orelse return false;
@@ -1960,7 +1956,7 @@ test "review state persistence App quit drains accepted mutation and reopens aft
     const repository_id = try committed.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
     const review_id = try committed.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
     const oid = try committed.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    const binding: review_store.mutation.RunBinding = .{
+    const binding: review_store.ReviewRunBinding = .{
         .review_repository_id = repository_id,
         .review_id = review_id,
         .target = .{
@@ -1973,10 +1969,10 @@ test "review state persistence App quit drains accepted mutation and reopens aft
         .findings_digest = committed.Sha256Digest.hash("findings\n"),
     };
     var app: App = .{
-        .review_store_path = .{ .available = try allocator.dupe(u8, "/unused") },
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
         .allocator = allocator,
     };
-    defer app.review_store_path.deinit(allocator);
+    defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     defer ctx.runtimeClearPendingEffectCopies();

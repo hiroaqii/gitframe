@@ -32,7 +32,7 @@ const TestApp = struct {
     repo_session: repo_session.State = .{},
     pages: struct { review: review_page.ReviewPageState = .{} } = .{},
     layout: diff_surface.Layout = .{ .width = 100, .height = 30 },
-    store_path: review_store.ResolvedPath = .{ .unavailable = .no_state_home },
+    store: ?review_store.ConfiguredStore = null,
 
     const Msg = app_message.Msg;
 
@@ -42,7 +42,7 @@ const TestApp = struct {
             .repo = self.repo_session.view(),
             .layout = self.layout,
             .env_map = null,
-            .store_path = &self.store_path,
+            .store = if (self.store) |*value| value else null,
         };
     }
 
@@ -76,9 +76,9 @@ test "AI Reviews picker requests return to the event loop before captured worker
     var app: TestApp = .{
         .allocator = allocator,
         .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
-        .store_path = .{ .available = try allocator.dupe(u8, "/captured-ai-review-store") },
+        .store = try review_store.ConfiguredStore.initConfigured(allocator, "/captured-ai-review-store"),
     };
-    defer app.store_path.deinit(allocator);
+    defer app.store.?.deinit(allocator);
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -101,12 +101,12 @@ test "AI Reviews picker requests return to the event loop before captured worker
     // A retained row follows the same boundary: activation returns with one
     // captured worker and only completion delivery advances the terminal.
     const review_id = try committed_review.ReviewId.parse("623e4567-e89b-42d3-a456-426614174000");
-    const rows = try allocator.alloc(review_store.history.RunSummary, 1);
+    const rows = try allocator.alloc(review_store.RunSummary, 1);
     rows[0] = try reviewHistoryRow(allocator, review_id, .available);
     app.pages.review.ai_reviews.scan_result = .{ .history = .{
         .snapshot = undefined,
         .rows = rows,
-        .diagnostics = try allocator.alloc(review_store.history.Diagnostic, 0),
+        .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
         .skipped_count = 0,
         .orphan_count = 0,
     } };
@@ -150,16 +150,16 @@ test "AI Reviews picker requests return to the event loop before captured worker
     const scan_identity = scan_task.identity;
     const scan_generation = scan_task.generation;
     ReviewHistoryScanTask.destroy(scan_task, allocator);
-    const refreshed_rows = try allocator.alloc(review_store.history.RunSummary, 1);
+    const refreshed_rows = try allocator.alloc(review_store.RunSummary, 1);
     refreshed_rows[0] = try reviewHistoryRow(allocator, review_id, .available);
     try app.update(.{ .load_finished = .{ .review = .{ .history_scan = .{
         .identity = scan_identity,
         .generation = scan_generation,
-        .store_root = try allocator.dupe(u8, "/captured-ai-review-store"),
+        .store_identity = app.store.?.identity(),
         .result = .{ .scanned = .{ .history = .{
             .snapshot = undefined,
             .rows = refreshed_rows,
-            .diagnostics = try allocator.alloc(review_store.history.Diagnostic, 0),
+            .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
             .skipped_count = 0,
             .orphan_count = 0,
         } } },
@@ -572,7 +572,7 @@ fn reviewHistoryRow(
     allocator: std.mem.Allocator,
     review_id: committed_review.ReviewId,
     availability: git_review.TargetAvailability,
-) !review_store.history.RunSummary {
+) !review_store.RunSummary {
     return .{
         .review_id = review_id,
         .target = .{
@@ -610,9 +610,9 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     var app: TestApp = .{
         .allocator = allocator,
         .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, repo_root) } },
-        .store_path = .{ .available = try allocator.dupe(u8, store_root) },
+        .store = try review_store.ConfiguredStore.initConfigured(allocator, store_root),
     };
-    defer app.store_path.deinit(allocator);
+    defer app.store.?.deinit(allocator);
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(repo_root);
@@ -657,12 +657,10 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
         try std.testing.expect(app.pages.review.refresh_anchor != null);
     }
 
-    var store = try review_store.StoreRootCapability.openCanonical(store_root);
-    defer store.deinit();
     const repository_id = try committed_review.ReviewRepositoryId.parse("723e4567-e89b-42d3-a456-426614174000");
-    const store_snapshot: review_store.history.StoreSnapshot = .{
-        .root_device = store.directory.metadata.device,
-        .root_inode = store.directory.metadata.inode,
+    const store_snapshot: review_store.StoreSnapshot = .{
+        .root_device = 101,
+        .root_inode = 103,
         .repository_locator = .{
             .device = app.repo_session.repo_state.root.?.identity.device,
             .inode = app.repo_session.repo_state.root.?.identity.inode,
@@ -690,7 +688,7 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     var bundle_owned = true;
     defer if (bundle_owned) pinned_bundle.deinit(allocator);
 
-    const rows = try allocator.alloc(review_store.history.RunSummary, 1);
+    const rows = try allocator.alloc(review_store.RunSummary, 1);
     rows[0] = try reviewHistoryRow(allocator, review_id, .available);
     rows[0].target = pinned_target;
     rows[0].status = .new;
@@ -699,7 +697,7 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     app.pages.review.ai_reviews.scan_result = .{ .history = .{
         .snapshot = store_snapshot,
         .rows = rows,
-        .diagnostics = try allocator.alloc(review_store.history.Diagnostic, 0),
+        .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
         .skipped_count = 0,
         .orphan_count = 0,
     } };
@@ -718,12 +716,11 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     const selection_generation = selection_task.generation;
     ReviewHistorySelectionTask.destroy(selection_task, allocator);
 
-    const completion_store_root = try allocator.dupe(u8, store_root);
     bundle_owned = false;
     try app.update(.{ .load_finished = .{ .review = .{ .history_selection = .{
         .identity = selection_identity,
         .generation = selection_generation,
-        .store_root = completion_store_root,
+        .store_identity = app.store.?.identity(),
         .review_id = review_id,
         .result = .{ .loaded = pinned_bundle },
     } } } }, &ctx);
@@ -751,7 +748,7 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
 
 fn reviewHistoryPinnedBundle(
     allocator: std.mem.Allocator,
-    snapshot: review_store.history.StoreSnapshot,
+    snapshot: review_store.StoreSnapshot,
     repository_id: committed_review.ReviewRepositoryId,
     review_id: committed_review.ReviewId,
     target: committed_review.CommittedReviewTarget,

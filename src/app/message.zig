@@ -15,7 +15,7 @@ const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_layout = @import("pages/repository/layout.zig");
 const changes_message = @import("pages/changes/message.zig");
-const review_store_mutation = @import("../review_store/mutation.zig");
+const review_store = @import("../review_store.zig");
 
 pub const LoadFinished = load.ReadFinished;
 
@@ -75,8 +75,8 @@ pub const ReviewStoreOperationId = u64;
 pub const ReviewStoreOperationKind = enum { draft, result };
 
 pub const ReviewStoreOperationResult = union(enum) {
-    draft: review_store_mutation.DraftResult,
-    result: review_store_mutation.ResultResult,
+    draft: review_store.DraftSaveResult,
+    result: review_store.ReviewResultCreateResult,
 
     pub fn deinit(self: *ReviewStoreOperationResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -86,7 +86,7 @@ pub const ReviewStoreOperationResult = union(enum) {
         self.* = undefined;
     }
 
-    pub fn failure(self: *const ReviewStoreOperationResult) ?review_store_mutation.Failure {
+    pub fn failure(self: *const ReviewStoreOperationResult) ?review_store.PersistenceFailure {
         return switch (self.*) {
             .draft => |*value| switch (value.*) {
                 .committed => null,
@@ -115,7 +115,7 @@ pub const ReviewStoreOperationResult = union(enum) {
 
 pub const ReviewStoreOperationFinished = struct {
     operation_id: ReviewStoreOperationId,
-    binding: review_store_mutation.RunBinding,
+    binding: review_store.ReviewRunBinding,
     kind: ReviewStoreOperationKind,
     result: ReviewStoreOperationResult,
 
@@ -419,14 +419,17 @@ test "undelivered remaining read routes release owned payloads" {
     review_msg.deinitUndelivered(allocator);
 }
 
-test "AI Reviews picker undelivered task terminals release every owned store path" {
+test "AI Reviews picker undelivered task terminals preserve semantic store identity" {
     const allocator = std.testing.allocator;
     const identity = page.RequestIdentity.review(3, 5);
+    var store = try review_store.ConfiguredStore.initConfigured(allocator, "/store");
+    defer store.deinit(allocator);
+    const store_identity = store.identity();
 
     var scan = Msg.loadFinished(.{ .review = .{ .history_scan = .{
         .identity = identity,
         .generation = 1,
-        .store_root = try allocator.dupe(u8, "/store"),
+        .store_identity = store_identity,
         .result = .{ .failed_static = "scan failed" },
     } } });
     scan.deinitUndelivered(allocator);
@@ -434,7 +437,7 @@ test "AI Reviews picker undelivered task terminals release every owned store pat
     var selection = Msg.loadFinished(.{ .review = .{ .history_selection = .{
         .identity = identity,
         .generation = 2,
-        .store_root = try allocator.dupe(u8, "/store"),
+        .store_identity = store_identity,
         .review_id = undefined,
         .result = .{ .failed_static = "selection failed" },
     } } });
@@ -443,7 +446,7 @@ test "AI Reviews picker undelivered task terminals release every owned store pat
     var normal = Msg.loadFinished(.{ .review = .{ .history_normal_return = .{
         .identity = identity,
         .generation = 3,
-        .store_root = try allocator.dupe(u8, "/store"),
+        .store_identity = store_identity,
         .result = .{ .failed_static = "normal failed" },
     } } });
     normal.deinitUndelivered(allocator);

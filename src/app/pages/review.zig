@@ -398,12 +398,12 @@ pub const AiReviewsPickerState = struct {
         allocator: std.mem.Allocator,
         repo_epoch: u64,
         root_identity: ?root_capability.Identity,
-        store_root: []const u8,
+        store_identity: review_store.ConfigurationIdentity,
         activation: *const diff_surface.authority.Lifecycle,
         finished: *app_load.ReviewHistoryScanFinished,
     ) bool {
         if (self.phase != .scan_loading or
-            !self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_root, finished.store_root, activation)) return false;
+            !self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_identity, finished.store_identity, activation)) return false;
 
         switch (finished.result) {
             .failed_static => |message| self.phase = .{ .scan_failed = message },
@@ -516,7 +516,7 @@ pub const AiReviewsPickerState = struct {
         self: *const AiReviewsPickerState,
         repo_epoch: u64,
         root_identity: ?root_capability.Identity,
-        store_root: []const u8,
+        store_identity: review_store.ConfigurationIdentity,
         activation: *const diff_surface.authority.Lifecycle,
         finished: app_load.ReviewHistorySelectionFinished,
     ) bool {
@@ -525,7 +525,7 @@ pub const AiReviewsPickerState = struct {
             else => return false,
         };
         return phase_loading.review_id.eql(finished.review_id) and
-            self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_root, finished.store_root, activation);
+            self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_identity, finished.store_identity, activation);
     }
 
     pub fn failSelection(
@@ -561,12 +561,12 @@ pub const AiReviewsPickerState = struct {
         self: *const AiReviewsPickerState,
         repo_epoch: u64,
         root_identity: ?root_capability.Identity,
-        store_root: []const u8,
+        store_identity: review_store.ConfigurationIdentity,
         activation: *const diff_surface.authority.Lifecycle,
         finished: app_load.ReviewHistoryNormalReturnFinished,
     ) bool {
         if (self.phase != .return_loading) return false;
-        return self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_root, finished.store_root, activation);
+        return self.accepts(finished.identity, finished.generation, repo_epoch, root_identity, store_identity, finished.store_identity, activation);
     }
 
     pub fn failNormalReturn(self: *AiReviewsPickerState, message: []const u8) void {
@@ -696,13 +696,13 @@ pub const AiReviewsPickerState = struct {
         generation: u64,
         repo_epoch: u64,
         root_identity: ?root_capability.Identity,
-        expected_store_root: []const u8,
-        finished_store_root: []const u8,
+        expected_store: review_store.ConfigurationIdentity,
+        finished_store: review_store.ConfigurationIdentity,
         activation: *const diff_surface.authority.Lifecycle,
     ) bool {
         if (generation != self.generation or self.identity == null or self.root_identity == null) return false;
         if (!std.meta.eql(self.identity.?, identity) or !self.root_identity.?.eql(root_identity orelse return false)) return false;
-        if (!std.mem.eql(u8, expected_store_root, finished_store_root)) return false;
+        if (!expected_store.eql(finished_store)) return false;
         if (!activation.acceptsRepoEpoch(identity, repo_epoch)) return false;
         const current = activation.currentIdentity() orelse return false;
         return std.meta.eql(current, identity);
@@ -2394,6 +2394,9 @@ test "Review base picker owns recency order filter projection and full-ref activ
 
 test "AI Reviews picker rejects stale scan completion and admits exact generation root and store" {
     const allocator = std.testing.allocator;
+    var store = try review_store.ConfiguredStore.initConfigured(allocator, "/store");
+    defer store.deinit(allocator);
+    const store_identity = store.identity();
     var state: ReviewPageState = .{};
     defer state.deinit(allocator);
     _ = state.activate(7);
@@ -2404,7 +2407,7 @@ test "AI Reviews picker rejects stale scan completion and admits exact generatio
     var stale: app_load.ReviewHistoryScanFinished = .{
         .identity = request.identity,
         .generation = request.generation + 1,
-        .store_root = try allocator.dupe(u8, "/store"),
+        .store_identity = store_identity,
         .result = .{ .failed_static = "stale" },
     };
     defer stale.deinit(allocator);
@@ -2412,7 +2415,7 @@ test "AI Reviews picker rejects stale scan completion and admits exact generatio
         allocator,
         7,
         root_identity,
-        "/store",
+        store_identity,
         &state.activation,
         &stale,
     ));
@@ -2421,7 +2424,7 @@ test "AI Reviews picker rejects stale scan completion and admits exact generatio
     var exact: app_load.ReviewHistoryScanFinished = .{
         .identity = request.identity,
         .generation = request.generation,
-        .store_root = try allocator.dupe(u8, "/store"),
+        .store_identity = store_identity,
         .result = .{ .failed_static = "Could not load AI reviews: test" },
     };
     defer exact.deinit(allocator);
@@ -2429,7 +2432,7 @@ test "AI Reviews picker rejects stale scan completion and admits exact generatio
         allocator,
         7,
         root_identity,
-        "/store",
+        store_identity,
         &state.activation,
         &exact,
     ));

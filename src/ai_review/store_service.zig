@@ -12,9 +12,25 @@ const repository_locator = @import("../git/repository_locator.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const catalog_store = @import("../review_store/catalog.zig");
 const core = @import("../review_store/core.zig");
+const mutation_store = @import("../review_store/mutation.zig");
+const store_path = @import("../review_store/path.zig");
 const run = @import("../review_store/run.zig");
 
 const OpaqueStoreContext = opaque {};
+
+pub const ConfigurationIdentity = struct {
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+
+    pub fn eql(self: ConfigurationIdentity, other: ConfigurationIdentity) bool {
+        return std.mem.eql(u8, &self.digest, &other.digest);
+    }
+};
+
+const StoreContextState = struct {
+    context: core.Context,
+    identity: ConfigurationIdentity,
+    configured: bool,
+};
 
 pub const max_namespace_entries = catalog_store.max_namespace_entries;
 pub const max_run_candidates = catalog_store.max_run_candidates;
@@ -32,44 +48,95 @@ pub const ConfiguredStore = struct {
         configured: ?[]const u8,
         environment: ?*const std.process.Environ.Map,
     ) !ConfiguredStore {
-        const context_ptr = try allocator.create(core.Context);
-        errdefer allocator.destroy(context_ptr);
-        context_ptr.* = try core.Context.init(allocator, configured, environment);
-        return .{ .state = @ptrCast(context_ptr) };
+        var resolved = try store_path.resolveFromEnvironment(allocator, configured, environment);
+        defer resolved.deinit(allocator);
+        const state_ptr = try allocator.create(StoreContextState);
+        errdefer allocator.destroy(state_ptr);
+        state_ptr.* = .{
+            .context = try core.Context.initResolved(allocator, &resolved),
+            .identity = configurationIdentity(&resolved),
+            .configured = resolved == .available,
+        };
+        return .{ .state = @ptrCast(state_ptr) };
     }
 
     pub fn initConfigured(
         allocator: std.mem.Allocator,
         configured: []const u8,
     ) !ConfiguredStore {
-        const context_ptr = try allocator.create(core.Context);
-        errdefer allocator.destroy(context_ptr);
-        context_ptr.* = try core.Context.initConfigured(allocator, configured);
-        return .{ .state = @ptrCast(context_ptr) };
+        try store_path.validateAbsoluteCanonical(configured);
+        const state_ptr = try allocator.create(StoreContextState);
+        errdefer allocator.destroy(state_ptr);
+        state_ptr.* = .{
+            .context = try core.Context.initConfigured(allocator, configured),
+            .identity = configuredIdentity(configured),
+            .configured = true,
+        };
+        return .{ .state = @ptrCast(state_ptr) };
     }
 
     pub fn clone(self: *const ConfiguredStore, allocator: std.mem.Allocator) std.mem.Allocator.Error!ConfiguredStore {
-        const context_ptr = try allocator.create(core.Context);
-        errdefer allocator.destroy(context_ptr);
-        context_ptr.* = try self.context().clone(allocator);
-        return .{ .state = @ptrCast(context_ptr) };
+        const state_ptr = try allocator.create(StoreContextState);
+        errdefer allocator.destroy(state_ptr);
+        const source = self.contextState();
+        state_ptr.* = .{
+            .context = try source.context.clone(allocator),
+            .identity = source.identity,
+            .configured = source.configured,
+        };
+        return .{ .state = @ptrCast(state_ptr) };
     }
 
     pub fn deinit(self: *ConfiguredStore, allocator: std.mem.Allocator) void {
-        const context_ptr = self.contextMut();
-        context_ptr.deinit(allocator);
-        allocator.destroy(context_ptr);
+        const state_ptr = self.contextStateMut();
+        state_ptr.context.deinit(allocator);
+        allocator.destroy(state_ptr);
         self.* = undefined;
     }
 
+    pub fn identity(self: *const ConfiguredStore) ConfigurationIdentity {
+        return self.contextState().identity;
+    }
+
+    pub fn isConfigured(self: *const ConfiguredStore) bool {
+        return self.contextState().configured;
+    }
+
     fn context(self: *const ConfiguredStore) *const core.Context {
+        return &self.contextState().context;
+    }
+
+    fn contextState(self: *const ConfiguredStore) *const StoreContextState {
         return @ptrCast(@alignCast(self.state));
     }
 
-    fn contextMut(self: *ConfiguredStore) *core.Context {
+    fn contextStateMut(self: *ConfiguredStore) *StoreContextState {
         return @ptrCast(@alignCast(self.state));
     }
 };
+
+fn configurationIdentity(resolved: *const store_path.Resolved) ConfigurationIdentity {
+    return switch (resolved.*) {
+        .available => |value| configuredIdentity(value),
+        .unavailable => |reason| blk: {
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update("unavailable\x00");
+            hasher.update(@tagName(reason));
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            hasher.final(&digest);
+            break :blk .{ .digest = digest };
+        },
+    };
+}
+
+fn configuredIdentity(value: []const u8) ConfigurationIdentity {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("configured\x00");
+    hasher.update(value);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .digest = digest };
+}
 
 /// Borrowed physical repository authority for one service call.
 pub const RepositoryContext = struct {
@@ -532,6 +599,12 @@ pub const PrepareSuccess = struct { review_repository_id: committed_review.Revie
 pub const PrepareResult = union(enum) { success: PrepareSuccess, failure: PublicationFailure };
 pub const PublishRequest = struct { repository_path: []const u8, review_repository_id: committed_review.ReviewRepositoryId, review_id: committed_review.ReviewId, manifest_bytes: []const u8, findings_bytes: []const u8 };
 pub const PublishResult = union(enum) { success, failure: PublicationFailure };
+pub const PersistenceFailure = mutation_store.Failure;
+pub const ReviewRunBinding = mutation_store.RunBinding;
+pub const DraftSaveRequest = mutation_store.DraftRequest;
+pub const DraftSaveResult = mutation_store.DraftResult;
+pub const ReviewResultCreateRequest = mutation_store.ResultRequest;
+pub const ReviewResultCreateResult = mutation_store.ResultResult;
 
 pub fn prepare(
     allocator: std.mem.Allocator,
@@ -618,6 +691,24 @@ pub fn publish(
         .success => .success,
         .failure => |failure| .{ .failure = mapPublishCoreFailure(failure) },
     };
+}
+
+pub fn saveDraft(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    request: DraftSaveRequest,
+) std.mem.Allocator.Error!DraftSaveResult {
+    return core.saveDraft(allocator, io, configured_store.context(), request);
+}
+
+pub fn createResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    request: ReviewResultCreateRequest,
+) std.mem.Allocator.Error!ReviewResultCreateResult {
+    return core.createResult(allocator, io, configured_store.context(), request);
 }
 
 const OwnedRepository = struct {
@@ -867,7 +958,18 @@ test "AI Review Store application configured context clones without opening auth
     defer store.deinit(allocator);
     var duplicate = try store.clone(allocator);
     defer duplicate.deinit(allocator);
+    try std.testing.expect(store.isConfigured());
+    try std.testing.expect(store.identity().eql(duplicate.identity()));
     try std.testing.expect(duplicate.context().openExisting() == .missing);
+
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("XDG_STATE_HOME", "/definitely/missing");
+    var resolved = try ConfiguredStore.init(allocator, null, &environment);
+    defer resolved.deinit(allocator);
+    var explicit = try ConfiguredStore.initConfigured(allocator, "/definitely/missing/gitframe/ai-reviews");
+    defer explicit.deinit(allocator);
+    try std.testing.expect(resolved.identity().eql(explicit.identity()));
 }
 
 test "AI Review Store ownership proof has one application composition owner and no read fallback" {
@@ -924,19 +1026,70 @@ test "AI Review Store ownership proof has one application composition owner and 
     }
 
     inline for (.{
+        "src/app.zig",
         "src/app/load.zig",
+        "src/app/message.zig",
+        "src/app/review_store_operations.zig",
         "src/app/pages/review.zig",
         "src/app/pages/review/coordinator.zig",
         "src/app/pages/review/view.zig",
+        "src/config.zig",
+        "src/main.zig",
+        "src/root.zig",
         "src/ai_review/store_read_command.zig",
+        "src/review_store/prepare_command.zig",
+        "src/review_store/publish_command.zig",
     }) |path| {
         const consumer = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
         defer allocator.free(consumer);
         const production = applicationProductionPrefix(consumer);
         try std.testing.expect(std.mem.indexOf(u8, production, "review_store.history") == null);
-        inline for (.{ "review_store/core.zig", "review_store/catalog.zig", "review_store/run.zig", "review_store/capability.zig" }) |raw_import| {
+        inline for (.{
+            "review_store/path.zig",
+            "review_store/capability.zig",
+            "review_store/registry.zig",
+            "review_store/run.zig",
+            "review_store/history.zig",
+            "review_store/publication.zig",
+            "review_store/mutation.zig",
+            "review_store/core.zig",
+            "review_store/catalog.zig",
+        }) |raw_import| {
             try std.testing.expect(std.mem.indexOf(u8, production, raw_import) == null);
         }
+    }
+
+    const facade_source = try std.Io.Dir.cwd().readFileAlloc(io, "src/review_store.zig", allocator, .limited(8 * 1024 * 1024));
+    defer allocator.free(facade_source);
+    const facade = applicationProductionPrefix(facade_source);
+    inline for (.{
+        "pub const path",
+        "pub const capability",
+        "pub const registry",
+        "pub const run",
+        "StoreRootCapability",
+        "DirectoryCapability",
+        "ParsedRegistry",
+        "ResolvedPath",
+        "@import(\"review_store/path.zig\")",
+        "@import(\"review_store/capability.zig\")",
+        "@import(\"review_store/registry.zig\")",
+        "@import(\"review_store/run.zig\")",
+        "@import(\"review_store/publication.zig\")",
+        "@import(\"review_store/mutation.zig\")",
+    }) |raw_surface| {
+        try std.testing.expect(std.mem.indexOf(u8, facade, raw_surface) == null);
+    }
+    inline for (.{
+        "ConfiguredStore",
+        "ConfigurationIdentity",
+        "readExactIdentity",
+        "prepare",
+        "publish",
+        "saveDraft",
+        "createResult",
+    }) |semantic_surface| {
+        try std.testing.expect(std.mem.indexOf(u8, facade, semantic_surface) != null);
     }
 }
 
@@ -954,7 +1107,6 @@ fn applicationProductionPrefix(source: []const u8) []const u8 {
 // Test-only low-level fixture authority. Production composition above reaches
 // Store descriptors exclusively through core/catalog semantic results.
 const capability = @import("../review_store/capability.zig");
-const store_path = @import("../review_store/path.zig");
 
 fn scanCompatibility(
     allocator: std.mem.Allocator,
@@ -1659,6 +1811,39 @@ test "AI Review Store application review history backend AI Reviews picker selec
     expected.manifest_sha256 = exact_identity.identity.manifest_sha256;
     expected.findings_sha256 = committed_review.Sha256Digest.hash("other findings");
     try expectExactIdentityMismatch(allocator, io, &command_environment, repo_path, new_id, expected);
+
+    // The public semantic context owns the same mutation use cases without
+    // exposing a Store path or capability to App consumers.
+    try store.createDir(io, ".locks", .fromMode(0o700));
+    var locks = try store.openDir(io, ".locks", .{});
+    defer locks.close(io);
+    try locks.createDir(io, &repository_text, .fromMode(0o700));
+    var configured_store = try ConfiguredStore.initConfigured(allocator, store_path_text);
+    defer configured_store.deinit(allocator);
+    const mutation_binding: ReviewRunBinding = .{
+        .review_repository_id = exact_identity.identity.review_repository_id,
+        .review_id = new_id,
+        .target = exact_identity.identity.target,
+        .findings_digest = exact_identity.identity.findings_sha256,
+    };
+    var saved = try saveDraft(allocator, io, &configured_store, .{
+        .binding = mutation_binding,
+        .expected_revision = 0,
+        .summary = "semantic context",
+        .finding_dispositions = &.{},
+        .anchored_notes = &.{},
+    });
+    defer saved.deinit(allocator);
+    try std.testing.expect(saved == .committed);
+    try std.testing.expectEqual(@as(u64, 1), saved.committed.revision);
+    var completed = try createResult(allocator, io, &configured_store, .{
+        .binding = mutation_binding,
+        .expected_revision = 1,
+        .decision = .approved,
+    });
+    defer completed.deinit(allocator);
+    try std.testing.expect(completed == .committed);
+    try std.testing.expectEqual(@as(u64, 1), completed.committed.revision);
 
     try tmp.dir.rename("store", tmp.dir, "store-original", io);
     try tmp.dir.createDir(io, "store", .fromMode(0o700));

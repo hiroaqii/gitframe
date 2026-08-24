@@ -6,7 +6,7 @@ const limits = @import("../committed_review/limits.zig");
 const projection_command = @import("../committed_review/projection_command.zig");
 const length_frame = @import("../data/length_frame.zig");
 const strict_data = @import("../data/strict_json.zig");
-const publication = @import("publication.zig");
+const store_service = @import("../ai_review/store_service.zig");
 
 const StrictParser = strict_data.Parser(.{
     .max_token_bytes = limits.max_json_token_bytes,
@@ -30,7 +30,7 @@ pub const ParsedFrame = struct {
         self.* = undefined;
     }
 
-    pub fn request(self: *const ParsedFrame) publication.PublishRequest {
+    pub fn request(self: *const ParsedFrame) store_service.PublishRequest {
         return .{
             .repository_path = self.repository_path,
             .review_repository_id = self.review_repository_id,
@@ -151,7 +151,7 @@ pub fn executeAlloc(
         }),
     };
     defer parsed.deinit();
-    const result = try publication.publish(allocator, io, environment_map, parsed.request());
+    const result = try store_service.publish(allocator, io, environment_map, parsed.request());
     return switch (result) {
         .success => successOutputAlloc(allocator, parsed.review_repository_id, parsed.review_id),
         .failure => |failure| errorOutputAlloc(allocator, failureTerminal(failure)),
@@ -244,7 +244,7 @@ fn errorOutputAlloc(allocator: std.mem.Allocator, failure: Failure) std.mem.Allo
     return .{ .exit_code = failure.exit_code, .bytes = try allocator.realloc(storage, writer.buffered().len) };
 }
 
-fn failureTerminal(failure: publication.Failure) Failure {
+fn failureTerminal(failure: store_service.PublicationFailure) Failure {
     return switch (failure) {
         .invalid_artifact => .{ .exit_code = 64, .code = "invalid_artifact", .message = "manifest/findings artifacts are invalid" },
         .target_unavailable => .{ .exit_code = 66, .code = "target_unavailable", .message = "target commit objects are unavailable" },

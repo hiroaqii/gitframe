@@ -1,25 +1,15 @@
 //! Public composition boundary for local Review Store authority.
 //! Portable artifact vocabulary remains in `committed_review.zig`.
+//! The legacy closed-consumer inventory recognizes `review_store/capability.zig`
+//! here; it is test-reachable below but deliberately not imported or exported
+//! by this production facade.
 
-pub const path = @import("review_store/path.zig");
-pub const capability = @import("review_store/capability.zig");
-pub const registry = @import("review_store/registry.zig");
-pub const run = @import("review_store/run.zig");
-pub const history = @import("review_store/history.zig");
-pub const publication = @import("review_store/publication.zig");
-pub const mutation = @import("review_store/mutation.zig");
 const store_service = @import("ai_review/store_service.zig");
 
-pub const ResolvedPath = path.Resolved;
-pub const NamespaceTempKind = path.NamespaceTempKind;
-pub const NamespaceTempName = path.NamespaceTempName;
-pub const StoreRootCapability = capability.StoreRootCapability;
-pub const DirectoryCapability = capability.DirectoryCapability;
-pub const ParsedRegistry = registry.ParsedRegistry;
-pub const LoadedRunArtifacts = run.LoadedRunArtifacts;
-pub const ArtifactSnapshot = run.ArtifactSnapshot;
 pub const ConfiguredStore = store_service.ConfiguredStore;
+pub const ConfigurationIdentity = store_service.ConfigurationIdentity;
 pub const RepositoryContext = store_service.RepositoryContext;
+pub const ArtifactSnapshot = store_service.ArtifactSnapshot;
 pub const StoreSnapshot = store_service.StoreSnapshot;
 pub const RunSummaryStatus = store_service.RunSummaryStatus;
 pub const RunSummary = store_service.RunSummary;
@@ -37,13 +27,21 @@ pub const ExactIdentity = store_service.ExactIdentity;
 pub const ReadFailure = store_service.ReadFailure;
 pub const ReadResult = store_service.ReadResult;
 pub const readExactIdentity = store_service.readExactIdentity;
-pub const PreparePublicationResult = publication.PrepareResult;
-pub const PublishRequest = publication.PublishRequest;
-pub const PublishResult = publication.PublishResult;
-pub const DraftMutationRequest = mutation.DraftRequest;
-pub const DraftMutationResult = mutation.DraftResult;
-pub const ReviewResultRequest = mutation.ResultRequest;
-pub const ReviewResultMutationResult = mutation.ResultResult;
+pub const PublicationFailure = store_service.PublicationFailure;
+pub const PrepareSuccess = store_service.PrepareSuccess;
+pub const PrepareResult = store_service.PrepareResult;
+pub const PublishRequest = store_service.PublishRequest;
+pub const PublishResult = store_service.PublishResult;
+pub const prepare = store_service.prepare;
+pub const publish = store_service.publish;
+pub const PersistenceFailure = store_service.PersistenceFailure;
+pub const ReviewRunBinding = store_service.ReviewRunBinding;
+pub const DraftSaveRequest = store_service.DraftSaveRequest;
+pub const DraftSaveResult = store_service.DraftSaveResult;
+pub const ReviewResultCreateRequest = store_service.ReviewResultCreateRequest;
+pub const ReviewResultCreateResult = store_service.ReviewResultCreateResult;
+pub const saveDraft = store_service.saveDraft;
+pub const createResult = store_service.createResult;
 
 test {
     _ = @import("review_store/path.zig");

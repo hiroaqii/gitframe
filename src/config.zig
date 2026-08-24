@@ -1,7 +1,6 @@
 const std = @import("std");
 const keymap = @import("keymap");
 const theme = @import("theme");
-const review_store_path = @import("review_store/path.zig");
 
 const max_config_bytes = 64 * 1024;
 pub const supported_schema_version = 1;
@@ -424,7 +423,7 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                 if (!std.mem.eql(u8, key, "store_root")) return error.UnknownKey;
                 if (saw_ai_review_store_root) return error.DuplicateKey;
                 const store_root = try parseTomlString(value);
-                review_store_path.validateAbsoluteCanonical(store_root) catch
+                validateAiReviewStoreRoot(store_root) catch
                     return error.InvalidAiReviewStoreRoot;
                 config.ai_review.store_root = store_root;
                 saw_ai_review_store_root = true;
@@ -446,6 +445,20 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
     if (!keymap.validateConfig(config.keymap)) return error.InvalidKeyBinding;
     if (config.schema_version != supported_schema_version) return error.UnsupportedSchemaVersion;
     return config;
+}
+
+fn validateAiReviewStoreRoot(value: []const u8) error{InvalidStoreRoot}!void {
+    if (value.len == 0 or value.len > 4095 or value[0] != '/' or
+        value.len == 1 or value[value.len - 1] == '/' or
+        std.mem.indexOfScalar(u8, value, 0) != null)
+    {
+        return error.InvalidStoreRoot;
+    }
+    var components = std.mem.splitScalar(u8, value[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..")) return error.InvalidStoreRoot;
+    }
 }
 
 const ConfigSection = enum {

@@ -5,7 +5,7 @@ const committed_review = @import("../committed_review.zig");
 const limits = @import("../committed_review/limits.zig");
 const projection_command = @import("../committed_review/projection_command.zig");
 const strict = @import("../committed_review/strict_json.zig");
-const publication = @import("publication.zig");
+const store_service = @import("../ai_review/store_service.zig");
 
 pub const max_request_bytes: usize = 8 * 1024;
 pub const max_terminal_bytes: usize = 4 * 1024;
@@ -103,7 +103,7 @@ pub fn executeAlloc(
         }),
     };
     defer parsed.deinit();
-    const result = try publication.prepare(
+    const result = try store_service.prepare(
         allocator,
         io,
         environment_map,
@@ -159,7 +159,7 @@ pub fn run(
 
 fn successOutputAlloc(
     allocator: std.mem.Allocator,
-    success: publication.PrepareSuccess,
+    success: store_service.PrepareSuccess,
 ) std.mem.Allocator.Error!CommandOutput {
     const storage = try allocator.alloc(u8, max_terminal_bytes);
     errdefer allocator.free(storage);
@@ -203,7 +203,7 @@ fn errorOutputAlloc(
     return .{ .exit_code = failure.exit_code, .bytes = try allocator.realloc(storage, writer.buffered().len) };
 }
 
-fn failureTerminal(failure: publication.Failure) Failure {
+fn failureTerminal(failure: store_service.PublicationFailure) Failure {
     return switch (failure) {
         .store_unavailable => .{ .exit_code = 69, .code = "store_unavailable", .message = "Review Store is unavailable" },
         .unsupported_platform => .{ .exit_code = 69, .code = "unsupported_platform", .message = "Review Store writer is unsupported on this platform" },

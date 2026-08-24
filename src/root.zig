@@ -113,7 +113,6 @@ test {
     _ = @import("committed_review/target_command.zig");
     _ = @import("review_store/prepare_command.zig");
     _ = @import("review_store/publish_command.zig");
-    _ = @import("review_store/mutation.zig");
     _ = @import("context.zig");
     _ = @import("context_export.zig");
     _ = @import("draw");

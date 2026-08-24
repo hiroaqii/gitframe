@@ -228,11 +228,10 @@ pub const ReviewHistoryScanTaskResult = union(enum) {
 pub const ReviewHistoryScanFinished = struct {
     identity: page.RequestIdentity,
     generation: u64,
-    store_root: []u8,
+    store_identity: review_store.ConfigurationIdentity,
     result: ReviewHistoryScanTaskResult,
 
     pub fn deinit(self: *ReviewHistoryScanFinished, allocator: std.mem.Allocator) void {
-        allocator.free(self.store_root);
         self.result.deinit(allocator);
         self.* = undefined;
     }
@@ -267,12 +266,11 @@ pub const ReviewHistorySelectionTaskResult = union(enum) {
 pub const ReviewHistorySelectionFinished = struct {
     identity: page.RequestIdentity,
     generation: u64,
-    store_root: []u8,
+    store_identity: review_store.ConfigurationIdentity,
     review_id: committed_review.ReviewId,
     result: ReviewHistorySelectionTaskResult,
 
     pub fn deinit(self: *ReviewHistorySelectionFinished, allocator: std.mem.Allocator) void {
-        allocator.free(self.store_root);
         self.result.deinit(allocator);
         self.* = undefined;
     }
@@ -281,11 +279,10 @@ pub const ReviewHistorySelectionFinished = struct {
 pub const ReviewHistoryNormalReturnFinished = struct {
     identity: page.RequestIdentity,
     generation: u64,
-    store_root: []u8,
+    store_identity: review_store.ConfigurationIdentity,
     result: ReviewLoadTaskResult,
 
     pub fn deinit(self: *ReviewHistoryNormalReturnFinished, allocator: std.mem.Allocator) void {
-        allocator.free(self.store_root);
         self.result.deinit(allocator);
         self.* = undefined;
     }
@@ -1027,7 +1024,6 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
         generation: u64,
-        store_root: []u8,
         store: review_store.ConfiguredStore,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
@@ -1035,21 +1031,18 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
         pub fn init(
             identity: page.RequestIdentity,
             generation: u64,
-            store_root: []const u8,
+            store: *const review_store.ConfiguredStore,
             root: root_capability.RootCapability,
             env_map: ?*const std.process.Environ.Map,
             allocator: std.mem.Allocator,
         ) !@This() {
-            const owned_store_root = try allocator.dupe(u8, store_root);
-            errdefer allocator.free(owned_store_root);
-            var owned_store = try review_store.ConfiguredStore.initConfigured(allocator, store_root);
+            var owned_store = try store.clone(allocator);
             errdefer owned_store.deinit(allocator);
             var owned_root = try root.duplicate();
             errdefer owned_root.deinit();
             return .{
                 .identity = identity,
                 .generation = generation,
-                .store_root = owned_store_root,
                 .store = owned_store,
                 .root = owned_root,
                 .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map),
@@ -1082,12 +1075,11 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
                 task.store.deinit(allocator);
                 allocator.destroy(task);
             }
-            const store_root = task.store_root;
-            task.store_root = &.{};
+            const store_identity = task.store.identity();
             return Msg.loadFinished(.{ .review = .{ .history_scan = .{
                 .identity = task.identity,
                 .generation = task.generation,
-                .store_root = store_root,
+                .store_identity = store_identity,
                 .result = result,
             } } });
         }
@@ -1096,7 +1088,6 @@ pub fn ReviewHistoryScanTask(comptime Msg: type) type {
             task.environment.deinit();
             task.root.deinit();
             task.store.deinit(allocator);
-            allocator.free(task.store_root);
         }
     };
 }
@@ -1106,7 +1097,6 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
         generation: u64,
-        store_root: []u8,
         store: review_store.ConfiguredStore,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
@@ -1117,7 +1107,7 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
         pub fn init(
             identity: page.RequestIdentity,
             generation: u64,
-            store_root: []const u8,
+            store: *const review_store.ConfiguredStore,
             root: root_capability.RootCapability,
             env_map: ?*const std.process.Environ.Map,
             expected_store: review_store.StoreSnapshot,
@@ -1125,16 +1115,13 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
             expected_artifacts: review_store.ArtifactSnapshot,
             allocator: std.mem.Allocator,
         ) !@This() {
-            const owned_store_root = try allocator.dupe(u8, store_root);
-            errdefer allocator.free(owned_store_root);
-            var owned_store = try review_store.ConfiguredStore.initConfigured(allocator, store_root);
+            var owned_store = try store.clone(allocator);
             errdefer owned_store.deinit(allocator);
             var owned_root = try root.duplicate();
             errdefer owned_root.deinit();
             return .{
                 .identity = identity,
                 .generation = generation,
-                .store_root = owned_store_root,
                 .store = owned_store,
                 .root = owned_root,
                 .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map),
@@ -1174,12 +1161,11 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
                 task.store.deinit(allocator);
                 allocator.destroy(task);
             }
-            const store_root = task.store_root;
-            task.store_root = &.{};
+            const store_identity = task.store.identity();
             return Msg.loadFinished(.{ .review = .{ .history_selection = .{
                 .identity = task.identity,
                 .generation = task.generation,
-                .store_root = store_root,
+                .store_identity = store_identity,
                 .review_id = task.review_id,
                 .result = result,
             } } });
@@ -1189,7 +1175,6 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
             task.environment.deinit();
             task.root.deinit();
             task.store.deinit(allocator);
-            allocator.free(task.store_root);
         }
     };
 }
@@ -1235,7 +1220,7 @@ pub fn ReviewHistoryNormalReturnTask(comptime Msg: type) type {
     return struct {
         identity: page.RequestIdentity,
         generation: u64,
-        store_root: []u8,
+        store_identity: review_store.ConfigurationIdentity,
         root: root_capability.RootCapability,
         target: ?diff_basis.BaseTarget,
         environment: git_command.LocalGitEnvironment,
@@ -1243,14 +1228,12 @@ pub fn ReviewHistoryNormalReturnTask(comptime Msg: type) type {
         pub fn init(
             identity: page.RequestIdentity,
             generation: u64,
-            store_root: []const u8,
+            store: *const review_store.ConfiguredStore,
             root: root_capability.RootCapability,
             target: ?diff_basis.BaseTarget,
             env_map: ?*const std.process.Environ.Map,
             allocator: std.mem.Allocator,
         ) !@This() {
-            const owned_store_root = try allocator.dupe(u8, store_root);
-            errdefer allocator.free(owned_store_root);
             var owned_root = try root.duplicate();
             errdefer owned_root.deinit();
             var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map);
@@ -1258,7 +1241,7 @@ pub fn ReviewHistoryNormalReturnTask(comptime Msg: type) type {
             return .{
                 .identity = identity,
                 .generation = generation,
-                .store_root = owned_store_root,
+                .store_identity = store.identity(),
                 .root = owned_root,
                 .target = if (target) |value| try value.clone(allocator) else null,
                 .environment = environment,
@@ -1293,12 +1276,10 @@ pub fn ReviewHistoryNormalReturnTask(comptime Msg: type) type {
                 if (task.target) |*target| target.deinit(allocator);
                 allocator.destroy(task);
             }
-            const store_root = task.store_root;
-            task.store_root = &.{};
             return Msg.loadFinished(.{ .review = .{ .history_normal_return = .{
                 .identity = task.identity,
                 .generation = task.generation,
-                .store_root = store_root,
+                .store_identity = task.store_identity,
                 .result = result,
             } } });
         }
@@ -1307,7 +1288,6 @@ pub fn ReviewHistoryNormalReturnTask(comptime Msg: type) type {
             if (task.target) |*target| target.deinit(allocator);
             task.environment.deinit();
             task.root.deinit();
-            allocator.free(task.store_root);
         }
     };
 }
