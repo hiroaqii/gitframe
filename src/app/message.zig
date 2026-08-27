@@ -16,6 +16,7 @@ const repository_page = @import("pages/repository.zig");
 const repository_layout = @import("pages/repository/layout.zig");
 const changes_message = @import("pages/changes/message.zig");
 const review_store = @import("../review_store.zig");
+const human_review_session = @import("human_review_session.zig");
 
 pub const LoadFinished = load.ReadFinished;
 
@@ -70,9 +71,9 @@ pub const MouseSelectionContinuation = struct {
     target: MouseSelectionTarget,
 };
 
-pub const ReviewStoreOperationId = u64;
+pub const ReviewStoreOperationId = human_review_session.OperationId;
 
-pub const ReviewStoreOperationKind = enum { draft, result };
+pub const ReviewStoreOperationKind = human_review_session.OperationKind;
 
 pub const ReviewStoreOperationResult = union(enum) {
     draft: review_store.DraftSaveResult,
@@ -107,6 +108,16 @@ pub const ReviewStoreOperationResult = union(enum) {
             },
             .result => |*value| switch (value.*) {
                 .committed => |commit| commit.revision,
+                .failure => null,
+            },
+        };
+    }
+
+    pub fn completedAt(self: *const ReviewStoreOperationResult) ?[20]u8 {
+        return switch (self.*) {
+            .draft => null,
+            .result => |*value| switch (value.*) {
+                .committed => |commit| commit.completed_at,
                 .failure => null,
             },
         };

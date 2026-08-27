@@ -19,6 +19,7 @@ const review_page = @import("../review.zig");
 const review_input = @import("input.zig");
 const review_navigation = @import("navigation.zig");
 const review_store = @import("../../../review_store.zig");
+const human_review_session = @import("../../human_review_session.zig");
 
 const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
 const BranchListTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
@@ -69,6 +70,7 @@ pub const Controller = struct {
     mode_toggle_hint_width: u16 = 0,
     env_map: ?*std.process.Environ.Map,
     store: ?*const review_store.ConfiguredStore = null,
+    sessions: *human_review_session.Owner,
 
     pub fn navigation(self: Controller) review_navigation.Controller {
         return .{
@@ -311,6 +313,29 @@ pub const Controller = struct {
 
         switch (finished.result) {
             .loaded => |*bundle| {
+                const artifacts = &bundle.selection.artifacts;
+                const manifest = &artifacts.manifest.value;
+                var candidate = human_review_session.Session.init(
+                    ctx.allocator(),
+                    .{
+                        .review_repository_id = manifest.review_repository_id,
+                        .review_id = manifest.review_id,
+                        .target = manifest.target,
+                        .findings_digest = manifest.findings_digest,
+                    },
+                    &artifacts.findings.value,
+                    if (artifacts.draft) |*draft| &draft.value else null,
+                    if (artifacts.result) |*review_result| &review_result.value else null,
+                ) catch |err| {
+                    self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "Could not own AI review session");
+                    return err;
+                };
+                var install = self.sessions.prepareInstall(&candidate) catch |err| {
+                    candidate.deinit();
+                    self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "AI review has unsaved recovery state");
+                    return err;
+                };
+                defer install.deinit();
                 self.page_state.commitPinnedAi(
                     ctx.allocator(),
                     self.repo.epoch(),
@@ -321,6 +346,7 @@ pub const Controller = struct {
                     self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "Could not apply AI review");
                     return err;
                 };
+                self.sessions.commitInstall(&install);
                 finished.result = .empty;
                 self.page_state.ai_reviews.close(ctx.allocator());
                 self.initializeAcceptedBody(ctx.allocator());
@@ -350,6 +376,10 @@ pub const Controller = struct {
 
         switch (finished.result) {
             .loaded => |*bundle| {
+                const clear_plan = self.sessions.prepareClear() catch |err| {
+                    self.page_state.ai_reviews.failNormalReturn("AI review has unsaved recovery state");
+                    return err;
+                };
                 self.page_state.commitNormalReturn(
                     ctx.allocator(),
                     self.repo.epoch(),
@@ -360,6 +390,7 @@ pub const Controller = struct {
                     self.page_state.ai_reviews.failNormalReturn("Could not apply normal Review");
                     return err;
                 };
+                self.sessions.commitClear(clear_plan);
                 finished.result = .empty;
                 self.page_state.ai_reviews.close(ctx.allocator());
                 self.initializeAcceptedBody(ctx.allocator());
@@ -747,12 +778,15 @@ test "Review changed reload restores semantic viewport after removing retained a
     defer repo.deinit(allocator);
     var review: review_page.ReviewPageState = .{};
     defer review.deinit(allocator);
+    var sessions: human_review_session.Owner = .{};
+    defer sessions.deinit();
     _ = review.activate(repo.repo_epoch);
     const controller: Controller = .{
         .page_state = &review,
         .repo = repo.view(),
         .layout = .{ .width = 80, .height = 9 },
         .env_map = null,
+        .sessions = &sessions,
     };
     var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
 
@@ -840,12 +874,15 @@ test "Review deferred exact and stale completions reconcile only after release" 
         defer repo.deinit(allocator);
         var review: review_page.ReviewPageState = .{};
         defer review.deinit(allocator);
+        var sessions: human_review_session.Owner = .{};
+        defer sessions.deinit();
         _ = review.activate(repo.repo_epoch);
         const controller: Controller = .{
             .page_state = &review,
             .repo = repo.view(),
             .layout = .{ .width = 80, .height = 9 },
             .env_map = null,
+            .sessions = &sessions,
         };
         var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
 
@@ -913,12 +950,15 @@ test "Review deferred exact and stale completions reconcile only after release" 
         defer repo.deinit(allocator);
         var review: review_page.ReviewPageState = .{};
         defer review.deinit(allocator);
+        var sessions: human_review_session.Owner = .{};
+        defer sessions.deinit();
         _ = review.activate(repo.repo_epoch);
         const controller: Controller = .{
             .page_state = &review,
             .repo = repo.view(),
             .layout = .{ .width = 80, .height = 9 },
             .env_map = null,
+            .sessions = &sessions,
         };
         var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
 

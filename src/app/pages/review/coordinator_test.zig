@@ -19,6 +19,7 @@ const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const review_page = @import("../review.zig");
 const review_coordinator = @import("coordinator.zig");
+const human_review_session = @import("../../human_review_session.zig");
 
 const ReviewLoadFinished = app_load.ReviewLoadFinished;
 const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
@@ -33,6 +34,7 @@ const TestApp = struct {
     pages: struct { review: review_page.ReviewPageState = .{} } = .{},
     layout: diff_surface.Layout = .{ .width = 100, .height = 30 },
     store: ?review_store.ConfiguredStore = null,
+    sessions: human_review_session.Owner = .{},
 
     const Msg = app_message.Msg;
 
@@ -43,6 +45,7 @@ const TestApp = struct {
             .layout = self.layout,
             .env_map = null,
             .store = if (self.store) |*value| value else null,
+            .sessions = &self.sessions,
         };
     }
 
@@ -79,6 +82,7 @@ test "AI Reviews picker requests return to the event loop before captured worker
         .store = try review_store.ConfiguredStore.initConfigured(allocator, "/captured-ai-review-store"),
     };
     defer app.store.?.deinit(allocator);
+    defer app.sessions.deinit();
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -214,6 +218,7 @@ test "Review document navigation and diff wheel share rendered cursor authority"
         } },
         .layout = .{ .width = 140, .height = 9 },
     };
+    defer app.sessions.deinit();
     defer app.pages.review.deinit(allocator);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
@@ -283,6 +288,7 @@ test "Review coordinator returns shared drag auto-scroll outcome" {
         } },
         .layout = .{ .width = 100, .height = 9 },
     };
+    defer app.sessions.deinit();
     defer app.pages.review.deinit(allocator);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
@@ -315,6 +321,7 @@ test "Review reload retries user intent and preserves accepted display on failur
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
+    defer app.sessions.deinit();
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -373,6 +380,7 @@ test "Review refresh restores its anchor after atomic replacement" {
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
+    defer app.sessions.deinit();
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -440,6 +448,7 @@ test "Review app route retains viewed marks only for an unchanged oid pair" {
                 .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, "/repo") },
             },
         };
+        defer app.sessions.deinit();
         defer app.pages.review.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
         _ = app.pages.review.activate(app.repo_session.repo_epoch);
@@ -487,6 +496,7 @@ test "Review picker rejects replaced and closed generations through the App rout
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
+    defer app.sessions.deinit();
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -532,6 +542,7 @@ test "Review load route admits failure intent through the Review owner" {
     var app: TestApp = .{
         .repo_session = .{ .repo_epoch = 12 },
     };
+    defer app.sessions.deinit();
     defer app.pages.review.deinit(allocator);
     _ = app.pages.review.activate(app.repo_session.repo_epoch);
     const request = app.pages.review.beginRefresh().?;
@@ -613,6 +624,7 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
         .store = try review_store.ConfiguredStore.initConfigured(allocator, store_root),
     };
     defer app.store.?.deinit(allocator);
+    defer app.sessions.deinit();
     defer app.pages.review.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(repo_root);
@@ -729,6 +741,10 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     try std.testing.expectEqual(normal_revision +% 1, pinned_revision);
     try std.testing.expect(app.pages.review.activeAiReviewId().?.eql(review_id));
     try std.testing.expect(app.pages.review.pinnedAiConst().?.target().eql(&pinned_target));
+    const owned_session = app.sessions.currentSessionConst().?;
+    try std.testing.expect(owned_session.binding.review_id.eql(review_id));
+    try std.testing.expect(owned_session.binding.review_repository_id.eql(repository_id));
+    try std.testing.expectEqual(human_review_session.Lifecycle.editable, owned_session.lifecycle());
 
     if (!defer_ordinary_completion) {
         try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(

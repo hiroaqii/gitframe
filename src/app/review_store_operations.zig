@@ -9,6 +9,7 @@ const chasen = @import("chasen");
 const committed_review = @import("../committed_review.zig");
 const review_store = @import("../review_store.zig");
 const app_message = @import("message.zig");
+const human_review_session = @import("human_review_session.zig");
 
 pub const max_active_runs: usize = 64;
 
@@ -17,6 +18,7 @@ pub const Rejection = enum {
     capacity,
     incompatible_queue,
     store_unavailable,
+    queue_changed,
 };
 
 pub const Admission = union(enum) {
@@ -37,6 +39,9 @@ pub const CompletionRecord = struct {
     operation_id: app_message.ReviewStoreOperationId,
     binding: review_store.ReviewRunBinding,
     kind: app_message.ReviewStoreOperationKind,
+    expected_revision: u64,
+    committed_revision: ?u64,
+    completed_at: ?[20]u8,
     failure: ?review_store.PersistenceFailure,
     notified_review: bool,
 };
@@ -49,6 +54,7 @@ pub const FinishOutcome = struct {
     start_pending: bool = false,
     quit_ready: bool = false,
     quit_canceled: bool = false,
+    direct_terminal: ?CompletionRecord = null,
     dependent_terminal_count: usize = 0,
     dependent_terminals: [max_dependent_terminals]CompletionRecord = undefined,
 
@@ -173,10 +179,22 @@ const Slot = struct {
     }
 };
 
+const DraftPlan = union(enum) {
+    new_slot,
+    append: usize,
+    replace: struct { slot_index: usize, operation_id: app_message.ReviewStoreOperationId },
+};
+
+const ResultPlan = union(enum) { new_slot, append: usize };
+
+const DraftPlanResult = union(enum) { accepted: DraftPlan, rejected: Rejection };
+const ResultPlanResult = union(enum) { accepted: ResultPlan, rejected: Rejection };
+
 pub const Owner = struct {
     slots: [max_active_runs]Slot = undefined,
     slots_len: usize = 0,
     next_operation_id: app_message.ReviewStoreOperationId = 1,
+    queue_epoch: u64 = 1,
     admission_open: bool = true,
     draining: bool = false,
     last_completion: ?CompletionRecord = null,
@@ -192,49 +210,63 @@ pub const Owner = struct {
         store: *const review_store.ConfiguredStore,
         request: review_store.DraftSaveRequest,
     ) !Admission {
+        const token = self.queueToken(request.binding);
+        return self.enqueueDraftChecked(allocator, store, request, token);
+    }
+
+    pub fn enqueueDraftChecked(
+        self: *Owner,
+        allocator: std.mem.Allocator,
+        store: *const review_store.ConfiguredStore,
+        request: review_store.DraftSaveRequest,
+        token: human_review_session.QueueToken,
+    ) !Admission {
         if (!self.admission_open) return .{ .rejected = .admission_closed };
-        const operation_id = self.issueOperationId();
-        var operation = try OwnedOperation.initDraft(allocator, operation_id, store, request);
+        if (!self.tokenMatches(&token)) return .{ .rejected = .queue_changed };
+        const first_plan = switch (self.planDraft(request)) {
+            .accepted => |plan| plan,
+            .rejected => |reason| return .{ .rejected = reason },
+        };
+        _ = first_plan;
+
+        var operation = try OwnedOperation.initDraft(allocator, 0, store, request);
         var operation_owned = true;
         defer if (operation_owned) operation.deinit(allocator);
 
-        const slot_index = self.findSlot(request.binding) orelse blk: {
-            if (self.slots_len == max_active_runs) return .{ .rejected = .capacity };
-            const index = self.slots_len;
-            self.slots[index] = .{ .binding = request.binding };
-            self.slots_len += 1;
-            break :blk index;
+        if (!self.admission_open) return .{ .rejected = .admission_closed };
+        if (!self.tokenMatches(&token)) return .{ .rejected = .queue_changed };
+        const plan = switch (self.planDraft(request)) {
+            .accepted => |value| value,
+            .rejected => return .{ .rejected = .queue_changed },
         };
-        const slot = &self.slots[slot_index];
-        if (!slot.binding.eql(request.binding)) return .{ .rejected = .incompatible_queue };
-        if (slot.pending_result != null or
-            (slot.in_flight != null and slot.in_flight.?.kind == .result))
-        {
-            return .{ .rejected = .incompatible_queue };
-        }
-        if (slot.pending_draft) |*pending| {
-            if (pending.expectedRevision() != request.expected_revision) {
-                return .{ .rejected = .incompatible_queue };
-            }
-            const superseded = pending.operation_id;
-            pending.deinit(allocator);
-            pending.* = operation;
-            operation_owned = false;
-            return .{ .accepted = .{
-                .operation_id = operation_id,
-                .superseded_operation_id = superseded,
-            } };
-        }
-        if (slot.in_flight) |active| {
-            const compatible_revision = std.math.add(u64, active.expected_revision, 1) catch
-                return .{ .rejected = .incompatible_queue };
-            if (active.kind != .draft or request.expected_revision != compatible_revision) {
-                return .{ .rejected = .incompatible_queue };
-            }
-        }
-        slot.pending_draft = operation;
-        operation_owned = false;
-        return .{ .accepted = .{ .operation_id = operation_id } };
+        const operation_id = self.issueOperationId();
+        operation.operation_id = operation_id;
+        const superseded: ?app_message.ReviewStoreOperationId = switch (plan) {
+            .new_slot => blk: {
+                const index = self.slots_len;
+                self.slots[index] = .{ .binding = request.binding, .pending_draft = operation };
+                self.slots_len += 1;
+                operation_owned = false;
+                break :blk null;
+            },
+            .append => |slot_index| blk: {
+                self.slots[slot_index].pending_draft = operation;
+                operation_owned = false;
+                break :blk null;
+            },
+            .replace => |replacement| blk: {
+                const slot = &self.slots[replacement.slot_index];
+                slot.pending_draft.?.deinit(allocator);
+                slot.pending_draft = operation;
+                operation_owned = false;
+                break :blk replacement.operation_id;
+            },
+        };
+        self.bumpQueueEpoch();
+        return .{ .accepted = .{
+            .operation_id = operation_id,
+            .superseded_operation_id = superseded,
+        } };
     }
 
     pub fn enqueueResult(
@@ -243,43 +275,89 @@ pub const Owner = struct {
         store: *const review_store.ConfiguredStore,
         request: review_store.ReviewResultCreateRequest,
     ) !Admission {
+        const token = self.queueToken(request.binding);
+        return self.enqueueResultChecked(allocator, store, request, token);
+    }
+
+    pub fn enqueueResultChecked(
+        self: *Owner,
+        allocator: std.mem.Allocator,
+        store: *const review_store.ConfiguredStore,
+        request: review_store.ReviewResultCreateRequest,
+        token: human_review_session.QueueToken,
+    ) !Admission {
         if (!self.admission_open) return .{ .rejected = .admission_closed };
-        const operation_id = self.issueOperationId();
-        var operation = try OwnedOperation.initResult(allocator, operation_id, store, request);
+        if (!self.tokenMatches(&token)) return .{ .rejected = .queue_changed };
+        const first_plan = switch (self.planResult(request)) {
+            .accepted => |plan| plan,
+            .rejected => |reason| return .{ .rejected = reason },
+        };
+        _ = first_plan;
+
+        var operation = try OwnedOperation.initResult(allocator, 0, store, request);
         var operation_owned = true;
         defer if (operation_owned) operation.deinit(allocator);
 
-        const slot_index = self.findSlot(request.binding) orelse blk: {
-            if (self.slots_len == max_active_runs) return .{ .rejected = .capacity };
-            const index = self.slots_len;
-            self.slots[index] = .{ .binding = request.binding };
-            self.slots_len += 1;
-            break :blk index;
+        if (!self.admission_open) return .{ .rejected = .admission_closed };
+        if (!self.tokenMatches(&token)) return .{ .rejected = .queue_changed };
+        const plan = switch (self.planResult(request)) {
+            .accepted => |value| value,
+            .rejected => return .{ .rejected = .queue_changed },
         };
-        const slot = &self.slots[slot_index];
-        if (!slot.binding.eql(request.binding)) return .{ .rejected = .incompatible_queue };
-        if (slot.pending_result != null or
-            (slot.in_flight != null and slot.in_flight.?.kind == .result))
-        {
-            return .{ .rejected = .incompatible_queue };
+        const operation_id = self.issueOperationId();
+        operation.operation_id = operation_id;
+        switch (plan) {
+            .new_slot => {
+                self.slots[self.slots_len] = .{ .binding = request.binding, .pending_result = operation };
+                self.slots_len += 1;
+            },
+            .append => |slot_index| self.slots[slot_index].pending_result = operation,
         }
-        const prior_draft_revision = if (slot.pending_draft) |*pending|
-            std.math.add(u64, pending.expectedRevision(), 1) catch
-                return .{ .rejected = .incompatible_queue }
-        else if (slot.in_flight) |active|
-            if (active.kind == .draft)
-                std.math.add(u64, active.expected_revision, 1) catch
-                    return .{ .rejected = .incompatible_queue }
-            else
-                null
-        else
-            null;
-        if (prior_draft_revision) |revision| {
-            if (request.expected_revision != revision) return .{ .rejected = .incompatible_queue };
-        }
-        slot.pending_result = operation;
         operation_owned = false;
+        self.bumpQueueEpoch();
         return .{ .accepted = .{ .operation_id = operation_id } };
+    }
+
+    pub fn queueToken(
+        self: *const Owner,
+        requested_binding: review_store.ReviewRunBinding,
+    ) human_review_session.QueueToken {
+        var token: human_review_session.QueueToken = .{
+            .binding = requested_binding,
+            .epoch = self.queue_epoch,
+        };
+        const slot_index = self.findSlot(requested_binding) orelse return token;
+        const slot = &self.slots[slot_index];
+        token.binding = slot.binding;
+        if (slot.in_flight) |active| {
+            token.entries[token.entries_len] = .{
+                .operation_id = active.operation_id,
+                .kind = active.kind,
+                .expected_revision = active.expected_revision,
+                .role = .active,
+            };
+            token.entries_len += 1;
+        }
+        if (slot.pending_draft) |*pending| {
+            token.entries[token.entries_len] = .{
+                .operation_id = pending.operation_id,
+                .kind = .draft,
+                .expected_revision = pending.expectedRevision(),
+                .role = .pending_draft,
+            };
+            token.entries_len += 1;
+        }
+        if (slot.pending_result) |*pending| {
+            token.entries[token.entries_len] = .{
+                .operation_id = pending.operation_id,
+                .kind = .result,
+                .expected_revision = pending.expectedRevision(),
+                .role = .pending_result,
+            };
+            token.entries_len += 1;
+        }
+        std.debug.assert(token.entries_len <= human_review_session.max_operations);
+        return token;
     }
 
     /// Starts at most one task for each currently idle Run. A failed spawn
@@ -324,6 +402,7 @@ pub const Owner = struct {
                 .kind = operation.kind(),
                 .expected_revision = operation.expectedRevision(),
             };
+            self.bumpQueueEpoch();
             started += 1;
         }
         return started;
@@ -345,19 +424,26 @@ pub const Owner = struct {
 
         var failure = finished.result.failure();
         const revision = finished.result.committedRevision();
+        const completed_at = finished.result.completedAt();
         slot.in_flight = null;
-        self.last_completion = .{
+        self.bumpQueueEpoch();
+        const direct_terminal: CompletionRecord = .{
             .operation_id = finished.operation_id,
             .binding = finished.binding,
             .kind = finished.kind,
+            .expected_revision = active.expected_revision,
+            .committed_revision = revision,
+            .completed_at = completed_at,
             .failure = failure,
             .notified_review = presentation_matches,
         };
+        self.last_completion = direct_terminal;
 
         var outcome: FinishOutcome = .{
             .accepted = true,
             .failure = failure,
             .start_pending = slot.hasPending(),
+            .direct_terminal = direct_terminal,
         };
         if (failure == null and finished.kind == .draft) {
             if (revision) |committed_revision| {
@@ -371,6 +457,7 @@ pub const Owner = struct {
             outcome.failure = terminal;
             outcome.start_pending = false;
             self.last_completion.?.failure = terminal;
+            outcome.direct_terminal.?.failure = terminal;
             retirePending(
                 allocator,
                 slot,
@@ -393,8 +480,40 @@ pub const Owner = struct {
         return outcome;
     }
 
+    /// Retire only unstarted dependents for one exact Run before the common
+    /// update tail can pump them after a session reconciliation mismatch.
+    pub fn retireUnstarted(
+        self: *Owner,
+        allocator: std.mem.Allocator,
+        binding: review_store.ReviewRunBinding,
+        failure: review_store.PersistenceFailure,
+        presentation_matches: bool,
+    ) FinishOutcome {
+        const slot_index = self.findSlot(binding) orelse return .{};
+        const slot = &self.slots[slot_index];
+        if (!slot.binding.eql(binding)) return .{};
+        var outcome: FinishOutcome = .{};
+        retirePending(allocator, slot, failure, presentation_matches, &outcome);
+        if (outcome.dependent_terminal_count != 0) self.bumpQueueEpoch();
+        if (slot.in_flight == null and !slot.hasPending()) self.removeSlot(allocator, slot_index);
+        if (self.draining) {
+            self.draining = false;
+            self.admission_open = true;
+            self.bumpQueueEpoch();
+            outcome.quit_canceled = true;
+        }
+        return outcome;
+    }
+
+    pub fn reopenAfterReconciliation(self: *Owner) void {
+        self.draining = false;
+        self.admission_open = true;
+        self.bumpQueueEpoch();
+    }
+
     pub fn requestQuit(self: *Owner) QuitAdmission {
         self.admission_open = false;
+        self.bumpQueueEpoch();
         if (!self.hasWork()) return .ready;
         self.draining = true;
         return .draining;
@@ -404,6 +523,7 @@ pub const Owner = struct {
         if (!self.draining) return;
         self.draining = false;
         self.admission_open = true;
+        self.bumpQueueEpoch();
         _ = failure;
     }
 
@@ -420,6 +540,82 @@ pub const Owner = struct {
             if (slot.in_flight != null or slot.hasPending()) return true;
         }
         return false;
+    }
+
+    fn planDraft(
+        self: *const Owner,
+        request: review_store.DraftSaveRequest,
+    ) DraftPlanResult {
+        const slot_index = self.findSlot(request.binding) orelse {
+            if (self.slots_len == max_active_runs) return .{ .rejected = .capacity };
+            return .{ .accepted = .new_slot };
+        };
+        const slot = &self.slots[slot_index];
+        if (!slot.binding.eql(request.binding)) return .{ .rejected = .incompatible_queue };
+        if (slot.pending_result != null or
+            (slot.in_flight != null and slot.in_flight.?.kind == .result))
+        {
+            return .{ .rejected = .incompatible_queue };
+        }
+        if (slot.pending_draft) |*pending| {
+            if (pending.expectedRevision() != request.expected_revision) {
+                return .{ .rejected = .incompatible_queue };
+            }
+            return .{ .accepted = .{ .replace = .{
+                .slot_index = slot_index,
+                .operation_id = pending.operation_id,
+            } } };
+        }
+        if (slot.in_flight) |active| {
+            const compatible_revision = std.math.add(u64, active.expected_revision, 1) catch
+                return .{ .rejected = .incompatible_queue };
+            if (active.kind != .draft or request.expected_revision != compatible_revision) {
+                return .{ .rejected = .incompatible_queue };
+            }
+        }
+        return .{ .accepted = .{ .append = slot_index } };
+    }
+
+    fn planResult(
+        self: *const Owner,
+        request: review_store.ReviewResultCreateRequest,
+    ) ResultPlanResult {
+        const slot_index = self.findSlot(request.binding) orelse {
+            if (self.slots_len == max_active_runs) return .{ .rejected = .capacity };
+            return .{ .accepted = .new_slot };
+        };
+        const slot = &self.slots[slot_index];
+        if (!slot.binding.eql(request.binding)) return .{ .rejected = .incompatible_queue };
+        if (slot.pending_result != null or
+            (slot.in_flight != null and slot.in_flight.?.kind == .result))
+        {
+            return .{ .rejected = .incompatible_queue };
+        }
+        const prior_draft_revision = if (slot.pending_draft) |*pending|
+            std.math.add(u64, pending.expectedRevision(), 1) catch
+                return .{ .rejected = .incompatible_queue }
+        else if (slot.in_flight) |active|
+            if (active.kind == .draft)
+                std.math.add(u64, active.expected_revision, 1) catch
+                    return .{ .rejected = .incompatible_queue }
+            else
+                null
+        else
+            null;
+        if (prior_draft_revision) |revision| {
+            if (request.expected_revision != revision) return .{ .rejected = .incompatible_queue };
+        }
+        return .{ .accepted = .{ .append = slot_index } };
+    }
+
+    fn tokenMatches(self: *const Owner, token: *const human_review_session.QueueToken) bool {
+        const current = self.queueToken(token.binding);
+        return current.eql(token);
+    }
+
+    fn bumpQueueEpoch(self: *Owner) void {
+        self.queue_epoch +%= 1;
+        if (self.queue_epoch == 0) self.queue_epoch = 1;
     }
 
     fn findSlot(self: *const Owner, binding: review_store.ReviewRunBinding) ?usize {
@@ -441,6 +637,7 @@ pub const Owner = struct {
         self.slots[index].deinit(allocator);
         self.slots_len -= 1;
         if (index != self.slots_len) self.slots[index] = self.slots[self.slots_len];
+        self.bumpQueueEpoch();
     }
 };
 
@@ -476,6 +673,9 @@ fn recordDependentTerminal(
         .operation_id = operation.operation_id,
         .binding = operation.binding,
         .kind = operation.kind(),
+        .expected_revision = operation.expectedRevision(),
+        .committed_revision = null,
+        .completed_at = null,
         .failure = failure,
         .notified_review = presentation_matches,
     };
@@ -749,6 +949,75 @@ test "review state persistence operation owner cancels failed drain and enforces
         testDraft(try testBinding(250), 0, "overflow"),
     );
     try std.testing.expectEqual(Rejection.capacity, overflow.rejected);
+}
+
+test "review state persistence checked tokens reject drift and pre-pump retirement is finite" {
+    const allocator = std.testing.allocator;
+    var store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused");
+    defer store.deinit(allocator);
+    var owner: Owner = .{};
+    defer owner.deinit(allocator);
+    const binding = try testBinding(9);
+
+    const empty = owner.queueToken(binding);
+    const active_admission = try owner.enqueueDraftChecked(
+        allocator,
+        &store,
+        testDraft(binding, 0, "active"),
+        empty,
+    );
+    const issued_after_active = owner.next_operation_id;
+    const stale = try owner.enqueueDraftChecked(
+        allocator,
+        &store,
+        testDraft(binding, 0, "must not mutate"),
+        empty,
+    );
+    try std.testing.expectEqual(Rejection.queue_changed, stale.rejected);
+    try std.testing.expectEqual(issued_after_active, owner.next_operation_id);
+    try std.testing.expectEqual(@as(usize, 1), owner.slots_len);
+
+    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    try std.testing.expectEqual(@as(usize, 1), try owner.pump(&ctx));
+    const active_token = owner.queueToken(binding);
+    try std.testing.expectEqual(@as(usize, 1), active_token.entries_len);
+    try std.testing.expectEqual(human_review_session.QueueRole.active, active_token.entries[0].role);
+    const pending_draft = try owner.enqueueDraftChecked(
+        allocator,
+        &store,
+        testDraft(binding, 1, "pending"),
+        active_token,
+    );
+    const with_draft = owner.queueToken(binding);
+    const pending_result = try owner.enqueueResultChecked(
+        allocator,
+        &store,
+        .{ .binding = binding, .expected_revision = 2, .decision = .approved },
+        with_draft,
+    );
+
+    const tasks = ctx.takePendingTasksWith();
+    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+    var finished = try committedDraftFinished(
+        allocator,
+        active_admission.accepted.operation_id,
+        binding,
+        1,
+    );
+    const completed = owner.finish(allocator, &finished, false);
+    try std.testing.expect(completed.accepted);
+    try std.testing.expectEqual(@as(u64, 0), completed.direct_terminal.?.expected_revision);
+    try std.testing.expectEqual(@as(?u64, 1), completed.direct_terminal.?.committed_revision);
+    try std.testing.expect(completed.direct_terminal.?.completed_at == null);
+
+    const retired = owner.retireUnstarted(allocator, binding, .run_invalid, false);
+    try std.testing.expectEqual(@as(usize, 2), retired.dependentTerminals().len);
+    try std.testing.expectEqual(pending_draft.accepted.operation_id, retired.dependentTerminals()[0].operation_id);
+    try std.testing.expectEqual(@as(u64, 1), retired.dependentTerminals()[0].expected_revision);
+    try std.testing.expectEqual(pending_result.accepted.operation_id, retired.dependentTerminals()[1].operation_id);
+    try std.testing.expectEqual(@as(u64, 2), retired.dependentTerminals()[1].expected_revision);
+    try std.testing.expect(!owner.hasWork());
 }
 
 fn failedFinished(

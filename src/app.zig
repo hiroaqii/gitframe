@@ -40,6 +40,7 @@ const action_lifecycle = @import("app/workflow/action_lifecycle.zig");
 const workflow_local = @import("app/workflow/local.zig");
 const workflow_remote = @import("app/workflow/remote.zig");
 const shell_effects = @import("app/shell_effects.zig");
+const human_review_session_mod = @import("app/human_review_session.zig");
 const review_store_operations_mod = @import("app/review_store_operations.zig");
 const context = @import("context.zig");
 const config_mod = @import("config.zig");
@@ -50,6 +51,7 @@ const diff_source = @import("diff/source.zig");
 const keymap = @import("keymap");
 const theme = @import("theme");
 const review_store = @import("review_store.zig");
+const committed_review = @import("committed_review.zig");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
 const CliConfig = diff_source.CliConfig;
@@ -58,6 +60,12 @@ const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
 const LoadFinishedMsg = app_message.LoadFinished;
 const ActionFinishedMsg = app_message.ActionFinished;
 const ShellEffectFinishedMsg = app_message.ShellEffectFinished;
+
+comptime {
+    if (human_review_session_mod.max_detached_sessions != review_store_operations_mod.max_active_runs) {
+        @compileError("human Review recovery and mutation queue capacities must remain equal");
+    }
+}
 
 const PageStates = struct {
     changes: changes_page.ChangesPageState = .{},
@@ -103,6 +111,20 @@ pub const RedrawPlan = struct {
     }
 };
 
+pub const HumanReviewSaveOutcome = union(enum) {
+    no_change,
+    accepted: app_message.ReviewStoreOperationId,
+    rejected: human_review_session_mod.AdmissionFailure,
+};
+
+pub const HumanReviewFinalizeOutcome = union(enum) {
+    accepted: struct {
+        draft_operation_id: ?app_message.ReviewStoreOperationId,
+        result_operation_id: app_message.ReviewStoreOperationId,
+    },
+    rejected: human_review_session_mod.AdmissionFailure,
+};
+
 pub const App = struct {
     active_page: page.Id = .changes,
     repo_session: repo_session.State = .{},
@@ -129,6 +151,7 @@ pub const App = struct {
     remote_workflow: workflow_remote.State = .{},
     overlay: app_state.OverlayState = .{},
     shell_effects_state: shell_effects.State = .{},
+    human_review_sessions: human_review_session_mod.Owner = .{},
     review_store_operations: review_store_operations_mod.Owner = .{},
     /// Retains the user's quit intent after Store drain success until the
     /// existing Git action lifecycle is also terminal.
@@ -174,11 +197,161 @@ pub const App = struct {
         self.remote_workflow.deinit(deinit_ctx.allocator);
         self.shell_effects_state.deinit(deinit_ctx.allocator);
         self.review_store_operations.deinit(deinit_ctx.allocator);
+        self.human_review_sessions.deinit();
     }
 
-    /// Clone and admit one full draft snapshot for page-independent Store
-    /// persistence. The caller retains its editable state on every terminal.
-    pub fn persistReviewDraft(
+    /// Prepare, checked-admit, and infallibly track the current session's
+    /// complete working snapshot before starting Store work.
+    pub fn saveHumanReviewSession(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+    ) !HumanReviewSaveOutcome {
+        const session = self.human_review_sessions.currentSession() orelse
+            return error.NoHumanReviewSession;
+        const token = self.review_store_operations.queueToken(session.binding);
+        const preparation = session.prepareSave(ctx.allocator(), token, .dirty_only) catch |err| {
+            self.recordHumanReviewPreparationFailure(ctx, session, &token, .draft, null, err);
+            return err;
+        };
+        switch (preparation) {
+            .no_change => return .no_change,
+            .ready => |value| {
+                var prepared = value;
+                defer prepared.deinit();
+                const store = if (self.configured_review_store) |*configured| configured else {
+                    session.rejectDraft(&prepared, .store_unavailable);
+                    return .{ .rejected = .store_unavailable };
+                };
+                if (!store.isConfigured()) {
+                    session.rejectDraft(&prepared, .store_unavailable);
+                    return .{ .rejected = .store_unavailable };
+                }
+                const admission = try self.enqueuePreparedHumanReviewDraft(
+                    ctx.allocator(),
+                    store,
+                    session,
+                    &prepared,
+                );
+                switch (admission) {
+                    .rejected => |reason| {
+                        const mapped = mapHumanReviewAdmissionFailure(reason);
+                        session.rejectDraft(&prepared, mapped);
+                        return .{ .rejected = mapped };
+                    },
+                    .accepted => |accepted| {
+                        session.commitDraft(
+                            &prepared,
+                            accepted.operation_id,
+                            accepted.superseded_operation_id,
+                        );
+                        self.pumpReviewStoreOperations(ctx);
+                        return .{ .accepted = accepted.operation_id };
+                    },
+                }
+            },
+        }
+    }
+
+    /// Admit an optional exact draft followed by one result bound to the
+    /// revision that draft is guaranteed to commit. Pumping happens only
+    /// after every accepted operation has an infallible session ledger entry.
+    pub fn finalizeHumanReviewSession(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        decision: @import("committed_review.zig").ReviewResultValue,
+    ) !HumanReviewFinalizeOutcome {
+        const session = self.human_review_sessions.currentSession() orelse
+            return error.NoHumanReviewSession;
+        const store = if (self.configured_review_store) |*value| value else {
+            session.markAdmissionFailure(.result, decision, .store_unavailable);
+            return .{ .rejected = .store_unavailable };
+        };
+        if (!store.isConfigured()) {
+            session.markAdmissionFailure(.result, decision, .store_unavailable);
+            return .{ .rejected = .store_unavailable };
+        }
+
+        var draft_operation_id: ?app_message.ReviewStoreOperationId = null;
+        var pump_on_return = false;
+        defer if (pump_on_return) self.pumpReviewStoreOperations(ctx);
+
+        const draft_token = self.review_store_operations.queueToken(session.binding);
+        const draft_preparation = session.prepareSave(
+            ctx.allocator(),
+            draft_token,
+            .ensure_persisted,
+        ) catch |err| {
+            self.recordHumanReviewPreparationFailure(ctx, session, &draft_token, .draft, decision, err);
+            return err;
+        };
+        switch (draft_preparation) {
+            .no_change => {},
+            .ready => |value| {
+                var prepared = value;
+                defer prepared.deinit();
+                const admission = try self.enqueuePreparedHumanReviewDraft(
+                    ctx.allocator(),
+                    store,
+                    session,
+                    &prepared,
+                );
+                switch (admission) {
+                    .rejected => |reason| {
+                        const mapped = mapHumanReviewAdmissionFailure(reason);
+                        session.rejectDraft(&prepared, mapped);
+                        return .{ .rejected = mapped };
+                    },
+                    .accepted => |accepted| {
+                        session.commitDraft(
+                            &prepared,
+                            accepted.operation_id,
+                            accepted.superseded_operation_id,
+                        );
+                        draft_operation_id = accepted.operation_id;
+                        pump_on_return = true;
+                    },
+                }
+            },
+        }
+
+        const result_token = self.review_store_operations.queueToken(session.binding);
+        var prepared_result = session.prepareResult(
+            ctx.allocator(),
+            result_token,
+            decision,
+        ) catch |err| {
+            self.recordHumanReviewPreparationFailure(ctx, session, &result_token, .result, decision, err);
+            return err;
+        };
+        defer prepared_result.deinit();
+        const result_admission = try self.enqueuePreparedHumanReviewResult(
+            ctx.allocator(),
+            store,
+            session,
+            &prepared_result,
+        );
+        return switch (result_admission) {
+            .rejected => |reason| blk: {
+                const mapped = mapHumanReviewAdmissionFailure(reason);
+                session.rejectResult(&prepared_result, mapped);
+                break :blk .{ .rejected = mapped };
+            },
+            .accepted => |accepted| blk: {
+                session.commitResult(
+                    &prepared_result,
+                    accepted.operation_id,
+                );
+                pump_on_return = true;
+                break :blk .{ .accepted = .{
+                    .draft_operation_id = draft_operation_id,
+                    .result_operation_id = accepted.operation_id,
+                } };
+            },
+        };
+    }
+
+    /// Test-only raw bridge retained for mutation-owner discrimination.
+    fn persistReviewDraft(
         self: *App,
         ctx: *chasen.Ctx(Msg),
         request: review_store.DraftSaveRequest,
@@ -195,7 +368,7 @@ pub const App = struct {
     }
 
     /// Admit create-once completion behind any accepted draft for the Run.
-    pub fn persistReviewResult(
+    fn persistReviewResult(
         self: *App,
         ctx: *chasen.Ctx(Msg),
         request: review_store.ReviewResultCreateRequest,
@@ -254,6 +427,7 @@ pub const App = struct {
             .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
             .env_map = self.env_map,
             .store = if (self.configured_review_store) |*value| value else null,
+            .sessions = &self.human_review_sessions,
         };
     }
 
@@ -781,6 +955,69 @@ pub const App = struct {
         };
     }
 
+    fn enqueuePreparedHumanReviewDraft(
+        self: *App,
+        allocator: std.mem.Allocator,
+        store: *const review_store.ConfiguredStore,
+        session: *human_review_session_mod.Session,
+        prepared: *const human_review_session_mod.PreparedDraft,
+    ) !review_store_operations_mod.Admission {
+        return self.review_store_operations.enqueueDraftChecked(
+            allocator,
+            store,
+            prepared.request(),
+            prepared.token,
+        ) catch |err| {
+            session.rejectDraft(prepared, .preparation_failed);
+            return err;
+        };
+    }
+
+    fn enqueuePreparedHumanReviewResult(
+        self: *App,
+        allocator: std.mem.Allocator,
+        store: *const review_store.ConfiguredStore,
+        session: *human_review_session_mod.Session,
+        prepared: *const human_review_session_mod.PreparedResult,
+    ) !review_store_operations_mod.Admission {
+        return self.review_store_operations.enqueueResultChecked(
+            allocator,
+            store,
+            prepared.request(),
+            prepared.token,
+        ) catch |err| {
+            session.rejectResult(prepared, .preparation_failed);
+            return err;
+        };
+    }
+
+    fn recordHumanReviewPreparationFailure(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        session: *human_review_session_mod.Session,
+        token: *const human_review_session_mod.QueueToken,
+        kind: human_review_session_mod.OperationKind,
+        decision: ?@import("committed_review.zig").ReviewResultValue,
+        err: anyerror,
+    ) void {
+        if (err != error.QueueMismatch) {
+            session.markPreparationFailure(token, kind, decision);
+            return;
+        }
+        const binding = session.binding;
+        session.markQueueMismatch(kind, decision);
+        const retired = self.review_store_operations.retireUnstarted(
+            ctx.allocator(),
+            binding,
+            .run_invalid,
+            self.reviewStorePresentationMatches(binding),
+        );
+        for (retired.dependentTerminals()) |terminal| {
+            _ = self.human_review_sessions.reduce(humanReviewCompletion(terminal));
+        }
+        if (retired.quit_canceled) self.quit_after_store_drain = false;
+    }
+
     fn finishReviewStoreOperation(
         self: *App,
         ctx: *chasen.Ctx(Msg),
@@ -795,23 +1032,59 @@ pub const App = struct {
             presentation_matches,
         );
         if (!outcome.accepted) return;
-        if (outcome.quit_canceled) self.quit_after_store_drain = false;
-        if (outcome.failure) |failure| {
-            if (outcome.dependent_terminal_count == 0) {
-                self.setStatus("AI review save failed: {s}", .{@tagName(failure)});
-            } else {
-                self.setStatus(
-                    "AI review save failed: {s}; canceled {d} dependent save(s)",
-                    .{ @tagName(failure), outcome.dependent_terminal_count },
-                );
+        var reconciliation_required = false;
+        var reconciliation_current = false;
+        if (outcome.direct_terminal) |terminal| {
+            const routed = self.human_review_sessions.reduce(humanReviewCompletion(terminal));
+            reconciliation_required = routed.reduction == .reconciliation_required;
+            reconciliation_current = reconciliation_required and routed.current_match;
+        }
+        for (outcome.dependentTerminals()) |terminal| {
+            const routed = self.human_review_sessions.reduce(humanReviewCompletion(terminal));
+            reconciliation_required = reconciliation_required or
+                routed.reduction == .reconciliation_required;
+            reconciliation_current = reconciliation_current or
+                (routed.reduction == .reconciliation_required and routed.current_match);
+        }
+        var reconciliation_quit_canceled = false;
+        if (reconciliation_required) {
+            const retired = self.review_store_operations.retireUnstarted(
+                ctx.allocator(),
+                completion.binding,
+                .run_invalid,
+                presentation_matches,
+            );
+            for (retired.dependentTerminals()) |terminal| {
+                _ = self.human_review_sessions.reduce(humanReviewCompletion(terminal));
             }
-        } else if (presentation_matches) {
-            switch (kind) {
-                .draft => self.pages.review.status.set("AI review draft saved", .{}),
-                .result => self.pages.review.status.set("AI review result saved", .{}),
+            reconciliation_quit_canceled = retired.quit_canceled or outcome.quit_ready;
+            self.review_store_operations.reopenAfterReconciliation();
+            self.quit_after_store_drain = false;
+            if (reconciliation_current and presentation_matches) {
+                self.setStatus("AI review save requires exact reload: internal_mismatch", .{});
             }
         }
-        if (outcome.quit_ready) self.resumeQuitAfterStoreDrain(ctx);
+        if (outcome.quit_canceled or reconciliation_quit_canceled) self.quit_after_store_drain = false;
+        if (!reconciliation_required) {
+            if (outcome.failure) |failure| {
+                if (presentation_matches or outcome.quit_canceled) {
+                    if (outcome.dependent_terminal_count == 0) {
+                        self.setStatus("AI review save failed: {s}", .{@tagName(failure)});
+                    } else {
+                        self.setStatus(
+                            "AI review save failed: {s}; canceled {d} dependent save(s)",
+                            .{ @tagName(failure), outcome.dependent_terminal_count },
+                        );
+                    }
+                }
+            } else if (presentation_matches) {
+                switch (kind) {
+                    .draft => self.pages.review.status.set("AI review draft saved", .{}),
+                    .result => self.pages.review.status.set("AI review result saved", .{}),
+                }
+            }
+        }
+        if (outcome.quit_ready and !reconciliation_required) self.resumeQuitAfterStoreDrain(ctx);
     }
 
     fn resumeQuitAfterStoreDrain(self: *App, ctx: *chasen.Ctx(Msg)) void {
@@ -1771,10 +2044,18 @@ pub const App = struct {
 
     fn applyRepoSessionCommit(self: *App, ctx: *chasen.Ctx(Msg), outcome: repo_session.CommitOutcome) !void {
         switch (outcome) {
-            .changed => try self.applyPageCoordinationIntent(
-                ctx,
-                self.pageCoordinator().acceptedRepositoryChange(),
-            ),
+            .changed => {
+                const session_transition = self.human_review_sessions.prepareClear() catch null;
+                try self.applyPageCoordinationIntent(
+                    ctx,
+                    self.pageCoordinator().acceptedRepositoryChange(),
+                );
+                if (session_transition) |plan| {
+                    self.human_review_sessions.commitClear(plan);
+                } else if (self.human_review_sessions.currentSessionConst() != null) {
+                    self.setStatus("AI review has unsaved state; reselect it to reconcile", .{});
+                }
+            },
             .unchanged => {},
             .rejected => self.setStatus("Repository root could not be opened safely", .{}),
         }
@@ -1788,6 +2069,32 @@ pub const App = struct {
         );
     }
 };
+
+fn mapHumanReviewAdmissionFailure(
+    reason: review_store_operations_mod.Rejection,
+) human_review_session_mod.AdmissionFailure {
+    return switch (reason) {
+        .admission_closed => .admission_closed,
+        .capacity => .capacity,
+        .incompatible_queue => .incompatible_queue,
+        .store_unavailable => .store_unavailable,
+        .queue_changed => .queue_changed,
+    };
+}
+
+fn humanReviewCompletion(
+    terminal: review_store_operations_mod.CompletionRecord,
+) human_review_session_mod.Completion {
+    return .{
+        .operation_id = terminal.operation_id,
+        .binding = terminal.binding,
+        .kind = terminal.kind,
+        .expected_revision = terminal.expected_revision,
+        .committed_revision = terminal.committed_revision,
+        .completed_at = terminal.completed_at,
+        .failure = terminal.failure,
+    };
+}
 
 fn diffAutoScrollViewport(
     body: diff_surface.navigation.BodyController,
@@ -2042,4 +2349,681 @@ test "review state persistence App quit drains accepted mutation and reopens aft
     try std.testing.expect(ctx.shouldQuit());
     try std.testing.expect(app.teardown_requested);
     try std.testing.expect(!app.quit_after_store_drain);
+}
+
+test "human review session App bridge tracks every accepted draft and result before pump" {
+    const allocator = std.testing.allocator;
+    const committed = @import("committed_review.zig");
+    const repository_id = try committed.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
+    const review_id = try committed.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
+    const oid = try committed.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const binding: review_store.ReviewRunBinding = .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = oid,
+            .head_oid = oid,
+            .diff_base_oid = oid,
+        },
+        .findings_digest = committed.Sha256Digest.hash("findings\n"),
+    };
+    const findings: committed.FindingSet = .{
+        .schema_version = committed.limits.schema_version,
+        .review_id = review_id,
+        .created_at = "2026-08-27T00:00:00Z",
+        .timing = .{ .duration_ms = 1 },
+        .target = binding.target,
+        .producer = .{ .name = "test" },
+        .findings = &.{},
+    };
+    var app: App = .{
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
+        .allocator = allocator,
+    };
+    defer app.configured_review_store.?.deinit(allocator);
+    defer app.review_store_operations.deinit(allocator);
+    defer app.human_review_sessions.deinit();
+    app.human_review_sessions.current = try human_review_session_mod.Session.init(
+        allocator,
+        binding,
+        &findings,
+        null,
+        null,
+    );
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try app.human_review_sessions.currentSession().?.editSummary(allocator, "first");
+    const first = try app.saveHumanReviewSession(&ctx);
+    try std.testing.expect(first == .accepted);
+    try std.testing.expectEqual(@as(usize, 1), app.human_review_sessions.currentSessionConst().?.operationCount());
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+
+    try app.human_review_sessions.currentSession().?.editSummary(allocator, "second");
+    const second = try app.saveHumanReviewSession(&ctx);
+    try std.testing.expect(second == .accepted);
+    try app.human_review_sessions.currentSession().?.editSummary(allocator, "final");
+    const finalized = try app.finalizeHumanReviewSession(&ctx, .needs_changes);
+    try std.testing.expect(finalized == .accepted);
+    try std.testing.expect(finalized.accepted.draft_operation_id != null);
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        app.human_review_sessions.currentSessionConst().?.operationCount(),
+    );
+    try std.testing.expectEqual(human_review_session_mod.Lifecycle.finalizing, app.human_review_sessions.currentSessionConst().?.lifecycle());
+
+    var active_tasks = ctx.takePendingTasksWith();
+    var abandoned = active_tasks[0].failed(active_tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+    try app.update(.{ .review_store_operation_finished = .{
+        .operation_id = first.accepted,
+        .binding = binding,
+        .kind = .draft,
+        .result = .{ .draft = .{ .committed = .{
+            .revision = 1,
+            .canonical_bytes = try allocator.dupe(u8, "draft-1\n"),
+        } } },
+    } }, &ctx);
+
+    active_tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), active_tasks.len);
+    abandoned = active_tasks[0].failed(active_tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+    try app.update(.{ .review_store_operation_finished = .{
+        .operation_id = finalized.accepted.draft_operation_id.?,
+        .binding = binding,
+        .kind = .draft,
+        .result = .{ .draft = .{ .committed = .{
+            .revision = 2,
+            .canonical_bytes = try allocator.dupe(u8, "draft-2\n"),
+        } } },
+    } }, &ctx);
+
+    active_tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), active_tasks.len);
+    abandoned = active_tasks[0].failed(active_tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+    try app.update(.{ .review_store_operation_finished = .{
+        .operation_id = finalized.accepted.result_operation_id,
+        .binding = binding,
+        .kind = .result,
+        .result = .{ .result = .{ .committed = .{
+            .revision = 2,
+            .completed_at = "2026-08-27T12:00:00Z".*,
+            .canonical_bytes = try allocator.dupe(u8, "result\n"),
+        } } },
+    } }, &ctx);
+    try std.testing.expectEqual(human_review_session_mod.Lifecycle.completed, app.human_review_sessions.currentSessionConst().?.lifecycle());
+    try std.testing.expect(!app.review_store_operations.hasWork());
+}
+
+test "human review session App admission faults preserve exact prepared intents" {
+    const allocator = std.testing.allocator;
+    const binding = try humanReviewTestBinding(14);
+    const findings = humanReviewTestFindings(binding);
+    var app: App = .{
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
+        .allocator = allocator,
+    };
+    defer app.configured_review_store.?.deinit(allocator);
+    defer app.review_store_operations.deinit(allocator);
+    defer app.human_review_sessions.deinit();
+    app.human_review_sessions.current = try human_review_session_mod.Session.init(
+        allocator,
+        binding,
+        &findings,
+        null,
+        null,
+    );
+    const session = app.human_review_sessions.currentSession().?;
+    const store = &app.configured_review_store.?;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try session.editSummary(allocator, "first");
+    const initial_generation = session.generation;
+    const draft_preparation_token = app.review_store_operations.queueToken(binding);
+    var draft_preparation_failing = std.testing.FailingAllocator.init(
+        allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        session.prepareSave(
+            draft_preparation_failing.allocator(),
+            draft_preparation_token,
+            .dirty_only,
+        ),
+    );
+    app.recordHumanReviewPreparationFailure(
+        &ctx,
+        session,
+        &draft_preparation_token,
+        .draft,
+        null,
+        error.OutOfMemory,
+    );
+    const queue_after_draft_preparation = app.review_store_operations.queueToken(binding);
+    try std.testing.expect(draft_preparation_token.eql(&queue_after_draft_preparation));
+    try std.testing.expectEqual(@as(usize, 0), session.operationCount());
+    try std.testing.expectEqual(@as(u64, 0), session.last_failure.?.expected_revision);
+    try std.testing.expectEqual(initial_generation, session.last_failure.?.submitted_generation);
+    try std.testing.expectEqual(human_review_session_mod.OperationKind.draft, session.last_failure.?.kind);
+
+    const initial_token = app.review_store_operations.queueToken(binding);
+    const initial_preparation = try session.prepareSave(allocator, initial_token, .dirty_only);
+    var initial = initial_preparation.ready;
+    defer initial.deinit();
+    const initial_queue = app.review_store_operations.queueToken(binding);
+    var initial_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        app.enqueuePreparedHumanReviewDraft(
+            initial_failing.allocator(),
+            store,
+            session,
+            &initial,
+        ),
+    );
+    const queue_after_initial_admission = app.review_store_operations.queueToken(binding);
+    try std.testing.expect(initial_queue.eql(&queue_after_initial_admission));
+    try std.testing.expectEqual(@as(usize, 0), session.operationCount());
+    try std.testing.expectEqual(@as(u64, 0), session.last_failure.?.expected_revision);
+    try std.testing.expectEqual(initial_generation, session.last_failure.?.submitted_generation);
+    try std.testing.expectEqual(
+        human_review_session_mod.AdmissionFailure.preparation_failed,
+        session.last_failure.?.reason.admission,
+    );
+
+    const initial_admission = try app.enqueuePreparedHumanReviewDraft(
+        allocator,
+        store,
+        session,
+        &initial,
+    );
+    session.commitDraft(
+        &initial,
+        initial_admission.accepted.operation_id,
+        initial_admission.accepted.superseded_operation_id,
+    );
+    app.pumpReviewStoreOperations(&ctx);
+
+    try session.editSummary(allocator, "second");
+    const pending_token = app.review_store_operations.queueToken(binding);
+    const pending_preparation = try session.prepareSave(allocator, pending_token, .dirty_only);
+    var pending = pending_preparation.ready;
+    defer pending.deinit();
+    const pending_admission = try app.enqueuePreparedHumanReviewDraft(
+        allocator,
+        store,
+        session,
+        &pending,
+    );
+    session.commitDraft(
+        &pending,
+        pending_admission.accepted.operation_id,
+        pending_admission.accepted.superseded_operation_id,
+    );
+
+    try session.editSummary(allocator, "third");
+    const replacement_generation = session.generation;
+    const replacement_token = app.review_store_operations.queueToken(binding);
+    const replacement_preparation = try session.prepareSave(
+        allocator,
+        replacement_token,
+        .dirty_only,
+    );
+    var replacement = replacement_preparation.ready;
+    defer replacement.deinit();
+    const replacement_queue = app.review_store_operations.queueToken(binding);
+    var replacement_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        app.enqueuePreparedHumanReviewDraft(
+            replacement_failing.allocator(),
+            store,
+            session,
+            &replacement,
+        ),
+    );
+    const queue_after_replacement_admission = app.review_store_operations.queueToken(binding);
+    try std.testing.expect(replacement_queue.eql(&queue_after_replacement_admission));
+    try std.testing.expectEqual(@as(usize, 2), session.operationCount());
+    try std.testing.expectEqual(@as(u64, 1), session.last_failure.?.expected_revision);
+    try std.testing.expectEqual(replacement_generation, session.last_failure.?.submitted_generation);
+
+    const replacement_admission = try app.enqueuePreparedHumanReviewDraft(
+        allocator,
+        store,
+        session,
+        &replacement,
+    );
+    session.commitDraft(
+        &replacement,
+        replacement_admission.accepted.operation_id,
+        replacement_admission.accepted.superseded_operation_id,
+    );
+
+    const result_token = app.review_store_operations.queueToken(binding);
+    const result_generation = session.generation;
+    var preparation_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        session.prepareResult(preparation_failing.allocator(), result_token, .needs_changes),
+    );
+    app.recordHumanReviewPreparationFailure(
+        &ctx,
+        session,
+        &result_token,
+        .result,
+        .needs_changes,
+        error.OutOfMemory,
+    );
+    const queue_after_result_preparation = app.review_store_operations.queueToken(binding);
+    try std.testing.expect(result_token.eql(&queue_after_result_preparation));
+    try std.testing.expectEqual(@as(usize, 2), session.operationCount());
+    try std.testing.expectEqual(@as(u64, 2), session.last_failure.?.expected_revision);
+    try std.testing.expectEqual(result_generation, session.last_failure.?.submitted_generation);
+    try std.testing.expectEqual(
+        committed_review.ReviewResultValue.needs_changes,
+        session.last_failure.?.decision.?,
+    );
+
+    var result = try session.prepareResult(allocator, result_token, .needs_changes);
+    defer result.deinit();
+    const result_queue = app.review_store_operations.queueToken(binding);
+    var result_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        app.enqueuePreparedHumanReviewResult(
+            result_failing.allocator(),
+            store,
+            session,
+            &result,
+        ),
+    );
+    const queue_after_result_admission = app.review_store_operations.queueToken(binding);
+    try std.testing.expect(result_queue.eql(&queue_after_result_admission));
+    try std.testing.expectEqual(@as(usize, 2), session.operationCount());
+    try std.testing.expectEqual(@as(u64, 2), session.last_failure.?.expected_revision);
+    try std.testing.expectEqual(result_generation, session.last_failure.?.submitted_generation);
+    try std.testing.expectEqual(
+        committed_review.ReviewResultValue.needs_changes,
+        session.last_failure.?.decision.?,
+    );
+
+    const tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), tasks.len);
+    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+}
+
+test "human review session App bridge keeps detached failure on original Run" {
+    const allocator = std.testing.allocator;
+    const binding_a = try humanReviewTestBinding(11);
+    const binding_b = try humanReviewTestBinding(12);
+    const findings_a = humanReviewTestFindings(binding_a);
+    const findings_b = humanReviewTestFindings(binding_b);
+    var app: App = .{
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
+        .allocator = allocator,
+    };
+    defer app.configured_review_store.?.deinit(allocator);
+    defer app.review_store_operations.deinit(allocator);
+    defer app.human_review_sessions.deinit();
+    app.human_review_sessions.current = try human_review_session_mod.Session.init(
+        allocator,
+        binding_a,
+        &findings_a,
+        null,
+        null,
+    );
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try app.human_review_sessions.currentSession().?.editSummary(allocator, "A recovery bytes");
+    const save = try app.saveHumanReviewSession(&ctx);
+    try std.testing.expect(save == .accepted);
+    var session_b = try human_review_session_mod.Session.init(
+        allocator,
+        binding_b,
+        &findings_b,
+        null,
+        null,
+    );
+    var install_b = try app.human_review_sessions.prepareInstall(&session_b);
+    defer install_b.deinit();
+    app.human_review_sessions.commitInstall(&install_b);
+    app.status.set("B status stays", .{});
+
+    const tasks = ctx.takePendingTasksWith();
+    const failed = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
+    try app.update(failed, &ctx);
+    try std.testing.expectEqualStrings("B status stays", app.status.text());
+    try std.testing.expect(app.human_review_sessions.currentSessionConst().?.binding.eql(binding_b));
+    try std.testing.expectEqual(@as(usize, 1), app.human_review_sessions.detached_len);
+    try std.testing.expectEqual(@as(usize, 1), app.human_review_sessions.detached[0].recoveryCount());
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        app.human_review_sessions.detached[0].last_failure.?.expected_revision,
+    );
+
+    var fresh_a = try human_review_session_mod.Session.init(
+        allocator,
+        binding_a,
+        &findings_a,
+        null,
+        null,
+    );
+    var reattach = try app.human_review_sessions.prepareInstall(&fresh_a);
+    defer reattach.deinit();
+    app.human_review_sessions.commitInstall(&reattach);
+    try std.testing.expect(app.human_review_sessions.currentSessionConst().?.binding.eql(binding_a));
+    try std.testing.expectEqual(human_review_session_mod.Lifecycle.failed, app.human_review_sessions.currentSessionConst().?.lifecycle());
+    try std.testing.expectEqualStrings(
+        "A recovery bytes",
+        app.human_review_sessions.currentSessionConst().?.workingSnapshot().?.summary.?,
+    );
+}
+
+test "human review session App mismatch cancels quit and requires exact reload" {
+    const allocator = std.testing.allocator;
+    const binding = try humanReviewTestBinding(13);
+    const findings = humanReviewTestFindings(binding);
+    var app: App = .{
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
+        .allocator = allocator,
+    };
+    defer app.configured_review_store.?.deinit(allocator);
+    defer app.review_store_operations.deinit(allocator);
+    defer app.human_review_sessions.deinit();
+    app.human_review_sessions.current = try human_review_session_mod.Session.init(
+        allocator,
+        binding,
+        &findings,
+        null,
+        null,
+    );
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try app.human_review_sessions.currentSession().?.editSummary(allocator, "unconfirmed");
+    const save = try app.saveHumanReviewSession(&ctx);
+    try app.update(.quit, &ctx);
+    try std.testing.expect(app.review_store_operations.isDraining());
+    const tasks = ctx.takePendingTasksWith();
+    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+    try app.update(.{ .review_store_operation_finished = .{
+        .operation_id = save.accepted,
+        .binding = binding,
+        .kind = .draft,
+        .result = .{ .draft = .{ .committed = .{
+            .revision = 9,
+            .canonical_bytes = try allocator.dupe(u8, "unexpected\n"),
+        } } },
+    } }, &ctx);
+    try std.testing.expect(!ctx.shouldQuit());
+    try std.testing.expect(!app.quit_after_store_drain);
+    try std.testing.expect(app.review_store_operations.admissionsOpen());
+    try std.testing.expectEqual(
+        human_review_session_mod.Reconciliation.reload_required,
+        app.human_review_sessions.currentSessionConst().?.reconciliation,
+    );
+    try std.testing.expectEqual(@as(?u64, 0), app.human_review_sessions.currentSessionConst().?.confirmedRevision());
+    try std.testing.expectEqual(@as(usize, 1), app.human_review_sessions.currentSessionConst().?.recoveryCount());
+}
+
+fn humanReviewTestBinding(suffix: u8) !review_store.ReviewRunBinding {
+    var repository_id = try committed_review.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
+    repository_id.bytes[15] = suffix;
+    var review_id = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
+    review_id.bytes[15] = suffix;
+    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    return .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = oid,
+            .head_oid = oid,
+            .diff_base_oid = oid,
+        },
+        .findings_digest = committed_review.Sha256Digest.hash(&.{suffix}),
+    };
+}
+
+fn humanReviewTestFindings(binding: review_store.ReviewRunBinding) committed_review.FindingSet {
+    return .{
+        .schema_version = committed_review.limits.schema_version,
+        .review_id = binding.review_id,
+        .created_at = "2026-08-27T00:00:00Z",
+        .timing = .{ .duration_ms = 1 },
+        .target = binding.target,
+        .producer = .{ .name = "test" },
+        .findings = &.{},
+    };
+}
+
+test "human review session App and Store keep an in-flight revert on one completed snapshot" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try HumanReviewStoreFixture.init(allocator, io, tmp.dir, "store");
+    defer fixture.deinit(allocator);
+
+    var seed_store = try review_store.ConfiguredStore.initConfigured(allocator, fixture.store_root);
+    var seeded = try review_store.saveDraft(allocator, io, &seed_store, .{
+        .binding = fixture.binding,
+        .expected_revision = 0,
+        .summary = "A",
+        .finding_dispositions = &.{},
+        .anchored_notes = &.{},
+    });
+    seed_store.deinit(allocator);
+    defer seeded.deinit(allocator);
+    try std.testing.expect(seeded == .committed);
+    var loaded = try committed_review.ReviewDraftState.parseStrict(
+        allocator,
+        seeded.committed.canonical_bytes,
+    );
+    defer loaded.deinit();
+
+    var app: App = .{
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(
+            allocator,
+            fixture.store_root,
+        ),
+        .allocator = allocator,
+    };
+    defer app.configured_review_store.?.deinit(allocator);
+    defer app.review_store_operations.deinit(allocator);
+    defer app.human_review_sessions.deinit();
+    app.human_review_sessions.current = try human_review_session_mod.Session.init(
+        allocator,
+        fixture.binding,
+        &fixture.findings,
+        &loaded.value,
+        null,
+    );
+    const session = app.human_review_sessions.currentSession().?;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try session.editSummary(allocator, "B");
+    const b_save = try app.saveHumanReviewSession(&ctx);
+    try std.testing.expect(b_save == .accepted);
+    try session.editSummary(allocator, "A");
+    const finalized = try app.finalizeHumanReviewSession(&ctx, .approved);
+    try std.testing.expect(finalized == .accepted);
+    try std.testing.expect(finalized.accepted.draft_operation_id != null);
+    try std.testing.expectEqual(@as(usize, 3), session.operationCount());
+
+    const b_tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), b_tasks.len);
+    const b_message = b_tasks[0].run(b_tasks[0].ctx, allocator, io);
+    try std.testing.expect(b_message == .review_store_operation_finished);
+    try std.testing.expect(b_message.review_store_operation_finished.result == .draft);
+    try std.testing.expect(b_message.review_store_operation_finished.result.draft == .committed);
+    var durable_b = try committed_review.ReviewDraftState.parseStrict(
+        allocator,
+        b_message.review_store_operation_finished.result.draft.committed.canonical_bytes,
+    );
+    defer durable_b.deinit();
+    try std.testing.expectEqualStrings("B", durable_b.value.summary.?);
+    try app.update(b_message, &ctx);
+    try std.testing.expectEqualStrings("A", session.workingSnapshot().?.summary.?);
+
+    const corrective_tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), corrective_tasks.len);
+    const corrective_message = corrective_tasks[0].run(corrective_tasks[0].ctx, allocator, io);
+    try std.testing.expect(corrective_message == .review_store_operation_finished);
+    try std.testing.expect(corrective_message.review_store_operation_finished.result == .draft);
+    try std.testing.expect(corrective_message.review_store_operation_finished.result.draft == .committed);
+    var durable_a = try committed_review.ReviewDraftState.parseStrict(
+        allocator,
+        corrective_message.review_store_operation_finished.result.draft.committed.canonical_bytes,
+    );
+    defer durable_a.deinit();
+    try std.testing.expectEqual(@as(u64, 3), durable_a.value.revision);
+    try std.testing.expectEqualStrings("A", durable_a.value.summary.?);
+    try app.update(corrective_message, &ctx);
+
+    const result_tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), result_tasks.len);
+    const result_message = result_tasks[0].run(result_tasks[0].ctx, allocator, io);
+    try std.testing.expect(result_message == .review_store_operation_finished);
+    try std.testing.expect(result_message.review_store_operation_finished.result == .result);
+    try std.testing.expect(result_message.review_store_operation_finished.result.result == .committed);
+    var durable_result = try committed_review.RevisionReviewResult.parseStrict(
+        allocator,
+        result_message.review_store_operation_finished.result.result.committed.canonical_bytes,
+    );
+    defer durable_result.deinit();
+    try std.testing.expectEqual(
+        @as(u64, 3),
+        result_message.review_store_operation_finished.result.result.committed.revision,
+    );
+    try std.testing.expectEqualStrings("A", durable_result.value.summary.?);
+    try app.update(result_message, &ctx);
+
+    try std.testing.expectEqual(human_review_session_mod.Lifecycle.completed, session.lifecycle());
+    try std.testing.expectEqualStrings(
+        durable_result.value.summary.?,
+        session.completedSnapshot().?.summary.?,
+    );
+    try std.testing.expect(!app.review_store_operations.hasWork());
+}
+
+const HumanReviewStoreFixture = struct {
+    store_root: [:0]u8,
+    binding: review_store.ReviewRunBinding,
+    findings: committed_review.FindingSet,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        parent: std.Io.Dir,
+        name: []const u8,
+    ) !HumanReviewStoreFixture {
+        const repository_id = try committed_review.ReviewRepositoryId.parse(
+            "123e4567-e89b-42d3-a456-426614174000",
+        );
+        const review_id = try committed_review.ReviewId.parse(
+            "223e4567-e89b-42d3-a456-426614174000",
+        );
+        const oid = try committed_review.ObjectId.parse(
+            .sha1,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        const review_target: committed_review.CommittedReviewTarget = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = oid,
+            .head_oid = oid,
+            .diff_base_oid = oid,
+        };
+        const findings: committed_review.FindingSet = .{
+            .schema_version = committed_review.limits.schema_version,
+            .review_id = review_id,
+            .created_at = "2026-08-28T00:00:00Z",
+            .timing = .{ .duration_ms = 1 },
+            .target = review_target,
+            .producer = .{ .name = "test" },
+            .findings = &.{},
+        };
+        const findings_bytes = try findings.writeCanonical(allocator);
+        defer allocator.free(findings_bytes);
+        const findings_digest = committed_review.Sha256Digest.hash(findings_bytes);
+        const manifest: committed_review.ReviewRunManifest = .{
+            .schema_version = committed_review.limits.schema_version,
+            .review_id = review_id,
+            .review_repository_id = repository_id,
+            .target = review_target,
+            .created_at = findings.created_at,
+            .display = null,
+            .finding_count = 0,
+            .producer = findings.producer,
+            .findings_digest = findings_digest,
+        };
+        const manifest_bytes = try manifest.writeCanonical(allocator);
+        defer allocator.free(manifest_bytes);
+
+        try parent.createDir(io, name, .fromMode(0o700));
+        var store = try parent.openDir(io, name, .{});
+        defer store.close(io);
+        try store.createDir(io, ".locks", .fromMode(0o700));
+        var locks = try store.openDir(io, ".locks", .{});
+        defer locks.close(io);
+        const repository_text = repository_id.canonical();
+        try locks.createDir(io, &repository_text, .fromMode(0o700));
+        try store.createDir(io, &repository_text, .fromMode(0o700));
+        var namespace = try store.openDir(io, &repository_text, .{});
+        defer namespace.close(io);
+        const review_text = review_id.canonical();
+        try namespace.createDir(io, &review_text, .fromMode(0o700));
+        var run = try namespace.openDir(io, &review_text, .{});
+        defer run.close(io);
+        try writeHumanReviewFixtureFile(io, run, "manifest.json", manifest_bytes);
+        try writeHumanReviewFixtureFile(io, run, "findings.json", findings_bytes);
+        try writeHumanReviewFixtureFile(
+            io,
+            store,
+            "registry.json",
+            "{\"schema_version\":1,\"bindings\":[{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/test/repository\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/test/repository\"}}]}\n",
+        );
+        return .{
+            .store_root = try parent.realPathFileAlloc(io, name, allocator),
+            .binding = .{
+                .review_repository_id = repository_id,
+                .review_id = review_id,
+                .target = review_target,
+                .findings_digest = findings_digest,
+            },
+            .findings = findings,
+        };
+    }
+
+    fn deinit(self: *HumanReviewStoreFixture, allocator: std.mem.Allocator) void {
+        allocator.free(self.store_root);
+        self.* = undefined;
+    }
+};
+
+fn writeHumanReviewFixtureFile(
+    io: std.Io,
+    directory: std.Io.Dir,
+    name: []const u8,
+    bytes: []const u8,
+) !void {
+    try directory.writeFile(io, .{
+        .sub_path = name,
+        .data = bytes,
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
 }
