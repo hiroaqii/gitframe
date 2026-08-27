@@ -19,6 +19,9 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "docs/ai-review-producer-v1.md",
+        "docs/ai-review-skill.md",
+        "skills/gitframe-ai-review",
         "src",
     },
 }

@@ -40,7 +40,7 @@ versions array is non-empty, positive, strictly increasing, and unique.
 Compatibility is exact name/version membership; GitFrame semver is diagnostic
 only and a future-only `[2]` does not satisfy a v1 requirement.
 
-The input-materialization release advertises exactly, in order:
+The installed producer release advertises exactly, in order:
 
 1. `ai-review.input@1`
 2. `ai-review.producer@1`
