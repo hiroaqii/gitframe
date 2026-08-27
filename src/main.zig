@@ -123,6 +123,7 @@ pub fn main(init: std.process.Init) !void {
 const HelperCommand = enum {
     review_capabilities,
     review_input,
+    review_producer,
     review_target,
     review_projection,
     review_store_prepare,
@@ -134,6 +135,7 @@ fn helperCommand(args: []const []const u8) ?HelperCommand {
     if (args.len < 2) return null;
     if (std.mem.eql(u8, args[1], "review-capabilities")) return .review_capabilities;
     if (std.mem.eql(u8, args[1], "review-input")) return .review_input;
+    if (std.mem.eql(u8, args[1], "review-producer")) return .review_producer;
     if (std.mem.eql(u8, args[1], "review-target")) return .review_target;
     if (std.mem.eql(u8, args[1], "review-projection")) return .review_projection;
     if (std.mem.eql(u8, args[1], "review-store-prepare")) return .review_store_prepare;
@@ -151,6 +153,14 @@ fn runHelper(command: HelperCommand, init: std.process.Init, arguments: []const 
             .stdout(),
         ),
         .review_input => gitframe.review_input_command.run(
+            init.gpa,
+            init.io,
+            init.environ_map,
+            arguments,
+            .stdin(),
+            .stdout(),
+        ),
+        .review_producer => gitframe.review_producer_command.run(
             init.gpa,
             init.io,
             init.environ_map,
@@ -425,6 +435,9 @@ test "helper first-token dispatch precedes global help scanning" {
     const input_args = [_][]const u8{ "gitframe", "review-input", "--help" };
     try std.testing.expectEqual(HelperCommand.review_input, helperCommand(&input_args).?);
     try std.testing.expect(wantsHelp(&input_args));
+    const producer_args = [_][]const u8{ "gitframe", "review-producer", "--help" };
+    try std.testing.expectEqual(HelperCommand.review_producer, helperCommand(&producer_args).?);
+    try std.testing.expect(wantsHelp(&producer_args));
     const projection_args = [_][]const u8{ "gitframe", "review-projection", "--help" };
     try std.testing.expectEqual(HelperCommand.review_projection, helperCommand(&projection_args).?);
     try std.testing.expect(wantsHelp(&projection_args));

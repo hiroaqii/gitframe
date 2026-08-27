@@ -32,7 +32,7 @@ does not open a repository, config, Store, TUI, or installation state. Success
 is one `CapabilityResponse`:
 
 ```json
-{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"ai-review.input","versions":[1]},{"name":"committed-review.artifact","versions":[1]},{"name":"committed-review.instructions","versions":[1]},{"name":"committed-review.projection","versions":[1]},{"name":"committed-review.target","versions":[1]},{"name":"review-store.prepare","versions":[1]},{"name":"review-store.publish","versions":[1]}]}
+{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"ai-review.input","versions":[1]},{"name":"ai-review.producer","versions":[1]},{"name":"committed-review.artifact","versions":[1]},{"name":"committed-review.instructions","versions":[1]},{"name":"committed-review.projection","versions":[1]},{"name":"committed-review.target","versions":[1]},{"name":"review-store.prepare","versions":[1]},{"name":"review-store.publish","versions":[1]}]}
 ```
 
 Capability names are strictly increasing by unsigned UTF-8 bytes. Each
@@ -43,15 +43,17 @@ only and a future-only `[2]` does not satisfy a v1 requirement.
 The input-materialization release advertises exactly, in order:
 
 1. `ai-review.input@1`
-2. `committed-review.artifact@1`
-3. `committed-review.instructions@1`
-4. `committed-review.projection@1`
-5. `committed-review.target@1`
-6. `review-store.prepare@1`
-7. `review-store.publish@1`
+2. `ai-review.producer@1`
+3. `committed-review.artifact@1`
+4. `committed-review.instructions@1`
+5. `committed-review.projection@1`
+6. `committed-review.target@1`
+7. `review-store.prepare@1`
+8. `review-store.publish@1`
 
-No candidate, producer, Store verification, or installation capability is
-advertised before its owning later slice exists and passes its contract tests.
+`ai-review.producer@1` names only the installed read-only artifact command
+below. No Skill installation, result-reader, retry, recovery, or provider
+capability is advertised.
 
 Any argument, including `--help`, returns exit 2 and a bounded canonical error
 line. Allocation/internal failure returns exit 70. Successful output is capped
@@ -339,3 +341,48 @@ Every exit-4 limit error appends `resource`, `observed`, and `allowed` after
 `code` and `message`. The resource token is fixed and path-free; bounded reads
 stop after observing `allowed + 1`, so diagnostics never need to echo a source
 or Store path or consume an unbounded payload merely to report its full size.
+
+## Installed artifact producer
+
+`gitframe review-producer artifacts` is the sole producer action. It reads one
+bounded frame and requires EOF immediately after the declared segments:
+
+```text
+<canonical JSON header><LF>
+<exact successful review-input bytes>
+<candidate-0001 bytes>...<candidate-NNNN bytes><EOF>
+```
+
+The header fields are `schema_version`, `repository`,
+`review_repository_id`, `review_id`, `producer`, optional `display`,
+`review_input_size`, and `candidate_sizes`, in that order. `repository` is the
+canonical unpadded-base64url absolute path object. There is one positive,
+bounded candidate size for every ordered review unit; their aggregate is at
+most 16 MiB. The header is at most 16 KiB and the review-input segment at most
+32 MiB. Unknown, duplicate, missing, reordered, short, extra, or over-limit
+content rejects the complete frame.
+
+The command strictly admits the successful review-input wrapper and each
+candidate payload, then re-emits and compares every nested plan summary and
+unit with its canonical writer. It resolves every derived code anchor against
+the exact committed target through read-only Git access. It never reads or
+mutates a Review Store, publishes a Run, creates a temporary workspace, or
+invokes a provider.
+
+Success is exactly:
+
+```text
+<canonical success JSON header><LF><manifest bytes><findings bytes><EOF>
+```
+
+The success-header fields are `schema_version`, `status`,
+`review_repository_id`, `review_id`, `target`, `producer`, `created_at`,
+`finding_count`, `manifest_sha256`, `findings_sha256`, `manifest_size`, and
+`findings_size`, in that order. The declared sizes and digests bind the exact
+canonical artifact segments.
+
+Every failure is one bounded canonical, path-free JSON line and emits no
+artifact bytes. Exit 64 covers invalid arguments, frames, candidates, or
+artifact input; exit 66 covers an unavailable repository or committed anchor;
+exit 70 covers clock, allocation, or internal failure. The command accepts no
+fallback flags, including `--help`.

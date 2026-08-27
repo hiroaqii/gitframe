@@ -18,6 +18,8 @@ pub const review_store_read_command = @import("ai_review/store_read_command.zig"
 pub const review_capabilities_command = @import("ai_review/capabilities_command.zig");
 /// Installed side-effect-free deterministic review input materializer.
 pub const review_input_command = @import("ai_review/input_command.zig");
+/// Installed read-only adapter for canonical AI review artifact construction.
+pub const review_producer_command = @import("ai_review/producer_command.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
 pub const theme = @import("theme");
@@ -104,6 +106,7 @@ test {
     _ = @import("ai_review.zig");
     _ = @import("ai_review/capabilities_command.zig");
     _ = @import("ai_review/input_command.zig");
+    _ = @import("ai_review/producer_command.zig");
     _ = @import("ai_review/store_service.zig");
     _ = @import("ai_review/store_read_command.zig");
     _ = @import("content_fingerprint.zig");

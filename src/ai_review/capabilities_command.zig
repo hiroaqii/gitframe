@@ -10,9 +10,10 @@ pub const gitframe_version = "0.0.0";
 
 const v1 = [_]u16{1};
 
-/// Exact cumulative list after deterministic input materialization exists.
+/// Exact cumulative list after installed artifact production exists.
 pub const capabilities = [_]protocol.Capability{
     .{ .name = "ai-review.input", .versions = &v1 },
+    .{ .name = "ai-review.producer", .versions = &v1 },
     .{ .name = "committed-review.artifact", .versions = &v1 },
     .{ .name = "committed-review.instructions", .versions = &v1 },
     .{ .name = "committed-review.projection", .versions = &v1 },
@@ -83,7 +84,7 @@ fn readFixture(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(limits.max_capabilities_bytes));
 }
 
-test "AI review protocol capabilities command emits the exact honest input-materialization list" {
+test "AI review protocol capabilities command emits the exact honest installed producer list" {
     var output = try executeAlloc(std.testing.allocator, &.{});
     defer output.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 0), output.exit_code);
@@ -97,6 +98,7 @@ test "AI review protocol capabilities command emits the exact honest input-mater
     defer parsed.deinit();
     try protocol.requireCapabilities(&parsed.value, &.{
         .{ .name = "ai-review.input", .version = 1 },
+        .{ .name = "ai-review.producer", .version = 1 },
         .{ .name = "committed-review.artifact", .version = 1 },
         .{ .name = "committed-review.instructions", .version = 1 },
         .{ .name = "committed-review.projection", .version = 1 },
@@ -104,7 +106,7 @@ test "AI review protocol capabilities command emits the exact honest input-mater
         .{ .name = "review-store.prepare", .version = 1 },
         .{ .name = "review-store.publish", .version = 1 },
     });
-    try std.testing.expectError(error.IncompatibleCapabilities, protocol.requireCapabilities(&parsed.value, &.{.{ .name = "ai-review.producer", .version = 1 }}));
+    try protocol.requireCapabilities(&parsed.value, &.{.{ .name = "ai-review.producer", .version = 1 }});
 }
 
 test "AI review protocol capabilities command rejects every argument without fallback" {
