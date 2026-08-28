@@ -20,6 +20,7 @@ const review_input = @import("input.zig");
 const review_navigation = @import("navigation.zig");
 const review_store = @import("../../../review_store.zig");
 const human_review_session = @import("../../human_review_session.zig");
+const committed_review = @import("../../../committed_review.zig");
 
 const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
 const BranchListTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
@@ -50,6 +51,7 @@ pub const ClipboardEffect = struct {
 pub const UpdateOutcome = struct {
     clipboard: ?ClipboardEffect = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    human_review_finalize: ?committed_review.ReviewResultValue = null,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -60,6 +62,12 @@ pub const UpdateOutcome = struct {
         const effect = self.clipboard;
         self.clipboard = null;
         return effect;
+    }
+
+    pub fn takeHumanReviewFinalize(self: *UpdateOutcome) ?committed_review.ReviewResultValue {
+        const decision = self.human_review_finalize;
+        self.human_review_finalize = null;
+        return decision;
     }
 };
 
@@ -158,8 +166,75 @@ pub const Controller = struct {
             .copy_current_line => return self.copyCurrentLine(),
             .copy_current_hunk => return try self.copyCurrentHunk(ctx.allocator()),
             .branch_switch_unavailable => self.page_state.status.set("branch switching is not available in Review", .{}),
+            .open_human_review_decision => try self.openHumanReviewDecision(ctx.allocator()),
+            .human_review_decision => |decision_msg| {
+                switch (decision_msg) {
+                    .close => {
+                        self.page_state.human_review_decision.close();
+                        return .{};
+                    },
+                    else => {},
+                }
+                const presentation = self.currentHumanReviewPresentation() orelse {
+                    self.page_state.human_review_decision.markBindingUnavailable();
+                    self.page_state.status.set("Pinned human review session is unavailable", .{});
+                    return .{};
+                };
+                const action = try self.page_state.human_review_decision.apply(
+                    decision_msg,
+                    presentation,
+                );
+                switch (action) {
+                    .none => {},
+                    .submit => |decision| {
+                        const session = self.sessions.currentSession() orelse {
+                            self.page_state.human_review_decision.markBindingUnavailable();
+                            return .{};
+                        };
+                        if (!session.binding.eql(presentation.binding)) {
+                            self.page_state.human_review_decision.markBindingUnavailable();
+                            return .{};
+                        }
+                        session.editSummary(
+                            ctx.allocator(),
+                            self.page_state.human_review_decision.submittedSummary(),
+                        ) catch |err| {
+                            self.page_state.human_review_decision.markFinalizeError(err);
+                            if (err == error.OutOfMemory) return err;
+                            return .{};
+                        };
+                        return .{ .human_review_finalize = decision };
+                    },
+                }
+            },
         }
         return .{};
+    }
+
+    pub fn currentHumanReviewPresentation(self: Controller) ?human_review_session.Presentation {
+        const pinned = self.page_state.pinnedAiConst() orelse return null;
+        const presentation = self.sessions.currentPresentation() orelse return null;
+        if (!pinned.binding().eql(presentation.binding)) return null;
+        return presentation;
+    }
+
+    fn openHumanReviewDecision(self: Controller, allocator: std.mem.Allocator) !void {
+        if (self.page_state.base_picker.open or self.page_state.ai_reviews.isOpen()) {
+            self.page_state.status.set("Close the Review picker before finalizing", .{});
+            return;
+        }
+        const presentation = self.currentHumanReviewPresentation() orelse {
+            self.page_state.status.set("Pinned human review session is unavailable", .{});
+            return;
+        };
+        self.page_state.human_review_decision.open(allocator, presentation) catch |err| {
+            if (err == error.SessionUnavailable) {
+                self.page_state.status.set("Pinned human review session has no review snapshot", .{});
+                return;
+            }
+            return err;
+        };
+        self.page_state.status.clearIfEphemeral();
     }
 
     pub fn refresh(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {

@@ -295,6 +295,20 @@ const Persisted = union(enum) {
     }
 };
 
+/// Borrowed read-only projection for page and renderer consumers. The Session
+/// remains the sole owner of snapshots, failures, operation state, revisions,
+/// decisions, and completion time; callers must not retain any pointer beyond
+/// the synchronous App update/render that produced this value.
+pub const Presentation = struct {
+    binding: review_store.ReviewRunBinding,
+    lifecycle: Lifecycle,
+    snapshot: ?*const DraftSnapshot,
+    decision: ?artifact.ReviewResultValue = null,
+    completed_at: ?*const [20]u8 = null,
+    failure: ?FailureReason = null,
+    reconciliation: Reconciliation,
+};
+
 const DraftOperation = struct { snapshot: DraftSnapshot };
 const ResultOperation = struct {
     decision: committed_review.ReviewResultValue,
@@ -478,6 +492,28 @@ pub const Session = struct {
         if (self.last_failure != null or self.reconciliation == .reload_required or
             self.recovery_len != 0) return .failed;
         return .editable;
+    }
+
+    pub fn presentation(self: *const Session) Presentation {
+        const common: Presentation = .{
+            .binding = self.binding,
+            .lifecycle = self.lifecycle(),
+            .snapshot = self.workingSnapshot(),
+            .failure = if (self.last_failure) |failure| failure.reason else null,
+            .reconciliation = self.reconciliation,
+        };
+        return switch (self.persisted) {
+            .completed => |*value| .{
+                .binding = common.binding,
+                .lifecycle = common.lifecycle,
+                .snapshot = &value.snapshot,
+                .decision = value.decision,
+                .completed_at = &value.completed_at,
+                .failure = common.failure,
+                .reconciliation = common.reconciliation,
+            },
+            .absent, .draft => common,
+        };
     }
 
     pub fn workingSnapshot(self: *const Session) ?*const DraftSnapshot {
@@ -1031,6 +1067,11 @@ pub const Owner = struct {
         return if (self.current) |*value| value else null;
     }
 
+    pub fn currentPresentation(self: *const Owner) ?Presentation {
+        const session = self.currentSessionConst() orelse return null;
+        return session.presentation();
+    }
+
     pub fn prepareInstall(
         self: *const Owner,
         candidate: *Session,
@@ -1256,7 +1297,7 @@ fn defaultSnapshotClean(snapshot: *const DraftSnapshot) bool {
     return true;
 }
 
-test "human review session owns defaults edits and a coalesced save chain" {
+test "human review result session owns defaults edits and a coalesced save chain" {
     const allocator = std.testing.allocator;
     const binding = try testBinding(1);
     const findings = [_]committed_review.Finding{
@@ -1337,7 +1378,7 @@ test "human review session owns defaults edits and a coalesced save chain" {
     try std.testing.expectEqual(@as(?u64, null), session.dirty_generation);
 }
 
-test "human review session revert during an accepted draft queues a corrective draft before result" {
+test "human review result session revert during an accepted draft queues a corrective draft before result" {
     const allocator = std.testing.allocator;
     const binding = try testBinding(14);
     const finding_set = testFindingSet(binding, &.{});
@@ -1416,7 +1457,7 @@ test "human review session revert during an accepted draft queues a corrective d
     try std.testing.expectEqualStrings("A", session.completedSnapshot().?.summary.?);
 }
 
-test "human review session finalization persists a complete initial draft then trusted result" {
+test "human review result session finalization persists a complete initial draft then trusted result" {
     const allocator = std.testing.allocator;
     const binding = try testBinding(2);
     const findings = [_]committed_review.Finding{testFinding("F-1", "one")};
@@ -1462,7 +1503,7 @@ test "human review session finalization persists a complete initial draft then t
     try std.testing.expect(session.workingSnapshot() == null);
 }
 
-test "human review session failures retain exact intents and known mismatches require reload" {
+test "human review result session failures retain exact intents and known mismatches require reload" {
     const allocator = std.testing.allocator;
     const binding = try testBinding(3);
     const finding_set = testFindingSet(binding, &.{});
@@ -1537,7 +1578,7 @@ test "human review session failures retain exact intents and known mismatches re
     );
 }
 
-test "human review session owner routes detached terminals without retargeting current Run" {
+test "human review result session owner routes detached terminals without retargeting current Run" {
     const allocator = std.testing.allocator;
     const binding_a = try testBinding(4);
     const binding_b = try testBinding(5);
@@ -1577,7 +1618,7 @@ test "human review session owner routes detached terminals without retargeting c
     );
 }
 
-test "human review session initialization and transition failures are atomic" {
+test "human review result session initialization and transition failures are atomic" {
     const allocator = std.testing.allocator;
     const binding = try testBinding(7);
     const duplicate_findings = [_]committed_review.Finding{
@@ -1620,7 +1661,7 @@ test "human review session initialization and transition failures are atomic" {
     );
 }
 
-test "human review session losslessly owns loaded draft notes and completed result precedence" {
+test "human review result session losslessly owns loaded draft notes and completed result precedence" {
     const allocator = std.testing.allocator;
     const binding = try testBinding(10);
     const findings = [_]committed_review.Finding{testFinding("F-1", "one")};
@@ -1667,6 +1708,9 @@ test "human review session losslessly owns loaded draft notes and completed resu
     try std.testing.expectEqualStrings("note", session.workingSnapshot().?.anchored_notes[0].body);
     try std.testing.expectEqualStrings("src/a.zig", session.workingSnapshot().?.anchored_notes[0].anchor.path_bytes);
 
+    summary[0] = 's';
+    note_body[0] = 'n';
+    path[0] = 's';
     const result: committed_review.RevisionReviewResult = .{
         .schema_version = committed_review.limits.schema_version,
         .review_id = binding.review_id,
@@ -1680,9 +1724,18 @@ test "human review session losslessly owns loaded draft notes and completed resu
     };
     var completed = try Session.init(allocator, binding, &finding_set, &draft, &result);
     defer completed.deinit();
+    summary[0] = 'X';
+    note_body[0] = 'X';
+    path[0] = 'X';
     try std.testing.expectEqual(Lifecycle.completed, completed.lifecycle());
     try std.testing.expect(completed.workingSnapshot() == null);
     try std.testing.expectEqual(@as(?u64, null), completed.confirmedRevision());
+    const presentation = completed.presentation();
+    try std.testing.expect(presentation.binding.eql(binding));
+    try std.testing.expectEqual(Lifecycle.completed, presentation.lifecycle);
+    try std.testing.expectEqual(committed_review.ReviewResultValue.approved, presentation.decision.?);
+    try std.testing.expectEqualStrings("2026-08-27T12:00:00Z", presentation.completed_at.?.*[0..]);
+    try std.testing.expectEqualStrings("saved", presentation.snapshot.?.summary.?);
 
     var zero_revision = draft;
     zero_revision.revision = 0;
@@ -1698,7 +1751,7 @@ test "human review session losslessly owns loaded draft notes and completed resu
     );
 }
 
-test "human review session owner refuses a sixty-fifth detached recovery atomically" {
+test "human review result session owner refuses a sixty-fifth detached recovery atomically" {
     const allocator = std.testing.allocator;
     var owner: Owner = .{};
     defer owner.deinit();

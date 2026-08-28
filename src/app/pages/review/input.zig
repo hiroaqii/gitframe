@@ -5,6 +5,7 @@ const chasen = @import("chasen");
 const keymap = @import("keymap");
 const diff_surface = @import("../../diff_surface.zig");
 const key_input = @import("../../key_input.zig");
+const human_review_decision = @import("human_review_decision.zig");
 
 pub const Msg = union(enum) {
     shared: diff_surface.message.Msg,
@@ -34,6 +35,8 @@ pub const Msg = union(enum) {
     copy_current_line,
     copy_current_hunk,
     branch_switch_unavailable,
+    open_human_review_decision,
+    human_review_decision: human_review_decision.Msg,
 };
 
 pub const Context = struct {
@@ -51,6 +54,7 @@ pub const Context = struct {
     ai_reviews_query_len: usize = 0,
     ai_reviews_loading: bool = false,
     pinned_ai: bool = false,
+    human_review: human_review_decision.InputContext = .{},
     selection_owner: diff_surface.input.SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
     keymap: keymap.Effective = .{},
@@ -68,10 +72,16 @@ pub const Context = struct {
 };
 
 pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
+    if (context.human_review.open) {
+        return .{ .human_review_decision = human_review_decision.pasteToMsg(context.human_review, text) orelse return null };
+    }
     return .{ .shared = diff_surface.input.pasteToMsg(context.shared(), text) orelse return null };
 }
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
+    if (context.human_review.open) {
+        return .{ .human_review_decision = human_review_decision.keyToMsg(context.human_review, key) orelse return null };
+    }
     if (context.ai_reviews_open) {
         if (key.matches(chasen.Key.escape, .{})) {
             if (context.ai_reviews_query_mode or context.ai_reviews_query_len > 0)
@@ -147,6 +157,10 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     // over the page-local picker mnemonic.
     if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action, context.focus == .diff);
 
+    if (context.pinned_ai and key_input.matchesShiftedAscii(key, 'e', 'E')) {
+        return .open_human_review_decision;
+    }
+
     if (context.focus == .diff and key_input.matchesShiftedAscii(key, 'v', 'V')) return shared(.begin_keyboard_line_selection);
 
     if (key_input.matchesShiftedAscii(key, 'j', 'J')) return if (context.focus == .diff) shared(.select_next_hunk) else null;
@@ -212,6 +226,43 @@ test "Review exposes display actions but no write actions" {
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'P' }) == null);
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'U' }) == null);
     try std.testing.expectEqual(Msg.branch_switch_unavailable, keyToMsg(.{}, .{ .codepoint = 'b' }).?);
+}
+
+test "human review result uses unclaimed uppercase E after public key precedence" {
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'E' }) == null);
+    const pinned: Context = .{ .pinned_ai = true };
+    try std.testing.expectEqual(
+        Msg.open_human_review_decision,
+        keyToMsg(pinned, .{ .codepoint = 'E' }).?,
+    );
+    try std.testing.expectEqual(
+        Msg.open_human_review_decision,
+        keyToMsg(pinned, .{ .codepoint = 'e', .mods = .{ .shift = true } }).?,
+    );
+    try std.testing.expect(keyToMsg(pinned, .{ .codepoint = 'e' }) == null);
+
+    var config: keymap.Config = .{};
+    config.set(.toggle_line_numbers, .{ .plain_codepoint = 'E' });
+    const claimed: Context = .{
+        .pinned_ai = true,
+        .keymap = keymap.Effective.fromConfig(config),
+    };
+    try std.testing.expectEqual(
+        Msg{ .shared = .toggle_line_numbers },
+        keyToMsg(claimed, .{ .codepoint = 'E' }).?,
+    );
+}
+
+test "human review result modal consumes close keys and summary paste" {
+    try std.testing.expectEqual(
+        Msg{ .human_review_decision = .close },
+        keyToMsg(.{ .human_review = .{ .open = true } }, .{ .codepoint = 'q' }).?,
+    );
+    try std.testing.expectEqual(
+        Msg{ .human_review_decision = .{ .summary_paste = "要約" } },
+        pasteToMsg(.{ .human_review = .{ .open = true, .focus = .summary, .summary_editing = true } }, "要約").?,
+    );
+    try std.testing.expect(pasteToMsg(.{ .human_review = .{ .open = true } }, "hidden") == null);
 }
 
 test "Review document navigation preserves Home End focus and custom bindings" {

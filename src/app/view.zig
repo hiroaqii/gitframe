@@ -156,7 +156,9 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     var body = surface.child(sections.body);
     try viewBody(app, &body);
 
-    if (!(app.active_page == .review and app.review.page.ai_reviews.isOpen())) {
+    if (!(app.active_page == .review and
+        (app.review.page.ai_reviews.isOpen() or app.review.page.human_review_decision.isOpen())))
+    {
         var footer = surface.child(sections.footer);
         viewFooter(app, &footer);
     }
@@ -193,6 +195,9 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     }
     if (app.active_page == .review and app.review.page.ai_reviews.isOpen()) {
         try review_view.viewAiReviews(app.review, surface);
+    }
+    if (app.active_page == .review and app.review.page.human_review_decision.isOpen()) {
+        try review_view.viewHumanReviewDecision(app.review, surface);
     }
 }
 
@@ -524,7 +529,8 @@ const FooterProjection = struct {
 /// drift away from the mouse hit target.
 pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     if (app.command_line != null) return null;
-    if (app.active_page == .review and app.review.page.ai_reviews.isOpen()) return null;
+    if (app.active_page == .review and
+        (app.review.page.ai_reviews.isOpen() or app.review.page.human_review_decision.isOpen())) return null;
     if (width == 0 or app.active_page == .config) return null;
     if (app.action.spinnerPresentation() != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
@@ -1746,8 +1752,19 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         },
         .review => {
             const footer = app.review.footer();
-            if (!footer.normal_action_hints_enabled or app.review.page.base_picker.open or app.review.page.ai_reviews.isOpen()) return result;
+            if (!footer.normal_action_hints_enabled or app.review.page.base_picker.open or
+                app.review.page.ai_reviews.isOpen() or app.review.page.human_review_decision.isOpen()) return result;
             result.append(ui.key_hint.item("a", "AI reviews"), .review_ai);
+            if (review_view.humanReviewActionLabel(app.review)) |label| {
+                appendUnclaimedFooterItem(
+                    app,
+                    &result,
+                    .{ .codepoint = 'E' },
+                    "E",
+                    label,
+                    .primary,
+                );
+            }
             appendUnclaimedFooterItem(
                 app,
                 &result,

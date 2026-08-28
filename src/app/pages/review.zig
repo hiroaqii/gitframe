@@ -22,6 +22,7 @@ const reviewed_files = @import("../../reviewed_files.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const review_store = @import("../../review_store.zig");
 const commit_time = @import("../branch_commit_time.zig");
+const human_review_decision = @import("review/human_review_decision.zig");
 
 pub const selection_source: diff_source.SourceMode = .{ .range = "review" };
 
@@ -948,6 +949,16 @@ pub const PinnedAiPresentation = struct {
     pub fn target(self: *const PinnedAiPresentation) committed_review.CommittedReviewTarget {
         return self.selection.artifacts.manifest.value.target;
     }
+
+    pub fn binding(self: *const PinnedAiPresentation) review_store.ReviewRunBinding {
+        const manifest = &self.selection.artifacts.manifest.value;
+        return .{
+            .review_repository_id = manifest.review_repository_id,
+            .review_id = manifest.review_id,
+            .target = manifest.target,
+            .findings_digest = manifest.findings_digest,
+        };
+    }
 };
 
 pub const Presentation = union(enum) {
@@ -999,6 +1010,7 @@ pub const ReviewPageState = struct {
     load_failure: ?[]u8 = null,
     base_picker: BasePickerState = .{},
     ai_reviews: AiReviewsPickerState = .{},
+    human_review_decision: human_review_decision.State = .{},
     refresh_generation: u64 = 0,
     deferred_load_apply: ?DeferredLoadApply = null,
     refresh_anchor: ?diff_surface.ReloadAnchor = null,
@@ -1012,6 +1024,7 @@ pub const ReviewPageState = struct {
 
     pub fn deactivate(self: *ReviewPageState) void {
         self.selection_owner = .none;
+        self.human_review_decision.close();
         self.activation.deactivate();
     }
 
@@ -1248,6 +1261,7 @@ pub const ReviewPageState = struct {
     }
 
     pub fn markNoRepository(self: *ReviewPageState, allocator: std.mem.Allocator) void {
+        self.human_review_decision.close();
         self.accepted_repository_identity = null;
         self.clearRetainedSelection(allocator);
         self.load.replaceEmpty(allocator, .no_repository);
@@ -1406,6 +1420,7 @@ pub const ReviewPageState = struct {
         root_identity: ?root_capability.Identity,
         bundle: *app_load.ReviewLoadedBundle,
     ) !void {
+        self.human_review_decision.close();
         try self.commitLoaded(allocator, repo_epoch, repo_root, root_identity, bundle);
     }
 
@@ -1417,6 +1432,7 @@ pub const ReviewPageState = struct {
         root_identity: ?root_capability.Identity,
         bundle: *app_load.PinnedReviewLoadedBundle,
     ) !void {
+        self.human_review_decision.close();
         const manifest = &bundle.selection.artifacts.manifest.value;
         const target = manifest.target;
         const pair_changed = if (self.presentation) |*current| !current.target().eql(&target) else true;
@@ -1571,6 +1587,7 @@ pub const ReviewPageState = struct {
         if (self.load_failure) |message| allocator.free(message);
         self.base_picker.deinit(allocator);
         self.ai_reviews.deinit(allocator);
+        self.human_review_decision.deinit();
         if (self.deferred_load_apply) |*deferred| deferred.deinit(allocator);
         self.* = .{};
     }

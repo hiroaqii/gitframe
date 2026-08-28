@@ -16,9 +16,12 @@ const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
+const human_review_session = @import("../../human_review_session.zig");
+const human_review_decision = @import("human_review_decision.zig");
 
 pub const Context = struct {
     page: *const review_page.ReviewPageState,
+    human_review: ?human_review_session.Presentation = null,
     palette: theme.Palette,
     repo_root: ?[]const u8,
     repo_epoch: u64,
@@ -40,6 +43,24 @@ pub const Context = struct {
         return result;
     }
 };
+
+pub fn humanReviewActionLabel(app: Context) ?[]const u8 {
+    if (app.page.human_review_decision.isOpen() or
+        app.page.base_picker.open or app.page.ai_reviews.isOpen()) return null;
+    const presentation = matchingHumanReviewPresentation(app) orelse return null;
+    return switch (presentation.lifecycle) {
+        .saving, .finalizing, .completed => "result",
+        .failed => if (presentation.reconciliation == .reload_required) "result" else "finalize",
+        .editable => "finalize",
+    };
+}
+
+fn matchingHumanReviewPresentation(app: Context) ?human_review_session.Presentation {
+    const pinned = app.page.pinnedAiConst() orelse return null;
+    const presentation = app.human_review orelse return null;
+    if (!pinned.binding().eql(presentation.binding)) return null;
+    return presentation;
+}
 
 /// Project one accepted BASE-HEAD pair. Identity and current target must both
 /// still match; otherwise a retained old BASE is never exposed in the header.
@@ -405,6 +426,262 @@ pub fn viewAiReviews(app: Context, surface: *chasen.Surface) !void {
 
     const footer = aiReviewsFooterText(picker);
     try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.palette.style(.accent));
+}
+
+pub fn viewHumanReviewDecision(app: Context, surface: *chasen.Surface) !void {
+    if (!app.page.human_review_decision.isOpen()) return;
+    const presentation = matchingHumanReviewPresentation(app);
+    const lifecycle = if (presentation) |value| value.lifecycle else null;
+    const completed = lifecycle != null and lifecycle.? == .completed;
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, 88),
+        .dialog_height = @min(surface.size().height, 24),
+        .title = if (completed) "Human review result" else "Finalize human review",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = app.palette.boldStyle(if (completed) .staged else .accent),
+        .border_style = app.palette.style(if (lifecycle != null and lifecycle.? == .failed) .danger else .accent),
+    };
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    var dialog = frame.dialogSurface();
+    dialog.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
+    frame.view();
+    var content = frame.contentSurface();
+    const size = content.size();
+    if (size.height == 0) return;
+    const footer_row = size.height - 1;
+    var row: u16 = 0;
+
+    if (presentation == null) {
+        if (row < footer_row) {
+            try draw.copyClippedTextAt(&content, 0, row, "Pinned review session is no longer available", app.palette.style(.danger));
+            row += 1;
+        }
+        if (row < footer_row) {
+            try draw.copyClippedTextAt(&content, 0, row, "Close this overlay and reopen the pinned Review.", app.palette.style(.muted));
+        }
+        try draw.copyClippedTextAt(&content, 0, footer_row, "Esc/q: close", app.palette.style(.accent));
+        return;
+    }
+    const current = presentation.?;
+    const snapshot = current.snapshot;
+    const read_only = current.lifecycle == .saving or
+        current.lifecycle == .finalizing or
+        current.lifecycle == .completed or
+        current.reconciliation == .reload_required;
+
+    if (row < footer_row) {
+        const status = try humanReviewLifecycleText(current, content.frameAllocator());
+        const tone: theme.Role = switch (current.lifecycle) {
+            .completed => .staged,
+            .failed => .danger,
+            .saving, .finalizing => .prompt,
+            .editable => .accent,
+        };
+        try draw.copyClippedTextAt(&content, 0, row, status, app.palette.boldStyle(tone));
+        row += 1;
+    }
+    if (row < footer_row) {
+        const review_id = current.binding.review_id.canonical();
+        const identity = try std.fmt.allocPrint(content.frameAllocator(), "Run {s}", .{&review_id});
+        try draw.copyClippedTextAt(&content, 0, row, identity, app.palette.style(.muted));
+        row += 1;
+    }
+
+    const displayed_decision = if (current.lifecycle == .completed)
+        current.decision
+    else
+        app.page.human_review_decision.selectedDecision();
+    const focus = app.page.human_review_decision.focus();
+    inline for ([_]struct {
+        value: committed_review.ReviewResultValue,
+        focus: human_review_decision.Focus,
+        label: []const u8,
+    }{
+        .{ .value = .approved, .focus = .approved, .label = "Approved" },
+        .{ .value = .needs_changes, .focus = .needs_changes, .label = "Needs changes" },
+        .{ .value = .canceled, .focus = .canceled, .label = "Canceled" },
+    }) |choice| {
+        if (row >= footer_row) break;
+        const selected = displayed_decision != null and displayed_decision.? == choice.value;
+        const focused = !read_only and focus != null and focus.? == choice.focus;
+        const line = try std.fmt.allocPrint(content.frameAllocator(), "{s} [{s}] {s}", .{
+            if (focused) ">" else " ",
+            if (selected) "x" else " ",
+            choice.label,
+        });
+        try draw.copyClippedTextAt(
+            &content,
+            0,
+            row,
+            line,
+            if (focused) app.palette.boldStyle(.accent) else if (selected) app.palette.style(.staged) else chasen.TextStyle{},
+        );
+        row += 1;
+    }
+
+    if (snapshot) |value| {
+        if (row < footer_row and size.height >= 11) {
+            const evidence = try std.fmt.allocPrint(content.frameAllocator(), "Evidence  {d} accepted finding{s}  {d} anchored note{s}", .{
+                acceptedDispositionCount(value.finding_dispositions),
+                if (acceptedDispositionCount(value.finding_dispositions) == 1) "" else "s",
+                value.anchored_notes.len,
+                if (value.anchored_notes.len == 1) "" else "s",
+            });
+            try draw.copyClippedTextAt(&content, 0, row, evidence, app.palette.style(.muted));
+            row += 1;
+        }
+    }
+
+    if (row < footer_row) {
+        const summary_focused = !read_only and focus != null and focus.? == .summary;
+        const summary_label = if (read_only)
+            "Summary (read-only)"
+        else if (summary_focused)
+            "> Summary"
+        else
+            "  Summary";
+        try draw.copyClippedTextAt(
+            &content,
+            0,
+            row,
+            summary_label,
+            if (summary_focused) app.palette.boldStyle(.accent) else app.palette.style(.prompt),
+        );
+        row += 1;
+    }
+
+    const diagnostic = humanReviewDiagnostic(app, current);
+    const submit_rows: u16 = if (read_only) 0 else 1;
+    const diagnostic_rows: u16 = @intFromBool(diagnostic.len != 0);
+    const summary_end = footer_row -| (submit_rows + diagnostic_rows);
+    if (row < summary_end) {
+        var summary_surface = content.child(.{
+            .col = 2,
+            .row = row,
+            .width = size.width -| 2,
+            .height = summary_end - row,
+        });
+        if (read_only) {
+            drawReadonlySummary(
+                &summary_surface,
+                if (snapshot) |value| value.summary orelse "(none)" else "(none)",
+                app.palette.style(.muted),
+            );
+        } else if (app.page.human_review_decision.summaryArea()) |area| {
+            area.view(&summary_surface, .{
+                .scroll_line = app.page.human_review_decision.summaryScrollLine(summary_surface.size().height),
+                .style = chasen.TextStyle{},
+                .placeholder_style = app.palette.style(.muted),
+                .show_cursor = app.page.human_review_decision.summaryEditing(),
+            });
+        }
+        row = summary_end;
+    }
+
+    if (submit_rows != 0 and row < footer_row) {
+        const submit_focused = focus != null and focus.? == .submit;
+        try draw.copyClippedTextAt(
+            &content,
+            0,
+            row,
+            if (submit_focused) "> [ Submit ]" else "  [ Submit ]",
+            if (submit_focused) app.palette.boldStyle(.accent) else app.palette.style(.muted),
+        );
+        row += 1;
+    }
+    if (diagnostic.len != 0 and row < footer_row) {
+        try draw.copyClippedTextAt(
+            &content,
+            0,
+            row,
+            diagnostic,
+            app.palette.style(if (current.lifecycle == .failed or
+                app.page.human_review_decision.feedback() != .submitting) .danger else .prompt),
+        );
+    }
+
+    const footer = switch (current.lifecycle) {
+        .completed => "Esc/q: close  E: reopen after close",
+        .saving, .finalizing => "Completing continues after Esc/q: close",
+        .failed => if (current.reconciliation == .reload_required)
+            "Esc/q: close  Reload the pinned Review before retry"
+        else if (focus != null and focus.? == .summary and app.page.human_review_decision.summaryEditing())
+            "Type: summary  Tab: Submit  Esc: leave summary"
+        else if (focus != null and focus.? == .summary)
+            "Enter: edit summary  Tab/j/k: move  Esc/q: close"
+        else
+            "Tab/j/k: move  Enter/Space: select  Esc/q: close",
+        .editable => if (focus != null and focus.? == .summary and app.page.human_review_decision.summaryEditing())
+            "Type: summary  Tab: Submit  Esc: leave summary"
+        else if (focus != null and focus.? == .summary)
+            "Enter: edit summary  Tab/j/k: move  Esc/q: close"
+        else
+            "Tab/j/k: move  Enter/Space: select  Esc/q: close",
+    };
+    try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.palette.style(.accent));
+}
+
+fn humanReviewLifecycleText(
+    presentation: human_review_session.Presentation,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    return switch (presentation.lifecycle) {
+        .editable => "Ready for human decision",
+        .saving => "Saving review draft...",
+        .finalizing => "Completing review result...",
+        .failed => if (presentation.reconciliation == .reload_required)
+            "Review state requires reload"
+        else
+            "Completion failed — review and retry",
+        .completed => if (presentation.completed_at) |completed_at|
+            try std.fmt.allocPrint(allocator, "Completed at {s}", .{completed_at.*[0..]})
+        else
+            "Completed",
+    };
+}
+
+fn humanReviewDiagnostic(
+    app: Context,
+    presentation: human_review_session.Presentation,
+) []const u8 {
+    switch (presentation.lifecycle) {
+        .saving, .finalizing, .completed => return "",
+        .editable, .failed => {},
+    }
+    if (presentation.lifecycle == .failed) {
+        if (presentation.reconciliation == .reload_required) return "Binding/revision drift detected; reload before retry";
+        if (presentation.failure) |reason| return switch (reason) {
+            .persistence => "Persistence failed; Submit retries the preserved snapshot",
+            .admission => "Store admission failed; Submit retries without losing the form",
+            .internal_mismatch => "Operation state changed unexpectedly; reload before retry",
+        };
+        return "Completion failed; the preserved form remains available for retry";
+    }
+    return app.page.human_review_decision.feedback().text();
+}
+
+fn acceptedDispositionCount(values: []const committed_review.FindingDisposition) usize {
+    var count: usize = 0;
+    for (values) |value| if (value.disposition == .accepted) {
+        count += 1;
+    };
+    return count;
+}
+
+fn drawReadonlySummary(surface: *chasen.Surface, text: []const u8, style: chasen.TextStyle) void {
+    const height = surface.size().height;
+    if (height == 0) return;
+    var row: u16 = 0;
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index <= text.len and row < height) : (index += 1) {
+        if (index == text.len or text[index] == '\n') {
+            draw.copyClippedTextAt(surface, 0, row, text[start..index], style) catch {};
+            row += 1;
+            start = index + 1;
+        }
+    }
 }
 
 const AiReviewsStateMessage = struct {

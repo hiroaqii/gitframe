@@ -431,6 +431,13 @@ pub const App = struct {
         };
     }
 
+    fn humanReviewPresentation(self: *const App) ?human_review_session_mod.Presentation {
+        const pinned = self.pages.review.pinnedAiConst() orelse return null;
+        const presentation = self.human_review_sessions.currentPresentation() orelse return null;
+        if (!pinned.binding().eql(presentation.binding)) return null;
+        return presentation;
+    }
+
     fn pageCoordinator(self: *App) page_coordinator.Controller {
         return .{
             .active_page = &self.active_page,
@@ -1319,6 +1326,17 @@ pub const App = struct {
                 .selection_generation = effect.selection_generation,
             });
         }
+        if (outcome.takeHumanReviewFinalize()) |decision| {
+            const finalized = self.finalizeHumanReviewSession(ctx, decision) catch |err| {
+                self.pages.review.human_review_decision.markFinalizeError(err);
+                if (err == error.OutOfMemory) return err;
+                return auto_scroll;
+            };
+            switch (finalized) {
+                .accepted => self.pages.review.human_review_decision.markFinalizeAccepted(),
+                .rejected => |reason| self.pages.review.human_review_decision.markFinalizeRejected(reason),
+            }
+        }
         return auto_scroll;
     }
 
@@ -1634,6 +1652,7 @@ pub const App = struct {
             .changes = self.changesViewContext(),
             .review = .{
                 .page = &self.pages.review,
+                .human_review = self.humanReviewPresentation(),
                 .palette = self.theme,
                 .repo_root = self.repoSessionView().activeRoot(),
                 .repo_epoch = self.repoSessionView().epoch(),
@@ -1767,6 +1786,9 @@ pub const App = struct {
                     .ai_reviews_query_len = self.pages.review.ai_reviews.query.len,
                     .ai_reviews_loading = self.pages.review.ai_reviews.loading(),
                     .pinned_ai = self.pages.review.isPinnedAi(),
+                    .human_review = self.pages.review.human_review_decision.inputContext(
+                        self.humanReviewPresentation(),
+                    ),
                     .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.review.selection_owner),
                     .retained_selection_action_available = review_body_view.retainedSelectionActionAvailable(),
                     .keymap = self.keymap,
@@ -2351,7 +2373,7 @@ test "review state persistence App quit drains accepted mutation and reopens aft
     try std.testing.expect(!app.quit_after_store_drain);
 }
 
-test "human review session App bridge tracks every accepted draft and result before pump" {
+test "human review result session App bridge tracks every accepted draft and result before pump" {
     const allocator = std.testing.allocator;
     const committed = @import("committed_review.zig");
     const repository_id = try committed.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
@@ -2459,7 +2481,7 @@ test "human review session App bridge tracks every accepted draft and result bef
     try std.testing.expect(!app.review_store_operations.hasWork());
 }
 
-test "human review session App admission faults preserve exact prepared intents" {
+test "human review result session App admission faults preserve exact prepared intents" {
     const allocator = std.testing.allocator;
     const binding = try humanReviewTestBinding(14);
     const findings = humanReviewTestFindings(binding);
@@ -2470,6 +2492,7 @@ test "human review session App admission faults preserve exact prepared intents"
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
+    defer app.pages.review.deinit(allocator);
     app.human_review_sessions.current = try human_review_session_mod.Session.init(
         allocator,
         binding,
@@ -2483,6 +2506,12 @@ test "human review session App admission faults preserve exact prepared intents"
     defer ctx.runtimeClearPendingEffectCopies();
 
     try session.editSummary(allocator, "first");
+    try app.pages.review.human_review_decision.open(allocator, session.presentation());
+    _ = try app.pages.review.human_review_decision.apply(.focus_next, session.presentation());
+    _ = try app.pages.review.human_review_decision.apply(.activate, session.presentation());
+    _ = try app.pages.review.human_review_decision.apply(.focus_next, session.presentation());
+    _ = try app.pages.review.human_review_decision.apply(.focus_next, session.presentation());
+    _ = try app.pages.review.human_review_decision.apply(.activate, session.presentation());
     const initial_generation = session.generation;
     const draft_preparation_token = app.review_store_operations.queueToken(binding);
     var draft_preparation_failing = std.testing.FailingAllocator.init(
@@ -2631,6 +2660,45 @@ test "human review session App admission faults preserve exact prepared intents"
         session.last_failure.?.decision.?,
     );
 
+    const saving_after_preparation_failure = session.presentation();
+    try std.testing.expectEqual(human_review_session_mod.Lifecycle.saving, saving_after_preparation_failure.lifecycle);
+    try std.testing.expect(app.pages.review.human_review_decision.inputContext(saving_after_preparation_failure).read_only);
+    const focus_before_blocked_input = app.pages.review.human_review_decision.focus();
+    const decision_before_blocked_input = app.pages.review.human_review_decision.selectedDecision();
+    const queue_before_blocked_input = app.review_store_operations.queueToken(binding);
+    const operation_count_before_blocked_input = session.operationCount();
+    const generation_before_blocked_input = session.generation;
+    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+        .{ .summary_paste = "must not replace accepted draft bytes" },
+        saving_after_preparation_failure,
+    )) == .none);
+    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+        .focus_next,
+        saving_after_preparation_failure,
+    )) == .none);
+    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+        .activate,
+        saving_after_preparation_failure,
+    )) == .none);
+    try std.testing.expectEqual(focus_before_blocked_input, app.pages.review.human_review_decision.focus());
+    try std.testing.expectEqual(decision_before_blocked_input, app.pages.review.human_review_decision.selectedDecision());
+    try std.testing.expectEqualStrings("first", app.pages.review.human_review_decision.submittedSummary().?);
+    try std.testing.expectEqualStrings("third", session.workingSnapshot().?.summary.?);
+    try std.testing.expectEqual(generation_before_blocked_input, session.generation);
+    try std.testing.expectEqual(operation_count_before_blocked_input, session.operationCount());
+    const queue_after_blocked_input = app.review_store_operations.queueToken(binding);
+    try std.testing.expect(queue_before_blocked_input.eql(&queue_after_blocked_input));
+    app.pages.review.human_review_decision.close();
+    try std.testing.expect(!app.pages.review.human_review_decision.isOpen());
+    try app.pages.review.human_review_decision.open(allocator, saving_after_preparation_failure);
+    try std.testing.expect(app.pages.review.human_review_decision.inputContext(saving_after_preparation_failure).read_only);
+    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+        .activate,
+        saving_after_preparation_failure,
+    )) == .none);
+    try std.testing.expect(app.pages.review.human_review_decision.selectedDecision() == null);
+    app.pages.review.human_review_decision.close();
+
     var result = try session.prepareResult(allocator, result_token, .needs_changes);
     defer result.deinit();
     const result_queue = app.review_store_operations.queueToken(binding);
@@ -2654,13 +2722,27 @@ test "human review session App admission faults preserve exact prepared intents"
         session.last_failure.?.decision.?,
     );
 
+    const saving_after_admission_failure = session.presentation();
+    try std.testing.expectEqual(human_review_session_mod.Lifecycle.saving, saving_after_admission_failure.lifecycle);
+    const queue_before_reopen = app.review_store_operations.queueToken(binding);
+    try app.pages.review.human_review_decision.open(allocator, saving_after_admission_failure);
+    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+        .activate,
+        saving_after_admission_failure,
+    )) == .none);
+    try std.testing.expectEqualStrings("third", app.pages.review.human_review_decision.submittedSummary().?);
+    try std.testing.expect(app.pages.review.human_review_decision.selectedDecision() == null);
+    app.pages.review.human_review_decision.close();
+    const queue_after_reopen = app.review_store_operations.queueToken(binding);
+    try std.testing.expect(queue_before_reopen.eql(&queue_after_reopen));
+
     const tasks = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), tasks.len);
     var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
     abandoned.deinitUndelivered(allocator);
 }
 
-test "human review session App bridge keeps detached failure on original Run" {
+test "human review result session App bridge keeps detached failure on original Run" {
     const allocator = std.testing.allocator;
     const binding_a = try humanReviewTestBinding(11);
     const binding_b = try humanReviewTestBinding(12);
@@ -2728,7 +2810,7 @@ test "human review session App bridge keeps detached failure on original Run" {
     );
 }
 
-test "human review session App mismatch cancels quit and requires exact reload" {
+test "human review result session App mismatch cancels quit and requires exact reload" {
     const allocator = std.testing.allocator;
     const binding = try humanReviewTestBinding(13);
     const findings = humanReviewTestFindings(binding);
@@ -2808,7 +2890,7 @@ fn humanReviewTestFindings(binding: review_store.ReviewRunBinding) committed_rev
     };
 }
 
-test "human review session App and Store keep an in-flight revert on one completed snapshot" {
+test "human review result session App and Store keep an in-flight revert on one completed snapshot" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;

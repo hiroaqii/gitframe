@@ -7,6 +7,8 @@
 const std = @import("std");
 const anchor_mod = @import("anchor.zig");
 const identity = @import("identity.zig");
+const limits = @import("limits.zig");
+const strict_json = @import("strict_json.zig");
 const target_mod = @import("target.zig");
 
 /// Bounded identifier whose namespace is one `ReviewId`, not a repository.
@@ -191,6 +193,29 @@ pub const ReviewResultValue = enum {
     canceled,
 };
 
+/// Validate one present human summary with the same byte and control policy
+/// used by canonical draft/result parsing and writing. Empty editor contents
+/// are represented as an absent optional value and therefore are not admitted
+/// by this present-value helper.
+pub fn validateHumanSummaryText(text: []const u8) strict_json.ParseError!void {
+    return strict_json.validateText(text, limits.max_body_bytes, true);
+}
+
+/// Shared admission predicate for an explicit `needs_changes` decision.
+/// Producer severity and unreviewed findings never imply a human decision;
+/// evidence must be authored/preserved in the exact submitted snapshot.
+pub fn hasNeedsChangesEvidence(
+    summary: ?[]const u8,
+    dispositions: []const FindingDisposition,
+    notes: []const AnchoredNote,
+) bool {
+    if (summary != null or notes.len != 0) return true;
+    for (dispositions) |disposition| {
+        if (disposition.disposition == .accepted) return true;
+    }
+    return false;
+}
+
 /// Human-authored note with its own content-authoritative anchor.
 pub const AnchoredNote = struct {
     anchor: anchor_mod.CodeAnchor,
@@ -289,6 +314,32 @@ test "finding IDs remain scoped values instead of review identities" {
     try std.testing.expect(a.eql(a));
     try std.testing.expect(!a.eql(b));
     try testReviewRunStateAdmission();
+}
+
+test "human review result evidence and summary validation share artifact policy" {
+    try validateHumanSummaryText("要修正\nsecond line");
+    try std.testing.expectError(error.InvalidValue, validateHumanSummaryText("escape\x1b"));
+    try std.testing.expect(!hasNeedsChangesEvidence(null, &.{}, &.{}));
+    try std.testing.expect(hasNeedsChangesEvidence("summary", &.{}, &.{}));
+
+    const dispositions = [_]FindingDisposition{.{
+        .finding_id = .{ .bytes = "F-1" },
+        .disposition = .accepted,
+    }};
+    try std.testing.expect(hasNeedsChangesEvidence(null, &dispositions, &.{}));
+
+    const notes = [_]AnchoredNote{.{
+        .anchor = .{
+            .path_bytes = "src/main.zig",
+            .side = .after,
+            .start_line = 1,
+            .end_line = 1,
+            .content_digest = identity.Sha256Digest.hash("line\n"),
+        },
+        .body = "human note",
+        .related_finding_ids = &.{},
+    }};
+    try std.testing.expect(hasNeedsChangesEvidence(null, &.{}, &notes));
 }
 
 fn testReviewRunStateAdmission() !void {

@@ -111,6 +111,10 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     else
         .owned_noop };
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
+    if (context.active_page == .review and context.review.human_review.open) {
+        const review_msg = review_input.pasteToMsg(context.review, text) orelse return null;
+        return .{ .review = review_msg };
+    }
     // Review base search v1 is key-event-only. The modal owns this event even
     // if an underlying diff/file search flag is retained, so pasted bytes can
     // never leak through to that hidden input.
@@ -139,6 +143,10 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.command_line_active) return .{ .command_line = commandLineKeyToMsg(key) };
+    if (context.active_page == .review and context.review.human_review.open) {
+        const review_msg = review_input.keyToMsg(context.review, key) orelse return null;
+        return .{ .review = review_msg };
+    }
     if (context.remote_action_cancelable and key.matches(chasen.Key.escape, .{}))
         return app_message.Msg.cancel_remote_action;
     if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
@@ -150,7 +158,8 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         return .{ .repository = repository_msg };
     }
     if (context.active_page == .review and
-        (context.review.search_mode or context.review.file_search_mode or context.review.base_picker_open or context.review.ai_reviews_open))
+        (context.review.search_mode or context.review.file_search_mode or context.review.base_picker_open or
+            context.review.ai_reviews_open or context.review.human_review.open))
     {
         const review_msg = review_input.keyToMsg(context.review, key) orelse return null;
         return .{ .review = review_msg };
@@ -461,7 +470,7 @@ fn expectMsg(expected: app_message.Msg, actual: app_message.Msg) !void {
     try std.testing.expectEqual(expected, actual);
 }
 
-test "normal page keys map after text and overlay precedence" {
+test "human review result modal precedes normal root page and remote-cancel routes" {
     try expectMsg(.{ .switch_page = .changes }, keyToMsg(.{}, .{ .codepoint = '1' }).?);
     try expectMsg(.{ .switch_page = .config }, keyToMsg(.{}, .{ .codepoint = '4' }).?);
     try std.testing.expectEqual(changesMsg(.{ .search_insert = '2' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, .{ .codepoint = '2' }).?);
@@ -474,6 +483,30 @@ test "normal page keys map after text and overlay precedence" {
     const remapped = keymap.Effective.fromConfig(config);
     try expectMsg(.{ .switch_page = .repository }, keyToMsg(.{ .keymap = remapped }, .{ .codepoint = 'w' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .keymap = remapped }, .{ .codepoint = '2' }));
+
+    const modal: KeyContext = .{
+        .active_page = .review,
+        .remote_action_cancelable = true,
+        .review = .{ .human_review = .{ .open = true } },
+    };
+    try expectMsg(
+        .{ .review = .{ .human_review_decision = .close } },
+        keyToMsg(modal, .{ .codepoint = chasen.Key.escape }).?,
+    );
+    try expectMsg(
+        .{ .review = .{ .human_review_decision = .close } },
+        keyToMsg(modal, .{ .codepoint = 'q' }).?,
+    );
+    try std.testing.expect(keyToMsg(modal, .{ .codepoint = '1' }) == null);
+    try std.testing.expect(pasteToMsg(modal, "underlying diff") == null);
+
+    var summary_modal = modal;
+    summary_modal.review.human_review.focus = .summary;
+    summary_modal.review.human_review.summary_editing = true;
+    try expectMsg(
+        .{ .review = .{ .human_review_decision = .{ .summary_paste = "人の要約" } } },
+        pasteToMsg(summary_modal, "人の要約").?,
+    );
 }
 
 test "command line owns key and paste input before every normal route" {

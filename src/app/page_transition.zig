@@ -27,6 +27,7 @@ pub const Blocker = enum {
     branch_switch,
     review_base_picker,
     review_ai_picker,
+    review_human_decision,
     push_error,
     git_action,
     foreground_command,
@@ -52,6 +53,7 @@ pub const Blocker = enum {
             .branch_switch => "finish branch switch before switching pages",
             .review_base_picker => "close Review base picker before switching pages",
             .review_ai_picker => "close Reviews picker before switching pages",
+            .review_human_decision => "close Review finalization before switching pages",
             .push_error => "close push error before switching pages",
             .git_action => "finish current git action before switching pages",
             .foreground_command => "finish foreground command before switching pages",
@@ -79,6 +81,7 @@ pub const Snapshot = struct {
     branch_switch: bool = false,
     review_base_picker: bool = false,
     review_ai_picker: bool = false,
+    review_human_decision: bool = false,
     push_error: bool = false,
     git_action: bool = false,
     foreground_command: bool = false,
@@ -103,6 +106,7 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.branch_switch) return .{ .blocked = .branch_switch };
     if (snapshot.review_base_picker) return .{ .blocked = .review_base_picker };
     if (snapshot.review_ai_picker) return .{ .blocked = .review_ai_picker };
+    if (snapshot.review_human_decision) return .{ .blocked = .review_human_decision };
     if (snapshot.push_error) return .{ .blocked = .push_error };
     if (snapshot.changes_search) return .{ .blocked = .changes_search };
     if (snapshot.changes_file_search) return .{ .blocked = .changes_file_search };
@@ -159,7 +163,7 @@ test "repository selection transition blocks every page switch" {
     );
 }
 
-test "Changes Repository transitions reject every blocker in both directions" {
+test "human review result and all shell blockers reject Changes Repository transitions in both directions" {
     const cases = [_]struct {
         blocker: Blocker,
         snapshot: Snapshot,
@@ -182,6 +186,7 @@ test "Changes Repository transitions reject every blocker in both directions" {
         .{ .blocker = .branch_switch, .snapshot = .{ .branch_switch = true } },
         .{ .blocker = .review_base_picker, .snapshot = .{ .review_base_picker = true } },
         .{ .blocker = .review_ai_picker, .snapshot = .{ .review_ai_picker = true } },
+        .{ .blocker = .review_human_decision, .snapshot = .{ .review_human_decision = true } },
         .{ .blocker = .push_error, .snapshot = .{ .push_error = true } },
         .{ .blocker = .git_action, .snapshot = .{ .git_action = true } },
         .{ .blocker = .foreground_command, .snapshot = .{ .foreground_command = true } },

@@ -117,6 +117,7 @@ pub const View = struct {
 
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
         if (self.command_line_active) return null;
+        if (self.active_page == .review and self.review.key.human_review.open) return null;
         if (self.activeDiffSelectionOwner()) |selection| {
             if (selection.active()) switch (selection) {
                 .changes => switch (mouse.type) {
@@ -400,7 +401,7 @@ fn applySignedScroll(current: usize, delta: isize) usize {
     return current +| @as(usize, @intCast(delta));
 }
 
-test "Repository Help controller bounds row and page scrolling" {
+test "human review result modal blocks mouse routing while Repository Help scrolling stays bounded" {
     const size: chasen.Size = .{ .width = 80, .height = 12 };
     const visible_rows: usize = app_view.helpVisibleRows(size, .repository);
     const max_scroll = app_view.helpMaxScroll(size, .repository);
@@ -426,4 +427,48 @@ test "Repository Help controller bounds row and page scrolling" {
     try std.testing.expectEqual(max_scroll -| visible_rows, overlay.help_scroll);
     controller.scrollHelp(-std.math.maxInt(isize));
     try std.testing.expectEqual(@as(usize, 0), overlay.help_scroll);
+
+    overlay.close();
+    var selection_owner: diff_selection.Owner = .none;
+    var repository_state: repository_page.RepositoryPageState = .{};
+    const modal_view: View = .{
+        .active_page = .review,
+        .changes = .{
+            .key = .{},
+            .selection_owner = &selection_owner,
+            .loaded = null,
+            .selected_node = 0,
+            .sidebar_hidden = false,
+            .sidebar_width = null,
+        },
+        .review = .{
+            .key = .{ .human_review = .{ .open = true } },
+            .selection_owner = &selection_owner,
+            .loaded = null,
+            .selected_node = 0,
+            .sidebar_hidden = false,
+            .sidebar_width = null,
+        },
+        .repository = .{ .key = .{}, .page_state = &repository_state },
+        .commit_panel_mode = false,
+        .repo_picker_mode = false,
+        .repo_picker_input_mode = .list,
+        .keymap = .{},
+        .overlay = &overlay,
+        .layout = app_shell_layout.compute(.{ .width = 80, .height = 24 }, .{ .page_bar_visible = true }),
+    };
+    try std.testing.expect(modal_view.handleEvent(.{ .mouse = .{
+        .col = 2,
+        .row = 2,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } }) == null);
+    try std.testing.expect(modal_view.handleEvent(.{ .mouse = .{
+        .col = 2,
+        .row = 2,
+        .button = .wheel_down,
+        .mods = .{},
+        .type = .press,
+    } }) == null);
 }

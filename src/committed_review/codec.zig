@@ -239,7 +239,7 @@ fn parseDraftValue(parser: *strict.Parser) ParseError!artifact.ReviewDraftState 
         } else if (std.mem.eql(u8, key, "summary")) {
             try strict.markSeen(&seen, 5);
             const value = try parser.string();
-            try strict.validateText(value, limits.max_body_bytes, true);
+            try artifact.validateHumanSummaryText(value);
             summary = value;
         } else if (std.mem.eql(u8, key, "finding_dispositions")) {
             try strict.markSeen(&seen, 6);
@@ -305,7 +305,7 @@ fn parseResultValue(parser: *strict.Parser) ParseError!artifact.RevisionReviewRe
         } else if (std.mem.eql(u8, key, "summary")) {
             try strict.markSeen(&seen, 6);
             const value = try parser.string();
-            try strict.validateText(value, limits.max_body_bytes, true);
+            try artifact.validateHumanSummaryText(value);
             summary = value;
         } else if (std.mem.eql(u8, key, "finding_dispositions")) {
             try strict.markSeen(&seen, 7);
@@ -699,6 +699,7 @@ pub const ValidationError = error{
     MissingFindingId,
     DuplicateRelatedFindingId,
     RelatedFindingIdNotFound,
+    InvalidSummary,
     NeedsChangesEvidenceMissing,
     SummarySnapshotMismatch,
     DispositionSnapshotMismatch,
@@ -738,6 +739,8 @@ pub fn validateDraftAgainst(
         finding_set,
         findings_digest,
     );
+    if (draft.summary) |summary| artifact.validateHumanSummaryText(summary) catch
+        return error.InvalidSummary;
     try validateDispositionSnapshot(draft.finding_dispositions, finding_set);
     try validateAnchoredNotesAgainst(draft.anchored_notes, finding_set);
 }
@@ -756,12 +759,16 @@ pub fn validateResultAgainst(
         finding_set,
         findings_digest,
     );
+    if (result.summary) |summary| artifact.validateHumanSummaryText(summary) catch
+        return error.InvalidSummary;
     try validateDispositionSnapshot(result.finding_dispositions, finding_set);
     try validateAnchoredNotesAgainst(result.anchored_notes, finding_set);
     if (result.result == .needs_changes and
-        result.summary == null and
-        result.anchored_notes.len == 0 and
-        !hasAcceptedFinding(result.finding_dispositions))
+        !artifact.hasNeedsChangesEvidence(
+            result.summary,
+            result.finding_dispositions,
+            result.anchored_notes,
+        ))
     {
         return error.NeedsChangesEvidenceMissing;
     }
@@ -836,11 +843,6 @@ fn validateDispositionSnapshot(
         }
         if (!found) return error.MissingFindingId;
     }
-}
-
-fn hasAcceptedFinding(dispositions: []const artifact.FindingDisposition) bool {
-    for (dispositions) |disposition| if (disposition.disposition == .accepted) return true;
-    return false;
 }
 
 fn optionalTextEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -981,7 +983,7 @@ fn validateDraftValue(value: *const artifact.ReviewDraftState) ParseError!void {
     try validateReviewId(value.review_id);
     try validateTarget(&value.target);
     if (value.revision == 0) return error.InvalidValue;
-    if (value.summary) |summary| try strict.validateText(summary, limits.max_body_bytes, true);
+    if (value.summary) |summary| try artifact.validateHumanSummaryText(summary);
     try validateDispositionsStandalone(value.finding_dispositions);
     try validateAnchoredNotesStandalone(value.anchored_notes);
 }
@@ -991,12 +993,15 @@ fn validateResultValue(value: *const artifact.RevisionReviewResult) ParseError!v
     try validateReviewId(value.review_id);
     try validateTarget(&value.target);
     try strict.validateTimestamp(value.completed_at);
-    if (value.summary) |summary| try strict.validateText(summary, limits.max_body_bytes, true);
+    if (value.summary) |summary| try artifact.validateHumanSummaryText(summary);
     try validateDispositionsStandalone(value.finding_dispositions);
     try validateAnchoredNotesStandalone(value.anchored_notes);
     if (value.result == .needs_changes and
-        value.summary == null and value.anchored_notes.len == 0 and
-        !hasAcceptedFinding(value.finding_dispositions))
+        !artifact.hasNeedsChangesEvidence(
+            value.summary,
+            value.finding_dispositions,
+            value.anchored_notes,
+        ))
     {
         return error.InvalidValue;
     }

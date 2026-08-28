@@ -19,6 +19,8 @@ const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const review_page = @import("../review.zig");
 const review_coordinator = @import("coordinator.zig");
+const review_view = @import("view.zig");
+const human_review_decision = @import("human_review_decision.zig");
 const human_review_session = @import("../../human_review_session.zig");
 
 const ReviewLoadFinished = app_load.ReviewLoadFinished;
@@ -186,7 +188,7 @@ test "AI Reviews picker requests return to the event loop before captured worker
     try std.testing.expect(app.pages.review.isPinnedAi());
 }
 
-test "AI Reviews picker pinned acceptance retires in-flight and deferred ordinary Review refreshes" {
+test "human review result pinned acceptance retires in-flight and deferred ordinary Review refreshes" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -745,6 +747,106 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     try std.testing.expect(owned_session.binding.review_id.eql(review_id));
     try std.testing.expect(owned_session.binding.review_repository_id.eql(repository_id));
     try std.testing.expectEqual(human_review_session.Lifecycle.editable, owned_session.lifecycle());
+    const editable_presentation = app.sessions.currentPresentation().?;
+    try expectHumanReviewActionLabels(
+        &app.pages.review,
+        editable_presentation,
+        repo_root,
+        app.repo_session.repo_epoch,
+        app.repo_session.repo_state.root.?.identity,
+    );
+
+    try std.testing.expect((try updateHumanReviewDecision(
+        &app,
+        &ctx,
+        .open_human_review_decision,
+    )) == null);
+    try std.testing.expect(app.pages.review.human_review_decision.isOpen());
+    try std.testing.expect(app.pages.review.human_review_decision.selectedDecision() == null);
+    try expectHumanReviewDecisionSurfaces(
+        &app.pages.review,
+        editable_presentation,
+        repo_root,
+        app.repo_session.repo_epoch,
+        app.repo_session.repo_state.root.?.identity,
+    );
+
+    {
+        var missing_session = app.sessions.current.?;
+        app.sessions.current = null;
+        defer if (app.sessions.current == null) {
+            app.sessions.current = missing_session;
+            missing_session = undefined;
+        };
+        try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .focus_next })) == null);
+        try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .{
+            .summary_paste = "must not escape to the background",
+        } })) == null);
+        try std.testing.expect(app.pages.review.human_review_decision.isOpen());
+        try std.testing.expectEqual(
+            human_review_decision.Feedback.binding_unavailable,
+            app.pages.review.human_review_decision.feedback(),
+        );
+        try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .close })) == null);
+        try std.testing.expect(!app.pages.review.human_review_decision.isOpen());
+        app.sessions.current = missing_session;
+        missing_session = undefined;
+    }
+
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .open_human_review_decision)) == null);
+    {
+        const original_review_id = app.sessions.current.?.binding.review_id;
+        app.sessions.current.?.binding.review_id.bytes[15] +%= 1;
+        defer app.sessions.current.?.binding.review_id = original_review_id;
+        try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .activate })) == null);
+        try std.testing.expect(app.pages.review.human_review_decision.isOpen());
+        try std.testing.expectEqual(
+            human_review_decision.Feedback.binding_unavailable,
+            app.pages.review.human_review_decision.feedback(),
+        );
+        try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .close })) == null);
+        try std.testing.expect(!app.pages.review.human_review_decision.isOpen());
+    }
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .open_human_review_decision)) == null);
+
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .focus_next })) == null);
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .activate })) == null);
+    try std.testing.expectEqual(
+        committed_review.ReviewResultValue.needs_changes,
+        app.pages.review.human_review_decision.selectedDecision().?,
+    );
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .focus_previous })) == null);
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .focus_previous })) == null);
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .activate })) == null);
+    try std.testing.expectEqual(
+        human_review_decision.Feedback.needs_changes_evidence_required,
+        app.pages.review.human_review_decision.feedback(),
+    );
+    try std.testing.expectEqual(human_review_decision.Focus.summary, app.pages.review.human_review_decision.focus().?);
+    try expectHumanReviewLifecycleSurface(
+        &app.pages.review,
+        editable_presentation,
+        repo_root,
+        app.repo_session.repo_epoch,
+        app.repo_session.repo_state.root.?.identity,
+        .{ .width = 56, .height = 16 },
+        &.{ "[x] Needs changes", "Needs changes requires", "> Summary" },
+        &.{},
+    );
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .{
+        .summary_paste = "Evidence from the human reviewer",
+    } })) == null);
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .focus_next })) == null);
+    try std.testing.expectEqual(
+        committed_review.ReviewResultValue.needs_changes,
+        (try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .activate })).?,
+    );
+    try std.testing.expectEqualStrings(
+        "Evidence from the human reviewer",
+        app.sessions.currentSessionConst().?.workingSnapshot().?.summary.?,
+    );
+    try std.testing.expect((try updateHumanReviewDecision(&app, &ctx, .{ .human_review_decision = .close })) == null);
+    try std.testing.expect(!app.pages.review.human_review_decision.isOpen());
 
     if (!defer_ordinary_completion) {
         try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
@@ -760,6 +862,204 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     try std.testing.expectEqual(pinned_revision, app.pages.review.source_session_revision);
     try std.testing.expect(app.pages.review.activeAiReviewId().?.eql(review_id));
     try std.testing.expect(app.pages.review.pinnedAiConst().?.target().eql(&pinned_target));
+}
+
+fn updateHumanReviewDecision(
+    app: *TestApp,
+    ctx: *chasen.Ctx(TestApp.Msg),
+    msg: @import("input.zig").Msg,
+) !?committed_review.ReviewResultValue {
+    var outcome = try app.controller().update(ctx, msg);
+    defer outcome.deinit(ctx.allocator());
+    return outcome.takeHumanReviewFinalize();
+}
+
+fn expectHumanReviewDecisionSurfaces(
+    page_state: *review_page.ReviewPageState,
+    editable: human_review_session.Presentation,
+    repo_root: []const u8,
+    repo_epoch: u64,
+    root_identity: repo_root_capability.Identity,
+) !void {
+    const sizes = [_]chasen.Size{
+        .{ .width = 120, .height = 32 },
+        .{ .width = 80, .height = 24 },
+        .{ .width = 56, .height = 16 },
+    };
+    for (sizes) |size| {
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(size.width, size.height);
+        defer surface.deinit();
+        try review_view.viewHumanReviewDecision(.{
+            .page = page_state,
+            .human_review = editable,
+            .palette = .default(),
+            .repo_root = repo_root,
+            .repo_epoch = repo_epoch,
+            .root_identity = root_identity,
+            .layout = .{ .width = size.width, .height = size.height },
+        }, &surface.surface);
+        const snapshot = try surface.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Finalize human review") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Approved") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Needs changes") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Canceled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "[x]") == null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc/q: close") != null);
+    }
+
+    var finalizing = editable;
+    finalizing.lifecycle = .finalizing;
+    try expectHumanReviewLifecycleSurface(
+        page_state,
+        finalizing,
+        repo_root,
+        repo_epoch,
+        root_identity,
+        .{ .width = 56, .height = 16 },
+        &.{ "Completing review result", "Run ", "Summary (read-only)", "Completing continues" },
+        &.{"[ Submit ]"},
+    );
+
+    var saving = editable;
+    saving.lifecycle = .saving;
+    page_state.human_review_decision.markFinalizeRejected(.capacity);
+    try expectHumanReviewLifecycleSurface(
+        page_state,
+        saving,
+        repo_root,
+        repo_epoch,
+        root_identity,
+        .{ .width = 56, .height = 16 },
+        &.{ "Saving review draft", "Run ", "Summary (read-only)", "Completing continues" },
+        &.{ "[ Submit ]", "capacity" },
+    );
+
+    var long_snapshot = try human_review_session.DraftSnapshot.init(
+        std.testing.allocator,
+        "長い人間レビュー要約 👩‍🚀 e\u{301}\nsecond line remains exact",
+        if (editable.snapshot) |snapshot| snapshot.finding_dispositions else &.{},
+        if (editable.snapshot) |snapshot| snapshot.anchored_notes else &.{},
+    );
+    defer long_snapshot.deinit();
+    var completed_at = "2026-08-27T12:00:00Z".*;
+    var completed = editable;
+    completed.lifecycle = .completed;
+    completed.decision = .approved;
+    completed.completed_at = &completed_at;
+    completed.snapshot = &long_snapshot;
+    page_state.human_review_decision.markFinalizeAccepted();
+    for ([_]chasen.Size{
+        .{ .width = 80, .height = 24 },
+        .{ .width = 56, .height = 16 },
+    }) |size| try expectHumanReviewLifecycleSurface(
+        page_state,
+        completed,
+        repo_root,
+        repo_epoch,
+        root_identity,
+        size,
+        &.{ "Human review result", "Completed at 2026-08-27T12:00:00Z", "Run ", "[x] Approved", "Summary (read-only)", "👩‍🚀", "second line remains exact" },
+        &.{"Completing review..."},
+    );
+    try page_state.human_review_decision.open(std.testing.allocator, editable);
+
+    var failed = editable;
+    failed.lifecycle = .failed;
+    try expectHumanReviewLifecycleSurface(
+        page_state,
+        failed,
+        repo_root,
+        repo_epoch,
+        root_identity,
+        .{ .width = 80, .height = 24 },
+        &.{ "Completion failed", "preserved form remains available for retry", "[ Submit ]" },
+        &.{},
+    );
+
+    var reload_required = failed;
+    reload_required.reconciliation = .reload_required;
+    try expectHumanReviewLifecycleSurface(
+        page_state,
+        reload_required,
+        repo_root,
+        repo_epoch,
+        root_identity,
+        .{ .width = 56, .height = 16 },
+        &.{ "Review state requires reload", "Summary (read-only)", "Reload the pinned Review" },
+        &.{"[ Submit ]"},
+    );
+}
+
+fn expectHumanReviewActionLabels(
+    page_state: *const review_page.ReviewPageState,
+    editable: human_review_session.Presentation,
+    repo_root: []const u8,
+    repo_epoch: u64,
+    root_identity: repo_root_capability.Identity,
+) !void {
+    const base_context: review_view.Context = .{
+        .page = page_state,
+        .human_review = editable,
+        .palette = .default(),
+        .repo_root = repo_root,
+        .repo_epoch = repo_epoch,
+        .root_identity = root_identity,
+        .layout = .{ .width = 80, .height = 24 },
+    };
+    try std.testing.expectEqualStrings("finalize", review_view.humanReviewActionLabel(base_context).?);
+    var missing = base_context;
+    missing.human_review = null;
+    try std.testing.expect(review_view.humanReviewActionLabel(missing) == null);
+    var mismatched_presentation = editable;
+    mismatched_presentation.binding.review_id.bytes[15] +%= 1;
+    var mismatched = base_context;
+    mismatched.human_review = mismatched_presentation;
+    try std.testing.expect(review_view.humanReviewActionLabel(mismatched) == null);
+    var completed = editable;
+    completed.lifecycle = .completed;
+    var completed_context = base_context;
+    completed_context.human_review = completed;
+    try std.testing.expectEqualStrings("result", review_view.humanReviewActionLabel(completed_context).?);
+    var saving = editable;
+    saving.lifecycle = .saving;
+    var saving_context = base_context;
+    saving_context.human_review = saving;
+    try std.testing.expectEqualStrings("result", review_view.humanReviewActionLabel(saving_context).?);
+}
+
+fn expectHumanReviewLifecycleSurface(
+    page_state: *const review_page.ReviewPageState,
+    presentation: human_review_session.Presentation,
+    repo_root: []const u8,
+    repo_epoch: u64,
+    root_identity: repo_root_capability.Identity,
+    size: chasen.Size,
+    expected: []const []const u8,
+    forbidden: []const []const u8,
+) !void {
+    var surface: chasen.testing.TestSurface = undefined;
+    try surface.init(size.width, size.height);
+    defer surface.deinit();
+    try review_view.viewHumanReviewDecision(.{
+        .page = page_state,
+        .human_review = presentation,
+        .palette = .default(),
+        .repo_root = repo_root,
+        .repo_epoch = repo_epoch,
+        .root_identity = root_identity,
+        .layout = .{ .width = size.width, .height = size.height },
+    }, &surface.surface);
+    const snapshot = try surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    for (expected) |text| {
+        if (std.mem.indexOf(u8, snapshot, text) == null) {
+            std.debug.print("missing renderer text {s} at {d}x{d}:\n{s}\n", .{ text, size.width, size.height, snapshot });
+            return error.TestUnexpectedResult;
+        }
+    }
+    for (forbidden) |text| try std.testing.expect(std.mem.indexOf(u8, snapshot, text) == null);
 }
 
 fn reviewHistoryPinnedBundle(
