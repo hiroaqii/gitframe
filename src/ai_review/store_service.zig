@@ -6,6 +6,7 @@
 const std = @import("std");
 const committed_review = @import("../committed_review.zig");
 const config = @import("../config.zig");
+const finding_projection = @import("finding_projection.zig");
 const git_command = @import("../git/command.zig");
 const git_review = @import("../git/committed_review.zig");
 const repository_locator = @import("../git/repository_locator.zig");
@@ -319,8 +320,10 @@ pub const SelectedRunRead = struct {
     snapshot: StoreSnapshot,
     artifacts: run.LoadedRunArtifacts,
     projection: git_review.CommittedDiffProjection,
+    finding_projection: finding_projection.FindingProjectionIndex,
 
     pub fn deinit(self: *SelectedRunRead, allocator: std.mem.Allocator) void {
+        self.finding_projection.deinit(allocator);
         self.projection.deinit(allocator);
         self.artifacts.deinit(allocator);
         self.* = undefined;
@@ -400,26 +403,56 @@ pub fn selectExact(
         .availability => |value| if (value == .missing) return .{ .failure = .target_unavailable },
         .failure => return .{ .failure = .git_failed },
     }
-    var projection_result = try git_review.materializeCommittedProjection(
+    var source_result = try git_review.materializeCommittedFindingProjectionSource(
         allocator,
         io,
         owned_context.git(),
         exact.artifacts.manifest.value.target,
     );
-    defer projection_result.deinit(allocator);
-    const projection = switch (projection_result) {
-        .projection => |value| value,
+    defer source_result.deinit(allocator);
+    const source = switch (source_result) {
+        .source => |*value| value,
         .failure => return .{ .failure = .projection_failed },
     };
 
+    const anchors = try allocator.alloc(committed_review.CodeAnchor, exact.artifacts.findings.value.findings.len);
+    defer allocator.free(anchors);
+    for (exact.artifacts.findings.value.findings, anchors) |finding, *anchor| anchor.* = finding.anchor;
+    const validations = try git_review.validateCodeAnchors(
+        allocator,
+        io,
+        owned_context.git(),
+        exact.artifacts.manifest.value.target,
+        anchors,
+    );
+    defer allocator.free(validations);
+    var finding_index = finding_projection.build(allocator, .{
+        .expected_review_repository_id = expected.review_repository_id,
+        .requested_review_id = review_id,
+        .projection_target = exact.artifacts.manifest.value.target,
+        .manifest = &exact.artifacts.manifest.value,
+        .findings_bytes = exact.artifacts.findings_bytes,
+        .finding_set = &exact.artifacts.findings.value,
+        .projection = &source.projection,
+        .endpoints = &source.endpoints,
+        .anchor_validations = validations,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidBinding, error.InvalidSource => return .{ .failure = .projection_failed },
+    };
+    errdefer finding_index.deinit(allocator);
+
     const artifacts = exact.artifacts;
+    const projection = source.projection;
+    source.endpoints.deinit(allocator);
+    source_result = .{ .failure = .projection_git_command_failed };
     exact.root.deinit();
     exact_result = .absent;
-    projection_result = .{ .failure = .projection_git_command_failed };
     return .{ .selected = .{
         .snapshot = expected,
         .artifacts = artifacts,
         .projection = projection,
+        .finding_projection = finding_index,
     } };
 }
 
@@ -1127,8 +1160,8 @@ test "AI Review Store ownership proof has one application composition owner and 
     try std.testing.expect(configured_fields[0].type != *core.Context);
 
     const selected_fields = @typeInfo(SelectedRunRead).@"struct".fields;
-    try std.testing.expectEqual(@as(usize, 3), selected_fields.len);
-    inline for (selected_fields, .{ "snapshot", "artifacts", "projection" }) |field, expected_name| {
+    try std.testing.expectEqual(@as(usize, 4), selected_fields.len);
+    inline for (selected_fields, .{ "snapshot", "artifacts", "projection", "finding_projection" }) |field, expected_name| {
         try std.testing.expectEqualStrings(expected_name, field.name);
         try std.testing.expect(field.type != @FieldType(core.OpenedRoot, "root"));
         try std.testing.expect(field.type != root_capability.RootCapability);
@@ -1764,6 +1797,10 @@ test "AI Review Store application review history backend AI Reviews picker selec
     try std.testing.expect(selected_value.artifacts.state == .completed);
     try std.testing.expect(selected_value.artifacts.retained_draft_diagnostic == .invalid);
     try std.testing.expect(std.mem.indexOf(u8, selected_value.projection.patch_bytes, "+changed") != null);
+    try std.testing.expect(selected_value.finding_projection.identity.review_repository_id.eql(repository_id));
+    try std.testing.expect(selected_value.finding_projection.identity.review_id.eql(valid_id));
+    try std.testing.expectEqual(@as(usize, 1), selected_value.finding_projection.files.len);
+    try std.testing.expectEqual(@as(usize, 0), selected_value.finding_projection.entries.len);
 
     try tmp.dir.createDir(io, "not-repository", .default_dir);
     var not_repository_directory = try tmp.dir.openDir(io, "not-repository", .{});

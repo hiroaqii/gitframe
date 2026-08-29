@@ -4,6 +4,7 @@ pub const limits = @import("ai_review/limits.zig");
 pub const protocol = @import("ai_review/protocol.zig");
 pub const codec = @import("ai_review/codec.zig");
 pub const producer = @import("ai_review/producer.zig");
+pub const finding_projection = @import("ai_review/finding_projection.zig");
 pub const store_service = @import("ai_review/store_service.zig");
 pub const store_read_command = @import("ai_review/store_read_command.zig");
 pub const result_read_command = @import("ai_review/result_read_command.zig");
@@ -24,6 +25,7 @@ test {
     _ = protocol;
     _ = codec;
     _ = producer;
+    _ = finding_projection;
     _ = store_service;
     _ = store_read_command;
     _ = result_read_command;

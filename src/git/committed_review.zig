@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const wire = @import("../committed_review.zig");
+const diff_parser = @import("../diff/parser.zig");
 const git_command = @import("command.zig");
 const endpoint = @import("committed_review/endpoint.zig");
 const root_ref = @import("committed_review/root_ref.zig");
@@ -114,6 +115,95 @@ pub const ProjectionResult = union(enum) {
     }
 };
 
+/// One exact raw-diff endpoint. Paths are allocator-owned lossless Git path
+/// bytes; object identity is retained even when the mode is not blob-backed.
+pub const CommittedDiffEndpoint = struct {
+    path_bytes: []u8,
+    object_oid: ObjectId,
+    mode: [6]u8,
+    is_blob: bool,
+
+    fn deinit(self: *CommittedDiffEndpoint, allocator: std.mem.Allocator) void {
+        allocator.free(self.path_bytes);
+        self.* = undefined;
+    }
+};
+
+/// Exact endpoint identity for one file in the extracted patch, in patch
+/// order. `status_bytes` retains Git's complete raw status token.
+pub const CommittedDiffEndpointRecord = struct {
+    file_ordinal: usize,
+    status_bytes: []u8,
+    old_mode: [6]u8,
+    new_mode: [6]u8,
+    before: ?CommittedDiffEndpoint,
+    after: ?CommittedDiffEndpoint,
+
+    fn deinit(self: *CommittedDiffEndpointRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.status_bytes);
+        if (self.before) |*value| value.deinit(allocator);
+        if (self.after) |*value| value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Owned raw endpoint records paired ordinal-for-ordinal with one patch.
+pub const CommittedDiffEndpointSidecar = struct {
+    target: CommittedReviewTarget,
+    records: []CommittedDiffEndpointRecord,
+
+    pub fn deinit(self: *CommittedDiffEndpointSidecar, allocator: std.mem.Allocator) void {
+        for (self.records) |*record| record.deinit(allocator);
+        allocator.free(self.records);
+        self.* = undefined;
+    }
+
+    /// Recheck the complete public value before a pure projection builder
+    /// trusts its ordinal and endpoint framing.
+    pub fn validFor(self: *const CommittedDiffEndpointSidecar, target: CommittedReviewTarget, file_count: usize) bool {
+        if (!self.target.eql(&target) or self.records.len != file_count) return false;
+        for (self.records, 0..) |record, ordinal| {
+            if (record.file_ordinal != ordinal or !validRawStatus(record.status_bytes)) return false;
+            if (!validRawEndpointShape(record.status_bytes[0], record.before != null, record.after != null)) return false;
+            if (!validRawMode(&record.old_mode) or !validRawMode(&record.new_mode) or
+                rawModeAbsent(&record.old_mode) != (record.before == null) or
+                rawModeAbsent(&record.new_mode) != (record.after == null)) return false;
+            if (record.before) |value| if (!validCommittedDiffEndpoint(value, target.object_format) or
+                !std.mem.eql(u8, &value.mode, &record.old_mode)) return false;
+            if (record.after) |value| if (!validCommittedDiffEndpoint(value, target.object_format) or
+                !std.mem.eql(u8, &value.mode, &record.new_mode)) return false;
+        }
+        return true;
+    }
+};
+
+/// One-command source for exact Finding projection. The patch shape remains
+/// the established public projection value; the sidecar supplies authority
+/// that patch presentation paths cannot provide.
+pub const CommittedFindingProjectionSource = struct {
+    projection: CommittedDiffProjection,
+    endpoints: CommittedDiffEndpointSidecar,
+
+    pub fn deinit(self: *CommittedFindingProjectionSource, allocator: std.mem.Allocator) void {
+        self.endpoints.deinit(allocator);
+        self.projection.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const FindingProjectionSourceResult = union(enum) {
+    source: CommittedFindingProjectionSource,
+    failure: ProjectionFailure,
+
+    pub fn deinit(self: *FindingProjectionSourceResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .source => |*source| source.deinit(allocator),
+            .failure => {},
+        }
+        self.* = .{ .failure = .projection_git_command_failed };
+    }
+};
+
 /// Provisional availability for one exact target. Missing is not a Git
 /// process failure and never triggers ref resolution or fetch.
 pub const TargetAvailability = enum { available, missing };
@@ -185,6 +275,13 @@ pub const CodeAnchorResolution = union(enum) {
         }
         self.* = .{ .failure = .anchor_git_command_failed };
     }
+};
+
+/// Ordered, non-owning result of validating one anchor. Exact selected bytes
+/// are intentionally not retained by the batch operation.
+pub const CodeAnchorValidation = union(enum) {
+    validated: ObjectId,
+    failure: CodeAnchorFailure,
 };
 
 const EndpointSide = enum { base, head };
@@ -349,6 +446,23 @@ pub fn materializeCommittedProjection(
     return materializeCommittedProjectionWithGit(allocator, io, context, target, strict_prefix[0]);
 }
 
+/// Materialize one patch plus its exact raw endpoint identities with one Git
+/// command. There is no retry or path-derived fallback.
+pub fn materializeCommittedFindingProjectionSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    target: CommittedReviewTarget,
+) std.mem.Allocator.Error!FindingProjectionSourceResult {
+    return materializeCommittedFindingProjectionSourceWithGit(
+        allocator,
+        io,
+        context,
+        target,
+        strict_prefix[0],
+    );
+}
+
 /// Probe up to 512 targets with one no-lazy-fetch `cat-file` transaction.
 /// Any framing/type/process failure discards every partial classification.
 pub fn checkTargetsAvailability(
@@ -453,18 +567,123 @@ fn materializeCommittedProjectionWithGit(
     target: CommittedReviewTarget,
     git_executable: []const u8,
 ) std.mem.Allocator.Error!ProjectionResult {
+    const capture = try captureCommittedDiff(
+        allocator,
+        io,
+        context,
+        target,
+        git_executable,
+        &.{},
+        max_projection_bytes,
+    );
+    return switch (capture) {
+        .bytes => |bytes| .{ .projection = .{ .target = target, .patch_bytes = bytes } },
+        .failure => |failure| .{ .failure = failure },
+    };
+}
+
+fn materializeCommittedFindingProjectionSourceWithGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    target: CommittedReviewTarget,
+    git_executable: []const u8,
+) std.mem.Allocator.Error!FindingProjectionSourceResult {
+    const combined_limit = std.math.mul(usize, max_projection_bytes, 2) catch unreachable;
+    const capture = try captureCommittedDiff(
+        allocator,
+        io,
+        context,
+        target,
+        git_executable,
+        &.{ "--raw", "-z", "--no-abbrev", "--patch" },
+        combined_limit,
+    );
+    const combined = switch (capture) {
+        .bytes => |bytes| bytes,
+        .failure => |failure| return .{ .failure = failure },
+    };
+    defer allocator.free(combined);
+
+    return buildFindingProjectionSourceFromCombined(allocator, target, combined);
+}
+
+fn buildFindingProjectionSourceFromCombined(
+    allocator: std.mem.Allocator,
+    target: CommittedReviewTarget,
+    combined: []const u8,
+) std.mem.Allocator.Error!FindingProjectionSourceResult {
+    const admitted_patch_start = switch (combinedComponentBounds(combined)) {
+        .patch_start => |value| value,
+        .too_large => return .{ .failure = .projection_too_large },
+        .malformed => return .{ .failure = .projection_git_command_failed },
+    };
+    var split_optional: ?ParsedCombinedDiffSource = parseCombinedDiffSource(allocator, target, combined) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = .projection_git_command_failed },
+    };
+    defer if (split_optional) |*split| split.endpoints.deinit(allocator);
+    const split = &split_optional.?;
+    if (split.patch_start != admitted_patch_start) return .{ .failure = .projection_git_command_failed };
+    const patch = combined[split.patch_start..];
+
+    var document = diff_parser.parse(allocator, patch) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = .projection_git_command_failed },
+    };
+    defer document.deinit(allocator);
+    if (document.files.len != split.endpoints.records.len)
+        return .{ .failure = .projection_git_command_failed };
+
+    const patch_bytes = try allocator.dupe(u8, patch);
+    const endpoints = split.endpoints;
+    split_optional = null;
+    return .{ .source = .{
+        .projection = .{ .target = target, .patch_bytes = patch_bytes },
+        .endpoints = endpoints,
+    } };
+}
+
+const ProjectionCapture = union(enum) {
+    bytes: []u8,
+    failure: ProjectionFailure,
+};
+
+fn captureCommittedDiff(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    target: CommittedReviewTarget,
+    git_executable: []const u8,
+    output_options: []const []const u8,
+    stdout_limit: usize,
+) std.mem.Allocator.Error!ProjectionCapture {
     target.validate() catch return .{ .failure = .projection_git_command_failed };
     const attr_source = try std.fmt.allocPrint(allocator, "--attr-source={s}", .{target.head_oid.slice()});
     defer allocator.free(attr_source);
-    const argv = [_][]const u8{
-        git_executable,          strict_prefix[1],  strict_prefix[2],  strict_prefix[3],
-        attr_source,             "diff",            "--no-color",      "--no-ext-diff",
-        "--no-textconv",         "--src-prefix=a/", "--dst-prefix=b/", target.diff_base_oid.slice(),
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
+        git_executable,
+        strict_prefix[1],
+        strict_prefix[2],
+        strict_prefix[3],
+        attr_source,
+        "diff",
+    });
+    try argv.appendSlice(allocator, output_options);
+    try argv.appendSlice(allocator, &.{
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        target.diff_base_oid.slice(),
         target.head_oid.slice(),
-    };
+    });
     var result = try git_command.runCapturedBounded(allocator, io, context, .{
-        .argv = &argv,
-        .stdout_limit = .limited(max_projection_bytes),
+        .argv = argv.items,
+        .stdout_limit = .limited(stdout_limit),
         .stderr_limit = .limited(stderr_capture_bytes),
     });
     switch (result) {
@@ -480,12 +699,212 @@ fn materializeCommittedProjectionWithGit(
                 return .{ .failure = .projection_git_command_failed };
             }
             allocator.free(completed.stderr);
-            return .{ .projection = .{
-                .target = target,
-                .patch_bytes = completed.stdout,
-            } };
+            return .{ .bytes = completed.stdout };
         },
     }
+}
+
+const ParsedCombinedDiffSource = struct {
+    patch_start: usize,
+    endpoints: CommittedDiffEndpointSidecar,
+};
+
+const CombinedComponentBounds = union(enum) { patch_start: usize, too_large, malformed };
+
+fn combinedComponentBounds(bytes: []const u8) CombinedComponentBounds {
+    if (bytes.len == 0) return .{ .patch_start = 0 };
+    const boundary = std.mem.indexOf(u8, bytes, "\x00\x00") orelse return .malformed;
+    const patch_start = boundary + 2;
+    if (patch_start > max_projection_bytes or bytes.len - patch_start > max_projection_bytes) return .too_large;
+    return .{ .patch_start = patch_start };
+}
+
+const RawDiffParseError = error{InvalidRawDiff};
+
+fn parseCombinedDiffSource(
+    allocator: std.mem.Allocator,
+    target: CommittedReviewTarget,
+    bytes: []const u8,
+) (RawDiffParseError || std.mem.Allocator.Error)!ParsedCombinedDiffSource {
+    if (bytes.len == 0) return .{
+        .patch_start = 0,
+        .endpoints = .{ .target = target, .records = try allocator.alloc(CommittedDiffEndpointRecord, 0) },
+    };
+
+    var records: std.ArrayList(CommittedDiffEndpointRecord) = .empty;
+    errdefer {
+        for (records.items) |*record| record.deinit(allocator);
+        records.deinit(allocator);
+    }
+    var cursor: usize = 0;
+    while (true) {
+        if (cursor >= bytes.len) return error.InvalidRawDiff;
+        if (bytes[cursor] == 0) {
+            cursor += 1;
+            break;
+        }
+        if (bytes[cursor] != ':') return error.InvalidRawDiff;
+        const header_end = std.mem.indexOfScalarPos(u8, bytes, cursor, 0) orelse return error.InvalidRawDiff;
+        const header = bytes[cursor + 1 .. header_end];
+        var fields = std.mem.splitScalar(u8, header, ' ');
+        const old_mode_text = fields.next() orelse return error.InvalidRawDiff;
+        const new_mode_text = fields.next() orelse return error.InvalidRawDiff;
+        const old_oid_text = fields.next() orelse return error.InvalidRawDiff;
+        const new_oid_text = fields.next() orelse return error.InvalidRawDiff;
+        const status = fields.next() orelse return error.InvalidRawDiff;
+        if (fields.next() != null or !validRawMode(old_mode_text) or !validRawMode(new_mode_text) or
+            !validRawStatus(status)) return error.InvalidRawDiff;
+        const old_oid = try parseRawOid(target.object_format, old_oid_text);
+        const new_oid = try parseRawOid(target.object_format, new_oid_text);
+        const old_absent = rawModeAbsent(old_mode_text);
+        const new_absent = rawModeAbsent(new_mode_text);
+        if ((old_oid == null) != old_absent or (new_oid == null) != new_absent)
+            return error.InvalidRawDiff;
+
+        cursor = header_end + 1;
+        const first_path_end = std.mem.indexOfScalarPos(u8, bytes, cursor, 0) orelse return error.InvalidRawDiff;
+        if (first_path_end == cursor or first_path_end - cursor > wire.limits.max_raw_path_bytes)
+            return error.InvalidRawDiff;
+        const first_path = bytes[cursor..first_path_end];
+        cursor = first_path_end + 1;
+        var second_path: ?[]const u8 = null;
+        if (status[0] == 'R' or status[0] == 'C') {
+            const second_path_end = std.mem.indexOfScalarPos(u8, bytes, cursor, 0) orelse return error.InvalidRawDiff;
+            if (second_path_end == cursor or second_path_end - cursor > wire.limits.max_raw_path_bytes)
+                return error.InvalidRawDiff;
+            second_path = bytes[cursor..second_path_end];
+            cursor = second_path_end + 1;
+        }
+
+        const before_path = first_path;
+        const after_path = second_path orelse first_path;
+        var before = if (old_oid) |oid|
+            try makeRawEndpoint(allocator, before_path, oid, old_mode_text)
+        else
+            null;
+        errdefer if (before) |*value| value.deinit(allocator);
+        var after = if (new_oid) |oid|
+            try makeRawEndpoint(allocator, after_path, oid, new_mode_text)
+        else
+            null;
+        errdefer if (after) |*value| value.deinit(allocator);
+        if (!validRawEndpointShape(status[0], before != null, after != null)) return error.InvalidRawDiff;
+        var status_bytes: ?[]u8 = try allocator.dupe(u8, status);
+        errdefer if (status_bytes) |owned| allocator.free(owned);
+        try records.append(allocator, .{
+            .file_ordinal = records.items.len,
+            .status_bytes = status_bytes.?,
+            .old_mode = rawModeValue(old_mode_text),
+            .new_mode = rawModeValue(new_mode_text),
+            .before = before,
+            .after = after,
+        });
+        before = null;
+        after = null;
+        status_bytes = null;
+    }
+    if (records.items.len == 0 or cursor > bytes.len) return error.InvalidRawDiff;
+    return .{
+        .patch_start = cursor,
+        .endpoints = .{ .target = target, .records = try records.toOwnedSlice(allocator) },
+    };
+}
+
+fn validRawMode(text: []const u8) bool {
+    if (text.len != 6) return false;
+    for (text) |byte| if (byte < '0' or byte > '7') return false;
+    return rawModeAbsent(text) or std.mem.eql(u8, text, "100644") or
+        std.mem.eql(u8, text, "100755") or std.mem.eql(u8, text, "120000") or
+        std.mem.eql(u8, text, "160000") or std.mem.eql(u8, text, "040000");
+}
+
+fn rawModeAbsent(text: []const u8) bool {
+    return std.mem.eql(u8, text, "000000");
+}
+
+fn rawModeIsBlob(text: []const u8) bool {
+    return std.mem.eql(u8, text, "100644") or std.mem.eql(u8, text, "100755") or
+        std.mem.eql(u8, text, "120000");
+}
+
+fn rawModeValue(text: []const u8) [6]u8 {
+    var value: [6]u8 = undefined;
+    @memcpy(&value, text);
+    return value;
+}
+
+fn validCommittedDiffEndpoint(endpoint_value: CommittedDiffEndpoint, format: ObjectFormat) bool {
+    return endpoint_value.path_bytes.len != 0 and
+        endpoint_value.path_bytes.len <= wire.limits.max_raw_path_bytes and
+        std.mem.indexOfScalar(u8, endpoint_value.path_bytes, 0) == null and
+        endpoint_value.object_oid.validFor(format) and validRawMode(&endpoint_value.mode) and
+        !rawModeAbsent(&endpoint_value.mode) and endpoint_value.is_blob == rawModeIsBlob(&endpoint_value.mode);
+}
+
+fn validRawStatus(status: []const u8) bool {
+    if (status.len == 1) return switch (status[0]) {
+        'A', 'D', 'M', 'T' => true,
+        else => false,
+    };
+    if (status.len != 4 or (status[0] != 'R' and status[0] != 'C')) return false;
+    for (status[1..]) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+fn validRawEndpointShape(status: u8, has_before: bool, has_after: bool) bool {
+    return switch (status) {
+        'A' => !has_before and has_after,
+        'D' => has_before and !has_after,
+        'M', 'T', 'R', 'C' => has_before and has_after,
+        else => false,
+    };
+}
+
+fn parseRawOid(format: ObjectFormat, text: []const u8) RawDiffParseError!?ObjectId {
+    if (text.len != format.oidHexLength()) return error.InvalidRawDiff;
+    var all_zero = true;
+    for (text) |byte| if (byte != '0') {
+        all_zero = false;
+        break;
+    };
+    if (all_zero) return null;
+    return ObjectId.parse(format, text) catch error.InvalidRawDiff;
+}
+
+fn makeRawEndpoint(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    oid: ObjectId,
+    mode_text: []const u8,
+) std.mem.Allocator.Error!CommittedDiffEndpoint {
+    return .{
+        .path_bytes = try allocator.dupe(u8, path),
+        .object_oid = oid,
+        .mode = rawModeValue(mode_text),
+        .is_blob = rawModeIsBlob(mode_text),
+    };
+}
+
+/// Validate an ordered set of anchors with operation-local path and blob
+/// deduplication. Returned entries retain no blob or selected-range bytes.
+pub fn validateCodeAnchors(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    target: CommittedReviewTarget,
+    anchors: []const CodeAnchor,
+) std.mem.Allocator.Error![]CodeAnchorValidation {
+    const batch = try resolveCodeAnchorsInternal(
+        allocator,
+        io,
+        context,
+        target,
+        anchors,
+        null,
+        strict_prefix[0],
+    );
+    std.debug.assert(batch.selected_bytes == null);
+    return batch.validations;
 }
 
 /// Read and validate one anchor against exact committed blob bytes selected by
@@ -497,26 +916,249 @@ pub fn resolveCodeAnchor(
     target: CommittedReviewTarget,
     anchor: CodeAnchor,
 ) std.mem.Allocator.Error!CodeAnchorResolution {
-    target.validate() catch return .{ .failure = .anchor_git_command_failed };
-    if (anchor.path_bytes.len == 0 or anchor.path_bytes.len > wire.limits.max_raw_path_bytes or
-        std.mem.indexOfScalar(u8, anchor.path_bytes, 0) != null or
-        anchor.start_line == 0 or anchor.end_line < anchor.start_line)
-    {
-        return .{ .failure = .invalid_anchor };
-    }
-    const tree_oid = switch (anchor.side) {
-        .before => target.diff_base_oid,
-        .after => target.head_oid,
+    const batch = try resolveCodeAnchorsInternal(
+        allocator,
+        io,
+        context,
+        target,
+        &.{anchor},
+        0,
+        strict_prefix[0],
+    );
+    defer allocator.free(batch.validations);
+    return switch (batch.validations[0]) {
+        .failure => |failure| .{ .failure = failure },
+        .validated => |blob_oid| .{ .resolved = .{
+            .blob_oid = blob_oid,
+            .selected_bytes = batch.selected_bytes.?,
+        } },
     };
-    switch (try batchCheck(allocator, io, context, target.object_format, tree_oid.slice())) {
-        .missing => return .{ .failure = .blob_object_unavailable },
-        .failed => return .{ .failure = .anchor_git_command_failed },
-        .object => {},
+}
+
+const AnchorBatchResolution = struct {
+    validations: []CodeAnchorValidation,
+    selected_bytes: ?[]u8,
+};
+
+const AnchorPathResolution = union(enum) {
+    pending,
+    blob: ObjectId,
+    failure: CodeAnchorFailure,
+};
+
+const AnchorPathGroup = struct {
+    representative: usize,
+    resolution: AnchorPathResolution = .pending,
+};
+
+fn resolveCodeAnchorsInternal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    target: CommittedReviewTarget,
+    anchors: []const CodeAnchor,
+    capture_anchor_index: ?usize,
+    git_executable: []const u8,
+) std.mem.Allocator.Error!AnchorBatchResolution {
+    std.debug.assert(capture_anchor_index == null or capture_anchor_index.? < anchors.len);
+    const validations = try allocator.alloc(CodeAnchorValidation, anchors.len);
+    errdefer allocator.free(validations);
+    @memset(validations, .{ .failure = .anchor_git_command_failed });
+    target.validate() catch {
+        return .{ .validations = validations, .selected_bytes = null };
+    };
+    if (anchors.len == 0) return .{ .validations = validations, .selected_bytes = null };
+
+    const group_for_anchor = try allocator.alloc(?usize, anchors.len);
+    defer allocator.free(group_for_anchor);
+    @memset(group_for_anchor, null);
+    var groups: std.ArrayList(AnchorPathGroup) = .empty;
+    defer groups.deinit(allocator);
+
+    for (anchors, 0..) |anchor, anchor_index| {
+        if (!validCodeAnchor(anchor)) {
+            validations[anchor_index] = .{ .failure = .invalid_anchor };
+            continue;
+        }
+        const group_index = findAnchorPathGroup(groups.items, anchors, anchor) orelse group: {
+            try groups.append(allocator, .{ .representative = anchor_index });
+            break :group groups.items.len - 1;
+        };
+        group_for_anchor[anchor_index] = group_index;
     }
+
+    var before_tree: ?BatchResult = null;
+    var after_tree: ?BatchResult = null;
+    for (groups.items) |group| {
+        switch (anchors[group.representative].side) {
+            .before => if (before_tree == null) {
+                before_tree = try batchCheckWithGit(
+                    allocator,
+                    io,
+                    context,
+                    target.object_format,
+                    target.diff_base_oid.slice(),
+                    git_executable,
+                );
+            },
+            .after => if (after_tree == null) {
+                after_tree = try batchCheckWithGit(
+                    allocator,
+                    io,
+                    context,
+                    target.object_format,
+                    target.head_oid.slice(),
+                    git_executable,
+                );
+            },
+        }
+    }
+
+    for (groups.items) |*group| {
+        const anchor = anchors[group.representative];
+        const tree_oid = switch (anchor.side) {
+            .before => target.diff_base_oid,
+            .after => target.head_oid,
+        };
+        const tree_result = switch (anchor.side) {
+            .before => before_tree.?,
+            .after => after_tree.?,
+        };
+        switch (tree_result) {
+            .missing => {
+                group.resolution = .{ .failure = .blob_object_unavailable };
+                continue;
+            },
+            .failed => {
+                group.resolution = .{ .failure = .anchor_git_command_failed };
+                continue;
+            },
+            .object => {},
+        }
+        group.resolution = switch (try lookupAnchorPathWithGit(
+            allocator,
+            io,
+            context,
+            target.object_format,
+            tree_oid,
+            anchor.path_bytes,
+            git_executable,
+        )) {
+            .blob => |oid| .{ .blob = oid },
+            .not_found => .{ .failure = .path_not_found },
+            .not_blob => .{ .failure = .path_not_blob },
+            .failed => .{ .failure = .anchor_git_command_failed },
+        };
+    }
+
+    for (anchors, 0..) |_, anchor_index| {
+        const group_index = group_for_anchor[anchor_index] orelse continue;
+        switch (groups.items[group_index].resolution) {
+            .failure => |failure| validations[anchor_index] = .{ .failure = failure },
+            .pending, .blob => {},
+        }
+    }
+
+    var blob_oids: std.ArrayList(ObjectId) = .empty;
+    defer blob_oids.deinit(allocator);
+    for (groups.items) |group| {
+        const oid = switch (group.resolution) {
+            .blob => |value| value,
+            .pending, .failure => continue,
+        };
+        var seen = false;
+        for (blob_oids.items) |*existing| {
+            if (existing.eql(&oid)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try blob_oids.append(allocator, oid);
+    }
+
+    var selected_bytes: ?[]u8 = null;
+    errdefer if (selected_bytes) |bytes| allocator.free(bytes);
+    for (blob_oids.items) |blob_oid| {
+        const checked = try batchCheckWithGit(
+            allocator,
+            io,
+            context,
+            target.object_format,
+            blob_oid.slice(),
+            git_executable,
+        );
+        const check_failure: ?CodeAnchorFailure = switch (checked) {
+            .missing => .blob_object_unavailable,
+            .failed => .anchor_git_command_failed,
+            .object => |object| if (object.kind == .blob) null else .path_not_blob,
+        };
+        if (check_failure) |failure| {
+            assignBlobFailure(validations, anchors, group_for_anchor, groups.items, blob_oid, failure);
+            continue;
+        }
+
+        var blob_result = try readAnchorBlobWithGit(allocator, io, context, blob_oid, git_executable);
+        defer blob_result.deinit(allocator);
+        const blob = switch (blob_result) {
+            .bytes => |bytes| bytes,
+            .failure => |failure| {
+                assignBlobFailure(validations, anchors, group_for_anchor, groups.items, blob_oid, failure);
+                continue;
+            },
+        };
+        for (anchors, 0..) |anchor, anchor_index| {
+            const group_index = group_for_anchor[anchor_index] orelse continue;
+            const group_oid = switch (groups.items[group_index].resolution) {
+                .blob => |value| value,
+                .pending, .failure => continue,
+            };
+            if (!group_oid.eql(&blob_oid)) continue;
+            switch (validateAnchorBlobBytes(blob, anchor)) {
+                .failure => |failure| validations[anchor_index] = .{ .failure = failure },
+                .selected => |selected| {
+                    validations[anchor_index] = .{ .validated = blob_oid };
+                    if (capture_anchor_index != null and capture_anchor_index.? == anchor_index)
+                        selected_bytes = try allocator.dupe(u8, selected);
+                },
+            }
+        }
+    }
+    return .{ .validations = validations, .selected_bytes = selected_bytes };
+}
+
+fn validCodeAnchor(anchor: CodeAnchor) bool {
+    return anchor.path_bytes.len != 0 and anchor.path_bytes.len <= wire.limits.max_raw_path_bytes and
+        std.mem.indexOfScalar(u8, anchor.path_bytes, 0) == null and
+        anchor.start_line != 0 and anchor.end_line >= anchor.start_line;
+}
+
+fn findAnchorPathGroup(
+    groups: []const AnchorPathGroup,
+    anchors: []const CodeAnchor,
+    anchor: CodeAnchor,
+) ?usize {
+    for (groups, 0..) |group, index| {
+        const existing = anchors[group.representative];
+        if (existing.side == anchor.side and std.mem.eql(u8, existing.path_bytes, anchor.path_bytes)) return index;
+    }
+    return null;
+}
+
+const AnchorPathLookup = union(enum) { blob: ObjectId, not_found, not_blob, failed };
+
+fn lookupAnchorPathWithGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    format: ObjectFormat,
+    tree_oid: ObjectId,
+    path: []const u8,
+    git_executable: []const u8,
+) std.mem.Allocator.Error!AnchorPathLookup {
     const tree_argv = [_][]const u8{
-        strict_prefix[0],      strict_prefix[1], strict_prefix[2],  strict_prefix[3],
-        "--literal-pathspecs", "ls-tree",        "-rz",             "--full-tree",
-        tree_oid.slice(),      "--",             anchor.path_bytes,
+        git_executable,        strict_prefix[1], strict_prefix[2], strict_prefix[3],
+        "--literal-pathspecs", "ls-tree",        "-rz",            "--full-tree",
+        tree_oid.slice(),      "--",             path,
     };
     var tree_result = try git_command.runCapturedBounded(allocator, io, context, .{
         .argv = &tree_argv,
@@ -526,21 +1168,37 @@ pub fn resolveCodeAnchor(
     defer tree_result.deinit(allocator);
     const tree_completed = switch (tree_result) {
         .completed => |value| value,
-        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return .{ .failure = .anchor_git_command_failed },
+        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return .failed,
     };
-    if (!termExited(tree_completed.term, 0)) return .{ .failure = .anchor_git_command_failed };
-    if (tree_completed.stdout.len == 0) return .{ .failure = .path_not_found };
-    const blob_oid = parseLsTreeRecord(target.object_format, tree_completed.stdout, anchor.path_bytes) orelse
-        return .{ .failure = .path_not_blob };
-    switch (try batchCheck(allocator, io, context, target.object_format, blob_oid.slice())) {
-        .missing => return .{ .failure = .blob_object_unavailable },
-        .failed => return .{ .failure = .anchor_git_command_failed },
-        .object => |object| if (object.kind != .blob) return .{ .failure = .path_not_blob },
-    }
+    if (!termExited(tree_completed.term, 0)) return .failed;
+    if (tree_completed.stdout.len == 0) return .not_found;
+    const blob_oid = parseLsTreeRecord(format, tree_completed.stdout, path) orelse return .not_blob;
+    return .{ .blob = blob_oid };
+}
 
+const AnchorBlobRead = union(enum) {
+    bytes: []u8,
+    failure: CodeAnchorFailure,
+
+    fn deinit(self: *AnchorBlobRead, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .bytes => |bytes| allocator.free(bytes),
+            .failure => {},
+        }
+        self.* = .{ .failure = .anchor_git_command_failed };
+    }
+};
+
+fn readAnchorBlobWithGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    blob_oid: ObjectId,
+    git_executable: []const u8,
+) std.mem.Allocator.Error!AnchorBlobRead {
     const blob_argv = [_][]const u8{
-        strict_prefix[0], strict_prefix[1], strict_prefix[2], strict_prefix[3],
-        "cat-file",       "blob",           blob_oid.slice(),
+        git_executable, strict_prefix[1], strict_prefix[2], strict_prefix[3],
+        "cat-file",     "blob",           blob_oid.slice(),
     };
     var blob_result = try git_command.runCapturedBounded(allocator, io, context, .{
         .argv = &blob_argv,
@@ -559,17 +1217,41 @@ pub fn resolveCodeAnchor(
                 completed.deinit(allocator);
                 return .{ .failure = .anchor_git_command_failed };
             }
-            defer completed.deinit(allocator);
-            if (std.mem.indexOfScalar(u8, completed.stdout, 0) != null) return .{ .failure = .binary_blob };
-            const selected = selectLines(completed.stdout, anchor.start_line, anchor.end_line) orelse
-                return .{ .failure = .range_out_of_bounds };
-            const digest = wire.Sha256Digest.hash(selected);
-            if (!digest.eql(anchor.content_digest)) return .{ .failure = .content_digest_mismatch };
-            return .{ .resolved = .{
-                .blob_oid = blob_oid,
-                .selected_bytes = try allocator.dupe(u8, selected),
-            } };
+            allocator.free(completed.stderr);
+            return .{ .bytes = completed.stdout };
         },
+    }
+}
+
+const AnchorBlobValidation = union(enum) {
+    selected: []const u8,
+    failure: CodeAnchorFailure,
+};
+
+fn validateAnchorBlobBytes(bytes: []const u8, anchor: CodeAnchor) AnchorBlobValidation {
+    if (std.mem.indexOfScalar(u8, bytes, 0) != null) return .{ .failure = .binary_blob };
+    const selected = selectLines(bytes, anchor.start_line, anchor.end_line) orelse
+        return .{ .failure = .range_out_of_bounds };
+    const digest = wire.Sha256Digest.hash(selected);
+    if (!digest.eql(anchor.content_digest)) return .{ .failure = .content_digest_mismatch };
+    return .{ .selected = selected };
+}
+
+fn assignBlobFailure(
+    validations: []CodeAnchorValidation,
+    anchors: []const CodeAnchor,
+    group_for_anchor: []const ?usize,
+    groups: []const AnchorPathGroup,
+    blob_oid: ObjectId,
+    failure: CodeAnchorFailure,
+) void {
+    for (anchors, 0..) |_, anchor_index| {
+        const group_index = group_for_anchor[anchor_index] orelse continue;
+        const group_oid = switch (groups[group_index].resolution) {
+            .blob => |value| value,
+            .pending, .failure => continue,
+        };
+        if (group_oid.eql(&blob_oid)) validations[anchor_index] = .{ .failure = failure };
     }
 }
 
@@ -956,11 +1638,22 @@ fn batchCheck(
     format: ObjectFormat,
     expression: []const u8,
 ) std.mem.Allocator.Error!BatchResult {
+    return batchCheckWithGit(allocator, io, context, format, expression, strict_prefix[0]);
+}
+
+fn batchCheckWithGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    format: ObjectFormat,
+    expression: []const u8,
+    git_executable: []const u8,
+) std.mem.Allocator.Error!BatchResult {
     const stdin = try std.fmt.allocPrint(allocator, "{s}\n", .{expression});
     defer allocator.free(stdin);
     const argv = [_][]const u8{
-        strict_prefix[0], strict_prefix[1], strict_prefix[2], strict_prefix[3],
-        "cat-file",       "--batch-check",
+        git_executable, strict_prefix[1], strict_prefix[2], strict_prefix[3],
+        "cat-file",     "--batch-check",
     };
     var result = try git_command.runWithStdinBounded(allocator, io, context, .{
         .argv = &argv,
@@ -1346,6 +2039,276 @@ test "target resolver ends at pinned target and projection and anchor are separa
     try std.testing.expectEqualStrings("base\n", before.resolved.selected_bytes);
 }
 
+test "finding projection source keeps byte-identical patch and lossless endpoint identities" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try runTestGit(io, tmp.dir, &.{ "git", "init", "--initial-branch=main" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "modify.txt", .data = "old\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "rename-old.txt", .data = "rename\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "delete.txt", .data = "delete\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary.dat", .data = "old\x00binary" });
+    try runTestGit(io, tmp.dir, &.{ "git", "add", "." });
+    try runTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "modify.txt", .data = "new\n" });
+    try tmp.dir.rename("rename-old.txt", tmp.dir, "rename-new.txt", io);
+    try tmp.dir.deleteFile(io, "delete.txt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "add.txt", .data = "add\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary.dat", .data = "new\x00binary" });
+    const raw_path = "raw-\xff.txt";
+    try tmp.dir.writeFile(io, .{ .sub_path = raw_path, .data = "raw\n" });
+    try runTestGit(io, tmp.dir, &.{ "git", "add", "-A" });
+    try runTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "head" });
+
+    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
+    defer environment.deinit();
+    const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+    const target = try expectTarget(try resolveTarget(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "HEAD^",
+        .head = "HEAD",
+    }));
+    var ordinary = try materializeCommittedProjection(std.testing.allocator, io, context, target);
+    defer ordinary.deinit(std.testing.allocator);
+    var combined = try materializeCommittedFindingProjectionSource(std.testing.allocator, io, context, target);
+    defer combined.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, ordinary.projection.patch_bytes, combined.source.projection.patch_bytes);
+    try std.testing.expectEqual(@as(usize, 6), combined.source.endpoints.records.len);
+
+    var modify_record: ?*const CommittedDiffEndpointRecord = null;
+    var rename_record: ?*const CommittedDiffEndpointRecord = null;
+    var add_record: ?*const CommittedDiffEndpointRecord = null;
+    var delete_record: ?*const CommittedDiffEndpointRecord = null;
+    var binary_record: ?*const CommittedDiffEndpointRecord = null;
+    var raw_record: ?*const CommittedDiffEndpointRecord = null;
+    for (combined.source.endpoints.records) |*record| {
+        if (record.before) |before_endpoint| {
+            if (std.mem.eql(u8, before_endpoint.path_bytes, "modify.txt")) modify_record = record;
+            if (std.mem.eql(u8, before_endpoint.path_bytes, "rename-old.txt")) rename_record = record;
+            if (std.mem.eql(u8, before_endpoint.path_bytes, "delete.txt")) delete_record = record;
+            if (std.mem.eql(u8, before_endpoint.path_bytes, "binary.dat")) binary_record = record;
+        } else if (record.after) |after_endpoint| {
+            if (std.mem.eql(u8, after_endpoint.path_bytes, "add.txt")) add_record = record;
+            if (std.mem.eql(u8, after_endpoint.path_bytes, raw_path)) raw_record = record;
+        }
+    }
+
+    const modify_before_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD^:modify.txt" });
+    defer std.testing.allocator.free(modify_before_output);
+    const modify_after_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD:modify.txt" });
+    defer std.testing.allocator.free(modify_after_output);
+    const rename_before_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD^:rename-old.txt" });
+    defer std.testing.allocator.free(rename_before_output);
+    const rename_after_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD:rename-new.txt" });
+    defer std.testing.allocator.free(rename_after_output);
+    const delete_before_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD^:delete.txt" });
+    defer std.testing.allocator.free(delete_before_output);
+    const add_after_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD:add.txt" });
+    defer std.testing.allocator.free(add_after_output);
+    const binary_before_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD^:binary.dat" });
+    defer std.testing.allocator.free(binary_before_output);
+    const binary_after_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD:binary.dat" });
+    defer std.testing.allocator.free(binary_after_output);
+    const raw_after_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD:raw-\xff.txt" });
+    defer std.testing.allocator.free(raw_after_output);
+    const modify_before_oid = try testOutputLine(modify_before_output);
+    const modify_after_oid = try testOutputLine(modify_after_output);
+    const rename_before_oid = try testOutputLine(rename_before_output);
+    const rename_after_oid = try testOutputLine(rename_after_output);
+    const delete_before_oid = try testOutputLine(delete_before_output);
+    const add_after_oid = try testOutputLine(add_after_output);
+    const binary_before_oid = try testOutputLine(binary_before_output);
+    const binary_after_oid = try testOutputLine(binary_after_output);
+    const raw_after_oid = try testOutputLine(raw_after_output);
+    const regular_mode = "100644";
+    const absent_mode = "000000";
+
+    const modify = modify_record orelse return error.ExpectedModifyEndpoint;
+    try std.testing.expectEqualStrings("M", modify.status_bytes);
+    try std.testing.expectEqualSlices(u8, regular_mode, &modify.old_mode);
+    try std.testing.expectEqualSlices(u8, regular_mode, &modify.new_mode);
+    try std.testing.expectEqualStrings("modify.txt", modify.before.?.path_bytes);
+    try std.testing.expectEqualStrings("modify.txt", modify.after.?.path_bytes);
+    try std.testing.expectEqualStrings(modify_before_oid, modify.before.?.object_oid.slice());
+    try std.testing.expectEqualStrings(modify_after_oid, modify.after.?.object_oid.slice());
+    try std.testing.expectEqualSlices(u8, regular_mode, &modify.before.?.mode);
+    try std.testing.expectEqualSlices(u8, regular_mode, &modify.after.?.mode);
+    try std.testing.expect(modify.before.?.is_blob and modify.after.?.is_blob);
+
+    const rename = rename_record orelse return error.ExpectedRenameEndpoint;
+    try std.testing.expectEqualStrings("R100", rename.status_bytes);
+    try std.testing.expectEqualSlices(u8, regular_mode, &rename.old_mode);
+    try std.testing.expectEqualSlices(u8, regular_mode, &rename.new_mode);
+    try std.testing.expectEqualStrings("rename-old.txt", rename.before.?.path_bytes);
+    try std.testing.expectEqualStrings("rename-new.txt", rename.after.?.path_bytes);
+    try std.testing.expectEqualStrings(rename_before_oid, rename.before.?.object_oid.slice());
+    try std.testing.expectEqualStrings(rename_after_oid, rename.after.?.object_oid.slice());
+    try std.testing.expectEqualSlices(u8, regular_mode, &rename.before.?.mode);
+    try std.testing.expectEqualSlices(u8, regular_mode, &rename.after.?.mode);
+    try std.testing.expect(rename.before.?.is_blob and rename.after.?.is_blob);
+
+    const add = add_record orelse return error.ExpectedAddEndpoint;
+    try std.testing.expectEqualStrings("A", add.status_bytes);
+    try std.testing.expectEqualSlices(u8, absent_mode, &add.old_mode);
+    try std.testing.expectEqualSlices(u8, regular_mode, &add.new_mode);
+    try std.testing.expect(add.before == null);
+    try std.testing.expectEqualStrings("add.txt", add.after.?.path_bytes);
+    try std.testing.expectEqualStrings(add_after_oid, add.after.?.object_oid.slice());
+    try std.testing.expectEqualSlices(u8, regular_mode, &add.after.?.mode);
+    try std.testing.expect(add.after.?.is_blob);
+
+    const deleted = delete_record orelse return error.ExpectedDeleteEndpoint;
+    try std.testing.expectEqualStrings("D", deleted.status_bytes);
+    try std.testing.expectEqualSlices(u8, regular_mode, &deleted.old_mode);
+    try std.testing.expectEqualSlices(u8, absent_mode, &deleted.new_mode);
+    try std.testing.expectEqualStrings("delete.txt", deleted.before.?.path_bytes);
+    try std.testing.expectEqualStrings(delete_before_oid, deleted.before.?.object_oid.slice());
+    try std.testing.expectEqualSlices(u8, regular_mode, &deleted.before.?.mode);
+    try std.testing.expect(deleted.before.?.is_blob);
+    try std.testing.expect(deleted.after == null);
+
+    const binary = binary_record orelse return error.ExpectedBinaryEndpoint;
+    try std.testing.expectEqualStrings("M", binary.status_bytes);
+    try std.testing.expectEqualSlices(u8, regular_mode, &binary.old_mode);
+    try std.testing.expectEqualSlices(u8, regular_mode, &binary.new_mode);
+    try std.testing.expectEqualStrings("binary.dat", binary.before.?.path_bytes);
+    try std.testing.expectEqualStrings("binary.dat", binary.after.?.path_bytes);
+    try std.testing.expectEqualStrings(binary_before_oid, binary.before.?.object_oid.slice());
+    try std.testing.expectEqualStrings(binary_after_oid, binary.after.?.object_oid.slice());
+    try std.testing.expectEqualSlices(u8, regular_mode, &binary.before.?.mode);
+    try std.testing.expectEqualSlices(u8, regular_mode, &binary.after.?.mode);
+    try std.testing.expect(binary.before.?.is_blob and binary.after.?.is_blob);
+
+    const raw = raw_record orelse return error.ExpectedRawEndpoint;
+    try std.testing.expectEqualStrings("A", raw.status_bytes);
+    try std.testing.expectEqualSlices(u8, absent_mode, &raw.old_mode);
+    try std.testing.expectEqualSlices(u8, regular_mode, &raw.new_mode);
+    try std.testing.expect(raw.before == null);
+    try std.testing.expectEqualSlices(u8, raw_path, raw.after.?.path_bytes);
+    try std.testing.expectEqualStrings(raw_after_oid, raw.after.?.object_oid.slice());
+    try std.testing.expectEqualSlices(u8, regular_mode, &raw.after.?.mode);
+    try std.testing.expect(raw.after.?.is_blob);
+
+    const same_target = try expectTarget(try resolveTarget(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "HEAD",
+        .head = "HEAD",
+    }));
+    var empty = try materializeCommittedFindingProjectionSource(std.testing.allocator, io, context, same_target);
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), empty.source.projection.patch_bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), empty.source.endpoints.records.len);
+
+    const oid = "1111111111111111111111111111111111111111";
+    const malformed = try std.fmt.allocPrint(std.testing.allocator, ":100644 100644 {s} {s} M\x00unterminated", .{ oid, oid });
+    defer std.testing.allocator.free(malformed);
+    try std.testing.expectError(error.InvalidRawDiff, parseCombinedDiffSource(std.testing.allocator, target, malformed));
+
+    const raw_exact = try std.testing.allocator.alloc(u8, max_projection_bytes);
+    defer std.testing.allocator.free(raw_exact);
+    @memset(raw_exact, 'x');
+    raw_exact[raw_exact.len - 2] = 0;
+    raw_exact[raw_exact.len - 1] = 0;
+    const raw_exact_bounds = combinedComponentBounds(raw_exact);
+    try std.testing.expect(raw_exact_bounds == .patch_start);
+    try std.testing.expectEqual(max_projection_bytes, raw_exact_bounds.patch_start);
+    const raw_over = try std.testing.allocator.alloc(u8, max_projection_bytes + 1);
+    defer std.testing.allocator.free(raw_over);
+    @memset(raw_over, 'x');
+    raw_over[raw_over.len - 2] = 0;
+    raw_over[raw_over.len - 1] = 0;
+    try std.testing.expect(combinedComponentBounds(raw_over) == .too_large);
+    const patch_over = try std.testing.allocator.alloc(u8, max_projection_bytes + 3);
+    defer std.testing.allocator.free(patch_over);
+    @memset(patch_over, 'x');
+    patch_over[0] = 0;
+    patch_over[1] = 0;
+    try std.testing.expect(combinedComponentBounds(patch_over) == .too_large);
+
+    const contradictory_patch =
+        "diff --git a/one.txt b/one.txt\n" ++
+        "--- a/one.txt\n" ++
+        "+++ b/one.txt\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+new\n" ++
+        "diff --git a/two.txt b/two.txt\n" ++
+        "--- a/two.txt\n" ++
+        "+++ b/two.txt\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+new\n";
+    const contradictory = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ":100644 100644 {s} {s} M\x00one.txt\x00\x00{s}",
+        .{ oid, oid, contradictory_patch },
+    );
+    defer std.testing.allocator.free(contradictory);
+    var contradictory_result = try buildFindingProjectionSourceFromCombined(
+        std.testing.allocator,
+        target,
+        contradictory,
+    );
+    defer contradictory_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ProjectionFailure.projection_git_command_failed, contradictory_result.failure);
+}
+
+test "CodeAnchor batch reads each exact path and distinct blob once per operation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try runTestGit(io, tmp.dir, &.{ "git", "init", "--initial-branch=main" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "one.txt", .data = "one\ntwo\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.txt", .data = "one\ntwo\n" });
+    try runTestGit(io, tmp.dir, &.{ "git", "add", "." });
+    try runTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "anchor" });
+
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_path);
+    const log_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "commands.log" });
+    defer std.testing.allocator.free(log_path);
+    const script = "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$OBSERVER_LOG\"\nexec git \"$@\"\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "git-observer", .data = script });
+    try runTestGit(io, tmp.dir, &.{ "chmod", "+x", "git-observer" });
+    const observer_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "git-observer" });
+    defer std.testing.allocator.free(observer_path);
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("OBSERVER_LOG", log_path);
+    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, &parent);
+    defer environment.deinit();
+    const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+    const target = try expectTarget(try resolveTarget(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "HEAD",
+        .head = "HEAD",
+    }));
+    const anchors = [_]CodeAnchor{
+        .{ .path_bytes = "one.txt", .side = .after, .start_line = 1, .end_line = 1, .content_digest = wire.Sha256Digest.hash("one\n") },
+        .{ .path_bytes = "one.txt", .side = .after, .start_line = 2, .end_line = 2, .content_digest = wire.Sha256Digest.hash("two\n") },
+        .{ .path_bytes = "two.txt", .side = .after, .start_line = 1, .end_line = 2, .content_digest = wire.Sha256Digest.hash("one\ntwo\n") },
+    };
+    inline for (0..2) |_| {
+        const batch = try resolveCodeAnchorsInternal(
+            std.testing.allocator,
+            io,
+            context,
+            target,
+            &anchors,
+            null,
+            observer_path,
+        );
+        defer std.testing.allocator.free(batch.validations);
+        for (batch.validations) |validation| try std.testing.expect(validation == .validated);
+        try std.testing.expect(batch.selected_bytes == null);
+    }
+    const log = try tmp.dir.readFileAlloc(io, "commands.log", std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, log, "ls-tree -rz"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, log, "cat-file blob"));
+}
+
 test "CodeAnchor reads exact committed bytes and keeps path blob range digest and size terminals separate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1712,6 +2675,11 @@ test "projection accepts exact sixteen MiB and rejects only the next stdout byte
     var exact = try materializeCommittedProjection(std.testing.allocator, io, context, exact_target);
     defer exact.deinit(std.testing.allocator);
     try std.testing.expectEqual(max_projection_bytes, exact.projection.patch_bytes.len);
+    var exact_source = try materializeCommittedFindingProjectionSource(std.testing.allocator, io, context, exact_target);
+    defer exact_source.deinit(std.testing.allocator);
+    try std.testing.expectEqual(max_projection_bytes, exact_source.source.projection.patch_bytes.len);
+    try std.testing.expectEqualSlices(u8, exact.projection.patch_bytes, exact_source.source.projection.patch_bytes);
+    try std.testing.expectEqual(@as(usize, 1), exact_source.source.endpoints.records.len);
 
     try runTestGit(io, tmp.dir, &.{ "git", "reset", "--hard", "refs/heads/main" });
     const over_bytes = try std.testing.allocator.alloc(u8, exact_file_size + 1);
@@ -1730,6 +2698,9 @@ test "projection accepts exact sixteen MiB and rejects only the next stdout byte
     var over = try materializeCommittedProjection(std.testing.allocator, io, context, over_target);
     defer over.deinit(std.testing.allocator);
     try std.testing.expectEqual(ProjectionFailure.projection_too_large, over.failure);
+    var over_source = try materializeCommittedFindingProjectionSource(std.testing.allocator, io, context, over_target);
+    defer over_source.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ProjectionFailure.projection_too_large, over_source.failure);
 }
 
 test "partial clone missing blob keeps target success and fails projection without helpers or ODB writes" {

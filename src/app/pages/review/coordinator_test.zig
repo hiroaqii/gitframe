@@ -11,6 +11,7 @@ const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const app_test_support = @import("../../test_support.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
+const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const git_review = @import("../../../git/committed_review.zig");
 const git_refs = @import("../../../git/refs.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
@@ -698,6 +699,7 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
         repository_id,
         review_id,
         pinned_target,
+        false,
     );
     var bundle_owned = true;
     defer if (bundle_owned) pinned_bundle.deinit(allocator);
@@ -729,6 +731,24 @@ fn expectPinnedAcceptanceRetiresOrdinaryRefresh(
     const selection_identity = selection_task.identity;
     const selection_generation = selection_task.generation;
     ReviewHistorySelectionTask.destroy(selection_task, allocator);
+
+    const stale_bundle = try reviewHistoryPinnedBundle(
+        allocator,
+        store_snapshot,
+        repository_id,
+        review_id,
+        pinned_target,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 1), stale_bundle.selection.finding_projection.entries.len);
+    try app.update(.{ .load_finished = .{ .review = .{ .history_selection = .{
+        .identity = selection_identity,
+        .generation = selection_generation -% 1,
+        .store_identity = app.store.?.identity(),
+        .review_id = review_id,
+        .result = .{ .loaded = stale_bundle },
+    } } } }, &ctx);
+    try std.testing.expect(app.pages.review.ai_reviews.phase == .selection_loading);
 
     bundle_owned = false;
     try app.update(.{ .load_finished = .{ .review = .{ .history_selection = .{
@@ -1068,8 +1088,22 @@ fn reviewHistoryPinnedBundle(
     repository_id: committed_review.ReviewRepositoryId,
     review_id: committed_review.ReviewId,
     target: committed_review.CommittedReviewTarget,
+    with_finding: bool,
 ) !app_load.PinnedReviewLoadedBundle {
     const producer: committed_review.Producer = .{ .name = "reviewer", .model = "gpt-test" };
+    const finding_values = [_]committed_review.Finding{.{
+        .finding_id = .{ .bytes = "finding-stale" },
+        .anchor = .{
+            .path_bytes = "unchanged.zig",
+            .side = .after,
+            .start_line = 1,
+            .end_line = 1,
+            .content_digest = committed_review.Sha256Digest.hash("line\n"),
+        },
+        .severity = .warning,
+        .title = "stale fixture",
+        .body = "owned index cleanup",
+    }};
     const finding_set: committed_review.FindingSet = .{
         .schema_version = 1,
         .review_id = review_id,
@@ -1077,7 +1111,7 @@ fn reviewHistoryPinnedBundle(
         .timing = .{ .duration_ms = 1 },
         .target = target,
         .producer = producer,
-        .findings = &.{},
+        .findings = if (with_finding) &finding_values else &.{},
     };
     const findings_bytes = try finding_set.writeCanonical(allocator);
     errdefer allocator.free(findings_bytes);
@@ -1090,7 +1124,7 @@ fn reviewHistoryPinnedBundle(
         .target = target,
         .created_at = "2026-08-20T00:00:00Z",
         .display = .{ .base_label = "main", .head_label = "topic" },
-        .finding_count = 0,
+        .finding_count = if (with_finding) 1 else 0,
         .producer = producer,
         .findings_digest = committed_review.Sha256Digest.hash(findings_bytes),
     };
@@ -1100,6 +1134,26 @@ fn reviewHistoryPinnedBundle(
     errdefer manifest.deinit();
     const patch_bytes = try allocator.dupe(u8, "");
     errdefer allocator.free(patch_bytes);
+    var projection: git_review.CommittedDiffProjection = .{ .target = target, .patch_bytes = patch_bytes };
+    errdefer projection.deinit(allocator);
+    var endpoints: git_review.CommittedDiffEndpointSidecar = .{
+        .target = target,
+        .records = try allocator.alloc(git_review.CommittedDiffEndpointRecord, 0),
+    };
+    defer endpoints.deinit(allocator);
+    const one_validation = [_]git_review.CodeAnchorValidation{.{ .failure = .path_not_found }};
+    var index = try finding_projection.build(allocator, .{
+        .expected_review_repository_id = repository_id,
+        .requested_review_id = review_id,
+        .projection_target = target,
+        .manifest = &manifest.value,
+        .findings_bytes = findings_bytes,
+        .finding_set = &findings.value,
+        .projection = &projection,
+        .endpoints = &endpoints,
+        .anchor_validations = if (with_finding) &one_validation else &.{},
+    });
+    errdefer index.deinit(allocator);
 
     return .{
         .selection = .{
@@ -1117,7 +1171,8 @@ fn reviewHistoryPinnedBundle(
                 .created_at_unix = 0,
                 .retained_draft_diagnostic = null,
             },
-            .projection = .{ .target = target, .patch_bytes = patch_bytes },
+            .projection = projection,
+            .finding_projection = index,
         },
         .diff = .empty,
     };
