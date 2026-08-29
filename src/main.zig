@@ -129,6 +129,7 @@ const HelperCommand = enum {
     review_store_prepare,
     review_store_publish,
     review_store_read,
+    review_result_read,
 };
 
 fn helperCommand(args: []const []const u8) ?HelperCommand {
@@ -141,6 +142,7 @@ fn helperCommand(args: []const []const u8) ?HelperCommand {
     if (std.mem.eql(u8, args[1], "review-store-prepare")) return .review_store_prepare;
     if (std.mem.eql(u8, args[1], "review-store-publish")) return .review_store_publish;
     if (std.mem.eql(u8, args[1], "review-store-read")) return .review_store_read;
+    if (std.mem.eql(u8, args[1], "review-result-read")) return .review_result_read;
     return null;
 }
 
@@ -200,6 +202,14 @@ fn runHelper(command: HelperCommand, init: std.process.Init, arguments: []const 
             .stdout(),
         ),
         .review_store_read => gitframe.review_store_read_command.run(
+            init.gpa,
+            init.io,
+            init.environ_map,
+            arguments,
+            .stdin(),
+            .stdout(),
+        ),
+        .review_result_read => gitframe.review_result_read_command.run(
             init.gpa,
             init.io,
             init.environ_map,
@@ -450,6 +460,9 @@ test "helper first-token dispatch precedes global help scanning" {
     const read_args = [_][]const u8{ "gitframe", "review-store-read", "--help" };
     try std.testing.expectEqual(HelperCommand.review_store_read, helperCommand(&read_args).?);
     try std.testing.expect(wantsHelp(&read_args));
+    const result_read_args = [_][]const u8{ "gitframe", "review-result-read", "--help" };
+    try std.testing.expectEqual(HelperCommand.review_result_read, helperCommand(&result_read_args).?);
+    try std.testing.expect(wantsHelp(&result_read_args));
     const global_args = [_][]const u8{ "gitframe", "--help" };
     try std.testing.expect(helperCommand(&global_args) == null);
 }

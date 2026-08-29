@@ -20,6 +20,7 @@ pub const capabilities = [_]protocol.Capability{
     .{ .name = "committed-review.target", .versions = &v1 },
     .{ .name = "review-store.prepare", .versions = &v1 },
     .{ .name = "review-store.publish", .versions = &v1 },
+    .{ .name = "review-store.result-read", .versions = &v1 },
 };
 
 pub const CommandOutput = struct {
@@ -105,6 +106,7 @@ test "AI review protocol capabilities command emits the exact honest installed p
         .{ .name = "committed-review.target", .version = 1 },
         .{ .name = "review-store.prepare", .version = 1 },
         .{ .name = "review-store.publish", .version = 1 },
+        .{ .name = "review-store.result-read", .version = 1 },
     });
     try protocol.requireCapabilities(&parsed.value, &.{.{ .name = "ai-review.producer", .version = 1 }});
 }

@@ -6,6 +6,7 @@ pub const codec = @import("ai_review/codec.zig");
 pub const producer = @import("ai_review/producer.zig");
 pub const store_service = @import("ai_review/store_service.zig");
 pub const store_read_command = @import("ai_review/store_read_command.zig");
+pub const result_read_command = @import("ai_review/result_read_command.zig");
 
 pub const ReviewPlanSummary = protocol.ReviewPlanSummary;
 pub const ReviewUnit = protocol.ReviewUnit;
@@ -25,4 +26,5 @@ test {
     _ = producer;
     _ = store_service;
     _ = store_read_command;
+    _ = result_read_command;
 }

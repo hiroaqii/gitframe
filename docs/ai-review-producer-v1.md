@@ -3,7 +3,8 @@
 This document defines the provider-neutral protocol and deterministic input
 materializer used by the portable `gitframe-ai-review` Skill. The current
 input materializer does not invoke an AI, mutate the Review Store, publish a
-Run, install a Skill, or read a human result.
+Run, install a Skill, or read a human result. Human-result retrieval is a
+separate exact-ID helper described below.
 
 ## Authority boundary
 
@@ -32,7 +33,7 @@ does not open a repository, config, Store, TUI, or installation state. Success
 is one `CapabilityResponse`:
 
 ```json
-{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"ai-review.input","versions":[1]},{"name":"ai-review.producer","versions":[1]},{"name":"committed-review.artifact","versions":[1]},{"name":"committed-review.instructions","versions":[1]},{"name":"committed-review.projection","versions":[1]},{"name":"committed-review.target","versions":[1]},{"name":"review-store.prepare","versions":[1]},{"name":"review-store.publish","versions":[1]}]}
+{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"ai-review.input","versions":[1]},{"name":"ai-review.producer","versions":[1]},{"name":"committed-review.artifact","versions":[1]},{"name":"committed-review.instructions","versions":[1]},{"name":"committed-review.projection","versions":[1]},{"name":"committed-review.target","versions":[1]},{"name":"review-store.prepare","versions":[1]},{"name":"review-store.publish","versions":[1]},{"name":"review-store.result-read","versions":[1]}]}
 ```
 
 Capability names are strictly increasing by unsigned UTF-8 bytes. Each
@@ -50,14 +51,50 @@ The installed producer release advertises exactly, in order:
 6. `committed-review.target@1`
 7. `review-store.prepare@1`
 8. `review-store.publish@1`
+9. `review-store.result-read@1`
 
 `ai-review.producer@1` names only the installed read-only artifact command
-below. No Skill installation, result-reader, retry, recovery, or provider
-capability is advertised.
+below. `review-store.result-read@1` separately names the exact human-result
+reader; neither capability implies Skill installation, retry, recovery, or a
+provider capability.
 
 Any argument, including `--help`, returns exit 2 and a bounded canonical error
 line. Allocation/internal failure returns exit 70. Successful output is capped
 at 16 KiB.
+
+## Exact human result reader
+
+`gitframe review-result-read` is a one-shot, no-write helper for one canonical
+Review ID. It accepts the same strict v1 request as `review-store-read`: an
+absolute repository encoded as canonical padded RFC 4648 standard Base64, the
+exact `review_id`, and an optional complete expected publication identity. The
+request is capped at 16 KiB and the decoded repository path at 4,096 bytes.
+
+GitFrame freshly resolves the physical repository binding and configured
+Store, admits only the named Run, validates its manifest, findings, draft/result
+precedence and target objects, and revalidates concurrent snapshots. It never
+enumerates a namespace, selects newest/mtime/target alternatives, starts the
+TUI, polls, retries, or mutates Git or the Store.
+
+A valid Run without a result returns exit 0 and one compact `pending` header
+line. A valid result returns exit 0 and one compact `completed` header line,
+immediately followed by the exact canonical `result.json` bytes (including
+their final LF):
+
+```text
+pending:   status, schema_version, review_repository_id, review_id, target,
+           findings_sha256, finding_count, LF, EOF
+completed: the same fields, result_sha256, result_size, LF,
+           exactly result_size payload bytes, EOF
+```
+
+The header is capped at 16 KiB and the payload at the committed-review 16 MiB
+artifact bound. `result_sha256` binds every payload byte; the admitted result's
+review ID, target, and findings digest are cross-validated before output. A
+missing or invalid Run, unavailable target, expectation mismatch, invalid
+binding/Store, or concurrent change is a bounded path-free JSON error line with
+nonzero exit and no payload. Exact request, header, and payload examples live in
+[`testdata/ai-review-result-reader-v1`](../testdata/ai-review-result-reader-v1).
 
 ## Plan summary
 

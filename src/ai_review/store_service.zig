@@ -500,17 +500,62 @@ pub const ReadResult = union(enum) {
     }
 };
 
-/// Generic no-write exact-ID use case. It freshly resolves repository and
-/// Store authority, verifies both target objects, then compares the optional
-/// complete immutable publication identity.
-pub fn readExactIdentity(
+pub const ResultIdentity = struct {
+    review_repository_id: committed_review.ReviewRepositoryId,
+    review_id: committed_review.ReviewId,
+    target: committed_review.CommittedReviewTarget,
+    finding_count: u32,
+    findings_sha256: committed_review.Sha256Digest,
+};
+
+pub const CompletedResult = struct {
+    identity: ResultIdentity,
+    result_sha256: committed_review.Sha256Digest,
+    result_bytes: []u8,
+
+    pub fn deinit(self: *CompletedResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.result_bytes);
+        self.* = undefined;
+    }
+};
+
+pub const ExactResultRead = union(enum) {
+    pending: ResultIdentity,
+    completed: CompletedResult,
+    failure: ReadFailure,
+
+    pub fn deinit(self: *ExactResultRead, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .completed => |*value| value.deinit(allocator),
+            .pending, .failure => {},
+        }
+        self.* = .{ .failure = .io_failed };
+    }
+};
+
+const AdmittedExactRun = union(enum) {
+    exact: catalog_store.ExactRun,
+    failure: ReadFailure,
+
+    fn deinit(self: *AdmittedExactRun, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .exact => |*value| value.deinit(allocator),
+            .failure => {},
+        }
+        self.* = .{ .failure = .io_failed };
+    }
+};
+
+/// Freshly resolve and admit one exact Run. This common operation never scans
+/// a namespace and keeps the validated result bytes in the admitted snapshot.
+fn admitExactRun(
     allocator: std.mem.Allocator,
     io: std.Io,
     environment_map: ?*std.process.Environ.Map,
     repository_path: []const u8,
     review_id: committed_review.ReviewId,
     expected: ?ExpectedPublicationIdentity,
-) std.mem.Allocator.Error!ReadResult {
+) std.mem.Allocator.Error!AdmittedExactRun {
     var repository = switch (try openRepository(allocator, io, environment_map, repository_path)) {
         .context => |value| value,
         .failure => |failure| return .{ .failure = mapPublicationToReadFailure(failure) },
@@ -561,6 +606,36 @@ pub fn readExactIdentity(
             return .{ .failure = .expected_mismatch };
         }
     }
+    const owned = exact.*;
+    exact_result = .absent;
+    return .{ .exact = owned };
+}
+
+/// Generic no-write exact-ID use case. The compatibility result deliberately
+/// exposes identity and lifecycle only, preserving `review-store-read` v1.
+pub fn readExactIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment_map: ?*std.process.Environ.Map,
+    repository_path: []const u8,
+    review_id: committed_review.ReviewId,
+    expected: ?ExpectedPublicationIdentity,
+) std.mem.Allocator.Error!ReadResult {
+    var admitted = try admitExactRun(
+        allocator,
+        io,
+        environment_map,
+        repository_path,
+        review_id,
+        expected,
+    );
+    defer admitted.deinit(allocator);
+    const exact = switch (admitted) {
+        .failure => |failure| return .{ .failure = failure },
+        .exact => |*value| value,
+    };
+    const manifest = &exact.artifacts.manifest.value;
+    const artifacts = exact.artifact_snapshot;
     const producer_name = try allocator.dupe(u8, manifest.producer.name);
     errdefer allocator.free(producer_name);
     const producer_model = if (manifest.producer.model) |value| try allocator.dupe(u8, value) else null;
@@ -591,6 +666,51 @@ pub fn readExactIdentity(
             .draft => .draft,
             .completed => .result,
         },
+    } };
+}
+
+/// Read one exact human result without returning Store paths or authority.
+/// Pending is valid only after the same full Run and target admission.
+pub fn readExactResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment_map: ?*std.process.Environ.Map,
+    repository_path: []const u8,
+    review_id: committed_review.ReviewId,
+    expected: ?ExpectedPublicationIdentity,
+) std.mem.Allocator.Error!ExactResultRead {
+    var admitted = try admitExactRun(
+        allocator,
+        io,
+        environment_map,
+        repository_path,
+        review_id,
+        expected,
+    );
+    defer admitted.deinit(allocator);
+    const exact = switch (admitted) {
+        .failure => |failure| return .{ .failure = failure },
+        .exact => |*value| value,
+    };
+    const manifest = &exact.artifacts.manifest.value;
+    const identity: ResultIdentity = .{
+        .review_repository_id = manifest.review_repository_id,
+        .review_id = review_id,
+        .target = manifest.target,
+        .finding_count = manifest.finding_count,
+        .findings_sha256 = exact.artifact_snapshot.findings_digest,
+    };
+    const result_bytes = exact.artifacts.result_bytes orelse return .{ .pending = identity };
+    if (result_bytes.len == 0 or result_bytes.len > committed_review.limits.max_artifact_bytes) {
+        return .{ .failure = .artifact_invalid };
+    }
+    const result_sha256 = exact.artifact_snapshot.result_digest orelse
+        return .{ .failure = .artifact_invalid };
+    exact.artifacts.result_bytes = null;
+    return .{ .completed = .{
+        .identity = identity,
+        .result_sha256 = result_sha256,
+        .result_bytes = result_bytes,
     } };
 }
 
@@ -1017,7 +1137,7 @@ test "AI Review Store ownership proof has one application composition owner and 
 
     const own_source = try std.Io.Dir.cwd().readFileAlloc(io, "src/ai_review/store_service.zig", allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(own_source);
-    const read_start = std.mem.indexOf(u8, own_source, "pub fn readExactIdentity(") orelse return error.MissingExactReader;
+    const read_start = std.mem.indexOf(u8, own_source, "fn admitExactRun(") orelse return error.MissingExactReader;
     const read_end = std.mem.indexOfPos(u8, own_source, read_start, "pub const PublicationFailure") orelse return error.MissingExactReaderEnd;
     const exact_reader = own_source[read_start..read_end];
     try std.testing.expect(std.mem.indexOf(u8, exact_reader, "catalog_store.readExact(") != null);
@@ -1037,6 +1157,7 @@ test "AI Review Store ownership proof has one application composition owner and 
         "src/main.zig",
         "src/root.zig",
         "src/ai_review/store_read_command.zig",
+        "src/ai_review/result_read_command.zig",
         "src/review_store/prepare_command.zig",
         "src/review_store/publish_command.zig",
     }) |path| {
@@ -1084,6 +1205,7 @@ test "AI Review Store ownership proof has one application composition owner and 
         "ConfiguredStore",
         "ConfigurationIdentity",
         "readExactIdentity",
+        "readExactResult",
         "prepare",
         "publish",
         "saveDraft",
@@ -1198,6 +1320,11 @@ fn runTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
     return error.GitCommandFailed;
 }
 
+fn runTestGitDiscard(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !void {
+    const stdout = try runTestGit(io, cwd, argv);
+    std.testing.allocator.free(stdout);
+}
+
 fn singleOutputLine(bytes: []const u8) ![]const u8 {
     if (bytes.len < 2 or bytes[bytes.len - 1] != '\n' or
         std.mem.indexOfScalar(u8, bytes[0 .. bytes.len - 1], '\n') != null)
@@ -1213,6 +1340,191 @@ fn writePrivate(io: std.Io, directory: std.Io.Dir, name: []const u8, bytes: []co
         .data = bytes,
         .flags = .{ .permissions = .fromMode(0o600) },
     });
+}
+
+const ReadStateContext = struct {
+    repository: std.Io.Dir,
+    repository_path: []const u8,
+    store_path: []const u8,
+};
+
+const ReadOnlyState = struct {
+    head: []u8,
+    branch: []u8,
+    index: []u8,
+    local_config: []u8,
+    worktree: []u8,
+    store: []u8,
+
+    fn deinit(self: *ReadOnlyState, allocator: std.mem.Allocator) void {
+        allocator.free(self.store);
+        allocator.free(self.worktree);
+        allocator.free(self.local_config);
+        allocator.free(self.index);
+        allocator.free(self.branch);
+        allocator.free(self.head);
+        self.* = undefined;
+    }
+};
+
+fn captureReadOnlyState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: ReadStateContext,
+) !ReadOnlyState {
+    const head = try runTestGit(io, context.repository, &.{ "git", "--no-optional-locks", "rev-parse", "--verify", "HEAD" });
+    errdefer allocator.free(head);
+    const branch = try runTestGit(io, context.repository, &.{ "git", "--no-optional-locks", "rev-parse", "--symbolic-full-name", "HEAD" });
+    errdefer allocator.free(branch);
+    const index_path_output = try runTestGit(io, context.repository, &.{ "git", "--no-optional-locks", "rev-parse", "--path-format=absolute", "--git-path", "index" });
+    defer allocator.free(index_path_output);
+    const index_path = try singleOutputLine(index_path_output);
+    const index = try std.Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(64 * 1024 * 1024));
+    errdefer allocator.free(index);
+    const local_config = try runTestGit(io, context.repository, &.{ "git", "--no-optional-locks", "config", "--local", "--null", "--list" });
+    errdefer allocator.free(local_config);
+    const worktree = try directoryInventory(allocator, io, context.repository_path, true);
+    errdefer allocator.free(worktree);
+    const store = try directoryInventory(allocator, io, context.store_path, false);
+    return .{
+        .head = head,
+        .branch = branch,
+        .index = index,
+        .local_config = local_config,
+        .worktree = worktree,
+        .store = store,
+    };
+}
+
+fn expectReadOnlyStateEqual(before: ReadOnlyState, after: ReadOnlyState) !void {
+    if (!std.mem.eql(u8, before.head, after.head)) return error.ReadMutatedHead;
+    if (!std.mem.eql(u8, before.branch, after.branch)) return error.ReadMutatedBranch;
+    if (!std.mem.eql(u8, before.index, after.index)) return error.ReadMutatedIndex;
+    if (!std.mem.eql(u8, before.local_config, after.local_config)) return error.ReadMutatedRemote;
+    if (!std.mem.eql(u8, before.worktree, after.worktree)) return error.ReadMutatedWorktree;
+    if (!std.mem.eql(u8, before.store, after.store)) return error.ReadMutatedStore;
+}
+
+fn expectReadOnlyStateSensitivity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: ReadStateContext,
+) !void {
+    {
+        var baseline = try captureReadOnlyState(allocator, io, context);
+        defer baseline.deinit(allocator);
+        const original_branch = try singleOutputLine(baseline.branch);
+        try runTestGitDiscard(io, context.repository, &.{ "git", "branch", "read-state-proof", "HEAD" });
+        try runTestGitDiscard(io, context.repository, &.{ "git", "symbolic-ref", "HEAD", "refs/heads/read-state-proof" });
+        var changed = try captureReadOnlyState(allocator, io, context);
+        defer changed.deinit(allocator);
+        try std.testing.expectError(error.ReadMutatedBranch, expectReadOnlyStateEqual(baseline, changed));
+        try runTestGitDiscard(io, context.repository, &.{ "git", "symbolic-ref", "HEAD", original_branch });
+        try runTestGitDiscard(io, context.repository, &.{ "git", "branch", "--delete", "--force", "read-state-proof" });
+        var restored = try captureReadOnlyState(allocator, io, context);
+        defer restored.deinit(allocator);
+        try expectReadOnlyStateEqual(baseline, restored);
+    }
+
+    {
+        var baseline = try captureReadOnlyState(allocator, io, context);
+        defer baseline.deinit(allocator);
+        try runTestGitDiscard(io, context.repository, &.{ "git", "update-index", "--skip-worktree", "file.txt" });
+        var changed = try captureReadOnlyState(allocator, io, context);
+        defer changed.deinit(allocator);
+        try std.testing.expectError(error.ReadMutatedIndex, expectReadOnlyStateEqual(baseline, changed));
+        try runTestGitDiscard(io, context.repository, &.{ "git", "update-index", "--no-skip-worktree", "file.txt" });
+    }
+
+    {
+        var baseline = try captureReadOnlyState(allocator, io, context);
+        defer baseline.deinit(allocator);
+        try runTestGitDiscard(io, context.repository, &.{ "git", "remote", "add", "read-state-proof", "https://example.invalid/repository" });
+        var changed = try captureReadOnlyState(allocator, io, context);
+        defer changed.deinit(allocator);
+        try std.testing.expectError(error.ReadMutatedRemote, expectReadOnlyStateEqual(baseline, changed));
+        try runTestGitDiscard(io, context.repository, &.{ "git", "remote", "remove", "read-state-proof" });
+        var restored = try captureReadOnlyState(allocator, io, context);
+        defer restored.deinit(allocator);
+        try expectReadOnlyStateEqual(baseline, restored);
+    }
+}
+
+fn inventoryLineLessThan(_: void, left: []u8, right: []u8) bool {
+    return std.mem.lessThan(u8, left, right);
+}
+
+fn collectDirectoryInventory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    directory: std.Io.Dir,
+    prefix: []const u8,
+    skip_root_git: bool,
+    lines: *std.ArrayList([]u8),
+) !void {
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (skip_root_git and prefix.len == 0 and std.mem.eql(u8, entry.name, ".git")) continue;
+        const relative = if (prefix.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+        defer allocator.free(relative);
+        const stat = try directory.statFile(io, entry.name, .{ .follow_symlinks = false });
+        const mode = stat.permissions.toMode() & 0o7777;
+        switch (entry.kind) {
+            .directory => {
+                const line = try std.fmt.allocPrint(allocator, "{s}\tdirectory\t{o}\n", .{ relative, mode });
+                errdefer allocator.free(line);
+                try lines.append(allocator, line);
+                var child = try directory.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+                defer child.close(io);
+                try collectDirectoryInventory(allocator, io, child, relative, false, lines);
+            },
+            .file => {
+                const bytes = try directory.readFileAlloc(io, entry.name, allocator, .limited(64 * 1024 * 1024));
+                defer allocator.free(bytes);
+                const digest = committed_review.Sha256Digest.hash(bytes).canonical();
+                const line = try std.fmt.allocPrint(allocator, "{s}\tfile\t{o}\t{d}\t{s}\n", .{ relative, mode, bytes.len, &digest });
+                errdefer allocator.free(line);
+                try lines.append(allocator, line);
+            },
+            .sym_link => {
+                var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const target_length = try directory.readLink(io, entry.name, &target_buffer);
+                const target = target_buffer[0..target_length];
+                const line = try std.fmt.allocPrint(allocator, "{s}\tsym_link\t{o}\t{d}:{s}\n", .{ relative, mode, target.len, target });
+                errdefer allocator.free(line);
+                try lines.append(allocator, line);
+            },
+            else => {
+                const line = try std.fmt.allocPrint(allocator, "{s}\t{s}\t{o}\n", .{ relative, @tagName(entry.kind), mode });
+                errdefer allocator.free(line);
+                try lines.append(allocator, line);
+            },
+        }
+    }
+}
+
+fn directoryInventory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    skip_root_git: bool,
+) ![]u8 {
+    var directory = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true, .follow_symlinks = false });
+    defer directory.close(io);
+    var lines: std.ArrayList([]u8) = .empty;
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    try collectDirectoryInventory(allocator, io, directory, "", skip_root_git, &lines);
+    std.mem.sort([]u8, lines.items, {}, inventoryLineLessThan);
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    for (lines.items) |line| try result.appendSlice(allocator, line);
+    return result.toOwnedSlice(allocator);
 }
 
 fn seedTestRun(
@@ -1741,6 +2053,91 @@ test "AI Review Store application review history backend AI Reviews picker selec
     defer command_environment.deinit();
     try command_environment.put("XDG_CONFIG_HOME", config_home);
 
+    // The drift/invalid-artifact checks above deliberately replaced this
+    // manifest. Restore the admitted bytes before exercising the fresh reader.
+    try writePrivate(io, valid_directory, "manifest.json", selected_value.artifacts.manifest_bytes);
+    const read_state: ReadStateContext = .{
+        .repository = repo,
+        .repository_path = repo_path,
+        .store_path = store_path_text,
+    };
+
+    // These fixture-owned mutations prove the comparator's sensitivity and
+    // are fully restored before any product-read interval begins.
+    try expectReadOnlyStateSensitivity(allocator, io, read_state);
+
+    try expectExactResultPending(
+        allocator,
+        io,
+        read_state,
+        &command_environment,
+        repo_path,
+        repository_id,
+        new_id,
+        target,
+    );
+    try expectExactResultPending(
+        allocator,
+        io,
+        read_state,
+        &command_environment,
+        repo_path,
+        repository_id,
+        draft_id,
+        target,
+    );
+    for ([_]struct { id: committed_review.ReviewId, decision: committed_review.ReviewResultValue }{
+        .{ .id = completed_id, .decision = .approved },
+        .{ .id = needs_changes_id, .decision = .needs_changes },
+        .{ .id = canceled_id, .decision = .canceled },
+        // A valid result remains authoritative over an invalid or unsafe
+        // retained draft and returns no draft bytes.
+        .{ .id = valid_id, .decision = .approved },
+        .{ .id = unsafe_draft_id, .decision = .approved },
+    }) |case| {
+        try expectExactResultDecision(
+            allocator,
+            io,
+            read_state,
+            &command_environment,
+            repo_path,
+            repository_id,
+            case.id,
+            target,
+            case.decision,
+        );
+    }
+    try expectExactResultFailure(
+        allocator,
+        io,
+        read_state,
+        &command_environment,
+        repo_path,
+        invalid_result_id,
+        null,
+        .artifact_invalid,
+    );
+    try expectExactResultFailure(
+        allocator,
+        io,
+        read_state,
+        &command_environment,
+        repo_path,
+        missing_target_id,
+        null,
+        .target_unavailable,
+    );
+    try expectExactResultFailure(
+        allocator,
+        io,
+        read_state,
+        &command_environment,
+        repo_path,
+        try committed_review.ReviewId.parse("e23e4567-e89b-42d3-a456-426614174000"),
+        null,
+        .review_not_found,
+    );
+
     var observed = try readExactIdentity(
         allocator,
         io,
@@ -1811,6 +2208,16 @@ test "AI Review Store application review history backend AI Reviews picker selec
     expected.manifest_sha256 = exact_identity.identity.manifest_sha256;
     expected.findings_sha256 = committed_review.Sha256Digest.hash("other findings");
     try expectExactIdentityMismatch(allocator, io, &command_environment, repo_path, new_id, expected);
+    try expectExactResultFailure(
+        allocator,
+        io,
+        read_state,
+        &command_environment,
+        repo_path,
+        new_id,
+        expected,
+        .expected_mismatch,
+    );
 
     // The public semantic context owns the same mutation use cases without
     // exposing a Store path or capability to App consumers.
@@ -1844,6 +2251,17 @@ test "AI Review Store application review history backend AI Reviews picker selec
     defer completed.deinit(allocator);
     try std.testing.expect(completed == .committed);
     try std.testing.expectEqual(@as(u64, 1), completed.committed.revision);
+    try expectExactResultDecision(
+        allocator,
+        io,
+        read_state,
+        &command_environment,
+        repo_path,
+        repository_id,
+        new_id,
+        target,
+        .approved,
+    );
 
     try tmp.dir.rename("store", tmp.dir, "store-original", io);
     try tmp.dir.createDir(io, "store", .fromMode(0o700));
@@ -1859,6 +2277,95 @@ test "AI Review Store application review history backend AI Reviews picker selec
     defer root_replaced.deinit(allocator);
     try std.testing.expect(root_replaced == .failure);
     try std.testing.expectEqual(SelectionFailure.root_drift, root_replaced.failure);
+}
+
+fn expectExactResultPending(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_context: ReadStateContext,
+    environment: *std.process.Environ.Map,
+    repository_path: []const u8,
+    repository_id: committed_review.ReviewRepositoryId,
+    review_id: committed_review.ReviewId,
+    target: committed_review.CommittedReviewTarget,
+) !void {
+    var before = try captureReadOnlyState(allocator, io, state_context);
+    defer before.deinit(allocator);
+    var result = try readExactResult(allocator, io, environment, repository_path, review_id, null);
+    defer result.deinit(allocator);
+    const identity = switch (result) {
+        .pending => |*value| value,
+        .completed, .failure => return error.ExpectedPendingResult,
+    };
+    try std.testing.expect(identity.review_repository_id.eql(repository_id));
+    try std.testing.expect(identity.review_id.eql(review_id));
+    try std.testing.expect(identity.target.eql(&target));
+    try std.testing.expectEqual(@as(u32, 0), identity.finding_count);
+    var after = try captureReadOnlyState(allocator, io, state_context);
+    defer after.deinit(allocator);
+    try expectReadOnlyStateEqual(before, after);
+}
+
+fn expectExactResultDecision(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_context: ReadStateContext,
+    environment: *std.process.Environ.Map,
+    repository_path: []const u8,
+    repository_id: committed_review.ReviewRepositoryId,
+    review_id: committed_review.ReviewId,
+    target: committed_review.CommittedReviewTarget,
+    decision: committed_review.ReviewResultValue,
+) !void {
+    var before = try captureReadOnlyState(allocator, io, state_context);
+    defer before.deinit(allocator);
+    var result = try readExactResult(allocator, io, environment, repository_path, review_id, null);
+    defer result.deinit(allocator);
+    const completed = switch (result) {
+        .completed => |*value| value,
+        .pending, .failure => return error.ExpectedCompletedResult,
+    };
+    try std.testing.expect(completed.identity.review_repository_id.eql(repository_id));
+    try std.testing.expect(completed.identity.review_id.eql(review_id));
+    try std.testing.expect(completed.identity.target.eql(&target));
+    try std.testing.expectEqual(@as(u32, 0), completed.identity.finding_count);
+    try std.testing.expect(completed.result_bytes.len > 0);
+    try std.testing.expect(completed.result_bytes.len <= committed_review.limits.max_artifact_bytes);
+    try std.testing.expect(committed_review.Sha256Digest.hash(completed.result_bytes).eql(completed.result_sha256));
+
+    var parsed = try committed_review.RevisionReviewResult.parseStrict(allocator, completed.result_bytes);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.review_id.eql(review_id));
+    try std.testing.expect(parsed.value.target.eql(&target));
+    try std.testing.expect(parsed.value.findings_digest.eql(completed.identity.findings_sha256));
+    try std.testing.expectEqual(decision, parsed.value.result);
+    const canonical = try parsed.value.writeCanonical(allocator);
+    defer allocator.free(canonical);
+    try std.testing.expectEqualStrings(completed.result_bytes, canonical);
+    var after = try captureReadOnlyState(allocator, io, state_context);
+    defer after.deinit(allocator);
+    try expectReadOnlyStateEqual(before, after);
+}
+
+fn expectExactResultFailure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_context: ReadStateContext,
+    environment: *std.process.Environ.Map,
+    repository_path: []const u8,
+    review_id: committed_review.ReviewId,
+    expected: ?ExpectedPublicationIdentity,
+    failure: ReadFailure,
+) !void {
+    var before = try captureReadOnlyState(allocator, io, state_context);
+    defer before.deinit(allocator);
+    var result = try readExactResult(allocator, io, environment, repository_path, review_id, expected);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqual(failure, result.failure);
+    var after = try captureReadOnlyState(allocator, io, state_context);
+    defer after.deinit(allocator);
+    try expectReadOnlyStateEqual(before, after);
 }
 
 fn expectExactIdentityMatch(
