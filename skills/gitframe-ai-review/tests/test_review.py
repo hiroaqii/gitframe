@@ -23,7 +23,7 @@ SPEC.loader.exec_module(review)
 
 FAKE = r'''#!/usr/bin/env python3
 import base64,binascii,hashlib,json,os,sys,uuid
-def enc(v): return (json.dumps(v,separators=(",",":"))+"\n").encode()
+def enc(v): return (json.dumps(v,ensure_ascii=False,separators=(",",":"))+"\n").encode()
 def sha(v): return "sha256:"+hashlib.sha256(v).hexdigest()
 def log(name):
  p=os.environ["FAKE_LOG"]
@@ -32,7 +32,9 @@ cmd=sys.argv[1:]; name=" ".join(cmd[:2]) if cmd[:1]==["review-producer"] else cm
 target={"object_format":"sha1","source_kind":"branch_range","base_oid":"1"*40,"head_oid":"2"*40,"diff_base_oid":"1"*40}
 if name=="review-capabilities":
  names=["ai-review.input","ai-review.producer","committed-review.artifact","committed-review.instructions","committed-review.projection","committed-review.target","review-store.prepare","review-store.publish"]
- sys.stdout.buffer.write(enc({"schema_version":1,"status":"ok","gitframe_version":"0.0.0-test","capabilities":[{"name":n,"versions":[1]} for n in names]}))
+ if os.environ.get("FAKE_NO_RESULT_CAPABILITY")!="1": names.append("review-store.result-read")
+ capabilities=[{"name":n,"versions":[True if n=="review-store.result-read" and os.environ.get("FAKE_BOOLEAN_RESULT_CAPABILITY")=="1" else 2 if n=="review-store.result-read" and os.environ.get("FAKE_FUTURE_RESULT_CAPABILITY")=="1" else 1]} for n in names]
+ sys.stdout.buffer.write(enc({"schema_version":True if os.environ.get("FAKE_BOOLEAN_CAPABILITY_SCHEMA")=="1" else 1,"status":"ok","gitframe_version":"0.0.0-test","capabilities":capabilities}))
 elif name=="review-target": sys.stdout.buffer.write(enc({"schema_version":1,"status":"ok","target":target}))
 elif name=="review-projection":
  patch=b"" if os.environ.get("FAKE_EMPTY")=="1" else b"diff"
@@ -57,6 +59,36 @@ elif name=="review-store-publish":
   sys.stdout.buffer.write(enc({"status":"error","schema_version":1,"code":"review_exists","message":"review already exists"})); sys.exit(73)
  if os.environ.get("FAKE_UNKNOWN")=="1": sys.stdout.buffer.write(b"not-json")
  else: sys.stdout.buffer.write(enc({"status":"ok","schema_version":1,"review_repository_id":header["review_repository_id"],"review_id":header["review_id"]}))
+elif name=="review-result-read":
+ data=sys.stdin.buffer.read()
+ request_path=os.environ.get("FAKE_REQUEST_LOG")
+ if request_path:
+  with open(request_path,"wb") as f: f.write(data)
+ mode=os.environ.get("FAKE_RESULT_MODE","completed")
+ if mode in ("error","boolean_error_schema","unknown_error"):
+  sys.stderr.buffer.write(b"/secret/review-store/result.json\n")
+  sys.stdout.buffer.write(enc({"status":"error","schema_version":True if mode=="boolean_error_schema" else 1,"code":"unexpected" if mode=="unknown_error" else "artifact_invalid","message":"hidden fake path"}));sys.exit(65)
+ if mode=="oversized_error":
+  sys.stdout.buffer.write(enc({"status":"error","schema_version":1,"code":"x"*20000,"message":"hidden fake path"}));sys.exit(65)
+ if mode=="oversized": sys.stdout.buffer.write(b"x"*(16*1024*1024+16*1024+1));sys.exit(0)
+ if mode=="malformed": sys.stdout.buffer.write(b"not-json");sys.exit(0)
+ request=json.loads(data);review_id=request["review_id"]
+ repository_id="223e4567-e89b-42d3-a456-426614174000";findings=sha(b"findings\n")
+ zero=os.environ.get("FAKE_ZERO_FINDINGS")=="1";count=0 if zero else 3
+ header={"status":"pending","schema_version":1,"review_repository_id":repository_id,"review_id":review_id,"target":target,"findings_sha256":findings,"finding_count":count}
+ if mode=="boolean_header_schema": header["schema_version"]=True
+ if mode=="pending": sys.stdout.buffer.write(enc(header));sys.exit(0)
+ dispositions=[] if zero else [{"finding_id":"F-1","disposition":"accepted"},{"finding_id":"F-2","disposition":"dismissed"},{"finding_id":"F-3","disposition":"unreviewed"}]
+ notes=[] if zero else [{"anchor":{"path_bytes_b64":"c3JjL21haW4uemln","display_path":"src/main.zig","side":"after","start_line":2,"end_line":2,"content_digest":"sha256:"+"0"*64,"quoted_text":"line\n"},"body":"確認してください。\n詳細","related_finding_ids":["F-1","F-2"]}]
+ result={"schema_version":1,"review_id":review_id,"target":target,"findings_digest":findings,"result":os.environ.get("FAKE_DECISION","needs_changes"),"completed_at":"2026-08-29T00:00:00Z","summary":"要修正です。\n二行目","finding_dispositions":dispositions,"anchored_notes":notes}
+ if mode=="boolean_result_schema": result["schema_version"]=True
+ payload=enc(result)
+ header["status"]="completed";header["result_sha256"]=sha(payload);header["result_size"]=len(payload)
+ if mode=="wrong_identity": header["review_id"]="323e4567-e89b-42d3-a456-426614174000"
+ if mode=="wrong_digest": header["result_sha256"]=sha(b"wrong")
+ frame=enc(header)+payload
+ if mode=="extra": frame+=b"x"
+ sys.stdout.buffer.write(frame)
 elif name=="review-store-read":
  try:
   request=json.loads(sys.stdin.buffer.read()); value=request["repository"]["path_bytes_b64"]
@@ -71,6 +103,15 @@ elif name=="review-store-read":
   sys.stdout.buffer.write(enc({"status":"error","schema_version":1,"code":"invalid_request","message":"invalid request"})); sys.exit(64)
 '''
 
+REVIEW_ID = "123e4567-e89b-42d3-a456-426614174000"
+TARGET = {"object_format": "sha1", "source_kind": "branch_range", "base_oid": "1" * 40,
+    "head_oid": "2" * 40, "diff_base_oid": "1" * 40}
+FINDINGS_DIGEST = review.digest(b"findings\n")
+EXPECTED = {"review_repository_id": "223e4567-e89b-42d3-a456-426614174000",
+    "target": TARGET, "producer": {"name": "test", "model": "fixture", "version": "1",
+        "skill_version": "0.1.0"}, "created_at": "2026-08-29T00:00:00Z", "finding_count": 3,
+    "manifest_sha256": review.digest(b"manifest\n"), "findings_sha256": FINDINGS_DIGEST}
+
 
 class DriverTests(unittest.TestCase):
     def setUp(self):
@@ -82,19 +123,23 @@ class DriverTests(unittest.TestCase):
         self.fake.write_text(FAKE)
         self.fake.chmod(0o700)
         self.log = self.root / "events"
+        self.request_log = self.root / "request"
         self.store = self.root / "store"
         self.store.mkdir()
         self.environment = dict(os.environ, FAKE_LOG=str(self.log), FAKE_STORE=str(self.store),
-            FAKE_REPOSITORY=str(self.repository))
+            FAKE_REPOSITORY=str(self.repository), FAKE_REQUEST_LOG=str(self.request_log))
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def invoke(self, *arguments, extra=None):
+    def invoke_raw(self, *arguments, extra=None):
         environment = dict(self.environment)
         environment.update(extra or {})
-        completed = subprocess.run([sys.executable, "-I", str(DRIVER), *arguments],
+        return subprocess.run([sys.executable, "-I", str(DRIVER), *arguments],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment, check=False)
+
+    def invoke(self, *arguments, extra=None):
+        completed = self.invoke_raw(*arguments, extra=extra)
         return completed, json.loads(completed.stdout)
 
     def start(self, extra=None):
@@ -109,11 +154,23 @@ class DriverTests(unittest.TestCase):
     def events(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
 
+    def read_result(self, expected=None, extra=None, review_id=REVIEW_ID):
+        arguments = ["read-result", "--gitframe", str(self.fake), "--repository",
+            str(self.repository), "--review-id", review_id]
+        if expected is not None:
+            arguments.extend(["--expected-publication-json", expected])
+        return self.invoke_raw(*arguments, extra=extra)
+
+    def split_frame(self, data):
+        header, payload = data.split(b"\n", 1)
+        return json.loads(header), payload
+
     def test_argument_failures_are_one_canonical_json_terminal_without_children(self):
         cases = [
             (),
             ("begin", "--gitframe", str(self.fake)),
             ("complete", "--workspace", "/nonexistent"),
+            ("read-result", "--gitframe", str(self.fake), "--repository", str(self.repository)),
             ("begin", "--gitframe", str(self.fake), "--repository", str(self.repository),
                 "--base", "main", "--unknown"),
             ("--help",),
@@ -125,6 +182,172 @@ class DriverTests(unittest.TestCase):
                     "code": "invalid_arguments", "message": "review driver arguments are invalid"}
                 self.assertEqual((completed.returncode, completed.stderr, result), (1, b"", expected))
                 self.assertEqual(completed.stdout, review.encoded(expected))
+                self.assertEqual(self.events(), [])
+
+    def test_read_result_pending_is_one_exact_read_without_retry_or_mutation(self):
+        completed = self.read_result(extra={"FAKE_RESULT_MODE": "pending"})
+        header, payload = self.split_frame(completed.stdout)
+        self.assertEqual((completed.returncode, completed.stderr, payload), (0, b"", b""))
+        self.assertEqual(header, {"status": "pending", "schema_version": 1,
+            "review_repository_id": EXPECTED["review_repository_id"], "review_id": REVIEW_ID,
+            "target": TARGET, "findings_sha256": FINDINGS_DIGEST, "finding_count": 3})
+        self.assertEqual(completed.stdout, review.encoded(header))
+        request = json.loads(self.request_log.read_bytes())
+        self.assertEqual(list(request), ["schema_version", "repository", "review_id"])
+        self.assertEqual(base64.b64decode(request["repository"]["path_bytes_b64"], validate=True),
+            os.fsencode(self.repository))
+        self.assertEqual(self.events(), ["review-capabilities", "review-result-read"])
+
+    def test_read_result_preserves_all_decisions_zero_findings_and_unicode_notes(self):
+        anchor = {"path_bytes_b64": "c3JjL21haW4uemln", "display_path": "src/main.zig",
+            "side": "after", "start_line": 2, "end_line": 2,
+            "content_digest": "sha256:" + "0" * 64, "quoted_text": "line\n"}
+        dispositions = [{"finding_id": "F-1", "disposition": "accepted"},
+            {"finding_id": "F-2", "disposition": "dismissed"},
+            {"finding_id": "F-3", "disposition": "unreviewed"}]
+        notes = [{"anchor": anchor, "body": "確認してください。\n詳細",
+            "related_finding_ids": ["F-1", "F-2"]}]
+        for decision in ("approved", "needs_changes", "canceled"):
+            with self.subTest(decision=decision):
+                self.log.unlink(missing_ok=True)
+                completed = self.read_result(extra={"FAKE_DECISION": decision})
+                header, payload = self.split_frame(completed.stdout)
+                expected_result = {"schema_version": 1, "review_id": REVIEW_ID, "target": TARGET,
+                    "findings_digest": FINDINGS_DIGEST, "result": decision,
+                    "completed_at": "2026-08-29T00:00:00Z", "summary": "要修正です。\n二行目",
+                    "finding_dispositions": dispositions, "anchored_notes": notes}
+                expected_payload = review.encoded(expected_result)
+                expected_header = {"status": "completed", "schema_version": 1,
+                    "review_repository_id": EXPECTED["review_repository_id"], "review_id": REVIEW_ID,
+                    "target": TARGET, "findings_sha256": FINDINGS_DIGEST, "finding_count": 3,
+                    "result_sha256": review.digest(expected_payload), "result_size": len(expected_payload)}
+                self.assertEqual((completed.returncode, completed.stderr), (0, b""))
+                self.assertEqual((header, payload), (expected_header, expected_payload))
+                self.assertEqual(completed.stdout, review.encoded(expected_header) + expected_payload)
+                self.assertEqual(self.events(), ["review-capabilities", "review-result-read"])
+
+        self.log.unlink(missing_ok=True)
+        completed = self.read_result(extra={"FAKE_ZERO_FINDINGS": "1"})
+        header, payload = self.split_frame(completed.stdout)
+        result = json.loads(payload)
+        self.assertEqual((completed.returncode, header["finding_count"],
+            result["finding_dispositions"], result["anchored_notes"]), (0, 0, [], []))
+        self.assertEqual(self.events(), ["review-capabilities", "review-result-read"])
+
+    def test_read_result_validates_and_forwards_complete_expected_identity(self):
+        expected_text = review.encoded(EXPECTED)[:-1].decode()
+        completed = self.read_result(expected=expected_text)
+        self.assertEqual((completed.returncode, completed.stderr), (0, b""))
+        request = json.loads(self.request_log.read_bytes(), object_pairs_hook=review.no_duplicates)
+        self.assertEqual(list(request), ["schema_version", "repository", "review_id", "expected"])
+        self.assertEqual(request["expected"], EXPECTED)
+        self.assertEqual(self.request_log.read_bytes(), review.encoded(request))
+        self.assertEqual(self.events(), ["review-capabilities", "review-result-read"])
+
+    def test_invalid_expected_identity_boundaries_start_no_child(self):
+        expected_text = review.encoded(EXPECTED)[:-1].decode()
+        reordered = dict(list(EXPECTED.items())[1:] + list(EXPECTED.items())[:1])
+        cases = [
+            "",
+            "{",
+            '{"review_repository_id":"223e4567-e89b-42d3-a456-426614174000","review_repository_id":"223e4567-e89b-42d3-a456-426614174000"}',
+            '{"review_repository_id":"223e4567-e89b-42d3-a456-426614174000"}',
+            expected_text[:-1] + ',"unknown":1}',
+            "null",
+            json.dumps(reordered, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(EXPECTED, ensure_ascii=False),
+            expected_text.replace('{"name":"test"', '{"name":null', 1),
+            "x" * 4096,
+            "x" * 4097,
+            "é" * 2048,
+            "é" * 2048 + "x",
+        ]
+        expected_terminal = {"status": "error", "schema_version": 1,
+            "code": "invalid_expected_publication",
+            "message": "expected publication identity is invalid"}
+        for value in cases:
+            with self.subTest(size=len(value.encode("utf-8")), prefix=value[:20]):
+                self.log.unlink(missing_ok=True)
+                self.request_log.unlink(missing_ok=True)
+                completed = self.read_result(expected=value)
+                self.assertEqual((completed.returncode, completed.stderr, json.loads(completed.stdout)),
+                    (1, b"", expected_terminal))
+                self.assertEqual(completed.stdout, review.encoded(expected_terminal))
+                self.assertEqual(self.events(), [])
+                self.assertFalse(self.request_log.exists())
+
+        args = types.SimpleNamespace(gitframe=str(self.fake), repository=str(self.repository),
+            review_id=REVIEW_ID, expected_publication_json="\ud800")
+        with mock.patch.object(review, "helper") as child:
+            with self.assertRaises(review.Failure) as failure:
+                review.read_result(args)
+        self.assertEqual(failure.exception.code, "invalid_expected_publication")
+        child.assert_not_called()
+
+        args.expected_publication_json = expected_text
+        with mock.patch.object(review, "MAX_READ_REQUEST", 1), mock.patch.object(review, "helper") as child:
+            with self.assertRaises(review.Failure) as failure:
+                review.read_result(args)
+        self.assertEqual(failure.exception.code, "invalid_expected_publication")
+        child.assert_not_called()
+
+    def test_read_result_requires_only_its_action_capability(self):
+        for extra in ({"FAKE_NO_RESULT_CAPABILITY": "1"},
+                {"FAKE_FUTURE_RESULT_CAPABILITY": "1"},
+                {"FAKE_BOOLEAN_RESULT_CAPABILITY": "1"},
+                {"FAKE_BOOLEAN_CAPABILITY_SCHEMA": "1"}):
+            with self.subTest(extra=extra):
+                self.log.unlink(missing_ok=True)
+                completed = self.read_result(extra=extra)
+                result = json.loads(completed.stdout)
+                self.assertEqual((completed.returncode, result["code"]), (1, "incompatible_gitframe"))
+                self.assertEqual(self.events(), ["review-capabilities"])
+
+        self.log.unlink(missing_ok=True)
+        completed = self.read_result(extra={"FAKE_RESULT_MODE": "pending"})
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(self.events(), ["review-capabilities", "review-result-read"])
+
+    def test_read_result_failures_are_bounded_sanitized_and_never_retried(self):
+        cases = {
+            "error": "artifact_invalid",
+            "boolean_error_schema": "helper_failed",
+            "unknown_error": "helper_failed",
+            "malformed": "invalid_result_frame",
+            "wrong_identity": "invalid_result_frame",
+            "wrong_digest": "invalid_result_frame",
+            "extra": "invalid_result_frame",
+            "oversized": "helper_output_limit",
+            "oversized_error": "helper_failed",
+            "boolean_header_schema": "invalid_result_frame",
+            "boolean_result_schema": "invalid_result_frame",
+        }
+        for mode, code in cases.items():
+            with self.subTest(mode=mode):
+                self.log.unlink(missing_ok=True)
+                completed = self.read_result(extra={"FAKE_RESULT_MODE": mode})
+                result = json.loads(completed.stdout)
+                self.assertEqual((completed.returncode, completed.stderr, result["status"], result["code"]),
+                    (1, b"", "error", code))
+                self.assertNotIn(b"/secret/", completed.stdout)
+                self.assertLess(len(completed.stdout), 256)
+                self.assertEqual(self.events(), ["review-capabilities", "review-result-read"])
+
+        mismatched = dict(EXPECTED, finding_count=2)
+        self.log.unlink(missing_ok=True)
+        completed = self.read_result(expected=review.encoded(mismatched)[:-1].decode())
+        self.assertEqual((completed.returncode, json.loads(completed.stdout)["code"]),
+            (1, "invalid_result_frame"))
+        self.assertEqual(self.events(), ["review-capabilities", "review-result-read"])
+
+    def test_read_result_rejects_noncanonical_review_ids_before_children(self):
+        for review_id in (REVIEW_ID.upper(), "123e4567-e89b-12d3-a456-426614174000",
+                "123e4567-e89b-42d3-7456-426614174000", "partial"):
+            with self.subTest(review_id=review_id):
+                self.log.unlink(missing_ok=True)
+                completed = self.read_result(review_id=review_id)
+                self.assertEqual((completed.returncode, json.loads(completed.stdout)["code"]),
+                    (1, "invalid_review_id"))
                 self.assertEqual(self.events(), [])
 
     def test_normal_lifecycle_publishes_once_and_cleans(self):

@@ -29,11 +29,35 @@ CAPABILITIES = {
     "review-store.prepare",
     "review-store.publish",
 }
+RESULT_CAPABILITY = "review-store.result-read"
+RESULT_ERROR_CODES = frozenset({
+    "expected_mismatch",
+    "artifact_invalid",
+    "review_not_found",
+    "target_unavailable",
+    "store_unavailable",
+    "unsupported_platform",
+    "unsupported_filesystem",
+    "repository_invalid",
+    "git_failed",
+    "store_invalid",
+    "binding_invalid",
+    "io_failed",
+    "root_changed",
+    "binding_changed",
+    "artifact_changed",
+    "concurrent_conflict",
+    "out_of_memory",
+})
 PREFIX = "gitframe-ai-review-"
 MAX_UNITS = 256
 MAX_UNIT = 256 * 1024
 MAX_CANDIDATE = 256 * 1024
 MAX_CANDIDATES = 16 * 1024 * 1024
+MAX_EXPECTED_PUBLICATION = 4096
+MAX_READ_REQUEST = 16 * 1024
+MAX_READ_HEADER = 16 * 1024
+MAX_RESULT = 16 * 1024 * 1024
 
 
 class Failure(Exception):
@@ -83,11 +107,16 @@ def no_duplicates(pairs):
     return result
 
 
+def reject_json_constant(_value):
+    raise ValueError("non-finite JSON number")
+
+
 def strict_json(data, limit):
     if not data or len(data) > limit or not data.endswith(b"\n") or data.endswith(b"\n\n"):
         raise Failure("invalid_helper_output", "helper output is not one bounded JSON line")
     try:
-        value = json.loads(data[:-1].decode("utf-8"), object_pairs_hook=no_duplicates)
+        value = json.loads(data[:-1].decode("utf-8"), object_pairs_hook=no_duplicates,
+            parse_constant=reject_json_constant)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise Failure("invalid_helper_output", "helper output is not strict JSON") from error
     if not isinstance(value, dict) or encoded(value) != data:
@@ -98,6 +127,103 @@ def strict_json(data, limit):
 def require_keys(value, keys):
     if list(value) != keys:
         raise Failure("invalid_helper_output", "helper terminal has unexpected fields")
+
+
+def canonical_uuid_v4(value):
+    if (not isinstance(value, str) or len(value) != 36
+            or value[8] != "-" or value[13] != "-" or value[18] != "-" or value[23] != "-"):
+        return False
+    compact = value.replace("-", "")
+    return (len(compact) == 32 and all(character in "0123456789abcdef" for character in compact)
+        and value[14] == "4" and value[19] in "89ab")
+
+
+def canonical_digest(value):
+    return (isinstance(value, str) and len(value) == 71 and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:]))
+
+
+def schema_v1(value):
+    return type(value) is int and value == SCHEMA
+
+
+def validate_target(value):
+    keys = ["object_format", "source_kind", "base_oid", "head_oid", "diff_base_oid"]
+    if not isinstance(value, dict) or list(value) != keys:
+        raise ValueError("target shape")
+    width = {"sha1": 40, "sha256": 64}.get(value["object_format"])
+    if width is None or value["source_kind"] != "branch_range":
+        raise ValueError("target kind")
+    for key in ("base_oid", "head_oid", "diff_base_oid"):
+        oid = value[key]
+        if (not isinstance(oid, str) or len(oid) != width
+                or any(character not in "0123456789abcdef" for character in oid)):
+            raise ValueError("target object ID")
+
+
+def validate_text(value, maximum, multiline):
+    if not isinstance(value, str):
+        raise ValueError("text type")
+    raw = value.encode("utf-8")
+    if not raw or len(raw) > maximum:
+        raise ValueError("text bound")
+    for character in value:
+        codepoint = ord(character)
+        if (codepoint in (0x00, 0x1b, 0x0d, 0x7f) or 0x80 <= codepoint <= 0x9f
+                or (codepoint < 0x20 and not (multiline and character in "\n\t"))):
+            raise ValueError("text control")
+
+
+def validate_timestamp(value):
+    if (not isinstance(value, str) or len(value) != 20 or value[4] != "-" or value[7] != "-"
+            or value[10] != "T" or value[13] != ":" or value[16] != ":" or value[19] != "Z"):
+        raise ValueError("timestamp shape")
+    pieces = (value[0:4], value[5:7], value[8:10], value[11:13], value[14:16], value[17:19])
+    if any(not piece.isascii() or not piece.isdecimal() for piece in pieces):
+        raise ValueError("timestamp decimal")
+    year, month, day, hour, minute, second = (int(piece) for piece in pieces)
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    days = (31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+    if (year == 0 or not 1 <= month <= 12 or not 1 <= day <= days[month - 1]
+            or hour > 23 or minute > 59 or second > 59):
+        raise ValueError("timestamp value")
+
+
+def validate_producer(value):
+    order = ["name", "model", "version", "skill_version"]
+    if (not isinstance(value, dict) or "name" not in value
+            or list(value) != [key for key in order if key in value]):
+        raise ValueError("producer shape")
+    for field in value.values():
+        validate_text(field, 256, False)
+
+
+def parse_expected_publication(text):
+    failure = Failure("invalid_expected_publication", "expected publication identity is invalid")
+    if text is None:
+        return None
+    try:
+        raw = text.encode("utf-8")
+        if not raw or len(raw) > MAX_EXPECTED_PUBLICATION:
+            raise ValueError("expected bound")
+        value = json.loads(text, object_pairs_hook=no_duplicates, parse_constant=reject_json_constant)
+        keys = ["review_repository_id", "target", "producer", "created_at", "finding_count",
+            "manifest_sha256", "findings_sha256"]
+        if not isinstance(value, dict) or list(value) != keys or encoded(value)[:-1] != raw:
+            raise ValueError("expected shape")
+        if not canonical_uuid_v4(value["review_repository_id"]):
+            raise ValueError("repository ID")
+        validate_target(value["target"])
+        validate_producer(value["producer"])
+        validate_timestamp(value["created_at"])
+        count = value["finding_count"]
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 4096:
+            raise ValueError("finding count")
+        if not canonical_digest(value["manifest_sha256"]) or not canonical_digest(value["findings_sha256"]):
+            raise ValueError("digest")
+        return value
+    except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise failure from error
 
 
 def run(command, stdin, timeout, stdout_limit, stderr_limit=8192):
@@ -174,7 +300,7 @@ def run(command, stdin, timeout, stdout_limit, stderr_limit=8192):
     }
 
 
-def helper(gitframe, action, request=b"", timeout=120, cap=16384):
+def helper(gitframe, action, request=b"", timeout=120, cap=16384, error_codes=None):
     result = run([gitframe, *action], request, timeout, cap)
     if not result["started"]:
         raise Failure("helper_not_started", "GitFrame helper could not be started")
@@ -183,11 +309,21 @@ def helper(gitframe, action, request=b"", timeout=120, cap=16384):
     if result["overflow"]:
         raise Failure("helper_output_limit", "GitFrame helper exceeded its output bound")
     if result["returncode"] != 0:
+        code = None
         try:
-            terminal = strict_json(result["stdout"], cap)
-            code = terminal.get("code") or terminal.get("error", {}).get("code")
-        except Failure:
-            code = None
+            error_cap = min(cap, MAX_READ_HEADER) if error_codes is not None else cap
+            terminal = strict_json(result["stdout"], error_cap)
+            if error_codes is None:
+                code = terminal.get("code") or terminal.get("error", {}).get("code")
+            else:
+                require_keys(terminal, ["status", "schema_version", "code", "message"])
+                if (terminal["status"] == "error" and schema_v1(terminal["schema_version"])
+                        and isinstance(terminal["code"], str)
+                        and isinstance(terminal["message"], str)
+                        and terminal["code"] in error_codes):
+                    code = terminal["code"]
+        except (KeyError, TypeError, Failure):
+            pass
         raise Failure(code or "helper_failed", "GitFrame helper rejected the request")
     return result["stdout"]
 
@@ -314,6 +450,114 @@ def begin(args):
         "workspace_nonce": nonce, "review_repository_id": prepared["review_repository_id"],
         "review_id": prepared["review_id"], "target": target, "unit_count": len(units),
         "unit_files": [item["unit_file"] for item in inventory]}
+
+
+def invalid_result_frame():
+    return Failure("invalid_result_frame", "GitFrame result frame is invalid")
+
+
+def validate_result_frame(data, review_id, expected):
+    failure = invalid_result_frame()
+    try:
+        newline = data.index(b"\n", 0, MAX_READ_HEADER) + 1
+    except ValueError as error:
+        raise failure from error
+    try:
+        header = strict_json(data[:newline], MAX_READ_HEADER)
+        common = ["status", "schema_version", "review_repository_id", "review_id", "target",
+            "findings_sha256", "finding_count"]
+        completed = common + ["result_sha256", "result_size"]
+        if list(header) not in (common, completed) or header["status"] not in ("pending", "completed"):
+            raise ValueError("header shape")
+        if ((header["status"] == "pending" and list(header) != common)
+                or (header["status"] == "completed" and list(header) != completed)
+                or not schema_v1(header["schema_version"])
+                or not canonical_uuid_v4(header["review_repository_id"])
+                or header["review_id"] != review_id or not canonical_uuid_v4(header["review_id"])
+                or not canonical_digest(header["findings_sha256"])):
+            raise ValueError("header identity")
+        validate_target(header["target"])
+        count = header["finding_count"]
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 4096:
+            raise ValueError("finding count")
+        if expected is not None and (header["review_repository_id"] != expected["review_repository_id"]
+                or header["target"] != expected["target"]
+                or header["findings_sha256"] != expected["findings_sha256"]
+                or count != expected["finding_count"]):
+            raise ValueError("expected identity")
+        if header["status"] == "pending":
+            if len(data) != newline:
+                raise ValueError("pending payload")
+            return data
+
+        size = header["result_size"]
+        if (not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= MAX_RESULT
+                or len(data) != newline + size or not canonical_digest(header["result_sha256"])):
+            raise ValueError("result length")
+        payload = data[newline:]
+        if digest(payload) != header["result_sha256"]:
+            raise ValueError("result digest")
+        result = strict_json(payload, MAX_RESULT)
+        result_keys = ["schema_version", "review_id", "target", "findings_digest", "result",
+            "completed_at"]
+        if "summary" in result:
+            result_keys.append("summary")
+        result_keys.extend(["finding_dispositions", "anchored_notes"])
+        if (list(result) != result_keys or not schema_v1(result["schema_version"])
+                or result["review_id"] != review_id or result["target"] != header["target"]
+                or result["findings_digest"] != header["findings_sha256"]
+                or result["result"] not in ("approved", "needs_changes", "canceled")):
+            raise ValueError("result identity")
+        validate_target(result["target"])
+        validate_timestamp(result["completed_at"])
+        if "summary" in result:
+            validate_text(result["summary"], 65536, True)
+        dispositions = result["finding_dispositions"]
+        notes = result["anchored_notes"]
+        if (not isinstance(dispositions, list) or len(dispositions) != count
+                or not isinstance(notes, list) or len(notes) > 4096):
+            raise ValueError("result collections")
+        for disposition in dispositions:
+            if (not isinstance(disposition, dict)
+                    or list(disposition) != ["finding_id", "disposition"]
+                    or disposition["disposition"] not in ("accepted", "dismissed", "unreviewed")):
+                raise ValueError("result disposition")
+        return data
+    except (KeyError, TypeError, UnicodeError, ValueError, Failure) as error:
+        raise failure from error
+
+
+def read_result(args):
+    gitframe = validate_executable(args.gitframe)
+    repository = validate_repository(args.repository)
+    if not canonical_uuid_v4(args.review_id):
+        raise Failure("invalid_review_id", "review ID is invalid")
+    expected = parse_expected_publication(args.expected_publication_json)
+    request = {"schema_version": SCHEMA, "repository": repository_read_wire(repository),
+        "review_id": args.review_id}
+    if expected is not None:
+        request["expected"] = expected
+    request_bytes = encoded(request)
+    if not request_bytes or len(request_bytes) > MAX_READ_REQUEST:
+        raise Failure("invalid_expected_publication", "expected publication identity is invalid")
+
+    capabilities = strict_json(helper(gitframe, ["review-capabilities"], timeout=10,
+        error_codes=frozenset()), MAX_READ_HEADER)
+    require_keys(capabilities, ["schema_version", "status", "gitframe_version", "capabilities"])
+    offered = set()
+    entries = capabilities["capabilities"]
+    if isinstance(entries, list):
+        for item in entries:
+            if (isinstance(item, dict) and isinstance(item.get("name"), str)
+                    and isinstance(item.get("versions"), list)
+                    and any(type(version) is int and version == 1 for version in item["versions"])):
+                offered.add(item["name"])
+    if (not schema_v1(capabilities["schema_version"]) or capabilities["status"] != "ok"
+            or RESULT_CAPABILITY not in offered):
+        raise Failure("incompatible_gitframe", "GitFrame does not advertise result-read v1")
+    frame = helper(gitframe, ["review-result-read"], request_bytes,
+        cap=MAX_READ_HEADER + MAX_RESULT, error_codes=RESULT_ERROR_CODES)
+    return validate_result_frame(frame, args.review_id, expected)
 
 
 def open_workspace(path, nonce):
@@ -520,12 +764,20 @@ def parser():
     finish = actions.add_parser("complete")
     finish.add_argument("--workspace", required=True)
     finish.add_argument("--workspace-nonce", required=True)
+    reader = actions.add_parser("read-result")
+    reader.add_argument("--gitframe", required=True)
+    reader.add_argument("--repository", required=True)
+    reader.add_argument("--review-id", required=True)
+    reader.add_argument("--expected-publication-json")
     return root
 
 
 def main():
     try:
         args = parser().parse_args()
+        if args.action == "read-result":
+            sys.stdout.buffer.write(read_result(args))
+            return 0
         result = begin(args) if args.action == "begin" else complete(args)
         sys.stdout.buffer.write(encoded(result))
         return 0 if result["status"] in ("ready", "no_changes", "ok") else 1
