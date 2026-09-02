@@ -700,22 +700,37 @@ pub const App = struct {
                 // Mouse coordinates are relative to the old geometry. End the
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
-                self.drag_auto_scroll.clear();
                 const changes_selection_anchor = self.changesNavigation().captureSelectionViewportAnchor();
-                self.changesNavigation().clearMouseDiffSelection();
-                const previous_review_view = self.reviewCoordinator().navigationView();
+                const previous_review_base_view = self.reviewCoordinator().navigationView();
+                const resize_allocator = self.allocator;
+                var previous_review_frame = if (resize_allocator) |allocator|
+                    try previous_review_base_view.buildFindingCardFrame(allocator)
+                else
+                    null;
+                defer if (previous_review_frame) |*frame| frame.deinit(resize_allocator.?);
+                const previous_review_view = previous_review_base_view.withPresentationRows(
+                    if (previous_review_frame) |*frame| &frame.presentation_rows else null,
+                );
                 var previous_review_adapter = previous_review_view.resolver();
                 const previous_review_body = previous_review_view.bodyView(&previous_review_adapter);
                 const review_selection_anchor = previous_review_body.captureSelectionViewportAnchor();
-                if (self.pages.review.selection_owner.activeMouseSelection()) {
-                    self.pages.review.selection_owner = .none;
-                }
                 const repository_selection_anchor = self.pages.repository.captureSelectionViewportAnchor();
-                self.pages.repository.cancelMouseOwner();
                 const previous_width = self.changesNavigationView().diffPaneWidth();
                 const previous_mode = self.changesNavigationView().effectiveDisplayMode();
                 const previous_review_width = previous_review_body.view.diffPaneWidth();
                 const previous_review_display_mode = previous_review_body.view.effectiveDisplayMode();
+                var incoming_review_preparation = if (resize_allocator) |allocator|
+                    try previous_review_base_view.prepareFindingCardFrame(allocator)
+                else
+                    null;
+                defer if (incoming_review_preparation) |*preparation| preparation.deinit();
+
+                self.drag_auto_scroll.clear();
+                self.changesNavigation().clearMouseDiffSelection();
+                if (self.pages.review.selection_owner.activeMouseSelection()) {
+                    self.pages.review.selection_owner = .none;
+                }
+                self.pages.repository.cancelMouseOwner();
                 self.terminal_size = size;
                 self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
@@ -729,7 +744,14 @@ pub const App = struct {
                 self.changesNavigation().updateSearchMatchOffset();
                 self.changesNavigation().scrollSearchMatchIntoView();
                 self.changesNavigation().clampDiffNavigation();
-                const review_controller = self.reviewCoordinator().navigation();
+                self.reviewCoordinator().reconcileFindingCardVisibility();
+                const current_review_view = self.reviewCoordinator().navigationView();
+                var current_review_frame = if (incoming_review_preparation) |*preparation|
+                    preparation.fill(current_review_view, self.pages.review.finding_card)
+                else
+                    null;
+                var review_controller = self.reviewCoordinator().navigation();
+                review_controller.presentation_rows = if (current_review_frame) |*frame| &frame.presentation_rows else null;
                 var review_adapter = review_controller.updateAdapter();
                 var review_body = review_adapter.bodyController();
                 review_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_review_width);
@@ -1791,6 +1813,8 @@ pub const App = struct {
                     ),
                     .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.review.selection_owner),
                     .retained_selection_action_available = review_body_view.retainedSelectionActionAvailable(),
+                    .finding_card_focused = self.pages.review.finding_card.isFocused(),
+                    .finding_card_at_cursor = review_navigation_view.findingCardAtCursor(),
                     .keymap = self.keymap,
                 },
                 .selection_owner = &self.pages.review.selection_owner,

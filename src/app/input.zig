@@ -159,7 +159,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     }
     if (context.active_page == .review and
         (context.review.search_mode or context.review.file_search_mode or context.review.base_picker_open or
-            context.review.ai_reviews_open or context.review.human_review.open))
+            context.review.ai_reviews_open or context.review.human_review.open or context.review.finding_card_focused))
     {
         const review_msg = review_input.keyToMsg(context.review, key) orelse return null;
         return .{ .review = review_msg };

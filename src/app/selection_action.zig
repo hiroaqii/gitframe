@@ -261,13 +261,14 @@ pub const ViewportBasis = struct {
     layout_revision: u64,
     mapping_variant: u8 = 0,
     source_rows: usize,
+    presentation_rows: usize,
 
     pub fn eql(self: ViewportBasis, other: ViewportBasis) bool {
         return std.meta.eql(self, other);
     }
 
     pub fn maxScroll(self: ViewportBasis, visible_rows: usize) usize {
-        return self.source_rows -| visible_rows;
+        return self.presentation_rows -| visible_rows;
     }
 
     pub fn clampScroll(self: ViewportBasis, scroll: usize, visible_rows: usize) usize {
@@ -301,19 +302,19 @@ pub fn captureAnchorPosition(
 pub fn restoreViewportAnchor(
     anchor: anytype,
     incoming_basis: ViewportBasis,
-    resolved_semantic_source: ?usize,
+    resolved_semantic_presentation: ?usize,
+    fallback_presentation: ?usize,
     visible_rows: usize,
 ) usize {
-    if (incoming_basis.source_rows == 0) return 0;
+    if (incoming_basis.source_rows == 0 or incoming_basis.presentation_rows == 0) return 0;
     if (anchor.basis.eql(incoming_basis)) {
         return incoming_basis.clampScroll(anchor.raw_presentation_scroll, visible_rows);
     }
 
-    const source = @min(
-        resolved_semantic_source orelse anchor.source_offset_fallback,
-        incoming_basis.source_rows - 1,
+    return incoming_basis.clampScroll(
+        resolved_semantic_presentation orelse fallback_presentation orelse 0,
+        visible_rows,
     );
-    return incoming_basis.clampScroll(source, visible_rows);
 }
 
 test "selection action maps exact keys without command modifiers" {
@@ -456,6 +457,7 @@ test "selection viewport anchor restores semantic source after basis changes" {
     const basis: ViewportBasis = .{
         .layout_revision = 1,
         .source_rows = 8,
+        .presentation_rows = 8,
     };
     const position = captureAnchorPosition(8, 3);
     const Anchor = ViewportAnchor(usize);
@@ -468,7 +470,8 @@ test "selection viewport anchor restores semantic source after basis changes" {
     try std.testing.expectEqual(@as(usize, 3), restoreViewportAnchor(anchor, .{
         .layout_revision = 2,
         .source_rows = 8,
-    }, 3, 4));
+        .presentation_rows = 8,
+    }, 3, 3, 4));
 
     const eof_position = captureAnchorPosition(4, 5);
     const eof_anchor: Anchor = .{
@@ -478,18 +481,21 @@ test "selection viewport anchor restores semantic source after basis changes" {
         .basis = .{
             .layout_revision = 1,
             .source_rows = 4,
+            .presentation_rows = 4,
         },
     };
     try std.testing.expectEqual(@as(usize, 3), eof_anchor.source_offset_fallback);
     try std.testing.expectEqual(@as(usize, 3), restoreViewportAnchor(eof_anchor, .{
         .layout_revision = 2,
         .source_rows = 8,
-    }, null, 2));
+        .presentation_rows = 8,
+    }, null, 3, 2));
 
     const same_basis: ViewportBasis = .{
         .layout_revision = 9,
         .mapping_variant = 1,
         .source_rows = 12,
+        .presentation_rows = 12,
     };
     const same_anchor: Anchor = .{
         .semantic_source = 5,
@@ -499,11 +505,12 @@ test "selection viewport anchor restores semantic source after basis changes" {
     };
     try std.testing.expectEqual(
         @as(usize, 7),
-        restoreViewportAnchor(same_anchor, same_basis, 1, 3),
+        restoreViewportAnchor(same_anchor, same_basis, 1, 5, 3),
     );
-    try std.testing.expectEqual(@as(usize, 4), restoreViewportAnchor(same_anchor, .{
+    try std.testing.expectEqual(@as(usize, 10), restoreViewportAnchor(same_anchor, .{
         .layout_revision = 10,
         .mapping_variant = 0,
         .source_rows = 9,
-    }, 4, 3));
+        .presentation_rows = 15,
+    }, 10, 4, 3));
 }

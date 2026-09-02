@@ -2464,6 +2464,7 @@ pub const RepositoryPageState = struct {
         return .{
             .layout_revision = self.source_revision,
             .source_rows = document.rowCount(),
+            .presentation_rows = document.rowCount(),
         };
     }
 
@@ -2493,6 +2494,7 @@ pub const RepositoryPageState = struct {
             anchor,
             self.sourceViewportBasis(document),
             @min(anchor.semantic_source, document.rowCount() - 1),
+            @min(anchor.source_offset_fallback, document.rowCount() - 1),
             visible_rows,
         );
     }

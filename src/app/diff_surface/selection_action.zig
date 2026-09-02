@@ -41,13 +41,15 @@ pub const captureAnchorPosition = common.captureAnchorPosition;
 pub fn restoreViewportAnchor(
     anchor: SelectionViewportAnchor,
     incoming_basis: ViewportBasis,
-    resolved_semantic_source: ?usize,
+    resolved_semantic_presentation: ?usize,
+    fallback_presentation: ?usize,
     visible_rows: usize,
 ) usize {
     return common.restoreViewportAnchor(
         anchor,
         incoming_basis,
-        resolved_semantic_source,
+        resolved_semantic_presentation,
+        fallback_presentation,
         visible_rows,
     );
 }

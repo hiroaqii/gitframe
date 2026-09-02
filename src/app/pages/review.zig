@@ -6,6 +6,7 @@
 const std = @import("std");
 const ui = @import("chasen_ui");
 const committed_review = @import("../../committed_review.zig");
+const finding_card = @import("../../ai_review/finding_card.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const app_state = @import("../state.zig");
 const app_prompt = @import("../prompt.zig");
@@ -961,6 +962,99 @@ pub const PinnedAiPresentation = struct {
     }
 };
 
+pub const FindingCardContent = struct {
+    producer: []const u8,
+    model: ?[]const u8,
+    title: []const u8,
+    body: []const u8,
+    suggestion: ?[]const u8,
+};
+
+/// Resolve presentation text only through one accepted selected-run owner.
+/// Independently supplied bytes or decoded payload values cannot cross this
+/// boundary.
+pub fn findingCardContent(
+    selection: *const review_store.SelectedRunRead,
+    model: finding_card.FindingCardModel,
+) ?FindingCardContent {
+    if (!finding_card.identityEql(selection.finding_projection.identity, model.identity)) return null;
+    if (model.entry_index >= selection.finding_projection.entries.len or
+        model.entry_index >= selection.artifacts.findings.value.findings.len) return null;
+    const entry = selection.finding_projection.entries[model.entry_index];
+    const finding = selection.artifacts.findings.value.findings[model.entry_index];
+    const span = switch (entry.outcome) {
+        .mapped => |value| value,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, entry.finding_id, model.finding_id) or
+        !std.mem.eql(u8, finding.finding_id.bytes, model.finding_id) or
+        !std.meta.eql(span, model.span) or entry.severity != model.severity) return null;
+    const producer = selection.artifacts.findings.value.producer;
+    return .{
+        .producer = producer.name,
+        .model = producer.model,
+        .title = finding.title,
+        .body = finding.body,
+        .suggestion = finding.suggestion,
+    };
+}
+
+pub fn findingCardDisplayText(
+    allocator: std.mem.Allocator,
+    content: FindingCardContent,
+) std.mem.Allocator.Error![]u8 {
+    if (content.model) |model| {
+        if (content.suggestion) |suggestion| return std.fmt.allocPrint(
+            allocator,
+            "Producer: {s}\nModel: {s}\n\n{s}\n\nSuggestion:\n{s}",
+            .{ content.producer, model, content.body, suggestion },
+        );
+        return std.fmt.allocPrint(
+            allocator,
+            "Producer: {s}\nModel: {s}\n\n{s}",
+            .{ content.producer, model, content.body },
+        );
+    }
+    if (content.suggestion) |suggestion| return std.fmt.allocPrint(
+        allocator,
+        "Producer: {s}\n\n{s}\n\nSuggestion:\n{s}",
+        .{ content.producer, content.body, suggestion },
+    );
+    return std.fmt.allocPrint(allocator, "Producer: {s}\n\n{s}", .{ content.producer, content.body });
+}
+
+pub fn findingCardMaxBodyScroll(
+    allocator: std.mem.Allocator,
+    content: FindingCardContent,
+    width: u16,
+) std.mem.Allocator.Error!usize {
+    if (width == 0) return 0;
+    const text = try findingCardDisplayText(allocator, content);
+    defer allocator.free(text);
+    const rows = ui.Paragraph.init(.{ .text = text }).lineCount(width);
+    return rows -| 5;
+}
+
+pub fn findingCardContentWidth(row_width: u16) u16 {
+    return row_width -| 1;
+}
+
+test "Finding card content width reserves the painter border across wrap boundaries" {
+    try std.testing.expectEqual(@as(u16, 0), findingCardContentWidth(0));
+    try std.testing.expectEqual(@as(u16, 0), findingCardContentWidth(1));
+    try std.testing.expectEqual(@as(u16, 19), findingCardContentWidth(20));
+    const content: FindingCardContent = .{
+        .producer = "agent",
+        .model = null,
+        .title = "wrap",
+        .body = "012345678901234567890123456789012345678901234567890123456789",
+        .suggestion = null,
+    };
+    const narrow = try findingCardMaxBodyScroll(std.testing.allocator, content, findingCardContentWidth(10));
+    const wide = try findingCardMaxBodyScroll(std.testing.allocator, content, findingCardContentWidth(20));
+    try std.testing.expect(narrow > wide);
+}
+
 pub const Presentation = union(enum) {
     normal: NormalPresentation,
     pinned_ai: PinnedAiPresentation,
@@ -1011,6 +1105,7 @@ pub const ReviewPageState = struct {
     base_picker: BasePickerState = .{},
     ai_reviews: AiReviewsPickerState = .{},
     human_review_decision: human_review_decision.State = .{},
+    finding_card: finding_card.State = .unfocused,
     refresh_generation: u64 = 0,
     deferred_load_apply: ?DeferredLoadApply = null,
     refresh_anchor: ?diff_surface.ReloadAnchor = null,
@@ -1024,6 +1119,7 @@ pub const ReviewPageState = struct {
 
     pub fn deactivate(self: *ReviewPageState) void {
         self.selection_owner = .none;
+        self.finding_card = .unfocused;
         self.human_review_decision.close();
         self.activation.deactivate();
     }
@@ -1077,6 +1173,11 @@ pub const ReviewPageState = struct {
             .pinned_ai => |*pinned| pinned,
             .normal => null,
         };
+    }
+
+    pub fn contentForFindingCard(self: *const ReviewPageState, model: finding_card.FindingCardModel) ?FindingCardContent {
+        const pinned = self.pinnedAiConst() orelse return null;
+        return findingCardContent(&pinned.selection, model);
     }
 
     pub fn advanceSelectionLayoutRevision(self: *ReviewPageState) void {
@@ -1422,6 +1523,8 @@ pub const ReviewPageState = struct {
     ) !void {
         self.human_review_decision.close();
         try self.commitLoaded(allocator, repo_epoch, repo_root, root_identity, bundle);
+        self.finding_card = .unfocused;
+        self.advanceSelectionLayoutRevision();
     }
 
     pub fn commitPinnedAi(
@@ -1433,6 +1536,7 @@ pub const ReviewPageState = struct {
         bundle: *app_load.PinnedReviewLoadedBundle,
     ) !void {
         self.human_review_decision.close();
+        const next_finding_card = self.finding_card.transferred(&bundle.selection.finding_projection);
         const manifest = &bundle.selection.artifacts.manifest.value;
         const target = manifest.target;
         const pair_changed = if (self.presentation) |*current| !current.target().eql(&target) else true;
@@ -1498,6 +1602,8 @@ pub const ReviewPageState = struct {
             .head_display = head_display,
         } };
         bundle.selection = undefined;
+        self.finding_card = next_finding_card;
+        self.advanceSelectionLayoutRevision();
 
         self.load.clearCurrent(allocator);
         if (prepared_session) |session| {

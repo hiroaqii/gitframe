@@ -37,6 +37,17 @@ pub const Msg = union(enum) {
     branch_switch_unavailable,
     open_human_review_decision,
     human_review_decision: human_review_decision.Msg,
+    finding_card: FindingCardMsg,
+};
+
+pub const FindingCardMsg = enum {
+    focus_or_cycle,
+    toggle,
+    scroll_up,
+    scroll_down,
+    copy,
+    leave,
+    owned_noop,
 };
 
 pub const Context = struct {
@@ -57,6 +68,8 @@ pub const Context = struct {
     human_review: human_review_decision.InputContext = .{},
     selection_owner: diff_surface.input.SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
+    finding_card_focused: bool = false,
+    finding_card_at_cursor: bool = false,
     keymap: keymap.Effective = .{},
 
     fn shared(self: Context) diff_surface.input.Context {
@@ -75,6 +88,7 @@ pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
     if (context.human_review.open) {
         return .{ .human_review_decision = human_review_decision.pasteToMsg(context.human_review, text) orelse return null };
     }
+    if (context.finding_card_focused) return .{ .finding_card = .owned_noop };
     return .{ .shared = diff_surface.input.pasteToMsg(context.shared(), text) orelse return null };
 }
 
@@ -126,6 +140,7 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
         if (key.codepoint == 'j') return .base_picker_next;
         return null;
     }
+    if (context.finding_card_focused) return .{ .finding_card = findingCardKeyToMsg(key) };
     if (diff_surface.input.keyToMsg(context.shared(), key)) |msg| return .{ .shared = msg };
     if (context.search_mode or context.file_search_mode) return null;
     return normalKeyToMsg(context, key);
@@ -157,6 +172,10 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     // over the page-local picker mnemonic.
     if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action, context.focus == .diff);
 
+    if (context.finding_card_at_cursor and !key_input.hasCommandModifier(key) and key.codepoint == 's') {
+        return .{ .finding_card = .focus_or_cycle };
+    }
+
     if (context.pinned_ai and key_input.matchesShiftedAscii(key, 'e', 'E')) {
         return .open_human_review_decision;
     }
@@ -177,6 +196,22 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
         'n' => if (context.search_query_len > 0) shared(.select_next_search_match) else shared(.select_next_hunk),
         'p' => if (context.search_query_len > 0) shared(.select_previous_search_match) else shared(.select_previous_hunk),
         else => null,
+    };
+}
+
+fn findingCardKeyToMsg(key: chasen.Key) FindingCardMsg {
+    if (key.matches(chasen.Key.enter, .{})) return .toggle;
+    if (key.matches(chasen.Key.escape, .{})) return .leave;
+    if (key.matches(chasen.Key.up, .{})) return .scroll_up;
+    if (key.matches(chasen.Key.down, .{})) return .scroll_down;
+    if (key_input.hasCommandModifier(key)) return .owned_noop;
+    return switch (key.codepoint) {
+        's' => .focus_or_cycle,
+        'k' => .scroll_up,
+        'j' => .scroll_down,
+        'y' => .copy,
+        'q' => .leave,
+        else => .owned_noop,
     };
 }
 
@@ -228,6 +263,19 @@ test "Review exposes display actions but no write actions" {
     try std.testing.expectEqual(Msg.branch_switch_unavailable, keyToMsg(.{}, .{ .codepoint = 'b' }).?);
 }
 
+test "Review inline Finding card owns its local grammar" {
+    const available: Context = .{ .focus = .diff, .finding_card_at_cursor = true };
+    try std.testing.expectEqual(
+        Msg{ .finding_card = .focus_or_cycle },
+        keyToMsg(available, .{ .codepoint = 's' }).?,
+    );
+    const focused: Context = .{ .finding_card_focused = true };
+    try std.testing.expectEqual(Msg{ .finding_card = .toggle }, keyToMsg(focused, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .copy }, keyToMsg(focused, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .leave }, keyToMsg(focused, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .owned_noop }, keyToMsg(focused, .{ .codepoint = '1' }).?);
+}
+
 test "human review result uses unclaimed uppercase E after public key precedence" {
     try std.testing.expect(keyToMsg(.{}, .{ .codepoint = 'E' }) == null);
     const pinned: Context = .{ .pinned_ai = true };
@@ -263,6 +311,21 @@ test "human review result modal consumes close keys and summary paste" {
         pasteToMsg(.{ .human_review = .{ .open = true, .focus = .summary, .summary_editing = true } }, "要約").?,
     );
     try std.testing.expect(pasteToMsg(.{ .human_review = .{ .open = true } }, "hidden") == null);
+}
+
+test "Review inline Finding focus owns its complete input grammar" {
+    const focused: Context = .{ .finding_card_focused = true };
+    try std.testing.expectEqual(Msg{ .finding_card = .focus_or_cycle }, keyToMsg(focused, .{ .codepoint = 's' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .toggle }, keyToMsg(focused, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .scroll_down }, keyToMsg(focused, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .scroll_up }, keyToMsg(focused, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .copy }, keyToMsg(focused, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .leave }, keyToMsg(focused, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .owned_noop }, keyToMsg(focused, .{ .codepoint = 'm' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .owned_noop }, pasteToMsg(focused, "ignored").?);
+
+    const at_cursor: Context = .{ .focus = .diff, .finding_card_at_cursor = true };
+    try std.testing.expectEqual(Msg{ .finding_card = .focus_or_cycle }, keyToMsg(at_cursor, .{ .codepoint = 's' }).?);
 }
 
 test "Review document navigation preserves Home End focus and custom bindings" {

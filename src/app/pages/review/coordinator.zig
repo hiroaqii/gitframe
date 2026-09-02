@@ -14,7 +14,10 @@ const page = @import("../../page.zig");
 const repo_session = @import("../../repo_session.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
+const diff_render = @import("../../../diff/render.zig");
 const diff_selection = @import("../../../diff/selection.zig");
+const finding_card = @import("../../../ai_review/finding_card.zig");
+const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const review_page = @import("../review.zig");
 const review_input = @import("input.zig");
 const review_navigation = @import("navigation.zig");
@@ -109,11 +112,66 @@ pub const Controller = struct {
     ) !UpdateOutcome {
         switch (msg) {
             .shared => |shared_msg| {
-                const navigation_controller = self.navigation();
+                const base_navigation_view = self.navigationView();
+                var finding_frame = try base_navigation_view.buildFindingCardFrame(ctx.allocator());
+                defer if (finding_frame) |*frame| frame.deinit(ctx.allocator());
+                const changes_basis = sharedMessageMayChangeFindingCardBasis(shared_msg);
+                var incoming_preparation = if (changes_basis)
+                    try base_navigation_view.prepareFindingCardFrame(ctx.allocator())
+                else
+                    null;
+                defer if (incoming_preparation) |*preparation| preparation.deinit();
+                const raw_scroll_before = if (changes_basis) self.page_state.viewer.diff_scroll else undefined;
+                const selected_target_before = if (changes_basis) self.page_state.viewer.selected_target else undefined;
+                const effective_mode_before = if (changes_basis) base_navigation_view.view().effectiveDisplayMode() else undefined;
+                const layout_revision_before = if (changes_basis) self.page_state.selection_layout_revision else undefined;
+                const source_scroll_before = if (changes_basis) blk: {
+                    var outgoing_view = base_navigation_view.withPresentationRows(
+                        if (finding_frame) |*frame| &frame.presentation_rows else null,
+                    );
+                    var resolver = outgoing_view.resolver();
+                    const source_scroll = outgoing_view.bodyView(&resolver).sourceAnchorAtOrBeforePresentation(raw_scroll_before) orelse 0;
+                    self.page_state.viewer.diff_scroll = source_scroll;
+                    break :blk source_scroll;
+                } else undefined;
+                var navigation_controller = self.navigation();
+                navigation_controller.presentation_rows = if (!changes_basis and finding_frame != null)
+                    &finding_frame.?.presentation_rows
+                else
+                    null;
                 var update_adapter = navigation_controller.updateAdapter();
-                var page_update = try update_adapter.shared().apply(ctx.allocator(), shared_msg);
+                var page_update = update_adapter.shared().apply(ctx.allocator(), shared_msg) catch |err| {
+                    if (changes_basis) self.page_state.viewer.diff_scroll = raw_scroll_before;
+                    return err;
+                };
                 defer page_update.deinit(ctx.allocator());
                 update_adapter.applyRetentionTransition(ctx.allocator(), page_update.retention_transition);
+                self.reconcileFindingCardVisibility();
+                if (changes_basis) {
+                    const source_scroll_after = self.page_state.viewer.diff_scroll;
+                    var incoming_frame = if (incoming_preparation) |*preparation|
+                        preparation.fill(self.navigationView(), self.page_state.finding_card)
+                    else
+                        null;
+                    var incoming_controller = self.navigation();
+                    incoming_controller.presentation_rows = if (incoming_frame) |*frame| &frame.presentation_rows else null;
+                    var incoming_adapter = incoming_controller.updateAdapter();
+                    const incoming_body = incoming_adapter.bodyController();
+                    const mapping_changed = !std.meta.eql(selected_target_before, self.page_state.viewer.selected_target) or
+                        effective_mode_before != incoming_controller.view().view().effectiveDisplayMode() or
+                        !sameFindingCardPresentationRows(
+                            if (finding_frame) |*frame| &frame.presentation_rows else null,
+                            if (incoming_frame) |*frame| &frame.presentation_rows else null,
+                        );
+                    self.page_state.viewer.diff_scroll = if (!mapping_changed and source_scroll_after == source_scroll_before)
+                        raw_scroll_before
+                    else
+                        incoming_body.view().sourceToPresentationOffset(source_scroll_after) orelse source_scroll_after;
+                    incoming_body.clampDiffNavigation();
+                    if (mapping_changed and self.page_state.selection_layout_revision == layout_revision_before) {
+                        self.page_state.advanceSelectionLayoutRevision();
+                    }
+                }
                 const auto_scroll = page_update.auto_scroll;
                 const effect = page_update.takeEffect() orelse return .{ .auto_scroll = auto_scroll };
                 return switch (effect) {
@@ -207,6 +265,7 @@ pub const Controller = struct {
                     },
                 }
             },
+            .finding_card => |card_msg| return try self.updateFindingCard(ctx.allocator(), card_msg),
         }
         return .{};
     }
@@ -425,6 +484,7 @@ pub const Controller = struct {
                 finished.result = .empty;
                 self.page_state.ai_reviews.close(ctx.allocator());
                 self.initializeAcceptedBody(ctx.allocator());
+                self.reconcileFindingCardVisibility();
             },
             .selection_failed => |failure| self.page_state.ai_reviews.failSelection(finished.review_id, failure),
             .failed_static => |message| self.page_state.ai_reviews.failSelectionStatic(finished.review_id, message),
@@ -744,6 +804,107 @@ pub const Controller = struct {
         return .{};
     }
 
+    fn updateFindingCard(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        msg: review_input.FindingCardMsg,
+    ) !UpdateOutcome {
+        if (msg == .owned_noop) return .{};
+
+        const base_view = self.navigationView();
+        var current_frame = (try base_view.buildFindingCardFrame(allocator)) orelse {
+            self.clearFindingCardFocus();
+            return .{};
+        };
+        defer current_frame.deinit(allocator);
+
+        var current_view = base_view.withPresentationRows(&current_frame.presentation_rows);
+        var current_resolver = current_view.resolver();
+        const current_body = current_view.bodyView(&current_resolver);
+        const source_anchor = current_body.sourceAnchorAtOrBeforePresentation(self.page_state.viewer.diff_scroll);
+        var next_state = self.page_state.finding_card;
+        var action: finding_card.Action = .none;
+
+        switch (msg) {
+            .focus_or_cycle => {
+                const cursor = switch (self.page_state.viewer.diff_cursor) {
+                    .hunk_line => |line| line,
+                    else => return .{},
+                };
+                const group = current_frame.row_plan.groupAtOrigin(cursor.hunk_index, cursor.line_index) orelse return .{};
+                const cards = current_frame.row_plan.cardsForGroup(group);
+                if (cards.len == 0) return .{};
+                var next_index: usize = 0;
+                for (cards, 0..) |model, index| {
+                    if (!next_state.matches(model)) continue;
+                    next_index = (index + 1) % cards.len;
+                    break;
+                }
+                action = next_state.apply(.{ .cycle = cards[next_index] });
+            },
+            .toggle => {
+                if (!current_frame.containsFocused(next_state)) return .{};
+                action = next_state.apply(.toggle);
+            },
+            .scroll_up, .scroll_down => {
+                const model = focusedFindingCard(current_frame.row_plan, next_state) orelse return .{};
+                const content = self.page_state.contentForFindingCard(model) orelse return .{};
+                const content_width = review_page.findingCardContentWidth(current_body.view.diffPaneWidth());
+                const max_scroll = try review_page.findingCardMaxBodyScroll(allocator, content, content_width);
+                _ = next_state.apply(.{ .scroll = .{
+                    .direction = if (msg == .scroll_up) .up else .down,
+                    .max_scroll = max_scroll,
+                } });
+                self.page_state.finding_card = next_state;
+                return .{};
+            },
+            .copy => {
+                const model = focusedFindingCard(current_frame.row_plan, next_state) orelse return .{};
+                const content = self.page_state.contentForFindingCard(model) orelse return .{};
+                if (next_state.apply(.copy) != .copy_requested) return .{};
+                const text = try findingCardCopyText(allocator, content);
+                return .{ .clipboard = self.ownedClipboard("Finding", text) };
+            },
+            .leave => {
+                action = next_state.apply(.leave);
+            },
+            .owned_noop => unreachable,
+        }
+
+        var next_frame = (try base_view.buildFindingCardFrameForState(allocator, next_state)) orelse return .{};
+        defer next_frame.deinit(allocator);
+        const transition = findingCardScrollTransition(
+            &current_frame,
+            &next_frame,
+            self.page_state.viewer.diff_scroll,
+            source_anchor,
+            base_view.view().diffVisibleRows(),
+            next_state,
+            action,
+        );
+        if (transition.mapping_changed) {
+            self.page_state.advanceSelectionLayoutRevision();
+        }
+        self.page_state.finding_card = next_state;
+        self.page_state.viewer.diff_scroll = transition.scroll;
+        return .{};
+    }
+
+    pub fn reconcileFindingCardVisibility(self: Controller) void {
+        const view = self.navigationView();
+        if (view.focusedFindingCardVisible()) return;
+        self.clearFindingCardFocus();
+        var navigation_controller = self.navigation();
+        var adapter = navigation_controller.updateAdapter();
+        adapter.bodyController().clampDiffNavigation();
+    }
+
+    fn clearFindingCardFocus(self: Controller) void {
+        const layout_changed = findingCardStateExpanded(self.page_state.finding_card);
+        self.page_state.finding_card = .unfocused;
+        if (layout_changed) self.page_state.advanceSelectionLayoutRevision();
+    }
+
     fn clearRefreshAnchor(self: Controller, allocator: std.mem.Allocator) void {
         if (self.page_state.takeRefreshAnchor()) |anchor_value| {
             var anchor = anchor_value;
@@ -787,6 +948,243 @@ pub const Controller = struct {
         };
     }
 };
+
+fn sharedMessageMayChangeFindingCardBasis(msg: diff_surface.message.Msg) bool {
+    return switch (msg) {
+        .select_previous_file,
+        .select_next_file,
+        .select_first_file,
+        .select_last_file,
+        .sidebar_click_node,
+        .mouse_sidebar_wheel_up,
+        .mouse_sidebar_wheel_down,
+        .submit_file_search,
+        .toggle_hunk_fold,
+        .submit_search,
+        .select_next_search_match,
+        .select_previous_search_match,
+        .toggle_display_mode,
+        .toggle_sidebar_visibility,
+        .decrease_sidebar_width,
+        .increase_sidebar_width,
+        .toggle_reviewed_file,
+        .toggle_hide_reviewed_files,
+        .cycle_changed_file_filter,
+        => true,
+        else => false,
+    };
+}
+
+fn sameFindingCardPresentationRows(
+    left: ?*const diff_render.PresentationRows,
+    right: ?*const diff_render.PresentationRows,
+) bool {
+    if (left == null or right == null) return left == null and right == null;
+    if (left.?.source_rows != right.?.source_rows or
+        left.?.total_rows != right.?.total_rows or
+        left.?.blocks.len != right.?.blocks.len) return false;
+    for (left.?.blocks, right.?.blocks) |left_block, right_block| {
+        if (!std.meta.eql(left_block, right_block)) return false;
+    }
+    return true;
+}
+
+fn focusedFindingCard(plan: finding_card.RowPlan, state: finding_card.State) ?finding_card.FindingCardModel {
+    const index = focusedFindingCardIndex(plan, state) orelse return null;
+    return plan.cards[index];
+}
+
+fn focusedFindingCardIndex(plan: finding_card.RowPlan, state: finding_card.State) ?usize {
+    for (plan.cards, 0..) |model, index| if (state.matches(model)) return index;
+    return null;
+}
+
+fn findingCardStateExpanded(state: finding_card.State) bool {
+    return switch (state) {
+        .unfocused => false,
+        .focused => |focused| switch (focused.view) {
+            .collapsed => false,
+            .expanded => true,
+        },
+    };
+}
+
+const FindingCardScrollTransition = struct {
+    scroll: usize,
+    mapping_changed: bool,
+};
+
+fn findingCardScrollTransition(
+    current_frame: *const review_navigation.FindingCardFrame,
+    next_frame: *const review_navigation.FindingCardFrame,
+    current_scroll: usize,
+    source_anchor: ?usize,
+    visible_rows: usize,
+    next_state: finding_card.State,
+    action: finding_card.Action,
+) FindingCardScrollTransition {
+    const max_scroll = next_frame.presentation_rows.total_rows -| visible_rows;
+    const mapping_changed = current_frame.presentation_rows.total_rows != next_frame.presentation_rows.total_rows;
+    var next_scroll = if (!mapping_changed)
+        current_scroll
+    else if (source_anchor) |anchor|
+        next_frame.presentation_rows.sourceToPresentation(anchor) orelse current_scroll
+    else
+        current_scroll;
+    next_scroll = @min(next_scroll, max_scroll);
+    if (action == .ensure_visible) {
+        if (focusedFindingCardIndex(next_frame.row_plan, next_state)) |card_index| {
+            const start = next_frame.presentation_rows.cardStart(card_index) orelse next_scroll;
+            const height = next_state.cardRows(next_frame.row_plan.cards[card_index]);
+            if (start < next_scroll) {
+                next_scroll = start;
+            } else if (visible_rows > 0 and height < visible_rows and start + height > next_scroll + visible_rows) {
+                next_scroll = start + height - visible_rows;
+            } else if (visible_rows > 0 and height >= visible_rows) {
+                next_scroll = start;
+            }
+            next_scroll = @min(next_scroll, max_scroll);
+        }
+    }
+    return .{ .scroll = next_scroll, .mapping_changed = mapping_changed };
+}
+
+fn findingCardCopyText(
+    allocator: std.mem.Allocator,
+    content: review_page.FindingCardContent,
+) std.mem.Allocator.Error![]u8 {
+    if (content.suggestion) |suggestion| return std.fmt.allocPrint(
+        allocator,
+        "{s}\n\n{s}\n\nSuggestion:\n{s}",
+        .{ content.title, content.body, suggestion },
+    );
+    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ content.title, content.body });
+}
+
+test "Review inline Finding copy bytes are width and scroll independent" {
+    const allocator = std.testing.allocator;
+    const without = try findingCardCopyText(allocator, .{
+        .producer = "agent",
+        .model = null,
+        .title = "Title",
+        .body = "Body\nline",
+        .suggestion = null,
+    });
+    defer allocator.free(without);
+    try std.testing.expectEqualStrings("Title\n\nBody\nline", without);
+
+    const with = try findingCardCopyText(allocator, .{
+        .producer = "agent",
+        .model = "model",
+        .title = "Title",
+        .body = "Body",
+        .suggestion = "replace exactly",
+    });
+    defer allocator.free(with);
+    try std.testing.expectEqualStrings("Title\n\nBody\n\nSuggestion:\nreplace exactly", with);
+}
+
+test "Review inline Finding coordinator preserves raw scroll until card row geometry changes" {
+    var repository_id: committed_review.ReviewRepositoryId = .{ .bytes = [_]u8{0} ** 16 };
+    var review_id: committed_review.ReviewId = .{ .bytes = [_]u8{0} ** 16 };
+    var digest: committed_review.Sha256Digest = .{ .bytes = [_]u8{0} ** 32 };
+    repository_id.bytes[0] = 1;
+    review_id.bytes[0] = 2;
+    digest.bytes[0] = 3;
+    const identity: finding_projection.Identity = .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = .{},
+            .head_oid = .{},
+            .diff_base_oid = .{},
+        },
+        .findings_digest = digest,
+    };
+    var cards = [_]finding_card.FindingCardModel{
+        .{
+            .identity = identity,
+            .entry_index = 0,
+            .finding_id = "first",
+            .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
+            .severity = .warning,
+        },
+        .{
+            .identity = identity,
+            .entry_index = 1,
+            .finding_id = "second",
+            .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
+            .severity = .warning,
+        },
+    };
+    var groups = [_]finding_card.Group{.{
+        .hunk_ordinal = 0,
+        .last_diff_line_ordinal = 1,
+        .card_start = 0,
+        .card_count = cards.len,
+    }};
+    const row_plan: finding_card.RowPlan = .{ .groups = &groups, .cards = &cards };
+    const collapsed_inputs = [_]diff_render.InlineBlockInput{
+        .{ .after_source_offset = 1, .height = 1, .kind = .{ .card = 0 } },
+        .{ .after_source_offset = 1, .height = 1, .kind = .{ .card = 1 } },
+        .{ .after_source_offset = 1, .height = 1, .kind = .spacer },
+    };
+    const expanded_inputs = [_]diff_render.InlineBlockInput{
+        .{ .after_source_offset = 1, .height = finding_card.expanded_rows, .kind = .{ .card = 0 } },
+        .{ .after_source_offset = 1, .height = 1, .kind = .{ .card = 1 } },
+        .{ .after_source_offset = 1, .height = 1, .kind = .spacer },
+    };
+    var collapsed_rows = try diff_render.PresentationRows.init(std.testing.allocator, 6, &collapsed_inputs);
+    defer collapsed_rows.deinit(std.testing.allocator);
+    var expanded_rows = try diff_render.PresentationRows.init(std.testing.allocator, 6, &expanded_inputs);
+    defer expanded_rows.deinit(std.testing.allocator);
+    const collapsed_frame: review_navigation.FindingCardFrame = .{ .row_plan = row_plan, .presentation_rows = collapsed_rows };
+    const expanded_frame: review_navigation.FindingCardFrame = .{ .row_plan = row_plan, .presentation_rows = expanded_rows };
+
+    var state: finding_card.State = .unfocused;
+    _ = state.apply(.{ .focus = cards[0] });
+    _ = state.apply(.{ .cycle = cards[1] });
+    const cycled = findingCardScrollTransition(&collapsed_frame, &collapsed_frame, 2, 1, 4, state, .ensure_visible);
+    try std.testing.expect(!cycled.mapping_changed);
+    try std.testing.expectEqual(@as(usize, 2), cycled.scroll);
+
+    _ = state.apply(.leave);
+    const left = findingCardScrollTransition(&collapsed_frame, &collapsed_frame, 5, 1, 4, state, .none);
+    try std.testing.expect(!left.mapping_changed);
+    try std.testing.expectEqual(@as(usize, 5), left.scroll);
+
+    _ = state.apply(.{ .focus = cards[0] });
+    _ = state.apply(.toggle);
+    const expanded = findingCardScrollTransition(&collapsed_frame, &expanded_frame, 3, 1, 4, state, .ensure_visible);
+    try std.testing.expect(expanded.mapping_changed);
+    try std.testing.expectEqual(@as(usize, 2), expanded.scroll);
+
+    _ = state.apply(.toggle);
+    const collapsed = findingCardScrollTransition(&expanded_frame, &collapsed_frame, 6, 1, 4, state, .ensure_visible);
+    try std.testing.expect(collapsed.mapping_changed);
+    try std.testing.expectEqual(@as(usize, 1), collapsed.scroll);
+
+    var unresolved = cards[0];
+    unresolved.entry_index = 2;
+    unresolved.finding_id = "unresolved";
+    _ = state.apply(.{ .focus = unresolved });
+    try std.testing.expect(focusedFindingCard(row_plan, state) == null);
+    try std.testing.expect(state.reconcileVisible(row_plan.cards));
+    try std.testing.expect(!state.isFocused());
+}
+
+test "Review inline Finding copy reports allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, findingCardCopyText(failing.allocator(), .{
+        .producer = "agent",
+        .model = null,
+        .title = "Title",
+        .body = "Body",
+        .suggestion = null,
+    }));
+}
 
 const semantic_viewport_test_diff =
     "diff --git a/src/compare.zig b/src/compare.zig\n" ++

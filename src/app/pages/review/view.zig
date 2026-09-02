@@ -18,6 +18,7 @@ const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const human_review_session = @import("../../human_review_session.zig");
 const human_review_decision = @import("human_review_decision.zig");
+const finding_card_view = @import("finding_card_view.zig");
 
 pub const Context = struct {
     page: *const review_page.ReviewPageState,
@@ -855,14 +856,29 @@ const DiffPaneAdapter = struct {
 
     fn render(ctx: *anyopaque, surface: *chasen.Surface, loaded: @import("../../../loaded_diff.zig").LoadedDiff) !void {
         const self: *DiffPaneAdapter = @ptrCast(@alignCast(ctx));
-        var adapter = self.context.resolver();
+        const allocator = surface.frameAllocator();
+        var frame = try self.context.buildFindingCardFrame(allocator);
+        defer if (frame) |*value| value.deinit(allocator);
+        const rows = if (frame) |*value| &value.presentation_rows else null;
+        const context = self.context.withPresentationRows(rows);
+        var adapter = context.resolver();
+        var card_painter: finding_card_view.Painter = undefined;
+        const painter: ?diff_render.InlineRowPainter = if (frame) |*value| blk: {
+            card_painter = .{
+                .page = self.context.page,
+                .row_plan = &value.row_plan,
+                .palette = self.palette,
+            };
+            break :blk card_painter.interface();
+        } else null;
         return diff_surface.view.viewDiffPane(
             surface,
-            self.context.bodyView(&adapter),
+            context.bodyView(&adapter),
             loaded,
             self.palette,
             null,
             self.mode_toggle_key,
+            painter,
         );
     }
 };

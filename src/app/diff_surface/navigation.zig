@@ -97,6 +97,7 @@ pub const View = struct {
     surface: diff_surface.ReadSurface,
     repo_root: ?[]const u8,
     mode_toggle_hint_width: u16 = 0,
+    presentation_rows: ?*const diff_render.PresentationRows = null,
 
     pub fn displayNavigationSnapshot(self: View) diff_surface.DisplayNavigationSnapshot {
         return .{
@@ -304,7 +305,9 @@ pub const BodyView = struct {
     }
 
     pub fn presentationDiffLineCount(self: BodyView) usize {
-        return self.sourceDiffLineCount();
+        const rows = self.view.presentation_rows orelse return self.sourceDiffLineCount();
+        if (rows.source_rows != self.sourceDiffLineCount()) return self.sourceDiffLineCount();
+        return rows.total_rows;
     }
 
     pub fn hunkStagePresentation(self: BodyView, allocator: std.mem.Allocator, file_index: usize) !diff_render.HunkStagePresentation {
@@ -940,11 +943,28 @@ pub const BodyView = struct {
     }
 
     pub fn sourceToPresentationOffset(self: BodyView, source_offset: usize) ?usize {
-        return if (source_offset < self.sourceDiffLineCount()) source_offset else null;
+        const rows = self.view.presentation_rows orelse
+            return if (source_offset < self.sourceDiffLineCount()) source_offset else null;
+        if (rows.source_rows != self.sourceDiffLineCount()) return null;
+        return rows.sourceToPresentation(source_offset);
     }
 
     pub fn presentationToSourceOffset(self: BodyView, presentation_offset: usize) ?usize {
-        return if (presentation_offset < self.sourceDiffLineCount()) presentation_offset else null;
+        const rows = self.view.presentation_rows orelse
+            return if (presentation_offset < self.sourceDiffLineCount()) presentation_offset else null;
+        if (rows.source_rows != self.sourceDiffLineCount()) return null;
+        const hit = rows.hitAtPresentation(presentation_offset) orelse return null;
+        return switch (hit) {
+            .source => |source_offset| source_offset,
+            .card, .spacer => null,
+        };
+    }
+
+    pub fn sourceAnchorAtOrBeforePresentation(self: BodyView, presentation_offset: usize) ?usize {
+        const rows = self.view.presentation_rows orelse
+            return if (self.sourceDiffLineCount() == 0) null else @min(presentation_offset, self.sourceDiffLineCount() - 1);
+        if (rows.source_rows != self.sourceDiffLineCount()) return null;
+        return rows.sourceAnchorAtOrBeforePresentation(presentation_offset);
     }
 
     pub fn selectedDiffCursorPresentationOffset(self: BodyView) ?usize {
@@ -960,6 +980,7 @@ pub const BodyView = struct {
             .layout_revision = self.view.surface.selection_layout_revision.*,
             .mapping_variant = @intFromEnum(self.view.effectiveDisplayMode()),
             .source_rows = self.sourceDiffLineCount(),
+            .presentation_rows = self.presentationDiffLineCount(),
         };
     }
 
@@ -993,10 +1014,8 @@ pub const BodyView = struct {
         if (self.selectionPresentation() == null) return null;
         const basis = self.selectionViewportBasis();
         if (basis.source_rows == 0) return null;
-        const position = selection_action.captureAnchorPosition(
-            basis.source_rows,
-            self.view.surface.viewer.diff_scroll,
-        );
+        const source_anchor = self.sourceAnchorAtOrBeforePresentation(self.view.surface.viewer.diff_scroll) orelse return null;
+        const position = selection_action.captureAnchorPosition(basis.source_rows, source_anchor);
         return .{
             .semantic_source = self.semanticSourceAtOffset(position.source_offset_fallback),
             .source_offset_fallback = position.source_offset_fallback,
@@ -1009,7 +1028,11 @@ pub const BodyView = struct {
         return selection_action.restoreViewportAnchor(
             anchor,
             self.selectionViewportBasis(),
-            self.resolveSemanticSource(anchor.semantic_source),
+            if (self.resolveSemanticSource(anchor.semantic_source)) |source_offset|
+                self.sourceToPresentationOffset(source_offset)
+            else
+                null,
+            self.sourceToPresentationOffset(anchor.source_offset_fallback),
             self.view.diffVisibleRows(),
         );
     }
@@ -1036,6 +1059,7 @@ pub const Controller = struct {
     repo_root: ?[]const u8,
     repo_epoch: u64 = 0,
     mode_toggle_hint_width: u16 = 0,
+    presentation_rows: ?*const diff_render.PresentationRows = null,
     diagnostics: diff_surface.DiagnosticSink,
 
     pub fn view(self: Controller) View {
@@ -1043,6 +1067,7 @@ pub const Controller = struct {
             .surface = self.surface.readOnly(),
             .repo_root = self.repo_root,
             .mode_toggle_hint_width = self.mode_toggle_hint_width,
+            .presentation_rows = self.presentation_rows,
         };
     }
 

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
+const app_root = @import("../../../app.zig");
 const app_load = @import("../../load.zig");
 const app_message = @import("../../message.zig");
 const page = @import("../../page.zig");
@@ -10,7 +11,10 @@ const diff_basis = @import("../../diff_basis.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const app_test_support = @import("../../test_support.zig");
+const diff_render = @import("../../../diff/render.zig");
+const diff_selection = @import("../../../diff/selection.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
+const finding_card = @import("../../../ai_review/finding_card.zig");
 const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const git_review = @import("../../../git/committed_review.zig");
 const git_refs = @import("../../../git/refs.zig");
@@ -20,6 +24,7 @@ const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const review_page = @import("../review.zig");
 const review_coordinator = @import("coordinator.zig");
+const review_navigation = @import("navigation.zig");
 const review_view = @import("view.zig");
 const human_review_decision = @import("human_review_decision.zig");
 const human_review_session = @import("../../human_review_session.zig");
@@ -1082,6 +1087,333 @@ fn expectHumanReviewLifecycleSurface(
     for (forbidden) |text| try std.testing.expect(std.mem.indexOf(u8, snapshot, text) == null);
 }
 
+test "Review inline Finding owner and fold mode file lifecycle use the accepted projection" {
+    const allocator = std.testing.allocator;
+    const repository_id = try committed_review.ReviewRepositoryId.parse("a23e4567-e89b-42d3-a456-426614174000");
+    const review_id = try committed_review.ReviewId.parse("b23e4567-e89b-42d3-a456-426614174000");
+    const target: committed_review.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = reviewAppTestOid('a'),
+        .head_oid = reviewAppTestOid('b'),
+        .diff_base_oid = reviewAppTestOid('a'),
+    };
+    const snapshot: review_store.StoreSnapshot = .{
+        .root_device = 1,
+        .root_inode = 2,
+        .repository_locator = .{ .device = 3, .inode = 4 },
+        .review_repository_id = repository_id,
+    };
+    var bundle = try reviewHistoryPinnedBundle(allocator, snapshot, repository_id, review_id, target, true);
+    try std.testing.expectEqual(@as(usize, 1), bundle.selection.finding_projection.summary.mapped);
+
+    var folded_hunks = [_]bool{ false, false };
+    var loaded = app_test_support.loadedDiffTwo();
+    loaded.collapsed_hunks = &folded_hunks;
+    var page_state: review_page.ReviewPageState = .{
+        .load = app_test_support.loadState(loaded),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_node = 0,
+            .focus = .diff,
+            .sidebar_hidden = true,
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } },
+            .display_mode = .unified,
+        },
+        .presentation = .{ .pinned_ai = .{
+            .selection = bundle.selection,
+            .base_display = try allocator.dupe(u8, "base"),
+            .head_display = try allocator.dupe(u8, "head"),
+        } },
+    };
+    bundle.selection = undefined;
+    defer page_state.deinit(allocator);
+
+    const model = finding_card.FindingCardModel.init(&page_state.pinnedAiConst().?.selection.finding_projection, 0).?;
+    page_state.viewer.diff_cursor = .{ .hunk_line = .{
+        .hunk_index = model.span.hunk_ordinal,
+        .line_index = model.span.last_diff_line_ordinal,
+    } };
+    _ = page_state.finding_card.apply(.{ .focus = model });
+    const unified_view: review_navigation.View = .{
+        .page = &page_state,
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = 100, .height = 30 },
+    };
+    try std.testing.expect(unified_view.findingCardAtCursor());
+    try std.testing.expect(unified_view.focusedFindingCardVisible());
+    var frame = (try unified_view.buildFindingCardFrame(allocator)).?;
+    defer frame.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), frame.row_plan.cards.len);
+
+    var foreign = model;
+    foreign.identity.findings_digest.bytes[0] ^= 0xff;
+    try std.testing.expect(review_page.findingCardContent(&page_state.pinnedAiConst().?.selection, foreign) == null);
+
+    var repository: repo_session.State = .{};
+    var sessions: human_review_session.Owner = .{};
+    defer sessions.deinit();
+    const controller: review_coordinator.Controller = .{
+        .page_state = &page_state,
+        .repo = repository.view(),
+        .layout = .{ .width = 100, .height = 30 },
+        .env_map = null,
+        .sessions = &sessions,
+    };
+
+    switch (page_state.load.state) {
+        .loaded => |*session| session.loaded.setHunkFolded(0, model.span.hunk_ordinal, true),
+        else => unreachable,
+    }
+    controller.reconcileFindingCardVisibility();
+    try std.testing.expect(!page_state.finding_card.isFocused());
+
+    switch (page_state.load.state) {
+        .loaded => |*session| session.loaded.setHunkFolded(0, model.span.hunk_ordinal, false),
+        else => unreachable,
+    }
+    _ = page_state.finding_card.apply(.{ .focus = model });
+    page_state.viewer.display_mode = .side_by_side;
+    controller.reconcileFindingCardVisibility();
+    try std.testing.expect(!page_state.finding_card.isFocused());
+
+    _ = page_state.finding_card.apply(.{ .focus = model });
+    var narrow_controller = controller;
+    narrow_controller.layout.width = 40;
+    narrow_controller.reconcileFindingCardVisibility();
+    try std.testing.expect(page_state.finding_card.isFocused());
+
+    page_state.viewer.display_mode = .unified;
+    page_state.viewer.selected_target = .{ .diff_file = 1 };
+    page_state.viewer.selected_node = 1;
+    controller.reconcileFindingCardVisibility();
+    try std.testing.expect(!page_state.finding_card.isFocused());
+
+    page_state.pinnedAi().?.selection.finding_projection.entries[0].outcome = .{ .stale = .range_out_of_bounds };
+    try std.testing.expect(page_state.contentForFindingCard(model) == null);
+}
+
+test "Review shared display-mode and terminal resize prepare Finding cards before mutation" {
+    const allocator = std.testing.allocator;
+    const repository_id = try committed_review.ReviewRepositoryId.parse("c23e4567-e89b-42d3-a456-426614174000");
+    const review_id = try committed_review.ReviewId.parse("d23e4567-e89b-42d3-a456-426614174000");
+    const target: committed_review.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = reviewAppTestOid('a'),
+        .head_oid = reviewAppTestOid('b'),
+        .diff_base_oid = reviewAppTestOid('a'),
+    };
+    const snapshot: review_store.StoreSnapshot = .{
+        .root_device = 1,
+        .root_inode = 2,
+        .repository_locator = .{ .device = 3, .inode = 4 },
+        .review_repository_id = repository_id,
+    };
+    var bundle = try reviewHistoryPinnedBundle(allocator, snapshot, repository_id, review_id, target, true);
+    bundle.selection.finding_projection.entries[0].outcome = .{ .mapped = .{
+        .file_ordinal = 0,
+        .hunk_ordinal = 0,
+        .first_diff_line_ordinal = 0,
+        .last_diff_line_ordinal = 0,
+    } };
+
+    var folded_hunks = [_]bool{false};
+    var loaded = app_test_support.loadedDiffWide();
+    loaded.collapsed_hunks = &folded_hunks;
+    var page_state: review_page.ReviewPageState = .{
+        .load = app_test_support.loadState(loaded),
+        .viewer = .{
+            .selected_target = .{ .diff_file = 0 },
+            .selected_node = 0,
+            .focus = .diff,
+            .sidebar_hidden = true,
+            .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+            .display_mode = .unified,
+        },
+        .presentation = .{ .pinned_ai = .{
+            .selection = bundle.selection,
+            .base_display = try allocator.dupe(u8, "base"),
+            .head_display = try allocator.dupe(u8, "head"),
+        } },
+    };
+    bundle.selection = undefined;
+    var page_state_owned = true;
+    defer if (page_state_owned) page_state.deinit(allocator);
+
+    var repository: repo_session.State = .{};
+    var sessions: human_review_session.Owner = .{};
+    defer sessions.deinit();
+    const controller: review_coordinator.Controller = .{
+        .page_state = &page_state,
+        .repo = repository.view(),
+        .layout = .{ .width = 140, .height = 4 },
+        .env_map = null,
+        .sessions = &sessions,
+    };
+    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+
+    const retained_source_line_bound = page_state.load.state.loaded.loaded.lines;
+    page_state.load.state.loaded.loaded.lines = std.math.maxInt(usize);
+    try std.testing.expectError(
+        error.InvalidFindingCardPreparation,
+        controller.navigationView().prepareFindingCardFrame(allocator),
+    );
+    page_state.load.state.loaded.loaded.lines = retained_source_line_bound;
+
+    const failure_model = finding_card.FindingCardModel.init(
+        &page_state.pinnedAiConst().?.selection.finding_projection,
+        0,
+    ).?;
+    page_state.viewer.display_mode = .side_by_side;
+    page_state.viewer.diff_scroll = 1;
+    page_state.selection_layout_revision = 17;
+    _ = page_state.finding_card.apply(.{ .focus = failure_model });
+    page_state.selection_owner = .{ .diff = diff_selection.DragSelection.init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    const owner_before = page_state.selection_owner;
+    const card_before = page_state.finding_card;
+    const target_before = page_state.viewer.selected_target;
+    const cursor_before = page_state.viewer.diff_cursor;
+    const display_before = page_state.review_display;
+    var semantic_before_adapter = controller.navigation().updateAdapter();
+    const semantic_before = semantic_before_adapter.bodyController().view().selectedCoordinateAtOffset(1);
+    for (0..review_navigation.FindingCardFramePreparation.allocation_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var failing_ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = failing.allocator() };
+        try std.testing.expectError(error.OutOfMemory, controller.update(&failing_ctx, .{ .shared = .toggle_display_mode }));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, page_state.viewer.display_mode);
+        try std.testing.expectEqual(@as(usize, 1), page_state.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(u64, 17), page_state.selection_layout_revision);
+        try std.testing.expectEqualDeep(owner_before, page_state.selection_owner);
+        try std.testing.expectEqualDeep(card_before, page_state.finding_card);
+        try std.testing.expectEqualDeep(target_before, page_state.viewer.selected_target);
+        try std.testing.expectEqualDeep(cursor_before, page_state.viewer.diff_cursor);
+        try std.testing.expectEqualDeep(display_before, page_state.review_display);
+        try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, controller.navigationView().view().effectiveDisplayMode());
+        var semantic_after_adapter = controller.navigation().updateAdapter();
+        try std.testing.expectEqualDeep(semantic_before, semantic_after_adapter.bodyController().view().selectedCoordinateAtOffset(1));
+        try std.testing.expect(!folded_hunks[0] and page_state.completed_selection == null and page_state.pinned_selection_basis == null);
+    }
+    page_state.selection_owner = .none;
+    page_state.finding_card = .unfocused;
+    var no_late_allocation = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = review_navigation.FindingCardFramePreparation.allocation_count,
+    });
+    var success_ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = no_late_allocation.allocator() };
+    var prepared_success = try controller.update(&success_ctx, .{ .shared = .toggle_display_mode });
+    prepared_success.deinit(no_late_allocation.allocator());
+    try std.testing.expect(!no_late_allocation.has_induced_failure);
+    page_state.viewer.diff_scroll = 0;
+
+    var frame = (try controller.navigationView().buildFindingCardFrame(allocator)).?;
+    try std.testing.expect(page_state.selection_owner == .none);
+    try std.testing.expect(!page_state.finding_card.isFocused());
+    try std.testing.expectEqual(@as(usize, 2), frame.presentation_rows.blocks.len);
+    try std.testing.expectEqual(@as(usize, 1), frame.presentation_rows.blocks[0].height);
+    const source_anchor = frame.presentation_rows.blocks[0].after_source_offset;
+    const raw_tops = [_]usize{
+        frame.presentation_rows.blocks[0].presentation_start,
+        frame.presentation_rows.blocks[1].presentation_start,
+    };
+    var unified_controller = controller.navigation();
+    unified_controller.presentation_rows = &frame.presentation_rows;
+    var unified_adapter = unified_controller.updateAdapter();
+    const unified_body = unified_adapter.bodyController();
+    const source_rows = unified_body.view().sourceDiffLineCount();
+    const semantic_anchor = unified_body.view().selectedCoordinateAtOffset(source_anchor).?;
+    const source_cursor = page_state.viewer.diff_cursor;
+    frame.deinit(allocator);
+
+    for (raw_tops) |raw_top| {
+        page_state.viewer.display_mode = .unified;
+        page_state.viewer.diff_scroll = raw_top;
+        var to_side = try controller.update(&ctx, .{ .shared = .toggle_display_mode });
+        to_side.deinit(allocator);
+
+        var side_adapter = controller.navigation().updateAdapter();
+        const side_body = side_adapter.bodyController();
+        try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, side_body.view().view.effectiveDisplayMode());
+        try std.testing.expectEqual(source_rows, side_body.view().sourceDiffLineCount());
+        try std.testing.expectEqualDeep(semantic_anchor, side_body.view().selectedCoordinateAtOffset(page_state.viewer.diff_scroll).?);
+        try std.testing.expectEqualDeep(source_cursor, page_state.viewer.diff_cursor);
+
+        var to_unified = try controller.update(&ctx, .{ .shared = .toggle_display_mode });
+        to_unified.deinit(allocator);
+        var fresh = (try controller.navigationView().buildFindingCardFrame(allocator)).?;
+        defer fresh.deinit(allocator);
+        var fresh_controller = controller.navigation();
+        fresh_controller.presentation_rows = &fresh.presentation_rows;
+        var fresh_adapter = fresh_controller.updateAdapter();
+        const fresh_body = fresh_adapter.bodyController();
+        try std.testing.expectEqual(source_anchor, fresh_body.view().sourceAnchorAtOrBeforePresentation(page_state.viewer.diff_scroll).?);
+        try std.testing.expectEqual(fresh.presentation_rows.sourceToPresentation(source_anchor).?, page_state.viewer.diff_scroll);
+        try std.testing.expectEqualDeep(source_cursor, page_state.viewer.diff_cursor);
+    }
+
+    var narrow_controller = controller;
+    narrow_controller.layout.width = 40;
+    page_state.viewer.diff_scroll = raw_tops[0];
+    var effective_unified = try narrow_controller.update(&ctx, .{ .shared = .toggle_display_mode });
+    effective_unified.deinit(allocator);
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, narrow_controller.navigationView().view().effectiveDisplayMode());
+    try std.testing.expectEqual(raw_tops[0], page_state.viewer.diff_scroll);
+
+    var root_app: app_root.App = .{ .active_page = .review, .terminal_size = .{ .width = 140, .height = 12 } };
+    root_app.pages.review = page_state;
+    page_state_owned = false;
+    defer root_app.pages.review.deinit(allocator);
+    root_app.pages.review.viewer.display_mode = .side_by_side;
+    root_app.pages.review.viewer.diff_scroll = 1;
+    _ = root_app.pages.review.finding_card.apply(.{ .focus = failure_model });
+    root_app.pages.review.selection_owner = .{ .diff = diff_selection.DragSelection.init(
+        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .new,
+        .{ .hunk_index = 0, .line_index = 0 },
+    ) };
+    root_app.drag_auto_scroll.active = .{
+        .generation = 9,
+        .target = .review,
+        .intent = .{ .direction = .down, .endpoint = .{ .col = 5, .row = 10 } },
+    };
+    root_app.drag_auto_scroll.scheduled_generation = 9;
+    const resize_owner_before = root_app.pages.review.selection_owner;
+    const resize_card_before = root_app.pages.review.finding_card;
+    const resize_layout_before = root_app.pages.review.selection_layout_revision;
+    const resize_cursor_before = root_app.pages.review.viewer.diff_cursor;
+    for (0..review_navigation.FindingCardFramePreparation.allocation_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        root_app.allocator = failing.allocator();
+        var failing_ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = failing.allocator() };
+        try std.testing.expectError(error.OutOfMemory, root_app.update(.{ .terminal_resized = .{ .width = 40, .height = 12 } }, &failing_ctx));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(chasen.Size{ .width = 140, .height = 12 }, root_app.terminal_size);
+        try std.testing.expectEqualDeep(resize_owner_before, root_app.pages.review.selection_owner);
+        try std.testing.expect(root_app.drag_auto_scroll.active != null and root_app.drag_auto_scroll.scheduled_generation == 9);
+        try std.testing.expectEqual(@as(usize, 1), root_app.pages.review.viewer.diff_scroll);
+        try std.testing.expectEqualDeep(resize_card_before, root_app.pages.review.finding_card);
+        try std.testing.expectEqual(resize_layout_before, root_app.pages.review.selection_layout_revision);
+        try std.testing.expectEqualDeep(resize_cursor_before, root_app.pages.review.viewer.diff_cursor);
+    }
+    var resize_success = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = review_navigation.FindingCardFramePreparation.allocation_count,
+    });
+    root_app.drag_auto_scroll.scheduled_generation = null;
+    root_app.allocator = resize_success.allocator();
+    var resize_ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = resize_success.allocator() };
+    try root_app.update(.{ .terminal_resized = .{ .width = 40, .height = 12 } }, &resize_ctx);
+    root_app.allocator = allocator;
+    try std.testing.expect(!resize_success.has_induced_failure);
+    try std.testing.expectEqual(chasen.Size{ .width = 40, .height = 12 }, root_app.terminal_size);
+    try std.testing.expect(root_app.pages.review.selection_owner == .none and root_app.drag_auto_scroll.active == null);
+}
+
 fn reviewHistoryPinnedBundle(
     allocator: std.mem.Allocator,
     snapshot: review_store.StoreSnapshot,
@@ -1132,16 +1464,43 @@ fn reviewHistoryPinnedBundle(
     errdefer allocator.free(manifest_bytes);
     var manifest = try committed_review.ReviewRunManifest.parseStrict(allocator, manifest_bytes);
     errdefer manifest.deinit();
-    const patch_bytes = try allocator.dupe(u8, "");
+    const patch_text =
+        "diff --git a/unchanged.zig b/unchanged.zig\n" ++
+        "--- a/unchanged.zig\n" ++
+        "+++ b/unchanged.zig\n" ++
+        "@@ -1 +1 @@\n" ++
+        "-old\n" ++
+        "+line\n";
+    const patch_bytes = try allocator.dupe(u8, if (with_finding) patch_text else "");
     errdefer allocator.free(patch_bytes);
     var projection: git_review.CommittedDiffProjection = .{ .target = target, .patch_bytes = patch_bytes };
     errdefer projection.deinit(allocator);
+    const mode = [6]u8{ '1', '0', '0', '6', '4', '4' };
+    const endpoint_records = try allocator.alloc(git_review.CommittedDiffEndpointRecord, if (with_finding) 1 else 0);
+    if (with_finding) endpoint_records[0] = .{
+        .file_ordinal = 0,
+        .status_bytes = try allocator.dupe(u8, "M"),
+        .old_mode = mode,
+        .new_mode = mode,
+        .before = .{
+            .path_bytes = try allocator.dupe(u8, "unchanged.zig"),
+            .object_oid = target.base_oid,
+            .mode = mode,
+            .is_blob = true,
+        },
+        .after = .{
+            .path_bytes = try allocator.dupe(u8, "unchanged.zig"),
+            .object_oid = target.head_oid,
+            .mode = mode,
+            .is_blob = true,
+        },
+    };
     var endpoints: git_review.CommittedDiffEndpointSidecar = .{
         .target = target,
-        .records = try allocator.alloc(git_review.CommittedDiffEndpointRecord, 0),
+        .records = endpoint_records,
     };
     defer endpoints.deinit(allocator);
-    const one_validation = [_]git_review.CodeAnchorValidation{.{ .failure = .path_not_found }};
+    const one_validation = [_]git_review.CodeAnchorValidation{.{ .validated = target.head_oid }};
     var index = try finding_projection.build(allocator, .{
         .expected_review_repository_id = repository_id,
         .requested_review_id = review_id,

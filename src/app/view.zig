@@ -1753,7 +1753,8 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         .review => {
             const footer = app.review.footer();
             if (!footer.normal_action_hints_enabled or app.review.page.base_picker.open or
-                app.review.page.ai_reviews.isOpen() or app.review.page.human_review_decision.isOpen()) return result;
+                app.review.page.ai_reviews.isOpen() or app.review.page.human_review_decision.isOpen() or
+                app.review.page.finding_card.isFocused()) return result;
             result.append(ui.key_hint.item("a", "AI reviews"), .review_ai);
             if (review_view.humanReviewActionLabel(app.review)) |label| {
                 appendUnclaimedFooterItem(
@@ -3144,6 +3145,7 @@ const help_review_items = [_]HelpItem{
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
     .{ .key = .{ .text = "y / Y" }, .description = "copy current line / hunk" },
+    .{ .key = .{ .text = "s / Enter / j/k / y / Esc/q" }, .description = "focus, open, scroll, copy, or leave an inline Finding" },
     .{ .key = .{ .text = "Space / P / U / b" }, .description = "write operations unavailable" },
 };
 

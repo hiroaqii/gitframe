@@ -474,6 +474,7 @@ pub fn viewDiffPane(
     palette: theme.Palette,
     status_only: ?StatusOnlyRenderer,
     display_mode_toggle_key: ?[]const u8,
+    inline_row_painter: ?diff_render.InlineRowPainter,
 ) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
@@ -519,6 +520,8 @@ pub fn viewDiffPane(
                 .syntax = .initDirect(&loaded.syntax_spans, file_index),
                 .selection = body.diffSelectionView(),
                 .header_selection = body.diffHeaderSelectionActive(),
+                .presentation_rows = if (body.view.presentation_rows) |rows| rows.* else null,
+                .inline_row_painter = inline_row_painter,
             });
         },
     }
@@ -759,12 +762,12 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     try ts.init(80, 10);
     defer ts.deinit();
 
-    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null);
+    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null, null);
     try std.testing.expectEqual(@as(usize, 1), fake.resolved);
     try std.testing.expectEqual(@as(usize, 0), fake.hunk_stage + fake.generated + fake.displayed_file + fake.line_index + fake.unexpected);
 
     fake = .{ .kind = .primary, .loaded = &loaded };
-    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null);
+    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null, null);
     try std.testing.expectEqual(@as(usize, 3), fake.resolved);
     try std.testing.expectEqual(@as(usize, 1), fake.hunk_stage);
     try std.testing.expectEqual(@as(usize, 1), fake.generated);

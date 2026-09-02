@@ -3,6 +3,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const review_page = @import("../review.zig");
+const finding_card = @import("../../../ai_review/finding_card.zig");
+const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const context = @import("../../../context.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
@@ -13,6 +15,9 @@ const diff_selection = @import("../../../diff/selection.zig");
 const diff_source = @import("../../../diff/source.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
 const file_tree = @import("../../../file_tree.zig");
+const loaded_diff = @import("../../../loaded_diff.zig");
+const committed_review = @import("../../../committed_review.zig");
+const review_store = @import("../../../review_store.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
@@ -28,12 +33,14 @@ pub const View = struct {
     root_identity: ?root_capability.Identity,
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
+    presentation_rows: ?*const diff_render.PresentationRows = null,
 
     pub fn view(self: View) diff_surface.navigation.View {
         return .{
             .surface = self.page.readSurface(source, self.layout),
             .repo_root = self.repo_root,
             .mode_toggle_hint_width = self.mode_toggle_hint_width,
+            .presentation_rows = self.presentation_rows,
         };
     }
 
@@ -47,6 +54,160 @@ pub const View = struct {
 
     pub fn contentView(self: View, adapter: *BodyResolverAdapter) diff_surface.content.View {
         return .{ .navigation = self.bodyView(adapter) };
+    }
+
+    pub fn withPresentationRows(self: View, rows: ?*const diff_render.PresentationRows) View {
+        var result = self;
+        result.presentation_rows = rows;
+        return result;
+    }
+
+    pub fn findingCardAtCursor(self: View) bool {
+        if (self.page.viewer.focus != .diff or self.view().effectiveDisplayMode() != .unified) return false;
+        const cursor = switch (self.page.viewer.diff_cursor) {
+            .hunk_line => |line| line,
+            else => return false,
+        };
+        const loaded = self.view().activeLoadedDiffConst() orelse return false;
+        const file_index = self.view().selectedFileIndex(loaded) orelse return false;
+        if (!loaded.fileTextSelectable(file_index)) return false;
+        const pinned = self.page.pinnedAiConst() orelse return false;
+        if (file_index >= pinned.selection.finding_projection.files.len) return false;
+        const folded = loaded.foldedHunksForFile(file_index);
+        if (cursor.hunk_index < folded.len and folded[cursor.hunk_index]) return false;
+        const file_record = pinned.selection.finding_projection.files[file_index];
+        for (file_record.mapped_entry_indices) |entry_index| {
+            const model = finding_card.FindingCardModel.init(&pinned.selection.finding_projection, entry_index) orelse continue;
+            if (model.span.file_ordinal != file_index) continue;
+            if (model.span.hunk_ordinal != cursor.hunk_index or model.span.last_diff_line_ordinal != cursor.line_index) continue;
+            if (self.page.contentForFindingCard(model) != null) return true;
+        }
+        return false;
+    }
+
+    pub fn buildFindingCardFrame(self: View, allocator: std.mem.Allocator) !?FindingCardFrame {
+        return self.buildFindingCardFrameForState(allocator, self.page.finding_card);
+    }
+
+    pub fn prepareFindingCardFrame(
+        self: View,
+        allocator: std.mem.Allocator,
+    ) (std.mem.Allocator.Error || error{InvalidFindingCardPreparation})!?FindingCardFramePreparation {
+        const loaded = self.view().activeLoadedDiffConst() orelse return null;
+        const pinned = self.page.pinnedAiConst() orelse return null;
+        const entry_capacity = pinned.selection.finding_projection.entries.len;
+        if (entry_capacity == 0) return null;
+        if (entry_capacity > committed_review.limits.max_findings) return error.InvalidFindingCardPreparation;
+        const block_capacity = std.math.mul(usize, entry_capacity, 2) catch
+            return error.InvalidFindingCardPreparation;
+        const inserted_bound = std.math.mul(
+            usize,
+            entry_capacity,
+            finding_card.expanded_rows + finding_card.group_spacer_rows,
+        ) catch return error.InvalidFindingCardPreparation;
+        // Production load records this complete raw-input line count once.
+        // It bounds every parsed file's unified body rows (including their
+        // non-body file-header allowance) without a navigation-time scan.
+        _ = std.math.add(usize, loaded.lines, inserted_bound) catch
+            return error.InvalidFindingCardPreparation;
+        return try FindingCardFramePreparation.init(
+            allocator,
+            &pinned.selection,
+            loaded,
+            entry_capacity,
+            block_capacity,
+        );
+    }
+
+    pub fn buildFindingCardFrameForState(
+        self: View,
+        allocator: std.mem.Allocator,
+        state: finding_card.State,
+    ) !?FindingCardFrame {
+        if (self.view().effectiveDisplayMode() != .unified) return null;
+        const loaded = self.view().activeLoadedDiffConst() orelse return null;
+        const file_index = self.view().selectedFileIndex(loaded) orelse return null;
+        if (!loaded.fileTextSelectable(file_index)) return null;
+        const pinned = self.page.pinnedAiConst() orelse return null;
+        const index = &pinned.selection.finding_projection;
+        if (file_index >= index.files.len or file_index >= loaded.document.files.len) return null;
+        const file = loaded.document.files[file_index];
+        const folded = loaded.foldedHunksForFile(file_index);
+        const line_index = loaded.cachedRenderedLineIndex(file_index, .unified) orelse
+            loaded.renderedLineIndex(file_index, .unified);
+
+        var models: std.ArrayList(finding_card.FindingCardModel) = .empty;
+        defer models.deinit(allocator);
+        for (index.files[file_index].mapped_entry_indices) |entry_index| {
+            const model = finding_card.FindingCardModel.init(index, entry_index) orelse continue;
+            if (model.span.file_ordinal != file_index) continue;
+            if (self.page.contentForFindingCard(model) == null) continue;
+            try appendResolvedFindingCardModel(allocator, &models, file, folded, line_index, model);
+        }
+        if (models.items.len == 0) return null;
+
+        var row_plan = try finding_card.RowPlan.build(
+            allocator,
+            models.items,
+            folded,
+        );
+        errdefer row_plan.deinit(allocator);
+        if (row_plan.cards.len == 0) return null;
+
+        var inputs: std.ArrayList(diff_render.InlineBlockInput) = .empty;
+        defer inputs.deinit(allocator);
+        for (row_plan.groups) |group| {
+            const source_offset = diff_view_model.renderedOffsetForCoordinate(file, .unified, .{ .hunk_line = .{
+                .hunk_index = group.hunk_ordinal,
+                .line_index = group.last_diff_line_ordinal,
+            } }, folded, line_index) orelse continue;
+            for (group.card_start..group.card_start + group.card_count) |card_index| {
+                try inputs.append(allocator, .{
+                    .after_source_offset = source_offset,
+                    .height = state.cardRows(row_plan.cards[card_index]),
+                    .kind = .{ .card = card_index },
+                });
+            }
+            try inputs.append(allocator, .{
+                .after_source_offset = source_offset,
+                .height = finding_card.group_spacer_rows,
+                .kind = .spacer,
+            });
+        }
+        if (inputs.items.len == 0) return null;
+        var presentation_rows = try diff_render.PresentationRows.init(
+            allocator,
+            line_index.lineCount(),
+            inputs.items,
+        );
+        errdefer presentation_rows.deinit(allocator);
+        return .{ .row_plan = row_plan, .presentation_rows = presentation_rows };
+    }
+
+    /// Allocation-free lifecycle check used after shared navigation mutates
+    /// file, fold, or display-mode state.
+    pub fn focusedFindingCardVisible(self: View) bool {
+        if (!self.page.finding_card.isFocused()) return true;
+        if (self.view().effectiveDisplayMode() != .unified) return false;
+        const loaded = self.view().activeLoadedDiffConst() orelse return false;
+        const file_index = self.view().selectedFileIndex(loaded) orelse return false;
+        if (!loaded.fileTextSelectable(file_index)) return false;
+        const pinned = self.page.pinnedAiConst() orelse return false;
+        if (file_index >= pinned.selection.finding_projection.files.len) return false;
+        const folded = loaded.foldedHunksForFile(file_index);
+        const file = loaded.document.files[file_index];
+        const line_index = loaded.cachedRenderedLineIndex(file_index, .unified) orelse
+            loaded.renderedLineIndex(file_index, .unified);
+        const file_record = pinned.selection.finding_projection.files[file_index];
+        for (file_record.mapped_entry_indices) |entry_index| {
+            const model = finding_card.FindingCardModel.init(&pinned.selection.finding_projection, entry_index) orelse continue;
+            if (model.span.file_ordinal != file_index) continue;
+            if (model.span.hunk_ordinal < folded.len and folded[model.span.hunk_ordinal]) continue;
+            if (self.page.finding_card.matches(model) and
+                self.page.contentForFindingCard(model) != null and
+                sourceOffsetForModel(file, folded, line_index, model) != null) return true;
+        }
+        return false;
     }
 
     pub fn captureAnchor(self: View, allocator: std.mem.Allocator) !?diff_surface.ReloadAnchor {
@@ -85,6 +246,7 @@ pub const Controller = struct {
     root_identity: ?root_capability.Identity,
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
+    presentation_rows: ?*const diff_render.PresentationRows = null,
 
     fn sharedController(self: Controller) diff_surface.navigation.Controller {
         return .{
@@ -92,6 +254,7 @@ pub const Controller = struct {
             .repo_root = self.repo_root,
             .repo_epoch = self.repo_epoch,
             .mode_toggle_hint_width = self.mode_toggle_hint_width,
+            .presentation_rows = self.presentation_rows,
             .diagnostics = .{ .target = &self.page.status },
         };
     }
@@ -104,6 +267,7 @@ pub const Controller = struct {
             .root_identity = self.root_identity,
             .layout = self.layout,
             .mode_toggle_hint_width = self.mode_toggle_hint_width,
+            .presentation_rows = self.presentation_rows,
         };
     }
 
@@ -152,6 +316,240 @@ pub const Controller = struct {
         };
     }
 };
+
+pub const FindingCardFrame = struct {
+    row_plan: finding_card.RowPlan,
+    presentation_rows: diff_render.PresentationRows,
+
+    pub fn deinit(self: *FindingCardFrame, allocator: std.mem.Allocator) void {
+        self.presentation_rows.deinit(allocator);
+        self.row_plan.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn containsFocused(self: *const FindingCardFrame, state: finding_card.State) bool {
+        if (!state.isFocused()) return false;
+        for (self.presentation_rows.blocks) |block| switch (block.kind) {
+            .card => |card_index| {
+                if (card_index < self.row_plan.cards.len and state.matches(self.row_plan.cards[card_index])) return true;
+            },
+            .spacer => {},
+        };
+        return false;
+    }
+};
+
+pub const PreparedFindingCardFrame = struct {
+    row_plan: finding_card.RowPlan,
+    presentation_rows: diff_render.PresentationRows,
+};
+
+pub const FindingCardFramePreparation = struct {
+    pub const allocation_count: usize = 6;
+
+    allocator: std.mem.Allocator,
+    selection: *const review_store.SelectedRunRead,
+    loaded: *const loaded_diff.LoadedDiff,
+    models: []finding_card.FindingCardModel,
+    groups: []finding_card.Group,
+    cards: []finding_card.FindingCardModel,
+    cursors: []usize,
+    inputs: []diff_render.InlineBlockInput,
+    blocks: []diff_render.InlineBlock,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        selection: *const review_store.SelectedRunRead,
+        loaded: *const loaded_diff.LoadedDiff,
+        entry_capacity: usize,
+        block_capacity: usize,
+    ) std.mem.Allocator.Error!FindingCardFramePreparation {
+        const models = try allocator.alloc(finding_card.FindingCardModel, entry_capacity);
+        errdefer allocator.free(models);
+        const groups = try allocator.alloc(finding_card.Group, entry_capacity);
+        errdefer allocator.free(groups);
+        const cards = try allocator.alloc(finding_card.FindingCardModel, entry_capacity);
+        errdefer allocator.free(cards);
+        const cursors = try allocator.alloc(usize, entry_capacity);
+        errdefer allocator.free(cursors);
+        const inputs = try allocator.alloc(diff_render.InlineBlockInput, block_capacity);
+        errdefer allocator.free(inputs);
+        const blocks = try allocator.alloc(diff_render.InlineBlock, block_capacity);
+        return .{
+            .allocator = allocator,
+            .selection = selection,
+            .loaded = loaded,
+            .models = models,
+            .groups = groups,
+            .cards = cards,
+            .cursors = cursors,
+            .inputs = inputs,
+            .blocks = blocks,
+        };
+    }
+
+    pub fn deinit(self: *FindingCardFramePreparation) void {
+        self.allocator.free(self.blocks);
+        self.allocator.free(self.inputs);
+        self.allocator.free(self.cursors);
+        self.allocator.free(self.cards);
+        self.allocator.free(self.groups);
+        self.allocator.free(self.models);
+        self.* = undefined;
+    }
+
+    pub fn fill(
+        self: *FindingCardFramePreparation,
+        view: View,
+        state: finding_card.State,
+    ) ?PreparedFindingCardFrame {
+        const loaded = view.view().activeLoadedDiffConst().?;
+        const pinned = view.page.pinnedAiConst().?;
+        std.debug.assert(loaded == self.loaded);
+        std.debug.assert(&pinned.selection == self.selection);
+        if (view.view().effectiveDisplayMode() != .unified) return null;
+        const file_index = view.view().selectedFileIndex(loaded) orelse return null;
+        if (!loaded.fileTextSelectable(file_index)) return null;
+        const index = &pinned.selection.finding_projection;
+        if (file_index >= index.files.len or file_index >= loaded.document.files.len) return null;
+        const file = loaded.document.files[file_index];
+        const folded = loaded.foldedHunksForFile(file_index);
+        const line_index = loaded.cachedRenderedLineIndex(file_index, .unified) orelse
+            loaded.renderedLineIndex(file_index, .unified);
+
+        var model_count: usize = 0;
+        for (index.files[file_index].mapped_entry_indices) |entry_index| {
+            const model = finding_card.FindingCardModel.init(index, entry_index) orelse continue;
+            if (model.span.file_ordinal != file_index or view.page.contentForFindingCard(model) == null) continue;
+            if (sourceOffsetForModel(file, folded, line_index, model) == null) continue;
+            std.debug.assert(model_count < self.models.len);
+            self.models[model_count] = model;
+            model_count += 1;
+        }
+        if (model_count == 0) return null;
+        const row_plan = finding_card.RowPlan.buildPrepared(
+            self.models[0..model_count],
+            folded,
+            self.groups,
+            self.cards,
+            self.cursors,
+        );
+        if (row_plan.cards.len == 0) return null;
+
+        var input_count: usize = 0;
+        for (row_plan.groups) |group| {
+            const source_offset = sourceOffsetForModel(
+                file,
+                folded,
+                line_index,
+                row_plan.cards[group.card_start],
+            ).?;
+            for (group.card_start..group.card_start + group.card_count) |card_index| {
+                self.inputs[input_count] = .{
+                    .after_source_offset = source_offset,
+                    .height = state.cardRows(row_plan.cards[card_index]),
+                    .kind = .{ .card = card_index },
+                };
+                input_count += 1;
+            }
+            self.inputs[input_count] = .{
+                .after_source_offset = source_offset,
+                .height = finding_card.group_spacer_rows,
+                .kind = .spacer,
+            };
+            input_count += 1;
+        }
+        std.debug.assert(input_count <= self.inputs.len);
+        return .{
+            .row_plan = row_plan,
+            .presentation_rows = diff_render.PresentationRows.initPrepared(
+                line_index.lineCount(),
+                self.inputs[0..input_count],
+                self.blocks,
+            ),
+        };
+    }
+};
+
+fn sourceOffsetForModel(
+    file: diff_parser.FileDiff,
+    folded_hunks: []const bool,
+    line_index: diff_view_model.RenderedLineIndex,
+    model: finding_card.FindingCardModel,
+) ?usize {
+    return diff_view_model.renderedOffsetForCoordinate(file, .unified, .{ .hunk_line = .{
+        .hunk_index = model.span.hunk_ordinal,
+        .line_index = model.span.last_diff_line_ordinal,
+    } }, folded_hunks, line_index);
+}
+
+fn appendResolvedFindingCardModel(
+    allocator: std.mem.Allocator,
+    models: *std.ArrayList(finding_card.FindingCardModel),
+    file: diff_parser.FileDiff,
+    folded_hunks: []const bool,
+    line_index: diff_view_model.RenderedLineIndex,
+    model: finding_card.FindingCardModel,
+) std.mem.Allocator.Error!void {
+    if (sourceOffsetForModel(file, folded_hunks, line_index, model) == null) return;
+    try models.append(allocator, model);
+}
+
+test "Review Finding card frame admission omits unresolved coordinates and reports allocation failure" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/card.zig b/src/card.zig",
+        .old_path = "a/src/card.zig",
+        .new_path = "b/src/card.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 2,
+            .section = "cards",
+            .lines = &.{
+                .{ .kind = .context, .text = "one", .old_line = 1, .new_line = 1 },
+                .{ .kind = .added, .text = "two", .new_line = 2 },
+            },
+        }},
+    };
+    var line_index = try diff_view_model.RenderedLineIndex.build(std.testing.allocator, file, .unified);
+    defer line_index.deinit(std.testing.allocator);
+    const valid: finding_card.FindingCardModel = .{
+        .identity = std.mem.zeroes(finding_projection.Identity),
+        .entry_index = 0,
+        .finding_id = "valid",
+        .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
+        .severity = .warning,
+    };
+    var unresolved = valid;
+    unresolved.entry_index = 1;
+    unresolved.finding_id = "unresolved";
+    unresolved.span.last_diff_line_ordinal = 99;
+
+    var models: std.ArrayList(finding_card.FindingCardModel) = .empty;
+    defer models.deinit(std.testing.allocator);
+    try appendResolvedFindingCardModel(std.testing.allocator, &models, file, &.{false}, line_index, valid);
+    try appendResolvedFindingCardModel(std.testing.allocator, &models, file, &.{false}, line_index, unresolved);
+    try std.testing.expectEqual(@as(usize, 1), models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), models.items[0].entry_index);
+    var plan = try finding_card.RowPlan.build(std.testing.allocator, models.items, &.{false});
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.cards.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.cards[0].entry_index);
+
+    var failing_models: std.ArrayList(finding_card.FindingCardModel) = .empty;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, appendResolvedFindingCardModel(
+        failing.allocator(),
+        &failing_models,
+        file,
+        &.{false},
+        line_index,
+        valid,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), failing_models.items.len);
+}
 
 pub const BodyResolverAdapter = struct {
     context: View,

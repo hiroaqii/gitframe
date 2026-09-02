@@ -62,7 +62,277 @@ pub const RenderOptions = struct {
     source_has_visible_syntax: bool = false,
     selection: ?diff_selection.View = null,
     header_selection: bool = false,
+    presentation_rows: ?PresentationRows = null,
+    inline_row_painter: ?InlineRowPainter = null,
 };
+
+pub const InlineBlockKind = union(enum) {
+    card: usize,
+    spacer,
+};
+
+pub const InlineBlockInput = struct {
+    after_source_offset: usize,
+    height: usize,
+    kind: InlineBlockKind,
+};
+
+pub const InlineBlock = struct {
+    after_source_offset: usize,
+    presentation_start: usize,
+    height: usize,
+    kind: InlineBlockKind,
+};
+
+pub const PresentationHit = union(enum) {
+    source: usize,
+    card: struct { token: usize, local_row: usize },
+    spacer,
+};
+
+/// Neutral source/presentation mapping for transient rows inserted after
+/// source-model rows. It has no AI or artifact dependency.
+pub const PresentationRows = struct {
+    source_rows: usize,
+    blocks: []InlineBlock,
+    total_rows: usize,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        source_rows: usize,
+        inputs: []const InlineBlockInput,
+    ) (std.mem.Allocator.Error || error{InvalidPresentation})!PresentationRows {
+        const blocks = try allocator.alloc(InlineBlock, inputs.len);
+        errdefer allocator.free(blocks);
+        var inserted: usize = 0;
+        var previous_anchor: ?usize = null;
+        for (inputs, 0..) |input, index| {
+            if (input.height == 0 or input.after_source_offset >= source_rows) return error.InvalidPresentation;
+            if (previous_anchor) |anchor| if (input.after_source_offset < anchor) return error.InvalidPresentation;
+            blocks[index] = .{
+                .after_source_offset = input.after_source_offset,
+                .presentation_start = input.after_source_offset + 1 + inserted,
+                .height = input.height,
+                .kind = input.kind,
+            };
+            inserted += input.height;
+            previous_anchor = input.after_source_offset;
+        }
+        return .{ .source_rows = source_rows, .blocks = blocks, .total_rows = source_rows + inserted };
+    }
+
+    /// Fill a borrowing mapping after its capacity and maximum row growth
+    /// were proven by the caller before mutation.
+    pub fn initPrepared(
+        source_rows: usize,
+        inputs: []const InlineBlockInput,
+        block_storage: []InlineBlock,
+    ) PresentationRows {
+        std.debug.assert(block_storage.len >= inputs.len);
+        var inserted: usize = 0;
+        var previous_anchor: ?usize = null;
+        for (inputs, 0..) |input, index| {
+            std.debug.assert(input.height > 0 and input.after_source_offset < source_rows);
+            if (previous_anchor) |anchor| std.debug.assert(input.after_source_offset >= anchor);
+            block_storage[index] = .{
+                .after_source_offset = input.after_source_offset,
+                .presentation_start = input.after_source_offset + 1 + inserted,
+                .height = input.height,
+                .kind = input.kind,
+            };
+            inserted += input.height;
+            previous_anchor = input.after_source_offset;
+        }
+        return .{
+            .source_rows = source_rows,
+            .blocks = block_storage[0..inputs.len],
+            .total_rows = source_rows + inserted,
+        };
+    }
+
+    pub fn deinit(self: *PresentationRows, allocator: std.mem.Allocator) void {
+        allocator.free(self.blocks);
+        self.* = undefined;
+    }
+
+    pub fn sourceToPresentation(self: PresentationRows, source_offset: usize) ?usize {
+        if (source_offset >= self.source_rows) return null;
+        var inserted: usize = 0;
+        for (self.blocks) |block| {
+            if (block.after_source_offset >= source_offset) break;
+            inserted += block.height;
+        }
+        return source_offset + inserted;
+    }
+
+    pub fn hitAtPresentation(self: PresentationRows, presentation_offset: usize) ?PresentationHit {
+        if (presentation_offset >= self.total_rows) return null;
+        var inserted: usize = 0;
+        for (self.blocks) |block| {
+            if (presentation_offset < block.presentation_start) {
+                return .{ .source = presentation_offset - inserted };
+            }
+            if (presentation_offset < block.presentation_start + block.height) {
+                return switch (block.kind) {
+                    .card => |token| .{ .card = .{
+                        .token = token,
+                        .local_row = presentation_offset - block.presentation_start,
+                    } },
+                    .spacer => .spacer,
+                };
+            }
+            inserted += block.height;
+        }
+        return .{ .source = presentation_offset - inserted };
+    }
+
+    pub fn sourceAnchorAtOrBeforePresentation(self: PresentationRows, presentation_offset: usize) ?usize {
+        const hit = self.hitAtPresentation(@min(presentation_offset, self.total_rows -| 1)) orelse return null;
+        return switch (hit) {
+            .source => |source| source,
+            .card, .spacer => blk: {
+                for (self.blocks) |block| {
+                    if (presentation_offset >= block.presentation_start and
+                        presentation_offset < block.presentation_start + block.height)
+                    {
+                        break :blk block.after_source_offset;
+                    }
+                }
+                break :blk null;
+            },
+        };
+    }
+
+    pub fn sourceAtOrAfterPresentation(self: PresentationRows, presentation_offset: usize) ?usize {
+        const hit = self.hitAtPresentation(presentation_offset) orelse return null;
+        return switch (hit) {
+            .source => |source| source,
+            .card, .spacer => blk: {
+                for (self.blocks) |block| {
+                    if (presentation_offset >= block.presentation_start and
+                        presentation_offset < block.presentation_start + block.height)
+                    {
+                        const next = block.after_source_offset + 1;
+                        break :blk if (next < self.source_rows) next else null;
+                    }
+                }
+                break :blk null;
+            },
+        };
+    }
+
+    pub fn cardStart(self: PresentationRows, token: usize) ?usize {
+        for (self.blocks) |block| switch (block.kind) {
+            .card => |candidate| if (candidate == token) return block.presentation_start,
+            .spacer => {},
+        };
+        return null;
+    }
+};
+
+pub const InlineRowPainter = struct {
+    ctx: *anyopaque,
+    paint_fn: *const fn (ctx: *anyopaque, surface: *chasen.Surface, row: u16, token: usize, local_row: usize) anyerror!void,
+
+    pub fn paint(self: InlineRowPainter, surface: *chasen.Surface, row: u16, token: usize, local_row: usize) !void {
+        return self.paint_fn(self.ctx, surface, row, token, local_row);
+    }
+};
+
+test "presentation row plan maps source card and spacer rows exactly" {
+    const inputs = [_]InlineBlockInput{
+        .{ .after_source_offset = 1, .height = 1, .kind = .{ .card = 0 } },
+        .{ .after_source_offset = 1, .height = 3, .kind = .{ .card = 1 } },
+        .{ .after_source_offset = 1, .height = 1, .kind = .spacer },
+        .{ .after_source_offset = 3, .height = 1, .kind = .{ .card = 2 } },
+    };
+    var rows = try PresentationRows.init(std.testing.allocator, 5, &inputs);
+    defer rows.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 11), rows.total_rows);
+    try std.testing.expectEqual(@as(?usize, 0), rows.sourceToPresentation(0));
+    try std.testing.expectEqual(@as(?usize, 1), rows.sourceToPresentation(1));
+    try std.testing.expectEqual(@as(?usize, 7), rows.sourceToPresentation(2));
+    try std.testing.expectEqual(@as(?usize, 8), rows.sourceToPresentation(3));
+    try std.testing.expectEqual(@as(?usize, 10), rows.sourceToPresentation(4));
+    try std.testing.expectEqual(PresentationHit{ .card = .{ .token = 0, .local_row = 0 } }, rows.hitAtPresentation(2).?);
+    try std.testing.expectEqual(PresentationHit{ .card = .{ .token = 1, .local_row = 2 } }, rows.hitAtPresentation(5).?);
+    try std.testing.expectEqual(PresentationHit.spacer, rows.hitAtPresentation(6).?);
+    try std.testing.expectEqual(PresentationHit{ .source = 2 }, rows.hitAtPresentation(7).?);
+    try std.testing.expectEqual(@as(?usize, 1), rows.sourceAnchorAtOrBeforePresentation(5));
+    try std.testing.expectEqual(@as(?usize, 2), rows.sourceAtOrAfterPresentation(5));
+    try std.testing.expectEqual(@as(?usize, 3), rows.sourceAnchorAtOrBeforePresentation(9));
+}
+
+test "presentation rendering keeps the header and starts scrolled card source and tail rows in the body" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/src/card.zig b/src/card.zig",
+        .old_path = "a/src/card.zig",
+        .new_path = "b/src/card.zig",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 2,
+            .new_start = 1,
+            .new_count = 3,
+            .section = "cards",
+            .lines = &.{
+                .{ .kind = .context, .text = "source-one", .old_line = 1, .new_line = 1 },
+                .{ .kind = .added, .text = "source-two", .new_line = 2 },
+                .{ .kind = .context, .text = "source-tail", .old_line = 2, .new_line = 3 },
+            },
+        }},
+    };
+    var index = try diff_view_model.RenderedLineIndex.build(std.testing.allocator, file, .unified);
+    defer index.deinit(std.testing.allocator);
+    const inputs = [_]InlineBlockInput{
+        .{ .after_source_offset = 0, .height = 1, .kind = .{ .card = 7 } },
+        .{ .after_source_offset = 0, .height = 1, .kind = .spacer },
+    };
+    var rows = try PresentationRows.init(std.testing.allocator, index.lineCount(), &inputs);
+    defer rows.deinit(std.testing.allocator);
+
+    const Painter = struct {
+        fn paint(_: *anyopaque, surface: *chasen.Surface, row: u16, token: usize, local_row: usize) !void {
+            try std.testing.expectEqual(@as(usize, 7), token);
+            try std.testing.expectEqual(@as(usize, 0), local_row);
+            _ = surface.borrowTextAt(0, row, "CARD", .{});
+        }
+    };
+    var painter_context: u8 = 0;
+    const painter: InlineRowPainter = .{ .ctx = &painter_context, .paint_fn = Painter.paint };
+
+    var scrolled: chasen.testing.TestSurface = undefined;
+    try scrolled.init(80, 7);
+    defer scrolled.deinit();
+    try renderFile(&scrolled.surface, file, .{
+        .scroll = 1,
+        .line_index = index,
+        .presentation_rows = rows,
+        .inline_row_painter = painter,
+    });
+    const scrolled_snapshot = try scrolled.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(scrolled_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled_snapshot[0..80], "src/card.zig") != null);
+    try scrolled.expectCellText(0, body_start_row, "C");
+    try scrolled.expectCellText(0, body_start_row + 1, " ");
+    try std.testing.expect(std.mem.indexOf(u8, scrolled_snapshot[81 * 5 .. 81 * 5 + 80], "source-one") != null);
+
+    var tail: chasen.testing.TestSurface = undefined;
+    try tail.init(80, 5);
+    defer tail.deinit();
+    try renderFile(&tail.surface, file, .{
+        .scroll = rows.total_rows - 1,
+        .line_index = index,
+        .presentation_rows = rows,
+        .inline_row_painter = painter,
+    });
+    const tail_snapshot = try tail.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(tail_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, tail_snapshot[0..80], "src/card.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_snapshot[81 * 3 .. 81 * 3 + 80], "source-tail") != null);
+    try tail.expectCellText(0, body_start_row + 1, " ");
+}
 
 test "hunk stage presentation resolves uniform and exact per-hunk states" {
     const all_unstaged: HunkStagePresentation = .all_unstaged;
@@ -330,6 +600,18 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         .height = size.height,
     });
 
+    if (mode == .unified and options.presentation_rows != null and options.inline_row_painter != null) {
+        return renderFileWithPresentation(
+            surface,
+            &body_surface,
+            file,
+            options,
+            styles,
+            options.presentation_rows.?,
+            options.inline_row_painter.?,
+        );
+    }
+
     const line_index = if (options.line_index) |index|
         if (lineIndexMatchesFile(file, index, mode)) index else null
     else
@@ -387,6 +669,79 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                 }
                 if (current_hunk_highlighted) {
                     if (rows.currentHunkIndex()) |hunk_index| drawSideBySideHunkGuide(&body_surface, row, separatorGuideGlyph(guide_index, hunk_index, body_offset), options.hunk_stages.stateForHunk(hunk_index), presentation, styles);
+                }
+            },
+        }
+    }
+}
+
+fn renderFileWithPresentation(
+    surface: *chasen.Surface,
+    body_surface: *chasen.Surface,
+    file: diff_parser.FileDiff,
+    options: RenderOptions,
+    styles: RenderStyles,
+    presentation_rows: PresentationRows,
+    painter: InlineRowPainter,
+) !void {
+    const line_index = if (options.line_index) |index|
+        if (lineIndexMatchesFile(file, index, .unified)) index else null
+    else
+        null;
+    const guide_index = line_index orelse diff_view_model.RenderedLineIndex.buildFolded(
+        surface.frameAllocator(),
+        file,
+        .unified,
+        options.folded_hunks,
+    ) catch null;
+    const source_start = presentation_rows.sourceAtOrAfterPresentation(options.scroll) orelse presentation_rows.source_rows;
+    var rows = if (line_index) |index|
+        diff_view_model.BodyRowIterator.initAtWithFolded(file, .unified, index, source_start, options.folded_hunks)
+    else
+        diff_view_model.BodyRowIterator.initWithFolded(file, .unified, options.folded_hunks);
+    if (line_index == null) {
+        var skipped: usize = 0;
+        while (skipped < source_start) : (skipped += 1) _ = rows.next() orelse break;
+    }
+
+    var presentation_offset = options.scroll;
+    var screen_row: u16 = body_start_row;
+    var current_hunk_highlighted = false;
+    while (screen_row < surface.size().height and presentation_offset < presentation_rows.total_rows) : ({
+        screen_row += 1;
+        presentation_offset += 1;
+    }) {
+        const hit = presentation_rows.hitAtPresentation(presentation_offset) orelse break;
+        switch (hit) {
+            .card => |card| try painter.paint(surface, screen_row, card.token, card.local_row),
+            .spacer => fillRowRegion(surface, screen_row, .{ .col = 0, .width = surface.size().width }, .{}),
+            .source => |source_offset| {
+                const body_row = rows.next() orelse continue;
+                if (rows.currentHunkIndex()) |hunk_index| {
+                    current_hunk_highlighted = options.highlighted_hunk != null and options.highlighted_hunk.? == hunk_index;
+                } else {
+                    current_hunk_highlighted = false;
+                }
+                const row_presentation = RowPresentation.forBodyOffset(options, presentation_offset);
+                const projections = try admitBodyRow(body_row);
+                row_presentation.prefill(surface, screen_row, styles);
+                drawCursorMarker(surface, screen_row, presentation_offset, options.cursor_offset, row_presentation, styles);
+                switch (body_row) {
+                    .metadata => |line| try draw.copyClippedTextAt(body_surface, 0, screen_row, line, row_presentation.compose(styles.metadata, styles)),
+                    .binary_marker => _ = body_surface.borrowTextAt(0, screen_row, "Binary file", row_presentation.compose(styles.warning, styles)),
+                    .hunk_header => |hunk| {
+                        const current_stage = if (current_hunk_highlighted) options.hunk_stages.stateForHunk(hunk.hunk_index) else null;
+                        if (current_stage != null and !hunk.folded) drawHunkGuide(surface, screen_row, guideGlyph(guide_index, hunk.hunk_index, source_offset), current_stage.?, row_presentation, styles);
+                        try drawHunkHeaderRow(body_surface, screen_row, hunk, current_stage, .unified, row_presentation, styles);
+                    },
+                    .unified_line => |line| {
+                        if (current_hunk_highlighted) {
+                            if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, screen_row, guideGlyph(guide_index, hunk_index, source_offset), options.hunk_stages.stateForHunk(hunk_index), row_presentation, styles);
+                        }
+                        const syntax_ctx = unifiedSyntaxContext(options, rows, line);
+                        try drawUnifiedLine(body_surface, screen_row, line, projections.unified, options.horizontal_scroll, options.line_numbers, row_presentation, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
+                    },
+                    .side_by_side => unreachable,
                 }
             },
         }
