@@ -9,6 +9,7 @@ const app_actions = @import("actions.zig");
 const branch_commit_time = @import("branch_commit_time.zig");
 const action_lifecycle = @import("workflow/action_lifecycle.zig");
 const app_state = @import("state.zig");
+const diff_surface_view = @import("diff_surface/view.zig");
 const shell_layout = @import("shell_layout.zig");
 const view_primitives = @import("view_primitives.zig");
 const changes_view = @import("pages/changes/view.zig");
@@ -542,7 +543,9 @@ pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     }) catch return null;
     var key_buffers: [footer_hint_capacity][16]u8 = undefined;
     const hints = footerHints(app, &key_buffers);
-    const projection = projectFooter(app, width, &hints, terminal_text, null);
+    var finding_buffer: [128]u8 = undefined;
+    const finding_text = findingFooterText(app, finding_buffer[0..]);
+    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, null);
     const status_segment = projection.status_segment orelse return null;
     const range = projection.segments.renderedRange(status_segment, projection.left_limit) orelse return null;
     return .{
@@ -567,7 +570,9 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
         app.terminal_size.height,
     }) catch return;
     const spinner_text = gitActionSpinnerText(app, surface.frameAllocator());
-    const projection = projectFooter(app, width, &hints, terminal_text, spinner_text);
+    var finding_buffer: [128]u8 = undefined;
+    const finding_text = findingFooterText(app, finding_buffer[0..]);
+    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, spinner_text);
 
     var left_area = surface.child(.{
         .col = 0,
@@ -612,6 +617,7 @@ fn projectFooter(
     width: u16,
     hints: *const FooterHints,
     terminal_text: []const u8,
+    finding_text: ?[]const u8,
     spinner_text: ?[]const u8,
 ) FooterProjection {
     var footer_segments = FooterSegments{};
@@ -661,6 +667,10 @@ fn projectFooter(
             },
         });
     }
+    if (finding_text) |text| footer_segments.append(.{
+        .text = text,
+        .style = app.theme.style(.muted),
+    });
     var status_segment: ?usize = null;
     if (spinner_text) |text| {
         footer_segments.append(.{
@@ -705,6 +715,33 @@ fn projectFooter(
         .left_limit = left_limit,
         .status_segment = status_segment,
     };
+}
+
+fn findingFooterText(app: Context, buffer: []u8) ?[]const u8 {
+    if (app.active_page != .review) return null;
+    const summary = app.review.footer().finding_summary orelse return null;
+    return formatFindingFooterSummary(buffer, summary, app.terminal_size.width >= 96);
+}
+
+fn formatFindingFooterSummary(
+    buffer: []u8,
+    summary: diff_surface_view.FindingSummaryPresentation,
+    wide: bool,
+) ?[]const u8 {
+    return if (wide)
+        std.fmt.bufPrint(buffer, "AI mapped {d} unmapped {d} stale {d} failed {d}", .{
+            summary.mapped,
+            summary.unmapped,
+            summary.stale,
+            summary.failed,
+        }) catch null
+    else
+        std.fmt.bufPrint(buffer, "M{d}/U{d}/S{d}/F{d}", .{
+            summary.mapped,
+            summary.unmapped,
+            summary.stale,
+            summary.failed,
+        }) catch null;
 }
 
 fn projectFooterHints(
@@ -2066,6 +2103,45 @@ test "footer segment fit includes left inset" {
 
     try std.testing.expectEqual(@as(u16, 3), segments.requiredWidth());
     try std.testing.expect(!segments.items[1].visible);
+}
+
+test "Finding discovery footer formats responsive counts before transient status" {
+    // Keep the Slice A cross-boundary proofs reachable under this named filter.
+    _ = @import("pages/review/navigation.zig");
+    _ = @import("pages/review/view.zig");
+
+    const summary: diff_surface_view.FindingSummaryPresentation = .{
+        .mapped = 7,
+        .unmapped = 2,
+        .stale = 1,
+        .failed = 3,
+    };
+    var wide_buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "AI mapped 7 unmapped 2 stale 1 failed 3",
+        formatFindingFooterSummary(wide_buffer[0..], summary, true).?,
+    );
+    var compact_buffer: [128]u8 = undefined;
+    const compact = formatFindingFooterSummary(compact_buffer[0..], summary, false).?;
+    try std.testing.expectEqualStrings("M7/U2/S1/F3", compact);
+
+    var segments = FooterSegments{};
+    segments.append(.{ .text = "120x32", .style = .{}, .drop_priority = .terminal });
+    segments.append(.{ .text = compact, .style = .{} });
+    segments.append(.{ .text = "ready", .style = .{} });
+    segments.fit(19);
+    try std.testing.expect(!segments.items[0].visible);
+    try std.testing.expect(segments.items[1].visible);
+    try std.testing.expect(segments.items[2].visible);
+
+    var surface: chasen.testing.TestSurface = undefined;
+    try surface.init(19, 1);
+    defer surface.deinit();
+    segments.render(&surface.surface, 19);
+    const snapshot = try surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expectEqual(@as(?usize, 1), std.mem.indexOf(u8, snapshot, compact));
+    try std.testing.expectEqual(@as(?usize, 14), std.mem.indexOf(u8, snapshot, "ready"));
 }
 
 test "footer status target matches clipped rendered cells and retains full text" {

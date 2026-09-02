@@ -28,6 +28,7 @@ pub const RowLayout = struct {
     reviewed_col: ?u16,
     badge_col: ?u16,
     mode_col: ?u16,
+    finding_annotation_col: ?u16,
     name_col: u16,
     name_width: u16,
     tree_content_col: u16,
@@ -101,6 +102,13 @@ fn visibleRowAt(
 }
 
 pub fn layout(row: Row, width: u16) RowLayout {
+    return layoutWithFindingAnnotation(row, width, 0);
+}
+
+/// Reserve a right-aligned, file-only Finding annotation without moving the
+/// existing reviewed/status/mode gutters. The path viewport yields first and
+/// keeps one blank cell before the annotation.
+pub fn layoutWithFindingAnnotation(row: Row, width: u16, requested_annotation_width: u16) RowLayout {
     const indent: u16 = row.depth *| 2;
     // Root content follows the fixed one-cell sidebar gutter; directory
     // content keeps its existing tree-edge origin. File-only reviewed/status/
@@ -131,13 +139,28 @@ pub fn layout(row: Row, width: u16) RowLayout {
         4 +| indent
     else
         2 +| indent;
-    const name_width: u16 = width -| name_col;
-    const tree_content_width: u16 = width -| tree_content_col;
+    const annotation_width = if (row.kind == .file)
+        @min(requested_annotation_width, width)
+    else
+        0;
+    const finding_annotation_col: ?u16 = if (annotation_width > 0)
+        width - annotation_width
+    else
+        null;
+    const name_width: u16 = if (finding_annotation_col) |annotation_col|
+        annotation_col -| name_col -| 1
+    else
+        width -| name_col;
+    const tree_content_width: u16 = if (finding_annotation_col) |annotation_col|
+        annotation_col -| tree_content_col -| 1
+    else
+        width -| tree_content_col;
 
     return .{
         .badge_col = badge_col,
         .mode_col = mode_col,
         .reviewed_col = reviewed_col,
+        .finding_annotation_col = finding_annotation_col,
         .name_col = name_col,
         .name_width = name_width,
         .tree_content_col = tree_content_col,
@@ -155,7 +178,11 @@ pub fn treeContentDisplayWidth(row: Row) usize {
 }
 
 pub fn maxHorizontalScroll(row: Row, width: u16) usize {
-    const row_layout = layout(row, width);
+    return maxHorizontalScrollWithFindingAnnotation(row, width, 0);
+}
+
+pub fn maxHorizontalScrollWithFindingAnnotation(row: Row, width: u16, annotation_width: u16) usize {
+    const row_layout = layoutWithFindingAnnotation(row, width, annotation_width);
     const content_width = treeContentDisplayWidth(row);
     if (content_width <= row_layout.tree_content_width) return 0;
     return content_width - row_layout.tree_content_width;
@@ -391,4 +418,35 @@ test "diff markerless root uses the full sidebar width" {
     try std.testing.expectEqual(@as(u16, 1), narrow.name_col);
     try std.testing.expectEqual(@as(u16, 19), narrow.tree_content_width);
     try std.testing.expectEqual(@as(usize, 13), maxHorizontalScroll(root, 20));
+}
+
+test "Finding discovery layout right aligns annotations and yields only the path viewport" {
+    const nodes = [_]file_tree.Node{.{
+        .kind = .file,
+        .name = "long-file-name.zig",
+        .path = "long-file-name.zig",
+        .depth = 0,
+        .status = .modified,
+        .mode_changed = true,
+        .target = .{ .diff_file = 0 },
+    }};
+    const tree: file_tree.FileTree = .{ .nodes = &nodes };
+    const collapsed: file_tree.CollapsedSet = .empty;
+    const row = rowForNode(tree, &collapsed, &.{true}, 0, 0).?;
+
+    const wide = layoutWithFindingAnnotation(row, 40, 7);
+    try std.testing.expectEqual(@as(?u16, 33), wide.finding_annotation_col);
+    try std.testing.expectEqual(@as(u16, 26), wide.tree_content_width);
+    try std.testing.expectEqual(@as(u16, 26), wide.name_width);
+    try std.testing.expectEqual(@as(?u16, 1), wide.reviewed_col);
+    try std.testing.expectEqual(@as(?u16, 2), wide.badge_col);
+    try std.testing.expectEqual(@as(?u16, 4), wide.mode_col);
+
+    const narrow = layoutWithFindingAnnotation(row, 14, 7);
+    try std.testing.expectEqual(@as(?u16, 7), narrow.finding_annotation_col);
+    try std.testing.expectEqual(@as(u16, 0), narrow.tree_content_width);
+    try std.testing.expectEqual(
+        treeContentDisplayWidth(row),
+        maxHorizontalScrollWithFindingAnnotation(row, 14, 7),
+    );
 }

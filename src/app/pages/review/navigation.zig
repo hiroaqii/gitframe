@@ -19,9 +19,42 @@ const loaded_diff = @import("../../../loaded_diff.zig");
 const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
+const sidebar_view_model = if (builtin.is_test) @import("../../../sidebar/view_model.zig") else struct {};
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
 const source: diff_source.SourceMode = review_page.selection_source;
+
+const SidebarAnnotationWidthAdapter = struct {
+    projection: *const finding_projection.FindingProjectionIndex,
+
+    fn interface(self: *SidebarAnnotationWidthAdapter) diff_surface.navigation.SidebarAnnotationWidthResolver {
+        return .{ .ctx = self, .resolve_fn = resolve };
+    }
+
+    fn resolve(ctx: *anyopaque, file_index: usize) u16 {
+        const self: *SidebarAnnotationWidthAdapter = @ptrCast(@alignCast(ctx));
+        if (file_index >= self.projection.files.len) return 0;
+        const summary = self.projection.files[file_index].summary;
+        return findingAnnotationDisplayWidth(summary.total, summary.mapped);
+    }
+};
+
+fn findingAnnotationDisplayWidth(total: usize, mapped: usize) u16 {
+    if (total == 0) return 0;
+    const non_mapped = total -| mapped;
+    const width = 1 + decimalDisplayWidth(total) + if (non_mapped > 0)
+        2 + decimalDisplayWidth(non_mapped)
+    else
+        0;
+    return @intCast(@min(width, @as(usize, std.math.maxInt(u16))));
+}
+
+fn decimalDisplayWidth(value: usize) usize {
+    var remaining = value;
+    var width: usize = 1;
+    while (remaining >= 10) : (remaining /= 10) width += 1;
+    return width;
+}
 
 /// Read-only Review adapter. Rendering and content inspection must construct
 /// this value directly from a const page borrow; mutation authority belongs to
@@ -248,13 +281,17 @@ pub const Controller = struct {
     mode_toggle_hint_width: u16 = 0,
     presentation_rows: ?*const diff_render.PresentationRows = null,
 
-    fn sharedController(self: Controller) diff_surface.navigation.Controller {
+    fn sharedController(
+        self: Controller,
+        sidebar_annotation_width_resolver: ?diff_surface.navigation.SidebarAnnotationWidthResolver,
+    ) diff_surface.navigation.Controller {
         return .{
             .surface = self.page.diffSurface(source, self.layout),
             .repo_root = self.repo_root,
             .repo_epoch = self.repo_epoch,
             .mode_toggle_hint_width = self.mode_toggle_hint_width,
             .presentation_rows = self.presentation_rows,
+            .sidebar_annotation_width_resolver = sidebar_annotation_width_resolver,
             .diagnostics = .{ .target = &self.page.status },
         };
     }
@@ -277,10 +314,15 @@ pub const Controller = struct {
     pub const UpdateAdapter = struct {
         navigation: Controller,
         resolver: BodyResolverAdapter,
+        sidebar_annotation_width: ?SidebarAnnotationWidthAdapter,
 
         pub fn bodyController(self: *UpdateAdapter) diff_surface.navigation.BodyController {
+            const sidebar_annotation_width_resolver = if (self.sidebar_annotation_width) |*adapter|
+                adapter.interface()
+            else
+                null;
             return .{
-                .controller = self.navigation.sharedController(),
+                .controller = self.navigation.sharedController(sidebar_annotation_width_resolver),
                 .resolver = self.resolver.interface(),
             };
         }
@@ -310,9 +352,14 @@ pub const Controller = struct {
     };
 
     pub fn updateAdapter(self: Controller) UpdateAdapter {
+        const pinned = self.page.pinnedAiConst();
         return .{
             .navigation = self,
             .resolver = self.view().resolver(),
+            .sidebar_annotation_width = if (pinned) |value|
+                .{ .projection = &value.selection.finding_projection }
+            else
+                null,
         };
     }
 };
@@ -713,6 +760,141 @@ test "Review navigation separates read-only View from mutable Controller authori
     try std.testing.expect(!@hasDecl(Controller, "bodyController"));
     try std.testing.expect(!@hasDecl(Controller, "resolver"));
     try std.testing.expect(@hasDecl(Controller, "updateAdapter"));
+}
+
+test "Finding discovery actual Review controller reaches annotation-reduced sidebar tail" {
+    const allocator = std.testing.allocator;
+    var nodes = [_]file_tree.Node{.{
+        .kind = .file,
+        .name = "long-file-name.zig",
+        .path = "long-file-name.zig",
+        .depth = 0,
+        .status = .modified,
+        .mode_changed = true,
+        .target = .{ .diff_file = 0 },
+    }};
+    var loaded = test_support.loadedDiffOne();
+    loaded.tree = .{ .nodes = &nodes };
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(loaded),
+        .presentation = .{ .normal = undefined },
+    };
+    defer {
+        page.presentation = null;
+        page.deinit(allocator);
+    }
+    page.viewer.sidebar_width = 24;
+    const controller: Controller = .{
+        .page = &page,
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = 80, .height = 20 },
+    };
+
+    var normal_adapter = controller.updateAdapter();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        normal_adapter.bodyController().controller.view().visibleSidebarMaxHorizontalScroll(),
+    );
+    var normal_scroll = try normal_adapter.shared().apply(null, .scroll_sidebar_right);
+    defer normal_scroll.deinit(null);
+    try std.testing.expectEqual(@as(usize, 0), page.viewer.sidebar_horizontal_scroll);
+
+    var empty_bytes: [0]u8 = .{};
+    var empty_entries: [0]finding_projection.Entry = .{};
+    var empty_mapped_indices: [0]usize = .{};
+    var files = [_]finding_projection.FileRecord{.{
+        .ordinal = 0,
+        .status_bytes = empty_bytes[0..],
+        .before = null,
+        .after = null,
+        .summary = .{ .total = 3, .mapped = 2, .@"error" = 3 },
+    }};
+    const index: finding_projection.FindingProjectionIndex = .{
+        .identity = undefined,
+        .files = files[0..],
+        .entries = empty_entries[0..],
+        .summary = .{ .total = 3, .mapped = 2, .@"error" = 3 },
+        .mapped_entry_indices = empty_mapped_indices[0..],
+    };
+    page.presentation = .{ .pinned_ai = .{
+        .selection = .{
+            .snapshot = undefined,
+            .artifacts = undefined,
+            .projection = undefined,
+            .finding_projection = index,
+        },
+        .base_display = empty_bytes[0..],
+        .head_display = empty_bytes[0..],
+    } };
+
+    var pinned_adapter = controller.updateAdapter();
+    try std.testing.expectEqual(@as(u16, 5), findingAnnotationDisplayWidth(3, 2));
+    try std.testing.expectEqual(
+        @as(usize, 6),
+        pinned_adapter.bodyController().controller.view().visibleSidebarMaxHorizontalScroll(),
+    );
+    const active_loaded = pinned_adapter.bodyController().controller.view().activeLoadedDiffConst().?;
+    const row = sidebar_view_model.rowForNode(
+        active_loaded.tree,
+        &active_loaded.collapsed_dirs,
+        active_loaded.reviewed_files,
+        0,
+        0,
+    ).?;
+    const row_layout = sidebar_view_model.layoutWithFindingAnnotation(row, 24, 5);
+    try std.testing.expectEqual(@as(?u16, 19), row_layout.finding_annotation_col);
+    try std.testing.expectEqual(@as(u16, 12), row_layout.tree_content_width);
+    try std.testing.expectEqual(@as(usize, 18), sidebar_view_model.treeContentDisplayWidth(row));
+
+    var first_scroll = try pinned_adapter.shared().apply(null, .scroll_sidebar_right);
+    defer first_scroll.deinit(null);
+    try std.testing.expectEqual(@as(usize, 4), page.viewer.sidebar_horizontal_scroll);
+    var second_scroll = try pinned_adapter.shared().apply(null, .scroll_sidebar_right);
+    defer second_scroll.deinit(null);
+    try std.testing.expectEqual(@as(usize, 6), page.viewer.sidebar_horizontal_scroll);
+    var capped_scroll = try pinned_adapter.shared().apply(null, .scroll_sidebar_right);
+    defer capped_scroll.deinit(null);
+    try std.testing.expectEqual(@as(usize, 6), page.viewer.sidebar_horizontal_scroll);
+
+    page.presentation = .{ .normal = undefined };
+    var restored_normal_adapter = controller.updateAdapter();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        restored_normal_adapter.bodyController().controller.view().visibleSidebarMaxHorizontalScroll(),
+    );
+    try std.testing.expectEqual(@as(usize, 6), page.viewer.sidebar_horizontal_scroll);
+
+    const changes_page_module = @import("../changes.zig");
+    const changes_navigation = @import("../changes/navigation.zig");
+    var changes_loaded = test_support.loadedDiffOne();
+    changes_loaded.tree = .{ .nodes = &nodes };
+    var changes_page: changes_page_module.ChangesPageState = .{
+        .load = test_support.loadState(changes_loaded),
+    };
+    defer changes_page.deinit(allocator);
+    changes_page.viewer.sidebar_width = 24;
+    changes_page.viewer.sidebar_horizontal_scroll = 6;
+    const changes_controller: changes_navigation.Controller = .{
+        .page = &changes_page,
+        .repo_root = null,
+        .source = .unstaged,
+        .layout = .{ .width = 80, .height = 20 },
+        .diagnostics = .{ .target = &changes_page.status },
+    };
+    var changes_adapter = changes_controller.updateAdapter();
+    const changes_shared = changes_adapter.shared();
+    try std.testing.expect(changes_shared.navigation.controller.sidebar_annotation_width_resolver == null);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        changes_shared.navigation.controller.view().visibleSidebarMaxHorizontalScroll(),
+    );
+    try std.testing.expectEqual(@as(usize, 6), changes_page.viewer.sidebar_horizontal_scroll);
+    changes_page.viewer.sidebar_horizontal_scroll = 0;
+    var changes_scroll = try changes_shared.apply(null, .scroll_sidebar_right);
+    defer changes_scroll.deinit(null);
+    try std.testing.expectEqual(@as(usize, 0), changes_page.viewer.sidebar_horizontal_scroll);
 }
 
 test "Review selection release installs pinned retained actions" {

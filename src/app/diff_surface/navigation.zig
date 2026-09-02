@@ -33,6 +33,18 @@ const review_tab_width: usize = 4;
 
 pub const ParsedSelectionTarget = diff_surface.body_resolver.ParsedSelectionTarget;
 
+/// Optional page-owned presentation width used only while calculating the
+/// shared sidebar scroll maximum. The caller keeps the context alive for the
+/// synchronous delegated operation; the shared surface retains neither.
+pub const SidebarAnnotationWidthResolver = struct {
+    ctx: *anyopaque,
+    resolve_fn: *const fn (ctx: *anyopaque, file_index: usize) u16,
+
+    pub fn resolve(self: SidebarAnnotationWidthResolver, file_index: usize) u16 {
+        return self.resolve_fn(self.ctx, file_index);
+    }
+};
+
 pub fn resolvedTargetAllowsHunkFold(target: diff_surface.ResolvedTarget) bool {
     return target.hunk_interaction == .available and
         target.folded_hunks_source == .underlying_load;
@@ -98,6 +110,7 @@ pub const View = struct {
     repo_root: ?[]const u8,
     mode_toggle_hint_width: u16 = 0,
     presentation_rows: ?*const diff_render.PresentationRows = null,
+    sidebar_annotation_width_resolver: ?SidebarAnnotationWidthResolver = null,
 
     pub fn displayNavigationSnapshot(self: View) diff_surface.DisplayNavigationSnapshot {
         return .{
@@ -146,7 +159,15 @@ pub const View = struct {
         var visible_index: usize = 0;
         while (visible_index < loaded.visibleNodeCount()) : (visible_index += 1) {
             const row = sidebar_view_model.rowAt(source, visible_index, self.surface.viewer.selected_node) orelse continue;
-            max_scroll = @max(max_scroll, sidebar_view_model.maxHorizontalScroll(row, width));
+            const row_max = if (self.sidebar_annotation_width_resolver) |resolver|
+                sidebar_view_model.maxHorizontalScrollWithFindingAnnotation(
+                    row,
+                    width,
+                    resolveSidebarAnnotationWidth(loaded, row, resolver),
+                )
+            else
+                sidebar_view_model.maxHorizontalScroll(row, width);
+            max_scroll = @max(max_scroll, row_max);
         }
         return max_scroll;
     }
@@ -256,6 +277,16 @@ pub const View = struct {
         };
     }
 };
+
+fn resolveSidebarAnnotationWidth(
+    loaded: *const LoadedDiff,
+    row: sidebar_view_model.Row,
+    resolver: SidebarAnnotationWidthResolver,
+) u16 {
+    if (row.kind != .file or row.node_index >= loaded.tree.nodes.len) return 0;
+    const file_index = loaded.tree.nodes[row.node_index].diffFileIndex() orelse return 0;
+    return resolver.resolve(file_index);
+}
 
 /// Read-only diff view whose body-dependent operations require a resolver at
 /// construction time. The resolver context is valid only for the synchronous
@@ -1060,6 +1091,7 @@ pub const Controller = struct {
     repo_epoch: u64 = 0,
     mode_toggle_hint_width: u16 = 0,
     presentation_rows: ?*const diff_render.PresentationRows = null,
+    sidebar_annotation_width_resolver: ?SidebarAnnotationWidthResolver = null,
     diagnostics: diff_surface.DiagnosticSink,
 
     pub fn view(self: Controller) View {
@@ -1068,6 +1100,7 @@ pub const Controller = struct {
             .repo_root = self.repo_root,
             .mode_toggle_hint_width = self.mode_toggle_hint_width,
             .presentation_rows = self.presentation_rows,
+            .sidebar_annotation_width_resolver = self.sidebar_annotation_width_resolver,
         };
     }
 

@@ -19,6 +19,7 @@ const review_store = @import("../../../review_store.zig");
 const human_review_session = @import("../../human_review_session.zig");
 const human_review_decision = @import("human_review_decision.zig");
 const finding_card_view = @import("finding_card_view.zig");
+const finding_projection = @import("../../../ai_review/finding_projection.zig");
 
 pub const Context = struct {
     page: *const review_page.ReviewPageState,
@@ -41,9 +42,57 @@ pub const Context = struct {
         // Review's BASE … HEAD header already identifies the comparison.
         // Do not expose its internal `.range = "review"` surface as footer UI.
         result.source_label = null;
+        result.finding_summary = activeFindingSummary(self.page);
         return result;
     }
 };
+
+fn activeFindingProjection(page: *const review_page.ReviewPageState) ?*const finding_projection.FindingProjectionIndex {
+    const pinned = page.pinnedAiConst() orelse return null;
+    return &pinned.selection.finding_projection;
+}
+
+fn activeFindingSummary(page: *const review_page.ReviewPageState) ?diff_surface.view.FindingSummaryPresentation {
+    const index = activeFindingProjection(page) orelse return null;
+    return .{
+        .mapped = index.summary.mapped,
+        .unmapped = index.summary.unmapped,
+        .stale = index.summary.stale,
+        .failed = index.summary.failed,
+    };
+}
+
+const FindingAnnotationAdapter = struct {
+    projection: *const finding_projection.FindingProjectionIndex,
+
+    fn interface(self: *FindingAnnotationAdapter) diff_surface.view.FindingAnnotationResolver {
+        return .{ .ctx = self, .resolve_fn = resolve };
+    }
+
+    fn resolve(ctx: *anyopaque, file_index: usize) ?diff_surface.view.FindingAnnotation {
+        const self: *FindingAnnotationAdapter = @ptrCast(@alignCast(ctx));
+        return findingAnnotationForFile(self.projection, file_index);
+    }
+};
+
+fn findingAnnotationForFile(
+    projection: *const finding_projection.FindingProjectionIndex,
+    file_index: usize,
+) ?diff_surface.view.FindingAnnotation {
+    if (file_index >= projection.files.len) return null;
+    const summary = projection.files[file_index].summary;
+    if (summary.total == 0) return null;
+    return .{
+        .total = summary.total,
+        .mapped = summary.mapped,
+        .highest_severity = if (summary.@"error" > 0)
+            .@"error"
+        else if (summary.warning > 0)
+            .warning
+        else
+            .info,
+    };
+}
 
 pub fn humanReviewActionLabel(app: Context) ?[]const u8 {
     if (app.page.human_review_decision.isOpen() or
@@ -138,6 +187,11 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .palette = app.palette,
         .mode_toggle_key = displayModeToggleKey(app, mode_key_buffer[0..]),
     };
+    var finding_annotation_adapter: FindingAnnotationAdapter = undefined;
+    const finding_annotation_resolver: ?diff_surface.view.FindingAnnotationResolver = if (activeFindingProjection(app.page)) |projection| blk: {
+        finding_annotation_adapter = .{ .projection = projection };
+        break :blk finding_annotation_adapter.interface();
+    } else null;
     const empty_message: ?diff_surface.view.StateMessage = if (app.page.presentation) |presentation|
         switch (presentation) {
             .normal => |normal| try emptyStateMessage(surface.frameAllocator(), normal.basis.base.display_name, normal.basis.ahead_count),
@@ -158,6 +212,7 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .file_filter_binding = app.keymap.display(.changed_file_filter, filter_key_buffer[0..]),
         .no_changes_actions = .{},
         .empty_message = empty_message,
+        .finding_annotation_resolver = finding_annotation_resolver,
         .diff_pane = pane_adapter.interface(),
     });
 }
@@ -1414,4 +1469,219 @@ test "Review base picker surface renders query no-match loading and failure term
     try std.testing.expect(std.mem.indexOf(u8, empty_snapshot, "No local or remote branches") != null);
     try std.testing.expect(std.mem.indexOf(u8, empty_snapshot, "Filter:") != null);
     try std.testing.expect(std.mem.indexOf(u8, empty_snapshot, "Esc: close") != null);
+}
+
+test "Finding discovery Review adapter follows the active Run without retaining projection state" {
+    var empty_bytes: [0]u8 = .{};
+    var empty_entries: [0]finding_projection.Entry = .{};
+    var empty_mapped_indices: [0]usize = .{};
+    var files = [_]finding_projection.FileRecord{
+        .{
+            .ordinal = 0,
+            .status_bytes = empty_bytes[0..],
+            .before = null,
+            .after = null,
+            .summary = .{ .total = 5, .mapped = 2, .info = 1, .warning = 2, .@"error" = 2 },
+        },
+        .{
+            .ordinal = 1,
+            .status_bytes = empty_bytes[0..],
+            .before = null,
+            .after = null,
+            .summary = .{ .total = 2, .mapped = 2, .info = 1, .warning = 1 },
+        },
+        .{
+            .ordinal = 2,
+            .status_bytes = empty_bytes[0..],
+            .before = null,
+            .after = null,
+            .summary = .{ .total = 1, .mapped = 1, .info = 1 },
+        },
+        .{
+            .ordinal = 3,
+            .status_bytes = empty_bytes[0..],
+            .before = null,
+            .after = null,
+            .summary = .{},
+        },
+    };
+    const index: finding_projection.FindingProjectionIndex = .{
+        .identity = undefined,
+        .files = files[0..],
+        .entries = empty_entries[0..],
+        .summary = .{ .total = 5, .mapped = 2, .unmapped = 1, .stale = 1, .failed = 1 },
+        .mapped_entry_indices = empty_mapped_indices[0..],
+    };
+    var page: review_page.ReviewPageState = .{};
+    try std.testing.expect(activeFindingProjection(&page) == null);
+    try std.testing.expect(activeFindingSummary(&page) == null);
+
+    page.presentation = .{ .normal = undefined };
+    try std.testing.expect(activeFindingProjection(&page) == null);
+    try std.testing.expect(activeFindingSummary(&page) == null);
+
+    page.presentation = .{ .pinned_ai = .{
+        .selection = .{
+            .snapshot = undefined,
+            .artifacts = undefined,
+            .projection = undefined,
+            .finding_projection = index,
+        },
+        .base_display = empty_bytes[0..],
+        .head_display = empty_bytes[0..],
+    } };
+    const active = activeFindingProjection(&page).?;
+    const summary = activeFindingSummary(&page).?;
+    try std.testing.expectEqual(@as(usize, 2), summary.mapped);
+    try std.testing.expectEqual(@as(usize, 1), summary.unmapped);
+    try std.testing.expectEqual(@as(usize, 1), summary.stale);
+    try std.testing.expectEqual(@as(usize, 1), summary.failed);
+    try std.testing.expectEqual(diff_surface.view.FindingAnnotation.Severity.@"error", findingAnnotationForFile(active, 0).?.highest_severity);
+    try std.testing.expectEqual(diff_surface.view.FindingAnnotation.Severity.warning, findingAnnotationForFile(active, 1).?.highest_severity);
+    try std.testing.expectEqual(diff_surface.view.FindingAnnotation.Severity.info, findingAnnotationForFile(active, 2).?.highest_severity);
+    try std.testing.expect(findingAnnotationForFile(active, 3) == null);
+    try std.testing.expect(findingAnnotationForFile(active, files.len) == null);
+
+    var replacement_files = [_]finding_projection.FileRecord{.{
+        .ordinal = 0,
+        .status_bytes = empty_bytes[0..],
+        .before = null,
+        .after = null,
+        .summary = .{ .total = 1, .mapped = 1, .info = 1 },
+    }};
+    const replacement_index: finding_projection.FindingProjectionIndex = .{
+        .identity = undefined,
+        .files = replacement_files[0..],
+        .entries = empty_entries[0..],
+        .summary = .{ .total = 1, .mapped = 1, .info = 1 },
+        .mapped_entry_indices = empty_mapped_indices[0..],
+    };
+    page.presentation = .{ .pinned_ai = .{
+        .selection = .{
+            .snapshot = undefined,
+            .artifacts = undefined,
+            .projection = undefined,
+            .finding_projection = replacement_index,
+        },
+        .base_display = empty_bytes[0..],
+        .head_display = empty_bytes[0..],
+    } };
+    const replacement_summary = activeFindingSummary(&page).?;
+    try std.testing.expectEqual(@as(usize, 1), replacement_summary.mapped);
+    try std.testing.expectEqual(@as(usize, 0), replacement_summary.unmapped);
+    try std.testing.expectEqual(@as(usize, 1), findingAnnotationForFile(activeFindingProjection(&page).?, 0).?.total);
+
+    page.presentation = .{ .normal = undefined };
+    try std.testing.expect(activeFindingProjection(&page) == null);
+    try std.testing.expect(activeFindingSummary(&page) == null);
+
+    page.presentation = null;
+    try std.testing.expect(activeFindingProjection(&page) == null);
+    try std.testing.expect(activeFindingSummary(&page) == null);
+}
+
+test "Finding discovery renders the tail reached by the actual Review controller" {
+    const allocator = std.testing.allocator;
+    const test_support = @import("../../test_support.zig");
+    var nodes = [_]file_tree.Node{.{
+        .kind = .file,
+        .name = "long-file-name.zig",
+        .path = "long-file-name.zig",
+        .depth = 0,
+        .status = .modified,
+        .mode_changed = true,
+        .target = .{ .diff_file = 0 },
+    }};
+    var loaded = test_support.loadedDiffOne();
+    loaded.tree = .{ .nodes = &nodes };
+    var empty_bytes: [0]u8 = .{};
+    var empty_entries: [0]finding_projection.Entry = .{};
+    var empty_mapped_indices: [0]usize = .{};
+    var files = [_]finding_projection.FileRecord{.{
+        .ordinal = 0,
+        .status_bytes = empty_bytes[0..],
+        .before = null,
+        .after = null,
+        .summary = .{ .total = 3, .mapped = 2, .@"error" = 3 },
+    }};
+    const index: finding_projection.FindingProjectionIndex = .{
+        .identity = undefined,
+        .files = files[0..],
+        .entries = empty_entries[0..],
+        .summary = .{ .total = 3, .mapped = 2, .@"error" = 3 },
+        .mapped_entry_indices = empty_mapped_indices[0..],
+    };
+    var page: review_page.ReviewPageState = .{
+        .load = test_support.loadState(loaded),
+        .presentation = .{ .pinned_ai = .{
+            .selection = .{
+                .snapshot = undefined,
+                .artifacts = undefined,
+                .projection = undefined,
+                .finding_projection = index,
+            },
+            .base_display = empty_bytes[0..],
+            .head_display = empty_bytes[0..],
+        } },
+    };
+    defer {
+        page.presentation = null;
+        page.deinit(allocator);
+    }
+    page.viewer.sidebar_width = 24;
+    const layout: diff_surface.Layout = .{ .width = 80, .height = 20 };
+    const controller: review_navigation.Controller = .{
+        .page = &page,
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = layout,
+    };
+    var adapter = controller.updateAdapter();
+    var first_scroll = try adapter.shared().apply(null, .scroll_sidebar_right);
+    defer first_scroll.deinit(null);
+    var second_scroll = try adapter.shared().apply(null, .scroll_sidebar_right);
+    defer second_scroll.deinit(null);
+    try std.testing.expectEqual(@as(usize, 6), page.viewer.sidebar_horizontal_scroll);
+
+    const context: Context = .{
+        .page = &page,
+        .palette = .default(),
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = layout,
+    };
+    var reached: chasen.testing.TestSurface = undefined;
+    try reached.init(layout.width, layout.height);
+    defer reached.deinit();
+    try view(context, &reached.surface);
+
+    const row = diff_surface.layout.sidebar_header_rows;
+    const expected_tail = "ile-name.zig";
+    for (expected_tail, 0..) |_, index_value| {
+        try std.testing.expectEqualStrings(
+            expected_tail[index_value .. index_value + 1],
+            reached.surface.readCell(@intCast(6 + index_value), row).?.char.grapheme,
+        );
+    }
+    try std.testing.expectEqualStrings(" ", reached.surface.readCell(18, row).?.char.grapheme);
+    try std.testing.expectEqualStrings("E", reached.surface.readCell(19, row).?.char.grapheme);
+    try std.testing.expectEqualStrings("3", reached.surface.readCell(20, row).?.char.grapheme);
+    try std.testing.expectEqualStrings(" ", reached.surface.readCell(21, row).?.char.grapheme);
+    try std.testing.expectEqualStrings("N", reached.surface.readCell(22, row).?.char.grapheme);
+    try std.testing.expectEqualStrings("1", reached.surface.readCell(23, row).?.char.grapheme);
+    const reached_snapshot = try reached.snapshot(allocator);
+    defer allocator.free(reached_snapshot);
+
+    var capped_scroll = try adapter.shared().apply(null, .scroll_sidebar_right);
+    defer capped_scroll.deinit(null);
+    try std.testing.expectEqual(@as(usize, 6), page.viewer.sidebar_horizontal_scroll);
+    var capped: chasen.testing.TestSurface = undefined;
+    try capped.init(layout.width, layout.height);
+    defer capped.deinit();
+    try view(context, &capped.surface);
+    const capped_snapshot = try capped.snapshot(allocator);
+    defer allocator.free(capped_snapshot);
+    try std.testing.expectEqualStrings(reached_snapshot, capped_snapshot);
 }
