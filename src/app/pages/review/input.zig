@@ -37,7 +37,16 @@ pub const Msg = union(enum) {
     branch_switch_unavailable,
     open_human_review_decision,
     human_review_decision: human_review_decision.Msg,
+    finding_navigation: FindingNavigationIntent,
     finding_card: FindingCardMsg,
+};
+
+pub const FindingNavigationIntent = struct {
+    scope: Scope,
+    direction: Direction,
+
+    pub const Scope = enum { current_file, all_files };
+    pub const Direction = enum { previous, next };
 };
 
 pub const FindingCardMsg = enum {
@@ -140,14 +149,23 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
         if (key.codepoint == 'j') return .base_picker_next;
         return null;
     }
-    if (context.finding_card_focused) return .{ .finding_card = findingCardKeyToMsg(key) };
+    if (context.search_mode or context.file_search_mode) {
+        return .{ .shared = diff_surface.input.keyToMsg(context.shared(), key) orelse return null };
+    }
+    if (selectionOwnsFindingNavigation(context, key)) return .{ .shared = .selection_owned_noop };
+    if (context.finding_card_focused) {
+        if (context.pinned_ai) {
+            if (findingNavigationIntent(key)) |intent| return .{ .finding_navigation = intent };
+        }
+        return .{ .finding_card = findingCardKeyToMsg(key) };
+    }
     if (diff_surface.input.keyToMsg(context.shared(), key)) |msg| return .{ .shared = msg };
-    if (context.search_mode or context.file_search_mode) return null;
     return normalKeyToMsg(context, key);
 }
 
 pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (!key_input.hasCommandModifier(key) and key.codepoint == 'a') return .open_ai_reviews;
+    if (selectionOwnsFindingNavigation(context, key)) return .{ .shared = .selection_owned_noop };
     return .{ .shared = diff_surface.input.selectionKeyToMsg(context.shared(), key) orelse return null };
 }
 
@@ -170,7 +188,19 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     // A user binding consumes the key even when it names an operation Review
     // intentionally does not expose. This is what lets a user-bound `m` win
     // over the page-local picker mnemonic.
-    if (context.keymap.actionForKey(key)) |action| return publicActionToMsg(action, context.focus == .diff);
+    const finding_navigation = if (context.pinned_ai) findingNavigationIntent(key) else null;
+    if (context.keymap.actionForKey(key)) |action| {
+        if (finding_navigation) |intent| {
+            const default_width_collision = switch (key_input.textInputCodepoint(key).?) {
+                '[' => action == .decrease_sidebar_width,
+                ']' => action == .increase_sidebar_width,
+                else => false,
+            };
+            if (default_width_collision) return .{ .finding_navigation = intent };
+        }
+        return publicActionToMsg(action, context.focus == .diff);
+    }
+    if (finding_navigation) |intent| return .{ .finding_navigation = intent };
 
     if (context.finding_card_at_cursor and !key_input.hasCommandModifier(key) and key.codepoint == 's') {
         return .{ .finding_card = .focus_or_cycle };
@@ -197,6 +227,22 @@ fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
         'p' => if (context.search_query_len > 0) shared(.select_previous_search_match) else shared(.select_previous_hunk),
         else => null,
     };
+}
+
+fn findingNavigationIntent(key: chasen.Key) ?FindingNavigationIntent {
+    const codepoint = key_input.textInputCodepoint(key) orelse return null;
+    return switch (codepoint) {
+        '[' => .{ .scope = .current_file, .direction = .previous },
+        ']' => .{ .scope = .current_file, .direction = .next },
+        '{' => .{ .scope = .all_files, .direction = .previous },
+        '}' => .{ .scope = .all_files, .direction = .next },
+        else => null,
+    };
+}
+
+fn selectionOwnsFindingNavigation(context: Context, key: chasen.Key) bool {
+    return findingNavigationIntent(key) != null and
+        (context.selection_owner != .none or context.retained_selection_action_available);
 }
 
 fn findingCardKeyToMsg(key: chasen.Key) FindingCardMsg {
@@ -326,6 +372,78 @@ test "Review inline Finding focus owns its complete input grammar" {
 
     const at_cursor: Context = .{ .focus = .diff, .finding_card_at_cursor = true };
     try std.testing.expectEqual(Msg{ .finding_card = .focus_or_cycle }, keyToMsg(at_cursor, .{ .codepoint = 's' }).?);
+}
+
+test "Finding navigation owns exact four-key Review grammar without stealing priority" {
+    const pinned: Context = .{ .pinned_ai = true };
+    const cases = [_]struct { key: chasen.Key, intent: FindingNavigationIntent }{
+        .{ .key = .{ .codepoint = '[' }, .intent = .{ .scope = .current_file, .direction = .previous } },
+        .{ .key = .{ .codepoint = ']' }, .intent = .{ .scope = .current_file, .direction = .next } },
+        .{ .key = .{ .codepoint = '[', .mods = .{ .shift = true }, .shifted_codepoint = '{' }, .intent = .{ .scope = .all_files, .direction = .previous } },
+        .{ .key = .{ .codepoint = ']', .mods = .{ .shift = true }, .shifted_codepoint = '}' }, .intent = .{ .scope = .all_files, .direction = .next } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(Msg{ .finding_navigation = case.intent }, keyToMsg(pinned, case.key).?);
+        try std.testing.expectEqual(
+            Msg{ .finding_navigation = case.intent },
+            keyToMsg(.{ .pinned_ai = true, .finding_card_focused = true }, case.key).?,
+        );
+        try std.testing.expectEqual(
+            Msg{ .shared = .selection_owned_noop },
+            keyToMsg(.{ .pinned_ai = true, .finding_card_focused = true, .selection_owner = .mouse }, case.key).?,
+        );
+        try std.testing.expectEqual(
+            Msg{ .shared = .selection_owned_noop },
+            selectionKeyToMsg(.{ .pinned_ai = true, .retained_selection_action_available = true }, case.key).?,
+        );
+    }
+
+    try std.testing.expectEqual(Msg{ .shared = .decrease_sidebar_width }, keyToMsg(.{}, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .increase_sidebar_width }, keyToMsg(.{}, .{ .codepoint = ']' }).?);
+    try std.testing.expectEqual(
+        Msg{ .finding_card = .owned_noop },
+        keyToMsg(.{ .finding_card_focused = true }, .{ .codepoint = '[' }).?,
+    );
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = '{' }) == null);
+    try std.testing.expect(keyToMsg(pinned, .{ .codepoint = '[', .mods = .{ .ctrl = true } }) == null);
+    try std.testing.expectEqual(Msg{ .shared = .{ .search_insert = '[' } }, keyToMsg(.{
+        .pinned_ai = true,
+        .finding_card_focused = true,
+        .search_mode = true,
+    }, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .{ .file_search_insert = '[' } }, keyToMsg(.{
+        .pinned_ai = true,
+        .finding_card_focused = true,
+        .file_search_mode = true,
+    }, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(Msg{ .base_picker_insert = '[' }, keyToMsg(.{
+        .pinned_ai = true,
+        .finding_card_focused = true,
+        .base_picker_open = true,
+        .base_picker_query_mode = true,
+    }, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(Msg{ .human_review_decision = .{ .summary_edit = .{ .insert = '[' } } }, keyToMsg(.{
+        .pinned_ai = true,
+        .finding_card_focused = true,
+        .human_review = .{ .open = true, .focus = .summary, .summary_editing = true },
+    }, .{ .codepoint = '[' }).?);
+    try std.testing.expect(keyToMsg(.{ .pinned_ai = true, .ai_reviews_open = true }, .{ .codepoint = '[' }) == null);
+
+    var config: keymap.Config = .{};
+    config.set(.decrease_sidebar_width, .{ .plain_codepoint = 'z' });
+    config.set(.toggle_line_numbers, .{ .plain_codepoint = '[' });
+    try std.testing.expect(keymap.validateConfig(config));
+    const rebound: Context = .{ .pinned_ai = true, .keymap = keymap.Effective.fromConfig(config) };
+    try std.testing.expectEqual(Msg{ .shared = .toggle_line_numbers }, keyToMsg(rebound, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .decrease_sidebar_width }, keyToMsg(rebound, .{ .codepoint = 'z' }).?);
+    try std.testing.expectEqual(
+        Msg{ .finding_navigation = .{ .scope = .current_file, .direction = .previous } },
+        keyToMsg(.{ .pinned_ai = true, .finding_card_focused = true, .keymap = rebound.keymap }, .{ .codepoint = '[' }).?,
+    );
+
+    try std.testing.expectEqual(Msg{ .shared = .select_next_hunk }, keyToMsg(pinned, .{ .codepoint = 'n' }).?);
+    try std.testing.expectEqual(Msg{ .shared = .select_previous_hunk }, keyToMsg(pinned, .{ .codepoint = 'p' }).?);
+    try std.testing.expect(keyToMsg(pinned, .{ .codepoint = 's' }) == null);
 }
 
 test "Review document navigation preserves Home End focus and custom bindings" {

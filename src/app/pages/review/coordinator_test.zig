@@ -11,12 +11,15 @@ const diff_basis = @import("../../diff_basis.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const app_test_support = @import("../../test_support.zig");
+const context = @import("../../../context.zig");
 const diff_render = @import("../../../diff/render.zig");
 const diff_selection = @import("../../../diff/selection.zig");
 const diff_view_model = @import("../../../diff/view_model.zig");
+const file_tree = @import("../../../file_tree.zig");
 const finding_card = @import("../../../ai_review/finding_card.zig");
 const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const git_review = @import("../../../git/committed_review.zig");
+const loaded_diff = @import("../../../loaded_diff.zig");
 const git_refs = @import("../../../git/refs.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
@@ -24,6 +27,7 @@ const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const review_page = @import("../review.zig");
 const review_coordinator = @import("coordinator.zig");
+const review_input = @import("input.zig");
 const review_navigation = @import("navigation.zig");
 const review_view = @import("view.zig");
 const human_review_decision = @import("human_review_decision.zig");
@@ -1412,6 +1416,649 @@ test "Review shared display-mode and terminal resize prepare Finding cards befor
     try std.testing.expect(!resize_success.has_induced_failure);
     try std.testing.expectEqual(chasen.Size{ .width = 40, .height = 12 }, root_app.terminal_size);
     try std.testing.expect(root_app.pages.review.selection_owner == .none and root_app.drag_auto_scroll.active == null);
+}
+
+test "Finding navigation cycles projection order lands exact source and unfolds only its target" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 12 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    const projection = &harness.page_state.pinnedAi().?.selection.finding_projection;
+    try std.testing.expectEqual(@as(usize, 4), projection.files[0].mapped_entry_indices.len);
+    try std.testing.expectEqual(@as(usize, 5), projection.mapped_entry_indices.len);
+    const current_order = projection.files[0].mapped_entry_indices;
+
+    for (current_order) |entry_index| {
+        try harness.navigate(allocator, layout, .current_file, .next);
+        try expectFindingNavigationTarget(&harness, layout, entry_index);
+    }
+    try harness.navigate(allocator, layout, .current_file, .next);
+    try expectFindingNavigationTarget(&harness, layout, current_order[0]);
+    harness.page_state.finding_card = .unfocused;
+    try harness.navigate(allocator, layout, .current_file, .previous);
+    try expectFindingNavigationTarget(&harness, layout, current_order[current_order.len - 1]);
+
+    const original_current_order = projection.files[0].mapped_entry_indices;
+    projection.files[0].mapped_entry_indices = original_current_order[1..2];
+    const one_model = finding_card.FindingCardModel.init(projection, original_current_order[1]).?;
+    _ = harness.page_state.finding_card.apply(.{ .focus = one_model });
+    _ = harness.page_state.finding_card.apply(.toggle);
+    const one_revision = harness.page_state.selection_layout_revision;
+    try harness.navigate(allocator, layout, .current_file, .next);
+    try expectFindingNavigationTarget(&harness, layout, original_current_order[1]);
+    try std.testing.expectEqual(one_revision + 1, harness.page_state.selection_layout_revision);
+    projection.files[0].mapped_entry_indices = original_current_order;
+
+    const viewer_before_zero = harness.page_state.viewer;
+    const card_before_zero = harness.page_state.finding_card;
+    const revision_before_zero = harness.page_state.selection_layout_revision;
+    projection.files[0].mapped_entry_indices = &.{};
+    try harness.navigate(allocator, layout, .current_file, .next);
+    try std.testing.expectEqualStrings("No mapped Findings in this file", harness.page_state.status.text());
+    try std.testing.expectEqualDeep(viewer_before_zero, harness.page_state.viewer);
+    try std.testing.expectEqualDeep(card_before_zero, harness.page_state.finding_card);
+    try std.testing.expectEqual(revision_before_zero, harness.page_state.selection_layout_revision);
+    projection.files[0].mapped_entry_indices = original_current_order;
+
+    const invalid_entry = original_current_order[0];
+    const valid_outcome = projection.entries[invalid_entry].outcome;
+    projection.entries[invalid_entry].outcome = .{ .mapped = .{
+        .file_ordinal = 0,
+        .hunk_ordinal = 0,
+        .first_diff_line_ordinal = 0,
+        .last_diff_line_ordinal = 999,
+    } };
+    harness.page_state.finding_card = .unfocused;
+    const viewer_before_invalid = harness.page_state.viewer;
+    try harness.navigate(allocator, layout, .current_file, .next);
+    try std.testing.expectEqualStrings("Finding target is unavailable", harness.page_state.status.text());
+    try std.testing.expectEqualDeep(viewer_before_invalid, harness.page_state.viewer);
+    try std.testing.expect(!harness.page_state.finding_card.isFocused());
+    projection.entries[invalid_entry].outcome = valid_outcome;
+
+    const beta_entry = projection.mapped_entry_indices[projection.mapped_entry_indices.len - 1];
+    projection.files[0].mapped_entry_indices = projection.mapped_entry_indices[projection.mapped_entry_indices.len - 1 ..];
+    harness.page_state.finding_card = .unfocused;
+    const viewer_before_wrong_file = harness.page_state.viewer;
+    try harness.navigate(allocator, layout, .current_file, .next);
+    try std.testing.expectEqualStrings("Finding target is unavailable", harness.page_state.status.text());
+    try std.testing.expectEqualDeep(viewer_before_wrong_file, harness.page_state.viewer);
+    try std.testing.expect(!harness.page_state.finding_card.isFocused());
+    try std.testing.expectEqual(@as(usize, 1), finding_card.FindingCardModel.init(projection, beta_entry).?.span.file_ordinal);
+    projection.files[0].mapped_entry_indices = original_current_order;
+
+    const original_beta_order = projection.files[1].mapped_entry_indices;
+    projection.files[1].mapped_entry_indices = &.{};
+    const viewer_before_missing_file_entry = harness.page_state.viewer;
+    try harness.navigate(allocator, layout, .all_files, .previous);
+    try std.testing.expectEqualStrings("Finding target is unavailable", harness.page_state.status.text());
+    try std.testing.expectEqualDeep(viewer_before_missing_file_entry, harness.page_state.viewer);
+    try std.testing.expect(!harness.page_state.finding_card.isFocused());
+    projection.files[1].mapped_entry_indices = original_beta_order;
+
+    const loaded = harness.loaded();
+    loaded.setHunkFolded(0, 0, true);
+    loaded.setHunkFolded(0, 1, true);
+    harness.page_state.finding_card = .unfocused;
+    const unfold_revision = harness.page_state.selection_layout_revision;
+    try harness.navigate(allocator, layout, .current_file, .previous);
+    try expectFindingNavigationTarget(&harness, layout, current_order[current_order.len - 1]);
+    try std.testing.expect(loaded.isHunkFolded(0, 0));
+    try std.testing.expect(!loaded.isHunkFolded(0, 1));
+    try std.testing.expectEqual(unfold_revision + 1, harness.page_state.selection_layout_revision);
+    try std.testing.expectEqual(@as(usize, 0), harness.page_state.status.text().len);
+
+    harness.page_state.finding_card = .unfocused;
+    harness.page_state.viewer.selected_target = .{ .diff_file = 0 };
+    harness.page_state.viewer.selected_node = loaded.tree.selectedNodeIndex(0).?;
+    try harness.navigate(allocator, layout, .all_files, .next);
+    try expectFindingNavigationTarget(&harness, layout, projection.mapped_entry_indices[0]);
+    harness.page_state.finding_card = .unfocused;
+    try harness.navigate(allocator, layout, .all_files, .previous);
+    try expectFindingNavigationTarget(&harness, layout, projection.mapped_entry_indices[projection.mapped_entry_indices.len - 1]);
+    try std.testing.expectEqual(loaded.tree.selectedNodeIndex(1).?, harness.page_state.viewer.selected_node);
+    try harness.navigate(allocator, layout, .all_files, .next);
+    try expectFindingNavigationTarget(&harness, layout, projection.mapped_entry_indices[0]);
+    try harness.navigate(allocator, layout, .all_files, .previous);
+    try expectFindingNavigationTarget(&harness, layout, projection.mapped_entry_indices[projection.mapped_entry_indices.len - 1]);
+
+    const card_before_side = harness.page_state.finding_card;
+    const folds_before_side = [3]bool{
+        loaded.collapsed_hunks[0],
+        loaded.collapsed_hunks[1],
+        loaded.collapsed_hunks[2],
+    };
+    const revision_before_side = harness.page_state.selection_layout_revision;
+    harness.page_state.viewer.display_mode = .side_by_side;
+    const viewer_with_requested_side = harness.page_state.viewer;
+    try harness.navigate(allocator, .{ .width = 120, .height = 12 }, .all_files, .next);
+    try std.testing.expectEqualStrings(
+        "Finding navigation is unavailable in side-by-side view",
+        harness.page_state.status.text(),
+    );
+    try std.testing.expectEqualDeep(viewer_with_requested_side, harness.page_state.viewer);
+    try std.testing.expectEqualDeep(card_before_side, harness.page_state.finding_card);
+    try std.testing.expectEqual(folds_before_side[0], loaded.collapsed_hunks[0]);
+    try std.testing.expectEqual(folds_before_side[1], loaded.collapsed_hunks[1]);
+    try std.testing.expectEqual(folds_before_side[2], loaded.collapsed_hunks[2]);
+    try std.testing.expectEqual(revision_before_side, harness.page_state.selection_layout_revision);
+    const narrow: diff_surface.Layout = .{ .width = 40, .height = 12 };
+    try std.testing.expectEqual(diff_render.DisplayMode.unified, harness.controller(narrow).navigationView().view().effectiveDisplayMode());
+    try harness.navigate(allocator, narrow, .all_files, .next);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, harness.page_state.viewer.display_mode);
+    try expectFindingNavigationTarget(&harness, narrow, projection.mapped_entry_indices[0]);
+
+    const original_global_order = projection.mapped_entry_indices;
+    projection.mapped_entry_indices = &.{};
+    const viewer_before_global_zero = harness.page_state.viewer;
+    try harness.navigate(allocator, narrow, .all_files, .next);
+    try std.testing.expectEqualStrings("No mapped Findings in this review", harness.page_state.status.text());
+    try std.testing.expectEqualDeep(viewer_before_global_zero, harness.page_state.viewer);
+    projection.mapped_entry_indices = original_global_order;
+}
+
+test "Finding navigation commits every hidden sidebar scalar terminal and preserves later input semantics" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 12 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    const loaded = harness.loaded();
+    const alpha_file = loaded.tree.selectedNodeIndex(0).?;
+    const beta_file = loaded.tree.selectedNodeIndex(1).?;
+    const source_directory = findingNavigationTreeNode(loaded, .directory, "src").?;
+    const beta_directory = findingNavigationTreeNode(loaded, .directory, "src/beta").?;
+    const arena_allocator = harness.page_state.load.state.loaded.arena.allocator();
+
+    try file_tree.collapse(arena_allocator, &loaded.collapsed_dirs, "src/beta");
+    try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
+    resetFindingNavigationSource(&harness, alpha_file);
+    try harness.navigate(allocator, layout, .all_files, .previous);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+    try std.testing.expectEqual(beta_directory, harness.page_state.viewer.selected_node);
+    var adapter = harness.controller(layout).navigation().updateAdapter();
+    var body = adapter.bodyController();
+    body.selectFileDelta(-1);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 0 }), harness.page_state.viewer.selected_target);
+
+    resetFindingNavigationSource(&harness, alpha_file);
+    try harness.navigate(allocator, layout, .all_files, .previous);
+    adapter = harness.controller(layout).navigation().updateAdapter();
+    body = adapter.bodyController();
+    try body.clickSidebarNode(beta_directory);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+    try std.testing.expectEqual(beta_directory, harness.page_state.viewer.selected_node);
+    try body.clickSidebarNode(alpha_file);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 0 }), harness.page_state.viewer.selected_target);
+
+    const filter_cases = [_]struct { filter: loaded_diff.ChangedFileFilter, expected_node: enum { exact, ancestor } }{
+        .{ .filter = .all, .expected_node = .exact },
+        .{ .filter = .modified, .expected_node = .ancestor },
+        .{ .filter = .added, .expected_node = .exact },
+        .{ .filter = .deleted, .expected_node = .exact },
+        .{ .filter = .renamed, .expected_node = .exact },
+        .{ .filter = .binary, .expected_node = .exact },
+    };
+    for (filter_cases) |case| {
+        harness.page_state.review_display.changed_file_filter = case.filter;
+        try loaded.rebuildVisibleNodes(arena_allocator, false, case.filter);
+        resetFindingNavigationSource(&harness, alpha_file);
+        try harness.navigate(allocator, layout, .all_files, .previous);
+        try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+        try std.testing.expectEqual(
+            if (case.expected_node == .exact) beta_file else source_directory,
+            harness.page_state.viewer.selected_node,
+        );
+        if (case.filter == .deleted or case.filter == .renamed or case.filter == .binary) {
+            try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
+            var filtered_adapter = harness.controller(layout).navigation().updateAdapter();
+            var filtered_body = filtered_adapter.bodyController();
+            filtered_body.selectFileDelta(1);
+            try std.testing.expectEqual(beta_file, harness.page_state.viewer.selected_node);
+            try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+            try std.testing.expect(loaded.sidebarNodeAtBodyRow(beta_file, 8, 0) == null);
+        } else if (case.filter == .modified) {
+            var filtered_adapter = harness.controller(layout).navigation().updateAdapter();
+            var filtered_body = filtered_adapter.bodyController();
+            filtered_body.selectFileDelta(1);
+            try std.testing.expect(loaded.visibleRowOfNode(harness.page_state.viewer.selected_node) != null);
+            try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+            filtered_body.selectFileDelta(1);
+            try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 0 }), harness.page_state.viewer.selected_target);
+        }
+    }
+
+    harness.page_state.review_display.changed_file_filter = .all;
+    harness.page_state.review_display.hide_reviewed_files = true;
+    loaded.reviewed_files[1] = true;
+    try loaded.rebuildVisibleNodes(arena_allocator, true, .all);
+    resetFindingNavigationSource(&harness, alpha_file);
+    try harness.navigate(allocator, layout, .all_files, .previous);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+    try std.testing.expectEqual(source_directory, harness.page_state.viewer.selected_node);
+    adapter = harness.controller(layout).navigation().updateAdapter();
+    body = adapter.bodyController();
+    body.selectFileDelta(1);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+    body.selectFileDelta(1);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 0 }), harness.page_state.viewer.selected_target);
+    loaded.reviewed_files[1] = false;
+    harness.page_state.review_display.hide_reviewed_files = false;
+
+    try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
+    loaded.visible_nodes[0] = alpha_file;
+    loaded.visible_node_count = 1;
+    resetFindingNavigationSource(&harness, alpha_file);
+    try harness.navigate(allocator, layout, .all_files, .previous);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+    try std.testing.expectEqual(alpha_file, harness.page_state.viewer.selected_node);
+    adapter = harness.controller(layout).navigation().updateAdapter();
+    body = adapter.bodyController();
+    body.selectFileDelta(1);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+    try body.clickSidebarNode(alpha_file);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 0 }), harness.page_state.viewer.selected_target);
+
+    harness.page_state.review_display.changed_file_filter = .deleted;
+    try loaded.rebuildVisibleNodes(arena_allocator, false, .deleted);
+    resetFindingNavigationSource(&harness, alpha_file);
+    try harness.navigate(allocator, layout, .all_files, .previous);
+    try std.testing.expectEqual(@as(usize, 0), loaded.visibleNodeCount());
+    try std.testing.expectEqual(beta_file, harness.page_state.viewer.selected_node);
+    adapter = harness.controller(layout).navigation().updateAdapter();
+    body = adapter.bodyController();
+    body.selectFileDelta(-1);
+    body.selectFileDelta(1);
+    try std.testing.expectEqual(beta_file, harness.page_state.viewer.selected_node);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+
+    harness.page_state.review_display.changed_file_filter = .all;
+    try loaded.rebuildVisibleNodes(arena_allocator, false, .all);
+    body.reconcileSelectionAfterVisibleNodeChange(loaded);
+    try std.testing.expectEqual(beta_file, harness.page_state.viewer.selected_node);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 1 }), harness.page_state.viewer.selected_target);
+
+    harness.page_state.review_display.changed_file_filter = .deleted;
+    try loaded.rebuildVisibleNodes(arena_allocator, false, .deleted);
+    harness.page_state.review_display.changed_file_filter = .modified;
+    try loaded.rebuildVisibleNodes(arena_allocator, false, .modified);
+    body.reconcileSelectionAfterVisibleNodeChange(loaded);
+    try std.testing.expectEqual(alpha_file, harness.page_state.viewer.selected_node);
+    try std.testing.expectEqualDeep(@as(?context.SelectedTarget, .{ .diff_file = 0 }), harness.page_state.viewer.selected_target);
+}
+
+test "Finding navigation preparation failures preserve complete state and success allocates nothing late" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 8 };
+    var first_success: ?usize = null;
+    for (0..32) |fail_index| {
+        var harness = try FindingNavigationHarness.init(allocator, true);
+        defer harness.deinit(allocator);
+        const projection = &harness.page_state.pinnedAiConst().?.selection.finding_projection;
+        const first = finding_card.FindingCardModel.init(projection, projection.files[0].mapped_entry_indices[0]).?;
+        _ = harness.page_state.finding_card.apply(.{ .focus = first });
+        _ = harness.page_state.finding_card.apply(.toggle);
+        harness.page_state.viewer.diff_scroll = 3;
+        harness.page_state.viewer.diff_horizontal_scroll = 2;
+        harness.page_state.viewer.sidebar_horizontal_scroll = 1;
+        harness.page_state.selection_layout_revision = 41;
+        harness.page_state.selection_owner = .{ .diff = diff_selection.DragSelection.init(
+            .{ .loaded_file = .{ .file_index = 0, .path_key = "src/alpha/a.zig" } },
+            .new,
+            .{ .hunk_index = 0, .line_index = 0 },
+        ) };
+        harness.page_state.search.match = .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } } };
+        harness.page_state.search.match_offset = 4;
+        harness.loaded().setHunkFolded(0, 1, true);
+        harness.page_state.status.set("older diagnostic", .{});
+
+        const viewer_before = harness.page_state.viewer;
+        const card_before = harness.page_state.finding_card;
+        const selection_before = harness.page_state.selection_owner;
+        const search_before = harness.page_state.search;
+        const cache_before = harness.loaded().rendered_line_cache;
+        const folds_before = [3]bool{
+            harness.loaded().collapsed_hunks[0],
+            harness.loaded().collapsed_hunks[1],
+            harness.loaded().collapsed_hunks[2],
+        };
+        const revision_before = harness.page_state.selection_layout_revision;
+
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = failing.allocator() };
+        var outcome = try harness.controller(layout).update(&ctx, .{ .finding_navigation = .{
+            .scope = .all_files,
+            .direction = .previous,
+        } });
+        outcome.deinit(failing.allocator());
+        if (!failing.has_induced_failure) {
+            first_success = fail_index;
+            try expectFindingNavigationTarget(&harness, layout, projection.mapped_entry_indices[projection.mapped_entry_indices.len - 1]);
+            break;
+        }
+
+        try std.testing.expectEqualStrings("Could not prepare Finding navigation", harness.page_state.status.text());
+        try std.testing.expectEqualDeep(viewer_before, harness.page_state.viewer);
+        try std.testing.expectEqualDeep(card_before, harness.page_state.finding_card);
+        try std.testing.expectEqualDeep(selection_before, harness.page_state.selection_owner);
+        try std.testing.expectEqualDeep(search_before, harness.page_state.search);
+        try std.testing.expect(std.meta.eql(cache_before, harness.loaded().rendered_line_cache));
+        try std.testing.expectEqual(folds_before[0], harness.loaded().collapsed_hunks[0]);
+        try std.testing.expectEqual(folds_before[1], harness.loaded().collapsed_hunks[1]);
+        try std.testing.expectEqual(folds_before[2], harness.loaded().collapsed_hunks[2]);
+        try std.testing.expectEqual(revision_before, harness.page_state.selection_layout_revision);
+    }
+    try std.testing.expect(first_success != null);
+    try std.testing.expect(first_success.? >= review_navigation.FindingCardFramePreparation.allocation_count);
+}
+
+fn expectFindingNavigationTarget(
+    harness: *FindingNavigationHarness,
+    layout: diff_surface.Layout,
+    entry_index: usize,
+) !void {
+    const projection = &harness.page_state.pinnedAiConst().?.selection.finding_projection;
+    const model = finding_card.FindingCardModel.init(projection, entry_index).?;
+    try std.testing.expect(harness.page_state.finding_card.matches(model));
+    switch (harness.page_state.finding_card.focused.view) {
+        .collapsed => {},
+        .expanded => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualDeep(
+        @as(?context.SelectedTarget, .{ .diff_file = model.span.file_ordinal }),
+        harness.page_state.viewer.selected_target,
+    );
+    try std.testing.expectEqual(diff_surface.Focus.diff, harness.page_state.viewer.focus);
+    try std.testing.expectEqualDeep(diff_view_model.BodyCoordinate{ .hunk_line = .{
+        .hunk_index = model.span.hunk_ordinal,
+        .line_index = model.span.last_diff_line_ordinal,
+    } }, harness.page_state.viewer.diff_cursor);
+    var frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(std.testing.allocator)).?;
+    defer frame.deinit(std.testing.allocator);
+    const card_index = frame.row_plan.cardIndex(model).?;
+    const card_start = frame.presentation_rows.cardStart(card_index).?;
+    const visible_rows = harness.controller(layout).navigationView().view().diffVisibleRows();
+    try std.testing.expect(card_start >= harness.page_state.viewer.diff_scroll);
+    if (visible_rows > 0) try std.testing.expect(card_start < harness.page_state.viewer.diff_scroll + visible_rows);
+}
+
+fn findingNavigationTreeNode(
+    loaded: *const loaded_diff.LoadedDiff,
+    kind: file_tree.Node.Kind,
+    path: []const u8,
+) ?usize {
+    for (loaded.tree.nodes, 0..) |node, index| {
+        if (node.kind == kind and std.mem.eql(u8, node.path, path)) return index;
+    }
+    return null;
+}
+
+fn resetFindingNavigationSource(harness: *FindingNavigationHarness, alpha_file: usize) void {
+    harness.page_state.viewer.selected_target = .{ .diff_file = 0 };
+    harness.page_state.viewer.selected_node = alpha_file;
+    harness.page_state.finding_card = .unfocused;
+}
+
+const finding_navigation_patch =
+    "diff --git a/src/alpha/a.zig b/src/alpha/a.zig\n" ++
+    "index 1111111..2222222 100644\n" ++
+    "--- a/src/alpha/a.zig\n" ++
+    "+++ b/src/alpha/a.zig\n" ++
+    "@@ -1,3 +1,3 @@ alpha first\n" ++
+    " context-one\n" ++
+    "-old-two\n" ++
+    "+new-two\n" ++
+    " context-three\n" ++
+    "@@ -20,2 +20,2 @@ alpha second\n" ++
+    " late-context\n" ++
+    "-late-old\n" ++
+    "+late-new\n" ++
+    "diff --git a/src/beta/b.zig b/src/beta/b.zig\n" ++
+    "new file mode 100644\n" ++
+    "--- /dev/null\n" ++
+    "+++ b/src/beta/b.zig\n" ++
+    "@@ -0,0 +1,2 @@ beta\n" ++
+    "+beta-context\n" ++
+    "+beta-new\n";
+
+const FindingNavigationHarness = struct {
+    page_state: review_page.ReviewPageState,
+    repository: repo_session.State = .{},
+    sessions: human_review_session.Owner = .{},
+
+    fn init(allocator: std.mem.Allocator, rooted: bool) !FindingNavigationHarness {
+        const repository_id = try committed_review.ReviewRepositoryId.parse("e23e4567-e89b-42d3-a456-426614174000");
+        const review_id = try committed_review.ReviewId.parse("f23e4567-e89b-42d3-a456-426614174000");
+        const target: committed_review.CommittedReviewTarget = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = reviewAppTestOid('a'),
+            .head_oid = reviewAppTestOid('b'),
+            .diff_base_oid = reviewAppTestOid('a'),
+        };
+        const snapshot: review_store.StoreSnapshot = .{
+            .root_device = 1,
+            .root_inode = 2,
+            .repository_locator = .{ .device = 3, .inode = 4 },
+            .review_repository_id = repository_id,
+        };
+        var bundle = try findingNavigationPinnedBundle(allocator, snapshot, repository_id, review_id, target);
+        errdefer bundle.deinit(allocator);
+        var loaded_bundle = try app_load.buildLoadedBundle(allocator, finding_navigation_patch);
+        errdefer loaded_bundle.deinit();
+        const arena_allocator = loaded_bundle.arena.?.allocator();
+        const reviewed_files = try arena_allocator.alloc(bool, loaded_bundle.loaded.document.files.len);
+        @memset(reviewed_files, false);
+        loaded_bundle.loaded.reviewed_files = reviewed_files;
+        if (rooted) {
+            const old_nodes = loaded_bundle.loaded.tree.nodes;
+            const nodes = try arena_allocator.alloc(file_tree.Node, old_nodes.len + 1);
+            nodes[0] = .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root };
+            for (old_nodes, 0..) |old_node, index| {
+                nodes[index + 1] = old_node;
+                nodes[index + 1].depth += 1;
+            }
+            loaded_bundle.loaded.tree = .{ .nodes = nodes };
+            try loaded_bundle.loaded.rebuildVisibleNodes(arena_allocator, false, .all);
+        }
+        const selected_node = loaded_bundle.loaded.tree.selectedNodeIndex(0).?;
+        const base_display = try allocator.dupe(u8, "base");
+        errdefer allocator.free(base_display);
+        const head_display = try allocator.dupe(u8, "head");
+        errdefer allocator.free(head_display);
+        const loaded_value = loaded_bundle.loaded;
+        const arena = loaded_bundle.takeArena();
+        const selection = bundle.selection;
+        bundle.selection = undefined;
+        return .{ .page_state = .{
+            .load = .{ .state = .{ .loaded = .{ .arena = arena, .loaded = loaded_value } } },
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .selected_node = selected_node,
+                .focus = .sidebar,
+                .display_mode = .unified,
+            },
+            .presentation = .{ .pinned_ai = .{
+                .selection = selection,
+                .base_display = base_display,
+                .head_display = head_display,
+            } },
+        } };
+    }
+
+    fn deinit(self: *FindingNavigationHarness, allocator: std.mem.Allocator) void {
+        self.page_state.deinit(allocator);
+        self.sessions.deinit();
+        self.* = undefined;
+    }
+
+    fn controller(self: *FindingNavigationHarness, layout: diff_surface.Layout) review_coordinator.Controller {
+        return .{
+            .page_state = &self.page_state,
+            .repo = self.repository.view(),
+            .layout = layout,
+            .env_map = null,
+            .sessions = &self.sessions,
+        };
+    }
+
+    fn loaded(self: *FindingNavigationHarness) *loaded_diff.LoadedDiff {
+        return switch (self.page_state.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => unreachable,
+        };
+    }
+
+    fn navigate(
+        self: *FindingNavigationHarness,
+        allocator: std.mem.Allocator,
+        layout: diff_surface.Layout,
+        scope: review_input.FindingNavigationIntent.Scope,
+        direction: review_input.FindingNavigationIntent.Direction,
+    ) !void {
+        var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+        var outcome = try self.controller(layout).update(&ctx, .{ .finding_navigation = .{
+            .scope = scope,
+            .direction = direction,
+        } });
+        outcome.deinit(allocator);
+    }
+};
+
+fn findingNavigationPinnedBundle(
+    allocator: std.mem.Allocator,
+    snapshot: review_store.StoreSnapshot,
+    repository_id: committed_review.ReviewRepositoryId,
+    review_id: committed_review.ReviewId,
+    target: committed_review.CommittedReviewTarget,
+) !app_load.PinnedReviewLoadedBundle {
+    const producer: committed_review.Producer = .{ .name = "reviewer", .model = "gpt-test" };
+    const finding_values = [_]committed_review.Finding{
+        .{
+            .finding_id = .{ .bytes = "alpha-context" },
+            .anchor = .{ .path_bytes = "src/alpha/a.zig", .side = .after, .start_line = 1, .end_line = 1, .content_digest = committed_review.Sha256Digest.hash("context-one\n") },
+            .severity = .info,
+            .title = "alpha context",
+            .body = "first context line",
+        },
+        .{
+            .finding_id = .{ .bytes = "alpha-removed" },
+            .anchor = .{ .path_bytes = "src/alpha/a.zig", .side = .before, .start_line = 2, .end_line = 2, .content_digest = committed_review.Sha256Digest.hash("old-two\n") },
+            .severity = .warning,
+            .title = "alpha removed",
+            .body = "removed line",
+        },
+        .{
+            .finding_id = .{ .bytes = "alpha-added" },
+            .anchor = .{ .path_bytes = "src/alpha/a.zig", .side = .after, .start_line = 2, .end_line = 2, .content_digest = committed_review.Sha256Digest.hash("new-two\n") },
+            .severity = .@"error",
+            .title = "alpha added",
+            .body = "added line",
+        },
+        .{
+            .finding_id = .{ .bytes = "alpha-late" },
+            .anchor = .{ .path_bytes = "src/alpha/a.zig", .side = .after, .start_line = 21, .end_line = 21, .content_digest = committed_review.Sha256Digest.hash("late-new\n") },
+            .severity = .warning,
+            .title = "alpha late",
+            .body = "second hunk",
+        },
+        .{
+            .finding_id = .{ .bytes = "beta-added" },
+            .anchor = .{ .path_bytes = "src/beta/b.zig", .side = .after, .start_line = 1, .end_line = 1, .content_digest = committed_review.Sha256Digest.hash("beta-context\n") },
+            .severity = .info,
+            .title = "beta added",
+            .body = "added file",
+        },
+    };
+    const finding_set: committed_review.FindingSet = .{
+        .schema_version = 1,
+        .review_id = review_id,
+        .created_at = "2026-09-03T00:00:00Z",
+        .timing = .{ .duration_ms = 1 },
+        .target = target,
+        .producer = producer,
+        .findings = &finding_values,
+    };
+    const findings_bytes = try finding_set.writeCanonical(allocator);
+    errdefer allocator.free(findings_bytes);
+    var findings = try committed_review.FindingSet.parseStrict(allocator, findings_bytes);
+    errdefer findings.deinit();
+    const manifest_value: committed_review.ReviewRunManifest = .{
+        .schema_version = 1,
+        .review_id = review_id,
+        .review_repository_id = repository_id,
+        .target = target,
+        .created_at = "2026-09-03T00:00:00Z",
+        .display = .{ .base_label = "main", .head_label = "topic" },
+        .finding_count = finding_values.len,
+        .producer = producer,
+        .findings_digest = committed_review.Sha256Digest.hash(findings_bytes),
+    };
+    const manifest_bytes = try manifest_value.writeCanonical(allocator);
+    errdefer allocator.free(manifest_bytes);
+    var manifest = try committed_review.ReviewRunManifest.parseStrict(allocator, manifest_bytes);
+    errdefer manifest.deinit();
+    const patch_bytes = try allocator.dupe(u8, finding_navigation_patch);
+    errdefer allocator.free(patch_bytes);
+    var projection: git_review.CommittedDiffProjection = .{ .target = target, .patch_bytes = patch_bytes };
+    errdefer projection.deinit(allocator);
+    const mode = [6]u8{ '1', '0', '0', '6', '4', '4' };
+    const absent_mode = [6]u8{ '0', '0', '0', '0', '0', '0' };
+    const endpoint_records = try allocator.alloc(git_review.CommittedDiffEndpointRecord, 2);
+    endpoint_records[0] = .{
+        .file_ordinal = 0,
+        .status_bytes = try allocator.dupe(u8, "M"),
+        .old_mode = mode,
+        .new_mode = mode,
+        .before = .{ .path_bytes = try allocator.dupe(u8, "src/alpha/a.zig"), .object_oid = target.base_oid, .mode = mode, .is_blob = true },
+        .after = .{ .path_bytes = try allocator.dupe(u8, "src/alpha/a.zig"), .object_oid = target.head_oid, .mode = mode, .is_blob = true },
+    };
+    endpoint_records[1] = .{
+        .file_ordinal = 1,
+        .status_bytes = try allocator.dupe(u8, "A"),
+        .old_mode = absent_mode,
+        .new_mode = mode,
+        .before = null,
+        .after = .{ .path_bytes = try allocator.dupe(u8, "src/beta/b.zig"), .object_oid = target.head_oid, .mode = mode, .is_blob = true },
+    };
+    var endpoints: git_review.CommittedDiffEndpointSidecar = .{ .target = target, .records = endpoint_records };
+    defer endpoints.deinit(allocator);
+    const validations = [_]git_review.CodeAnchorValidation{
+        .{ .validated = target.head_oid },
+        .{ .validated = target.base_oid },
+        .{ .validated = target.head_oid },
+        .{ .validated = target.head_oid },
+        .{ .validated = target.head_oid },
+    };
+    var index = try finding_projection.build(allocator, .{
+        .expected_review_repository_id = repository_id,
+        .requested_review_id = review_id,
+        .projection_target = target,
+        .manifest = &manifest.value,
+        .findings_bytes = findings_bytes,
+        .finding_set = &findings.value,
+        .projection = &projection,
+        .endpoints = &endpoints,
+        .anchor_validations = &validations,
+    });
+    errdefer index.deinit(allocator);
+    return .{ .selection = .{
+        .snapshot = snapshot,
+        .artifacts = .{
+            .manifest_bytes = manifest_bytes,
+            .findings_bytes = findings_bytes,
+            .draft_bytes = null,
+            .result_bytes = null,
+            .manifest = manifest,
+            .findings = findings,
+            .draft = null,
+            .result = null,
+            .state = .new,
+            .created_at_unix = 0,
+            .retained_draft_diagnostic = null,
+        },
+        .projection = projection,
+        .finding_projection = index,
+    }, .diff = .empty };
 }
 
 fn reviewHistoryPinnedBundle(

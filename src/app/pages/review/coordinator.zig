@@ -18,6 +18,7 @@ const diff_render = @import("../../../diff/render.zig");
 const diff_selection = @import("../../../diff/selection.zig");
 const finding_card = @import("../../../ai_review/finding_card.zig");
 const finding_projection = @import("../../../ai_review/finding_projection.zig");
+const loaded_diff = @import("../../../loaded_diff.zig");
 const review_page = @import("../review.zig");
 const review_input = @import("input.zig");
 const review_navigation = @import("navigation.zig");
@@ -265,6 +266,7 @@ pub const Controller = struct {
                     },
                 }
             },
+            .finding_navigation => |intent| return self.updateFindingNavigation(ctx.allocator(), intent),
             .finding_card => |card_msg| return try self.updateFindingCard(ctx.allocator(), card_msg),
         }
         return .{};
@@ -890,6 +892,180 @@ pub const Controller = struct {
         return .{};
     }
 
+    fn updateFindingNavigation(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        intent: review_input.FindingNavigationIntent,
+    ) UpdateOutcome {
+        const pinned = self.page_state.pinnedAiConst() orelse return .{};
+        const base_view = self.navigationView();
+        if (base_view.view().effectiveDisplayMode() != .unified) {
+            self.page_state.status.set("Finding navigation is unavailable in side-by-side view", .{});
+            return .{};
+        }
+        const loaded = base_view.view().activeLoadedDiffConst() orelse {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        };
+        const projection = &pinned.selection.finding_projection;
+        const selected_file = base_view.view().selectedDiffFileTarget();
+        const ordered = switch (intent.scope) {
+            .current_file => blk: {
+                const file_index = selected_file orelse {
+                    self.page_state.status.set("Finding target is unavailable", .{});
+                    return .{};
+                };
+                if (file_index >= loaded.document.files.len or file_index >= projection.files.len) {
+                    self.page_state.status.set("Finding target is unavailable", .{});
+                    return .{};
+                }
+                break :blk projection.files[file_index].mapped_entry_indices;
+            },
+            .all_files => projection.mapped_entry_indices,
+        };
+        if (ordered.len == 0) {
+            switch (intent.scope) {
+                .current_file => self.page_state.status.set("No mapped Findings in this file", .{}),
+                .all_files => self.page_state.status.set("No mapped Findings in this review", .{}),
+            }
+            return .{};
+        }
+
+        const entry_index = findingNavigationEntryIndex(
+            projection,
+            ordered,
+            self.page_state.finding_card,
+            intent.direction,
+        );
+        const target = finding_card.FindingCardModel.init(projection, entry_index) orelse {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        };
+        if (intent.scope == .current_file and
+            (selected_file == null or selected_file.? != target.span.file_ordinal))
+        {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        }
+        if (target.span.file_ordinal >= loaded.document.files.len or
+            target.span.file_ordinal >= projection.files.len or
+            !loaded.fileTextSelectable(target.span.file_ordinal) or
+            self.page_state.contentForFindingCard(target) == null)
+        {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        }
+        const target_file = loaded.document.files[target.span.file_ordinal];
+        if (target.span.hunk_ordinal >= target_file.hunks.len or
+            target.span.first_diff_line_ordinal > target.span.last_diff_line_ordinal or
+            target.span.first_diff_line_ordinal >= target_file.hunks[target.span.hunk_ordinal].lines.len or
+            target.span.last_diff_line_ordinal >= target_file.hunks[target.span.hunk_ordinal].lines.len or
+            finding_card.FindingId.init(target.finding_id) == null or
+            !findingNavigationFileContainsEntry(projection, target.span.file_ordinal, entry_index))
+        {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        }
+        const exact_file_node = loaded.tree.selectedNodeIndex(target.span.file_ordinal) orelse {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        };
+        if (exact_file_node >= loaded.tree.nodes.len or
+            loaded.tree.nodes[exact_file_node].diffFileIndex() != target.span.file_ordinal)
+        {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        }
+        const switches_file = selected_file == null or selected_file.? != target.span.file_ordinal;
+        const target_node = if (intent.scope == .all_files and switches_file)
+            findingNavigationSidebarNode(loaded, exact_file_node)
+        else
+            self.page_state.viewer.selected_node;
+        if (switches_file and
+            (target_node >= loaded.tree.nodes.len or
+                (loaded.visibleNodeCount() > 0 and loaded.visibleRowOfNode(target_node) == null) or
+                (loaded.visibleNodeCount() == 0 and target_node != exact_file_node)))
+        {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        }
+
+        var outgoing_frame = base_view.buildFindingCardFrame(allocator) catch {
+            self.page_state.status.set("Could not prepare Finding navigation", .{});
+            return .{};
+        };
+        defer if (outgoing_frame) |*frame| frame.deinit(allocator);
+        var preparation = (base_view.prepareFindingCardFrame(allocator) catch {
+            self.page_state.status.set("Could not prepare Finding navigation", .{});
+            return .{};
+        }) orelse {
+            self.page_state.status.set("Finding target is unavailable", .{});
+            return .{};
+        };
+        defer preparation.deinit();
+
+        const raw_scroll_before = self.page_state.viewer.diff_scroll;
+        const selected_target_before = self.page_state.viewer.selected_target;
+        var outgoing_view = base_view.withPresentationRows(if (outgoing_frame) |*frame|
+            &frame.presentation_rows
+        else
+            null);
+        var outgoing_resolver = outgoing_view.resolver();
+        const source_anchor = outgoing_view.bodyView(&outgoing_resolver).sourceAnchorAtOrBeforePresentation(raw_scroll_before);
+        // No allocation or fallible operation is permitted below this point.
+        var navigation_controller = self.navigation();
+        var update_adapter = navigation_controller.updateAdapter();
+        var body = update_adapter.bodyController();
+        const mutable_loaded = body.controller.activeLoadedDiff().?;
+        if (switches_file) {
+            body.controller.setSelectedDiffFile(target.span.file_ordinal);
+            self.page_state.viewer.selected_node = target_node;
+            body.resetDiffPosition();
+        }
+        self.page_state.viewer.focus = .diff;
+        mutable_loaded.setHunkFolded(target.span.file_ordinal, target.span.hunk_ordinal, false);
+        body.updateSearchMatchOffset();
+        self.page_state.viewer.diff_cursor = .{ .hunk_line = .{
+            .hunk_index = target.span.hunk_ordinal,
+            .line_index = target.span.last_diff_line_ordinal,
+        } };
+        var next_state = self.page_state.finding_card;
+        const focus_action = next_state.apply(.{ .focus = target });
+        std.debug.assert(focus_action == .ensure_visible);
+        self.page_state.finding_card = next_state;
+
+        var incoming_frame = preparation.fill(self.navigationView(), next_state) orelse unreachable;
+        const mapping_changed = !std.meta.eql(selected_target_before, self.page_state.viewer.selected_target) or
+            !sameFindingCardPresentationRows(
+                if (outgoing_frame) |*frame| &frame.presentation_rows else null,
+                &incoming_frame.presentation_rows,
+            );
+        var scroll = if (switches_file)
+            0
+        else if (source_anchor) |anchor|
+            incoming_frame.presentation_rows.sourceToPresentation(anchor) orelse raw_scroll_before
+        else
+            raw_scroll_before;
+        const visible_rows = base_view.view().diffVisibleRows();
+        const max_scroll = incoming_frame.presentation_rows.total_rows -| visible_rows;
+        scroll = @min(scroll, max_scroll);
+        const card_index = incoming_frame.row_plan.cardIndex(target) orelse unreachable;
+        const card_start = incoming_frame.presentation_rows.cardStart(card_index) orelse unreachable;
+        const card_height = next_state.cardRows(target);
+        if (card_start < scroll) {
+            scroll = card_start;
+        } else if (visible_rows > 0 and card_start + card_height > scroll + visible_rows) {
+            scroll = if (card_height >= visible_rows)
+                card_start
+            else
+                card_start + card_height - visible_rows;
+        }
+        self.page_state.viewer.diff_scroll = @min(scroll, max_scroll);
+        if (mapping_changed) self.page_state.advanceSelectionLayoutRevision();
+        self.page_state.status.clearIfEphemeral();
+        return .{};
+    }
+
     pub fn reconcileFindingCardVisibility(self: Controller) void {
         const view = self.navigationView();
         if (view.focusedFindingCardVisible()) return;
@@ -948,6 +1124,47 @@ pub const Controller = struct {
         };
     }
 };
+
+fn findingNavigationEntryIndex(
+    projection: *const finding_projection.FindingProjectionIndex,
+    ordered: []const usize,
+    state: finding_card.State,
+    direction: review_input.FindingNavigationIntent.Direction,
+) usize {
+    std.debug.assert(ordered.len > 0);
+    var focused_position: ?usize = null;
+    for (ordered, 0..) |entry_index, position| {
+        const model = finding_card.FindingCardModel.init(projection, entry_index) orelse continue;
+        if (!state.matches(model)) continue;
+        focused_position = position;
+        break;
+    }
+    const position = if (focused_position) |current| switch (direction) {
+        .previous => if (current == 0) ordered.len - 1 else current - 1,
+        .next => (current + 1) % ordered.len,
+    } else switch (direction) {
+        .previous => ordered.len - 1,
+        .next => 0,
+    };
+    return ordered[position];
+}
+
+fn findingNavigationFileContainsEntry(
+    projection: *const finding_projection.FindingProjectionIndex,
+    file_index: usize,
+    entry_index: usize,
+) bool {
+    for (projection.files[file_index].mapped_entry_indices) |candidate| {
+        if (candidate == entry_index) return true;
+    }
+    return false;
+}
+
+fn findingNavigationSidebarNode(loaded: *const loaded_diff.LoadedDiff, exact_file_node: usize) usize {
+    if (loaded.visibleRowOfNode(exact_file_node) != null) return exact_file_node;
+    if (loaded.visibleAncestorOrSelf(exact_file_node)) |node_index| return node_index;
+    return loaded.visibleNodeAt(0) orelse exact_file_node;
+}
 
 fn sharedMessageMayChangeFindingCardBasis(msg: diff_surface.message.Msg) bool {
     return switch (msg) {
