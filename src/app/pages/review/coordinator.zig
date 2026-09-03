@@ -22,6 +22,7 @@ const loaded_diff = @import("../../../loaded_diff.zig");
 const review_page = @import("../review.zig");
 const review_input = @import("input.zig");
 const review_navigation = @import("navigation.zig");
+const finding_card_view = @import("finding_card_view.zig");
 const review_store = @import("../../../review_store.zig");
 const human_review_session = @import("../../human_review_session.zig");
 const committed_review = @import("../../../committed_review.zig");
@@ -112,87 +113,7 @@ pub const Controller = struct {
         msg: review_input.Msg,
     ) !UpdateOutcome {
         switch (msg) {
-            .shared => |shared_msg| {
-                const base_navigation_view = self.navigationView();
-                var finding_frame = try base_navigation_view.buildFindingCardFrame(ctx.allocator());
-                defer if (finding_frame) |*frame| frame.deinit(ctx.allocator());
-                const changes_basis = sharedMessageMayChangeFindingCardBasis(shared_msg);
-                var incoming_preparation = if (changes_basis)
-                    try base_navigation_view.prepareFindingCardFrame(ctx.allocator())
-                else
-                    null;
-                defer if (incoming_preparation) |*preparation| preparation.deinit();
-                const raw_scroll_before = if (changes_basis) self.page_state.viewer.diff_scroll else undefined;
-                const selected_target_before = if (changes_basis) self.page_state.viewer.selected_target else undefined;
-                const effective_mode_before = if (changes_basis) base_navigation_view.view().effectiveDisplayMode() else undefined;
-                const layout_revision_before = if (changes_basis) self.page_state.selection_layout_revision else undefined;
-                const source_scroll_before = if (changes_basis) blk: {
-                    var outgoing_view = base_navigation_view.withPresentationRows(
-                        if (finding_frame) |*frame| &frame.presentation_rows else null,
-                    );
-                    var resolver = outgoing_view.resolver();
-                    const source_scroll = outgoing_view.bodyView(&resolver).sourceAnchorAtOrBeforePresentation(raw_scroll_before) orelse 0;
-                    self.page_state.viewer.diff_scroll = source_scroll;
-                    break :blk source_scroll;
-                } else undefined;
-                var navigation_controller = self.navigation();
-                navigation_controller.presentation_rows = if (!changes_basis and finding_frame != null)
-                    &finding_frame.?.presentation_rows
-                else
-                    null;
-                var update_adapter = navigation_controller.updateAdapter();
-                var page_update = update_adapter.shared().apply(ctx.allocator(), shared_msg) catch |err| {
-                    if (changes_basis) self.page_state.viewer.diff_scroll = raw_scroll_before;
-                    return err;
-                };
-                defer page_update.deinit(ctx.allocator());
-                update_adapter.applyRetentionTransition(ctx.allocator(), page_update.retention_transition);
-                self.reconcileFindingCardVisibility();
-                if (changes_basis) {
-                    const source_scroll_after = self.page_state.viewer.diff_scroll;
-                    var incoming_frame = if (incoming_preparation) |*preparation|
-                        preparation.fill(self.navigationView(), self.page_state.finding_card)
-                    else
-                        null;
-                    var incoming_controller = self.navigation();
-                    incoming_controller.presentation_rows = if (incoming_frame) |*frame| &frame.presentation_rows else null;
-                    var incoming_adapter = incoming_controller.updateAdapter();
-                    const incoming_body = incoming_adapter.bodyController();
-                    const mapping_changed = !std.meta.eql(selected_target_before, self.page_state.viewer.selected_target) or
-                        effective_mode_before != incoming_controller.view().view().effectiveDisplayMode() or
-                        !sameFindingCardPresentationRows(
-                            if (finding_frame) |*frame| &frame.presentation_rows else null,
-                            if (incoming_frame) |*frame| &frame.presentation_rows else null,
-                        );
-                    self.page_state.viewer.diff_scroll = if (!mapping_changed and source_scroll_after == source_scroll_before)
-                        raw_scroll_before
-                    else
-                        incoming_body.view().sourceToPresentationOffset(source_scroll_after) orelse source_scroll_after;
-                    incoming_body.clampDiffNavigation();
-                    if (mapping_changed and self.page_state.selection_layout_revision == layout_revision_before) {
-                        self.page_state.advanceSelectionLayoutRevision();
-                    }
-                }
-                const auto_scroll = page_update.auto_scroll;
-                const effect = page_update.takeEffect() orelse return .{ .auto_scroll = auto_scroll };
-                return switch (effect) {
-                    .copy_diff_selection => |copy| .{
-                        .clipboard = self.ownedSelectionClipboard("diff selection", copy),
-                        .auto_scroll = auto_scroll,
-                    },
-                    .copy_diff_header_path => |selection_value| blk: {
-                        const selection = selection_value;
-                        defer ctx.allocator().free(selection.identity.path_key);
-                        const navigation_view = navigation_controller.view();
-                        var content_adapter = navigation_view.resolver();
-                        const path = navigation_view.contentView(&content_adapter).diffHeaderPath(selection) orelse break :blk .{};
-                        break :blk .{
-                            .clipboard = self.borrowedClipboard("file path", path),
-                            .auto_scroll = auto_scroll,
-                        };
-                    },
-                };
-            },
+            .shared => |shared_msg| return try self.updateShared(ctx, shared_msg),
             .open_base_picker => try self.startBasePicker(ctx),
             .close_base_picker => self.page_state.closeBasePicker(ctx.allocator()),
             .base_picker_enter_query => self.page_state.base_picker.enterQuery(),
@@ -268,8 +189,109 @@ pub const Controller = struct {
             },
             .finding_navigation => |intent| return self.updateFindingNavigation(ctx.allocator(), intent),
             .finding_card => |card_msg| return try self.updateFindingCard(ctx.allocator(), card_msg),
+            .finding_pointer => |pointer| return try self.updateFindingPointer(ctx, pointer),
         }
         return .{};
+    }
+
+    fn updateShared(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        shared_msg: diff_surface.message.Msg,
+    ) !UpdateOutcome {
+        const base_navigation_view = self.navigationView();
+        var finding_frame = try base_navigation_view.buildFindingCardFrame(ctx.allocator());
+        defer if (finding_frame) |*frame| frame.deinit(ctx.allocator());
+        return self.updateSharedWithFindingFrame(
+            ctx,
+            shared_msg,
+            if (finding_frame) |*frame| frame else null,
+        );
+    }
+
+    fn updateSharedWithFindingFrame(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        shared_msg: diff_surface.message.Msg,
+        finding_frame: ?*review_navigation.FindingCardFrame,
+    ) !UpdateOutcome {
+        const base_navigation_view = self.navigationView();
+        const changes_basis = sharedMessageMayChangeFindingCardBasis(shared_msg);
+        var incoming_preparation = if (changes_basis)
+            try base_navigation_view.prepareFindingCardFrame(ctx.allocator())
+        else
+            null;
+        defer if (incoming_preparation) |*preparation| preparation.deinit();
+        const raw_scroll_before = if (changes_basis) self.page_state.viewer.diff_scroll else undefined;
+        const selected_target_before = if (changes_basis) self.page_state.viewer.selected_target else undefined;
+        const effective_mode_before = if (changes_basis) base_navigation_view.view().effectiveDisplayMode() else undefined;
+        const layout_revision_before = if (changes_basis) self.page_state.selection_layout_revision else undefined;
+        const source_scroll_before = if (changes_basis) blk: {
+            var outgoing_view = base_navigation_view.withPresentationRows(
+                if (finding_frame) |frame| &frame.presentation_rows else null,
+            );
+            var resolver = outgoing_view.resolver();
+            const source_scroll = outgoing_view.bodyView(&resolver).sourceAnchorAtOrBeforePresentation(raw_scroll_before) orelse 0;
+            self.page_state.viewer.diff_scroll = source_scroll;
+            break :blk source_scroll;
+        } else undefined;
+        var navigation_controller = self.navigation();
+        navigation_controller.presentation_rows = if (!changes_basis and finding_frame != null)
+            &finding_frame.?.presentation_rows
+        else
+            null;
+        var update_adapter = navigation_controller.updateAdapter();
+        var page_update = update_adapter.shared().apply(ctx.allocator(), shared_msg) catch |err| {
+            if (changes_basis) self.page_state.viewer.diff_scroll = raw_scroll_before;
+            return err;
+        };
+        defer page_update.deinit(ctx.allocator());
+        update_adapter.applyRetentionTransition(ctx.allocator(), page_update.retention_transition);
+        self.reconcileFindingCardVisibility();
+        if (changes_basis) {
+            const source_scroll_after = self.page_state.viewer.diff_scroll;
+            var incoming_frame = if (incoming_preparation) |*preparation|
+                preparation.fill(self.navigationView(), self.page_state.finding_card)
+            else
+                null;
+            var incoming_controller = self.navigation();
+            incoming_controller.presentation_rows = if (incoming_frame) |*frame| &frame.presentation_rows else null;
+            var incoming_adapter = incoming_controller.updateAdapter();
+            const incoming_body = incoming_adapter.bodyController();
+            const mapping_changed = !std.meta.eql(selected_target_before, self.page_state.viewer.selected_target) or
+                effective_mode_before != incoming_controller.view().view().effectiveDisplayMode() or
+                !sameFindingCardPresentationRows(
+                    if (finding_frame) |frame| &frame.presentation_rows else null,
+                    if (incoming_frame) |*frame| &frame.presentation_rows else null,
+                );
+            self.page_state.viewer.diff_scroll = if (!mapping_changed and source_scroll_after == source_scroll_before)
+                raw_scroll_before
+            else
+                incoming_body.view().sourceToPresentationOffset(source_scroll_after) orelse source_scroll_after;
+            incoming_body.clampDiffNavigation();
+            if (mapping_changed and self.page_state.selection_layout_revision == layout_revision_before) {
+                self.page_state.advanceSelectionLayoutRevision();
+            }
+        }
+        const auto_scroll = page_update.auto_scroll;
+        const effect = page_update.takeEffect() orelse return .{ .auto_scroll = auto_scroll };
+        return switch (effect) {
+            .copy_diff_selection => |copy| .{
+                .clipboard = self.ownedSelectionClipboard("diff selection", copy),
+                .auto_scroll = auto_scroll,
+            },
+            .copy_diff_header_path => |selection_value| blk: {
+                const selection = selection_value;
+                defer ctx.allocator().free(selection.identity.path_key);
+                const navigation_view = navigation_controller.view();
+                var content_adapter = navigation_view.resolver();
+                const path = navigation_view.contentView(&content_adapter).diffHeaderPath(selection) orelse break :blk .{};
+                break :blk .{
+                    .clipboard = self.borrowedClipboard("file path", path),
+                    .auto_scroll = auto_scroll,
+                };
+            },
+        };
     }
 
     pub fn currentHumanReviewPresentation(self: Controller) ?human_review_session.Presentation {
@@ -873,10 +895,30 @@ pub const Controller = struct {
             .owned_noop => unreachable,
         }
 
-        var next_frame = (try base_view.buildFindingCardFrameForState(allocator, next_state)) orelse return .{};
+        _ = try self.commitFindingCardTransition(
+            allocator,
+            base_view,
+            &current_frame,
+            source_anchor,
+            next_state,
+            action,
+        );
+        return .{};
+    }
+
+    fn commitFindingCardTransition(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        base_view: review_navigation.View,
+        current_frame: *const review_navigation.FindingCardFrame,
+        source_anchor: ?usize,
+        next_state: finding_card.State,
+        action: finding_card.Action,
+    ) !bool {
+        var next_frame = (try base_view.buildFindingCardFrameForState(allocator, next_state)) orelse return false;
         defer next_frame.deinit(allocator);
         const transition = findingCardScrollTransition(
-            &current_frame,
+            current_frame,
             &next_frame,
             self.page_state.viewer.diff_scroll,
             source_anchor,
@@ -889,7 +931,112 @@ pub const Controller = struct {
         }
         self.page_state.finding_card = next_state;
         self.page_state.viewer.diff_scroll = transition.scroll;
-        return .{};
+        return true;
+    }
+
+    fn updateFindingPointer(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        pointer: review_input.FindingPointerEvent,
+    ) !UpdateOutcome {
+        const shared_msg = findingPointerSharedMessage(pointer);
+        const allocator = ctx.allocator();
+        const base_view = self.navigationView();
+        const frame_optional = base_view.buildFindingCardFrame(allocator) catch {
+            self.page_state.status.set("Could not resolve Finding pointer", .{});
+            return .{};
+        };
+        if (frame_optional == null) return try self.updateSharedWithFindingFrame(ctx, shared_msg, null);
+        var current_frame = frame_optional.?;
+        defer current_frame.deinit(allocator);
+
+        var current_view = base_view.withPresentationRows(&current_frame.presentation_rows);
+        var resolver = current_view.resolver();
+        const body = current_view.bodyView(&resolver);
+        const hit = body.presentationCellHit(pointer.point) orelse
+            return try self.updateSharedWithFindingFrame(ctx, shared_msg, &current_frame);
+        switch (hit) {
+            .source => return try self.updateSharedWithFindingFrame(ctx, shared_msg, &current_frame),
+            .spacer => switch (pointer.button) {
+                .wheel_up, .wheel_down => return try self.updateSharedWithFindingFrame(ctx, shared_msg, &current_frame),
+                .left, .wheel_left, .wheel_right => return .{},
+            },
+            .card => |card_hit| {
+                if (card_hit.token >= current_frame.row_plan.cards.len) {
+                    self.page_state.status.set("Could not resolve Finding pointer", .{});
+                    return .{};
+                }
+                const model = current_frame.row_plan.cards[card_hit.token];
+                switch (pointer.button) {
+                    .left => {
+                        if (card_hit.local_row == finding_card.expanded_rows - 1 and
+                            self.page_state.finding_card.expanded(model))
+                        {
+                            const target = finding_card_view.footerCopyTarget(body.view.diffPaneWidth()) orelse return .{};
+                            if (!target.contains(card_hit.local_col)) return .{};
+                            const content = self.page_state.contentForFindingCard(model) orelse {
+                                self.page_state.status.set("Could not resolve Finding pointer", .{});
+                                return .{};
+                            };
+                            var copy_state = self.page_state.finding_card;
+                            if (copy_state.apply(.copy) != .copy_requested) return .{};
+                            const text = try findingCardCopyText(allocator, content);
+                            return .{ .clipboard = self.ownedClipboard("Finding", text) };
+                        }
+                        if (card_hit.local_row != 0) return .{};
+                        const source_anchor = body.sourceAnchorAtOrBeforePresentation(self.page_state.viewer.diff_scroll);
+                        var next_state = self.page_state.finding_card;
+                        const action = if (next_state.matches(model))
+                            next_state.apply(.toggle)
+                        else
+                            next_state.apply(.{ .focus = model });
+                        const committed = self.commitFindingCardTransition(
+                            allocator,
+                            base_view,
+                            &current_frame,
+                            source_anchor,
+                            next_state,
+                            action,
+                        ) catch {
+                            self.page_state.status.set("Could not resolve Finding pointer", .{});
+                            return .{};
+                        };
+                        if (!committed) {
+                            self.page_state.status.set("Could not resolve Finding pointer", .{});
+                            return .{};
+                        }
+                        self.page_state.viewer.focus = .diff;
+                        return .{};
+                    },
+                    .wheel_up, .wheel_down => {
+                        if (!self.page_state.finding_card.expanded(model)) {
+                            return try self.updateSharedWithFindingFrame(ctx, shared_msg, &current_frame);
+                        }
+                        const content = self.page_state.contentForFindingCard(model) orelse {
+                            self.page_state.status.set("Could not resolve Finding pointer", .{});
+                            return .{};
+                        };
+                        const content_width = review_page.findingCardContentWidth(body.view.diffPaneWidth());
+                        const max_scroll = review_page.findingCardMaxBodyScroll(
+                            allocator,
+                            content,
+                            content_width,
+                        ) catch {
+                            self.page_state.status.set("Could not resolve Finding pointer", .{});
+                            return .{};
+                        };
+                        var next_state = self.page_state.finding_card;
+                        _ = next_state.apply(.{ .scroll = .{
+                            .direction = if (pointer.button == .wheel_up) .up else .down,
+                            .max_scroll = max_scroll,
+                        } });
+                        self.page_state.finding_card = next_state;
+                        return .{};
+                    },
+                    .wheel_left, .wheel_right => return .{},
+                }
+            },
+        }
     }
 
     fn updateFindingNavigation(
@@ -1164,6 +1311,16 @@ fn findingNavigationSidebarNode(loaded: *const loaded_diff.LoadedDiff, exact_fil
     if (loaded.visibleRowOfNode(exact_file_node) != null) return exact_file_node;
     if (loaded.visibleAncestorOrSelf(exact_file_node)) |node_index| return node_index;
     return loaded.visibleNodeAt(0) orelse exact_file_node;
+}
+
+fn findingPointerSharedMessage(pointer: review_input.FindingPointerEvent) diff_surface.message.Msg {
+    return switch (pointer.button) {
+        .left => .{ .mouse_diff_press = pointer.point },
+        .wheel_up => .mouse_diff_wheel_up,
+        .wheel_down => .mouse_diff_wheel_down,
+        .wheel_left => .mouse_diff_wheel_left,
+        .wheel_right => .mouse_diff_wheel_right,
+    };
 }
 
 fn sharedMessageMayChangeFindingCardBasis(msg: diff_surface.message.Msg) bool {

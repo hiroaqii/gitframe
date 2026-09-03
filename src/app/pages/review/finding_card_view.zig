@@ -8,6 +8,32 @@ const finding_card = @import("../../../ai_review/finding_card.zig");
 const diff_render = @import("../../../diff/render.zig");
 const review_page = @import("../review.zig");
 
+pub const footer_text = "s: next  Enter: close  j/k: scroll  y: copy  Esc/q: back";
+const footer_copy_text = "y: copy";
+
+pub const CellRange = struct {
+    start: u16,
+    end: u16,
+
+    pub fn contains(self: CellRange, col: u16) bool {
+        return col >= self.start and col < self.end;
+    }
+};
+
+/// Exact fully-painted copy label in whole-card coordinates. Returning null
+/// when the right edge is clipped keeps paint and pointer admission identical.
+pub fn footerCopyTarget(row_width: u16) ?CellRange {
+    const content_width = review_page.findingCardContentWidth(row_width);
+    const byte_start = std.mem.indexOf(u8, footer_text, footer_copy_text) orelse unreachable;
+    const local_start = chasen.text.displayWidth(footer_text[0..byte_start]);
+    const target_width = chasen.text.displayWidth(footer_copy_text);
+    if (local_start + target_width > content_width) return null;
+    return .{
+        .start = 1 + local_start,
+        .end = 1 + local_start + target_width,
+    };
+}
+
 pub const Painter = struct {
     page: *const review_page.ReviewPageState,
     row_plan: *const finding_card.RowPlan,
@@ -63,7 +89,7 @@ pub const Painter = struct {
                 &content_line,
                 0,
                 0,
-                "s: next  Enter: close  j/k: scroll  y: copy  Esc/q: back",
+                footer_text,
                 .{ .fg = self.palette.color(.accent), .bg = background, .dim = !focused },
             );
         }
@@ -152,4 +178,16 @@ fn drawWrappedLogicalRow(surface: *chasen.Surface, text: []const u8, target_row:
 test "Review inline Finding wrapped rows are unicode and newline aware" {
     try std.testing.expectEqual(@as(usize, 3), wrappedLineCount("ab\n猫猫", 2));
     try std.testing.expectEqual(@as(usize, 2), wrappedLineCount("abcd", 2));
+}
+
+test "Finding pointer copy target follows the fully visible card footer" {
+    const wide = footerCopyTarget(80).?;
+    const content_start: usize = wide.start - 1;
+    const content_end: usize = wide.end - 1;
+    try std.testing.expectEqualStrings(footer_copy_text, footer_text[content_start..content_end]);
+    try std.testing.expect(wide.contains(wide.start));
+    try std.testing.expect(wide.contains(wide.end - 1));
+    try std.testing.expect(!wide.contains(wide.end));
+    try std.testing.expect(footerCopyTarget(wide.end - 1) == null);
+    try std.testing.expectEqualDeep(wide, footerCopyTarget(wide.end).?);
 }

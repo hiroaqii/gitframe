@@ -27,6 +27,7 @@ const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const review_page = @import("../review.zig");
 const review_coordinator = @import("coordinator.zig");
+const finding_card_view = @import("finding_card_view.zig");
 const review_input = @import("input.zig");
 const review_navigation = @import("navigation.zig");
 const review_view = @import("view.zig");
@@ -1922,7 +1923,370 @@ const FindingNavigationHarness = struct {
         } });
         outcome.deinit(allocator);
     }
+
+    fn pointer(
+        self: *FindingNavigationHarness,
+        allocator: std.mem.Allocator,
+        layout: diff_surface.Layout,
+        point: diff_surface.MousePoint,
+        button: review_input.FindingPointerEvent.Button,
+    ) !review_coordinator.UpdateOutcome {
+        var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+        return self.controller(layout).update(&ctx, .{ .finding_pointer = .{
+            .point = point,
+            .button = button,
+        } });
+    }
 };
+
+fn findingPointerPoint(
+    harness: *FindingNavigationHarness,
+    layout: diff_surface.Layout,
+    presentation_offset: usize,
+    local_col: u16,
+) !diff_surface.MousePoint {
+    const view = harness.controller(layout).navigationView().view();
+    const raw = view.rawDiffPaneGeometry() orelse return error.ExpectedDiffPane;
+    const scroll = harness.page_state.viewer.diff_scroll;
+    if (presentation_offset < scroll) return error.ExpectedVisiblePresentationRow;
+    const visible_row = presentation_offset - scroll;
+    if (visible_row >= view.diffVisibleRows()) return error.ExpectedVisiblePresentationRow;
+    return .{
+        .col = raw.col + (raw.width - view.diffPaneWidth()) + local_col,
+        .row = diff_render.body_start_row + @as(u16, @intCast(visible_row)),
+    };
+}
+
+fn findingPointerBlock(
+    rows: diff_render.PresentationRows,
+    kind: enum { card, spacer },
+    token: usize,
+) ?diff_render.InlineBlock {
+    for (rows.blocks) |block| switch (block.kind) {
+        .card => |candidate| if (kind == .card and candidate == token) return block,
+        .spacer => if (kind == .spacer) return block,
+    };
+    return null;
+}
+
+test "Finding pointer routes exact card cells with one semantic command" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 12 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    harness.page_state.viewer.sidebar_hidden = true;
+
+    const projection = &harness.page_state.pinnedAiConst().?.selection.finding_projection;
+    const model = finding_card.FindingCardModel.init(projection, projection.files[0].mapped_entry_indices[0]).?;
+    var collapsed = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const card_index = collapsed.row_plan.cardIndex(model).?;
+    const card_start = collapsed.presentation_rows.cardStart(card_index).?;
+    harness.page_state.viewer.diff_scroll = @min(
+        card_start,
+        collapsed.presentation_rows.total_rows -| harness.controller(layout).navigationView().view().diffVisibleRows(),
+    );
+    const header = try findingPointerPoint(&harness, layout, card_start, 5);
+    var collapsed_view = harness.controller(layout).navigationView().withPresentationRows(&collapsed.presentation_rows);
+    var collapsed_resolver = collapsed_view.resolver();
+    try std.testing.expectEqualDeep(
+        diff_surface.navigation.PresentationCellHit{ .card = .{
+            .token = card_index,
+            .local_row = 0,
+            .local_col = 5,
+        } },
+        collapsed_view.bodyView(&collapsed_resolver).presentationCellHit(header).?,
+    );
+    collapsed.deinit(allocator);
+
+    var focus = try harness.pointer(allocator, layout, header, .left);
+    defer focus.deinit(allocator);
+    try std.testing.expect(harness.page_state.finding_card.matches(model));
+    try std.testing.expect(!harness.page_state.finding_card.expanded(model));
+    try std.testing.expectEqual(diff_surface.Focus.diff, harness.page_state.viewer.focus);
+    try std.testing.expect(!harness.page_state.selection_owner.activeMouseSelection());
+
+    var focused_frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const focused_start = focused_frame.presentation_rows.cardStart(card_index).?;
+    const focused_header = try findingPointerPoint(&harness, layout, focused_start, 5);
+    focused_frame.deinit(allocator);
+    var expand = try harness.pointer(allocator, layout, focused_header, .left);
+    defer expand.deinit(allocator);
+    try std.testing.expect(harness.page_state.finding_card.expanded(model));
+
+    var expanded = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const expanded_start = expanded.presentation_rows.cardStart(card_index).?;
+    const body_point = try findingPointerPoint(&harness, layout, expanded_start + 1, 8);
+    var expanded_view = harness.controller(layout).navigationView().withPresentationRows(&expanded.presentation_rows);
+    var expanded_resolver = expanded_view.resolver();
+    try std.testing.expectEqualDeep(
+        diff_surface.navigation.PresentationCellHit{ .card = .{
+            .token = card_index,
+            .local_row = 1,
+            .local_col = 8,
+        } },
+        expanded_view.bodyView(&expanded_resolver).presentationCellHit(body_point).?,
+    );
+    expanded.deinit(allocator);
+
+    const viewport_before_body_scroll = harness.page_state.viewer.diff_scroll;
+    const content = harness.page_state.contentForFindingCard(model).?;
+    const max_body_scroll = try review_page.findingCardMaxBodyScroll(
+        allocator,
+        content,
+        review_page.findingCardContentWidth(harness.controller(layout).navigationView().view().diffPaneWidth()),
+    );
+    try std.testing.expect(max_body_scroll > 0);
+    for (0..max_body_scroll + 2) |_| {
+        var wheel = try harness.pointer(allocator, layout, body_point, .wheel_down);
+        wheel.deinit(allocator);
+    }
+    try std.testing.expectEqual(max_body_scroll, harness.page_state.finding_card.bodyScroll(model));
+    try std.testing.expectEqual(viewport_before_body_scroll, harness.page_state.viewer.diff_scroll);
+    const card_before_horizontal = harness.page_state.finding_card;
+    var horizontal = try harness.pointer(allocator, layout, body_point, .wheel_right);
+    horizontal.deinit(allocator);
+    try std.testing.expectEqualDeep(card_before_horizontal, harness.page_state.finding_card);
+    try std.testing.expectEqual(viewport_before_body_scroll, harness.page_state.viewer.diff_scroll);
+
+    var footer_frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const footer_start = footer_frame.presentation_rows.cardStart(card_index).?;
+    const footer_target = finding_card_view.footerCopyTarget(harness.controller(layout).navigationView().view().diffPaneWidth()).?;
+    const footer_point = try findingPointerPoint(
+        &harness,
+        layout,
+        footer_start + finding_card.expanded_rows - 1,
+        footer_target.start,
+    );
+    footer_frame.deinit(allocator);
+    var copy = try harness.pointer(allocator, layout, footer_point, .left);
+    defer copy.deinit(allocator);
+    try std.testing.expectEqualStrings("Finding", copy.clipboard.?.label);
+    try std.testing.expectEqualStrings(
+        "alpha context\n\nfirst context line\nsecond context line\nthird context line\nfourth context line\nfifth context line\nsixth context line\nseventh context line",
+        copy.clipboard.?.text,
+    );
+    const no_copy_point = try findingPointerPoint(
+        &harness,
+        layout,
+        footer_start + finding_card.expanded_rows - 1,
+        footer_target.start - 1,
+    );
+    var no_copy = try harness.pointer(allocator, layout, no_copy_point, .left);
+    defer no_copy.deinit(allocator);
+    try std.testing.expect(no_copy.clipboard == null);
+
+    const collapse_header = try findingPointerPoint(&harness, layout, footer_start, 5);
+    var collapse = try harness.pointer(allocator, layout, collapse_header, .left);
+    collapse.deinit(allocator);
+    try std.testing.expect(!harness.page_state.finding_card.expanded(model));
+    var collapsed_again = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const collapsed_again_start = collapsed_again.presentation_rows.cardStart(card_index).?;
+    const collapsed_again_point = try findingPointerPoint(&harness, layout, collapsed_again_start, 5);
+    const viewport_before_collapsed = harness.page_state.viewer.diff_scroll;
+    const viewport_max = collapsed_again.presentation_rows.total_rows -| harness.controller(layout).navigationView().view().diffVisibleRows();
+    const collapsed_button: review_input.FindingPointerEvent.Button = if (viewport_before_collapsed < viewport_max) .wheel_down else .wheel_up;
+    const expected_collapsed_scroll = if (collapsed_button == .wheel_down)
+        @min(viewport_before_collapsed + 1, viewport_max)
+    else
+        viewport_before_collapsed -| 1;
+    collapsed_again.deinit(allocator);
+    var collapsed_wheel = try harness.pointer(allocator, layout, collapsed_again_point, collapsed_button);
+    collapsed_wheel.deinit(allocator);
+    try std.testing.expectEqual(expected_collapsed_scroll, harness.page_state.viewer.diff_scroll);
+    try std.testing.expect(!harness.page_state.finding_card.expanded(model));
+
+    var spacer_frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const spacer = findingPointerBlock(spacer_frame.presentation_rows, .spacer, 0).?;
+    harness.page_state.viewer.diff_scroll = @min(
+        spacer.presentation_start,
+        spacer_frame.presentation_rows.total_rows -| harness.controller(layout).navigationView().view().diffVisibleRows(),
+    );
+    const spacer_point = try findingPointerPoint(&harness, layout, spacer.presentation_start, 7);
+    const spacer_scroll_before = harness.page_state.viewer.diff_scroll;
+    const spacer_max = spacer_frame.presentation_rows.total_rows -| harness.controller(layout).navigationView().view().diffVisibleRows();
+    const spacer_button: review_input.FindingPointerEvent.Button = if (spacer_scroll_before < spacer_max) .wheel_down else .wheel_up;
+    const expected_spacer_scroll = if (spacer_button == .wheel_down)
+        @min(spacer_scroll_before + 1, spacer_max)
+    else
+        spacer_scroll_before -| 1;
+    var spacer_view = harness.controller(layout).navigationView().withPresentationRows(&spacer_frame.presentation_rows);
+    var spacer_resolver = spacer_view.resolver();
+    try std.testing.expectEqualDeep(
+        diff_surface.navigation.PresentationCellHit{ .spacer = .{ .local_col = 7 } },
+        spacer_view.bodyView(&spacer_resolver).presentationCellHit(spacer_point).?,
+    );
+    spacer_frame.deinit(allocator);
+    const spacer_viewer_before = harness.page_state.viewer;
+    const spacer_card_before = harness.page_state.finding_card;
+    var spacer_press = try harness.pointer(allocator, layout, spacer_point, .left);
+    spacer_press.deinit(allocator);
+    var spacer_horizontal = try harness.pointer(allocator, layout, spacer_point, .wheel_left);
+    spacer_horizontal.deinit(allocator);
+    try std.testing.expectEqualDeep(spacer_viewer_before, harness.page_state.viewer);
+    try std.testing.expectEqualDeep(spacer_card_before, harness.page_state.finding_card);
+    try std.testing.expect(harness.page_state.selection_owner == .none);
+
+    var spacer_wheel = try harness.pointer(allocator, layout, spacer_point, spacer_button);
+    spacer_wheel.deinit(allocator);
+    try std.testing.expectEqual(expected_spacer_scroll, harness.page_state.viewer.diff_scroll);
+
+    var shared_frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const shared_source_offset = shared_frame.presentation_rows.blocks[0].after_source_offset;
+    const shared_source_presentation = shared_frame.presentation_rows.sourceToPresentation(shared_source_offset).?;
+    const shared_max = shared_frame.presentation_rows.total_rows -| harness.controller(layout).navigationView().view().diffVisibleRows();
+    harness.page_state.viewer.diff_scroll = @min(
+        shared_source_presentation,
+        shared_max,
+    );
+    const shared_source_point = try findingPointerPoint(&harness, layout, shared_source_presentation, 12);
+    var shared_view = harness.controller(layout).navigationView().withPresentationRows(&shared_frame.presentation_rows);
+    var shared_resolver = shared_view.resolver();
+    try std.testing.expectEqualDeep(
+        diff_surface.navigation.PresentationCellHit{ .source = .{
+            .source_offset = shared_source_offset,
+            .local_col = 12,
+        } },
+        shared_view.bodyView(&shared_resolver).presentationCellHit(shared_source_point).?,
+    );
+    shared_frame.deinit(allocator);
+    const source_scroll_before = harness.page_state.viewer.diff_scroll;
+    const source_button: review_input.FindingPointerEvent.Button = if (source_scroll_before < shared_max) .wheel_down else .wheel_up;
+    const expected_source_scroll = if (source_button == .wheel_down)
+        @min(source_scroll_before + 1, shared_max)
+    else
+        source_scroll_before -| 1;
+    var source_wheel = try harness.pointer(allocator, layout, shared_source_point, source_button);
+    source_wheel.deinit(allocator);
+    try std.testing.expectEqual(expected_source_scroll, harness.page_state.viewer.diff_scroll);
+
+    harness.page_state.viewer.diff_scroll = @min(@as(usize, 1), shared_max);
+    const header_scroll_before = harness.page_state.viewer.diff_scroll;
+    const header_button: review_input.FindingPointerEvent.Button = if (header_scroll_before > 0) .wheel_up else .wheel_down;
+    const expected_header_scroll = if (header_button == .wheel_down)
+        @min(header_scroll_before + 1, shared_max)
+    else
+        header_scroll_before -| 1;
+    const header_point: diff_surface.MousePoint = .{ .col = 12, .row = 0 };
+    var header_wheel = try harness.pointer(allocator, layout, header_point, header_button);
+    header_wheel.deinit(allocator);
+    try std.testing.expectEqual(expected_header_scroll, harness.page_state.viewer.diff_scroll);
+}
+
+test "Finding pointer isolates card selection lifecycle and allocation failures" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 12 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    harness.page_state.viewer.sidebar_hidden = true;
+    const projection = &harness.page_state.pinnedAiConst().?.selection.finding_projection;
+    const model = finding_card.FindingCardModel.init(projection, projection.files[0].mapped_entry_indices[0]).?;
+    _ = harness.page_state.finding_card.apply(.{ .focus = model });
+    _ = harness.page_state.finding_card.apply(.toggle);
+
+    var frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const card_index = frame.row_plan.cardIndex(model).?;
+    const card = findingPointerBlock(frame.presentation_rows, .card, card_index).?;
+    harness.page_state.viewer.diff_scroll = @min(
+        card.presentation_start,
+        frame.presentation_rows.total_rows -| harness.controller(layout).navigationView().view().diffVisibleRows(),
+    );
+    const card_body = try findingPointerPoint(&harness, layout, card.presentation_start + 1, 12);
+    var card_press = try harness.pointer(allocator, layout, card_body, .left);
+    card_press.deinit(allocator);
+    try std.testing.expect(harness.page_state.selection_owner == .none);
+    try std.testing.expect(harness.page_state.finding_card.expanded(model));
+
+    const source_presentation = frame.presentation_rows.sourceToPresentation(card.after_source_offset).?;
+    harness.page_state.viewer.diff_scroll = source_presentation;
+    const source_point = try findingPointerPoint(&harness, layout, source_presentation, 12);
+    const crossing_card = try findingPointerPoint(&harness, layout, card.presentation_start, 12);
+    frame.deinit(allocator);
+    var source_press = try harness.pointer(allocator, layout, source_point, .left);
+    source_press.deinit(allocator);
+    try std.testing.expect(harness.page_state.selection_owner.activeMouseSelection());
+    const selection_before_crossing = harness.page_state.selection_owner;
+    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var drag = try harness.controller(layout).update(&ctx, .{ .shared = .{ .mouse_diff_drag = crossing_card } });
+    drag.deinit(allocator);
+    try std.testing.expectEqualDeep(selection_before_crossing, harness.page_state.selection_owner);
+    try std.testing.expect(harness.page_state.finding_card.expanded(model));
+    var release = try harness.controller(layout).update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
+    release.deinit(allocator);
+    try std.testing.expect(!harness.page_state.selection_owner.activeMouseSelection());
+    try std.testing.expect(harness.page_state.finding_card.expanded(model));
+
+    const owner_after_release = harness.page_state.selection_owner;
+    var orphan_drag = try harness.controller(layout).update(&ctx, .{ .shared = .{ .mouse_diff_drag = crossing_card } });
+    orphan_drag.deinit(allocator);
+    try std.testing.expectEqualDeep(owner_after_release, harness.page_state.selection_owner);
+    var orphan_release = try harness.controller(layout).update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
+    orphan_release.deinit(allocator);
+    try std.testing.expect(!harness.page_state.selection_owner.activeMouseSelection());
+
+    var first_success: ?usize = null;
+    for (0..32) |fail_index| {
+        var failing_harness = try FindingNavigationHarness.init(allocator, true);
+        defer failing_harness.deinit(allocator);
+        failing_harness.page_state.viewer.sidebar_hidden = true;
+        var success_frame = (try failing_harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+        const success_start = success_frame.presentation_rows.cardStart(0).?;
+        failing_harness.page_state.viewer.diff_scroll = @min(
+            success_start,
+            success_frame.presentation_rows.total_rows -| failing_harness.controller(layout).navigationView().view().diffVisibleRows(),
+        );
+        const failure_point = try findingPointerPoint(&failing_harness, layout, success_start, 5);
+        success_frame.deinit(allocator);
+        const viewer_before = failing_harness.page_state.viewer;
+        const card_before = failing_harness.page_state.finding_card;
+        const owner_before = failing_harness.page_state.selection_owner;
+        const revision_before = failing_harness.page_state.selection_layout_revision;
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var failing_outcome = try failing_harness.pointer(failing.allocator(), layout, failure_point, .left);
+        failing_outcome.deinit(failing.allocator());
+        if (!failing.has_induced_failure) {
+            first_success = fail_index;
+            try std.testing.expect(failing_harness.page_state.finding_card.isFocused());
+            break;
+        }
+        try std.testing.expectEqualStrings("Could not resolve Finding pointer", failing_harness.page_state.status.text());
+        try std.testing.expectEqualDeep(viewer_before, failing_harness.page_state.viewer);
+        try std.testing.expectEqualDeep(card_before, failing_harness.page_state.finding_card);
+        try std.testing.expectEqualDeep(owner_before, failing_harness.page_state.selection_owner);
+        try std.testing.expectEqual(revision_before, failing_harness.page_state.selection_layout_revision);
+    }
+    try std.testing.expect(first_success != null);
+
+    var first_shared_success: ?usize = null;
+    for (0..64) |fail_index| {
+        var failing_harness = try FindingNavigationHarness.init(allocator, true);
+        defer failing_harness.deinit(allocator);
+        failing_harness.page_state.viewer.sidebar_hidden = true;
+        var success_frame = (try failing_harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+        const source_offset = success_frame.presentation_rows.blocks[0].after_source_offset;
+        const shared_source_presentation = success_frame.presentation_rows.sourceToPresentation(source_offset).?;
+        failing_harness.page_state.viewer.diff_scroll = shared_source_presentation;
+        const failure_point = try findingPointerPoint(&failing_harness, layout, shared_source_presentation, 12);
+        success_frame.deinit(allocator);
+        const viewer_before = failing_harness.page_state.viewer;
+        const card_before = failing_harness.page_state.finding_card;
+        const owner_before = failing_harness.page_state.selection_owner;
+        const revision_before = failing_harness.page_state.selection_layout_revision;
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var failing_outcome = try failing_harness.pointer(failing.allocator(), layout, failure_point, .left);
+        failing_outcome.deinit(failing.allocator());
+        if (!failing.has_induced_failure) {
+            first_shared_success = fail_index;
+            try std.testing.expect(failing_harness.page_state.selection_owner.activeMouseSelection());
+            break;
+        }
+        try std.testing.expectEqualStrings("Could not resolve Finding pointer", failing_harness.page_state.status.text());
+        try std.testing.expectEqualDeep(viewer_before, failing_harness.page_state.viewer);
+        try std.testing.expectEqualDeep(card_before, failing_harness.page_state.finding_card);
+        try std.testing.expectEqualDeep(owner_before, failing_harness.page_state.selection_owner);
+        try std.testing.expectEqual(revision_before, failing_harness.page_state.selection_layout_revision);
+    }
+    try std.testing.expect(first_shared_success != null);
+}
 
 fn findingNavigationPinnedBundle(
     allocator: std.mem.Allocator,
@@ -1938,7 +2302,7 @@ fn findingNavigationPinnedBundle(
             .anchor = .{ .path_bytes = "src/alpha/a.zig", .side = .after, .start_line = 1, .end_line = 1, .content_digest = committed_review.Sha256Digest.hash("context-one\n") },
             .severity = .info,
             .title = "alpha context",
-            .body = "first context line",
+            .body = "first context line\nsecond context line\nthird context line\nfourth context line\nfifth context line\nsixth context line\nseventh context line",
         },
         .{
             .finding_id = .{ .bytes = "alpha-removed" },

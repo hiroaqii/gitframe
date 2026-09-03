@@ -39,6 +39,7 @@ pub const Msg = union(enum) {
     human_review_decision: human_review_decision.Msg,
     finding_navigation: FindingNavigationIntent,
     finding_card: FindingCardMsg,
+    finding_pointer: FindingPointerEvent,
 };
 
 pub const FindingNavigationIntent = struct {
@@ -57,6 +58,22 @@ pub const FindingCardMsg = enum {
     copy,
     leave,
     owned_noop,
+};
+
+/// One synchronous Review diff-pane pointer sample. The shell preserves the
+/// body point and physical button until the current Finding presentation can
+/// classify the painted cell; no pointer value is retained by page state.
+pub const FindingPointerEvent = struct {
+    point: diff_surface.MousePoint,
+    button: Button,
+
+    pub const Button = enum {
+        left,
+        wheel_up,
+        wheel_down,
+        wheel_left,
+        wheel_right,
+    };
 };
 
 pub const Context = struct {

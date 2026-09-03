@@ -64,6 +64,16 @@ pub const ParsedMouseLine = struct {
     region: SelectionRegion,
 };
 
+/// One cell in the painted diff-body presentation. `local_col` is relative
+/// to the exact surface passed to the source renderer or inline-row painter,
+/// after the shared search-marker gutter. Page adapters may interpret card
+/// tokens, but the shared surface remains the only geometry authority.
+pub const PresentationCellHit = union(enum) {
+    source: struct { source_offset: usize, local_col: u16 },
+    card: struct { token: usize, local_row: usize, local_col: u16 },
+    spacer: struct { local_col: u16 },
+};
+
 pub const KeyboardLineHit = struct {
     source_offset: usize,
     hit: diff_surface.DiffMouseHit,
@@ -561,6 +571,43 @@ pub const BodyView = struct {
         return self.diffMouseHitLocked(point, null);
     }
 
+    pub fn presentationCellHit(self: BodyView, point: diff_surface.MousePoint) ?PresentationCellHit {
+        const raw_diff = self.view.rawDiffPaneGeometry() orelse return null;
+        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
+        if (point.row < diff_render.body_start_row) return null;
+
+        const raw_local_col = point.col - raw_diff.col;
+        const content_width = contentWidth(raw_diff.width);
+        const content_gutter = raw_diff.width - content_width;
+        if (raw_local_col < content_gutter) return null;
+        const local_col = raw_local_col - content_gutter;
+        if (local_col >= content_width) return null;
+
+        const visible_body_row: usize = point.row - diff_render.body_start_row;
+        if (visible_body_row >= self.view.diffVisibleRows()) return null;
+        const presentation_offset = self.view.surface.viewer.diff_scroll + visible_body_row;
+        const source_rows = self.sourceDiffLineCount();
+        const hit: diff_render.PresentationHit = if (self.view.presentation_rows) |rows| blk: {
+            if (rows.source_rows != source_rows) return null;
+            break :blk rows.hitAtPresentation(presentation_offset) orelse return null;
+        } else blk: {
+            if (presentation_offset >= source_rows) return null;
+            break :blk .{ .source = presentation_offset };
+        };
+        return switch (hit) {
+            .source => |source_offset| .{ .source = .{
+                .source_offset = source_offset,
+                .local_col = local_col,
+            } },
+            .card => |card| .{ .card = .{
+                .token = card.token,
+                .local_row = card.local_row,
+                .local_col = local_col,
+            } },
+            .spacer => .{ .spacer = .{ .local_col = local_col } },
+        };
+    }
+
     /// Resolve one line-wise endpoint from semantic body presentation without
     /// terminal coordinates. Presentation-only rows and opposite-side holes
     /// never become endpoints.
@@ -770,23 +817,15 @@ pub const BodyView = struct {
     }
 
     fn diffMouseHitLocked(self: BodyView, point: diff_surface.MousePoint, locked: ?diff_selection.DragSelection) ?diff_surface.DiffMouseHit {
-        const raw_diff = self.view.rawDiffPaneGeometry() orelse return null;
-        if (point.col < raw_diff.col or point.col >= raw_diff.col + raw_diff.width) return null;
-        if (point.row < diff_render.body_start_row) return null;
-
-        const local_col = point.col - raw_diff.col;
-        const content_width = contentWidth(raw_diff.width);
-        const content_gutter = raw_diff.width - content_width;
-        if (local_col < content_gutter) return null;
-        const render_col = local_col - content_gutter;
-        if (render_col >= content_width or render_col < diff_render.cursor_gutter_width) return null;
-
-        const body_col = render_col - diff_render.cursor_gutter_width;
-        const visible_body_row: usize = point.row - diff_render.body_start_row;
-        if (visible_body_row >= self.view.diffVisibleRows()) return null;
-        const presentation_offset = self.view.surface.viewer.diff_scroll + visible_body_row;
-        const offset = self.presentationToSourceOffset(presentation_offset) orelse return null;
-        const body_width = diff_render.bodyWidth(content_width);
+        const cell = self.presentationCellHit(point) orelse return null;
+        const source = switch (cell) {
+            .source => |value| value,
+            .card, .spacer => return null,
+        };
+        if (source.local_col < diff_render.cursor_gutter_width) return null;
+        const body_col = source.local_col - diff_render.cursor_gutter_width;
+        const body_width = diff_render.bodyWidth(self.view.diffPaneWidth());
+        const offset = source.source_offset;
         const display_mode = diff_render.effectiveMode(body_width, self.view.surface.viewer.display_mode);
 
         if (self.parsedSelectionTarget(if (locked) |selection_value| selection_value.identity else null)) |target| {

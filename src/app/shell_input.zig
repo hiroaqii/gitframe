@@ -237,12 +237,38 @@ pub const View = struct {
             return switch (mouse.button) {
                 .left => switch (pane) {
                     .sidebar => .{ .review = .{ .shared = self.reviewSidebarClickToMsg(mouse) } },
-                    .diff => .{ .review = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } },
+                    .diff => if (self.review.key.pinned_ai)
+                        .{ .review = .{ .finding_pointer = .{
+                            .point = self.bodyMousePoint(mouse) orelse return null,
+                            .button = .left,
+                        } } }
+                    else
+                        .{ .review = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } },
                 },
-                .wheel_up => .{ .review = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_up else .mouse_diff_wheel_up } },
-                .wheel_down => .{ .review = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_down else .mouse_diff_wheel_down } },
-                .wheel_left => if (pane == .diff) .{ .review = .{ .shared = .mouse_diff_wheel_left } } else null,
-                .wheel_right => if (pane == .diff) .{ .review = .{ .shared = .mouse_diff_wheel_right } } else null,
+                .wheel_up => if (pane == .sidebar)
+                    .{ .review = .{ .shared = .mouse_sidebar_wheel_up } }
+                else if (self.review.key.pinned_ai)
+                    .{ .review = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_up } } }
+                else
+                    .{ .review = .{ .shared = .mouse_diff_wheel_up } },
+                .wheel_down => if (pane == .sidebar)
+                    .{ .review = .{ .shared = .mouse_sidebar_wheel_down } }
+                else if (self.review.key.pinned_ai)
+                    .{ .review = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_down } } }
+                else
+                    .{ .review = .{ .shared = .mouse_diff_wheel_down } },
+                .wheel_left => if (pane != .diff)
+                    null
+                else if (self.review.key.pinned_ai)
+                    .{ .review = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_left } } }
+                else
+                    .{ .review = .{ .shared = .mouse_diff_wheel_left } },
+                .wheel_right => if (pane != .diff)
+                    null
+                else if (self.review.key.pinned_ai)
+                    .{ .review = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_right } } }
+                else
+                    .{ .review = .{ .shared = .mouse_diff_wheel_right } },
                 else => null,
             };
         }
@@ -471,4 +497,98 @@ test "human review result modal blocks mouse routing while Repository Help scrol
         .mods = .{},
         .type = .press,
     } }) == null);
+}
+
+test "Finding pointer shell preserves the Review body point and button once" {
+    var overlay: app_state.OverlayState = .{};
+    var selection_owner: diff_selection.Owner = .none;
+    var repository_state: repository_page.RepositoryPageState = .{};
+    var loaded: loaded_diff.LoadedDiff = undefined;
+    const layout = app_shell_layout.compute(.{ .width = 80, .height = 24 }, .{ .page_bar_visible = true });
+    const view: View = .{
+        .active_page = .review,
+        .changes = .{
+            .key = .{},
+            .selection_owner = &selection_owner,
+            .loaded = null,
+            .selected_node = 0,
+            .sidebar_hidden = false,
+            .sidebar_width = null,
+        },
+        .review = .{
+            .key = .{ .pinned_ai = true },
+            .selection_owner = &selection_owner,
+            .loaded = &loaded,
+            .selected_node = 0,
+            .sidebar_hidden = true,
+            .sidebar_width = null,
+        },
+        .repository = .{ .key = .{}, .page_state = &repository_state },
+        .commit_panel_mode = false,
+        .repo_picker_mode = false,
+        .repo_picker_input_mode = .list,
+        .keymap = .{},
+        .overlay = &overlay,
+        .layout = layout,
+    };
+    const point: MousePoint = .{ .col = 10, .row = 5 };
+    const terminal_col: i16 = @intCast(layout.body.col + point.col);
+    const terminal_row: i16 = @intCast(layout.body.row + point.row);
+    const cases = [_]struct {
+        event: chasen.Event,
+        review: @import("pages/review/input.zig").FindingPointerEvent.Button,
+    }{
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .left, .mods = .{}, .type = .press } }, .review = .left },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_up, .mods = .{}, .type = .press } }, .review = .wheel_up },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_down, .mods = .{}, .type = .press } }, .review = .wheel_down },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_left, .mods = .{}, .type = .press } }, .review = .wheel_left },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_right, .mods = .{}, .type = .press } }, .review = .wheel_right },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            app_message.Msg{ .review = .{ .finding_pointer = .{ .point = point, .button = case.review } } },
+            view.handleEvent(case.event).?,
+        );
+    }
+
+    try std.testing.expect(view.handleEvent(.{ .mouse = .{
+        .col = terminal_col,
+        .row = terminal_row,
+        .button = .left,
+        .mods = .{},
+        .type = .drag,
+    } }) == null);
+    try std.testing.expect(view.handleEvent(.{ .mouse = .{
+        .col = terminal_col,
+        .row = terminal_row,
+        .button = .left,
+        .mods = .{},
+        .type = .release,
+    } }) == null);
+
+    var sidebar_view = view;
+    sidebar_view.review.sidebar_hidden = false;
+    try std.testing.expectEqual(
+        app_message.Msg{ .review = .{ .shared = .mouse_sidebar_wheel_down } },
+        sidebar_view.handleEvent(.{ .mouse = .{
+            .col = @intCast(layout.body.col + 1),
+            .row = @intCast(layout.body.row + 5),
+            .button = .wheel_down,
+            .mods = .{},
+            .type = .press,
+        } }).?,
+    );
+
+    var normal_view = view;
+    normal_view.review.key.pinned_ai = false;
+    try std.testing.expectEqual(
+        app_message.Msg{ .review = .{ .shared = .{ .mouse_diff_press = point } } },
+        normal_view.handleEvent(.{ .mouse = .{
+            .col = terminal_col,
+            .row = terminal_row,
+            .button = .left,
+            .mods = .{},
+            .type = .press,
+        } }).?,
+    );
 }
