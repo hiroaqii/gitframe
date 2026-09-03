@@ -186,6 +186,7 @@ pub fn view(app: Context, surface: *chasen.Surface) !void {
         .context = navigation_context,
         .palette = app.palette,
         .mode_toggle_key = displayModeToggleKey(app, mode_key_buffer[0..]),
+        .human_review = matchingHumanReviewPresentation(app),
     };
     var finding_annotation_adapter: FindingAnnotationAdapter = undefined;
     const finding_annotation_resolver: ?diff_surface.view.FindingAnnotationResolver = if (activeFindingProjection(app.page)) |projection| blk: {
@@ -904,6 +905,7 @@ const DiffPaneAdapter = struct {
     context: review_navigation.View,
     palette: theme.Palette,
     mode_toggle_key: ?[]const u8,
+    human_review: ?human_review_session.Presentation,
 
     fn interface(self: *DiffPaneAdapter) diff_surface.view.DiffPaneRenderer {
         return .{ .ctx = self, .render_fn = render };
@@ -923,6 +925,7 @@ const DiffPaneAdapter = struct {
                 .page = self.context.page,
                 .row_plan = &value.row_plan,
                 .palette = self.palette,
+                .human_review = self.human_review,
             };
             break :blk card_painter.interface();
         } else null;

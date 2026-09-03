@@ -1103,6 +1103,7 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
         expected_store: review_store.StoreSnapshot,
         review_id: committed_review.ReviewId,
         expected_artifacts: review_store.ArtifactSnapshot,
+        direct: bool,
 
         pub fn init(
             identity: page.RequestIdentity,
@@ -1113,6 +1114,7 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
             expected_store: review_store.StoreSnapshot,
             review_id: committed_review.ReviewId,
             expected_artifacts: review_store.ArtifactSnapshot,
+            direct: bool,
             allocator: std.mem.Allocator,
         ) !@This() {
             var owned_store = try store.clone(allocator);
@@ -1128,6 +1130,7 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
                 .expected_store = expected_store,
                 .review_id = review_id,
                 .expected_artifacts = expected_artifacts,
+                .direct = direct,
             };
         }
 
@@ -1141,6 +1144,7 @@ pub fn ReviewHistorySelectionTask(comptime Msg: type) type {
                 task.expected_store,
                 task.review_id,
                 task.expected_artifacts,
+                task.direct,
             ));
         }
 
@@ -1187,8 +1191,9 @@ pub fn runReviewHistorySelection(
     expected_store: review_store.StoreSnapshot,
     review_id: committed_review.ReviewId,
     expected_artifacts: review_store.ArtifactSnapshot,
+    direct: bool,
 ) ReviewHistorySelectionTaskResult {
-    var selected = review_store.selectExact(
+    var selected = (if (direct) review_store.selectExactReload(
         allocator,
         io,
         configured_store,
@@ -1196,7 +1201,15 @@ pub fn runReviewHistorySelection(
         expected_store,
         review_id,
         expected_artifacts,
-    ) catch return .{ .failed_static = "Could not load AI review: out of memory" };
+    ) else review_store.selectExact(
+        allocator,
+        io,
+        configured_store,
+        repository,
+        expected_store,
+        review_id,
+        expected_artifacts,
+    )) catch return .{ .failed_static = "Could not load AI review: out of memory" };
     defer selected.deinit(allocator);
     switch (selected) {
         .failure => |failure| return .{ .selection_failed = failure },

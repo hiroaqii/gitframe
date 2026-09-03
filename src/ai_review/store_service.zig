@@ -354,6 +354,53 @@ pub fn selectExact(
     review_id: committed_review.ReviewId,
     expected_artifacts: ArtifactSnapshot,
 ) std.mem.Allocator.Error!SelectionResult {
+    return selectExactWithArtifactPolicy(
+        allocator,
+        io,
+        configured_store,
+        repository,
+        expected,
+        review_id,
+        expected_artifacts,
+        .strict,
+    );
+}
+
+/// Reload the same exact pinned Run after a known mutable-artifact drift.
+/// Store, repository, Run, manifest, and Findings identity remain pinned.
+pub fn selectExactReload(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    expected: StoreSnapshot,
+    review_id: committed_review.ReviewId,
+    expected_artifacts: ArtifactSnapshot,
+) std.mem.Allocator.Error!SelectionResult {
+    return selectExactWithArtifactPolicy(
+        allocator,
+        io,
+        configured_store,
+        repository,
+        expected,
+        review_id,
+        expected_artifacts,
+        .immutable,
+    );
+}
+
+const SelectionArtifactPolicy = enum { strict, immutable };
+
+fn selectExactWithArtifactPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    expected: StoreSnapshot,
+    review_id: committed_review.ReviewId,
+    expected_artifacts: ArtifactSnapshot,
+    artifact_policy: SelectionArtifactPolicy,
+) std.mem.Allocator.Error!SelectionResult {
     var owned_repository = repository.capability.duplicate() catch
         return .{ .failure = .repository_unavailable };
     defer owned_repository.deinit();
@@ -384,7 +431,7 @@ pub fn selectExact(
         locator,
         review_id,
         expected,
-        expected_artifacts,
+        if (artifact_policy == .strict) expected_artifacts else null,
     );
     defer exact_result.deinit(allocator);
     const exact = switch (exact_result) {
@@ -392,6 +439,11 @@ pub fn selectExact(
         .absent => return .{ .failure = .run_invalid },
         .failure => |failure| return .{ .failure = mapExactSelectionFailure(failure) },
     };
+    if (artifact_policy == .immutable and
+        !immutableArtifactIdentityEql(exact.artifact_snapshot, expected_artifacts))
+    {
+        return .{ .failure = .artifact_drift };
+    }
 
     const availability = try git_review.checkTargetAvailability(
         allocator,
@@ -454,6 +506,11 @@ pub fn selectExact(
         .projection = projection,
         .finding_projection = finding_index,
     } };
+}
+
+fn immutableArtifactIdentityEql(actual: ArtifactSnapshot, expected: ArtifactSnapshot) bool {
+    return actual.manifest_digest.eql(expected.manifest_digest) and
+        actual.findings_digest.eql(expected.findings_digest);
 }
 
 pub const ExpectedPublicationIdentity = struct {
@@ -1294,6 +1351,28 @@ fn loadSelectionCompatibility(
     return selectExact(allocator, io, &configured, repository, expected, review_id, expected_artifacts);
 }
 
+test "Finding disposition reload relaxes only mutable artifact identity" {
+    const original: ArtifactSnapshot = .{
+        .manifest_digest = committed_review.Sha256Digest.hash("manifest"),
+        .findings_digest = committed_review.Sha256Digest.hash("findings"),
+        .draft_state = .valid,
+        .draft_digest = committed_review.Sha256Digest.hash("draft-1"),
+        .result_digest = null,
+    };
+    var mutable_drift = original;
+    mutable_drift.draft_state = .absent;
+    mutable_drift.draft_digest = null;
+    mutable_drift.result_digest = committed_review.Sha256Digest.hash("result");
+    try std.testing.expect(immutableArtifactIdentityEql(mutable_drift, original));
+
+    var manifest_drift = mutable_drift;
+    manifest_drift.manifest_digest = committed_review.Sha256Digest.hash("changed manifest");
+    try std.testing.expect(!immutableArtifactIdentityEql(manifest_drift, original));
+    var findings_drift = mutable_drift;
+    findings_drift.findings_digest = committed_review.Sha256Digest.hash("changed findings");
+    try std.testing.expect(!immutableArtifactIdentityEql(findings_drift, original));
+}
+
 test "review history backend summary sorting ignores filesystem and completion time" {
     const older = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
     const first_tie = try committed_review.ReviewId.parse("123e4567-e89b-42d3-a456-426614174000");
@@ -1662,7 +1741,7 @@ fn testSummary(history: *const History, review_id: committed_review.ReviewId) !*
     return error.ExpectedReviewSummary;
 }
 
-test "AI Review Store application review history backend AI Reviews picker selection exact identity and no-scan behavior" {
+test "Finding disposition exact reload keeps AI Review Store selection identity and no-scan behavior" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2003,6 +2082,24 @@ test "AI Review Store application review history backend AI Reviews picker selec
     defer exact_drift.deinit(allocator);
     try std.testing.expect(exact_drift == .failure);
     try std.testing.expectEqual(SelectionFailure.artifact_drift, exact_drift.failure);
+
+    var reload_store = try ConfiguredStore.initConfigured(allocator, store_path_text);
+    defer reload_store.deinit(allocator);
+    var exact_reload = try selectExactReload(
+        allocator,
+        io,
+        &reload_store,
+        repository,
+        history.snapshot,
+        valid_id,
+        valid_row.artifact_snapshot,
+    );
+    defer exact_reload.deinit(allocator);
+    try std.testing.expect(exact_reload == .selected);
+    const reloaded_snapshot = run.ArtifactSnapshot.fromLoaded(&exact_reload.selected.artifacts);
+    try std.testing.expect(reloaded_snapshot.manifest_digest.eql(valid_row.artifact_snapshot.manifest_digest));
+    try std.testing.expect(reloaded_snapshot.findings_digest.eql(valid_row.artifact_snapshot.findings_digest));
+    try std.testing.expect(!reloaded_snapshot.eql(valid_row.artifact_snapshot));
 
     try writePrivate(io, valid_directory, "manifest.json", "{}\n");
     var invalid_artifact = try loadSelectionCompatibility(

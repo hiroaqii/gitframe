@@ -56,6 +56,7 @@ pub const ClipboardEffect = struct {
 pub const UpdateOutcome = struct {
     clipboard: ?ClipboardEffect = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    human_review_save: bool = false,
     human_review_finalize: ?committed_review.ReviewResultValue = null,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
@@ -73,6 +74,12 @@ pub const UpdateOutcome = struct {
         const decision = self.human_review_finalize;
         self.human_review_finalize = null;
         return decision;
+    }
+
+    pub fn takeHumanReviewSave(self: *UpdateOutcome) bool {
+        const requested = self.human_review_save;
+        self.human_review_save = false;
+        return requested;
     }
 };
 
@@ -188,7 +195,7 @@ pub const Controller = struct {
                 }
             },
             .finding_navigation => |intent| return self.updateFindingNavigation(ctx.allocator(), intent),
-            .finding_card => |card_msg| return try self.updateFindingCard(ctx.allocator(), card_msg),
+            .finding_card => |card_msg| return try self.updateFindingCard(ctx, card_msg),
             .finding_pointer => |pointer| return try self.updateFindingPointer(ctx, pointer),
         }
         return .{};
@@ -468,6 +475,10 @@ pub const Controller = struct {
             &self.page_state.activation,
             finished,
         )) return .skip;
+        const direct = switch (self.page_state.ai_reviews.phase) {
+            .selection_loading => |loading| loading.direct,
+            else => return .skip,
+        };
 
         switch (finished.result) {
             .loaded => |*bundle| {
@@ -488,7 +499,15 @@ pub const Controller = struct {
                     self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "Could not own AI review session");
                     return err;
                 };
-                var install = self.sessions.prepareInstall(&candidate) catch |err| {
+                const reload_current = if (self.sessions.currentSessionConst()) |current|
+                    direct and current.binding.eql(candidate.binding) and
+                        current.reconciliation == .reload_required
+                else
+                    false;
+                var install = (if (reload_current)
+                    self.sessions.prepareReload(&candidate)
+                else
+                    self.sessions.prepareInstall(&candidate)) catch |err| {
                     candidate.deinit();
                     self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "AI review has unsaved recovery state");
                     return err;
@@ -678,6 +697,7 @@ pub const Controller = struct {
             request.store,
             request.review_id,
             request.artifacts,
+            request.direct,
             ctx.allocator(),
         ) catch |err| {
             ctx.allocator().destroy(task);
@@ -830,10 +850,11 @@ pub const Controller = struct {
 
     fn updateFindingCard(
         self: Controller,
-        allocator: std.mem.Allocator,
+        ctx: *chasen.Ctx(app_message.Msg),
         msg: review_input.FindingCardMsg,
     ) !UpdateOutcome {
         if (msg == .owned_noop) return .{};
+        const allocator = ctx.allocator();
 
         const base_view = self.navigationView();
         var current_frame = (try base_view.buildFindingCardFrame(allocator)) orelse {
@@ -888,6 +909,57 @@ pub const Controller = struct {
                 if (next_state.apply(.copy) != .copy_requested) return .{};
                 const text = try findingCardCopyText(allocator, content);
                 return .{ .clipboard = self.ownedClipboard("Finding", text) };
+            },
+            .accept, .dismiss, .unreview => {
+                const model = focusedFindingCard(current_frame.row_plan, next_state) orelse return .{};
+                const presentation = self.currentHumanReviewPresentation() orelse {
+                    self.page_state.status.set("Finding disposition is unavailable", .{});
+                    return .{};
+                };
+                const current = findingDisposition(presentation, model) orelse {
+                    self.page_state.status.set("Finding disposition is unavailable", .{});
+                    return .{};
+                };
+                const desired: committed_review.FindingDispositionValue = switch (msg) {
+                    .accept => .accepted,
+                    .dismiss => .dismissed,
+                    .unreview => .unreviewed,
+                    else => unreachable,
+                };
+                if (current == desired) return .{};
+                const session = self.sessions.currentSession() orelse {
+                    self.page_state.status.set("Finding disposition is unavailable", .{});
+                    return .{};
+                };
+                if (!session.binding.eql(presentation.binding)) {
+                    self.page_state.status.set("Finding disposition is unavailable", .{});
+                    return .{};
+                }
+                session.editDisposition(
+                    allocator,
+                    .{ .bytes = model.finding_id },
+                    desired,
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    self.page_state.status.set("Finding disposition update is unavailable", .{});
+                    return .{};
+                };
+                return .{ .human_review_save = true };
+            },
+            .retry => {
+                const model = focusedFindingCard(current_frame.row_plan, next_state) orelse return .{};
+                const presentation = self.currentHumanReviewPresentation() orelse return .{};
+                if (findingDisposition(presentation, model) == null) return .{};
+                const session = self.sessions.currentSession() orelse return .{};
+                if (!session.binding.eql(presentation.binding)) return .{};
+                if (session.reconciliation == .reload_required) {
+                    try self.startPinnedRefresh(ctx);
+                    return .{};
+                }
+                if (session.lifecycle() != .failed) return .{};
+                const failure = session.last_failure orelse return .{};
+                if (failure.kind != .draft) return .{};
+                return .{ .human_review_save = true };
             },
             .leave => {
                 action = next_state.apply(.leave);
@@ -1366,6 +1438,21 @@ fn sameFindingCardPresentationRows(
 fn focusedFindingCard(plan: finding_card.RowPlan, state: finding_card.State) ?finding_card.FindingCardModel {
     const index = focusedFindingCardIndex(plan, state) orelse return null;
     return plan.cards[index];
+}
+
+fn findingDisposition(
+    presentation: human_review_session.Presentation,
+    model: finding_card.FindingCardModel,
+) ?committed_review.FindingDispositionValue {
+    if (!presentation.binding.review_repository_id.eql(model.identity.review_repository_id) or
+        !presentation.binding.review_id.eql(model.identity.review_id) or
+        !presentation.binding.target.eql(&model.identity.target) or
+        !presentation.binding.findings_digest.eql(model.identity.findings_digest)) return null;
+    const snapshot = presentation.snapshot orelse return null;
+    for (snapshot.finding_dispositions) |value| {
+        if (std.mem.eql(u8, value.finding_id.bytes, model.finding_id)) return value.disposition;
+    }
+    return null;
 }
 
 fn focusedFindingCardIndex(plan: finding_card.RowPlan, state: finding_card.State) ?usize {

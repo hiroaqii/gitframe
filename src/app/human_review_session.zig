@@ -761,6 +761,12 @@ pub const Session = struct {
                 completion.completed_at,
             );
             self.appendRecovery(terminal);
+            if (persistenceRequiresReload(failure)) {
+                while (self.operations_len != 0) self.appendRecovery(self.takeOperation(0));
+                self.refreshDirtyGeneration();
+                self.reconciliation = .reload_required;
+                return .reconciliation_required;
+            }
             self.refreshDirtyGeneration();
             return .applied;
         }
@@ -1105,6 +1111,31 @@ pub const Owner = struct {
         return result;
     }
 
+    /// Replace only the exact current session after a terminal Store failure
+    /// required reloading its pinned Run. The failed owner remains untouched
+    /// until the caller has also prepared the replacement page snapshot.
+    pub fn prepareReload(
+        self: *const Owner,
+        candidate: *Session,
+    ) TransitionError!PreparedInstall {
+        const current = if (self.current) |*value| value else return error.RecoveryRequiresDecision;
+        if (!current.binding.eql(candidate.binding) or
+            current.reconciliation != .reload_required or
+            current.operations_len != 0 or
+            !candidate.retireableClean() or
+            self.findDetached(candidate.binding) != null)
+        {
+            return error.RecoveryRequiresDecision;
+        }
+        const result: PreparedInstall = .{
+            .candidate = candidate.*,
+            .reattach_index = null,
+            .current_action = .retire,
+        };
+        candidate.* = undefined;
+        return result;
+    }
+
     /// Publish a fully prepared transition without allocation or validation.
     pub fn commitInstall(self: *Owner, prepared: *PreparedInstall) void {
         std.debug.assert(prepared.owned);
@@ -1244,6 +1275,21 @@ fn failureForEntry(
         .decision = entry.decision(),
         .observed_committed_revision = observed_revision,
         .observed_completed_at = observed_time,
+    };
+}
+
+fn persistenceRequiresReload(failure: review_store.PersistenceFailure) bool {
+    return switch (failure) {
+        .conflict,
+        .draft_required,
+        .already_completed,
+        .binding_changed,
+        .run_invalid,
+        => true,
+        .clock_unavailable,
+        .unsupported,
+        .io_failed,
+        => false,
     };
 }
 
@@ -1576,6 +1622,86 @@ test "human review result session failures retain exact intents and known mismat
         Reduction.ignored,
         mismatched.reduce(testCompletion(binding, 42, .result, 1, null, null, .run_invalid)),
     );
+}
+
+test "Finding disposition Store failures separate retry from exact reload" {
+    const allocator = std.testing.allocator;
+    const binding = try testBinding(33);
+    const finding_set = testFindingSet(binding, &.{});
+
+    var retryable = try Session.init(allocator, binding, &finding_set, null, null);
+    defer retryable.deinit();
+    try retryable.editSummary(allocator, "retry bytes");
+    const retry_preparation = try retryable.prepareSave(allocator, emptyToken(binding, 1), .dirty_only);
+    var retry = retry_preparation.ready;
+    defer retry.deinit();
+    retryable.commitDraft(&retry, 331, null);
+    try std.testing.expectEqual(
+        Reduction.applied,
+        retryable.reduce(testCompletion(binding, 331, .draft, 0, null, null, .io_failed)),
+    );
+    try std.testing.expectEqual(Reconciliation.confirmed, retryable.reconciliation);
+    try std.testing.expectEqual(Lifecycle.failed, retryable.lifecycle());
+    const retried_preparation = try retryable.prepareSave(allocator, emptyToken(binding, 2), .dirty_only);
+    var retried = retried_preparation.ready;
+    defer retried.deinit();
+    try std.testing.expectEqualStrings("retry bytes", retried.request().summary.?);
+
+    var drifting = try Session.init(allocator, binding, &finding_set, null, null);
+    try drifting.editSummary(allocator, "preserved first");
+    const first_preparation = try drifting.prepareSave(allocator, emptyToken(binding, 1), .dirty_only);
+    var first = first_preparation.ready;
+    defer first.deinit();
+    drifting.commitDraft(&first, 332, null);
+    try drifting.editSummary(allocator, "preserved latest");
+    const second_preparation = try drifting.prepareSave(
+        allocator,
+        oneToken(binding, 2, 332, .draft, 0, .active),
+        .dirty_only,
+    );
+    var second = second_preparation.ready;
+    defer second.deinit();
+    drifting.commitDraft(&second, 333, null);
+    try std.testing.expectEqual(
+        Reduction.reconciliation_required,
+        drifting.reduce(testCompletion(binding, 332, .draft, 0, null, null, .conflict)),
+    );
+    try std.testing.expectEqual(Reconciliation.reload_required, drifting.reconciliation);
+    try std.testing.expectEqual(@as(usize, 0), drifting.operationCount());
+    try std.testing.expectEqual(@as(usize, 2), drifting.recoveryCount());
+    switch (drifting.last_failure.?.reason) {
+        .persistence => |failure| try std.testing.expectEqual(review_store.PersistenceFailure.conflict, failure),
+        else => return error.ExpectedPersistenceFailure,
+    }
+    try std.testing.expectError(error.EditBlocked, drifting.editSummary(allocator, "blocked"));
+
+    var owner: Owner = .{ .current = drifting };
+    defer owner.deinit();
+    var candidate = try Session.init(allocator, binding, &finding_set, null, null);
+    var reload = try owner.prepareReload(&candidate);
+    defer reload.deinit();
+    try std.testing.expectEqualStrings(
+        "preserved latest",
+        owner.currentSessionConst().?.workingSnapshot().?.summary.?,
+    );
+    owner.commitInstall(&reload);
+    try std.testing.expectEqual(Reconciliation.confirmed, owner.currentSessionConst().?.reconciliation);
+    try std.testing.expectEqual(@as(usize, 0), owner.currentSessionConst().?.recoveryCount());
+}
+
+test "Finding disposition persistence failure classification covers the closed Store vocabulary" {
+    inline for (.{
+        review_store.PersistenceFailure.conflict,
+        .draft_required,
+        .already_completed,
+        .binding_changed,
+        .run_invalid,
+    }) |failure| try std.testing.expect(persistenceRequiresReload(failure));
+    inline for (.{
+        review_store.PersistenceFailure.clock_unavailable,
+        .unsupported,
+        .io_failed,
+    }) |failure| try std.testing.expect(!persistenceRequiresReload(failure));
 }
 
 test "human review result session owner routes detached terminals without retargeting current Run" {

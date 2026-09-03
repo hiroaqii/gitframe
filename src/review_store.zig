@@ -22,6 +22,7 @@ pub const SelectionFailure = store_service.SelectionFailure;
 pub const SelectedRunRead = store_service.SelectedRunRead;
 pub const scan = store_service.scan;
 pub const selectExact = store_service.selectExact;
+pub const selectExactReload = store_service.selectExactReload;
 pub const ExpectedPublicationIdentity = store_service.ExpectedPublicationIdentity;
 pub const ExactIdentity = store_service.ExactIdentity;
 pub const ReadFailure = store_service.ReadFailure;

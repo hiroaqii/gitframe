@@ -1090,7 +1090,8 @@ pub const App = struct {
             self.review_store_operations.reopenAfterReconciliation();
             self.quit_after_store_drain = false;
             if (reconciliation_current and presentation_matches) {
-                self.setStatus("AI review save requires exact reload: internal_mismatch", .{});
+                const reason = if (outcome.failure) |failure| @tagName(failure) else "internal_mismatch";
+                self.setStatus("AI review save requires exact reload: {s}", .{reason});
             }
         }
         if (outcome.quit_canceled or reconciliation_quit_canceled) self.quit_after_store_drain = false;
@@ -1347,6 +1348,17 @@ pub const App = struct {
                 .text = effect.text,
                 .selection_generation = effect.selection_generation,
             });
+        }
+        if (outcome.takeHumanReviewSave()) {
+            const saved = self.saveHumanReviewSession(ctx) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                self.setStatus("AI review save could not be prepared: {s}", .{@errorName(err)});
+                return auto_scroll;
+            };
+            switch (saved) {
+                .no_change, .accepted => {},
+                .rejected => |reason| self.setStatus("AI review save rejected: {s}", .{@tagName(reason)}),
+            }
         }
         if (outcome.takeHumanReviewFinalize()) |decision| {
             const finalized = self.finalizeHumanReviewSession(ctx, decision) catch |err| {
@@ -2503,6 +2515,62 @@ test "human review result session App bridge tracks every accepted draft and res
     } }, &ctx);
     try std.testing.expectEqual(human_review_session_mod.Lifecycle.completed, app.human_review_sessions.currentSessionConst().?.lifecycle());
     try std.testing.expect(!app.review_store_operations.hasWork());
+}
+
+test "Finding disposition App bridge immediately admits the existing draft save" {
+    const allocator = std.testing.allocator;
+    const binding = try humanReviewTestBinding(31);
+    const finding: committed_review.Finding = .{
+        .finding_id = .{ .bytes = "F-1" },
+        .anchor = .{
+            .path_bytes = "src/main.zig",
+            .side = .after,
+            .start_line = 1,
+            .end_line = 1,
+            .content_digest = committed_review.Sha256Digest.hash("line\n"),
+        },
+        .severity = .warning,
+        .title = "fixture",
+        .body = "fixture body",
+    };
+    const findings: committed_review.FindingSet = .{
+        .schema_version = committed_review.limits.schema_version,
+        .review_id = binding.review_id,
+        .created_at = "2026-09-04T00:00:00Z",
+        .timing = .{ .duration_ms = 1 },
+        .target = binding.target,
+        .producer = .{ .name = "test" },
+        .findings = &.{finding},
+    };
+    var app: App = .{
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
+        .allocator = allocator,
+    };
+    defer app.configured_review_store.?.deinit(allocator);
+    defer app.review_store_operations.deinit(allocator);
+    defer app.human_review_sessions.deinit();
+    app.human_review_sessions.current = try human_review_session_mod.Session.init(
+        allocator,
+        binding,
+        &findings,
+        null,
+        null,
+    );
+    const session = app.human_review_sessions.currentSession().?;
+    try session.editDisposition(allocator, .{ .bytes = "F-1" }, .accepted);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer ctx.runtimeClearPendingEffectCopies();
+    const saved = try app.saveHumanReviewSession(&ctx);
+    try std.testing.expect(saved == .accepted);
+    try std.testing.expectEqual(@as(usize, 1), session.operationCount());
+    try std.testing.expectEqual(
+        committed_review.FindingDispositionValue.accepted,
+        session.workingSnapshot().?.finding_dispositions[0].disposition,
+    );
+    const tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), tasks.len);
+    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
 }
 
 test "human review result session App admission faults preserve exact prepared intents" {

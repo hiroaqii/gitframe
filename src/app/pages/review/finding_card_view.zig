@@ -5,10 +5,12 @@ const chasen = @import("chasen");
 const draw = @import("draw");
 const theme = @import("theme");
 const finding_card = @import("../../../ai_review/finding_card.zig");
+const committed_review = @import("../../../committed_review.zig");
 const diff_render = @import("../../../diff/render.zig");
+const human_review_session = @import("../../human_review_session.zig");
 const review_page = @import("../review.zig");
 
-pub const footer_text = "s: next  Enter: close  j/k: scroll  y: copy  Esc/q: back";
+pub const footer_text = "s: next  a/d/u: set  r: retry  y: copy  Enter: close  j/k: scroll  Esc/q: back";
 const footer_copy_text = "y: copy";
 
 pub const CellRange = struct {
@@ -38,6 +40,7 @@ pub const Painter = struct {
     page: *const review_page.ReviewPageState,
     row_plan: *const finding_card.RowPlan,
     palette: theme.Palette,
+    human_review: ?human_review_session.Presentation,
 
     pub fn interface(self: *Painter) diff_render.InlineRowPainter {
         return .{ .ctx = self, .paint_fn = paint };
@@ -60,8 +63,14 @@ pub const Painter = struct {
         if (local_row == 0) {
             const marker = if (expanded) "▼" else "▶";
             const severity = severityLabel(model.severity);
+            const disposition = dispositionToken(self.human_review, model);
             const header = if (content.model) |producer_model|
-                try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] {s}/{s}  {s}", .{ marker, severity, content.producer, producer_model, firstLine(content.title) })
+                if (disposition) |disposition_label|
+                    try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] [{s}] {s}/{s}  {s}", .{ marker, severity, disposition_label, content.producer, producer_model, firstLine(content.title) })
+                else
+                    try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] {s}/{s}  {s}", .{ marker, severity, content.producer, producer_model, firstLine(content.title) })
+            else if (disposition) |disposition_label|
+                try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] [{s}] {s}  {s}", .{ marker, severity, disposition_label, content.producer, firstLine(content.title) })
             else
                 try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] {s}  {s}", .{ marker, severity, content.producer, firstLine(content.title) });
             try draw.copyClippedTextAt(&content_line, 0, 0, header, .{
@@ -96,7 +105,28 @@ pub const Painter = struct {
     }
 };
 
-fn severityLabel(severity: @import("../../../committed_review.zig").Severity) []const u8 {
+fn dispositionToken(
+    presentation: ?human_review_session.Presentation,
+    model: finding_card.FindingCardModel,
+) ?[]const u8 {
+    const current = presentation orelse return null;
+    if (!current.binding.review_repository_id.eql(model.identity.review_repository_id) or
+        !current.binding.review_id.eql(model.identity.review_id) or
+        !current.binding.target.eql(&model.identity.target) or
+        !current.binding.findings_digest.eql(model.identity.findings_digest)) return null;
+    const snapshot = current.snapshot orelse return null;
+    for (snapshot.finding_dispositions) |value| {
+        if (!std.mem.eql(u8, value.finding_id.bytes, model.finding_id)) continue;
+        return switch (value.disposition) {
+            .unreviewed => "U",
+            .accepted => "A",
+            .dismissed => "D",
+        };
+    }
+    return null;
+}
+
+fn severityLabel(severity: committed_review.Severity) []const u8 {
     return switch (severity) {
         .info => "info",
         .warning => "warning",
@@ -104,7 +134,7 @@ fn severityLabel(severity: @import("../../../committed_review.zig").Severity) []
     };
 }
 
-fn severityColor(palette: theme.Palette, severity: @import("../../../committed_review.zig").Severity) chasen.Color {
+fn severityColor(palette: theme.Palette, severity: committed_review.Severity) chasen.Color {
     return switch (severity) {
         .info => palette.color(.accent),
         .warning => palette.color(.warning),
@@ -178,6 +208,59 @@ fn drawWrappedLogicalRow(surface: *chasen.Surface, text: []const u8, target_row:
 test "Review inline Finding wrapped rows are unicode and newline aware" {
     try std.testing.expectEqual(@as(usize, 3), wrappedLineCount("ab\n猫猫", 2));
     try std.testing.expectEqual(@as(usize, 2), wrappedLineCount("abcd", 2));
+}
+
+test "Finding disposition header token requires one exact session value" {
+    const repository_id = try committed_review.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
+    const review_id = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
+    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const target: committed_review.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = oid,
+        .head_oid = oid,
+        .diff_base_oid = oid,
+    };
+    const findings_digest = committed_review.Sha256Digest.hash("findings");
+    var snapshot = try human_review_session.DraftSnapshot.init(
+        std.testing.allocator,
+        null,
+        &.{.{ .finding_id = .{ .bytes = "F-1" }, .disposition = .unreviewed }},
+        &.{},
+    );
+    defer snapshot.deinit();
+    const presentation: human_review_session.Presentation = .{
+        .binding = .{
+            .review_repository_id = repository_id,
+            .review_id = review_id,
+            .target = target,
+            .findings_digest = findings_digest,
+        },
+        .lifecycle = .editable,
+        .snapshot = &snapshot,
+        .reconciliation = .confirmed,
+    };
+    const model: finding_card.FindingCardModel = .{
+        .identity = .{
+            .review_repository_id = repository_id,
+            .review_id = review_id,
+            .target = target,
+            .findings_digest = findings_digest,
+        },
+        .entry_index = 0,
+        .finding_id = "F-1",
+        .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 0, .last_diff_line_ordinal = 0 },
+        .severity = .info,
+    };
+    try std.testing.expectEqualStrings("U", dispositionToken(presentation, model).?);
+    snapshot.finding_dispositions[0].disposition = .accepted;
+    try std.testing.expectEqualStrings("A", dispositionToken(presentation, model).?);
+    snapshot.finding_dispositions[0].disposition = .dismissed;
+    try std.testing.expectEqualStrings("D", dispositionToken(presentation, model).?);
+    var missing = model;
+    missing.finding_id = "F-2";
+    try std.testing.expect(dispositionToken(presentation, missing) == null);
+    try std.testing.expect(dispositionToken(null, model) == null);
 }
 
 test "Finding pointer copy target follows the fully visible card footer" {

@@ -56,6 +56,10 @@ pub const FindingCardMsg = enum {
     scroll_up,
     scroll_down,
     copy,
+    accept,
+    dismiss,
+    unreview,
+    retry,
     leave,
     owned_noop,
 };
@@ -273,6 +277,10 @@ fn findingCardKeyToMsg(key: chasen.Key) FindingCardMsg {
         'k' => .scroll_up,
         'j' => .scroll_down,
         'y' => .copy,
+        'a' => .accept,
+        'd' => .dismiss,
+        'u' => .unreview,
+        'r' => .retry,
         'q' => .leave,
         else => .owned_noop,
     };
@@ -376,13 +384,18 @@ test "human review result modal consumes close keys and summary paste" {
     try std.testing.expect(pasteToMsg(.{ .human_review = .{ .open = true } }, "hidden") == null);
 }
 
-test "Review inline Finding focus owns its complete input grammar" {
+test "Finding disposition keys stay inside the focused inline Finding grammar" {
     const focused: Context = .{ .finding_card_focused = true };
     try std.testing.expectEqual(Msg{ .finding_card = .focus_or_cycle }, keyToMsg(focused, .{ .codepoint = 's' }).?);
     try std.testing.expectEqual(Msg{ .finding_card = .toggle }, keyToMsg(focused, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(Msg{ .finding_card = .scroll_down }, keyToMsg(focused, .{ .codepoint = 'j' }).?);
     try std.testing.expectEqual(Msg{ .finding_card = .scroll_up }, keyToMsg(focused, .{ .codepoint = chasen.Key.up }).?);
     try std.testing.expectEqual(Msg{ .finding_card = .copy }, keyToMsg(focused, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .accept }, keyToMsg(focused, .{ .codepoint = 'a' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .dismiss }, keyToMsg(focused, .{ .codepoint = 'd' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .unreview }, keyToMsg(focused, .{ .codepoint = 'u' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .retry }, keyToMsg(focused, .{ .codepoint = 'r' }).?);
+    try std.testing.expectEqual(Msg{ .finding_card = .owned_noop }, keyToMsg(focused, .{ .codepoint = 'a', .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(Msg{ .finding_card = .leave }, keyToMsg(focused, .{ .codepoint = 'q' }).?);
     try std.testing.expectEqual(Msg{ .finding_card = .owned_noop }, keyToMsg(focused, .{ .codepoint = 'm' }).?);
     try std.testing.expectEqual(Msg{ .finding_card = .owned_noop }, pasteToMsg(focused, "ignored").?);

@@ -3221,7 +3221,7 @@ const help_review_items = [_]HelpItem{
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
     .{ .key = .{ .text = "y / Y" }, .description = "copy current line / hunk" },
-    .{ .key = .{ .text = "s / Enter / j/k / y / Esc/q" }, .description = "focus, open, scroll, copy, or leave an inline Finding" },
+    .{ .key = .{ .text = "s / Enter / a/d/u / r / j/k / y / Esc/q" }, .description = "focus, open, decide, retry, scroll, copy, or leave an inline Finding" },
     .{ .key = .{ .text = "Space / P / U / b" }, .description = "write operations unavailable" },
 };
 

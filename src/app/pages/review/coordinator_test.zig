@@ -1824,6 +1824,7 @@ const finding_navigation_patch =
 const FindingNavigationHarness = struct {
     page_state: review_page.ReviewPageState,
     repository: repo_session.State = .{},
+    store: ?review_store.ConfiguredStore = null,
     sessions: human_review_session.Owner = .{},
 
     fn init(allocator: std.mem.Allocator, rooted: bool) !FindingNavigationHarness {
@@ -1887,6 +1888,8 @@ const FindingNavigationHarness = struct {
     }
 
     fn deinit(self: *FindingNavigationHarness, allocator: std.mem.Allocator) void {
+        if (self.store) |*value| value.deinit(allocator);
+        self.repository.deinit(allocator);
         self.page_state.deinit(allocator);
         self.sessions.deinit();
         self.* = undefined;
@@ -1898,6 +1901,7 @@ const FindingNavigationHarness = struct {
             .repo = self.repository.view(),
             .layout = layout,
             .env_map = null,
+            .store = if (self.store) |*value| value else null,
             .sessions = &self.sessions,
         };
     }
@@ -1938,6 +1942,169 @@ const FindingNavigationHarness = struct {
         } });
     }
 };
+
+test "Finding disposition controller edits once, retries draft saves, and directly reloads drift" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 20 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    const selection = &harness.page_state.pinnedAiConst().?.selection;
+    const manifest = &selection.artifacts.manifest.value;
+    const binding: review_store.ReviewRunBinding = .{
+        .review_repository_id = manifest.review_repository_id,
+        .review_id = manifest.review_id,
+        .target = manifest.target,
+        .findings_digest = manifest.findings_digest,
+    };
+    harness.sessions.current = try human_review_session.Session.init(
+        allocator,
+        binding,
+        &selection.artifacts.findings.value,
+        null,
+        null,
+    );
+    const projection = &selection.finding_projection;
+    const finding_count = selection.artifacts.findings.value.findings.len;
+    const model = finding_card.FindingCardModel.init(projection, projection.files[0].mapped_entry_indices[0]).?;
+    _ = harness.page_state.finding_card.apply(.{ .focus = model });
+    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    var accepted = try harness.controller(layout).update(&ctx, .{ .finding_card = .accept });
+    defer accepted.deinit(allocator);
+    try std.testing.expect(accepted.takeHumanReviewSave());
+    const session = harness.sessions.currentSession().?;
+    try std.testing.expectEqual(
+        committed_review.FindingDispositionValue.accepted,
+        session.workingSnapshot().?.finding_dispositions[0].disposition,
+    );
+    const accepted_generation = session.generation;
+    var unchanged = try harness.controller(layout).update(&ctx, .{ .finding_card = .accept });
+    defer unchanged.deinit(allocator);
+    try std.testing.expect(!unchanged.takeHumanReviewSave());
+    try std.testing.expectEqual(accepted_generation, session.generation);
+
+    inline for (.{
+        .{ review_input.FindingCardMsg.dismiss, committed_review.FindingDispositionValue.dismissed },
+        .{ review_input.FindingCardMsg.unreview, committed_review.FindingDispositionValue.unreviewed },
+        .{ review_input.FindingCardMsg.accept, committed_review.FindingDispositionValue.accepted },
+    }) |case| {
+        var changed = try harness.controller(layout).update(&ctx, .{ .finding_card = case[0] });
+        defer changed.deinit(allocator);
+        try std.testing.expect(changed.takeHumanReviewSave());
+        try std.testing.expectEqual(case[1], session.workingSnapshot().?.finding_dispositions[0].disposition);
+    }
+
+    var app: app_root.App = .{
+        .active_page = .review,
+        .allocator = allocator,
+        .terminal_size = .{ .width = layout.width, .height = layout.height },
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
+    };
+    harness.store = null;
+    app.pages.review = harness.page_state;
+    harness.page_state = .{};
+    app.human_review_sessions = harness.sessions;
+    harness.sessions = .{};
+    var app_owns_harness_state = true;
+    defer {
+        app.review_store_operations.deinit(allocator);
+        if (app_owns_harness_state) {
+            harness.sessions = app.human_review_sessions;
+            app.human_review_sessions = .{};
+            harness.page_state = app.pages.review;
+            app.pages.review = .{};
+            harness.store = app.configured_review_store;
+            app.configured_review_store = null;
+        }
+    }
+
+    try std.testing.expect(app.review_store_operations.requestQuit() == .ready);
+    const rejected = try app.saveHumanReviewSession(&ctx);
+    try std.testing.expectEqual(
+        app_root.HumanReviewSaveOutcome{ .rejected = .admission_closed },
+        rejected,
+    );
+    const admission_session = app.human_review_sessions.currentSession().?;
+    try std.testing.expectEqual(@as(usize, 0), admission_session.operationCount());
+    try std.testing.expectEqual(human_review_session.Lifecycle.failed, admission_session.lifecycle());
+    app.review_store_operations.reopenAfterReconciliation();
+
+    try app.update(.{ .review = .{ .finding_card = .retry } }, &ctx);
+    try std.testing.expectEqual(@as(usize, 1), admission_session.operationCount());
+    try std.testing.expectEqual(human_review_session.Lifecycle.saving, admission_session.lifecycle());
+    try std.testing.expectEqual(
+        committed_review.FindingDispositionValue.accepted,
+        admission_session.workingSnapshot().?.finding_dispositions[0].disposition,
+    );
+    try std.testing.expectEqual(
+        finding_count,
+        admission_session.workingSnapshot().?.finding_dispositions.len,
+    );
+    for (admission_session.workingSnapshot().?.finding_dispositions[1..]) |disposition| {
+        try std.testing.expectEqual(committed_review.FindingDispositionValue.unreviewed, disposition.disposition);
+    }
+    try app.update(.{ .review = .{ .finding_card = .retry } }, &ctx);
+    var admission_tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), admission_tasks.len);
+    const admission_failure = admission_tasks[0].failed(admission_tasks[0].ctx, .runtime_abandoned, allocator);
+    const admission_operation_id = admission_failure.review_store_operation_finished.operation_id;
+    try app.update(admission_failure, &ctx);
+    try std.testing.expectEqual(human_review_session.Lifecycle.failed, admission_session.lifecycle());
+
+    try app.update(.{ .review = .{ .finding_card = .retry } }, &ctx);
+    var persistence_tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), persistence_tasks.len);
+    const persistence_failure = persistence_tasks[0].failed(persistence_tasks[0].ctx, .runtime_abandoned, allocator);
+    try std.testing.expect(persistence_failure.review_store_operation_finished.operation_id != admission_operation_id);
+    try app.update(persistence_failure, &ctx);
+    try std.testing.expectEqual(human_review_session.Lifecycle.failed, admission_session.lifecycle());
+
+    harness.sessions = app.human_review_sessions;
+    app.human_review_sessions = .{};
+    harness.page_state = app.pages.review;
+    app.pages.review = .{};
+    harness.store = app.configured_review_store;
+    app.configured_review_store = null;
+    app_owns_harness_state = false;
+    const recovered_session = harness.sessions.currentSession().?;
+
+    const drift_preparation = try recovered_session.prepareSave(
+        allocator,
+        .{ .binding = binding, .epoch = 2 },
+        .dirty_only,
+    );
+    var drift = drift_preparation.ready;
+    defer drift.deinit();
+    recovered_session.commitDraft(&drift, 702, null);
+    try std.testing.expectEqual(
+        human_review_session.Reduction.reconciliation_required,
+        recovered_session.reduce(.{
+            .operation_id = 702,
+            .binding = binding,
+            .kind = .draft,
+            .expected_revision = 0,
+            .committed_revision = null,
+            .completed_at = null,
+            .failure = .conflict,
+        }),
+    );
+
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    harness.repository.repo_state.discovery = try testSingleRepoDiscovery(allocator, roots.a);
+    harness.repository.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = harness.page_state.activate(harness.repository.repo_epoch);
+    var reload = try harness.controller(layout).update(&ctx, .{ .finding_card = .retry });
+    defer reload.deinit(allocator);
+    try std.testing.expect(!reload.takeHumanReviewSave());
+    try std.testing.expect(harness.page_state.ai_reviews.phase == .selection_loading);
+    try std.testing.expect(harness.page_state.ai_reviews.phase.selection_loading.direct);
+    const tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), tasks.len);
+    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+}
 
 fn findingPointerPoint(
     harness: *FindingNavigationHarness,

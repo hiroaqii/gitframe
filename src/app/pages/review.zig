@@ -295,6 +295,7 @@ pub const AiReviewSelectionRequest = struct {
     store: review_store.StoreSnapshot,
     review_id: committed_review.ReviewId,
     artifacts: review_store.ArtifactSnapshot,
+    direct: bool,
 };
 
 pub const AiReviewSelectionAdmission = union(enum) {
@@ -451,6 +452,7 @@ pub const AiReviewsPickerState = struct {
             .store = history_value.snapshot,
             .review_id = row.review_id,
             .artifacts = row.artifact_snapshot,
+            .direct = false,
         } };
     }
 
@@ -487,6 +489,7 @@ pub const AiReviewsPickerState = struct {
             .store = store,
             .review_id = review_id,
             .artifacts = artifacts,
+            .direct = true,
         };
     }
 
@@ -2590,7 +2593,7 @@ test "AI Reviews picker direct normal return cancellation closes without leaving
     try std.testing.expect(!picker.interactionCapabilities().list);
     try std.testing.expect(picker.beginSelectedRun() == .none);
 
-    _ = picker.beginDirectSelection(
+    const direct = picker.beginDirectSelection(
         allocator,
         page.RequestIdentity.review(5, 11),
         .{ .device = 2, .inode = 3 },
@@ -2598,6 +2601,7 @@ test "AI Reviews picker direct normal return cancellation closes without leaving
         try committed_review.ReviewId.parse("823e4567-e89b-42d3-a456-426614174000"),
         undefined,
     );
+    try std.testing.expect(direct.direct);
     picker.failSelectionStatic(
         try committed_review.ReviewId.parse("823e4567-e89b-42d3-a456-426614174000"),
         "direct selection failed",
@@ -2693,11 +2697,13 @@ test "AI Reviews picker failed Run B and normal return preserve accepted present
         else => return error.ExpectedAiReviewSelection,
     };
     try std.testing.expect(request.review_id.eql(review_id));
+    try std.testing.expect(!request.direct);
     const retried = switch (state.ai_reviews.retrySelectedRun()) {
         .request => |value| value,
         else => return error.ExpectedAiReviewSelectionRetry,
     };
     try std.testing.expect(retried.review_id.eql(review_id));
+    try std.testing.expect(!retried.direct);
     try std.testing.expect(retried.request.generation != request.request.generation);
     state.ai_reviews.failSelectionStatic(review_id, "Run B failed");
     try std.testing.expect(state.ai_reviews.interactionCapabilities().list);
