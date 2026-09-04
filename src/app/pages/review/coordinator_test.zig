@@ -1115,6 +1115,12 @@ test "Review inline Finding owner and fold mode file lifecycle use the accepted 
     var folded_hunks = [_]bool{ false, false };
     var loaded = app_test_support.loadedDiffTwo();
     loaded.collapsed_hunks = &folded_hunks;
+    var finding_presentation_cache = try review_page.FindingPresentationCache.init(
+        allocator,
+        &bundle.selection,
+        loaded.lines,
+    );
+    errdefer if (finding_presentation_cache) |*cache| cache.deinit(allocator);
     var page_state: review_page.ReviewPageState = .{
         .load = app_test_support.loadState(loaded),
         .viewer = .{
@@ -1129,8 +1135,10 @@ test "Review inline Finding owner and fold mode file lifecycle use the accepted 
             .selection = bundle.selection,
             .base_display = try allocator.dupe(u8, "base"),
             .head_display = try allocator.dupe(u8, "head"),
+            .finding_presentation_cache = finding_presentation_cache,
         } },
     };
+    finding_presentation_cache = null;
     bundle.selection = undefined;
     defer page_state.deinit(allocator);
 
@@ -1230,6 +1238,12 @@ test "Review shared display-mode and terminal resize prepare Finding cards befor
     var folded_hunks = [_]bool{false};
     var loaded = app_test_support.loadedDiffWide();
     loaded.collapsed_hunks = &folded_hunks;
+    var finding_presentation_cache = try review_page.FindingPresentationCache.init(
+        allocator,
+        &bundle.selection,
+        loaded.lines,
+    );
+    errdefer if (finding_presentation_cache) |*cache| cache.deinit(allocator);
     var page_state: review_page.ReviewPageState = .{
         .load = app_test_support.loadState(loaded),
         .viewer = .{
@@ -1244,8 +1258,10 @@ test "Review shared display-mode and terminal resize prepare Finding cards befor
             .selection = bundle.selection,
             .base_display = try allocator.dupe(u8, "base"),
             .head_display = try allocator.dupe(u8, "head"),
+            .finding_presentation_cache = finding_presentation_cache,
         } },
     };
+    finding_presentation_cache = null;
     bundle.selection = undefined;
     var page_state_owned = true;
     defer if (page_state_owned) page_state.deinit(allocator);
@@ -1890,7 +1906,13 @@ const FindingNavigationHarness = struct {
         const arena = loaded_bundle.takeArena();
         const selection = bundle.selection;
         bundle.selection = undefined;
-        return .{ .page_state = .{
+        var finding_presentation_cache = try review_page.FindingPresentationCache.init(
+            allocator,
+            &selection,
+            loaded_value.lines,
+        );
+        errdefer if (finding_presentation_cache) |*cache| cache.deinit(allocator);
+        const result: FindingNavigationHarness = .{ .page_state = .{
             .load = .{ .state = .{ .loaded = .{ .arena = arena, .loaded = loaded_value } } },
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
@@ -1902,8 +1924,11 @@ const FindingNavigationHarness = struct {
                 .selection = selection,
                 .base_display = base_display,
                 .head_display = head_display,
+                .finding_presentation_cache = finding_presentation_cache,
             } },
         } };
+        finding_presentation_cache = null;
+        return result;
     }
 
     fn deinit(self: *FindingNavigationHarness, allocator: std.mem.Allocator) void {
@@ -1961,6 +1986,97 @@ const FindingNavigationHarness = struct {
         } });
     }
 };
+
+test "Finding presentation cache reuses its exact frame and only prepares a visible body" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 80, .height = 10 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    harness.page_state.viewer.sidebar_hidden = true;
+    harness.page_state.viewer.focus = .diff;
+    const controller = harness.controller(layout);
+
+    controller.ensureFindingPresentationCache();
+    var frame = controller.navigationView().cachedFindingCardFrame() orelse return error.ExpectedFindingFrame;
+    const model = frame.row_plan.cards[0];
+    const initial_blocks_ptr = frame.presentation_rows.blocks.ptr;
+    _ = harness.page_state.finding_card.apply(.{ .focus = model });
+    _ = harness.page_state.finding_card.apply(.toggle);
+    harness.page_state.advanceSelectionLayoutRevision();
+    controller.ensureFindingPresentationCache();
+
+    frame = controller.navigationView().cachedFindingCardFrame() orelse return error.ExpectedFindingFrame;
+    const card_index = frame.row_plan.cardIndex(model) orelse return error.ExpectedFindingCard;
+    const card_start = frame.presentation_rows.cardStart(card_index) orelse return error.ExpectedFindingCard;
+    const content_width = review_page.findingCardContentWidth(controller.navigationView().findingCardRowWidth(model));
+    const cache = &harness.page_state.pinnedAi().?.finding_presentation_cache.?;
+
+    cache.invalidateBody();
+    harness.page_state.viewer.diff_scroll = frame.presentation_rows.total_rows -| 1;
+    controller.ensureFindingPresentationCache();
+    try std.testing.expect(harness.page_state.cachedFindingBody(model, content_width) == null);
+
+    harness.page_state.viewer.diff_scroll = card_start;
+    controller.ensureFindingPresentationCache();
+    const body = harness.page_state.cachedFindingBody(model, content_width) orelse return error.ExpectedFindingBody;
+    try std.testing.expect(body.rowCount() > 0);
+    const body_ptr = body.text.ptr;
+    const retained_blocks_ptr = frame.presentation_rows.blocks.ptr;
+    try std.testing.expectEqual(initial_blocks_ptr, retained_blocks_ptr);
+    controller.ensureFindingPresentationCache();
+    const steady = harness.page_state.cachedFindingBody(model, content_width) orelse return error.ExpectedFindingBody;
+    try std.testing.expectEqual(body_ptr, steady.text.ptr);
+    try std.testing.expectEqual(retained_blocks_ptr, controller.navigationView().cachedFindingCardFrame().?.presentation_rows.blocks.ptr);
+
+    harness.page_state.releaseFindingPresentationCache(allocator);
+    try std.testing.expect(harness.page_state.pinnedAi().?.finding_presentation_cache == null);
+    controller.ensureFindingPresentationCache();
+    try std.testing.expect(controller.navigationView().cachedFindingCardFrame() == null);
+}
+
+test "Finding cache lifecycle cannot re-admit a released retained presentation" {
+    const allocator = std.testing.allocator;
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    const controller = harness.controller(.{ .width = 80, .height = 24 });
+    controller.ensureFindingPresentationCache();
+    try std.testing.expect(controller.navigationView().cachedFindingCardFrame() != null);
+
+    harness.page_state.releaseFindingPresentationCache(allocator);
+    controller.ensureFindingPresentationCache();
+    try std.testing.expect(harness.page_state.pinnedAi().?.finding_presentation_cache == null);
+    try std.testing.expect(controller.navigationView().cachedFindingCardFrame() == null);
+}
+
+test "Finding cache lifecycle admission failure preserves the previous selected owner" {
+    const allocator = std.testing.allocator;
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    const current = harness.page_state.pinnedAiConst().?;
+    const old_review_id = current.reviewId();
+    const old_capacity = current.finding_presentation_cache.?.logicalCapacityBytes();
+    const incoming_review_id = try committed_review.ReviewId.parse("123e4567-e89b-42d3-a456-426614174099");
+    var incoming = try findingNavigationPinnedBundle(
+        allocator,
+        current.selection.snapshot,
+        current.selection.artifacts.manifest.value.review_repository_id,
+        incoming_review_id,
+        current.target(),
+        false,
+    );
+    defer incoming.deinit(allocator);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        harness.page_state.commitPinnedAi(failing.allocator(), 0, null, null, &incoming),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(harness.page_state.activeAiReviewId().?.eql(old_review_id));
+    try std.testing.expectEqual(
+        old_capacity,
+        harness.page_state.pinnedAiConst().?.finding_presentation_cache.?.logicalCapacityBytes(),
+    );
+}
 
 test "Finding card admission rejects a copied mismatched side" {
     const allocator = std.testing.allocator;

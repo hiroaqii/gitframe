@@ -73,10 +73,11 @@ pub const Controller = struct {
 
     /// Re-establishes page-local activation after an accepted repository
     /// replacement, then tells root which read owner must run.
-    pub fn acceptedRepositoryChange(self: Controller) Intent {
+    pub fn acceptedRepositoryChange(self: Controller, allocator: std.mem.Allocator) Intent {
         return switch (self.active_page.*) {
             .changes => .changes_repository_changed,
             .review => blk: {
+                self.review.releaseFindingPresentationCache(allocator);
                 _ = self.review.activate(self.repo.epoch());
                 break :blk .review_refresh;
             },
@@ -126,7 +127,10 @@ pub const Controller = struct {
 
         if (self.active_page.* == .changes) self.deactivateChangesForPageSwitch(allocator);
         if (self.active_page.* == .repository) self.deactivateRepositoryForPageSwitch();
-        if (self.active_page.* == .review) self.review.deactivate();
+        if (self.active_page.* == .review) {
+            self.review.releaseFindingPresentationCache(allocator);
+            self.review.deactivate();
+        }
         self.active_page.* = target;
         return switch (target) {
             .changes => blk: {

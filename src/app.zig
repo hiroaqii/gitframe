@@ -930,6 +930,9 @@ pub const App = struct {
         self.actionLifecycle().reconcileSpinner(ctx);
         self.pumpReviewStoreOperations(ctx);
         self.resumeQuitAfterStoreDrain(ctx);
+        if (!self.redraw_plan.resolvesToSkip() and self.active_page == .review) {
+            self.reviewCoordinator().ensureFindingPresentationCache();
+        }
         if (!self.redraw_plan.resolvesToSkip() and
             self.active_page == .review and
             (self.pages.review.base_picker.open or self.pages.review.ai_reviews.isOpen()))
@@ -2106,7 +2109,7 @@ pub const App = struct {
                 const session_transition = self.human_review_sessions.prepareClear() catch null;
                 try self.applyPageCoordinationIntent(
                     ctx,
-                    self.pageCoordinator().acceptedRepositoryChange(),
+                    self.pageCoordinator().acceptedRepositoryChange(self.allocator orelse ctx.allocator()),
                 );
                 if (session_transition) |plan| {
                     self.human_review_sessions.commitClear(plan);

@@ -147,6 +147,36 @@ pub const View = struct {
         return self.buildFindingCardFrameForState(allocator, self.page.finding_card);
     }
 
+    pub fn findingPresentationKey(self: View) ?review_page.FindingPresentationKey {
+        const shared_view = self.view();
+        _ = shared_view.activeLoadedDiffConst() orelse return null;
+        const pinned = self.page.pinnedAiConst() orelse return null;
+        return .{
+            .identity = pinned.selection.finding_projection.identity,
+            .source_session_revision = self.page.source_session_revision,
+            .selected_target = self.page.viewer.selected_target,
+            .pane_width = shared_view.diffPaneWidth(),
+            .mode = shared_view.effectiveDisplayMode(),
+            .selection_layout_revision = self.page.selection_layout_revision,
+        };
+    }
+
+    /// Borrow the retained frame only when every existing layout authority
+    /// still matches. A mismatch intentionally renders no Finding cards.
+    pub fn cachedFindingCardFrame(self: View) ?FindingCardFrame {
+        const key = self.findingPresentationKey() orelse return null;
+        const pinned = self.page.pinnedAiConst() orelse return null;
+        const cache = if (pinned.finding_presentation_cache) |*value| value else return null;
+        const cached_key = cache.frame_key orelse return null;
+        if (!cached_key.eql(key)) return null;
+        const frame = cache.frame orelse return null;
+        return .{
+            .row_plan = frame.row_plan,
+            .presentation_rows = frame.presentation_rows,
+            .owned = false,
+        };
+    }
+
     pub fn prepareFindingCardFrame(
         self: View,
         allocator: std.mem.Allocator,
@@ -328,6 +358,38 @@ pub const Controller = struct {
         };
     }
 
+    /// Fill the one admitted selected-Run cache. Capacity and all fallible
+    /// work were completed by the pinned acceptance transaction.
+    pub fn ensureFindingPresentationCache(self: Controller) void {
+        const read_view = self.view();
+        const key = read_view.findingPresentationKey() orelse {
+            if (self.page.pinnedAi()) |pinned| {
+                if (pinned.finding_presentation_cache) |*cache| cache.invalidateFrame();
+            }
+            return;
+        };
+        const loaded = read_view.view().activeLoadedDiffConst() orelse return;
+        const pinned = self.page.pinnedAi() orelse return;
+        const cache = if (pinned.finding_presentation_cache) |*value| value else return;
+        if (cache.frame_key) |cached_key| {
+            if (cached_key.eql(key)) return;
+        }
+
+        cache.invalidateFrame();
+        var preparation = FindingCardFramePreparation.initBorrowed(
+            &pinned.selection,
+            loaded,
+            cache,
+        );
+        if (preparation.fill(read_view, self.page.finding_card)) |frame| {
+            cache.frame = .{
+                .row_plan = frame.row_plan,
+                .presentation_rows = frame.presentation_rows,
+            };
+        }
+        cache.frame_key = key;
+    }
+
     /// Short-lived mutable adapter whose navigation and body resolver are
     /// constructed from the same Review page owner. Callers cannot pair a
     /// controller from one page with a resolver borrowed from another page.
@@ -387,10 +449,13 @@ pub const Controller = struct {
 pub const FindingCardFrame = struct {
     row_plan: finding_card.RowPlan,
     presentation_rows: diff_render.PresentationRows,
+    owned: bool = true,
 
     pub fn deinit(self: *FindingCardFrame, allocator: std.mem.Allocator) void {
-        self.presentation_rows.deinit(allocator);
-        self.row_plan.deinit(allocator);
+        if (self.owned) {
+            self.presentation_rows.deinit(allocator);
+            self.row_plan.deinit(allocator);
+        }
         self.* = undefined;
     }
 
@@ -414,7 +479,7 @@ pub const PreparedFindingCardFrame = struct {
 pub const FindingCardFramePreparation = struct {
     pub const allocation_count: usize = 6;
 
-    allocator: std.mem.Allocator,
+    allocator: ?std.mem.Allocator,
     selection: *const review_store.SelectedRunRead,
     loaded: *const loaded_diff.LoadedDiff,
     models: []finding_card.FindingCardModel,
@@ -455,13 +520,35 @@ pub const FindingCardFramePreparation = struct {
         };
     }
 
+    fn initBorrowed(
+        selection: *const review_store.SelectedRunRead,
+        loaded: *const loaded_diff.LoadedDiff,
+        cache: *review_page.FindingPresentationCache,
+    ) FindingCardFramePreparation {
+        return .{
+            .allocator = null,
+            .selection = selection,
+            .loaded = loaded,
+            .models = cache.models,
+            .groups = cache.groups,
+            .cards = cache.cards,
+            .cursors = cache.cursors,
+            .inputs = cache.inputs,
+            .blocks = cache.blocks,
+        };
+    }
+
     pub fn deinit(self: *FindingCardFramePreparation) void {
-        self.allocator.free(self.blocks);
-        self.allocator.free(self.inputs);
-        self.allocator.free(self.cursors);
-        self.allocator.free(self.cards);
-        self.allocator.free(self.groups);
-        self.allocator.free(self.models);
+        const allocator = self.allocator orelse {
+            self.* = undefined;
+            return;
+        };
+        allocator.free(self.blocks);
+        allocator.free(self.inputs);
+        allocator.free(self.cursors);
+        allocator.free(self.cards);
+        allocator.free(self.groups);
+        allocator.free(self.models);
         self.* = undefined;
     }
 

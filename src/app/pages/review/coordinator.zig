@@ -120,6 +120,9 @@ pub const Controller = struct {
         ctx: *chasen.Ctx(app_message.Msg),
         msg: review_input.Msg,
     ) !UpdateOutcome {
+        // Root normally establishes this at the preceding common update tail.
+        // Direct controller callers use the same allocation-free admission.
+        self.ensureFindingPresentationCache();
         switch (msg) {
             .shared => |shared_msg| return try self.updateShared(ctx, shared_msg),
             .open_base_picker => try self.startBasePicker(ctx),
@@ -208,8 +211,7 @@ pub const Controller = struct {
         shared_msg: diff_surface.message.Msg,
     ) !UpdateOutcome {
         const base_navigation_view = self.navigationView();
-        var finding_frame = try base_navigation_view.buildFindingCardFrame(ctx.allocator());
-        defer if (finding_frame) |*frame| frame.deinit(ctx.allocator());
+        var finding_frame = base_navigation_view.cachedFindingCardFrame();
         return self.updateSharedWithFindingFrame(
             ctx,
             shared_msg,
@@ -594,6 +596,44 @@ pub const Controller = struct {
         self.page_state.ai_reviews.prepareModalRedraw(io);
     }
 
+    /// Common update-tail admission for the one selected-Run presentation
+    /// cache. Rendering remains read-only and never reconstructs a frame.
+    pub fn ensureFindingPresentationCache(self: Controller) void {
+        self.navigation().ensureFindingPresentationCache();
+        self.ensureVisibleFindingBodyCache();
+    }
+
+    fn ensureVisibleFindingBodyCache(self: Controller) void {
+        const base_view = self.navigationView();
+        const frame = base_view.cachedFindingCardFrame() orelse return;
+        const model = focusedFindingCard(frame.row_plan, self.page_state.finding_card) orelse return;
+        if (!self.page_state.finding_card.expanded(model)) return;
+        const card_index = focusedFindingCardIndex(frame.row_plan, self.page_state.finding_card) orelse return;
+        const card_start = frame.presentation_rows.cardStart(card_index) orelse return;
+        const body_start = std.math.add(usize, card_start, 1) catch return;
+        const body_end = std.math.add(usize, body_start, 5) catch return;
+        const viewport_start = self.page_state.viewer.diff_scroll;
+        const viewport_end = std.math.add(
+            usize,
+            viewport_start,
+            base_view.view().diffVisibleRows(),
+        ) catch std.math.maxInt(usize);
+        if (body_start >= viewport_end or body_end <= viewport_start) return;
+
+        const width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
+        if (width == 0 or self.page_state.cachedFindingBody(model, width) != null) return;
+        const content = self.page_state.contentForFindingCard(model) orelse return;
+        const finding_id = finding_card.FindingId.init(model.finding_id) orelse return;
+        const pinned = self.page_state.pinnedAi() orelse return;
+        const cache = if (pinned.finding_presentation_cache) |*value| value else return;
+        cache.invalidateBody();
+        const text = review_page.findingCardDisplayTextInto(cache.body_display, content);
+        const row_count = finding_card_view.prepareWrappedRows(text, width, cache.body_row_starts);
+        cache.body_text_len = text.len;
+        cache.body_row_count = row_count;
+        cache.body_key = .{ .finding_id = finding_id, .width = width };
+    }
+
     fn startHistoryScan(self: Controller, ctx: *chasen.Ctx(app_message.Msg), retain_query: bool) !void {
         const identity = self.page_state.activation.currentIdentity() orelse return;
         const root_identity = self.repo.activeIdentity() orelse {
@@ -858,11 +898,10 @@ pub const Controller = struct {
         const allocator = ctx.allocator();
 
         const base_view = self.navigationView();
-        var current_frame = (try base_view.buildFindingCardFrame(allocator)) orelse {
+        var current_frame = base_view.cachedFindingCardFrame() orelse {
             self.clearFindingCardFocus();
             return .{};
         };
-        defer current_frame.deinit(allocator);
 
         var current_view = base_view.withPresentationRows(&current_frame.presentation_rows);
         var current_resolver = current_view.resolver();
@@ -883,9 +922,9 @@ pub const Controller = struct {
             },
             .scroll_up, .scroll_down => {
                 const model = focusedFindingCard(current_frame.row_plan, next_state) orelse return .{};
-                const content = self.page_state.contentForFindingCard(model) orelse return .{};
                 const content_width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
-                const max_scroll = try review_page.findingCardMaxBodyScroll(allocator, content, content_width);
+                const body = self.page_state.cachedFindingBody(model, content_width) orelse return .{};
+                const max_scroll = body.rowCount() -| 5;
                 _ = next_state.apply(.{ .scroll = .{
                     .direction = if (msg == .scroll_up) .up else .down,
                     .max_scroll = max_scroll,
@@ -1004,13 +1043,9 @@ pub const Controller = struct {
         const shared_msg = findingPointerSharedMessage(pointer);
         const allocator = ctx.allocator();
         const base_view = self.navigationView();
-        const frame_optional = base_view.buildFindingCardFrame(allocator) catch {
-            self.page_state.status.set("Could not resolve Finding pointer", .{});
-            return .{};
-        };
+        const frame_optional = base_view.cachedFindingCardFrame();
         if (frame_optional == null) return try self.updateSharedWithFindingFrame(ctx, shared_msg, null);
         var current_frame = frame_optional.?;
-        defer current_frame.deinit(allocator);
 
         var current_view = base_view.withPresentationRows(&current_frame.presentation_rows);
         var resolver = current_view.resolver();
@@ -1074,19 +1109,12 @@ pub const Controller = struct {
                         if (!self.page_state.finding_card.expanded(model)) {
                             return try self.updateSharedWithFindingFrame(ctx, shared_msg, &current_frame);
                         }
-                        const content = self.page_state.contentForFindingCard(model) orelse {
-                            self.page_state.status.set("Could not resolve Finding pointer", .{});
-                            return .{};
-                        };
                         const content_width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
-                        const max_scroll = review_page.findingCardMaxBodyScroll(
-                            allocator,
-                            content,
-                            content_width,
-                        ) catch {
+                        const cached_body = self.page_state.cachedFindingBody(model, content_width) orelse {
                             self.page_state.status.set("Could not resolve Finding pointer", .{});
                             return .{};
                         };
+                        const max_scroll = cached_body.rowCount() -| 5;
                         var next_state = self.page_state.finding_card;
                         _ = next_state.apply(.{ .scroll = .{
                             .direction = if (pointer.button == .wheel_up) .up else .down,
@@ -1204,11 +1232,7 @@ pub const Controller = struct {
             return .{};
         }
 
-        var outgoing_frame = base_view.buildFindingCardFrame(allocator) catch {
-            self.page_state.status.set("Could not prepare Finding navigation", .{});
-            return .{};
-        };
-        defer if (outgoing_frame) |*frame| frame.deinit(allocator);
+        var outgoing_frame = base_view.cachedFindingCardFrame();
         var preparation = (base_view.prepareFindingCardFrame(allocator) catch {
             self.page_state.status.set("Could not prepare Finding navigation", .{});
             return .{};

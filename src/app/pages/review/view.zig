@@ -913,9 +913,7 @@ const DiffPaneAdapter = struct {
 
     fn render(ctx: *anyopaque, surface: *chasen.Surface, loaded: @import("../../../loaded_diff.zig").LoadedDiff) !void {
         const self: *DiffPaneAdapter = @ptrCast(@alignCast(ctx));
-        const allocator = surface.frameAllocator();
-        var frame = try self.context.buildFindingCardFrame(allocator);
-        defer if (frame) |*value| value.deinit(allocator);
+        var frame = self.context.cachedFindingCardFrame();
         const rows = if (frame) |*value| &value.presentation_rows else null;
         const context = self.context.withPresentationRows(rows);
         var adapter = context.resolver();

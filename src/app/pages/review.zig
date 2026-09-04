@@ -7,7 +7,9 @@ const std = @import("std");
 const ui = @import("chasen_ui");
 const committed_review = @import("../../committed_review.zig");
 const finding_card = @import("../../ai_review/finding_card.zig");
+const finding_projection = @import("../../ai_review/finding_projection.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
+const context = @import("../../context.zig");
 const app_state = @import("../state.zig");
 const app_prompt = @import("../prompt.zig");
 const diff_basis = @import("../diff_basis.zig");
@@ -16,6 +18,7 @@ const app_load = @import("../load.zig");
 const load_state = @import("../load_state.zig");
 const page = @import("../page.zig");
 const diff_selection = @import("../../diff/selection.zig");
+const diff_render = @import("../../diff/render.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_refs = @import("../../git/refs.zig");
@@ -938,8 +941,10 @@ pub const PinnedAiPresentation = struct {
     selection: review_store.SelectedRunRead,
     base_display: []u8,
     head_display: []u8,
+    finding_presentation_cache: ?FindingPresentationCache = null,
 
     pub fn deinit(self: *PinnedAiPresentation, allocator: std.mem.Allocator) void {
+        if (self.finding_presentation_cache) |*cache| cache.deinit(allocator);
         allocator.free(self.head_display);
         allocator.free(self.base_display);
         self.selection.deinit(allocator);
@@ -971,6 +976,164 @@ pub const FindingCardContent = struct {
     title: []const u8,
     body: []const u8,
     suggestion: ?[]const u8,
+};
+
+pub const FindingPresentationKey = struct {
+    identity: finding_projection.Identity,
+    source_session_revision: u64,
+    selected_target: ?context.SelectedTarget,
+    pane_width: u16,
+    mode: diff_render.DisplayMode,
+    selection_layout_revision: u64,
+
+    pub fn eql(self: FindingPresentationKey, other: FindingPresentationKey) bool {
+        return finding_card.identityEql(self.identity, other.identity) and
+            self.source_session_revision == other.source_session_revision and
+            std.meta.eql(self.selected_target, other.selected_target) and
+            self.pane_width == other.pane_width and
+            self.mode == other.mode and
+            self.selection_layout_revision == other.selection_layout_revision;
+    }
+};
+
+pub const FindingBodyKey = struct {
+    finding_id: finding_card.FindingId,
+    width: u16,
+
+    pub fn eql(self: *const FindingBodyKey, model: finding_card.FindingCardModel, width: u16) bool {
+        return self.width == width and self.finding_id.eqlSlice(model.finding_id);
+    }
+};
+
+pub const FindingPresentationFrame = struct {
+    row_plan: finding_card.RowPlan,
+    presentation_rows: diff_render.PresentationRows,
+};
+
+pub const CachedFindingBody = struct {
+    text: []const u8,
+    row_starts: []const usize,
+
+    pub fn rowCount(self: CachedFindingBody) usize {
+        return self.row_starts.len;
+    }
+};
+
+/// Bounded derived storage subordinate to one accepted selected-Run owner.
+/// Its frame and body values only borrow the enclosing selection and these
+/// slices; they never own another decoded Finding collection.
+pub const FindingPresentationCache = struct {
+    models: []finding_card.FindingCardModel,
+    groups: []finding_card.Group,
+    cards: []finding_card.FindingCardModel,
+    cursors: []usize,
+    inputs: []diff_render.InlineBlockInput,
+    blocks: []diff_render.InlineBlock,
+    body_display: []u8,
+    body_row_starts: []usize,
+    frame_key: ?FindingPresentationKey = null,
+    frame: ?FindingPresentationFrame = null,
+    body_key: ?FindingBodyKey = null,
+    body_text_len: usize = 0,
+    body_row_count: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        selection: *const review_store.SelectedRunRead,
+        source_lines: ?usize,
+    ) (std.mem.Allocator.Error || error{InvalidFindingPresentationCache})!?FindingPresentationCache {
+        const entry_capacity = selection.finding_projection.entries.len;
+        if (entry_capacity == 0) return null;
+        if (entry_capacity > committed_review.limits.max_findings) {
+            return error.InvalidFindingPresentationCache;
+        }
+        const block_capacity = std.math.mul(usize, entry_capacity, 2) catch
+            return error.InvalidFindingPresentationCache;
+        const inserted_bound = std.math.mul(
+            usize,
+            entry_capacity,
+            finding_card.expanded_rows + finding_card.group_spacer_rows,
+        ) catch return error.InvalidFindingPresentationCache;
+        if (source_lines) |lines| {
+            _ = std.math.add(usize, lines, inserted_bound) catch
+                return error.InvalidFindingPresentationCache;
+        }
+
+        var body_capacity: usize = 0;
+        const value = &selection.artifacts.findings.value;
+        for (value.findings) |finding| {
+            body_capacity = @max(body_capacity, findingCardDisplayTextLength(.{
+                .producer = value.producer.name,
+                .model = value.producer.model,
+                .title = finding.title,
+                .body = finding.body,
+                .suggestion = finding.suggestion,
+            }));
+        }
+        const row_capacity = std.math.add(usize, body_capacity, 1) catch
+            return error.InvalidFindingPresentationCache;
+
+        const models = try allocator.alloc(finding_card.FindingCardModel, entry_capacity);
+        errdefer allocator.free(models);
+        const groups = try allocator.alloc(finding_card.Group, entry_capacity);
+        errdefer allocator.free(groups);
+        const cards = try allocator.alloc(finding_card.FindingCardModel, entry_capacity);
+        errdefer allocator.free(cards);
+        const cursors = try allocator.alloc(usize, entry_capacity);
+        errdefer allocator.free(cursors);
+        const inputs = try allocator.alloc(diff_render.InlineBlockInput, block_capacity);
+        errdefer allocator.free(inputs);
+        const blocks = try allocator.alloc(diff_render.InlineBlock, block_capacity);
+        errdefer allocator.free(blocks);
+        const body_display = try allocator.alloc(u8, body_capacity);
+        errdefer allocator.free(body_display);
+        const body_row_starts = try allocator.alloc(usize, row_capacity);
+        return .{
+            .models = models,
+            .groups = groups,
+            .cards = cards,
+            .cursors = cursors,
+            .inputs = inputs,
+            .blocks = blocks,
+            .body_display = body_display,
+            .body_row_starts = body_row_starts,
+        };
+    }
+
+    pub fn deinit(self: *FindingPresentationCache, allocator: std.mem.Allocator) void {
+        allocator.free(self.body_row_starts);
+        allocator.free(self.body_display);
+        allocator.free(self.blocks);
+        allocator.free(self.inputs);
+        allocator.free(self.cursors);
+        allocator.free(self.cards);
+        allocator.free(self.groups);
+        allocator.free(self.models);
+        self.* = undefined;
+    }
+
+    pub fn invalidateFrame(self: *FindingPresentationCache) void {
+        self.frame_key = null;
+        self.frame = null;
+        self.invalidateBody();
+    }
+
+    pub fn invalidateBody(self: *FindingPresentationCache) void {
+        self.body_key = null;
+        self.body_text_len = 0;
+        self.body_row_count = 0;
+    }
+
+    pub fn logicalCapacityBytes(self: *const FindingPresentationCache) usize {
+        return self.models.len * @sizeOf(finding_card.FindingCardModel) +
+            self.groups.len * @sizeOf(finding_card.Group) +
+            self.cards.len * @sizeOf(finding_card.FindingCardModel) +
+            self.cursors.len * @sizeOf(usize) +
+            self.inputs.len * @sizeOf(diff_render.InlineBlockInput) +
+            self.blocks.len * @sizeOf(diff_render.InlineBlock) +
+            self.body_display.len +
+            self.body_row_starts.len * @sizeOf(usize);
+    }
 };
 
 /// Resolve presentation text only through one accepted selected-run owner.
@@ -1007,24 +1170,47 @@ pub fn findingCardDisplayText(
     allocator: std.mem.Allocator,
     content: FindingCardContent,
 ) std.mem.Allocator.Error![]u8 {
+    const text = try allocator.alloc(u8, findingCardDisplayTextLength(content));
+    return findingCardDisplayTextInto(text, content);
+}
+
+pub fn findingCardDisplayTextLength(content: FindingCardContent) usize {
     if (content.model) |model| {
-        if (content.suggestion) |suggestion| return std.fmt.allocPrint(
-            allocator,
+        if (content.suggestion) |suggestion| return std.fmt.count(
             "Producer: {s}\nModel: {s}\n\n{s}\n\nSuggestion:\n{s}",
             .{ content.producer, model, content.body, suggestion },
         );
-        return std.fmt.allocPrint(
-            allocator,
+        return std.fmt.count(
             "Producer: {s}\nModel: {s}\n\n{s}",
             .{ content.producer, model, content.body },
         );
     }
-    if (content.suggestion) |suggestion| return std.fmt.allocPrint(
-        allocator,
+    if (content.suggestion) |suggestion| return std.fmt.count(
         "Producer: {s}\n\n{s}\n\nSuggestion:\n{s}",
         .{ content.producer, content.body, suggestion },
     );
-    return std.fmt.allocPrint(allocator, "Producer: {s}\n\n{s}", .{ content.producer, content.body });
+    return std.fmt.count("Producer: {s}\n\n{s}", .{ content.producer, content.body });
+}
+
+pub fn findingCardDisplayTextInto(buffer: []u8, content: FindingCardContent) []u8 {
+    if (content.model) |model| {
+        if (content.suggestion) |suggestion| return std.fmt.bufPrint(
+            buffer,
+            "Producer: {s}\nModel: {s}\n\n{s}\n\nSuggestion:\n{s}",
+            .{ content.producer, model, content.body, suggestion },
+        ) catch unreachable;
+        return std.fmt.bufPrint(
+            buffer,
+            "Producer: {s}\nModel: {s}\n\n{s}",
+            .{ content.producer, model, content.body },
+        ) catch unreachable;
+    }
+    if (content.suggestion) |suggestion| return std.fmt.bufPrint(
+        buffer,
+        "Producer: {s}\n\n{s}\n\nSuggestion:\n{s}",
+        .{ content.producer, content.body, suggestion },
+    ) catch unreachable;
+    return std.fmt.bufPrint(buffer, "Producer: {s}\n\n{s}", .{ content.producer, content.body }) catch unreachable;
 }
 
 pub fn findingCardMaxBodyScroll(
@@ -1057,6 +1243,41 @@ test "Finding card content width reserves the painter border across wrap boundar
     const narrow = try findingCardMaxBodyScroll(std.testing.allocator, content, findingCardContentWidth(10));
     const wide = try findingCardMaxBodyScroll(std.testing.allocator, content, findingCardContentWidth(20));
     try std.testing.expect(narrow > wide);
+}
+
+test "Finding presentation cache boundary capacity stays below five MiB" {
+    const per_entry = @sizeOf(finding_card.FindingCardModel) * 2 +
+        @sizeOf(finding_card.Group) +
+        @sizeOf(usize) +
+        @sizeOf(diff_render.InlineBlockInput) * 2 +
+        @sizeOf(diff_render.InlineBlock) * 2;
+    try std.testing.expectEqual(@as(usize, 856), per_entry);
+    const maximum_display = "Producer: ".len + committed_review.limits.max_short_text_bytes +
+        "\nModel: ".len + committed_review.limits.max_short_text_bytes +
+        "\n\n".len + committed_review.limits.max_body_bytes +
+        "\n\nSuggestion:\n".len + committed_review.limits.max_body_bytes;
+    try std.testing.expectEqual(@as(usize, 131_618), maximum_display);
+    const logical_capacity = committed_review.limits.max_findings * per_entry +
+        maximum_display + (maximum_display + 1) * @sizeOf(usize);
+    try std.testing.expectEqual(@as(usize, 4_690_746), logical_capacity);
+    try std.testing.expect(logical_capacity < 5 * 1024 * 1024);
+}
+
+test "Finding display text fills its exact admitted buffer" {
+    const content: FindingCardContent = .{
+        .producer = "reviewer",
+        .model = "model",
+        .title = "not part of body presentation",
+        .body = "body",
+        .suggestion = "replacement",
+    };
+    var buffer: [128]u8 = undefined;
+    const text = findingCardDisplayTextInto(&buffer, content);
+    try std.testing.expectEqual(findingCardDisplayTextLength(content), text.len);
+    try std.testing.expectEqualStrings(
+        "Producer: reviewer\nModel: model\n\nbody\n\nSuggestion:\nreplacement",
+        text,
+    );
 }
 
 pub const Presentation = union(enum) {
@@ -1182,6 +1403,31 @@ pub const ReviewPageState = struct {
     pub fn contentForFindingCard(self: *const ReviewPageState, model: finding_card.FindingCardModel) ?FindingCardContent {
         const pinned = self.pinnedAiConst() orelse return null;
         return findingCardContent(&pinned.selection, model);
+    }
+
+    pub fn cachedFindingBody(
+        self: *const ReviewPageState,
+        model: finding_card.FindingCardModel,
+        width: u16,
+    ) ?CachedFindingBody {
+        const pinned = self.pinnedAiConst() orelse return null;
+        const cache = if (pinned.finding_presentation_cache) |*value| value else return null;
+        const frame_key = cache.frame_key orelse return null;
+        if (!finding_card.identityEql(frame_key.identity, model.identity)) return null;
+        const body_key = cache.body_key orelse return null;
+        if (!body_key.eql(model, width)) return null;
+        if (cache.body_text_len > cache.body_display.len or
+            cache.body_row_count > cache.body_row_starts.len) return null;
+        return .{
+            .text = cache.body_display[0..cache.body_text_len],
+            .row_starts = cache.body_row_starts[0..cache.body_row_count],
+        };
+    }
+
+    pub fn releaseFindingPresentationCache(self: *ReviewPageState, allocator: std.mem.Allocator) void {
+        const pinned = self.pinnedAi() orelse return;
+        if (pinned.finding_presentation_cache) |*cache| cache.deinit(allocator);
+        pinned.finding_presentation_cache = null;
     }
 
     pub fn advanceSelectionLayoutRevision(self: *ReviewPageState) void {
@@ -1539,11 +1785,21 @@ pub const ReviewPageState = struct {
         root_identity: ?root_capability.Identity,
         bundle: *app_load.PinnedReviewLoadedBundle,
     ) !void {
-        self.human_review_decision.close();
         const next_finding_card = self.finding_card.transferred(&bundle.selection.finding_projection);
         const manifest = &bundle.selection.artifacts.manifest.value;
         const target = manifest.target;
         const pair_changed = if (self.presentation) |*current| !current.target().eql(&target) else true;
+
+        const source_lines: ?usize = switch (bundle.diff) {
+            .loaded => |*diff_bundle| diff_bundle.loaded.lines,
+            .empty => null,
+        };
+        var finding_presentation_cache = try FindingPresentationCache.init(
+            allocator,
+            &bundle.selection,
+            source_lines,
+        );
+        errdefer if (finding_presentation_cache) |*cache| cache.deinit(allocator);
 
         const base_label = if (manifest.display) |display| display.base_label else null;
         const head_label = if (manifest.display) |display| display.head_label else null;
@@ -1592,6 +1848,7 @@ pub const ReviewPageState = struct {
         }
         errdefer if (prepared_session) |*session| session.deinit(null);
 
+        self.human_review_decision.close();
         self.retireOrdinaryRefreshForPinnedAcceptance(allocator);
         self.file_search.deinit(allocator);
         self.clearRetainedSelection(allocator);
@@ -1604,8 +1861,10 @@ pub const ReviewPageState = struct {
             .selection = bundle.selection,
             .base_display = base_display,
             .head_display = head_display,
+            .finding_presentation_cache = finding_presentation_cache,
         } };
         bundle.selection = undefined;
+        finding_presentation_cache = null;
         self.finding_card = next_finding_card;
         self.advanceSelectionLayoutRevision();
 
@@ -1686,6 +1945,7 @@ pub const ReviewPageState = struct {
         if (self.completed_selection) |*selection| selection.deinit(allocator);
         // Candidate paths borrow the accepted load owner.
         self.file_search.deinit(allocator);
+        self.releaseFindingPresentationCache(allocator);
         self.load.clearCurrent(allocator);
         self.reviewed_store.deinit(allocator);
         self.tree_order.deinit(allocator);

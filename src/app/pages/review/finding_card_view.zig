@@ -82,13 +82,14 @@ pub const Painter = struct {
         }
         if (!expanded) return;
         if (local_row >= 1 and local_row <= 5) {
-            const text = try review_page.findingCardDisplayText(content_line.frameAllocator(), content);
-            const max_scroll = wrappedLineCount(text, content_line.size().width) -| 5;
+            const body = self.page.cachedFindingBody(model, content_line.size().width) orelse return;
+            const max_scroll = body.rowCount() -| 5;
             const scroll = @min(self.page.finding_card.bodyScroll(model), max_scroll);
-            drawWrappedLogicalRow(
-                &content_line,
+            const text = preparedWrappedRow(body.text, body.row_starts, scroll + local_row - 1) orelse return;
+            _ = content_line.borrowTextAt(
+                0,
+                0,
                 text,
-                scroll + local_row - 1,
                 .{ .fg = self.palette.color(.foreground), .bg = background },
             );
             return;
@@ -146,20 +147,25 @@ fn firstLine(text: []const u8) []const u8 {
     return text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
 }
 
-fn wrappedLineCount(text: []const u8, width: u16) usize {
-    if (width == 0) return 0;
+/// Record each logical wrapped-row start once into pre-admitted storage.
+pub fn prepareWrappedRows(text: []const u8, width: u16, starts: []usize) usize {
+    if (width == 0 or starts.len == 0) return 0;
+    std.debug.assert(starts.len >= text.len + 1);
+    starts[0] = 0;
     var rows: usize = 1;
     var line_width: u32 = 0;
     var iter = chasen.text.graphemeIterator(text);
     while (iter.next()) |grapheme| {
         const bytes = grapheme.bytes(text);
         if (bytes.len == 1 and bytes[0] == '\n') {
+            starts[rows] = grapheme.start + grapheme.len;
             rows += 1;
             line_width = 0;
             continue;
         }
         const grapheme_width = chasen.text.displayWidth(bytes);
         if (line_width > 0 and line_width + grapheme_width > width) {
+            starts[rows] = grapheme.start;
             rows += 1;
             line_width = 0;
         }
@@ -168,46 +174,23 @@ fn wrappedLineCount(text: []const u8, width: u16) usize {
     return rows;
 }
 
-fn drawWrappedLogicalRow(surface: *chasen.Surface, text: []const u8, target_row: usize, style: chasen.TextStyle) void {
-    if (surface.size().width == 0) return;
-    var logical_row: usize = 0;
-    var line_start: usize = 0;
-    var line_end: usize = 0;
-    var line_width: u32 = 0;
-    var iter = chasen.text.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        if (bytes.len == 1 and bytes[0] == '\n') {
-            if (logical_row == target_row) {
-                _ = surface.borrowTextAt(0, 0, text[line_start..line_end], style);
-                return;
-            }
-            logical_row += 1;
-            line_start = grapheme.start + grapheme.len;
-            line_end = line_start;
-            line_width = 0;
-            continue;
-        }
-        const grapheme_width = chasen.text.displayWidth(bytes);
-        if (line_width > 0 and line_width + grapheme_width > surface.size().width) {
-            if (logical_row == target_row) {
-                _ = surface.borrowTextAt(0, 0, text[line_start..line_end], style);
-                return;
-            }
-            logical_row += 1;
-            line_start = grapheme.start;
-            line_end = grapheme.start;
-            line_width = 0;
-        }
-        line_end = grapheme.start + grapheme.len;
-        line_width += grapheme_width;
-    }
-    if (logical_row == target_row) _ = surface.borrowTextAt(0, 0, text[line_start..line_end], style);
+pub fn preparedWrappedRow(text: []const u8, starts: []const usize, row: usize) ?[]const u8 {
+    if (row >= starts.len) return null;
+    const start = starts[row];
+    var end = if (row + 1 < starts.len) starts[row + 1] else text.len;
+    if (start > end or end > text.len) return null;
+    if (end > start and text[end - 1] == '\n') end -= 1;
+    return text[start..end];
 }
 
 test "Review inline Finding wrapped rows are unicode and newline aware" {
-    try std.testing.expectEqual(@as(usize, 3), wrappedLineCount("ab\n猫猫", 2));
-    try std.testing.expectEqual(@as(usize, 2), wrappedLineCount("abcd", 2));
+    var starts: [16]usize = undefined;
+    const count = prepareWrappedRows("ab\n猫猫", 2, &starts);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualStrings("ab", preparedWrappedRow("ab\n猫猫", starts[0..count], 0).?);
+    try std.testing.expectEqualStrings("猫", preparedWrappedRow("ab\n猫猫", starts[0..count], 1).?);
+    try std.testing.expectEqualStrings("猫", preparedWrappedRow("ab\n猫猫", starts[0..count], 2).?);
+    try std.testing.expectEqual(@as(usize, 2), prepareWrappedRows("abcd", 2, &starts));
 }
 
 test "Finding disposition header token requires one exact session value" {

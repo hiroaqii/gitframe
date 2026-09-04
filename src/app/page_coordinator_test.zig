@@ -302,7 +302,10 @@ test "Review retained selection survives page transitions and clears on reposito
     // second candidate-only clear that could preserve stale scroll state.
     app.pages.review.viewer.diff_scroll = 9;
     app.pages.review.deinit(allocator);
-    try std.testing.expectEqual(page_coordinator.Intent.review_refresh, app.controller().acceptedRepositoryChange());
+    try std.testing.expectEqual(
+        page_coordinator.Intent.review_refresh,
+        app.controller().acceptedRepositoryChange(app.allocator orelse std.testing.allocator),
+    );
     try std.testing.expect(app.pages.review.completed_selection == null);
     try std.testing.expect(app.pages.review.pinned_selection_basis == null);
     try std.testing.expectEqual(@as(usize, 0), app.pages.review.viewer.diff_scroll);

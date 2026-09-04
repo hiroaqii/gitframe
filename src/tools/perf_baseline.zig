@@ -1,9 +1,10 @@
 //! Synthetic performance baseline for GitFrame's shared diff model and renderer.
 //!
 //! This developer-only benchmark generates deterministic large-diff fixtures and
-//! reports observational timings and retained arena capacity for three scenarios: a
+//! reports observational timings and retained arena capacity for four scenarios: a
 //! huge single file rendered near its end, a tree containing many files, and a
-//! side-by-side search with no match. It is intended for before/after development
+//! side-by-side search with no match, plus one maximum Finding body cache fill and
+//! retained-row lookup. It is intended for before/after development
 //! comparisons, not correctness tests or wall-clock acceptance gates.
 //!
 //! Usage:
@@ -22,6 +23,9 @@ const diff_render = @import("../diff/render.zig");
 const diff_search = @import("../diff/search.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
+const committed_review = @import("../committed_review.zig");
+const review_page = @import("../app/pages/review.zig");
+const finding_card_view = @import("../app/pages/review/finding_card_view.zig");
 
 const huge_file_pairs = 8_000;
 const no_match_pairs = 2_000;
@@ -30,6 +34,7 @@ const huge_hunk_count = 100;
 const render_width = 120;
 const render_height = 40;
 const render_iterations = 25;
+const body_lookup_iterations = 25_000;
 
 const Stopwatch = struct {
     io: std.Io,
@@ -56,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
     try runHugeFileScenario(allocator, io);
     try runManyFileScenario(allocator, io);
     try runNoMatchSearchScenario(allocator, io);
+    try runMaximumFindingBodyScenario(allocator, io);
 }
 
 fn runHugeFileScenario(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -191,6 +197,52 @@ fn runNoMatchSearchScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     std.debug.print("  match: {s}\n", .{if (match == null) "none" else "found"});
     printMemory("raw diff bytes", raw.len);
     printMemory("loaded model arena capacity", loaded_model_capacity);
+}
+
+fn runMaximumFindingBodyScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    var producer: [committed_review.limits.max_short_text_bytes]u8 = undefined;
+    var model: [committed_review.limits.max_short_text_bytes]u8 = undefined;
+    @memset(&producer, 'p');
+    @memset(&model, 'm');
+    const maximum_body = try allocator.alloc(u8, committed_review.limits.max_body_bytes);
+    defer allocator.free(maximum_body);
+    @memset(maximum_body, 'x');
+    const content: review_page.FindingCardContent = .{
+        .producer = &producer,
+        .model = &model,
+        .title = "maximum body",
+        .body = maximum_body,
+        .suggestion = maximum_body,
+    };
+    const display = try allocator.alloc(u8, review_page.findingCardDisplayTextLength(content));
+    defer allocator.free(display);
+    const row_starts = try allocator.alloc(usize, display.len + 1);
+    defer allocator.free(row_starts);
+
+    var fill_timer = Stopwatch.start(io);
+    const text = review_page.findingCardDisplayTextInto(display, content);
+    const row_count = finding_card_view.prepareWrappedRows(text, 55, row_starts);
+    const fill_ns = fill_timer.read();
+
+    var checksum: usize = 0;
+    var lookup_timer = Stopwatch.start(io);
+    for (0..body_lookup_iterations) |index| {
+        checksum +%= finding_card_view.preparedWrappedRow(
+            text,
+            row_starts[0..row_count],
+            index % row_count,
+        ).?.len;
+    }
+    const lookup_ns = lookup_timer.read();
+
+    std.debug.print("\n[maximum Finding body cache: {d} display bytes]\n", .{text.len});
+    printTiming("one format and wrap fill", fill_ns);
+    printTiming("cached row-span lookup", lookup_ns / body_lookup_iterations);
+    std.debug.print("  wrapped rows: {d}, lookup iterations: {d}, checksum: {d}\n", .{
+        row_count,
+        body_lookup_iterations,
+        checksum,
+    });
 }
 
 fn loadedModelArenaCapacity(allocator: std.mem.Allocator, raw: []const u8) !usize {
