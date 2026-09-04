@@ -16,6 +16,7 @@ pub const FindingCardModel = struct {
     entry_index: usize,
     finding_id: []const u8,
     span: projection.ModelSpan,
+    side: committed.AnchorSide,
     severity: committed.Severity,
 
     pub fn init(index: *const projection.FindingProjectionIndex, entry_index: usize) ?FindingCardModel {
@@ -30,6 +31,7 @@ pub const FindingCardModel = struct {
             .entry_index = entry_index,
             .finding_id = entry.finding_id,
             .span = span,
+            .side = entry.side,
             .severity = entry.severity,
         };
     }
@@ -432,6 +434,7 @@ fn testModel(identity: projection.Identity, entry_index: usize, id: []const u8, 
             .first_diff_line_ordinal = line,
             .last_diff_line_ordinal = line,
         },
+        .side = .after,
         .severity = .warning,
     };
 }

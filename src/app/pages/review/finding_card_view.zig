@@ -250,6 +250,7 @@ test "Finding disposition header token requires one exact session value" {
         .entry_index = 0,
         .finding_id = "F-1",
         .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 0, .last_diff_line_ordinal = 0 },
+        .side = .after,
         .severity = .info,
     };
     try std.testing.expectEqualStrings("U", dispositionToken(presentation, model).?);

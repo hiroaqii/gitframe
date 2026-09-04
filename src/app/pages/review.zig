@@ -991,7 +991,8 @@ pub fn findingCardContent(
     };
     if (!std.mem.eql(u8, entry.finding_id, model.finding_id) or
         !std.mem.eql(u8, finding.finding_id.bytes, model.finding_id) or
-        !std.meta.eql(span, model.span) or entry.severity != model.severity) return null;
+        !std.meta.eql(span, model.span) or entry.side != model.side or
+        entry.severity != model.severity) return null;
     const producer = selection.artifacts.findings.value.producer;
     return .{
         .producer = producer.name,

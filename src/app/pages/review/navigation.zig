@@ -96,26 +96,51 @@ pub const View = struct {
     }
 
     pub fn findingCardAtCursor(self: View) bool {
-        if (self.page.viewer.focus != .diff or self.view().effectiveDisplayMode() != .unified) return false;
+        if (self.page.viewer.focus != .diff) return false;
         const cursor = switch (self.page.viewer.diff_cursor) {
             .hunk_line => |line| line,
             else => return false,
         };
-        const loaded = self.view().activeLoadedDiffConst() orelse return false;
-        const file_index = self.view().selectedFileIndex(loaded) orelse return false;
+        const shared_view = self.view();
+        const mode = shared_view.effectiveDisplayMode();
+        const loaded = shared_view.activeLoadedDiffConst() orelse return false;
+        const file_index = shared_view.selectedFileIndex(loaded) orelse return false;
         if (!loaded.fileTextSelectable(file_index)) return false;
         const pinned = self.page.pinnedAiConst() orelse return false;
         if (file_index >= pinned.selection.finding_projection.files.len) return false;
         const folded = loaded.foldedHunksForFile(file_index);
         if (cursor.hunk_index < folded.len and folded[cursor.hunk_index]) return false;
+        if (file_index >= loaded.document.files.len) return false;
+        const file = loaded.document.files[file_index];
+        const line_index = loaded.cachedRenderedLineIndex(file_index, mode) orelse
+            loaded.renderedLineIndex(file_index, mode);
+        const cursor_source_offset = diff_view_model.renderedOffsetForCoordinate(
+            file,
+            mode,
+            .{ .hunk_line = cursor },
+            folded,
+            line_index,
+        ) orelse return false;
         const file_record = pinned.selection.finding_projection.files[file_index];
         for (file_record.mapped_entry_indices) |entry_index| {
             const model = finding_card.FindingCardModel.init(&pinned.selection.finding_projection, entry_index) orelse continue;
             if (model.span.file_ordinal != file_index) continue;
-            if (model.span.hunk_ordinal != cursor.hunk_index or model.span.last_diff_line_ordinal != cursor.line_index) continue;
+            if (sourceOffsetForModel(file, folded, line_index, mode, model) != cursor_source_offset) continue;
             if (self.page.contentForFindingCard(model) != null) return true;
         }
         return false;
+    }
+
+    pub fn findingCardRowWidth(self: View, model: finding_card.FindingCardModel) u16 {
+        const shared_view = self.view();
+        const width = shared_view.diffPaneWidth();
+        return switch (shared_view.effectiveDisplayMode()) {
+            .unified => width,
+            .side_by_side => switch (model.side) {
+                .before => diff_render.sideBySideGeometry(diff_render.bodyWidth(width)).old.width,
+                .after => diff_render.sideBySideGeometry(diff_render.bodyWidth(width)).new.width,
+            },
+        };
     }
 
     pub fn buildFindingCardFrame(self: View, allocator: std.mem.Allocator) !?FindingCardFrame {
@@ -157,17 +182,18 @@ pub const View = struct {
         allocator: std.mem.Allocator,
         state: finding_card.State,
     ) !?FindingCardFrame {
-        if (self.view().effectiveDisplayMode() != .unified) return null;
-        const loaded = self.view().activeLoadedDiffConst() orelse return null;
-        const file_index = self.view().selectedFileIndex(loaded) orelse return null;
+        const shared_view = self.view();
+        const mode = shared_view.effectiveDisplayMode();
+        const loaded = shared_view.activeLoadedDiffConst() orelse return null;
+        const file_index = shared_view.selectedFileIndex(loaded) orelse return null;
         if (!loaded.fileTextSelectable(file_index)) return null;
         const pinned = self.page.pinnedAiConst() orelse return null;
         const index = &pinned.selection.finding_projection;
         if (file_index >= index.files.len or file_index >= loaded.document.files.len) return null;
         const file = loaded.document.files[file_index];
         const folded = loaded.foldedHunksForFile(file_index);
-        const line_index = loaded.cachedRenderedLineIndex(file_index, .unified) orelse
-            loaded.renderedLineIndex(file_index, .unified);
+        const line_index = loaded.cachedRenderedLineIndex(file_index, mode) orelse
+            loaded.renderedLineIndex(file_index, mode);
 
         var models: std.ArrayList(finding_card.FindingCardModel) = .empty;
         defer models.deinit(allocator);
@@ -175,7 +201,7 @@ pub const View = struct {
             const model = finding_card.FindingCardModel.init(index, entry_index) orelse continue;
             if (model.span.file_ordinal != file_index) continue;
             if (self.page.contentForFindingCard(model) == null) continue;
-            try appendResolvedFindingCardModel(allocator, &models, file, folded, line_index, model);
+            try appendResolvedFindingCardModel(allocator, &models, file, folded, line_index, mode, model);
         }
         if (models.items.len == 0) return null;
 
@@ -187,31 +213,24 @@ pub const View = struct {
         errdefer row_plan.deinit(allocator);
         if (row_plan.cards.len == 0) return null;
 
-        var inputs: std.ArrayList(diff_render.InlineBlockInput) = .empty;
-        defer inputs.deinit(allocator);
-        for (row_plan.groups) |group| {
-            const source_offset = diff_view_model.renderedOffsetForCoordinate(file, .unified, .{ .hunk_line = .{
-                .hunk_index = group.hunk_ordinal,
-                .line_index = group.last_diff_line_ordinal,
-            } }, folded, line_index) orelse continue;
-            for (group.card_start..group.card_start + group.card_count) |card_index| {
-                try inputs.append(allocator, .{
-                    .after_source_offset = source_offset,
-                    .height = state.cardRows(row_plan.cards[card_index]),
-                    .kind = .{ .card = card_index },
-                });
-            }
-            try inputs.append(allocator, .{
-                .after_source_offset = source_offset,
-                .height = finding_card.group_spacer_rows,
-                .kind = .spacer,
-            });
-        }
-        if (inputs.items.len == 0) return null;
+        const input_capacity = std.math.add(usize, row_plan.cards.len, row_plan.groups.len) catch
+            return error.InvalidPresentation;
+        const inputs = try allocator.alloc(diff_render.InlineBlockInput, input_capacity);
+        defer allocator.free(inputs);
+        const input_count = try fillFindingCardInputs(
+            inputs,
+            row_plan,
+            file,
+            folded,
+            line_index,
+            mode,
+            state,
+        );
+        if (input_count == 0) return null;
         var presentation_rows = try diff_render.PresentationRows.init(
             allocator,
             line_index.lineCount(),
-            inputs.items,
+            inputs[0..input_count],
         );
         errdefer presentation_rows.deinit(allocator);
         return .{ .row_plan = row_plan, .presentation_rows = presentation_rows };
@@ -221,16 +240,17 @@ pub const View = struct {
     /// file, fold, or display-mode state.
     pub fn focusedFindingCardVisible(self: View) bool {
         if (!self.page.finding_card.isFocused()) return true;
-        if (self.view().effectiveDisplayMode() != .unified) return false;
-        const loaded = self.view().activeLoadedDiffConst() orelse return false;
-        const file_index = self.view().selectedFileIndex(loaded) orelse return false;
+        const shared_view = self.view();
+        const mode = shared_view.effectiveDisplayMode();
+        const loaded = shared_view.activeLoadedDiffConst() orelse return false;
+        const file_index = shared_view.selectedFileIndex(loaded) orelse return false;
         if (!loaded.fileTextSelectable(file_index)) return false;
         const pinned = self.page.pinnedAiConst() orelse return false;
         if (file_index >= pinned.selection.finding_projection.files.len) return false;
         const folded = loaded.foldedHunksForFile(file_index);
         const file = loaded.document.files[file_index];
-        const line_index = loaded.cachedRenderedLineIndex(file_index, .unified) orelse
-            loaded.renderedLineIndex(file_index, .unified);
+        const line_index = loaded.cachedRenderedLineIndex(file_index, mode) orelse
+            loaded.renderedLineIndex(file_index, mode);
         const file_record = pinned.selection.finding_projection.files[file_index];
         for (file_record.mapped_entry_indices) |entry_index| {
             const model = finding_card.FindingCardModel.init(&pinned.selection.finding_projection, entry_index) orelse continue;
@@ -238,7 +258,7 @@ pub const View = struct {
             if (model.span.hunk_ordinal < folded.len and folded[model.span.hunk_ordinal]) continue;
             if (self.page.finding_card.matches(model) and
                 self.page.contentForFindingCard(model) != null and
-                sourceOffsetForModel(file, folded, line_index, model) != null) return true;
+                sourceOffsetForModel(file, folded, line_index, mode, model) != null) return true;
         }
         return false;
     }
@@ -454,21 +474,22 @@ pub const FindingCardFramePreparation = struct {
         const pinned = view.page.pinnedAiConst().?;
         std.debug.assert(loaded == self.loaded);
         std.debug.assert(&pinned.selection == self.selection);
-        if (view.view().effectiveDisplayMode() != .unified) return null;
-        const file_index = view.view().selectedFileIndex(loaded) orelse return null;
+        const shared_view = view.view();
+        const mode = shared_view.effectiveDisplayMode();
+        const file_index = shared_view.selectedFileIndex(loaded) orelse return null;
         if (!loaded.fileTextSelectable(file_index)) return null;
         const index = &pinned.selection.finding_projection;
         if (file_index >= index.files.len or file_index >= loaded.document.files.len) return null;
         const file = loaded.document.files[file_index];
         const folded = loaded.foldedHunksForFile(file_index);
-        const line_index = loaded.cachedRenderedLineIndex(file_index, .unified) orelse
-            loaded.renderedLineIndex(file_index, .unified);
+        const line_index = loaded.cachedRenderedLineIndex(file_index, mode) orelse
+            loaded.renderedLineIndex(file_index, mode);
 
         var model_count: usize = 0;
         for (index.files[file_index].mapped_entry_indices) |entry_index| {
             const model = finding_card.FindingCardModel.init(index, entry_index) orelse continue;
             if (model.span.file_ordinal != file_index or view.page.contentForFindingCard(model) == null) continue;
-            if (sourceOffsetForModel(file, folded, line_index, model) == null) continue;
+            if (sourceOffsetForModel(file, folded, line_index, mode, model) == null) continue;
             std.debug.assert(model_count < self.models.len);
             self.models[model_count] = model;
             model_count += 1;
@@ -483,30 +504,15 @@ pub const FindingCardFramePreparation = struct {
         );
         if (row_plan.cards.len == 0) return null;
 
-        var input_count: usize = 0;
-        for (row_plan.groups) |group| {
-            const source_offset = sourceOffsetForModel(
-                file,
-                folded,
-                line_index,
-                row_plan.cards[group.card_start],
-            ).?;
-            for (group.card_start..group.card_start + group.card_count) |card_index| {
-                self.inputs[input_count] = .{
-                    .after_source_offset = source_offset,
-                    .height = state.cardRows(row_plan.cards[card_index]),
-                    .kind = .{ .card = card_index },
-                };
-                input_count += 1;
-            }
-            self.inputs[input_count] = .{
-                .after_source_offset = source_offset,
-                .height = finding_card.group_spacer_rows,
-                .kind = .spacer,
-            };
-            input_count += 1;
-        }
-        std.debug.assert(input_count <= self.inputs.len);
+        const input_count = fillFindingCardInputs(
+            self.inputs,
+            row_plan,
+            file,
+            folded,
+            line_index,
+            mode,
+            state,
+        ) catch unreachable;
         return .{
             .row_plan = row_plan,
             .presentation_rows = diff_render.PresentationRows.initPrepared(
@@ -522,9 +528,19 @@ fn sourceOffsetForModel(
     file: diff_parser.FileDiff,
     folded_hunks: []const bool,
     line_index: diff_view_model.RenderedLineIndex,
+    mode: diff_render.DisplayMode,
     model: finding_card.FindingCardModel,
 ) ?usize {
-    return diff_view_model.renderedOffsetForCoordinate(file, .unified, .{ .hunk_line = .{
+    if (model.span.hunk_ordinal >= file.hunks.len or
+        (model.span.hunk_ordinal < folded_hunks.len and folded_hunks[model.span.hunk_ordinal])) return null;
+    const hunk = file.hunks[model.span.hunk_ordinal];
+    if (model.span.last_diff_line_ordinal >= hunk.lines.len) return null;
+    if (mode == .side_by_side and diff_view_model.sideBySideRenderedOffsetForLineOnSide(
+        hunk.lines,
+        model.span.last_diff_line_ordinal,
+        findingCardSide(model),
+    ) == null) return null;
+    return diff_view_model.renderedOffsetForCoordinate(file, mode, .{ .hunk_line = .{
         .hunk_index = model.span.hunk_ordinal,
         .line_index = model.span.last_diff_line_ordinal,
     } }, folded_hunks, line_index);
@@ -536,10 +552,69 @@ fn appendResolvedFindingCardModel(
     file: diff_parser.FileDiff,
     folded_hunks: []const bool,
     line_index: diff_view_model.RenderedLineIndex,
+    mode: diff_render.DisplayMode,
     model: finding_card.FindingCardModel,
 ) std.mem.Allocator.Error!void {
-    if (sourceOffsetForModel(file, folded_hunks, line_index, model) == null) return;
+    if (sourceOffsetForModel(file, folded_hunks, line_index, mode, model) == null) return;
     try models.append(allocator, model);
+}
+
+fn findingCardSide(model: finding_card.FindingCardModel) diff_selection.Side {
+    return switch (model.side) {
+        .before => .old,
+        .after => .new,
+    };
+}
+
+fn findingCardPlacement(mode: diff_render.DisplayMode, model: finding_card.FindingCardModel) diff_render.InlineBlockPlacement {
+    if (mode == .unified) return .full;
+    return switch (findingCardSide(model)) {
+        .old => .old,
+        .new => .new,
+    };
+}
+
+fn fillFindingCardInputs(
+    storage: []diff_render.InlineBlockInput,
+    row_plan: finding_card.RowPlan,
+    file: diff_parser.FileDiff,
+    folded_hunks: []const bool,
+    line_index: diff_view_model.RenderedLineIndex,
+    mode: diff_render.DisplayMode,
+    state: finding_card.State,
+) error{InvalidPresentation}!usize {
+    var input_count: usize = 0;
+    var previous_source_offset: ?usize = null;
+    while (true) {
+        var next_source_offset: ?usize = null;
+        for (row_plan.cards) |model| {
+            const source_offset = sourceOffsetForModel(file, folded_hunks, line_index, mode, model) orelse
+                return error.InvalidPresentation;
+            if (previous_source_offset) |previous| if (source_offset <= previous) continue;
+            if (next_source_offset == null or source_offset < next_source_offset.?) next_source_offset = source_offset;
+        }
+        const source_offset = next_source_offset orelse break;
+        for (row_plan.cards, 0..) |model, card_index| {
+            if (sourceOffsetForModel(file, folded_hunks, line_index, mode, model).? != source_offset) continue;
+            if (input_count >= storage.len) return error.InvalidPresentation;
+            storage[input_count] = .{
+                .after_source_offset = source_offset,
+                .height = state.cardRows(model),
+                .kind = .{ .card = card_index },
+                .placement = findingCardPlacement(mode, model),
+            };
+            input_count += 1;
+        }
+        if (input_count >= storage.len) return error.InvalidPresentation;
+        storage[input_count] = .{
+            .after_source_offset = source_offset,
+            .height = finding_card.group_spacer_rows,
+            .kind = .spacer,
+        };
+        input_count += 1;
+        previous_source_offset = source_offset;
+    }
+    return input_count;
 }
 
 test "Review Finding card frame admission omits unresolved coordinates and reports allocation failure" {
@@ -567,6 +642,7 @@ test "Review Finding card frame admission omits unresolved coordinates and repor
         .entry_index = 0,
         .finding_id = "valid",
         .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
+        .side = .after,
         .severity = .warning,
     };
     var unresolved = valid;
@@ -576,8 +652,8 @@ test "Review Finding card frame admission omits unresolved coordinates and repor
 
     var models: std.ArrayList(finding_card.FindingCardModel) = .empty;
     defer models.deinit(std.testing.allocator);
-    try appendResolvedFindingCardModel(std.testing.allocator, &models, file, &.{false}, line_index, valid);
-    try appendResolvedFindingCardModel(std.testing.allocator, &models, file, &.{false}, line_index, unresolved);
+    try appendResolvedFindingCardModel(std.testing.allocator, &models, file, &.{false}, line_index, .unified, valid);
+    try appendResolvedFindingCardModel(std.testing.allocator, &models, file, &.{false}, line_index, .unified, unresolved);
     try std.testing.expectEqual(@as(usize, 1), models.items.len);
     try std.testing.expectEqual(@as(usize, 0), models.items[0].entry_index);
     var plan = try finding_card.RowPlan.build(std.testing.allocator, models.items, &.{false});
@@ -593,6 +669,7 @@ test "Review Finding card frame admission omits unresolved coordinates and repor
         file,
         &.{false},
         line_index,
+        .unified,
         valid,
     ));
     try std.testing.expectEqual(@as(usize, 0), failing_models.items.len);

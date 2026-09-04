@@ -16,6 +16,7 @@ const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const diff_render = @import("../../../diff/render.zig");
 const diff_selection = @import("../../../diff/selection.zig");
+const diff_view_model = @import("../../../diff/view_model.zig");
 const finding_card = @import("../../../ai_review/finding_card.zig");
 const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
@@ -872,20 +873,9 @@ pub const Controller = struct {
 
         switch (msg) {
             .focus_or_cycle => {
-                const cursor = switch (self.page_state.viewer.diff_cursor) {
-                    .hunk_line => |line| line,
-                    else => return .{},
-                };
-                const group = current_frame.row_plan.groupAtOrigin(cursor.hunk_index, cursor.line_index) orelse return .{};
-                const cards = current_frame.row_plan.cardsForGroup(group);
-                if (cards.len == 0) return .{};
-                var next_index: usize = 0;
-                for (cards, 0..) |model, index| {
-                    if (!next_state.matches(model)) continue;
-                    next_index = (index + 1) % cards.len;
-                    break;
-                }
-                action = next_state.apply(.{ .cycle = cards[next_index] });
+                const source_offset = current_body.selectedDiffCursorOffset() orelse return .{};
+                const next = nextFindingCardAtSourceOffset(&current_frame, source_offset, next_state) orelse return .{};
+                action = next_state.apply(.{ .cycle = next });
             },
             .toggle => {
                 if (!current_frame.containsFocused(next_state)) return .{};
@@ -894,7 +884,7 @@ pub const Controller = struct {
             .scroll_up, .scroll_down => {
                 const model = focusedFindingCard(current_frame.row_plan, next_state) orelse return .{};
                 const content = self.page_state.contentForFindingCard(model) orelse return .{};
-                const content_width = review_page.findingCardContentWidth(current_body.view.diffPaneWidth());
+                const content_width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
                 const max_scroll = try review_page.findingCardMaxBodyScroll(allocator, content, content_width);
                 _ = next_state.apply(.{ .scroll = .{
                     .direction = if (msg == .scroll_up) .up else .down,
@@ -1044,7 +1034,7 @@ pub const Controller = struct {
                         if (card_hit.local_row == finding_card.expanded_rows - 1 and
                             self.page_state.finding_card.expanded(model))
                         {
-                            const target = finding_card_view.footerCopyTarget(body.view.diffPaneWidth()) orelse return .{};
+                            const target = finding_card_view.footerCopyTarget(base_view.findingCardRowWidth(model)) orelse return .{};
                             if (!target.contains(card_hit.local_col)) return .{};
                             const content = self.page_state.contentForFindingCard(model) orelse {
                                 self.page_state.status.set("Could not resolve Finding pointer", .{});
@@ -1088,7 +1078,7 @@ pub const Controller = struct {
                             self.page_state.status.set("Could not resolve Finding pointer", .{});
                             return .{};
                         };
-                        const content_width = review_page.findingCardContentWidth(body.view.diffPaneWidth());
+                        const content_width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
                         const max_scroll = review_page.findingCardMaxBodyScroll(
                             allocator,
                             content,
@@ -1118,10 +1108,7 @@ pub const Controller = struct {
     ) UpdateOutcome {
         const pinned = self.page_state.pinnedAiConst() orelse return .{};
         const base_view = self.navigationView();
-        if (base_view.view().effectiveDisplayMode() != .unified) {
-            self.page_state.status.set("Finding navigation is unavailable in side-by-side view", .{});
-            return .{};
-        }
+        const effective_mode = base_view.view().effectiveDisplayMode();
         const loaded = base_view.view().activeLoadedDiffConst() orelse {
             self.page_state.status.set("Finding target is unavailable", .{});
             return .{};
@@ -1179,6 +1166,14 @@ pub const Controller = struct {
             target.span.first_diff_line_ordinal > target.span.last_diff_line_ordinal or
             target.span.first_diff_line_ordinal >= target_file.hunks[target.span.hunk_ordinal].lines.len or
             target.span.last_diff_line_ordinal >= target_file.hunks[target.span.hunk_ordinal].lines.len or
+            (effective_mode == .side_by_side and diff_view_model.sideBySideRenderedOffsetForLineOnSide(
+                target_file.hunks[target.span.hunk_ordinal].lines,
+                target.span.last_diff_line_ordinal,
+                switch (target.side) {
+                    .before => .old,
+                    .after => .new,
+                },
+            ) == null) or
             finding_card.FindingId.init(target.finding_id) == null or
             !findingNavigationFileContainsEntry(projection, target.span.file_ordinal, entry_index))
         {
@@ -1440,6 +1435,28 @@ fn focusedFindingCard(plan: finding_card.RowPlan, state: finding_card.State) ?fi
     return plan.cards[index];
 }
 
+fn nextFindingCardAtSourceOffset(
+    frame: *const review_navigation.FindingCardFrame,
+    source_offset: usize,
+    state: finding_card.State,
+) ?finding_card.FindingCardModel {
+    var first: ?finding_card.FindingCardModel = null;
+    var choose_next = false;
+    for (frame.presentation_rows.blocks) |block| {
+        if (block.after_source_offset != source_offset) continue;
+        const card_index = switch (block.kind) {
+            .card => |value| value,
+            .spacer => continue,
+        };
+        if (card_index >= frame.row_plan.cards.len) return null;
+        const model = frame.row_plan.cards[card_index];
+        if (first == null) first = model;
+        if (choose_next) return model;
+        if (state.matches(model)) choose_next = true;
+    }
+    return first;
+}
+
 fn findingDisposition(
     presentation: human_review_session.Presentation,
     model: finding_card.FindingCardModel,
@@ -1570,6 +1587,7 @@ test "Review inline Finding coordinator preserves raw scroll until card row geom
             .entry_index = 0,
             .finding_id = "first",
             .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
+            .side = .after,
             .severity = .warning,
         },
         .{
@@ -1577,6 +1595,7 @@ test "Review inline Finding coordinator preserves raw scroll until card row geom
             .entry_index = 1,
             .finding_id = "second",
             .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
+            .side = .after,
             .severity = .warning,
         },
     };
