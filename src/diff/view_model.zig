@@ -1,5 +1,6 @@
 const std = @import("std");
 const diff_parser = @import("parser.zig");
+const diff_selection = @import("selection.zig");
 
 pub const DisplayMode = enum {
     unified,
@@ -657,6 +658,36 @@ pub fn sideBySideRenderedOffsetForLine(lines: []const diff_parser.DiffLine, targ
     return null;
 }
 
+/// Resolve one exact raw hunk line to the side-by-side row that paints it on
+/// the declared side. Context lines exist on both sides; removed and added
+/// lines never fall through to the opposite half of a paired row.
+pub fn sideBySideRenderedOffsetForLineOnSide(
+    lines: []const diff_parser.DiffLine,
+    target_line_index: usize,
+    side: diff_selection.Side,
+) ?usize {
+    if (target_line_index >= lines.len or !diff_selection.lineVisibleOnSide(lines[target_line_index], side)) return null;
+
+    var rows = SideBySideIndexedIterator.init(lines);
+    var offset: usize = 0;
+    while (rows.next()) |row| : (offset += 1) {
+        switch (row) {
+            .single => |line| {
+                if (line.line_index == target_line_index and diff_selection.lineVisibleOnSide(line.line, side)) return offset;
+            },
+            .paired => |pair| switch (side) {
+                .old => if (pair.removed) |line| {
+                    if (line.line_index == target_line_index) return offset;
+                },
+                .new => if (pair.added) |line| {
+                    if (line.line_index == target_line_index) return offset;
+                },
+            },
+        }
+    }
+    return null;
+}
+
 pub fn sideBySideLineIndexAtRenderedOffset(lines: []const diff_parser.DiffLine, target_offset: usize) ?usize {
     var rows = SideBySideIndexedIterator.init(lines);
     var offset: usize = 0;
@@ -1053,6 +1084,25 @@ test "rendered offset maps added side of paired rows to the paired row" {
 
     try std.testing.expectEqual(removed_offset, added_offset);
     try std.testing.expectEqual(@as(?usize, index.hunkOffset(0) + 2), added_offset);
+}
+
+test "side-by-side presentation resolves exact raw lines only on their declared side" {
+    const lines = [_]diff_parser.DiffLine{
+        .{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 },
+        .{ .kind = .removed, .text = "old one", .old_line = 2 },
+        .{ .kind = .removed, .text = "old two", .old_line = 3 },
+        .{ .kind = .added, .text = "new one", .new_line = 2 },
+    };
+
+    try std.testing.expectEqual(@as(?usize, 0), sideBySideRenderedOffsetForLineOnSide(&lines, 0, .old));
+    try std.testing.expectEqual(@as(?usize, 0), sideBySideRenderedOffsetForLineOnSide(&lines, 0, .new));
+    try std.testing.expectEqual(@as(?usize, 1), sideBySideRenderedOffsetForLineOnSide(&lines, 1, .old));
+    try std.testing.expectEqual(@as(?usize, null), sideBySideRenderedOffsetForLineOnSide(&lines, 1, .new));
+    try std.testing.expectEqual(@as(?usize, 1), sideBySideRenderedOffsetForLineOnSide(&lines, 3, .new));
+    try std.testing.expectEqual(@as(?usize, null), sideBySideRenderedOffsetForLineOnSide(&lines, 3, .old));
+    try std.testing.expectEqual(@as(?usize, 2), sideBySideRenderedOffsetForLineOnSide(&lines, 2, .old));
+    try std.testing.expectEqual(@as(?usize, null), sideBySideRenderedOffsetForLineOnSide(&lines, 2, .new));
+    try std.testing.expectEqual(@as(?usize, null), sideBySideRenderedOffsetForLineOnSide(&lines, lines.len, .old));
 }
 
 test "coordinateAtOffset maps rendered rows back to body coordinates" {

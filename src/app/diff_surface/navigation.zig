@@ -64,10 +64,11 @@ pub const ParsedMouseLine = struct {
     region: SelectionRegion,
 };
 
-/// One cell in the painted diff-body presentation. `local_col` is relative
-/// to the exact surface passed to the source renderer or inline-row painter,
-/// after the shared search-marker gutter. Page adapters may interpret card
-/// tokens, but the shared surface remains the only geometry authority.
+/// One cell in the painted diff-body presentation. Source and full-width card
+/// columns are relative to the diff surface after the search-marker gutter;
+/// pane card columns are relative to the exact pane child passed to its
+/// painter. Page adapters may interpret tokens, but shared diff geometry stays
+/// authoritative.
 pub const PresentationCellHit = union(enum) {
     source: struct { source_offset: usize, local_col: u16 },
     card: struct { token: usize, local_row: usize, local_col: u16 },
@@ -587,25 +588,27 @@ pub const BodyView = struct {
         if (visible_body_row >= self.view.diffVisibleRows()) return null;
         const presentation_offset = self.view.surface.viewer.diff_scroll + visible_body_row;
         const source_rows = self.sourceDiffLineCount();
-        const hit: diff_render.PresentationHit = if (self.view.presentation_rows) |rows| blk: {
+        if (self.view.presentation_rows) |rows| {
             if (rows.source_rows != source_rows) return null;
-            break :blk rows.hitAtPresentation(presentation_offset) orelse return null;
-        } else blk: {
-            if (presentation_offset >= source_rows) return null;
-            break :blk .{ .source = presentation_offset };
-        };
-        return switch (hit) {
-            .source => |source_offset| .{ .source = .{
-                .source_offset = source_offset,
-                .local_col = local_col,
-            } },
-            .card => |card| .{ .card = .{
-                .token = card.token,
-                .local_row = card.local_row,
-                .local_col = local_col,
-            } },
-            .spacer => .{ .spacer = .{ .local_col = local_col } },
-        };
+            const mode = self.view.effectiveDisplayMode();
+            const geometry = diff_render.sideBySideGeometry(diff_render.bodyWidth(content_width));
+            const hit = rows.hitAtCell(presentation_offset, local_col, mode, geometry) orelse return null;
+            return switch (hit) {
+                .source => |source| .{ .source = .{
+                    .source_offset = source.source_offset,
+                    .local_col = source.local_col,
+                } },
+                .card => |card| .{ .card = .{
+                    .token = card.token,
+                    .local_row = card.local_row,
+                    .local_col = card.local_col,
+                } },
+                .spacer => |spacer| .{ .spacer = .{ .local_col = spacer.local_col } },
+                .padding, .separator, .gutter => .{ .spacer = .{ .local_col = local_col } },
+            };
+        }
+        if (presentation_offset >= source_rows) return null;
+        return .{ .source = .{ .source_offset = presentation_offset, .local_col = local_col } };
     }
 
     /// Resolve one line-wise endpoint from semantic body presentation without
@@ -1026,7 +1029,7 @@ pub const BodyView = struct {
         const hit = rows.hitAtPresentation(presentation_offset) orelse return null;
         return switch (hit) {
             .source => |source_offset| source_offset,
-            .card, .spacer => null,
+            .card, .pane, .spacer => null,
         };
     }
 
