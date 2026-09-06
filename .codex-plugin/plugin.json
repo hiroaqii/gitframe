@@ -1,0 +1,32 @@
+{
+  "name": "gitframe",
+  "version": "0.1.0",
+  "description": "Create and inspect deterministic GitFrame AI review runs.",
+  "author": {
+    "name": "hiroaqii",
+    "url": "https://github.com/hiroaqii"
+  },
+  "homepage": "https://github.com/hiroaqii/gitframe",
+  "repository": "https://github.com/hiroaqii/gitframe",
+  "license": "MIT",
+  "keywords": [
+    "git",
+    "code-review",
+    "ai-review"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "GitFrame",
+    "shortDescription": "Review exact committed Git ranges with AI.",
+    "longDescription": "Create immutable AI Finding Runs from exact committed branch ranges and read their human decisions.",
+    "developerName": "hiroaqii",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $gitframe:gitframe-ai-review to review an exact committed branch range."
+    ]
+  }
+}

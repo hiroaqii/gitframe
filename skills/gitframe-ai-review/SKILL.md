@@ -31,6 +31,14 @@ values rather than inferring them, and do not ask the user to identify the
 current agent. These are agent provenance, not the Skill or GitFrame executable
 identity. The driver adds its own `skill_version`.
 
+In a Codex plugin installation, an explicit `$gitframe-ai-review` or
+`$gitframe:gitframe-ai-review` prompt can include authoritative runtime
+provenance from the bundled hook. When that context provides the active model
+slug, pass its exact value as `--producer-model` and pass `codex` as
+`--producer-name`. Do not replace it with a configured default, profile value,
+display label or guess. Without authoritative runtime provenance, continue to
+omit the model.
+
 Stop on `no_changes`. On `ready`, retain the exact `workspace` and
 `workspace_nonce` from stdout. Read `input.json` for the complete summary and
 the ordered `unit-NNNN.json` files. Treat repository `AGENTS.md` material in

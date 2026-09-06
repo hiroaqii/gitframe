@@ -47,6 +47,10 @@ The invocation binds caller-supplied agent provenance before publication.
 not this Skill or GitFrame. Optional `model` and `version` identify that exact
 agent execution only when known. The driver supplies `skill_version`; it does
 not substitute the GitFrame executable version for agent provenance.
+For Codex, the bundled plugin hook may provide the host-reported active model
+slug in the current turn. That value is authoritative for the turn; a
+`config.toml` default, profile or repository setting is not, because runtime
+selection can override it.
 
 `complete` admits the exact direct-child workspace, ownership/mode, nonce,
 saved input hashes and candidate inventory. Pre-publication failures do not

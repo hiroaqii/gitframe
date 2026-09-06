@@ -15,6 +15,27 @@ cp -R skills/gitframe-ai-review/. <agent-skill-root>/gitframe-ai-review/
 chmod 700 <agent-skill-root>/gitframe-ai-review/scripts/review.py
 ```
 
+## Codex plugin installation
+
+For Codex, install the GitFrame repository root as a plugin instead of copying
+only the Skill. The root `.codex-plugin/plugin.json` exposes the same canonical
+`skills/gitframe-ai-review` directory; there is no second copy of the driver.
+The default `hooks/hooks.json` registration also receives Codex's
+host-reported active model slug on `UserPromptSubmit`.
+
+The hook adds provenance context only when the prompt explicitly contains
+`$gitframe-ai-review` or its plugin-qualified form
+`$gitframe:gitframe-ai-review`. It does not rewrite commands, read a model from
+configuration, or run for unrelated prompts. The Skill then supplies
+`--producer-name codex` and the exact hook value as `--producer-model` to
+`begin`. If the host does not provide a valid model value, the field remains
+omitted rather than guessed.
+
+After installing or updating the plugin, review and trust its command hook in
+Codex with `/hooks`, then start a new session so plugin and hook discovery are
+refreshed. A standalone Skill copy remains supported for Codex and other
+agents, but it cannot discover an active model that its host does not expose.
+
 The runtime requires Python 3 with only its standard library, a POSIX host,
 and one absolute path to a GitFrame executable. `begin` and `complete` require
 the eight v1 AI review and Review Store publication capabilities;
@@ -43,9 +64,10 @@ python3 -I <agent-skill-root>/gitframe-ai-review/scripts/review.py begin \
 The invoking agent supplies its stable product name (`codex` for Codex or
 `claude-code` for Claude Code) without asking the user. It supplies the
 optional model and agent version only when their exact current identifiers are
-available, and omits unknown values rather than guessing. The driver records
-its own Skill version; the GitFrame executable version is not producer
-metadata.
+available, including authoritative current-turn hook context, and omits unknown
+values rather than guessing. A configured default is not proof of the active
+model because runtime selection can override it. The driver records its own
+Skill version; the GitFrame executable version is not producer metadata.
 
 If `--head` is omitted, the exact head commit-ish is `HEAD`. A `no_changes`
 terminal is complete and creates no Review ID. A `ready` terminal names a

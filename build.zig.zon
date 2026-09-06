@@ -17,10 +17,12 @@
         },
     },
     .paths = .{
+        ".codex-plugin/plugin.json",
         "build.zig",
         "build.zig.zon",
         "docs/ai-review-producer-v1.md",
         "docs/ai-review-skill.md",
+        "hooks",
         "skills/gitframe-ai-review",
         "src",
     },
