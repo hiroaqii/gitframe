@@ -2420,7 +2420,7 @@ fn findingPointerBlock(
 
 test "side-by-side Finding pointer keeps pane-local actions and inert padding" {
     const allocator = std.testing.allocator;
-    const layout: diff_surface.Layout = .{ .width = 120, .height = 12 };
+    const layout: diff_surface.Layout = .{ .width = 120, .height = 18 };
     var harness = try FindingNavigationHarness.initRename(allocator);
     defer harness.deinit(allocator);
     harness.page_state.viewer.sidebar_hidden = true;
@@ -2521,7 +2521,7 @@ test "side-by-side Finding pointer keeps pane-local actions and inert padding" {
     const footer = try findingPointerPoint(
         &harness,
         layout,
-        expanded_start + finding_card.expanded_rows - 1,
+        expanded_start + finding_card.footer_row,
         diff_render.cursor_gutter_width + geometry.new.col + footer_target.start,
     );
     var copy = try harness.pointer(allocator, layout, footer, .left);
@@ -2545,7 +2545,7 @@ test "side-by-side Finding pointer keeps pane-local actions and inert padding" {
 
 test "Finding pointer routes exact card cells with one semantic command" {
     const allocator = std.testing.allocator;
-    const layout: diff_surface.Layout = .{ .width = 100, .height = 12 };
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 18 };
     var harness = try FindingNavigationHarness.init(allocator, true);
     defer harness.deinit(allocator);
     harness.page_state.viewer.sidebar_hidden = true;
@@ -2628,7 +2628,7 @@ test "Finding pointer routes exact card cells with one semantic command" {
     const footer_point = try findingPointerPoint(
         &harness,
         layout,
-        footer_start + finding_card.expanded_rows - 1,
+        footer_start + finding_card.footer_row,
         footer_target.start,
     );
     footer_frame.deinit(allocator);
@@ -2642,7 +2642,7 @@ test "Finding pointer routes exact card cells with one semantic command" {
     const no_copy_point = try findingPointerPoint(
         &harness,
         layout,
-        footer_start + finding_card.expanded_rows - 1,
+        footer_start + finding_card.footer_row,
         footer_target.start - 1,
     );
     var no_copy = try harness.pointer(allocator, layout, no_copy_point, .left);

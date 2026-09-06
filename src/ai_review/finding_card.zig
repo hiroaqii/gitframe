@@ -7,9 +7,21 @@ const std = @import("std");
 const committed = @import("../committed_review.zig");
 const projection = @import("finding_projection.zig");
 
-pub const collapsed_rows: usize = 1;
-pub const expanded_rows: usize = 7;
+pub const header_row: usize = 0;
+pub const body_start_row: usize = header_row + 1;
+pub const body_rows: usize = 8;
+pub const footer_row: usize = body_start_row + body_rows;
+pub const collapsed_rows: usize = body_start_row;
+pub const expanded_rows: usize = footer_row + 1;
 pub const group_spacer_rows: usize = 1;
+
+test "Finding card expanded geometry is one header eight body rows and one footer" {
+    try std.testing.expectEqual(@as(usize, 0), header_row);
+    try std.testing.expectEqual(@as(usize, 1), body_start_row);
+    try std.testing.expectEqual(@as(usize, 8), body_rows);
+    try std.testing.expectEqual(@as(usize, 9), footer_row);
+    try std.testing.expectEqual(@as(usize, 10), expanded_rows);
+}
 
 pub const FindingCardModel = struct {
     identity: projection.Identity,

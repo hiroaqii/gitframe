@@ -610,8 +610,8 @@ pub const Controller = struct {
         if (!self.page_state.finding_card.expanded(model)) return;
         const card_index = focusedFindingCardIndex(frame.row_plan, self.page_state.finding_card) orelse return;
         const card_start = frame.presentation_rows.cardStart(card_index) orelse return;
-        const body_start = std.math.add(usize, card_start, 1) catch return;
-        const body_end = std.math.add(usize, body_start, 5) catch return;
+        const body_start = std.math.add(usize, card_start, finding_card.body_start_row) catch return;
+        const body_end = std.math.add(usize, body_start, finding_card.body_rows) catch return;
         const viewport_start = self.page_state.viewer.diff_scroll;
         const viewport_end = std.math.add(
             usize,
@@ -924,7 +924,7 @@ pub const Controller = struct {
                 const model = focusedFindingCard(current_frame.row_plan, next_state) orelse return .{};
                 const content_width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
                 const body = self.page_state.cachedFindingBody(model, content_width) orelse return .{};
-                const max_scroll = body.rowCount() -| 5;
+                const max_scroll = body.rowCount() -| finding_card.body_rows;
                 _ = next_state.apply(.{ .scroll = .{
                     .direction = if (msg == .scroll_up) .up else .down,
                     .max_scroll = max_scroll,
@@ -1066,7 +1066,7 @@ pub const Controller = struct {
                 const model = current_frame.row_plan.cards[card_hit.token];
                 switch (pointer.button) {
                     .left => {
-                        if (card_hit.local_row == finding_card.expanded_rows - 1 and
+                        if (card_hit.local_row == finding_card.footer_row and
                             self.page_state.finding_card.expanded(model))
                         {
                             const target = finding_card_view.footerCopyTarget(base_view.findingCardRowWidth(model)) orelse return .{};
@@ -1114,7 +1114,7 @@ pub const Controller = struct {
                             self.page_state.status.set("Could not resolve Finding pointer", .{});
                             return .{};
                         };
-                        const max_scroll = cached_body.rowCount() -| 5;
+                        const max_scroll = cached_body.rowCount() -| finding_card.body_rows;
                         var next_state = self.page_state.finding_card;
                         _ = next_state.apply(.{ .scroll = .{
                             .direction = if (pointer.button == .wheel_up) .up else .down,

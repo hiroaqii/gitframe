@@ -576,10 +576,18 @@ test "presentation rendering keeps the header and starts scrolled card source an
     defer rows.deinit(std.testing.allocator);
 
     const Painter = struct {
+        const card_background: chasen.Color = .{ .index = 4 };
+
         fn paint(_: *anyopaque, surface: *chasen.Surface, row: u16, token: usize, local_row: usize) !void {
             try std.testing.expectEqual(@as(usize, 7), token);
             try std.testing.expectEqual(@as(usize, 0), local_row);
-            _ = surface.borrowTextAt(0, row, "CARD", .{});
+            fillRowRegion(
+                surface,
+                row,
+                .{ .col = 0, .width = surface.size().width },
+                .{ .bg = card_background },
+            );
+            _ = surface.borrowTextAt(0, row, "CARD", .{ .bg = card_background });
         }
     };
     var painter_context: u8 = 0;
@@ -590,6 +598,8 @@ test "presentation rendering keeps the header and starts scrolled card source an
     defer scrolled.deinit();
     try renderFile(&scrolled.surface, file, .{
         .scroll = 1,
+        .highlighted_hunk = 0,
+        .hunk_stages = .all_staged,
         .line_index = index,
         .presentation_rows = rows,
         .inline_row_painter = painter,
@@ -598,7 +608,10 @@ test "presentation rendering keeps the header and starts scrolled card source an
     defer std.testing.allocator.free(scrolled_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, scrolled_snapshot[0..80], "src/card.zig") != null);
     try scrolled.expectCellText(0, body_start_row, "C");
+    try scrolled.expectCellText(cursor_gutter_width - 1, body_start_row, "┃");
+    try std.testing.expect(scrolled.surface.readCell(1, body_start_row).?.style.bg.eql(Painter.card_background));
     try scrolled.expectCellText(0, body_start_row + 1, " ");
+    try scrolled.expectCellText(1, body_start_row + 1, "┃");
     try std.testing.expect(std.mem.indexOf(u8, scrolled_snapshot[81 * 5 .. 81 * 5 + 80], "source-one") != null);
 
     var tail: chasen.testing.TestSurface = undefined;
@@ -667,6 +680,8 @@ test "side-by-side presentation renderer confines cards to aligned pane surfaces
     defer rendered.deinit();
     try renderFile(&rendered.surface, file, .{
         .requested_mode = .side_by_side,
+        .highlighted_hunk = 0,
+        .hunk_stages = .all_staged,
         .line_index = index,
         .presentation_rows = rows,
         .inline_row_painter = painter,
@@ -681,14 +696,17 @@ test "side-by-side presentation renderer confines cards to aligned pane surfaces
     const card_row = body_start_row + 1;
     const padding_row = body_start_row + 2;
     const spacer_row = body_start_row + 3;
+    try rendered.expectCellText(1, card_row, "┃");
+    try rendered.expectCellText(1, padding_row, "┃");
+    try rendered.expectCellText(1, spacer_row, "┃");
     try rendered.expectCellText(cursor_gutter_width + geometry.old.col, card_row, "L");
     try rendered.expectCellText(cursor_gutter_width + geometry.separator_col - 1, card_row, "L");
-    try rendered.expectCellText(cursor_gutter_width + geometry.separator_col, card_row, "│");
+    try rendered.expectCellText(cursor_gutter_width + geometry.separator_col, card_row, "┃");
     try rendered.expectCellText(cursor_gutter_width + geometry.new.col, card_row, "R");
     try rendered.expectCellText(81, card_row, "R");
     try rendered.expectCellText(cursor_gutter_width + geometry.new.col, padding_row, " ");
-    try rendered.expectCellText(cursor_gutter_width + geometry.separator_col, padding_row, "│");
-    try rendered.expectCellText(cursor_gutter_width + geometry.separator_col, spacer_row, " ");
+    try rendered.expectCellText(cursor_gutter_width + geometry.separator_col, padding_row, "┃");
+    try rendered.expectCellText(cursor_gutter_width + geometry.separator_col, spacer_row, "┃");
     try rendered.expectCellText(cursor_gutter_width + geometry.new.col + lineTextStart(true, .side_by_side), body_start_row + 4, "s");
 
     const one_sided_inputs = [_]InlineBlockInput{
@@ -1121,6 +1139,12 @@ fn renderFileWithPresentation(
         presentation_offset += 1;
     }) {
         const hit = presentation_rows.hitAtPresentation(presentation_offset) orelse break;
+        const highlighted_presentation_hunk = highlightedHunkForPresentationRow(
+            presentation_rows,
+            presentation_offset,
+            options.highlighted_hunk,
+            guide_index,
+        );
         switch (hit) {
             .card => |card| try painter.paint(surface, screen_row, card.token, card.local_row),
             .pane => {
@@ -1187,7 +1211,60 @@ fn renderFileWithPresentation(
                 }
             },
         }
+        if (highlighted_presentation_hunk) |hunk_index| {
+            paintPresentationHunkGuides(
+                surface,
+                body_surface,
+                screen_row,
+                mode,
+                hunk_index,
+                options.hunk_stages,
+                styles,
+            );
+        }
     }
+}
+
+fn highlightedHunkForPresentationRow(
+    presentation_rows: PresentationRows,
+    presentation_offset: usize,
+    highlighted_hunk: ?usize,
+    line_index: ?diff_view_model.RenderedLineIndex,
+) ?usize {
+    const highlighted = highlighted_hunk orelse return null;
+    const anchor = presentation_rows.insertionAnchorAt(presentation_offset) orelse return null;
+    const hunk_index = (line_index orelse return null).hunkIndexAtOffset(anchor) orelse return null;
+    return if (hunk_index == highlighted) highlighted else null;
+}
+
+fn paintPresentationHunkGuides(
+    surface: *chasen.Surface,
+    body_surface: *chasen.Surface,
+    row: u16,
+    mode: DisplayMode,
+    hunk_index: usize,
+    hunk_stages: HunkStagePresentation,
+    styles: RenderStyles,
+) void {
+    const stage = hunk_stages.stateForHunk(hunk_index);
+    paintPresentationHunkGuideAt(surface, cursor_gutter_width - 1, row, stage, styles);
+    if (mode == .side_by_side) {
+        const geometry = sideBySideGeometry(body_surface.size().width);
+        paintPresentationHunkGuideAt(body_surface, geometry.separator_col, row, stage, styles);
+    }
+}
+
+fn paintPresentationHunkGuideAt(
+    surface: *chasen.Surface,
+    col: u16,
+    row: u16,
+    stage: HunkStageState,
+    styles: RenderStyles,
+) void {
+    const existing = surface.readCell(col, row) orelse return;
+    var style = hunkGuideStyle(stage, styles);
+    style.bg = existing.style.bg;
+    _ = surface.borrowTextAt(col, row, "┃", style);
 }
 
 pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, source: *const repository_source.Document, options: RenderOptions) !void {

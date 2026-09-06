@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(
         usize,
         "expected_package_root_test_count",
-        if (!provider_enabled and test_filters.len == 0) 2171 else 0,
+        if (!provider_enabled and test_filters.len == 0) 2173 else 0,
     );
 
     const mod = mod: {
@@ -164,9 +164,12 @@ pub fn build(b: *std.Build) void {
 
     const diff_view_model_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff/view_model.zig"),
+            .root_source_file = b.path("src/diff_view_model_test.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+            },
         }),
         .filters = test_filters,
     });
@@ -174,9 +177,12 @@ pub fn build(b: *std.Build) void {
 
     const diff_search_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/diff/search.zig"),
+            .root_source_file = b.path("src/diff_search_test.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+            },
         }),
         .filters = test_filters,
     });

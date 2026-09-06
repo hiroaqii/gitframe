@@ -1222,17 +1222,50 @@ pub fn findingCardMaxBodyScroll(
     const text = try findingCardDisplayText(allocator, content);
     defer allocator.free(text);
     const rows = ui.Paragraph.init(.{ .text = text }).lineCount(width);
-    return rows -| 5;
+    return rows -| finding_card.body_rows;
 }
 
+pub const FindingCardLayout = struct {
+    // Coordinates are local to either the unified diff surface or one
+    // side-by-side pane. Keep the hunk-guide gutter and one blank cell before
+    // the left rail; reserve one blank cell after the right rail.
+    pub const border_left_col: u16 = diff_render.cursor_gutter_width + 1;
+    pub const content_col: u16 = border_left_col + 1;
+    pub const right_padding: u16 = 1;
+
+    pub fn borderRightCol(row_width: u16) ?u16 {
+        if (row_width <= border_left_col + right_padding) return null;
+        const right_col = row_width - 1 - right_padding;
+        return if (right_col > border_left_col) right_col else null;
+    }
+
+    pub fn expandedContentWidth(row_width: u16) u16 {
+        const right_col = borderRightCol(row_width) orelse return 0;
+        return right_col -| content_col;
+    }
+
+    pub fn collapsedContentWidth(row_width: u16) u16 {
+        return row_width -| content_col;
+    }
+};
+
 pub fn findingCardContentWidth(row_width: u16) u16 {
-    return row_width -| 1;
+    return FindingCardLayout.expandedContentWidth(row_width);
 }
 
 test "Finding card content width reserves the painter border across wrap boundaries" {
+    try std.testing.expectEqual(diff_render.cursor_gutter_width + 1, FindingCardLayout.border_left_col);
+    try std.testing.expectEqual(FindingCardLayout.border_left_col + 1, FindingCardLayout.content_col);
+    try std.testing.expect(FindingCardLayout.borderRightCol(5) == null);
+    try std.testing.expectEqual(@as(u16, 4), FindingCardLayout.borderRightCol(6).?);
+    try std.testing.expectEqual(@as(u16, 18), FindingCardLayout.borderRightCol(20).?);
     try std.testing.expectEqual(@as(u16, 0), findingCardContentWidth(0));
     try std.testing.expectEqual(@as(u16, 0), findingCardContentWidth(1));
-    try std.testing.expectEqual(@as(u16, 19), findingCardContentWidth(20));
+    try std.testing.expectEqual(@as(u16, 0), findingCardContentWidth(2));
+    try std.testing.expectEqual(@as(u16, 0), findingCardContentWidth(5));
+    try std.testing.expectEqual(@as(u16, 0), findingCardContentWidth(6));
+    try std.testing.expectEqual(@as(u16, 14), findingCardContentWidth(20));
+    try std.testing.expectEqual(@as(u16, 16), FindingCardLayout.collapsedContentWidth(20));
     const content: FindingCardContent = .{
         .producer = "agent",
         .model = null,

@@ -31,8 +31,8 @@ pub fn footerCopyTarget(row_width: u16) ?CellRange {
     const target_width = chasen.text.displayWidth(footer_copy_text);
     if (local_start + target_width > content_width) return null;
     return .{
-        .start = 1 + local_start,
-        .end = 1 + local_start + target_width,
+        .start = review_page.FindingCardLayout.content_col + local_start,
+        .end = review_page.FindingCardLayout.content_col + local_start + target_width,
     };
 }
 
@@ -56,11 +56,16 @@ pub const Painter = struct {
         const background: chasen.Color = if (focused) self.palette.color(.pane_cursor_bg) else .default;
         var line = surface.child(.{ .col = 0, .row = row, .width = surface.size().width, .height = 1 });
         line.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = background } });
-        const content_width = review_page.findingCardContentWidth(line.size().width);
+        if (expanded) paintExpandedBorder(&line, local_row, background, self.palette.color(.accent));
+        const content_width = if (expanded)
+            review_page.findingCardContentWidth(line.size().width)
+        else
+            review_page.FindingCardLayout.collapsedContentWidth(line.size().width);
         if (content_width == 0) return;
-        var content_line = line.child(.{ .col = 1, .row = 0, .width = content_width, .height = 1 });
+        const content_col = review_page.FindingCardLayout.content_col;
+        var content_line = line.child(.{ .col = content_col, .row = 0, .width = content_width, .height = 1 });
 
-        if (local_row == 0) {
+        if (local_row == finding_card.header_row) {
             const marker = if (expanded) "▼" else "▶";
             const severity = severityLabel(model.severity);
             const disposition = dispositionToken(self.human_review, model);
@@ -81,11 +86,11 @@ pub const Painter = struct {
             return;
         }
         if (!expanded) return;
-        if (local_row >= 1 and local_row <= 5) {
+        if (local_row >= finding_card.body_start_row and local_row < finding_card.footer_row) {
             const body = self.page.cachedFindingBody(model, content_line.size().width) orelse return;
-            const max_scroll = body.rowCount() -| 5;
+            const max_scroll = body.rowCount() -| finding_card.body_rows;
             const scroll = @min(self.page.finding_card.bodyScroll(model), max_scroll);
-            const text = preparedWrappedRow(body.text, body.row_starts, scroll + local_row - 1) orelse return;
+            const text = preparedWrappedRow(body.text, body.row_starts, scroll + local_row - finding_card.body_start_row) orelse return;
             _ = content_line.borrowTextAt(
                 0,
                 0,
@@ -94,7 +99,7 @@ pub const Painter = struct {
             );
             return;
         }
-        if (local_row == 6) {
+        if (local_row == finding_card.footer_row) {
             try draw.copyClippedTextAt(
                 &content_line,
                 0,
@@ -105,6 +110,57 @@ pub const Painter = struct {
         }
     }
 };
+
+fn paintExpandedBorder(
+    line: *chasen.Surface,
+    local_row: usize,
+    background: chasen.Color,
+    foreground: chasen.Color,
+) void {
+    const width = line.size().width;
+    const left_col = review_page.FindingCardLayout.border_left_col;
+    const right_col = review_page.FindingCardLayout.borderRightCol(width) orelse return;
+    const style: chasen.TextStyle = .{ .fg = foreground, .bg = background };
+    const left = if (local_row == finding_card.header_row) "╭" else if (local_row == finding_card.footer_row) "╰" else "│";
+    const right = if (local_row == finding_card.header_row) "╮" else if (local_row == finding_card.footer_row) "╯" else "│";
+    _ = line.borrowTextAt(left_col, 0, left, style);
+    _ = line.borrowTextAt(right_col, 0, right, style);
+    if ((local_row == finding_card.header_row or local_row == finding_card.footer_row) and right_col > left_col + 1) {
+        line.fill(
+            .{ .col = left_col + 1, .row = 0, .width = right_col - left_col - 1, .height = 1 },
+            .{ .char = .{ .grapheme = "─", .width = 1 }, .style = style },
+        );
+    }
+}
+
+test "expanded Finding border paints inset rounded rails around all ten rows" {
+    var rendered: chasen.testing.TestSurface = undefined;
+    try rendered.init(20, 3);
+    defer rendered.deinit();
+
+    const rows = [_]usize{ finding_card.header_row, finding_card.body_start_row, finding_card.footer_row };
+    for (rows, 0..) |local_row, surface_row| {
+        var line = rendered.surface.child(.{
+            .col = 0,
+            .row = @intCast(surface_row),
+            .width = rendered.surface.size().width,
+            .height = 1,
+        });
+        paintExpandedBorder(&line, local_row, .default, .default);
+    }
+
+    const left = review_page.FindingCardLayout.border_left_col;
+    const right = review_page.FindingCardLayout.borderRightCol(20).?;
+    try rendered.expectCellText(left, 0, "╭");
+    try rendered.expectCellText(left + 1, 0, "─");
+    try rendered.expectCellText(right, 0, "╮");
+    try rendered.expectCellText(left, 1, "│");
+    try rendered.expectCellText(right, 1, "│");
+    try rendered.expectCellText(left, 2, "╰");
+    try rendered.expectCellText(left + 1, 2, "─");
+    try rendered.expectCellText(right, 2, "╯");
+    try rendered.expectCellText(right + 1, 2, " ");
+}
 
 fn dispositionToken(
     presentation: ?human_review_session.Presentation,
@@ -249,12 +305,13 @@ test "Finding disposition header token requires one exact session value" {
 
 test "Finding pointer copy target follows the fully visible card footer" {
     const wide = footerCopyTarget(80).?;
-    const content_start: usize = wide.start - 1;
-    const content_end: usize = wide.end - 1;
+    const content_start: usize = wide.start - review_page.FindingCardLayout.content_col;
+    const content_end: usize = wide.end - review_page.FindingCardLayout.content_col;
     try std.testing.expectEqualStrings(footer_copy_text, footer_text[content_start..content_end]);
     try std.testing.expect(wide.contains(wide.start));
     try std.testing.expect(wide.contains(wide.end - 1));
     try std.testing.expect(!wide.contains(wide.end));
-    try std.testing.expect(footerCopyTarget(wide.end - 1) == null);
-    try std.testing.expectEqualDeep(wide, footerCopyTarget(wide.end).?);
+    const minimum_row_width = wide.end + 1 + review_page.FindingCardLayout.right_padding;
+    try std.testing.expect(footerCopyTarget(minimum_row_width - 1) == null);
+    try std.testing.expectEqualDeep(wide, footerCopyTarget(minimum_row_width).?);
 }
