@@ -5,6 +5,7 @@ const chasen = @import("chasen");
 const draw = @import("draw");
 const theme = @import("theme");
 const finding_card = @import("../../../ai_review/finding_card.zig");
+const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const committed_review = @import("../../../committed_review.zig");
 const diff_render = @import("../../../diff/render.zig");
 const human_review_session = @import("../../human_review_session.zig");
@@ -66,18 +67,14 @@ pub const Painter = struct {
         var content_line = line.child(.{ .col = content_col, .row = 0, .width = content_width, .height = 1 });
 
         if (local_row == finding_card.header_row) {
-            const marker = if (expanded) "▼" else "▶";
-            const severity = severityLabel(model.severity);
             const disposition = dispositionToken(self.human_review, model);
-            const header = if (content.model) |producer_model|
-                if (disposition) |disposition_label|
-                    try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] [{s}] {s}/{s}  {s}", .{ marker, severity, disposition_label, content.producer, producer_model, firstLine(content.title) })
-                else
-                    try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] {s}/{s}  {s}", .{ marker, severity, content.producer, producer_model, firstLine(content.title) })
-            else if (disposition) |disposition_label|
-                try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] [{s}] {s}  {s}", .{ marker, severity, disposition_label, content.producer, firstLine(content.title) })
-            else
-                try std.fmt.allocPrint(content_line.frameAllocator(), "{s} [{s}] {s}  {s}", .{ marker, severity, content.producer, firstLine(content.title) });
+            const header = try findingHeader(
+                content_line.frameAllocator(),
+                model,
+                expanded,
+                disposition,
+                content.title,
+            );
             try draw.copyClippedTextAt(&content_line, 0, 0, header, .{
                 .fg = severityColor(self.palette, model.severity),
                 .bg = background,
@@ -191,6 +188,48 @@ fn severityLabel(severity: committed_review.Severity) []const u8 {
     };
 }
 
+fn findingHeader(
+    allocator: std.mem.Allocator,
+    model: finding_card.FindingCardModel,
+    expanded: bool,
+    disposition: ?[]const u8,
+    title: []const u8,
+) ![]const u8 {
+    var location_buffer: [32]u8 = undefined;
+    const location = try findingLocationLabel(&location_buffer, model.side, model.anchor_range);
+    const marker = if (expanded) "▼" else "▶";
+    const severity = severityLabel(model.severity);
+    if (disposition) |disposition_label| return std.fmt.allocPrint(
+        allocator,
+        "{s} [{s}] [{s}] {s}  {s}",
+        .{ marker, severity, disposition_label, location, firstLine(title) },
+    );
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} [{s}] {s}  {s}",
+        .{ marker, severity, location, firstLine(title) },
+    );
+}
+
+fn findingLocationLabel(
+    buffer: []u8,
+    anchor_side: committed_review.AnchorSide,
+    anchor_range: finding_card.AnchorRange,
+) ![]const u8 {
+    const side_label = switch (anchor_side) {
+        .before => "old",
+        .after => "new",
+    };
+    if (anchor_range.start_line == anchor_range.end_line) {
+        return std.fmt.bufPrint(buffer, "{s}:L{d}", .{ side_label, anchor_range.start_line });
+    }
+    return std.fmt.bufPrint(
+        buffer,
+        "{s}:L{d}–{d}",
+        .{ side_label, anchor_range.start_line, anchor_range.end_line },
+    );
+}
+
 fn severityColor(palette: theme.Palette, severity: committed_review.Severity) chasen.Color {
     return switch (severity) {
         .info => palette.color(.accent),
@@ -290,6 +329,7 @@ test "Finding disposition header token requires one exact session value" {
         .finding_id = "F-1",
         .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 0, .last_diff_line_ordinal = 0 },
         .side = .after,
+        .anchor_range = .{ .start_line = 9, .end_line = 9 },
         .severity = .info,
     };
     try std.testing.expectEqualStrings("U", dispositionToken(presentation, model).?);
@@ -301,6 +341,27 @@ test "Finding disposition header token requires one exact session value" {
     missing.finding_id = "F-2";
     try std.testing.expect(dispositionToken(presentation, missing) == null);
     try std.testing.expect(dispositionToken(null, model) == null);
+}
+
+test "Finding headers show one-line and ranged anchor locations" {
+    var model: finding_card.FindingCardModel = .{
+        .identity = std.mem.zeroes(finding_projection.Identity),
+        .entry_index = 0,
+        .finding_id = "F-location",
+        .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 3 },
+        .side = .after,
+        .anchor_range = .{ .start_line = 9, .end_line = 9 },
+        .severity = .warning,
+    };
+    const one_line = try findingHeader(std.testing.allocator, model, false, null, "Title\nbody");
+    defer std.testing.allocator.free(one_line);
+    try std.testing.expectEqualStrings("▶ [warning] new:L9  Title", one_line);
+
+    model.side = .before;
+    model.anchor_range = .{ .start_line = 12, .end_line = 18 };
+    const range = try findingHeader(std.testing.allocator, model, true, "A", "Range title");
+    defer std.testing.allocator.free(range);
+    try std.testing.expectEqualStrings("▼ [warning] [A] old:L12–18  Range title", range);
 }
 
 test "Finding pointer copy target follows the fully visible card footer" {

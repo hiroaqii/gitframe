@@ -1612,6 +1612,7 @@ test "Review inline Finding coordinator preserves raw scroll until card row geom
             .finding_id = "first",
             .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
             .side = .after,
+            .anchor_range = .{ .start_line = 1, .end_line = 1 },
             .severity = .warning,
         },
         .{
@@ -1620,6 +1621,7 @@ test "Review inline Finding coordinator preserves raw scroll until card row geom
             .finding_id = "second",
             .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
             .side = .after,
+            .anchor_range = .{ .start_line = 1, .end_line = 1 },
             .severity = .warning,
         },
     };

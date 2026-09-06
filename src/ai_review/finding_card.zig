@@ -1,7 +1,8 @@
 //! Projection-only Finding card identity, state, and semantic row plan.
 //!
 //! Payload text remains owned by the selected Review run. This module knows
-//! only exact projection identity and diff-model coordinates.
+//! only exact projection identity, admitted anchor metadata, and diff-model
+//! coordinates.
 
 const std = @import("std");
 const committed = @import("../committed_review.zig");
@@ -23,12 +24,18 @@ test "Finding card expanded geometry is one header eight body rows and one foote
     try std.testing.expectEqual(@as(usize, 10), expanded_rows);
 }
 
+pub const AnchorRange = struct {
+    start_line: u32,
+    end_line: u32,
+};
+
 pub const FindingCardModel = struct {
     identity: projection.Identity,
     entry_index: usize,
     finding_id: []const u8,
     span: projection.ModelSpan,
     side: committed.AnchorSide,
+    anchor_range: AnchorRange,
     severity: committed.Severity,
 
     pub fn init(index: *const projection.FindingProjectionIndex, entry_index: usize) ?FindingCardModel {
@@ -44,6 +51,10 @@ pub const FindingCardModel = struct {
             .finding_id = entry.finding_id,
             .span = span,
             .side = entry.side,
+            .anchor_range = .{
+                .start_line = entry.start_line,
+                .end_line = entry.end_line,
+            },
             .severity = entry.severity,
         };
     }
@@ -447,6 +458,7 @@ fn testModel(identity: projection.Identity, entry_index: usize, id: []const u8, 
             .last_diff_line_ordinal = line,
         },
         .side = .after,
+        .anchor_range = .{ .start_line = 1, .end_line = 1 },
         .severity = .warning,
     };
 }

@@ -15,6 +15,7 @@ const selection_action = @import("../selection_action.zig");
 const app_state = @import("../state.zig");
 const view_primitives = @import("../view_primitives.zig");
 const diff_render = @import("../../diff/render.zig");
+const diff_selection_model = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const file_search = @import("file_search.zig");
@@ -507,6 +508,20 @@ pub const StatusOnlyRenderer = struct {
     }
 };
 
+/// Page-provided additions to the primary parsed-diff presentation. A passive
+/// selection is visual only and never replaces an active user selection.
+pub const PrimaryPresentation = struct {
+    inline_row_painter: ?diff_render.InlineRowPainter = null,
+    passive_selection: ?diff_selection_model.View = null,
+
+    fn effectiveSelection(
+        self: PrimaryPresentation,
+        active: ?diff_selection_model.View,
+    ) ?diff_selection_model.View {
+        return active orelse self.passive_selection;
+    }
+};
+
 /// Draw the selected shared diff body, delegating resolver-projected content
 /// and an optional page-only status row through synchronous capabilities.
 pub fn viewDiffPane(
@@ -516,7 +531,7 @@ pub fn viewDiffPane(
     palette: theme.Palette,
     status_only: ?StatusOnlyRenderer,
     display_mode_toggle_key: ?[]const u8,
-    inline_row_painter: ?diff_render.InlineRowPainter,
+    primary_presentation: PrimaryPresentation,
 ) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
@@ -560,10 +575,10 @@ pub fn viewDiffPane(
                 .folded_hunks = loaded.foldedHunksForFile(file_index),
                 .palette = palette,
                 .syntax = .initDirect(&loaded.syntax_spans, file_index),
-                .selection = body.diffSelectionView(),
+                .selection = primary_presentation.effectiveSelection(body.diffSelectionView()),
                 .header_selection = body.diffHeaderSelectionActive(),
                 .presentation_rows = if (body.view.presentation_rows) |rows| rows.* else null,
-                .inline_row_painter = inline_row_painter,
+                .inline_row_painter = primary_presentation.inline_row_painter,
             });
         },
     }
@@ -576,6 +591,24 @@ pub fn viewDiffPane(
         palette,
     );
     drawSearchMatchMarkerAt(surface, state, palette, if (state.search.match_offset) |offset| body.sourceToPresentationOffset(offset) else null);
+}
+
+test "primary diff presentation preserves active selection precedence" {
+    const passive: diff_selection_model.View = .{
+        .identity = .{ .generated_file = .{ .path_key = "passive" } },
+        .side = .new,
+        .start = diff_selection_model.pointFromLine(0, 1),
+        .end = diff_selection_model.pointFromLine(0, 2),
+    };
+    const active: diff_selection_model.View = .{
+        .identity = .{ .generated_file = .{ .path_key = "active" } },
+        .side = .old,
+        .start = diff_selection_model.pointFromLine(1, 3),
+        .end = diff_selection_model.pointFromLine(1, 4),
+    };
+    const presentation: PrimaryPresentation = .{ .passive_selection = passive };
+    try std.testing.expectEqualDeep(passive, presentation.effectiveSelection(null).?);
+    try std.testing.expectEqualDeep(active, presentation.effectiveSelection(active).?);
 }
 
 /// Shared projected-body presentation for inert/status content. Page adapters
@@ -804,12 +837,12 @@ test "diff pane evaluates resolver entries only for its selected body terminal" 
     try ts.init(80, 10);
     defer ts.deinit();
 
-    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null, null);
+    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null, .{});
     try std.testing.expectEqual(@as(usize, 1), fake.resolved);
     try std.testing.expectEqual(@as(usize, 0), fake.hunk_stage + fake.generated + fake.displayed_file + fake.line_index + fake.unexpected);
 
     fake = .{ .kind = .primary, .loaded = &loaded };
-    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null, null);
+    try viewDiffPane(&ts.surface, body, loaded, .default(), null, null, .{});
     try std.testing.expectEqual(@as(usize, 3), fake.resolved);
     try std.testing.expectEqual(@as(usize, 1), fake.hunk_stage);
     try std.testing.expectEqual(@as(usize, 1), fake.generated);

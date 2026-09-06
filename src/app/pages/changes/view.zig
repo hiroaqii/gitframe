@@ -245,7 +245,7 @@ pub fn viewDiffPane(app: Context, surface: *chasen.Surface, loaded: loaded_diff.
         app.theme,
         status_renderer,
         mode_toggle_key,
-        null,
+        .{},
     );
 }
 

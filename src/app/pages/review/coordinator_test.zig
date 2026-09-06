@@ -2078,7 +2078,7 @@ test "Finding cache lifecycle admission failure preserves the previous selected 
     );
 }
 
-test "Finding card admission rejects a copied mismatched side" {
+test "Finding card admission rejects copied mismatched projection fields" {
     const allocator = std.testing.allocator;
     var harness = try FindingNavigationHarness.init(allocator, true);
     defer harness.deinit(allocator);
@@ -2094,6 +2094,9 @@ test "Finding card admission rejects a copied mismatched side" {
             .before => .after,
             .after => .before,
         };
+        try std.testing.expect(review_page.findingCardContent(selection, mismatched) == null);
+        mismatched = admitted;
+        mismatched.anchor_range.end_line += 1;
         try std.testing.expect(review_page.findingCardContent(selection, mismatched) == null);
     }
 }

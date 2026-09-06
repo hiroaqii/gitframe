@@ -730,6 +730,7 @@ test "Review Finding card frame admission omits unresolved coordinates and repor
         .finding_id = "valid",
         .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
         .side = .after,
+        .anchor_range = .{ .start_line = 2, .end_line = 2 },
         .severity = .warning,
     };
     var unresolved = valid;

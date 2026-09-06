@@ -9,7 +9,9 @@ const review_page = @import("../review.zig");
 const commit_time = @import("../../branch_commit_time.zig");
 const review_navigation = @import("navigation.zig");
 const diff_surface = @import("../../diff_surface.zig");
+const diff_file = @import("../../../diff/file.zig");
 const diff_render = @import("../../../diff/render.zig");
+const diff_selection = @import("../../../diff/selection.zig");
 const file_tree = @import("../../../file_tree.zig");
 const keymap = @import("keymap");
 const page_header = @import("../../page_header.zig");
@@ -18,8 +20,10 @@ const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const human_review_session = @import("../../human_review_session.zig");
 const human_review_decision = @import("human_review_decision.zig");
+const finding_card = @import("../../../ai_review/finding_card.zig");
 const finding_card_view = @import("finding_card_view.zig");
 const finding_projection = @import("../../../ai_review/finding_projection.zig");
+const loaded_diff = @import("../../../loaded_diff.zig");
 
 pub const Context = struct {
     page: *const review_page.ReviewPageState,
@@ -911,11 +915,20 @@ const DiffPaneAdapter = struct {
         return .{ .ctx = self, .render_fn = render };
     }
 
-    fn render(ctx: *anyopaque, surface: *chasen.Surface, loaded: @import("../../../loaded_diff.zig").LoadedDiff) !void {
+    fn render(ctx: *anyopaque, surface: *chasen.Surface, loaded: loaded_diff.LoadedDiff) !void {
         const self: *DiffPaneAdapter = @ptrCast(@alignCast(ctx));
         var frame = self.context.cachedFindingCardFrame();
         const rows = if (frame) |*value| &value.presentation_rows else null;
         const context = self.context.withPresentationRows(rows);
+        const finding_highlight = if (frame) |*value|
+            focusedFindingHighlight(
+                context.page.finding_card,
+                &value.row_plan,
+                &loaded,
+                context.view().selectedFileIndex(&loaded),
+            )
+        else
+            null;
         var adapter = context.resolver();
         var card_painter: finding_card_view.Painter = undefined;
         const painter: ?diff_render.InlineRowPainter = if (frame) |*value| blk: {
@@ -934,10 +947,72 @@ const DiffPaneAdapter = struct {
             self.palette,
             null,
             self.mode_toggle_key,
-            painter,
+            .{
+                .inline_row_painter = painter,
+                .passive_selection = finding_highlight,
+            },
         );
     }
 };
+
+fn focusedFindingHighlight(
+    state: finding_card.State,
+    row_plan: *const finding_card.RowPlan,
+    loaded: *const loaded_diff.LoadedDiff,
+    selected_file: ?usize,
+) ?diff_selection.View {
+    const file_index = selected_file orelse return null;
+    if (file_index >= loaded.document.files.len) return null;
+    for (row_plan.cards) |model| {
+        if (!state.matches(model) or model.span.file_ordinal != file_index) continue;
+        const path_key = diff_file.canonicalPathKey(loaded.document.files[file_index]) orelse return null;
+        return .{
+            .identity = .{ .loaded_file = .{ .file_index = file_index, .path_key = path_key } },
+            .side = switch (model.side) {
+                .before => .old,
+                .after => .new,
+            },
+            .mode = .line,
+            .start = diff_selection.pointFromLine(model.span.hunk_ordinal, model.span.first_diff_line_ordinal),
+            .end = diff_selection.pointFromLine(model.span.hunk_ordinal, model.span.last_diff_line_ordinal),
+        };
+    }
+    return null;
+}
+
+test "focused Finding highlight binds the admitted span to its loaded file" {
+    const test_support = @import("../../test_support.zig");
+    var loaded = test_support.loadedDiffOne();
+    var cards = [_]finding_card.FindingCardModel{.{
+        .identity = std.mem.zeroes(finding_projection.Identity),
+        .entry_index = 0,
+        .finding_id = "F-highlight",
+        .span = .{ .file_ordinal = 0, .hunk_ordinal = 1, .first_diff_line_ordinal = 0, .last_diff_line_ordinal = 2 },
+        .side = .after,
+        .anchor_range = .{ .start_line = 20, .end_line = 21 },
+        .severity = .warning,
+    }};
+    const row_plan: finding_card.RowPlan = .{ .groups = &.{}, .cards = &cards };
+    var state: finding_card.State = .unfocused;
+    try std.testing.expect(focusedFindingHighlight(state, &row_plan, &loaded, 0) == null);
+
+    _ = state.apply(.{ .focus = cards[0] });
+    const after = focusedFindingHighlight(state, &row_plan, &loaded, 0).?;
+    try std.testing.expect(after.identity.matchesLoadedFile(0, loaded.document.files[0]));
+    try std.testing.expectEqual(diff_selection.Side.new, after.side);
+    try std.testing.expectEqual(diff_selection.Mode.line, after.mode);
+    try std.testing.expect(after.start.eql(diff_selection.pointFromLine(1, 0)));
+    try std.testing.expect(after.end.eql(diff_selection.pointFromLine(1, 2)));
+
+    cards[0].side = .before;
+    try std.testing.expectEqual(
+        diff_selection.Side.old,
+        focusedFindingHighlight(state, &row_plan, &loaded, 0).?.side,
+    );
+    cards[0].span.file_ordinal = 1;
+    try std.testing.expect(focusedFindingHighlight(state, &row_plan, &loaded, 0) == null);
+    try std.testing.expect(focusedFindingHighlight(state, &row_plan, &loaded, null) == null);
+}
 
 fn navigationView(app: Context) review_navigation.View {
     var key_buffer: [16]u8 = undefined;

@@ -1155,6 +1155,8 @@ pub fn findingCardContent(
     if (!std.mem.eql(u8, entry.finding_id, model.finding_id) or
         !std.mem.eql(u8, finding.finding_id.bytes, model.finding_id) or
         !std.meta.eql(span, model.span) or entry.side != model.side or
+        entry.start_line != model.anchor_range.start_line or
+        entry.end_line != model.anchor_range.end_line or
         entry.severity != model.severity) return null;
     const producer = selection.artifacts.findings.value.producer;
     return .{
@@ -1284,7 +1286,7 @@ test "Finding presentation cache boundary capacity stays below five MiB" {
         @sizeOf(usize) +
         @sizeOf(diff_render.InlineBlockInput) * 2 +
         @sizeOf(diff_render.InlineBlock) * 2;
-    try std.testing.expectEqual(@as(usize, 856), per_entry);
+    try std.testing.expectEqual(@as(usize, 872), per_entry);
     const maximum_display = "Producer: ".len + committed_review.limits.max_short_text_bytes +
         "\nModel: ".len + committed_review.limits.max_short_text_bytes +
         "\n\n".len + committed_review.limits.max_body_bytes +
@@ -1292,7 +1294,7 @@ test "Finding presentation cache boundary capacity stays below five MiB" {
     try std.testing.expectEqual(@as(usize, 131_618), maximum_display);
     const logical_capacity = committed_review.limits.max_findings * per_entry +
         maximum_display + (maximum_display + 1) * @sizeOf(usize);
-    try std.testing.expectEqual(@as(usize, 4_690_746), logical_capacity);
+    try std.testing.expectEqual(@as(usize, 4_756_282), logical_capacity);
     try std.testing.expect(logical_capacity < 5 * 1024 * 1024);
 }
 
