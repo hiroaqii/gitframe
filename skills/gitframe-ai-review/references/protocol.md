@@ -42,6 +42,12 @@ prepare once, receives fresh identifiers, and creates one private `0700`
 workspace beneath the platform temporary root. The raw 256-bit nonce appears
 only in the `ready` handoff; `invocation.json` stores its SHA-256 digest.
 
+The invocation binds caller-supplied agent provenance before publication.
+`producer.name` identifies the agent product performing the semantic review,
+not this Skill or GitFrame. Optional `model` and `version` identify that exact
+agent execution only when known. The driver supplies `skill_version`; it does
+not substitute the GitFrame executable version for agent provenance.
+
 `complete` admits the exact direct-child workspace, ownership/mode, nonce,
 saved input hashes and candidate inventory. Pre-publication failures do not
 call publish. Valid input calls `review-producer artifacts` once, verifies the

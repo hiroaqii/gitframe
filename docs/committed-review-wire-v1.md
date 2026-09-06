@@ -118,6 +118,13 @@ Canonical top-level writer order is fixed:
 | `review_state.json` | `schema_version`, `review_id`, `target`, `findings_digest`, `revision`, optional `summary`, `finding_dispositions`, `anchored_notes` |
 | `result.json` | `schema_version`, `review_id`, `target`, `findings_digest`, `result`, `completed_at`, optional `summary`, `finding_dispositions`, `anchored_notes` |
 
+`producer.name` identifies the agent product that performed the semantic
+review, rather than an orchestration Skill or GitFrame itself. Optional
+`producer.model` and `producer.version` identify that agent execution only when
+their exact values are known. Optional `producer.skill_version` independently
+identifies the orchestration Skill release. Producers omit unknown optional
+values rather than inferring or substituting unrelated component versions.
+
 `FindingSet.created_at` is required. It is the UTC second at which the producer completed one immutable FindingSet, in the exact RFC 3339 form `YYYY-MM-DDTHH:MM:SSZ`. The producer obtains it once and writes the same string to `findings.json` and `manifest.json`. The manifest copy is a lightweight history-index projection; cross-artifact admission requires byte-for-byte equality and reports a projection mismatch separately from a digest mismatch. A publish retry for one immutable Run retains the original findings bytes and timestamp. Rerunning review creates a new review ID and timestamp.
 
 `created_at` is provenance and display metadata. It is not review-request time, Store publication time, human decision time, target identity, anchor placement, or authorization authority. History ordering remains based on manifest `created_at`.

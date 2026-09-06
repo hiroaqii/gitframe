@@ -33,8 +33,19 @@ Start a review with:
 python3 -I <agent-skill-root>/gitframe-ai-review/scripts/review.py begin \
   --gitframe <absolute-gitframe> \
   --repository <absolute-repository> \
-  --base <commit-ish> [--head <commit-ish>]
+  --base <commit-ish> \
+  --producer-name <agent-product> \
+  [--producer-model <exact-model-id>] \
+  [--producer-version <exact-agent-version>] \
+  [--head <commit-ish>]
 ```
+
+The invoking agent supplies its stable product name (`codex` for Codex or
+`claude-code` for Claude Code) without asking the user. It supplies the
+optional model and agent version only when their exact current identifiers are
+available, and omits unknown values rather than guessing. The driver records
+its own Skill version; the GitFrame executable version is not producer
+metadata.
 
 If `--head` is omitted, the exact head commit-ish is `HEAD`. A `no_changes`
 terminal is complete and creates no Review ID. A `ready` terminal names a

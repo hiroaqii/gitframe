@@ -107,6 +107,10 @@ REVIEW_ID = "123e4567-e89b-42d3-a456-426614174000"
 TARGET = {"object_format": "sha1", "source_kind": "branch_range", "base_oid": "1" * 40,
     "head_oid": "2" * 40, "diff_base_oid": "1" * 40}
 FINDINGS_DIGEST = review.digest(b"findings\n")
+PRODUCER_ARGS = ("--producer-name", "codex", "--producer-model", "gpt-test",
+    "--producer-version", "codex-test")
+PRODUCER = {"name": "codex", "model": "gpt-test", "version": "codex-test",
+    "skill_version": "0.1.0"}
 EXPECTED = {"review_repository_id": "223e4567-e89b-42d3-a456-426614174000",
     "target": TARGET, "producer": {"name": "test", "model": "fixture", "version": "1",
         "skill_version": "0.1.0"}, "created_at": "2026-08-29T00:00:00Z", "finding_count": 3,
@@ -142,9 +146,9 @@ class DriverTests(unittest.TestCase):
         completed = self.invoke_raw(*arguments, extra=extra)
         return completed, json.loads(completed.stdout)
 
-    def start(self, extra=None):
+    def start(self, extra=None, producer_args=PRODUCER_ARGS):
         return self.invoke("begin", "--gitframe", str(self.fake), "--repository",
-            str(self.repository), "--base", "main", extra=extra)
+            str(self.repository), "--base", "main", *producer_args, extra=extra)
 
     def candidate(self, handoff):
         path = Path(handoff["workspace"]) / "candidate-0001.json"
@@ -180,6 +184,40 @@ class DriverTests(unittest.TestCase):
                 completed, result = self.invoke(*arguments)
                 expected = {"status": "error", "schema_version": 1,
                     "code": "invalid_arguments", "message": "review driver arguments are invalid"}
+                self.assertEqual((completed.returncode, completed.stderr, result), (1, b"", expected))
+                self.assertEqual(completed.stdout, review.encoded(expected))
+                self.assertEqual(self.events(), [])
+
+    def test_begin_records_exact_caller_provenance_without_gitframe_version(self):
+        completed, handoff = self.start()
+        self.assertEqual((completed.returncode, handoff["status"]), (0, "ready"))
+        workspace = Path(handoff["workspace"])
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        invocation = json.loads((workspace / "invocation.json").read_bytes())
+        self.assertEqual(invocation["producer"], PRODUCER)
+        self.assertNotIn("0.0.0-test", invocation["producer"].values())
+
+        completed, handoff = self.start(producer_args=("--producer-name", "claude-code"))
+        self.assertEqual((completed.returncode, handoff["status"]), (0, "ready"))
+        workspace = Path(handoff["workspace"])
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        invocation = json.loads((workspace / "invocation.json").read_bytes())
+        self.assertEqual(invocation["producer"], {
+            "name": "claude-code", "skill_version": "0.1.0"})
+
+    def test_begin_rejects_missing_or_invalid_provenance_before_children(self):
+        base = ("begin", "--gitframe", str(self.fake), "--repository",
+            str(self.repository), "--base", "main")
+        cases = [base, base + ("--producer-name",),
+            base + ("--producer-name", "codex", "--producer-model")]
+        for flag in ("--producer-name", "--producer-model", "--producer-version"):
+            prefix = base if flag == "--producer-name" else base + ("--producer-name", "codex")
+            cases.extend(prefix + (flag, value) for value in ("", "bad\x1bvalue", "x" * 257))
+        expected = {"status": "error", "schema_version": 1,
+            "code": "invalid_arguments", "message": "review driver arguments are invalid"}
+        for arguments in cases:
+            with self.subTest(arguments=arguments[:8], size=len(arguments[-1])):
+                completed, result = self.invoke(*arguments)
                 self.assertEqual((completed.returncode, completed.stderr, result), (1, b"", expected))
                 self.assertEqual(completed.stdout, review.encoded(expected))
                 self.assertEqual(self.events(), [])
@@ -394,7 +432,8 @@ class DriverTests(unittest.TestCase):
 
     def test_candidate_aggregate_limit_stops_before_artifacts_and_cleans(self):
         begin_args = types.SimpleNamespace(gitframe=str(self.fake), repository=str(self.repository),
-            base="main", head=None)
+            base="main", head=None, producer_name="codex", producer_model=None,
+            producer_version=None)
         with mock.patch.dict(os.environ, self.environment, clear=False):
             handoff = review.begin(begin_args)
             self.addCleanup(shutil.rmtree, handoff["workspace"], ignore_errors=True)
@@ -437,7 +476,9 @@ class DriverTests(unittest.TestCase):
         read = subprocess.run([str(self.fake), "review-store-read"], input=review.encoded(request),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.environment, check=False)
         self.assertEqual((read.returncode, json.loads(read.stdout)["lifecycle"]), (0, "published"))
-        wrong_request = dict(request, repository=review.repository_wire(str(self.repository)))
+        noncanonical_repository = (encoded_repository[:-1] if encoded_repository.endswith("=")
+            else encoded_repository + "=")
+        wrong_request = dict(request, repository={"path_bytes_b64": noncanonical_repository})
         rejected = subprocess.run([str(self.fake), "review-store-read"],
             input=review.encoded(wrong_request), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=self.environment, check=False)
@@ -458,7 +499,8 @@ class DriverTests(unittest.TestCase):
 
     def test_cleanup_residue_preserves_terminal_and_next_begin_is_fresh(self):
         begin_args = types.SimpleNamespace(gitframe=str(self.fake), repository=str(self.repository),
-            base="main", head=None)
+            base="main", head=None, producer_name="codex", producer_model=None,
+            producer_version=None)
         with mock.patch.dict(os.environ, self.environment, clear=False):
             first = review.begin(begin_args)
             self.addCleanup(shutil.rmtree, first["workspace"], ignore_errors=True)

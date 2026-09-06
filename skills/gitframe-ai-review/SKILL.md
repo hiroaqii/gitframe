@@ -17,8 +17,19 @@ Run from any directory, with absolute executable and repository paths:
 python3 -I <skill>/scripts/review.py begin \
   --gitframe <absolute-gitframe> \
   --repository <absolute-repository> \
-  --base <commit-ish> [--head <commit-ish>]
+  --base <commit-ish> \
+  --producer-name <agent-product> \
+  [--producer-model <exact-model-id>] \
+  [--producer-version <exact-agent-version>] \
+  [--head <commit-ish>]
 ```
+
+Supply the stable product name of the agent performing the semantic review:
+use `codex` for Codex and `claude-code` for Claude Code. Supply model and agent
+version only when their exact current identifiers are available; omit unknown
+values rather than inferring them, and do not ask the user to identify the
+current agent. These are agent provenance, not the Skill or GitFrame executable
+identity. The driver adds its own `skill_version`.
 
 Stop on `no_changes`. On `ready`, retain the exact `workspace` and
 `workspace_nonce` from stdout. Read `input.json` for the complete summary and

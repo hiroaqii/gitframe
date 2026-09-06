@@ -17,7 +17,6 @@ import tempfile
 import time
 
 SCHEMA = 1
-PRODUCER_NAME = "gitframe-ai-review"
 SKILL_VERSION = "0.1.0"
 CAPABILITIES = {
     "ai-review.input",
@@ -172,6 +171,14 @@ def validate_text(value, maximum, multiline):
         if (codepoint in (0x00, 0x1b, 0x0d, 0x7f) or 0x80 <= codepoint <= 0x9f
                 or (codepoint < 0x20 and not (multiline and character in "\n\t"))):
             raise ValueError("text control")
+
+
+def producer_argument(value):
+    try:
+        validate_text(value, 256, False)
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("invalid producer metadata") from error
+    return value
 
 
 def validate_timestamp(value):
@@ -418,8 +425,12 @@ def begin(args):
     workspace = tempfile.mkdtemp(prefix=PREFIX)
     os.chmod(workspace, 0o700)
     nonce = secrets.token_hex(32)
-    producer = {"name": PRODUCER_NAME, "version": capabilities["gitframe_version"],
-        "skill_version": SKILL_VERSION}
+    producer = {"name": args.producer_name}
+    if args.producer_model is not None:
+        producer["model"] = args.producer_model
+    if args.producer_version is not None:
+        producer["version"] = args.producer_version
+    producer["skill_version"] = SKILL_VERSION
     inventory = []
     try:
         directory_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
@@ -760,6 +771,9 @@ def parser():
     start.add_argument("--gitframe", required=True)
     start.add_argument("--repository", required=True)
     start.add_argument("--base", required=True)
+    start.add_argument("--producer-name", required=True, type=producer_argument)
+    start.add_argument("--producer-model", type=producer_argument)
+    start.add_argument("--producer-version", type=producer_argument)
     start.add_argument("--head")
     finish = actions.add_parser("complete")
     finish.add_argument("--workspace", required=True)
