@@ -18,6 +18,7 @@ const changes_page = @import("pages/changes.zig");
 const changes_content = @import("pages/changes/content.zig");
 const changes_navigation = @import("pages/changes/navigation.zig");
 const changes_authority = @import("diff_surface/authority.zig");
+const committed_review = @import("../committed_review.zig");
 const context = @import("../context.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const diff_source = @import("../diff/source.zig");
@@ -214,7 +215,7 @@ test "page transition blocker leaves page and Changes state unchanged" {
     try std.testing.expect(app.pages.review.activation.state == .inactive);
 }
 
-test "Review mouse selection and base picker block App page transitions" {
+test "Review transient owners block page transitions while direct reload does not" {
     const allocator = std.testing.allocator;
     var app: TestApp = .{ .allocator = allocator, .active_page = .review };
     defer app.pages.review.deinit(allocator);
@@ -244,6 +245,14 @@ test "Review mouse selection and base picker block App page transitions" {
     try requestPageSwitchForTest(&app, &ctx, .config);
     try std.testing.expectEqual(page.Id.review, app.active_page);
     try std.testing.expectEqualStrings("finish Review search before switching pages", app.status.text());
+
+    app.pages.review.search.mode = false;
+    const review_id = try committed_review.ReviewId.parse("723e4567-e89b-42d3-a456-426614174000");
+    app.pages.review.ai_reviews.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = true } };
+    try std.testing.expect(app.pages.review.ai_reviews.isOpen());
+    try std.testing.expect(!app.pages.review.ai_reviews.isPickerVisible());
+    try requestPageSwitchForTest(&app, &ctx, .config);
+    try std.testing.expectEqual(page.Id.config, app.active_page);
 }
 
 test "Review retained selection survives page transitions and clears on repository replacement" {

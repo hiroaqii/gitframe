@@ -348,6 +348,17 @@ pub const AiReviewsPickerState = struct {
         return self.phase != .closed;
     }
 
+    /// Direct selection reloads refresh the already-visible pinned Review and
+    /// do not present the keyboard-owned Reviews picker. A failure remains
+    /// visible so retry and close actions stay available.
+    pub fn isPickerVisible(self: *const AiReviewsPickerState) bool {
+        return switch (self.phase) {
+            .closed => false,
+            .selection_loading => |selection| !selection.direct,
+            else => true,
+        };
+    }
+
     pub fn queryMode(self: *const AiReviewsPickerState) bool {
         return self.input_mode == .query;
     }

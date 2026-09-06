@@ -158,7 +158,7 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     try viewBody(app, &body);
 
     if (!(app.active_page == .review and
-        (app.review.page.ai_reviews.isOpen() or app.review.page.human_review_decision.isOpen())))
+        (app.review.page.ai_reviews.isPickerVisible() or app.review.page.human_review_decision.isOpen())))
     {
         var footer = surface.child(sections.footer);
         viewFooter(app, &footer);
@@ -194,7 +194,7 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.active_page == .review and app.review.page.base_picker.open) {
         try review_view.viewBasePicker(app.review, surface);
     }
-    if (app.active_page == .review and app.review.page.ai_reviews.isOpen()) {
+    if (app.active_page == .review and app.review.page.ai_reviews.isPickerVisible()) {
         try review_view.viewAiReviews(app.review, surface);
     }
     if (app.active_page == .review and app.review.page.human_review_decision.isOpen()) {
@@ -531,7 +531,7 @@ const FooterProjection = struct {
 pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     if (app.command_line != null) return null;
     if (app.active_page == .review and
-        (app.review.page.ai_reviews.isOpen() or app.review.page.human_review_decision.isOpen())) return null;
+        (app.review.page.ai_reviews.isPickerVisible() or app.review.page.human_review_decision.isOpen())) return null;
     if (width == 0 or app.active_page == .config) return null;
     if (app.action.spinnerPresentation() != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
@@ -1790,7 +1790,7 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         .review => {
             const footer = app.review.footer();
             if (!footer.normal_action_hints_enabled or app.review.page.base_picker.open or
-                app.review.page.ai_reviews.isOpen() or app.review.page.human_review_decision.isOpen() or
+                app.review.page.ai_reviews.isPickerVisible() or app.review.page.human_review_decision.isOpen() or
                 app.review.page.finding_card.isFocused()) return result;
             result.append(ui.key_hint.item("a", "AI reviews"), .review_ai);
             if (review_view.humanReviewActionLabel(app.review)) |label| {
@@ -2652,6 +2652,33 @@ test "Review placeholder names its unloaded state when a repository is active" {
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Review: not loaded") != null);
+}
+
+test "direct pinned Review reload does not paint the Reviews picker" {
+    const committed_review = @import("../committed_review.zig");
+    const review_id = try committed_review.ReviewId.parse("723e4567-e89b-42d3-a456-426614174000");
+    var harness: ShellViewTestHarness = .{};
+    var context = harness.context();
+    context.active_page = .review;
+    context.page_status = &harness.review.status;
+
+    harness.review.ai_reviews.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = true } };
+    var direct: chasen.testing.TestSurface = undefined;
+    try direct.init(80, 24);
+    defer direct.deinit();
+    try viewContent(context, &direct.surface);
+    const direct_snapshot = try direct.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(direct_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, direct_snapshot, "Reviews") == null);
+
+    harness.review.ai_reviews.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = false } };
+    var picker: chasen.testing.TestSurface = undefined;
+    try picker.init(80, 24);
+    defer picker.deinit();
+    try viewContent(context, &picker.surface);
+    const picker_snapshot = try picker.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(picker_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, picker_snapshot, "Reviews") != null);
 }
 
 test "page bar renders labels above a full muted rule" {

@@ -512,7 +512,7 @@ pub const App = struct {
             .review => !self.pages.review.search.mode and
                 !self.pages.review.file_search.mode and
                 !self.pages.review.base_picker.open and
-                !self.pages.review.ai_reviews.isOpen(),
+                !self.pages.review.ai_reviews.isPickerVisible(),
             .repository, .config => false,
         };
         if (!reachable) return 0;
@@ -935,7 +935,7 @@ pub const App = struct {
         }
         if (!self.redraw_plan.resolvesToSkip() and
             self.active_page == .review and
-            (self.pages.review.base_picker.open or self.pages.review.ai_reviews.isOpen()))
+            (self.pages.review.base_picker.open or self.pages.review.ai_reviews.isPickerVisible()))
         {
             self.reviewCoordinator().prepareModalRedraw(ctx.io());
         }
@@ -1818,7 +1818,7 @@ pub const App = struct {
                     .base_picker_open = self.pages.review.base_picker.open,
                     .base_picker_query_mode = self.pages.review.base_picker.input_mode == .query,
                     .base_picker_query_len = self.pages.review.base_picker.query.len,
-                    .ai_reviews_open = self.pages.review.ai_reviews.isOpen(),
+                    .ai_reviews_open = self.pages.review.ai_reviews.isPickerVisible(),
                     .ai_reviews_query_mode = self.pages.review.ai_reviews.queryMode(),
                     .ai_reviews_query_len = self.pages.review.ai_reviews.query.len,
                     .ai_reviews_loading = self.pages.review.ai_reviews.loading(),

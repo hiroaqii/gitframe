@@ -363,7 +363,7 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
 
 pub fn viewAiReviews(app: Context, surface: *chasen.Surface) !void {
     const picker = &app.page.ai_reviews;
-    if (!picker.isOpen()) return;
+    if (!picker.isPickerVisible()) return;
 
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, 112),
@@ -766,13 +766,6 @@ fn aiReviewsStateMessage(
                 selected.head_label orelse "head",
                 selected.target.head_oid.short(),
             }) }
-        else if (app.page.pinnedAiConst()) |pinned|
-            .{ .text = try directPinnedLoadingText(
-                allocator,
-                pinned.selection.artifacts.manifest.value.producer.name,
-                pinned.base_display,
-                pinned.head_display,
-            ) }
         else
             .{ .text = "Loading review..." },
         .return_loading => if (app.page.base_target) |base|
@@ -890,19 +883,6 @@ fn aiReviewsFooterText(picker: *const review_page.AiReviewsPickerState) []const 
     if (capabilities.cancel) return "r: retry  Esc: cancel";
     if (capabilities.list) return "/: filter  j/k: move  Enter: open  r: refresh/retry  Esc/q: close";
     return "r: retry  Esc/q: close";
-}
-
-fn directPinnedLoadingText(
-    allocator: std.mem.Allocator,
-    producer: []const u8,
-    base_display: []const u8,
-    head_display: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(allocator, "Loading review... {s}  {s} -> {s}", .{
-        producer,
-        base_display,
-        head_display,
-    });
 }
 
 const DiffPaneAdapter = struct {
@@ -1029,7 +1009,7 @@ fn navigationView(app: Context) review_navigation.View {
 }
 
 fn displayModeToggleKey(app: Context, buffer: []u8) ?[]const u8 {
-    if (app.page.search.mode or app.page.file_search.mode or app.page.base_picker.open or app.page.ai_reviews.isOpen()) return null;
+    if (app.page.search.mode or app.page.file_search.mode or app.page.base_picker.open or app.page.ai_reviews.isPickerVisible()) return null;
     return app.keymap.display(.toggle_display_mode, buffer);
 }
 
@@ -1182,6 +1162,7 @@ test "AI Reviews picker renders bounded 120 80 56 loading and empty modal states
     var state: review_page.ReviewPageState = .{};
     defer state.deinit(std.testing.allocator);
     state.ai_reviews.phase = .scan_loading;
+    try std.testing.expect(state.ai_reviews.isPickerVisible());
     for (sizes) |size| {
         var ts: chasen.testing.TestSurface = undefined;
         try ts.init(size.width, size.height);
@@ -1205,33 +1186,17 @@ test "AI Reviews picker renders bounded 120 80 56 loading and empty modal states
     state.ai_reviews.phase = .{ .scan_failed = "scan failed" };
     try std.testing.expectEqualStrings("r: retry  Esc/q: close", aiReviewsFooterText(&state.ai_reviews));
     const direct_id = try committed_review.ReviewId.parse("723e4567-e89b-42d3-a456-426614174000");
+    state.ai_reviews.phase = .{ .selection_loading = .{ .review_id = direct_id, .direct = true } };
+    try std.testing.expect(state.ai_reviews.isOpen());
+    try std.testing.expect(!state.ai_reviews.isPickerVisible());
+    state.ai_reviews.phase = .{ .selection_loading = .{ .review_id = direct_id, .direct = false } };
+    try std.testing.expect(state.ai_reviews.isPickerVisible());
     state.ai_reviews.phase = .{ .selection_failed = .{ .review_id = direct_id, .direct = true, .message = "selection failed" } };
+    try std.testing.expect(state.ai_reviews.isPickerVisible());
     try std.testing.expectEqualStrings("r: retry  Esc/q: close", aiReviewsFooterText(&state.ai_reviews));
     state.ai_reviews.phase = .{ .return_failed = .{ .direct = true, .message = "return failed" } };
+    try std.testing.expect(state.ai_reviews.isPickerVisible());
     try std.testing.expectEqualStrings("r: retry  Esc/q: close", aiReviewsFooterText(&state.ai_reviews));
-
-    const labeled_loading = try directPinnedLoadingText(
-        std.testing.allocator,
-        "reviewer",
-        "AI main@aaaaaaa",
-        "topic@bbbbbbb",
-    );
-    defer std.testing.allocator.free(labeled_loading);
-    try std.testing.expectEqualStrings(
-        "Loading review... reviewer  AI main@aaaaaaa -> topic@bbbbbbb",
-        labeled_loading,
-    );
-    const oid_loading = try directPinnedLoadingText(
-        std.testing.allocator,
-        "reviewer",
-        "AI aaaaaaa",
-        "bbbbbbb",
-    );
-    defer std.testing.allocator.free(oid_loading);
-    try std.testing.expectEqualStrings(
-        "Loading review... reviewer  AI aaaaaaa -> bbbbbbb",
-        oid_loading,
-    );
 
     state.ai_reviews.phase = .{ .empty = .no_reviews };
     state.ai_reviews.scan_result = .unbound;
