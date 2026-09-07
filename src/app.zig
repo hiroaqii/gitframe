@@ -17,10 +17,14 @@ const page = @import("app/page.zig");
 const page_coordinator = @import("app/page_coordinator.zig");
 const shell_input = @import("app/shell_input.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
-const review_page = @import("app/pages/review.zig");
-const review_coordinator = @import("app/pages/review/coordinator.zig");
-const review_input = @import("app/pages/review/input.zig");
-const review_navigation = @import("app/pages/review/navigation.zig");
+const compare_page = @import("app/pages/compare.zig");
+const compare_coordinator = @import("app/pages/compare/coordinator.zig");
+const compare_input = @import("app/pages/compare/input.zig");
+const ai_reviews_page = @import("app/pages/ai_reviews.zig");
+const ai_reviews_coordinator = @import("app/pages/ai_reviews/coordinator.zig");
+const ai_reviews_input = @import("app/pages/ai_reviews/input.zig");
+const ai_reviews_navigation = @import("app/pages/ai_reviews/navigation.zig");
+const committed_diff_navigation = @import("app/pages/committed_diff/navigation.zig");
 const changes_page = @import("app/pages/changes.zig");
 const changes_content = @import("app/pages/changes/content.zig");
 const changes_action_fence = @import("app/pages/changes/action_fence.zig");
@@ -70,7 +74,8 @@ comptime {
 const PageStates = struct {
     changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
-    review: review_page.ReviewPageState = .{},
+    compare: compare_page.ComparePageState = .{},
+    ai_reviews: ai_reviews_page.AiReviewsPageState = .{},
     config: page.LazyPlaceholder = .{},
 };
 
@@ -190,7 +195,8 @@ pub const App = struct {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.pages.changes.deinit(deinit_ctx.allocator);
         self.pages.repository.deinit(deinit_ctx.allocator);
-        self.pages.review.deinit(deinit_ctx.allocator);
+        self.pages.compare.deinit(deinit_ctx.allocator);
+        self.pages.ai_reviews.deinit(deinit_ctx.allocator);
         if (self.configured_review_store) |*store| store.deinit(deinit_ctx.allocator);
         self.repo_session.deinit(deinit_ctx.allocator);
         self.local_workflow.deinit(deinit_ctx.allocator);
@@ -403,7 +409,8 @@ pub const App = struct {
             .action_pending = self.actionLifecycleView().hasPending(),
             .changes = self.changesRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
-            .review = .{ .page = &self.pages.review },
+            .compare = .{ .page = &self.pages.compare },
+            .ai_reviews = .{ .page = &self.pages.ai_reviews },
             .shell = self.remote_workflow.repositoryInvalidationPort(&self.overlay),
         };
     }
@@ -418,23 +425,34 @@ pub const App = struct {
         };
     }
 
-    fn reviewCoordinator(self: *App) review_coordinator.Controller {
+    fn aiReviewsCoordinator(self: *App) ai_reviews_coordinator.Controller {
         const body_size = self.shellLayout().bodySize();
         return .{
-            .page_state = &self.pages.review,
+            .page_state = &self.pages.ai_reviews,
             .repo = self.repoSessionView(),
             .layout = .{ .width = body_size.width, .height = body_size.height },
-            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.ai_reviews),
             .env_map = self.env_map,
             .store = if (self.configured_review_store) |*value| value else null,
             .sessions = &self.human_review_sessions,
         };
     }
 
+    fn compareCoordinator(self: *App) compare_coordinator.Controller {
+        const body_size = self.shellLayout().bodySize();
+        return .{
+            .page_state = &self.pages.compare,
+            .repo = self.repoSessionView(),
+            .layout = .{ .width = body_size.width, .height = body_size.height },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
+            .env_map = self.env_map,
+        };
+    }
+
     fn humanReviewPresentation(self: *const App) ?human_review_session_mod.Presentation {
-        const pinned = self.pages.review.pinnedAiConst() orelse return null;
+        const selected = self.pages.ai_reviews.selectedRunConst() orelse return null;
         const presentation = self.human_review_sessions.currentPresentation() orelse return null;
-        if (!pinned.binding().eql(presentation.binding)) return null;
+        if (!selected.binding().eql(presentation.binding)) return null;
         return presentation;
     }
 
@@ -443,7 +461,8 @@ pub const App = struct {
             .active_page = &self.active_page,
             .changes = &self.pages.changes,
             .repository = &self.pages.repository,
-            .review = &self.pages.review,
+            .compare = &self.pages.compare,
+            .ai_reviews = &self.pages.ai_reviews,
             .config_page = &self.pages.config,
             .repo = self.repoSessionView(),
             .source = self.config.source,
@@ -472,7 +491,7 @@ pub const App = struct {
             .none => {},
             .changes_revalidation => try self.changesRead().requestRevalidation(ctx),
             .changes_repository_changed => try self.changesRead().startDiffLoad(ctx, .repo_switch),
-            .review_refresh => try self.reviewCoordinator().refresh(ctx),
+            .compare_refresh => try self.compareCoordinator().refresh(ctx),
         }
     }
 
@@ -509,10 +528,12 @@ pub const App = struct {
     fn displayModeToggleHintWidth(self: *const App, target: page.Id) u16 {
         const reachable = switch (target) {
             .changes => !self.pages.changes.search.mode and !self.pages.changes.file_search.mode,
-            .review => !self.pages.review.search.mode and
-                !self.pages.review.file_search.mode and
-                !self.pages.review.base_picker.open and
-                !self.pages.review.ai_reviews.isPickerVisible(),
+            .compare => !self.pages.compare.diff.search.mode and
+                !self.pages.compare.diff.file_search.mode and
+                !self.pages.compare.base_picker.open,
+            .ai_reviews => !self.pages.ai_reviews.diff.search.mode and
+                !self.pages.ai_reviews.diff.file_search.mode and
+                !self.pages.ai_reviews.picker.isPickerVisible(),
             .repository, .config => false,
         };
         if (!reachable) return 0;
@@ -619,20 +640,23 @@ pub const App = struct {
     fn shellEffectOrigins(self: *const App) shell_effects.OriginContext {
         const repo_epoch = self.repoSessionView().epoch();
         const changes_identity = self.pages.changes.activation.currentIdentity();
-        const review_identity = self.pages.review.activation.currentIdentity();
+        const compare_identity = self.pages.compare.activation.currentIdentity();
+        const ai_reviews_identity = self.pages.ai_reviews.activation.currentIdentity();
         return .{
             .snapshot = .{
                 .active_page = self.active_page,
                 .repo_epoch = repo_epoch,
                 .changes_activation_id = self.pages.changes.activation.next_activation_id,
                 .repository_activation_id = self.pages.repository.activation_id,
-                .review_activation_id = self.pages.review.activation.next_activation_id,
+                .compare_activation_id = self.pages.compare.activation.next_activation_id,
+                .ai_reviews_activation_id = self.pages.ai_reviews.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = self.localWorkflowView().commitPanelInstanceId(),
             },
             .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
-            .review_repo_epoch = if (review_identity) |identity| identity.repo_epoch else repo_epoch,
+            .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
+            .ai_reviews_repo_epoch = if (ai_reviews_identity) |identity| identity.repo_epoch else repo_epoch,
         };
     }
 
@@ -646,7 +670,8 @@ pub const App = struct {
                 .shell = &self.status,
                 .changes = &self.pages.changes.status,
                 .repository = &self.pages.repository.status,
-                .review = &self.pages.review.status,
+                .compare = &self.pages.compare.status,
+                .ai_reviews = &self.pages.ai_reviews.status,
             },
             .redraw = .{ .skip_requested = &self.redraw_plan.skip_requested },
         };
@@ -701,34 +726,43 @@ pub const App = struct {
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
                 const changes_selection_anchor = self.changesNavigation().captureSelectionViewportAnchor();
-                const previous_review_base_view = self.reviewCoordinator().navigationView();
+                const previous_compare_view = self.compareCoordinator().navigationView();
+                var previous_compare_resolver = previous_compare_view.resolver();
+                const previous_compare_body = previous_compare_view.bodyView(&previous_compare_resolver);
+                const compare_selection_anchor = previous_compare_body.captureSelectionViewportAnchor();
+                const previous_ai_reviews_base_view = self.aiReviewsCoordinator().navigationView();
                 const resize_allocator = self.allocator;
-                var previous_review_frame = if (resize_allocator) |allocator|
-                    try previous_review_base_view.buildFindingCardFrame(allocator)
+                var previous_ai_reviews_frame = if (resize_allocator) |allocator|
+                    try previous_ai_reviews_base_view.buildFindingCardFrame(allocator)
                 else
                     null;
-                defer if (previous_review_frame) |*frame| frame.deinit(resize_allocator.?);
-                const previous_review_view = previous_review_base_view.withPresentationRows(
-                    if (previous_review_frame) |*frame| &frame.presentation_rows else null,
+                defer if (previous_ai_reviews_frame) |*frame| frame.deinit(resize_allocator.?);
+                const previous_ai_reviews_view = previous_ai_reviews_base_view.withPresentationRows(
+                    if (previous_ai_reviews_frame) |*frame| &frame.presentation_rows else null,
                 );
-                var previous_review_adapter = previous_review_view.resolver();
-                const previous_review_body = previous_review_view.bodyView(&previous_review_adapter);
-                const review_selection_anchor = previous_review_body.captureSelectionViewportAnchor();
+                var previous_ai_reviews_adapter = previous_ai_reviews_view.resolver();
+                const previous_ai_reviews_body = previous_ai_reviews_view.bodyView(&previous_ai_reviews_adapter);
+                const ai_reviews_selection_anchor = previous_ai_reviews_body.captureSelectionViewportAnchor();
                 const repository_selection_anchor = self.pages.repository.captureSelectionViewportAnchor();
                 const previous_width = self.changesNavigationView().diffPaneWidth();
                 const previous_mode = self.changesNavigationView().effectiveDisplayMode();
-                const previous_review_width = previous_review_body.view.diffPaneWidth();
-                const previous_review_display_mode = previous_review_body.view.effectiveDisplayMode();
-                var incoming_review_preparation = if (resize_allocator) |allocator|
-                    try previous_review_base_view.prepareFindingCardFrame(allocator)
+                const previous_compare_width = previous_compare_body.view.diffPaneWidth();
+                const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
+                const previous_ai_reviews_width = previous_ai_reviews_body.view.diffPaneWidth();
+                const previous_ai_reviews_display_mode = previous_ai_reviews_body.view.effectiveDisplayMode();
+                var incoming_ai_reviews_preparation = if (resize_allocator) |allocator|
+                    try previous_ai_reviews_base_view.prepareFindingCardFrame(allocator)
                 else
                     null;
-                defer if (incoming_review_preparation) |*preparation| preparation.deinit();
+                defer if (incoming_ai_reviews_preparation) |*preparation| preparation.deinit();
 
                 self.drag_auto_scroll.clear();
                 self.changesNavigation().clearMouseDiffSelection();
-                if (self.pages.review.selection_owner.activeMouseSelection()) {
-                    self.pages.review.selection_owner = .none;
+                if (self.pages.compare.diff.selection_owner.activeMouseSelection()) {
+                    self.pages.compare.diff.selection_owner = .none;
+                }
+                if (self.pages.ai_reviews.diff.selection_owner.activeMouseSelection()) {
+                    self.pages.ai_reviews.diff.selection_owner = .none;
                 }
                 self.pages.repository.cancelMouseOwner();
                 self.terminal_size = size;
@@ -744,28 +778,42 @@ pub const App = struct {
                 self.changesNavigation().updateSearchMatchOffset();
                 self.changesNavigation().scrollSearchMatchIntoView();
                 self.changesNavigation().clampDiffNavigation();
-                self.reviewCoordinator().reconcileFindingCardVisibility();
-                const current_review_view = self.reviewCoordinator().navigationView();
-                var current_review_frame = if (incoming_review_preparation) |*preparation|
-                    preparation.fill(current_review_view, self.pages.review.finding_card)
+                var compare_adapter = self.compareCoordinator().navigation().updateAdapter();
+                var compare_body = compare_adapter.bodyController();
+                compare_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_compare_width);
+                if (previous_compare_mode != compare_body.controller.view().effectiveDisplayMode()) {
+                    compare_body.controller.clearMouseDiffSelection();
+                    compare_body.controller.clearKeyboardSideChoice();
+                    self.pages.compare.diff.advanceSelectionLayoutRevision();
+                }
+                if (compare_selection_anchor) |anchor| compare_body.restoreSelectionViewportAnchor(anchor);
+                compare_body.controller.clampSidebarHorizontalScroll();
+                compare_body.clampDiffNavigationKeepingHunkVisible();
+                compare_body.updateSearchMatchOffset();
+                compare_body.controller.scrollSearchMatchIntoView();
+                compare_body.clampDiffNavigation();
+                self.aiReviewsCoordinator().reconcileFindingCardVisibility();
+                const current_ai_reviews_view = self.aiReviewsCoordinator().navigationView();
+                var current_ai_reviews_frame = if (incoming_ai_reviews_preparation) |*preparation|
+                    preparation.fill(current_ai_reviews_view, self.pages.ai_reviews.finding_card)
                 else
                     null;
-                var review_controller = self.reviewCoordinator().navigation();
-                review_controller.presentation_rows = if (current_review_frame) |*frame| &frame.presentation_rows else null;
-                var review_adapter = review_controller.updateAdapter();
-                var review_body = review_adapter.bodyController();
-                review_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_review_width);
-                if (previous_review_display_mode != review_body.controller.view().effectiveDisplayMode()) {
-                    review_body.controller.clearMouseDiffSelection();
-                    review_body.controller.clearKeyboardSideChoice();
-                    self.pages.review.advanceSelectionLayoutRevision();
+                var ai_reviews_controller = self.aiReviewsCoordinator().navigation();
+                ai_reviews_controller.presentation_rows = if (current_ai_reviews_frame) |*frame| &frame.presentation_rows else null;
+                var ai_reviews_adapter = ai_reviews_controller.updateAdapter();
+                var ai_reviews_body = ai_reviews_adapter.bodyController();
+                ai_reviews_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_ai_reviews_width);
+                if (previous_ai_reviews_display_mode != ai_reviews_body.controller.view().effectiveDisplayMode()) {
+                    ai_reviews_body.controller.clearMouseDiffSelection();
+                    ai_reviews_body.controller.clearKeyboardSideChoice();
+                    self.pages.ai_reviews.advanceSelectionLayoutRevision();
                 }
-                if (review_selection_anchor) |anchor| review_body.restoreSelectionViewportAnchor(anchor);
-                review_body.controller.clampSidebarHorizontalScroll();
-                review_body.clampDiffNavigationKeepingHunkVisible();
-                review_body.updateSearchMatchOffset();
-                review_body.controller.scrollSearchMatchIntoView();
-                review_body.clampDiffNavigation();
+                if (ai_reviews_selection_anchor) |anchor| ai_reviews_body.restoreSelectionViewportAnchor(anchor);
+                ai_reviews_body.controller.clampSidebarHorizontalScroll();
+                ai_reviews_body.clampDiffNavigationKeepingHunkVisible();
+                ai_reviews_body.updateSearchMatchOffset();
+                ai_reviews_body.controller.scrollSearchMatchIntoView();
+                ai_reviews_body.clampDiffNavigation();
                 const repository_body_size = self.shellLayout().bodySize();
                 if (repository_selection_anchor) |anchor|
                     self.pages.repository.restoreSelectionViewportAnchor(anchor, repository_body_size)
@@ -784,7 +832,8 @@ pub const App = struct {
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
             .review_store_operation_finished => |finished| self.finishReviewStoreOperation(ctx, finished),
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
-            .review => |review_msg| _ = try self.updateReview(ctx, review_msg),
+            .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
+            .ai_reviews => |ai_reviews_msg| _ = try self.updateAiReviews(ctx, ai_reviews_msg),
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
             .command_line => |command_msg| self.updateCommandLine(command_msg),
             .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
@@ -843,8 +892,11 @@ pub const App = struct {
             .open_help => {
                 self.drag_auto_scroll.clear();
                 if (self.active_page == .changes) self.changesNavigation().clearMouseDiffSelection();
-                if (self.active_page == .review and self.pages.review.selection_owner.activeMouseSelection()) {
-                    self.pages.review.selection_owner = .none;
+                if (self.active_page == .compare and self.pages.compare.diff.selection_owner.activeMouseSelection()) {
+                    self.pages.compare.diff.selection_owner = .none;
+                }
+                if (self.active_page == .ai_reviews and self.pages.ai_reviews.diff.selection_owner.activeMouseSelection()) {
+                    self.pages.ai_reviews.diff.selection_owner = .none;
                 }
                 if (self.active_page == .repository) {
                     self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize());
@@ -887,7 +939,8 @@ pub const App = struct {
                     }
                 },
                 .repository => self.repositoryCoordinator().requestReload(),
-                .review => try self.reviewCoordinator().refresh(ctx),
+                .compare => try self.compareCoordinator().refresh(ctx),
+                .ai_reviews => try self.aiReviewsCoordinator().refresh(ctx),
                 .config => self.status.set("reload is not available on this page yet", .{}),
             },
             .auto_reload_tick => try self.changesRead().autoReloadTick(ctx),
@@ -897,7 +950,8 @@ pub const App = struct {
                 switch (self.active_page) {
                     .changes => self.changesNavigation().clearDiffSelection(),
                     .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
-                    .review => self.pages.review.selection_owner = .none,
+                    .compare => self.pages.compare.diff.selection_owner = .none,
+                    .ai_reviews => self.pages.ai_reviews.diff.selection_owner = .none,
                     .config => {},
                 }
             },
@@ -911,7 +965,7 @@ pub const App = struct {
         self.changesRead().retireSupersededActionCursor(ctx, self.actionLifecycleView().generation());
         try self.changesRead().applyDeferredSourceIfReady(ctx);
         try self.changesRead().applyDeferredProjectionIfReady(ctx);
-        if (try self.reviewCoordinator().applyDeferred(ctx) == .skip) self.redraw_plan.requestSkip();
+        if (try self.compareCoordinator().applyDeferred(ctx) == .skip) self.redraw_plan.requestSkip();
         try self.changesRead().maybeStartQueuedRevalidation(ctx);
         try self.repositoryCoordinator().startPending(ctx);
         self.reconcileCommandLine();
@@ -930,14 +984,17 @@ pub const App = struct {
         self.actionLifecycle().reconcileSpinner(ctx);
         self.pumpReviewStoreOperations(ctx);
         self.resumeQuitAfterStoreDrain(ctx);
-        if (!self.redraw_plan.resolvesToSkip() and self.active_page == .review) {
-            self.reviewCoordinator().ensureFindingPresentationCache();
+        if (!self.redraw_plan.resolvesToSkip() and self.active_page == .ai_reviews) {
+            self.aiReviewsCoordinator().ensureFindingPresentationCache();
         }
         if (!self.redraw_plan.resolvesToSkip() and
-            self.active_page == .review and
-            (self.pages.review.base_picker.open or self.pages.review.ai_reviews.isPickerVisible()))
+            self.active_page == .ai_reviews and
+            self.pages.ai_reviews.picker.isPickerVisible())
         {
-            self.reviewCoordinator().prepareModalRedraw(ctx.io());
+            self.aiReviewsCoordinator().prepareModalRedraw(ctx.io());
+        }
+        if (!self.redraw_plan.resolvesToSkip() and self.active_page == .compare and self.pages.compare.base_picker.open) {
+            self.compareCoordinator().prepareModalRedraw(ctx.io());
         }
         if (!self.redraw_plan.resolvesToSkip() and self.overlay.isSwitchBranch()) {
             self.remoteWorkflow().prepareBranchSwitchModalRedraw(ctx.io());
@@ -959,9 +1016,9 @@ pub const App = struct {
             .draining => {
                 self.quit_after_store_drain = true;
                 // Store scans/selections are read generations, not accepted
-                // mutations. Invalidate them while retaining any pinned
-                // presentation and keep the event loop responsive.
-                self.pages.review.ai_reviews.close(ctx.allocator());
+                // mutations. Invalidate them while retaining the selected
+                // Run presentation and keep the event loop responsive.
+                self.pages.ai_reviews.picker.close(ctx.allocator());
                 self.setStatus("finishing AI review save before quitting", .{});
             },
             .failed => |failure| {
@@ -1112,8 +1169,8 @@ pub const App = struct {
                 }
             } else if (presentation_matches) {
                 switch (kind) {
-                    .draft => self.pages.review.status.set("AI review draft saved", .{}),
-                    .result => self.pages.review.status.set("AI review result saved", .{}),
+                    .draft => self.pages.ai_reviews.status.set("AI review draft saved", .{}),
+                    .result => self.pages.ai_reviews.status.set("AI review result saved", .{}),
                 }
             }
         }
@@ -1137,9 +1194,9 @@ pub const App = struct {
         self: *const App,
         binding: review_store.ReviewRunBinding,
     ) bool {
-        if (self.active_page != .review) return false;
-        const pinned = self.pages.review.pinnedAiConst() orelse return false;
-        const manifest = &pinned.selection.artifacts.manifest.value;
+        if (self.active_page != .ai_reviews) return false;
+        const selected = self.pages.ai_reviews.selectedRunConst() orelse return false;
+        const manifest = &selected.selection.artifacts.manifest.value;
         return manifest.review_repository_id.eql(binding.review_repository_id) and
             manifest.review_id.eql(binding.review_id) and
             manifest.target.eql(&binding.target) and
@@ -1157,10 +1214,15 @@ pub const App = struct {
                 _ = try self.updateChanges(ctx, .{ .mouse_diff_drag = point });
                 break :blk .changes;
             },
-            .review => |point| blk: {
-                if (self.active_page != .review) break :blk .review;
-                _ = try self.updateReview(ctx, .{ .shared = .{ .mouse_diff_drag = point } });
-                break :blk .review;
+            .compare => |point| blk: {
+                if (self.active_page != .compare) break :blk .compare;
+                _ = try self.updateCompare(ctx, .{ .common = .{ .shared = .{ .mouse_diff_drag = point } } });
+                break :blk .compare;
+            },
+            .ai_reviews => |point| blk: {
+                if (self.active_page != .ai_reviews) break :blk .ai_reviews;
+                _ = try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_drag = point } } });
+                break :blk .ai_reviews;
             },
             .repository => |point| blk: {
                 if (self.active_page != .repository) break :blk .repository;
@@ -1187,8 +1249,11 @@ pub const App = struct {
             .changes => |point| {
                 if (self.active_page == .changes) _ = try self.updateChanges(ctx, .{ .mouse_diff_release = point });
             },
-            .review => |point| {
-                if (self.active_page == .review) _ = try self.updateReview(ctx, .{ .shared = .{ .mouse_diff_release = point } });
+            .compare => |point| {
+                if (self.active_page == .compare) _ = try self.updateCompare(ctx, .{ .common = .{ .shared = .{ .mouse_diff_release = point } } });
+            },
+            .ai_reviews => |point| {
+                if (self.active_page == .ai_reviews) _ = try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_release = point } } });
             },
             .repository => |point| {
                 if (self.active_page == .repository) _ = self.updateRepository(ctx, .{ .mouse_owner_release = point });
@@ -1213,7 +1278,8 @@ pub const App = struct {
 
         const outcome: ?drag_auto_scroll.StepOutcome = switch (active.target) {
             .changes => try self.updateChanges(ctx, .{ .mouse_diff_auto_scroll_step = active.intent }),
-            .review => try self.updateReview(ctx, .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } }),
+            .compare => try self.updateCompare(ctx, .{ .common = .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } } }),
+            .ai_reviews => try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } } }),
             .repository => blk: {
                 const body_size = self.shellLayout().bodySize();
                 const body_point: repository_layout.BodyPoint = .{
@@ -1241,7 +1307,8 @@ pub const App = struct {
     ) ?drag_auto_scroll.Viewport {
         if (self.active_page != switch (target) {
             .changes => page.Id.changes,
-            .review => page.Id.review,
+            .compare => page.Id.compare,
+            .ai_reviews => page.Id.ai_reviews,
             .repository => page.Id.repository,
         }) return null;
 
@@ -1250,8 +1317,12 @@ pub const App = struct {
                 var adapter = self.changesNavigation().updateAdapter();
                 break :blk diffAutoScrollViewport(adapter.shared().navigation);
             },
-            .review => blk: {
-                var adapter = self.reviewCoordinator().navigation().updateAdapter();
+            .compare => blk: {
+                var adapter = self.compareCoordinator().navigation().updateAdapter();
+                break :blk diffAutoScrollViewport(adapter.bodyController());
+            },
+            .ai_reviews => blk: {
+                var adapter = self.aiReviewsCoordinator().navigation().updateAdapter();
                 break :blk diffAutoScrollViewport(adapter.bodyController());
             },
             .repository => self.pages.repository.sourceAutoScrollViewport(self.shellLayout().bodySize()),
@@ -1334,12 +1405,33 @@ pub const App = struct {
         return auto_scroll;
     }
 
-    fn updateReview(
+    fn updateCompare(
         self: *App,
         ctx: *chasen.Ctx(Msg),
-        msg: review_input.Msg,
+        msg: compare_input.Msg,
     ) !?drag_auto_scroll.StepOutcome {
-        var outcome = try self.reviewCoordinator().update(ctx, msg);
+        var outcome = try self.compareCoordinator().update(ctx, msg);
+        defer outcome.deinit(ctx.allocator());
+        const auto_scroll = outcome.auto_scroll;
+        if (outcome.takeClipboard()) |taken| {
+            var effect = taken;
+            defer effect.deinit(ctx.allocator());
+            self.shellEffects().queueClipboard(ctx, .{
+                .origin = effect.origin,
+                .label = effect.label,
+                .text = effect.text,
+                .selection_generation = effect.selection_generation,
+            });
+        }
+        return auto_scroll;
+    }
+
+    fn updateAiReviews(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        msg: ai_reviews_input.Msg,
+    ) !?drag_auto_scroll.StepOutcome {
+        var outcome = try self.aiReviewsCoordinator().update(ctx, msg);
         defer outcome.deinit(ctx.allocator());
         const auto_scroll = outcome.auto_scroll;
         if (outcome.takeClipboard()) |taken| {
@@ -1365,13 +1457,13 @@ pub const App = struct {
         }
         if (outcome.takeHumanReviewFinalize()) |decision| {
             const finalized = self.finalizeHumanReviewSession(ctx, decision) catch |err| {
-                self.pages.review.human_review_decision.markFinalizeError(err);
+                self.pages.ai_reviews.human_review_decision.markFinalizeError(err);
                 if (err == error.OutOfMemory) return err;
                 return auto_scroll;
             };
             switch (finalized) {
-                .accepted => self.pages.review.human_review_decision.markFinalizeAccepted(),
-                .rejected => |reason| self.pages.review.human_review_decision.markFinalizeRejected(reason),
+                .accepted => self.pages.ai_reviews.human_review_decision.markFinalizeAccepted(),
+                .rejected => |reason| self.pages.ai_reviews.human_review_decision.markFinalizeRejected(reason),
             }
         }
         return auto_scroll;
@@ -1408,29 +1500,26 @@ pub const App = struct {
                 .projection => |result| try self.changesRead().finishProjectionLoad(ctx.allocator(), result),
                 .projection_syntax => |result| self.changesRead().finishGeneratedProjectionSyntax(ctx.allocator(), result),
             },
-            .review => |review_result| switch (review_result) {
+            .compare => |compare_result| switch (compare_result) {
                 .source => |result| {
-                    if (try self.reviewCoordinator().finishLoad(ctx, result) == .skip) {
+                    if (try self.compareCoordinator().finishLoad(ctx, result) == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
                 .branch_list => |result| {
-                    if (self.reviewCoordinator().finishBranchList(ctx.allocator(), result) == .skip) {
+                    if (self.compareCoordinator().finishBranchList(ctx.allocator(), result) == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
+            },
+            .ai_reviews => |review_result| switch (review_result) {
                 .history_scan => |result| {
-                    if (self.reviewCoordinator().finishHistoryScan(ctx.allocator(), result) == .skip) {
+                    if (self.aiReviewsCoordinator().finishHistoryScan(ctx.allocator(), result) == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
                 .history_selection => |result| {
-                    if (try self.reviewCoordinator().finishHistorySelection(ctx, result) == .skip) {
-                        self.redraw_plan.requestSkip();
-                    }
-                },
-                .history_normal_return => |result| {
-                    if (try self.reviewCoordinator().finishHistoryNormalReturn(ctx, result) == .skip) {
+                    if (try self.aiReviewsCoordinator().finishHistorySelection(ctx, result) == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
@@ -1671,7 +1760,8 @@ pub const App = struct {
         if (app_message.keepsEphemeralStatus(msg)) return;
         self.status.clearIfEphemeral();
         if (self.active_page == .changes) self.pages.changes.status.clearIfEphemeral();
-        if (self.active_page == .review) self.pages.review.status.clearIfEphemeral();
+        if (self.active_page == .compare) self.pages.compare.status.clearIfEphemeral();
+        if (self.active_page == .ai_reviews) self.pages.ai_reviews.status.clearIfEphemeral();
         if (self.active_page == .repository) self.pages.repository.status.clearIfEphemeral();
     }
 
@@ -1687,8 +1777,17 @@ pub const App = struct {
         const remote = self.remoteWorkflowView();
         return .{
             .changes = self.changesViewContext(),
-            .review = .{
-                .page = &self.pages.review,
+            .compare = .{
+                .page = &self.pages.compare,
+                .palette = self.theme,
+                .repo_root = repo_view.activeRoot(),
+                .repo_epoch = repo_view.epoch(),
+                .root_identity = repo_view.activeIdentity(),
+                .layout = .{ .width = body_size.width, .height = body_size.height },
+                .keymap = self.keymap,
+            },
+            .ai_reviews = .{
+                .page = &self.pages.ai_reviews,
                 .human_review = self.humanReviewPresentation(),
                 .palette = self.theme,
                 .repo_root = self.repoSessionView().activeRoot(),
@@ -1776,16 +1875,31 @@ pub const App = struct {
         const body_size = layout.bodySize();
         const repo = self.repoSessionView();
         const picker = repo.picker();
-        const review_navigation_view: review_navigation.View = .{
-            .page = &self.pages.review,
+        const compare_navigation_view: committed_diff_navigation.View = .{
+            .diff = &self.pages.compare.diff,
+            .activation = &self.pages.compare.activation,
+            .status = &self.pages.compare.status,
+            .current_target = self.pages.compare.currentTarget(),
+            .repo_root = repo.activeRoot(),
+            .repo_epoch = repo.epoch(),
+            .root_identity = repo.activeIdentity(),
+            .source = compare_page.selection_source,
+            .layout = .{ .width = body_size.width, .height = body_size.height },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
+            .live_drag_deferred_source = self.pages.compare.deferred_load_apply != null,
+        };
+        var compare_body_adapter = compare_navigation_view.resolver();
+        const compare_body_view = compare_navigation_view.bodyView(&compare_body_adapter);
+        const ai_reviews_navigation_view: ai_reviews_navigation.View = .{
+            .page = &self.pages.ai_reviews,
             .repo_root = repo.activeRoot(),
             .repo_epoch = repo.epoch(),
             .root_identity = repo.activeIdentity(),
             .layout = .{ .width = body_size.width, .height = body_size.height },
-            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.review),
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.ai_reviews),
         };
-        var review_body_adapter = review_navigation_view.resolver();
-        const review_body_view = review_navigation_view.bodyView(&review_body_adapter);
+        var ai_reviews_body_adapter = ai_reviews_navigation_view.resolver();
+        const ai_reviews_body_view = ai_reviews_navigation_view.bodyView(&ai_reviews_body_adapter);
         const changes_navigation_view = self.changesNavigationView();
         return .{
             .active_page = self.active_page,
@@ -1807,36 +1921,58 @@ pub const App = struct {
                 .sidebar_hidden = self.pages.changes.viewer.sidebar_hidden,
                 .sidebar_width = self.pages.changes.viewer.sidebar_width,
             },
-            .review = .{
+            .compare = .{
                 .key = .{
-                    .search_mode = self.pages.review.search.mode,
-                    .file_search_mode = self.pages.review.file_search.mode,
-                    .search_query_len = self.pages.review.search.query.len,
-                    .focus = self.pages.review.viewer.focus,
-                    .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
-                    .side_by_side = review_navigation_view.view().effectiveDisplayMode() == .side_by_side,
-                    .base_picker_open = self.pages.review.base_picker.open,
-                    .base_picker_query_mode = self.pages.review.base_picker.input_mode == .query,
-                    .base_picker_query_len = self.pages.review.base_picker.query.len,
-                    .ai_reviews_open = self.pages.review.ai_reviews.isPickerVisible(),
-                    .ai_reviews_query_mode = self.pages.review.ai_reviews.queryMode(),
-                    .ai_reviews_query_len = self.pages.review.ai_reviews.query.len,
-                    .ai_reviews_loading = self.pages.review.ai_reviews.loading(),
-                    .pinned_ai = self.pages.review.isPinnedAi(),
-                    .human_review = self.pages.review.human_review_decision.inputContext(
+                    .common = .{
+                        .search_mode = self.pages.compare.diff.search.mode,
+                        .file_search_mode = self.pages.compare.diff.file_search.mode,
+                        .search_query_len = self.pages.compare.diff.search.query.len,
+                        .focus = self.pages.compare.diff.viewer.focus,
+                        .sidebar_hidden = self.pages.compare.diff.viewer.sidebar_hidden,
+                        .side_by_side = compare_navigation_view.view().effectiveDisplayMode() == .side_by_side,
+                        .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.compare.diff.selection_owner),
+                        .retained_selection_action_available = compare_body_view.retainedSelectionActionAvailable(),
+                        .keymap = self.keymap,
+                    },
+                    .base_picker_open = self.pages.compare.base_picker.open,
+                    .base_picker_query_mode = self.pages.compare.base_picker.input_mode == .query,
+                    .base_picker_query_len = self.pages.compare.base_picker.query.len,
+                },
+                .selection_owner = &self.pages.compare.diff.selection_owner,
+                .loaded = compare_navigation_view.view().activeLoadedDiffConst(),
+                .selected_node = self.pages.compare.diff.viewer.selected_node,
+                .sidebar_hidden = self.pages.compare.diff.viewer.sidebar_hidden,
+                .sidebar_width = self.pages.compare.diff.viewer.sidebar_width,
+            },
+            .ai_reviews = .{
+                .key = .{
+                    .common = .{
+                        .search_mode = self.pages.ai_reviews.diff.search.mode,
+                        .file_search_mode = self.pages.ai_reviews.diff.file_search.mode,
+                        .search_query_len = self.pages.ai_reviews.diff.search.query.len,
+                        .focus = self.pages.ai_reviews.diff.viewer.focus,
+                        .sidebar_hidden = self.pages.ai_reviews.diff.viewer.sidebar_hidden,
+                        .side_by_side = ai_reviews_navigation_view.view().effectiveDisplayMode() == .side_by_side,
+                        .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.ai_reviews.diff.selection_owner),
+                        .retained_selection_action_available = ai_reviews_body_view.retainedSelectionActionAvailable(),
+                        .keymap = self.keymap,
+                    },
+                    .picker_open = self.pages.ai_reviews.picker.isPickerVisible(),
+                    .picker_query_mode = self.pages.ai_reviews.picker.queryMode(),
+                    .picker_query_len = self.pages.ai_reviews.picker.query.len,
+                    .picker_loading = self.pages.ai_reviews.picker.loading(),
+                    .selected_run = self.pages.ai_reviews.selectedRunConst() != null,
+                    .human_review = self.pages.ai_reviews.human_review_decision.inputContext(
                         self.humanReviewPresentation(),
                     ),
-                    .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.review.selection_owner),
-                    .retained_selection_action_available = review_body_view.retainedSelectionActionAvailable(),
-                    .finding_card_focused = self.pages.review.finding_card.isFocused(),
-                    .finding_card_at_cursor = review_navigation_view.findingCardAtCursor(),
-                    .keymap = self.keymap,
+                    .finding_card_focused = self.pages.ai_reviews.finding_card.isFocused(),
+                    .finding_card_at_cursor = ai_reviews_navigation_view.findingCardAtCursor(),
                 },
-                .selection_owner = &self.pages.review.selection_owner,
-                .loaded = review_body_view.view.activeLoadedDiffConst(),
-                .selected_node = self.pages.review.viewer.selected_node,
-                .sidebar_hidden = self.pages.review.viewer.sidebar_hidden,
-                .sidebar_width = self.pages.review.viewer.sidebar_width,
+                .selection_owner = &self.pages.ai_reviews.diff.selection_owner,
+                .loaded = ai_reviews_body_view.view.activeLoadedDiffConst(),
+                .selected_node = self.pages.ai_reviews.diff.viewer.selected_node,
+                .sidebar_hidden = self.pages.ai_reviews.diff.viewer.sidebar_hidden,
+                .sidebar_width = self.pages.ai_reviews.diff.viewer.sidebar_width,
             },
             .repository = .{
                 .key = self.pages.repository.inputContext(self.keymap),
@@ -1863,7 +1999,8 @@ pub const App = struct {
         return switch (self.active_page) {
             .changes => &self.pages.changes.status,
             .repository => &self.pages.repository.status,
-            .review => &self.pages.review.status,
+            .compare => &self.pages.compare.status,
+            .ai_reviews => &self.pages.ai_reviews.status,
             .config => null,
         };
     }
@@ -1872,7 +2009,8 @@ pub const App = struct {
         return switch (self.active_page) {
             .changes => &self.pages.changes.status,
             .repository => &self.pages.repository.status,
-            .review => &self.pages.review.status,
+            .compare => &self.pages.compare.status,
+            .ai_reviews => &self.pages.ai_reviews.status,
             .config => null,
         };
     }
@@ -1944,12 +2082,19 @@ pub const App = struct {
                 allocator,
                 completion.generation,
             ),
-            .review => {
-                var adapter = self.reviewCoordinator().navigation().updateAdapter();
+            .compare => {
+                var adapter = self.compareCoordinator().navigation().updateAdapter();
                 if (adapter.bodyController().clearCompletedSelectionAfterCopy(
                     allocator,
                     completion.generation,
-                )) self.pages.review.pinned_selection_basis = null;
+                )) self.pages.compare.diff.pinned_selection_basis = null;
+            },
+            .ai_reviews => {
+                var adapter = self.aiReviewsCoordinator().navigation().updateAdapter();
+                if (adapter.bodyController().clearCompletedSelectionAfterCopy(
+                    allocator,
+                    completion.generation,
+                )) self.pages.ai_reviews.diff.pinned_selection_basis = null;
             },
             .repository => _ = self.pages.repository.clearCompletedSelectionAfterCopy(
                 allocator,
@@ -2003,7 +2148,8 @@ pub const App = struct {
         const origin = switch (self.active_page) {
             .changes => effects.changesOrigin(),
             .repository => effects.repositoryOrigin(),
-            .review => effects.reviewOrigin(),
+            .compare => effects.compareOrigin(),
+            .ai_reviews => effects.aiReviewsOrigin(),
             .config => return,
         };
         const queued = effects.queueClipboardAccepted(ctx, .{
@@ -2072,7 +2218,7 @@ pub const App = struct {
 
     /// Applies only the shell effects authorized by a completed repository
     /// commitment. A rejected capability open must not reload or reset the
-    /// still-authoritative Changes or Review page.
+    /// still-authoritative Changes, Compare, or AI Reviews page.
     fn finishChangesRepoDiscovery(
         self: *App,
         ctx: *chasen.Ctx(Msg),
@@ -2098,7 +2244,7 @@ pub const App = struct {
         }
 
         try self.changesRead().acceptRepoDiscoveryCommit(ctx);
-        if (outcome == .changed and self.active_page == .review) {
+        if (outcome == .changed and (self.active_page == .compare or self.active_page == .ai_reviews)) {
             try self.applyRepoSessionCommit(ctx, outcome);
         }
     }
@@ -2587,7 +2733,7 @@ test "human review result session App admission faults preserve exact prepared i
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.ai_reviews.deinit(allocator);
     app.human_review_sessions.current = try human_review_session_mod.Session.init(
         allocator,
         binding,
@@ -2601,12 +2747,12 @@ test "human review result session App admission faults preserve exact prepared i
     defer ctx.runtimeClearPendingEffectCopies();
 
     try session.editSummary(allocator, "first");
-    try app.pages.review.human_review_decision.open(allocator, session.presentation());
-    _ = try app.pages.review.human_review_decision.apply(.focus_next, session.presentation());
-    _ = try app.pages.review.human_review_decision.apply(.activate, session.presentation());
-    _ = try app.pages.review.human_review_decision.apply(.focus_next, session.presentation());
-    _ = try app.pages.review.human_review_decision.apply(.focus_next, session.presentation());
-    _ = try app.pages.review.human_review_decision.apply(.activate, session.presentation());
+    try app.pages.ai_reviews.human_review_decision.open(allocator, session.presentation());
+    _ = try app.pages.ai_reviews.human_review_decision.apply(.focus_next, session.presentation());
+    _ = try app.pages.ai_reviews.human_review_decision.apply(.activate, session.presentation());
+    _ = try app.pages.ai_reviews.human_review_decision.apply(.focus_next, session.presentation());
+    _ = try app.pages.ai_reviews.human_review_decision.apply(.focus_next, session.presentation());
+    _ = try app.pages.ai_reviews.human_review_decision.apply(.activate, session.presentation());
     const initial_generation = session.generation;
     const draft_preparation_token = app.review_store_operations.queueToken(binding);
     var draft_preparation_failing = std.testing.FailingAllocator.init(
@@ -2757,42 +2903,42 @@ test "human review result session App admission faults preserve exact prepared i
 
     const saving_after_preparation_failure = session.presentation();
     try std.testing.expectEqual(human_review_session_mod.Lifecycle.saving, saving_after_preparation_failure.lifecycle);
-    try std.testing.expect(app.pages.review.human_review_decision.inputContext(saving_after_preparation_failure).read_only);
-    const focus_before_blocked_input = app.pages.review.human_review_decision.focus();
-    const decision_before_blocked_input = app.pages.review.human_review_decision.selectedDecision();
+    try std.testing.expect(app.pages.ai_reviews.human_review_decision.inputContext(saving_after_preparation_failure).read_only);
+    const focus_before_blocked_input = app.pages.ai_reviews.human_review_decision.focus();
+    const decision_before_blocked_input = app.pages.ai_reviews.human_review_decision.selectedDecision();
     const queue_before_blocked_input = app.review_store_operations.queueToken(binding);
     const operation_count_before_blocked_input = session.operationCount();
     const generation_before_blocked_input = session.generation;
-    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
         .{ .summary_paste = "must not replace accepted draft bytes" },
         saving_after_preparation_failure,
     )) == .none);
-    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
         .focus_next,
         saving_after_preparation_failure,
     )) == .none);
-    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
         .activate,
         saving_after_preparation_failure,
     )) == .none);
-    try std.testing.expectEqual(focus_before_blocked_input, app.pages.review.human_review_decision.focus());
-    try std.testing.expectEqual(decision_before_blocked_input, app.pages.review.human_review_decision.selectedDecision());
-    try std.testing.expectEqualStrings("first", app.pages.review.human_review_decision.submittedSummary().?);
+    try std.testing.expectEqual(focus_before_blocked_input, app.pages.ai_reviews.human_review_decision.focus());
+    try std.testing.expectEqual(decision_before_blocked_input, app.pages.ai_reviews.human_review_decision.selectedDecision());
+    try std.testing.expectEqualStrings("first", app.pages.ai_reviews.human_review_decision.submittedSummary().?);
     try std.testing.expectEqualStrings("third", session.workingSnapshot().?.summary.?);
     try std.testing.expectEqual(generation_before_blocked_input, session.generation);
     try std.testing.expectEqual(operation_count_before_blocked_input, session.operationCount());
     const queue_after_blocked_input = app.review_store_operations.queueToken(binding);
     try std.testing.expect(queue_before_blocked_input.eql(&queue_after_blocked_input));
-    app.pages.review.human_review_decision.close();
-    try std.testing.expect(!app.pages.review.human_review_decision.isOpen());
-    try app.pages.review.human_review_decision.open(allocator, saving_after_preparation_failure);
-    try std.testing.expect(app.pages.review.human_review_decision.inputContext(saving_after_preparation_failure).read_only);
-    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+    app.pages.ai_reviews.human_review_decision.close();
+    try std.testing.expect(!app.pages.ai_reviews.human_review_decision.isOpen());
+    try app.pages.ai_reviews.human_review_decision.open(allocator, saving_after_preparation_failure);
+    try std.testing.expect(app.pages.ai_reviews.human_review_decision.inputContext(saving_after_preparation_failure).read_only);
+    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
         .activate,
         saving_after_preparation_failure,
     )) == .none);
-    try std.testing.expect(app.pages.review.human_review_decision.selectedDecision() == null);
-    app.pages.review.human_review_decision.close();
+    try std.testing.expect(app.pages.ai_reviews.human_review_decision.selectedDecision() == null);
+    app.pages.ai_reviews.human_review_decision.close();
 
     var result = try session.prepareResult(allocator, result_token, .needs_changes);
     defer result.deinit();
@@ -2820,14 +2966,14 @@ test "human review result session App admission faults preserve exact prepared i
     const saving_after_admission_failure = session.presentation();
     try std.testing.expectEqual(human_review_session_mod.Lifecycle.saving, saving_after_admission_failure.lifecycle);
     const queue_before_reopen = app.review_store_operations.queueToken(binding);
-    try app.pages.review.human_review_decision.open(allocator, saving_after_admission_failure);
-    try std.testing.expect((try app.pages.review.human_review_decision.apply(
+    try app.pages.ai_reviews.human_review_decision.open(allocator, saving_after_admission_failure);
+    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
         .activate,
         saving_after_admission_failure,
     )) == .none);
-    try std.testing.expectEqualStrings("third", app.pages.review.human_review_decision.submittedSummary().?);
-    try std.testing.expect(app.pages.review.human_review_decision.selectedDecision() == null);
-    app.pages.review.human_review_decision.close();
+    try std.testing.expectEqualStrings("third", app.pages.ai_reviews.human_review_decision.submittedSummary().?);
+    try std.testing.expect(app.pages.ai_reviews.human_review_decision.selectedDecision() == null);
+    app.pages.ai_reviews.human_review_decision.close();
     const queue_after_reopen = app.review_store_operations.queueToken(binding);
     try std.testing.expect(queue_before_reopen.eql(&queue_after_reopen));
 

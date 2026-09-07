@@ -65,7 +65,8 @@ pub const OriginContext = struct {
     snapshot: effect_origin.Snapshot,
     changes_repo_epoch: u64,
     repository_repo_epoch: u64,
-    review_repo_epoch: u64,
+    compare_repo_epoch: u64,
+    ai_reviews_repo_epoch: u64,
 
     pub fn changes(self: OriginContext) effect_origin.PageOrigin {
         return .{
@@ -83,11 +84,19 @@ pub const OriginContext = struct {
         };
     }
 
-    pub fn review(self: OriginContext) effect_origin.PageOrigin {
+    pub fn compare(self: OriginContext) effect_origin.PageOrigin {
         return .{
-            .page_id = .review,
-            .repo_epoch = self.review_repo_epoch,
-            .activation_id = self.snapshot.review_activation_id,
+            .page_id = .compare,
+            .repo_epoch = self.compare_repo_epoch,
+            .activation_id = self.snapshot.compare_activation_id,
+        };
+    }
+
+    pub fn aiReviews(self: OriginContext) effect_origin.PageOrigin {
+        return .{
+            .page_id = .ai_reviews,
+            .repo_epoch = self.ai_reviews_repo_epoch,
+            .activation_id = self.snapshot.ai_reviews_activation_id,
         };
     }
 };
@@ -96,7 +105,8 @@ pub const DiagnosticPorts = struct {
     shell: *app_state.StatusMessage,
     changes: *app_state.StatusMessage,
     repository: *app_state.StatusMessage,
-    review: *app_state.StatusMessage,
+    compare: *app_state.StatusMessage,
+    ai_reviews: *app_state.StatusMessage,
 };
 
 pub const RedrawSink = struct {
@@ -143,8 +153,12 @@ pub const Controller = struct {
         return self.origins.repository();
     }
 
-    pub fn reviewOrigin(self: Controller) effect_origin.PageOrigin {
-        return self.origins.review();
+    pub fn compareOrigin(self: Controller) effect_origin.PageOrigin {
+        return self.origins.compare();
+    }
+
+    pub fn aiReviewsOrigin(self: Controller) effect_origin.PageOrigin {
+        return self.origins.aiReviews();
     }
 
     pub fn requestEditor(
@@ -358,7 +372,8 @@ pub const Controller = struct {
             .page => |captured| switch (captured.page_id) {
                 .changes => self.diagnostics.changes.set(fmt, args),
                 .repository => self.diagnostics.repository.set(fmt, args),
-                .review => self.diagnostics.review.set(fmt, args),
+                .compare => self.diagnostics.compare.set(fmt, args),
+                .ai_reviews => self.diagnostics.ai_reviews.set(fmt, args),
                 .config => self.diagnostics.shell.set(fmt, args),
             },
             .shell_surface => self.diagnostics.shell.set(fmt, args),

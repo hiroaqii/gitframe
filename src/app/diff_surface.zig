@@ -1,11 +1,11 @@
-//! Page-independent read-only diff surface shared by Changes and, from issue
-//! #34 on, the Review page.
+//! Page-independent read-only diff surface shared by Changes and committed-diff
+//! pages.
 //!
 //! This module owns the shared view-state vocabulary (viewer, search,
 //! file-search, selection, activation) and the `DiffSurface` pointer bundle
 //! that page adapters build per call. It must not import any page namespace
-//! (`pages/changes*`, `pages/review*`): pages depend on the surface, never the
-//! other way around.
+//! (`pages/changes*`, `pages/compare*`, `pages/ai_reviews*`): pages depend on
+//! the surface, never the other way around.
 
 const std = @import("std");
 const load_state = @import("load_state.zig");

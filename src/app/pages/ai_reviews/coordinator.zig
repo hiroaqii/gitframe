@@ -1,6 +1,6 @@
-//! Review-page input, task, and completion coordination.
+//! AI Reviews input, task, and completion coordination.
 //!
-//! The controller is a short-lived composition over the retained Review page
+//! The controller is a short-lived composition over the retained AI Reviews page
 //! and a read-only repository snapshot. It owns task terminals and translates
 //! page-local commands into typed clipboard effects without importing App.
 
@@ -8,9 +8,7 @@ const std = @import("std");
 const chasen = @import("chasen");
 const app_load = @import("../../load.zig");
 const app_message = @import("../../message.zig");
-const diff_basis = @import("../../diff_basis.zig");
 const effect_origin = @import("../../effect_origin.zig");
-const page = @import("../../page.zig");
 const repo_session = @import("../../repo_session.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
@@ -20,26 +18,23 @@ const diff_view_model = @import("../../../diff/view_model.zig");
 const finding_card = @import("../../../ai_review/finding_card.zig");
 const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
-const review_page = @import("../review.zig");
-const review_input = @import("input.zig");
-const review_navigation = @import("navigation.zig");
+const ai_reviews_page = @import("../ai_reviews.zig");
+const ai_reviews_input = @import("input.zig");
+const ai_reviews_navigation = @import("navigation.zig");
 const finding_card_view = @import("finding_card_view.zig");
 const review_store = @import("../../../review_store.zig");
 const human_review_session = @import("../../human_review_session.zig");
 const committed_review = @import("../../../committed_review.zig");
 
-const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
-const BranchListTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
-const HistoryScanTask = app_load.ReviewHistoryScanTask(app_message.Msg);
-const HistorySelectionTask = app_load.ReviewHistorySelectionTask(app_message.Msg);
-const HistoryNormalReturnTask = app_load.ReviewHistoryNormalReturnTask(app_message.Msg);
+const HistoryScanTask = app_load.AiReviewScanTask(app_message.Msg);
+const HistorySelectionTask = app_load.AiReviewSelectionTask(app_message.Msg);
 
 pub const Redraw = enum {
     default,
     skip,
 };
 
-/// Clipboard text may borrow the accepted Review snapshot or own a short
+/// Clipboard text may borrow the accepted AI Reviews snapshot or own a short
 /// allocation. Root consumes the effect synchronously before `deinit`.
 pub const ClipboardEffect = struct {
     origin: effect_origin.Origin,
@@ -85,7 +80,7 @@ pub const UpdateOutcome = struct {
 };
 
 pub const Controller = struct {
-    page_state: *review_page.ReviewPageState,
+    page_state: *ai_reviews_page.AiReviewsPageState,
     repo: repo_session.View,
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
@@ -93,7 +88,7 @@ pub const Controller = struct {
     store: ?*const review_store.ConfiguredStore = null,
     sessions: *human_review_session.Owner,
 
-    pub fn navigation(self: Controller) review_navigation.Controller {
+    pub fn navigation(self: Controller) ai_reviews_navigation.Controller {
         return .{
             .page = self.page_state,
             .repo_root = self.repo.activeRoot(),
@@ -104,7 +99,7 @@ pub const Controller = struct {
         };
     }
 
-    pub fn navigationView(self: Controller) review_navigation.View {
+    pub fn navigationView(self: Controller) ai_reviews_navigation.View {
         return .{
             .page = self.page_state,
             .repo_root = self.repo.activeRoot(),
@@ -118,63 +113,43 @@ pub const Controller = struct {
     pub fn update(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        msg: review_input.Msg,
+        msg: ai_reviews_input.Msg,
     ) !UpdateOutcome {
-        // Root normally establishes this at the preceding common update tail.
-        // Direct controller callers use the same allocation-free admission.
         self.ensureFindingPresentationCache();
         switch (msg) {
-            .shared => |shared_msg| return try self.updateShared(ctx, shared_msg),
-            .open_base_picker => try self.startBasePicker(ctx),
-            .close_base_picker => self.page_state.closeBasePicker(ctx.allocator()),
-            .base_picker_enter_query => self.page_state.base_picker.enterQuery(),
-            .base_picker_leave_query => self.page_state.base_picker.leaveQuery(),
-            .base_picker_clear_query => self.page_state.base_picker.clearQuery(ctx.allocator()) catch
-                self.page_state.status.set("Could not clear Review base search", .{}),
-            .base_picker_insert => |codepoint| self.page_state.base_picker.insertQuery(ctx.allocator(), codepoint) catch
-                self.page_state.status.set("Could not update Review base search", .{}),
-            .base_picker_backspace => self.page_state.base_picker.backspaceQuery(ctx.allocator()) catch
-                self.page_state.status.set("Could not update Review base search", .{}),
-            .base_picker_previous => self.page_state.base_picker.moveSelection(-1),
-            .base_picker_next => self.page_state.base_picker.moveSelection(1),
-            .choose_base => if (try self.page_state.chooseBasePickerTarget(ctx.allocator())) try self.refresh(ctx),
-            .open_ai_reviews => try self.startHistoryScan(ctx, false),
-            .close_ai_reviews => self.page_state.ai_reviews.close(ctx.allocator()),
-            .ai_reviews_cancel_loading => self.page_state.ai_reviews.cancelLoading(ctx.allocator()),
-            .ai_reviews_enter_query => self.page_state.ai_reviews.enterQuery(),
-            .ai_reviews_leave_query => self.page_state.ai_reviews.leaveQuery(),
-            .ai_reviews_clear_query_or_leave => self.page_state.ai_reviews.clearQueryOrLeave(ctx.allocator()) catch
+            .common => |common_msg| switch (common_msg) {
+                .shared => |shared_msg| return self.updateShared(ctx, shared_msg),
+                .copy_current_line => return self.copyCurrentLine(),
+                .copy_current_hunk => return self.copyCurrentHunk(ctx.allocator()),
+                .branch_switch_unavailable => self.page_state.status.set("branch switching is not available in AI Reviews", .{}),
+            },
+            .open_picker => try self.startHistoryScan(ctx, false),
+            .close_picker => self.page_state.picker.close(ctx.allocator()),
+            .picker_cancel_loading => self.page_state.picker.cancelLoading(ctx.allocator()),
+            .picker_enter_query => self.page_state.picker.enterQuery(),
+            .picker_leave_query => self.page_state.picker.leaveQuery(),
+            .picker_clear_query_or_leave => self.page_state.picker.clearQueryOrLeave(ctx.allocator()) catch
                 self.page_state.status.set("Could not update AI review filter", .{}),
-            .ai_reviews_insert => |codepoint| self.page_state.ai_reviews.insertQuery(ctx.allocator(), codepoint) catch
+            .picker_insert => |codepoint| self.page_state.picker.insertQuery(ctx.allocator(), codepoint) catch
                 self.page_state.status.set("Could not update AI review filter", .{}),
-            .ai_reviews_backspace => self.page_state.ai_reviews.backspaceQuery(ctx.allocator()) catch
+            .picker_backspace => self.page_state.picker.backspaceQuery(ctx.allocator()) catch
                 self.page_state.status.set("Could not update AI review filter", .{}),
-            .ai_reviews_previous => self.page_state.ai_reviews.moveSelection(-1),
-            .ai_reviews_next => self.page_state.ai_reviews.moveSelection(1),
-            .ai_reviews_activate => try self.activateAiReviewSelection(ctx),
-            .ai_reviews_refresh_or_retry => try self.retryAiReviews(ctx),
-            .return_to_normal_review => try self.startNormalReturn(ctx, true),
-            .copy_current_line => return self.copyCurrentLine(),
-            .copy_current_hunk => return try self.copyCurrentHunk(ctx.allocator()),
-            .branch_switch_unavailable => self.page_state.status.set("branch switching is not available in Review", .{}),
+            .picker_previous => self.page_state.picker.moveSelection(-1),
+            .picker_next => self.page_state.picker.moveSelection(1),
+            .picker_activate => try self.activateSelection(ctx),
+            .picker_refresh_or_retry => try self.retryPicker(ctx),
             .open_human_review_decision => try self.openHumanReviewDecision(ctx.allocator()),
             .human_review_decision => |decision_msg| {
-                switch (decision_msg) {
-                    .close => {
-                        self.page_state.human_review_decision.close();
-                        return .{};
-                    },
-                    else => {},
+                if (decision_msg == .close) {
+                    self.page_state.human_review_decision.close();
+                    return .{};
                 }
                 const presentation = self.currentHumanReviewPresentation() orelse {
                     self.page_state.human_review_decision.markBindingUnavailable();
-                    self.page_state.status.set("Pinned human review session is unavailable", .{});
+                    self.page_state.status.set("Selected human review session is unavailable", .{});
                     return .{};
                 };
-                const action = try self.page_state.human_review_decision.apply(
-                    decision_msg,
-                    presentation,
-                );
+                const action = try self.page_state.human_review_decision.apply(decision_msg, presentation);
                 switch (action) {
                     .none => {},
                     .submit => |decision| {
@@ -199,8 +174,8 @@ pub const Controller = struct {
                 }
             },
             .finding_navigation => |intent| return self.updateFindingNavigation(ctx.allocator(), intent),
-            .finding_card => |card_msg| return try self.updateFindingCard(ctx, card_msg),
-            .finding_pointer => |pointer| return try self.updateFindingPointer(ctx, pointer),
+            .finding_card => |card_msg| return self.updateFindingCard(ctx, card_msg),
+            .finding_pointer => |pointer| return self.updateFindingPointer(ctx, pointer),
         }
         return .{};
     }
@@ -223,7 +198,7 @@ pub const Controller = struct {
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
         shared_msg: diff_surface.message.Msg,
-        finding_frame: ?*review_navigation.FindingCardFrame,
+        finding_frame: ?*ai_reviews_navigation.FindingCardFrame,
     ) !UpdateOutcome {
         const base_navigation_view = self.navigationView();
         const changes_basis = sharedMessageMayChangeFindingCardBasis(shared_msg);
@@ -232,17 +207,17 @@ pub const Controller = struct {
         else
             null;
         defer if (incoming_preparation) |*preparation| preparation.deinit();
-        const raw_scroll_before = if (changes_basis) self.page_state.viewer.diff_scroll else undefined;
-        const selected_target_before = if (changes_basis) self.page_state.viewer.selected_target else undefined;
+        const raw_scroll_before = if (changes_basis) self.page_state.diff.viewer.diff_scroll else undefined;
+        const selected_target_before = if (changes_basis) self.page_state.diff.viewer.selected_target else undefined;
         const effective_mode_before = if (changes_basis) base_navigation_view.view().effectiveDisplayMode() else undefined;
-        const layout_revision_before = if (changes_basis) self.page_state.selection_layout_revision else undefined;
+        const layout_revision_before = if (changes_basis) self.page_state.diff.selection_layout_revision else undefined;
         const source_scroll_before = if (changes_basis) blk: {
             var outgoing_view = base_navigation_view.withPresentationRows(
                 if (finding_frame) |frame| &frame.presentation_rows else null,
             );
             var resolver = outgoing_view.resolver();
             const source_scroll = outgoing_view.bodyView(&resolver).sourceAnchorAtOrBeforePresentation(raw_scroll_before) orelse 0;
-            self.page_state.viewer.diff_scroll = source_scroll;
+            self.page_state.diff.viewer.diff_scroll = source_scroll;
             break :blk source_scroll;
         } else undefined;
         var navigation_controller = self.navigation();
@@ -252,14 +227,14 @@ pub const Controller = struct {
             null;
         var update_adapter = navigation_controller.updateAdapter();
         var page_update = update_adapter.shared().apply(ctx.allocator(), shared_msg) catch |err| {
-            if (changes_basis) self.page_state.viewer.diff_scroll = raw_scroll_before;
+            if (changes_basis) self.page_state.diff.viewer.diff_scroll = raw_scroll_before;
             return err;
         };
         defer page_update.deinit(ctx.allocator());
         update_adapter.applyRetentionTransition(ctx.allocator(), page_update.retention_transition);
         self.reconcileFindingCardVisibility();
         if (changes_basis) {
-            const source_scroll_after = self.page_state.viewer.diff_scroll;
+            const source_scroll_after = self.page_state.diff.viewer.diff_scroll;
             var incoming_frame = if (incoming_preparation) |*preparation|
                 preparation.fill(self.navigationView(), self.page_state.finding_card)
             else
@@ -268,18 +243,18 @@ pub const Controller = struct {
             incoming_controller.presentation_rows = if (incoming_frame) |*frame| &frame.presentation_rows else null;
             var incoming_adapter = incoming_controller.updateAdapter();
             const incoming_body = incoming_adapter.bodyController();
-            const mapping_changed = !std.meta.eql(selected_target_before, self.page_state.viewer.selected_target) or
+            const mapping_changed = !std.meta.eql(selected_target_before, self.page_state.diff.viewer.selected_target) or
                 effective_mode_before != incoming_controller.view().view().effectiveDisplayMode() or
                 !sameFindingCardPresentationRows(
                     if (finding_frame) |frame| &frame.presentation_rows else null,
                     if (incoming_frame) |*frame| &frame.presentation_rows else null,
                 );
-            self.page_state.viewer.diff_scroll = if (!mapping_changed and source_scroll_after == source_scroll_before)
+            self.page_state.diff.viewer.diff_scroll = if (!mapping_changed and source_scroll_after == source_scroll_before)
                 raw_scroll_before
             else
                 incoming_body.view().sourceToPresentationOffset(source_scroll_after) orelse source_scroll_after;
             incoming_body.clampDiffNavigation();
-            if (mapping_changed and self.page_state.selection_layout_revision == layout_revision_before) {
+            if (mapping_changed and self.page_state.diff.selection_layout_revision == layout_revision_before) {
                 self.page_state.advanceSelectionLayoutRevision();
             }
         }
@@ -305,24 +280,24 @@ pub const Controller = struct {
     }
 
     pub fn currentHumanReviewPresentation(self: Controller) ?human_review_session.Presentation {
-        const pinned = self.page_state.pinnedAiConst() orelse return null;
+        const selected = self.page_state.selectedRunConst() orelse return null;
         const presentation = self.sessions.currentPresentation() orelse return null;
-        if (!pinned.binding().eql(presentation.binding)) return null;
+        if (!selected.binding().eql(presentation.binding)) return null;
         return presentation;
     }
 
     fn openHumanReviewDecision(self: Controller, allocator: std.mem.Allocator) !void {
-        if (self.page_state.base_picker.open or self.page_state.ai_reviews.isOpen()) {
-            self.page_state.status.set("Close the Review picker before finalizing", .{});
+        if (self.page_state.picker.isOpen()) {
+            self.page_state.status.set("Close the AI Reviews picker before finalizing", .{});
             return;
         }
         const presentation = self.currentHumanReviewPresentation() orelse {
-            self.page_state.status.set("Pinned human review session is unavailable", .{});
+            self.page_state.status.set("Selected AI review session is unavailable", .{});
             return;
         };
         self.page_state.human_review_decision.open(allocator, presentation) catch |err| {
             if (err == error.SessionUnavailable) {
-                self.page_state.status.set("Pinned human review session has no review snapshot", .{});
+                self.page_state.status.set("Selected AI review session has no review snapshot", .{});
                 return;
             }
             return err;
@@ -331,128 +306,22 @@ pub const Controller = struct {
     }
 
     pub fn refresh(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.page_state.isPinnedAi()) return self.startPinnedRefresh(ctx);
-        const capability = self.repo.activeCapability() orelse {
-            self.page_state.markNoRepository(ctx.allocator());
+        if (self.page_state.selectedRunConst() == null) {
+            self.page_state.status.set("Select an AI review before refreshing", .{});
             return;
-        };
-        const anchor = try self.navigationView().captureAnchor(ctx.allocator());
-        self.page_state.replaceRefreshAnchor(ctx.allocator(), anchor);
-        self.page_state.clearRefreshFailure(ctx.allocator());
-
-        const request = self.page_state.beginRefresh() orelse return;
-        const task = ctx.allocator().create(ReviewLoadTask) catch |err| {
-            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not allocate Review load task");
-            return err;
-        };
-        task.* = ReviewLoadTask.init(
-            request.identity,
-            request.generation,
-            capability.*,
-            self.page_state.base_target,
-            self.env_map,
-            ctx.allocator(),
-        ) catch |err| {
-            ctx.allocator().destroy(task);
-            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not prepare Review load task");
-            return err;
-        };
-        ctx.task().spawnWith(.{ .ctx = task, .run = ReviewLoadTask.run, .failed = ReviewLoadTask.failed }) catch |err| {
-            task.destroy(ctx.allocator());
-            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not start Review load task");
-            return err;
-        };
-    }
-
-    pub fn finishLoad(
-        self: Controller,
-        ctx: *chasen.Ctx(app_message.Msg),
-        result: app_load.ReviewLoadFinished,
-    ) !Redraw {
-        var finished = result;
-        defer finished.deinit(ctx.allocator());
-        if (self.page_state.selection_owner.activeMouseSelection() and
-            self.page_state.acceptsFinished(self.repo.epoch(), finished))
-        {
-            self.page_state.replaceDeferredLoad(ctx.allocator(), finished);
-            finished.result = .empty;
-            return .default;
         }
-
-        if (self.page_state.acceptsFinished(self.repo.epoch(), finished)) {
-            if (self.page_state.refresh_anchor) |*anchor| {
-                const navigation_view = self.navigationView();
-                var resolver = navigation_view.resolver();
-                anchor.selection_viewport = navigation_view.bodyView(&resolver).captureSelectionViewportAnchor();
-            }
-        }
-
-        const outcome = self.page_state.applyLoadFinished(
-            ctx.allocator(),
-            self.repo.epoch(),
-            self.repo.activeRoot(),
-            self.repo.activeIdentity(),
-            &finished,
-        ) catch |err| {
-            self.page_state.failRefresh(ctx.allocator(), .{
-                .identity = finished.identity,
-                .generation = finished.generation,
-            }, self.repo.epoch(), "Could not apply Review load");
-            self.clearRefreshAnchor(ctx.allocator());
-            return err;
-        };
-        if (outcome == .stale) return .skip;
-        if (outcome != .loaded) {
-            self.clearRefreshAnchor(ctx.allocator());
-            return .default;
-        }
-
-        const navigation_controller = self.navigation();
-        var update_adapter = navigation_controller.updateAdapter();
-        var body = update_adapter.bodyController();
-        if (body.controller.activeLoadedDiff()) |loaded| {
-            if (self.page_state.takeRefreshAnchor()) |anchor_value| {
-                var anchor = anchor_value;
-                defer anchor.deinit(ctx.allocator());
-                _ = body.restoreReloadAnchor(loaded, &anchor);
-            } else {
-                body.controller.syncSidebarNodeToSelectedFile(loaded);
-                body.initializeDiffCursorForSelectedFile();
-                body.clampDiffNavigation();
-                body.refreshSearchForSelectedFile();
-            }
-            body.controller.rebuildFileSearchProjection(ctx.allocator());
-        } else {
-            self.clearRefreshAnchor(ctx.allocator());
-        }
-        return .default;
-    }
-
-    pub fn finishBranchList(
-        self: Controller,
-        allocator: std.mem.Allocator,
-        result: app_load.ReviewBranchListFinished,
-    ) Redraw {
-        var finished = result;
-        defer finished.deinit(allocator);
-        const accepted = self.page_state.base_picker.acceptFinished(
-            allocator,
-            self.repo.epoch(),
-            &self.page_state.activation,
-            &finished,
-        );
-        return if (accepted) .default else .skip;
+        try self.startSelectedRefresh(ctx);
     }
 
     pub fn finishHistoryScan(
         self: Controller,
         allocator: std.mem.Allocator,
-        result: app_load.ReviewHistoryScanFinished,
+        result: app_load.AiReviewScanFinished,
     ) Redraw {
         var finished = result;
         defer finished.deinit(allocator);
         const store = self.configuredStore() orelse return .skip;
-        const accepted = self.page_state.ai_reviews.acceptScan(
+        const accepted = self.page_state.picker.acceptScan(
             allocator,
             self.repo.epoch(),
             self.repo.activeIdentity(),
@@ -460,28 +329,29 @@ pub const Controller = struct {
             &self.page_state.activation,
             &finished,
         );
-        return if (accepted) .default else .skip;
+        return if (accepted and self.page_state.activation.currentIdentity() != null) .default else .skip;
     }
 
     pub fn finishHistorySelection(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        result: app_load.ReviewHistorySelectionFinished,
+        result: app_load.AiReviewSelectionFinished,
     ) !Redraw {
         var finished = result;
         defer finished.deinit(ctx.allocator());
         const store = self.configuredStore() orelse return .skip;
-        if (!self.page_state.ai_reviews.acceptsSelection(
+        if (!self.page_state.picker.acceptsSelection(
             self.repo.epoch(),
             self.repo.activeIdentity(),
             store.identity(),
             &self.page_state.activation,
             finished,
         )) return .skip;
-        const direct = switch (self.page_state.ai_reviews.phase) {
+        const direct = switch (self.page_state.picker.phase) {
             .selection_loading => |loading| loading.direct,
             else => return .skip,
         };
+        const visible = self.page_state.activation.currentIdentity() != null;
 
         switch (finished.result) {
             .loaded => |*bundle| {
@@ -499,7 +369,7 @@ pub const Controller = struct {
                     if (artifacts.draft) |*draft| &draft.value else null,
                     if (artifacts.result) |*review_result| &review_result.value else null,
                 ) catch |err| {
-                    self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "Could not own AI review session");
+                    self.failSelectionStatic(ctx.allocator(), finished.review_id, direct, "Could not own AI review session");
                     return err;
                 };
                 const reload_current = if (self.sessions.currentSessionConst()) |current|
@@ -512,88 +382,57 @@ pub const Controller = struct {
                 else
                     self.sessions.prepareInstall(&candidate)) catch |err| {
                     candidate.deinit();
-                    self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "AI review has unsaved recovery state");
+                    self.failSelectionStatic(ctx.allocator(), finished.review_id, direct, "AI review has unsaved recovery state");
                     return err;
                 };
                 defer install.deinit();
-                self.page_state.commitPinnedAi(
+
+                self.page_state.commitSelectedRun(
                     ctx.allocator(),
                     self.repo.epoch(),
                     self.repo.activeRoot(),
                     self.repo.activeIdentity(),
                     bundle,
                 ) catch |err| {
-                    self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "Could not apply AI review");
+                    self.failSelectionStatic(ctx.allocator(), finished.review_id, direct, "Could not apply AI review");
                     return err;
                 };
                 self.sessions.commitInstall(&install);
                 finished.result = .empty;
-                self.page_state.ai_reviews.close(ctx.allocator());
-                self.initializeAcceptedBody(ctx.allocator());
+                self.page_state.picker.close(ctx.allocator());
+                self.initializeAcceptedBody(ctx.allocator(), direct);
                 self.reconcileFindingCardVisibility();
+                if (self.page_state.activation.currentIdentity()) |identity| {
+                    _ = self.page_state.activation.finishMember(identity, .source, .immutable);
+                }
             },
-            .selection_failed => |failure| self.page_state.ai_reviews.failSelection(finished.review_id, failure),
-            .failed_static => |message| self.page_state.ai_reviews.failSelectionStatic(finished.review_id, message),
-            .empty => self.page_state.ai_reviews.failSelectionStatic(finished.review_id, "Could not load AI review"),
-        }
-        return .default;
-    }
-
-    pub fn finishHistoryNormalReturn(
-        self: Controller,
-        ctx: *chasen.Ctx(app_message.Msg),
-        result: app_load.ReviewHistoryNormalReturnFinished,
-    ) !Redraw {
-        var finished = result;
-        defer finished.deinit(ctx.allocator());
-        const store = self.configuredStore() orelse return .skip;
-        if (!self.page_state.ai_reviews.acceptsNormalReturn(
-            self.repo.epoch(),
-            self.repo.activeIdentity(),
-            store.identity(),
-            &self.page_state.activation,
-            finished,
-        )) return .skip;
-
-        switch (finished.result) {
-            .loaded => |*bundle| {
-                const clear_plan = self.sessions.prepareClear() catch |err| {
-                    self.page_state.ai_reviews.failNormalReturn("AI review has unsaved recovery state");
-                    return err;
-                };
-                self.page_state.commitNormalReturn(
-                    ctx.allocator(),
-                    self.repo.epoch(),
-                    self.repo.activeRoot(),
-                    self.repo.activeIdentity(),
-                    bundle,
-                ) catch |err| {
-                    self.page_state.ai_reviews.failNormalReturn("Could not apply normal Review");
-                    return err;
-                };
-                self.sessions.commitClear(clear_plan);
-                finished.result = .empty;
-                self.page_state.ai_reviews.close(ctx.allocator());
-                self.initializeAcceptedBody(ctx.allocator());
+            .selection_failed => |failure| {
+                self.failSelection(ctx.allocator(), finished.review_id, direct, failure);
+                self.page_state.diff.clearReloadAnchor(ctx.allocator());
+                if (self.page_state.activation.currentIdentity()) |identity| {
+                    _ = self.page_state.activation.finishMember(identity, .source, .failed);
+                }
             },
-            .basis_failed => self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review: base unavailable"),
-            .failed => |message| self.page_state.ai_reviews.failNormalReturn(message),
-            .failed_static => |message| self.page_state.ai_reviews.failNormalReturn(message),
-            .empty => self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review"),
+            .failed_static => |message| {
+                self.failSelectionStatic(ctx.allocator(), finished.review_id, direct, message);
+                self.page_state.diff.clearReloadAnchor(ctx.allocator());
+                if (self.page_state.activation.currentIdentity()) |identity| {
+                    _ = self.page_state.activation.finishMember(identity, .source, .failed);
+                }
+            },
+            .empty => {
+                self.failSelectionStatic(ctx.allocator(), finished.review_id, direct, "Could not load AI review");
+                self.page_state.diff.clearReloadAnchor(ctx.allocator());
+                if (self.page_state.activation.currentIdentity()) |identity| {
+                    _ = self.page_state.activation.finishMember(identity, .source, .failed);
+                }
+            },
         }
-        return .default;
-    }
-
-    pub fn applyDeferred(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !Redraw {
-        if (self.page_state.selection_owner.activeMouseSelection()) return .default;
-        const deferred = self.page_state.deferred_load_apply orelse return .default;
-        self.page_state.deferred_load_apply = null;
-        return self.finishLoad(ctx, deferred.finished);
+        return if (visible) .default else .skip;
     }
 
     pub fn prepareModalRedraw(self: Controller, io: std.Io) void {
-        self.page_state.base_picker.prepareModalRedraw(io);
-        self.page_state.ai_reviews.prepareModalRedraw(io);
+        self.page_state.picker.prepareModalRedraw(io);
     }
 
     /// Common update-tail admission for the one selected-Run presentation
@@ -612,7 +451,7 @@ pub const Controller = struct {
         const card_start = frame.presentation_rows.cardStart(card_index) orelse return;
         const body_start = std.math.add(usize, card_start, finding_card.body_start_row) catch return;
         const body_end = std.math.add(usize, body_start, finding_card.body_rows) catch return;
-        const viewport_start = self.page_state.viewer.diff_scroll;
+        const viewport_start = self.page_state.diff.viewer.diff_scroll;
         const viewport_end = std.math.add(
             usize,
             viewport_start,
@@ -620,14 +459,14 @@ pub const Controller = struct {
         ) catch std.math.maxInt(usize);
         if (body_start >= viewport_end or body_end <= viewport_start) return;
 
-        const width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
+        const width = ai_reviews_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
         if (width == 0 or self.page_state.cachedFindingBody(model, width) != null) return;
         const content = self.page_state.contentForFindingCard(model) orelse return;
         const finding_id = finding_card.FindingId.init(model.finding_id) orelse return;
-        const pinned = self.page_state.pinnedAi() orelse return;
+        const pinned = self.page_state.selectedRun() orelse return;
         const cache = if (pinned.finding_presentation_cache) |*value| value else return;
         cache.invalidateBody();
-        const text = review_page.findingCardDisplayTextInto(cache.body_display, content);
+        const text = ai_reviews_page.findingCardDisplayTextInto(cache.body_display, content);
         const row_count = finding_card_view.prepareWrappedRows(text, width, cache.body_row_starts);
         cache.body_text_len = text.len;
         cache.body_row_count = row_count;
@@ -641,10 +480,10 @@ pub const Controller = struct {
             return;
         };
         const preferred = if (retain_query)
-            if (self.page_state.ai_reviews.selectedRow()) |row| row.review_id else self.page_state.activeAiReviewId()
+            if (self.page_state.picker.selectedRow()) |row| row.review_id else self.page_state.activeReviewId()
         else
-            self.page_state.activeAiReviewId();
-        const request = self.page_state.ai_reviews.beginScan(
+            self.page_state.activeReviewId();
+        const request = self.page_state.picker.beginScan(
             ctx.allocator(),
             identity,
             root_identity,
@@ -652,15 +491,15 @@ pub const Controller = struct {
             retain_query,
         );
         const store = self.configuredStore() orelse {
-            self.page_state.ai_reviews.markScanFailure("Could not load AI reviews: Store unavailable");
+            self.page_state.picker.markScanFailure("Could not load AI reviews: Store unavailable");
             return;
         };
         const capability = self.repo.activeCapability() orelse {
-            self.page_state.ai_reviews.markScanFailure("Could not load AI reviews: repository unavailable");
+            self.page_state.picker.markScanFailure("Could not load AI reviews: repository unavailable");
             return;
         };
         const task = ctx.allocator().create(HistoryScanTask) catch |err| {
-            self.page_state.ai_reviews.markScanFailure("Could not allocate AI review scan");
+            self.page_state.picker.markScanFailure("Could not allocate AI review scan");
             return err;
         };
         task.* = HistoryScanTask.init(
@@ -672,42 +511,38 @@ pub const Controller = struct {
             ctx.allocator(),
         ) catch |err| {
             ctx.allocator().destroy(task);
-            self.page_state.ai_reviews.markScanFailure("Could not prepare AI review scan");
+            self.page_state.picker.markScanFailure("Could not prepare AI review scan");
             return err;
         };
         ctx.task().spawnWith(.{ .ctx = task, .run = HistoryScanTask.run, .failed = HistoryScanTask.failed }) catch |err| {
             task.destroy(ctx.allocator());
-            self.page_state.ai_reviews.markScanFailure("Could not start AI review scan");
+            self.page_state.picker.markScanFailure("Could not start AI review scan");
             return err;
         };
     }
 
-    fn activateAiReviewSelection(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.page_state.ai_reviews.selectedIsNormal()) {
-            if (!self.page_state.isPinnedAi()) {
-                self.page_state.ai_reviews.close(ctx.allocator());
-                return;
-            }
-            return self.startNormalReturn(ctx, false);
-        }
-        switch (self.page_state.ai_reviews.beginSelectedRun()) {
+    fn activateSelection(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        switch (self.page_state.picker.beginSelectedRun()) {
             .none => {},
             .unavailable => self.page_state.status.set("Review target unavailable; restore objects and press r", .{}),
             .request => |request| try self.spawnSelection(ctx, request),
         }
     }
 
-    fn startPinnedRefresh(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        const pinned = self.page_state.pinnedAi() orelse return;
+    fn startSelectedRefresh(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        const selected = self.page_state.selectedRun() orelse return;
         const identity = self.page_state.activation.currentIdentity() orelse return;
         const root_identity = self.repo.activeIdentity() orelse return;
-        const request = self.page_state.ai_reviews.beginDirectSelection(
+        const anchor = try self.navigationView().captureAnchor(ctx.allocator());
+        self.page_state.diff.replaceReloadAnchor(ctx.allocator(), anchor);
+        self.page_state.activation.markPending(.source);
+        const request = self.page_state.picker.beginDirectSelection(
             ctx.allocator(),
             identity,
             root_identity,
-            pinned.selection.snapshot,
-            pinned.reviewId(),
-            review_store.ArtifactSnapshot.fromLoaded(&pinned.selection.artifacts),
+            selected.selection.snapshot,
+            selected.reviewId(),
+            review_store.ArtifactSnapshot.fromLoaded(&selected.selection.artifacts),
         );
         try self.spawnSelection(ctx, request);
     }
@@ -715,18 +550,18 @@ pub const Controller = struct {
     fn spawnSelection(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        request: review_page.AiReviewSelectionRequest,
+        request: ai_reviews_page.AiReviewSelectionRequest,
     ) !void {
         const store = self.configuredStore() orelse {
-            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not load AI review: Store unavailable");
+            self.failSelectionStatic(ctx.allocator(), request.review_id, request.direct, "Could not load AI review: Store unavailable");
             return;
         };
         const capability = self.repo.activeCapability() orelse {
-            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not load AI review: repository unavailable");
+            self.failSelectionStatic(ctx.allocator(), request.review_id, request.direct, "Could not load AI review: repository unavailable");
             return;
         };
         const task = ctx.allocator().create(HistorySelectionTask) catch |err| {
-            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not allocate AI review load");
+            self.failSelectionStatic(ctx.allocator(), request.review_id, request.direct, "Could not allocate AI review load");
             return err;
         };
         task.* = HistorySelectionTask.init(
@@ -742,125 +577,95 @@ pub const Controller = struct {
             ctx.allocator(),
         ) catch |err| {
             ctx.allocator().destroy(task);
-            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not prepare AI review load");
+            self.failSelectionStatic(ctx.allocator(), request.review_id, request.direct, "Could not prepare AI review load");
             return err;
         };
         ctx.task().spawnWith(.{ .ctx = task, .run = HistorySelectionTask.run, .failed = HistorySelectionTask.failed }) catch |err| {
             task.destroy(ctx.allocator());
-            self.page_state.ai_reviews.failSelectionStatic(request.review_id, "Could not start AI review load");
+            self.failSelectionStatic(ctx.allocator(), request.review_id, request.direct, "Could not start AI review load");
             return err;
         };
     }
 
-    fn startNormalReturn(self: Controller, ctx: *chasen.Ctx(app_message.Msg), direct: bool) !void {
-        if (!self.page_state.isPinnedAi()) {
-            if (!direct) self.page_state.ai_reviews.close(ctx.allocator());
-            if (direct) try self.startBasePicker(ctx);
-            return;
-        }
-        const identity = self.page_state.activation.currentIdentity() orelse return;
-        const root_identity = self.repo.activeIdentity() orelse return;
-        const request = if (direct)
-            self.page_state.ai_reviews.beginDirectNormalReturn(ctx.allocator(), identity, root_identity)
-        else
-            self.page_state.ai_reviews.beginNormalReturn(false) orelse return;
-        const store = self.configuredStore() orelse {
-            self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review: Store unavailable");
-            return;
+    fn failSelection(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        review_id: committed_review.ReviewId,
+        direct: bool,
+        failure: review_store.SelectionFailure,
+    ) void {
+        self.page_state.picker.failSelection(review_id, failure);
+        if (!direct) return;
+        const message = switch (self.page_state.picker.phase) {
+            .selection_failed => |value| value.message,
+            else => return,
         };
-        const capability = self.repo.activeCapability() orelse {
-            self.page_state.ai_reviews.failNormalReturn("Could not return to normal Review: repository unavailable");
-            return;
-        };
-        const task = ctx.allocator().create(HistoryNormalReturnTask) catch |err| {
-            self.page_state.ai_reviews.failNormalReturn("Could not allocate normal Review load");
-            return err;
-        };
-        task.* = HistoryNormalReturnTask.init(
-            request.identity,
-            request.generation,
-            store,
-            capability.*,
-            self.page_state.base_target,
-            self.env_map,
-            ctx.allocator(),
-        ) catch |err| {
-            ctx.allocator().destroy(task);
-            self.page_state.ai_reviews.failNormalReturn("Could not prepare normal Review load");
-            return err;
-        };
-        ctx.task().spawnWith(.{ .ctx = task, .run = HistoryNormalReturnTask.run, .failed = HistoryNormalReturnTask.failed }) catch |err| {
-            task.destroy(ctx.allocator());
-            self.page_state.ai_reviews.failNormalReturn("Could not start normal Review load");
-            return err;
-        };
+        self.page_state.status.set("{s}", .{message});
+        self.page_state.picker.close(allocator);
     }
 
-    fn retryAiReviews(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        switch (self.page_state.ai_reviews.phase) {
-            .scan_loading => try self.startHistoryScan(ctx, true),
+    fn failSelectionStatic(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        review_id: committed_review.ReviewId,
+        direct: bool,
+        message: []const u8,
+    ) void {
+        self.page_state.picker.failSelectionStatic(review_id, message);
+        if (!direct) return;
+        self.page_state.status.set("{s}", .{message});
+        self.page_state.picker.close(allocator);
+    }
+
+    fn retryPicker(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        switch (self.page_state.picker.phase) {
+            .scan_loading, .ready, .empty, .scan_failed => try self.startHistoryScan(ctx, true),
             .selection_loading => |loading| {
-                if (loading.direct) return self.startPinnedRefresh(ctx);
-                switch (self.page_state.ai_reviews.retrySelectedRun()) {
+                if (loading.direct) return self.startSelectedRefresh(ctx);
+                switch (self.page_state.picker.retrySelectedRun()) {
                     .request => |request| try self.spawnSelection(ctx, request),
                     .unavailable => self.page_state.status.set("Review target unavailable; restore objects and press r", .{}),
                     .none => try self.startHistoryScan(ctx, true),
                 }
             },
-            .return_loading => |loading| try self.startNormalReturn(ctx, loading.direct),
-            .ready, .empty, .scan_failed => try self.startHistoryScan(ctx, true),
             .selection_failed => |failure| {
-                if (failure.direct) return self.startPinnedRefresh(ctx);
+                if (failure.direct) return self.startSelectedRefresh(ctx);
                 try self.startHistoryScan(ctx, true);
             },
-            .return_failed => |failure| try self.startNormalReturn(ctx, failure.direct),
-            else => {},
+            .closed => {},
         }
     }
 
-    fn initializeAcceptedBody(self: Controller, allocator: std.mem.Allocator) void {
+    fn initializeAcceptedBody(self: Controller, allocator: std.mem.Allocator, restore_anchor: bool) void {
         const navigation_controller = self.navigation();
         var update_adapter = navigation_controller.updateAdapter();
         var body = update_adapter.bodyController();
         if (body.controller.activeLoadedDiff()) |loaded| {
-            body.controller.syncSidebarNodeToSelectedFile(loaded);
-            body.initializeDiffCursorForSelectedFile();
+            if (restore_anchor) {
+                if (self.page_state.diff.takeReloadAnchor()) |anchor_value| {
+                    var anchor = anchor_value;
+                    defer anchor.deinit(allocator);
+                    _ = body.restoreReloadAnchor(loaded, &anchor);
+                } else {
+                    body.controller.syncSidebarNodeToSelectedFile(loaded);
+                    body.initializeDiffCursorForSelectedFile();
+                }
+            } else {
+                self.page_state.diff.clearReloadAnchor(allocator);
+                body.controller.syncSidebarNodeToSelectedFile(loaded);
+                body.initializeDiffCursorForSelectedFile();
+            }
             body.clampDiffNavigation();
             body.refreshSearchForSelectedFile();
             body.controller.rebuildFileSearchProjection(allocator);
+        } else {
+            self.page_state.diff.clearReloadAnchor(allocator);
         }
     }
 
     fn configuredStore(self: Controller) ?*const review_store.ConfiguredStore {
         const store = self.store orelse return null;
         return if (store.isConfigured()) store else null;
-    }
-
-    fn startBasePicker(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        const request = self.page_state.beginBasePicker(ctx.allocator()) orelse return;
-        const capability = self.repo.activeCapability() orelse {
-            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Review base picker requires a repository");
-            return;
-        };
-        const task = ctx.allocator().create(BranchListTask) catch |err| {
-            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not allocate Review base list task");
-            return err;
-        };
-        task.* = BranchListTask.init(
-            request.identity,
-            request.generation,
-            capability.*,
-            self.env_map,
-        ) catch |err| {
-            ctx.allocator().destroy(task);
-            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not prepare Review base list task");
-            return err;
-        };
-        ctx.task().spawnWith(.{ .ctx = task, .run = BranchListTask.run, .failed = BranchListTask.failed }) catch |err| {
-            task.destroy(ctx.allocator());
-            self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not start Review base list task");
-            return err;
-        };
     }
 
     fn copyCurrentLine(self: Controller) UpdateOutcome {
@@ -892,7 +697,7 @@ pub const Controller = struct {
     fn updateFindingCard(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        msg: review_input.FindingCardMsg,
+        msg: ai_reviews_input.FindingCardMsg,
     ) !UpdateOutcome {
         if (msg == .owned_noop) return .{};
         const allocator = ctx.allocator();
@@ -906,7 +711,7 @@ pub const Controller = struct {
         var current_view = base_view.withPresentationRows(&current_frame.presentation_rows);
         var current_resolver = current_view.resolver();
         const current_body = current_view.bodyView(&current_resolver);
-        const source_anchor = current_body.sourceAnchorAtOrBeforePresentation(self.page_state.viewer.diff_scroll);
+        const source_anchor = current_body.sourceAnchorAtOrBeforePresentation(self.page_state.diff.viewer.diff_scroll);
         var next_state = self.page_state.finding_card;
         var action: finding_card.Action = .none;
 
@@ -922,7 +727,7 @@ pub const Controller = struct {
             },
             .scroll_up, .scroll_down => {
                 const model = focusedFindingCard(current_frame.row_plan, next_state) orelse return .{};
-                const content_width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
+                const content_width = ai_reviews_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
                 const body = self.page_state.cachedFindingBody(model, content_width) orelse return .{};
                 const max_scroll = body.rowCount() -| finding_card.body_rows;
                 _ = next_state.apply(.{ .scroll = .{
@@ -982,7 +787,7 @@ pub const Controller = struct {
                 const session = self.sessions.currentSession() orelse return .{};
                 if (!session.binding.eql(presentation.binding)) return .{};
                 if (session.reconciliation == .reload_required) {
-                    try self.startPinnedRefresh(ctx);
+                    try self.refresh(ctx);
                     return .{};
                 }
                 if (session.lifecycle() != .failed) return .{};
@@ -1010,8 +815,8 @@ pub const Controller = struct {
     fn commitFindingCardTransition(
         self: Controller,
         allocator: std.mem.Allocator,
-        base_view: review_navigation.View,
-        current_frame: *const review_navigation.FindingCardFrame,
+        base_view: ai_reviews_navigation.View,
+        current_frame: *const ai_reviews_navigation.FindingCardFrame,
         source_anchor: ?usize,
         next_state: finding_card.State,
         action: finding_card.Action,
@@ -1021,7 +826,7 @@ pub const Controller = struct {
         const transition = findingCardScrollTransition(
             current_frame,
             &next_frame,
-            self.page_state.viewer.diff_scroll,
+            self.page_state.diff.viewer.diff_scroll,
             source_anchor,
             base_view.view().diffVisibleRows(),
             next_state,
@@ -1031,14 +836,14 @@ pub const Controller = struct {
             self.page_state.advanceSelectionLayoutRevision();
         }
         self.page_state.finding_card = next_state;
-        self.page_state.viewer.diff_scroll = transition.scroll;
+        self.page_state.diff.viewer.diff_scroll = transition.scroll;
         return true;
     }
 
     fn updateFindingPointer(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        pointer: review_input.FindingPointerEvent,
+        pointer: ai_reviews_input.FindingPointerEvent,
     ) !UpdateOutcome {
         const shared_msg = findingPointerSharedMessage(pointer);
         const allocator = ctx.allocator();
@@ -1081,7 +886,7 @@ pub const Controller = struct {
                             return .{ .clipboard = self.ownedClipboard("Finding", text) };
                         }
                         if (card_hit.local_row != 0) return .{};
-                        const source_anchor = body.sourceAnchorAtOrBeforePresentation(self.page_state.viewer.diff_scroll);
+                        const source_anchor = body.sourceAnchorAtOrBeforePresentation(self.page_state.diff.viewer.diff_scroll);
                         var next_state = self.page_state.finding_card;
                         const action = if (next_state.matches(model))
                             next_state.apply(.toggle)
@@ -1102,14 +907,14 @@ pub const Controller = struct {
                             self.page_state.status.set("Could not resolve Finding pointer", .{});
                             return .{};
                         }
-                        self.page_state.viewer.focus = .diff;
+                        self.page_state.diff.viewer.focus = .diff;
                         return .{};
                     },
                     .wheel_up, .wheel_down => {
                         if (!self.page_state.finding_card.expanded(model)) {
                             return try self.updateSharedWithFindingFrame(ctx, shared_msg, &current_frame);
                         }
-                        const content_width = review_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
+                        const content_width = ai_reviews_page.findingCardContentWidth(base_view.findingCardRowWidth(model));
                         const cached_body = self.page_state.cachedFindingBody(model, content_width) orelse {
                             self.page_state.status.set("Could not resolve Finding pointer", .{});
                             return .{};
@@ -1132,9 +937,9 @@ pub const Controller = struct {
     fn updateFindingNavigation(
         self: Controller,
         allocator: std.mem.Allocator,
-        intent: review_input.FindingNavigationIntent,
+        intent: ai_reviews_input.FindingNavigationIntent,
     ) UpdateOutcome {
-        const pinned = self.page_state.pinnedAiConst() orelse return .{};
+        const pinned = self.page_state.selectedRunConst() orelse return .{};
         const base_view = self.navigationView();
         const effective_mode = base_view.view().effectiveDisplayMode();
         const loaded = base_view.view().activeLoadedDiffConst() orelse {
@@ -1222,7 +1027,7 @@ pub const Controller = struct {
         const target_node = if (intent.scope == .all_files and switches_file)
             findingNavigationSidebarNode(loaded, exact_file_node)
         else
-            self.page_state.viewer.selected_node;
+            self.page_state.diff.viewer.selected_node;
         if (switches_file and
             (target_node >= loaded.tree.nodes.len or
                 (loaded.visibleNodeCount() > 0 and loaded.visibleRowOfNode(target_node) == null) or
@@ -1242,8 +1047,8 @@ pub const Controller = struct {
         };
         defer preparation.deinit();
 
-        const raw_scroll_before = self.page_state.viewer.diff_scroll;
-        const selected_target_before = self.page_state.viewer.selected_target;
+        const raw_scroll_before = self.page_state.diff.viewer.diff_scroll;
+        const selected_target_before = self.page_state.diff.viewer.selected_target;
         var outgoing_view = base_view.withPresentationRows(if (outgoing_frame) |*frame|
             &frame.presentation_rows
         else
@@ -1257,13 +1062,13 @@ pub const Controller = struct {
         const mutable_loaded = body.controller.activeLoadedDiff().?;
         if (switches_file) {
             body.controller.setSelectedDiffFile(target.span.file_ordinal);
-            self.page_state.viewer.selected_node = target_node;
+            self.page_state.diff.viewer.selected_node = target_node;
             body.resetDiffPosition();
         }
-        self.page_state.viewer.focus = .diff;
+        self.page_state.diff.viewer.focus = .diff;
         mutable_loaded.setHunkFolded(target.span.file_ordinal, target.span.hunk_ordinal, false);
         body.updateSearchMatchOffset();
-        self.page_state.viewer.diff_cursor = .{ .hunk_line = .{
+        self.page_state.diff.viewer.diff_cursor = .{ .hunk_line = .{
             .hunk_index = target.span.hunk_ordinal,
             .line_index = target.span.last_diff_line_ordinal,
         } };
@@ -1273,7 +1078,7 @@ pub const Controller = struct {
         self.page_state.finding_card = next_state;
 
         var incoming_frame = preparation.fill(self.navigationView(), next_state) orelse unreachable;
-        const mapping_changed = !std.meta.eql(selected_target_before, self.page_state.viewer.selected_target) or
+        const mapping_changed = !std.meta.eql(selected_target_before, self.page_state.diff.viewer.selected_target) or
             !sameFindingCardPresentationRows(
                 if (outgoing_frame) |*frame| &frame.presentation_rows else null,
                 &incoming_frame.presentation_rows,
@@ -1298,7 +1103,7 @@ pub const Controller = struct {
             else
                 card_start + card_height - visible_rows;
         }
-        self.page_state.viewer.diff_scroll = @min(scroll, max_scroll);
+        self.page_state.diff.viewer.diff_scroll = @min(scroll, max_scroll);
         if (mapping_changed) self.page_state.advanceSelectionLayoutRevision();
         self.page_state.status.clearIfEphemeral();
         return .{};
@@ -1317,13 +1122,6 @@ pub const Controller = struct {
         const layout_changed = findingCardStateExpanded(self.page_state.finding_card);
         self.page_state.finding_card = .unfocused;
         if (layout_changed) self.page_state.advanceSelectionLayoutRevision();
-    }
-
-    fn clearRefreshAnchor(self: Controller, allocator: std.mem.Allocator) void {
-        if (self.page_state.takeRefreshAnchor()) |anchor_value| {
-            var anchor = anchor_value;
-            anchor.deinit(allocator);
-        }
     }
 
     fn borrowedClipboard(self: Controller, label: []const u8, text: []const u8) ClipboardEffect {
@@ -1356,7 +1154,7 @@ pub const Controller = struct {
     fn effectOrigin(self: Controller) effect_origin.PageOrigin {
         const identity = self.page_state.activation.currentIdentity();
         return .{
-            .page_id = .review,
+            .page_id = .ai_reviews,
             .repo_epoch = if (identity) |value| value.repo_epoch else self.repo.epoch(),
             .activation_id = if (identity) |value| value.activation_id else self.page_state.activation.next_activation_id,
         };
@@ -1367,7 +1165,7 @@ fn findingNavigationEntryIndex(
     projection: *const finding_projection.FindingProjectionIndex,
     ordered: []const usize,
     state: finding_card.State,
-    direction: review_input.FindingNavigationIntent.Direction,
+    direction: ai_reviews_input.FindingNavigationIntent.Direction,
 ) usize {
     std.debug.assert(ordered.len > 0);
     var focused_position: ?usize = null;
@@ -1404,7 +1202,7 @@ fn findingNavigationSidebarNode(loaded: *const loaded_diff.LoadedDiff, exact_fil
     return loaded.visibleNodeAt(0) orelse exact_file_node;
 }
 
-fn findingPointerSharedMessage(pointer: review_input.FindingPointerEvent) diff_surface.message.Msg {
+fn findingPointerSharedMessage(pointer: ai_reviews_input.FindingPointerEvent) diff_surface.message.Msg {
     return switch (pointer.button) {
         .left => .{ .mouse_diff_press = pointer.point },
         .wheel_up => .mouse_diff_wheel_up,
@@ -1460,7 +1258,7 @@ fn focusedFindingCard(plan: finding_card.RowPlan, state: finding_card.State) ?fi
 }
 
 fn nextFindingCardAtSourceOffset(
-    frame: *const review_navigation.FindingCardFrame,
+    frame: *const ai_reviews_navigation.FindingCardFrame,
     source_offset: usize,
     state: finding_card.State,
 ) ?finding_card.FindingCardModel {
@@ -1517,8 +1315,8 @@ const FindingCardScrollTransition = struct {
 };
 
 fn findingCardScrollTransition(
-    current_frame: *const review_navigation.FindingCardFrame,
-    next_frame: *const review_navigation.FindingCardFrame,
+    current_frame: *const ai_reviews_navigation.FindingCardFrame,
+    next_frame: *const ai_reviews_navigation.FindingCardFrame,
     current_scroll: usize,
     source_anchor: ?usize,
     visible_rows: usize,
@@ -1553,7 +1351,7 @@ fn findingCardScrollTransition(
 
 fn findingCardCopyText(
     allocator: std.mem.Allocator,
-    content: review_page.FindingCardContent,
+    content: ai_reviews_page.FindingCardContent,
 ) std.mem.Allocator.Error![]u8 {
     if (content.suggestion) |suggestion| return std.fmt.allocPrint(
         allocator,
@@ -1561,438 +1359,4 @@ fn findingCardCopyText(
         .{ content.title, content.body, suggestion },
     );
     return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ content.title, content.body });
-}
-
-test "Review inline Finding copy bytes are width and scroll independent" {
-    const allocator = std.testing.allocator;
-    const without = try findingCardCopyText(allocator, .{
-        .producer = "agent",
-        .model = null,
-        .title = "Title",
-        .body = "Body\nline",
-        .suggestion = null,
-    });
-    defer allocator.free(without);
-    try std.testing.expectEqualStrings("Title\n\nBody\nline", without);
-
-    const with = try findingCardCopyText(allocator, .{
-        .producer = "agent",
-        .model = "model",
-        .title = "Title",
-        .body = "Body",
-        .suggestion = "replace exactly",
-    });
-    defer allocator.free(with);
-    try std.testing.expectEqualStrings("Title\n\nBody\n\nSuggestion:\nreplace exactly", with);
-}
-
-test "Review inline Finding coordinator preserves raw scroll until card row geometry changes" {
-    var repository_id: committed_review.ReviewRepositoryId = .{ .bytes = [_]u8{0} ** 16 };
-    var review_id: committed_review.ReviewId = .{ .bytes = [_]u8{0} ** 16 };
-    var digest: committed_review.Sha256Digest = .{ .bytes = [_]u8{0} ** 32 };
-    repository_id.bytes[0] = 1;
-    review_id.bytes[0] = 2;
-    digest.bytes[0] = 3;
-    const identity: finding_projection.Identity = .{
-        .review_repository_id = repository_id,
-        .review_id = review_id,
-        .target = .{
-            .object_format = .sha1,
-            .source_kind = .branch_range,
-            .base_oid = .{},
-            .head_oid = .{},
-            .diff_base_oid = .{},
-        },
-        .findings_digest = digest,
-    };
-    var cards = [_]finding_card.FindingCardModel{
-        .{
-            .identity = identity,
-            .entry_index = 0,
-            .finding_id = "first",
-            .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
-            .side = .after,
-            .anchor_range = .{ .start_line = 1, .end_line = 1 },
-            .severity = .warning,
-        },
-        .{
-            .identity = identity,
-            .entry_index = 1,
-            .finding_id = "second",
-            .span = .{ .file_ordinal = 0, .hunk_ordinal = 0, .first_diff_line_ordinal = 1, .last_diff_line_ordinal = 1 },
-            .side = .after,
-            .anchor_range = .{ .start_line = 1, .end_line = 1 },
-            .severity = .warning,
-        },
-    };
-    var groups = [_]finding_card.Group{.{
-        .hunk_ordinal = 0,
-        .last_diff_line_ordinal = 1,
-        .card_start = 0,
-        .card_count = cards.len,
-    }};
-    const row_plan: finding_card.RowPlan = .{ .groups = &groups, .cards = &cards };
-    const collapsed_inputs = [_]diff_render.InlineBlockInput{
-        .{ .after_source_offset = 1, .height = 1, .kind = .{ .card = 0 } },
-        .{ .after_source_offset = 1, .height = 1, .kind = .{ .card = 1 } },
-        .{ .after_source_offset = 1, .height = 1, .kind = .spacer },
-    };
-    const expanded_inputs = [_]diff_render.InlineBlockInput{
-        .{ .after_source_offset = 1, .height = finding_card.expanded_rows, .kind = .{ .card = 0 } },
-        .{ .after_source_offset = 1, .height = 1, .kind = .{ .card = 1 } },
-        .{ .after_source_offset = 1, .height = 1, .kind = .spacer },
-    };
-    var collapsed_rows = try diff_render.PresentationRows.init(std.testing.allocator, 6, &collapsed_inputs);
-    defer collapsed_rows.deinit(std.testing.allocator);
-    var expanded_rows = try diff_render.PresentationRows.init(std.testing.allocator, 6, &expanded_inputs);
-    defer expanded_rows.deinit(std.testing.allocator);
-    const collapsed_frame: review_navigation.FindingCardFrame = .{ .row_plan = row_plan, .presentation_rows = collapsed_rows };
-    const expanded_frame: review_navigation.FindingCardFrame = .{ .row_plan = row_plan, .presentation_rows = expanded_rows };
-
-    var state: finding_card.State = .unfocused;
-    _ = state.apply(.{ .focus = cards[0] });
-    _ = state.apply(.{ .cycle = cards[1] });
-    const cycled = findingCardScrollTransition(&collapsed_frame, &collapsed_frame, 2, 1, 4, state, .ensure_visible);
-    try std.testing.expect(!cycled.mapping_changed);
-    try std.testing.expectEqual(@as(usize, 2), cycled.scroll);
-
-    _ = state.apply(.leave);
-    const left = findingCardScrollTransition(&collapsed_frame, &collapsed_frame, 5, 1, 4, state, .none);
-    try std.testing.expect(!left.mapping_changed);
-    try std.testing.expectEqual(@as(usize, 5), left.scroll);
-
-    _ = state.apply(.{ .focus = cards[0] });
-    _ = state.apply(.toggle);
-    const expanded = findingCardScrollTransition(&collapsed_frame, &expanded_frame, 3, 1, 4, state, .ensure_visible);
-    try std.testing.expect(expanded.mapping_changed);
-    try std.testing.expectEqual(@as(usize, 2), expanded.scroll);
-
-    _ = state.apply(.toggle);
-    const collapsed = findingCardScrollTransition(&expanded_frame, &collapsed_frame, 6, 1, 4, state, .ensure_visible);
-    try std.testing.expect(collapsed.mapping_changed);
-    try std.testing.expectEqual(@as(usize, 1), collapsed.scroll);
-
-    var unresolved = cards[0];
-    unresolved.entry_index = 2;
-    unresolved.finding_id = "unresolved";
-    _ = state.apply(.{ .focus = unresolved });
-    try std.testing.expect(focusedFindingCard(row_plan, state) == null);
-    try std.testing.expect(state.reconcileVisible(row_plan.cards));
-    try std.testing.expect(!state.isFocused());
-}
-
-test "Review inline Finding copy reports allocation failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, findingCardCopyText(failing.allocator(), .{
-        .producer = "agent",
-        .model = null,
-        .title = "Title",
-        .body = "Body",
-        .suggestion = null,
-    }));
-}
-
-const semantic_viewport_test_diff =
-    "diff --git a/src/compare.zig b/src/compare.zig\n" ++
-    "--- a/src/compare.zig\n" ++
-    "+++ b/src/compare.zig\n" ++
-    "@@ -1,8 +1,8 @@\n" ++
-    " context one\n" ++
-    "-old two\n" ++
-    "+new two\n" ++
-    " context three\n" ++
-    " context four\n" ++
-    " context five\n" ++
-    " context six\n" ++
-    " context seven\n" ++
-    " context eight\n";
-
-fn semanticViewportTestOid(byte: u8) diff_basis.Oid {
-    var oid: diff_basis.Oid = .{ .len = 40 };
-    @memset(oid.bytes[0..40], byte);
-    return oid;
-}
-
-fn semanticViewportLoadedFinished(
-    allocator: std.mem.Allocator,
-    identity: page.RequestIdentity,
-    generation: u64,
-    base_byte: u8,
-    head_byte: u8,
-) !app_load.ReviewLoadFinished {
-    const full_ref = try allocator.dupe(u8, "refs/heads/main");
-    errdefer allocator.free(full_ref);
-    const display_name = try allocator.dupe(u8, "main");
-    errdefer allocator.free(display_name);
-    const head_display = try allocator.dupe(u8, "topic");
-    errdefer allocator.free(head_display);
-    return .{
-        .identity = identity,
-        .generation = generation,
-        .result = .{ .loaded = .{
-            .basis = .{
-                .base = .{
-                    .full_ref = full_ref,
-                    .display_name = display_name,
-                    .kind = .local,
-                },
-                .head_display = head_display,
-                .target = .{
-                    .object_format = .sha1,
-                    .source_kind = .branch_range,
-                    .base_oid = semanticViewportTestOid(base_byte),
-                    .head_oid = semanticViewportTestOid(head_byte),
-                    .diff_base_oid = semanticViewportTestOid(base_byte),
-                },
-                .ahead_count = 1,
-            },
-            .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, semantic_viewport_test_diff) },
-        } },
-    };
-}
-
-test "Review changed reload restores semantic viewport after removing retained actions" {
-    const allocator = std.testing.allocator;
-    var repo: repo_session.State = .{};
-    defer repo.deinit(allocator);
-    var review: review_page.ReviewPageState = .{};
-    defer review.deinit(allocator);
-    var sessions: human_review_session.Owner = .{};
-    defer sessions.deinit();
-    _ = review.activate(repo.repo_epoch);
-    const controller: Controller = .{
-        .page_state = &review,
-        .repo = repo.view(),
-        .layout = .{ .width = 80, .height = 9 },
-        .env_map = null,
-        .sessions = &sessions,
-    };
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
-
-    const initial = review.beginRefresh().?;
-    try std.testing.expectEqual(
-        Redraw.default,
-        try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
-            allocator,
-            initial.identity,
-            initial.generation,
-            'a',
-            'b',
-        )),
-    );
-    review.viewer.selected_target = .{ .diff_file = 0 };
-    review.viewer.selected_node = 0;
-    review.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 5 } };
-    review.selection_owner = .{ .diff = diff_selection.DragSelection{
-        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
-        .side = .new,
-        .mode = .line,
-        .anchor = .{ .hunk_index = 0, .line_index = 0 },
-        .focus = .{ .hunk_index = 0, .line_index = 5 },
-        .moved = true,
-    } };
-    const outgoing_view = controller.navigationView();
-    review.replaceRefreshAnchor(allocator, try outgoing_view.captureAnchor(allocator));
-    const replacement = review.beginRefresh().?;
-    try std.testing.expectEqual(
-        Redraw.default,
-        try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
-            allocator,
-            replacement.identity,
-            replacement.generation,
-            'c',
-            'd',
-        )),
-    );
-    try std.testing.expect(review.deferred_load_apply != null);
-    try std.testing.expect(review.completed_selection == null);
-
-    const scroll_before_auto = review.viewer.diff_scroll;
-    var auto = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_auto_scroll_step = .{
-        .direction = .down,
-        .endpoint = .{ .col = 20, .row = 8 },
-    } } });
-    defer auto.deinit(allocator);
-    try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, auto.auto_scroll.?);
-    try std.testing.expectEqual(scroll_before_auto + 1, review.viewer.diff_scroll);
-    try std.testing.expect(review.deferred_load_apply != null);
-
-    var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
-    defer release.deinit(allocator);
-    try std.testing.expect(review.completed_selection != null);
-    try std.testing.expect(review.pinned_selection_basis != null);
-
-    var outgoing_resolver = outgoing_view.resolver();
-    const outgoing_body = outgoing_view.bodyView(&outgoing_resolver);
-    review.viewer.diff_scroll = @min(
-        outgoing_body.selectedDiffCursorOffset() orelse 0,
-        outgoing_body.sourceDiffLineCount() -| outgoing_body.view.diffVisibleRows(),
-    );
-    const outgoing_anchor = outgoing_body.captureSelectionViewportAnchor() orelse return error.ExpectedSelectionViewport;
-    try std.testing.expectEqual(
-        Redraw.default,
-        try controller.applyDeferred(&ctx),
-    );
-    try std.testing.expect(review.deferred_load_apply == null);
-    try std.testing.expect(review.completed_selection == null);
-    try std.testing.expect(review.pinned_selection_basis == null);
-
-    const incoming_view = controller.navigationView();
-    var incoming_resolver = incoming_view.resolver();
-    const incoming_body = incoming_view.bodyView(&incoming_resolver);
-    const expected_scroll = incoming_body.restoreSelectionViewportAnchor(outgoing_anchor);
-    try std.testing.expectEqual(outgoing_anchor.raw_presentation_scroll, expected_scroll);
-    try std.testing.expectEqual(expected_scroll, review.viewer.diff_scroll);
-}
-
-test "Review deferred exact and stale completions reconcile only after release" {
-    const allocator = std.testing.allocator;
-
-    {
-        var repo: repo_session.State = .{};
-        defer repo.deinit(allocator);
-        var review: review_page.ReviewPageState = .{};
-        defer review.deinit(allocator);
-        var sessions: human_review_session.Owner = .{};
-        defer sessions.deinit();
-        _ = review.activate(repo.repo_epoch);
-        const controller: Controller = .{
-            .page_state = &review,
-            .repo = repo.view(),
-            .layout = .{ .width = 80, .height = 9 },
-            .env_map = null,
-            .sessions = &sessions,
-        };
-        var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
-
-        const initial = review.beginRefresh().?;
-        try std.testing.expectEqual(
-            Redraw.default,
-            try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
-                allocator,
-                initial.identity,
-                initial.generation,
-                'a',
-                'b',
-            )),
-        );
-        review.viewer.selected_target = .{ .diff_file = 0 };
-        review.viewer.selected_node = 0;
-        review.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 5 } };
-        review.selection_owner = .{ .diff = .{
-            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
-            .side = .new,
-            .mode = .line,
-            .anchor = .{ .hunk_index = 0, .line_index = 0 },
-            .focus = .{ .hunk_index = 0, .line_index = 5 },
-            .moved = true,
-        } };
-        review.replaceRefreshAnchor(allocator, try controller.navigationView().captureAnchor(allocator));
-        const exact = review.beginRefresh().?;
-        try std.testing.expectEqual(
-            Redraw.default,
-            try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
-                allocator,
-                exact.identity,
-                exact.generation,
-                'a',
-                'b',
-            )),
-        );
-        try std.testing.expect(review.deferred_load_apply != null);
-
-        var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
-        defer release.deinit(allocator);
-        const retained_ptr = review.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
-        const retained_token = review.completed_selection.?.token;
-        const retained_pin = review.pinned_selection_basis.?;
-        try std.testing.expectEqual(
-            Redraw.default,
-            try controller.applyDeferred(&ctx),
-        );
-        try std.testing.expect(review.deferred_load_apply == null);
-        try std.testing.expectEqual(
-            retained_ptr,
-            review.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr,
-        );
-        try std.testing.expect(review.completed_selection.?.token.source_session_revision > retained_token.source_session_revision);
-        try std.testing.expectEqual(
-            review.source_session_revision,
-            review.completed_selection.?.token.source_session_revision,
-        );
-        try std.testing.expect(review.pinned_selection_basis.?.eql(retained_pin));
-        try std.testing.expect(review.retainedSelectionAdmitted());
-    }
-
-    {
-        var repo: repo_session.State = .{};
-        defer repo.deinit(allocator);
-        var review: review_page.ReviewPageState = .{};
-        defer review.deinit(allocator);
-        var sessions: human_review_session.Owner = .{};
-        defer sessions.deinit();
-        _ = review.activate(repo.repo_epoch);
-        const controller: Controller = .{
-            .page_state = &review,
-            .repo = repo.view(),
-            .layout = .{ .width = 80, .height = 9 },
-            .env_map = null,
-            .sessions = &sessions,
-        };
-        var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
-
-        const initial = review.beginRefresh().?;
-        try std.testing.expectEqual(
-            Redraw.default,
-            try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
-                allocator,
-                initial.identity,
-                initial.generation,
-                'a',
-                'b',
-            )),
-        );
-        review.viewer.selected_target = .{ .diff_file = 0 };
-        review.viewer.selected_node = 0;
-        review.selection_owner = .{ .diff = .{
-            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/compare.zig" } },
-            .side = .new,
-            .mode = .line,
-            .anchor = .{ .hunk_index = 0, .line_index = 0 },
-            .focus = .{ .hunk_index = 0, .line_index = 5 },
-            .moved = true,
-        } };
-        review.replaceRefreshAnchor(allocator, try controller.navigationView().captureAnchor(allocator));
-        const old = review.beginRefresh().?;
-        try std.testing.expectEqual(
-            Redraw.default,
-            try controller.finishLoad(&ctx, try semanticViewportLoadedFinished(
-                allocator,
-                old.identity,
-                old.generation,
-                'c',
-                'd',
-            )),
-        );
-        try std.testing.expect(review.deferred_load_apply != null);
-        _ = review.beginRefresh().?;
-
-        var release = try controller.update(&ctx, .{ .shared = .{ .mouse_diff_release = null } });
-        defer release.deinit(allocator);
-        const retained_ptr = review.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr;
-        const retained_token = review.completed_selection.?.token;
-        const retained_pin = review.pinned_selection_basis.?;
-        const retained_revision = review.source_session_revision;
-        try std.testing.expectEqual(Redraw.skip, try controller.applyDeferred(&ctx));
-        try std.testing.expect(review.deferred_load_apply == null);
-        try std.testing.expectEqual(
-            retained_ptr,
-            review.completed_selection.?.value.parsed_diff.fragments.items[0].text.ptr,
-        );
-        try std.testing.expect(review.completed_selection.?.token.eql(retained_token));
-        try std.testing.expect(review.pinned_selection_basis.?.eql(retained_pin));
-        try std.testing.expectEqual(retained_revision, review.source_session_revision);
-        try std.testing.expect(review.refresh_anchor != null);
-        try std.testing.expect(review.retainedSelectionAdmitted());
-    }
 }

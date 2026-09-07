@@ -1,10 +1,10 @@
 //! Page-independent contract for resolving the body currently displayed by a
 //! diff surface.
 //!
-//! Rich Changes and Review page bundles stay behind the vtable. Values may be
-//! retained, allocator-owned hunk stages belong to the caller, and borrowed
-//! parsed/generated/header data remains valid only until the next surface
-//! mutation.
+//! Rich Changes and committed-diff page bundles stay behind the vtable.
+//! Values may be retained, allocator-owned hunk stages belong to the caller,
+//! and borrowed parsed/generated/header data remains valid only until the next
+//! surface mutation.
 
 const std = @import("std");
 const chasen = @import("chasen");

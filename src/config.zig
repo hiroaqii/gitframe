@@ -1228,7 +1228,7 @@ test "loadConfig accepts keymap overrides" {
     try std.testing.expect(loaded.value.keymap.get(.repo_picker).?.eql(.{ .shifted_ascii = .{ .lower = 'o', .upper = 'O' } }));
 }
 
-test "keymap rejects removed page_history and accepts page_review" {
+test "keymap rejects removed Review routes and accepts Compare and AI Reviews pages" {
     try std.testing.expectError(error.UnknownKey, parseConfigToml(
         \\schema_version = 1
         \\[keymap]
@@ -1238,9 +1238,11 @@ test "keymap rejects removed page_history and accepts page_review" {
     const parsed = try parseConfigToml(
         \\schema_version = 1
         \\[keymap]
-        \\page_review = "3"
+        \\page_compare = "3"
+        \\page_ai_reviews = "4"
     );
-    try std.testing.expect(parsed.keymap.get(.page_review).?.eql(.{ .plain_codepoint = '3' }));
+    try std.testing.expect(parsed.keymap.get(.page_compare).?.eql(.{ .plain_codepoint = '3' }));
+    try std.testing.expect(parsed.keymap.get(.page_ai_reviews).?.eql(.{ .plain_codepoint = '4' }));
 }
 
 test "keymap rejects removed file edges and accepts document navigation actions" {

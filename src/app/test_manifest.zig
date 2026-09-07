@@ -15,7 +15,7 @@ pub fn include() void {
     _ = @import("workflow/local_test.zig");
     _ = @import("workflow/remote_test.zig");
     _ = @import("page_coordinator_test.zig");
-    _ = @import("pages/review/coordinator_test.zig");
+    _ = @import("pages/ai_reviews/coordinator_test.zig");
     _ = @import("pages/repository/coordinator_test.zig");
     _ = @import("pages/changes/content_app_test.zig");
     _ = @import("pages/changes/navigation_app_test.zig");

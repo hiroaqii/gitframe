@@ -9,7 +9,8 @@ const content_fingerprint = @import("../content_fingerprint.zig");
 const diff_surface = @import("diff_surface.zig");
 const effect_origin = @import("effect_origin.zig");
 const page = @import("page.zig");
-const review_page = @import("pages/review.zig");
+const compare_page = @import("pages/compare.zig");
+const ai_reviews_page = @import("pages/ai_reviews.zig");
 const repository_page = @import("pages/repository.zig");
 const changes_content = @import("pages/changes/content.zig");
 const changes_page = @import("pages/changes.zig");
@@ -19,7 +20,8 @@ const config_mod = @import("../config.zig");
 const ShellPages = struct {
     changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
-    review: review_page.ReviewPageState = .{},
+    compare: compare_page.ComparePageState = .{},
+    ai_reviews: ai_reviews_page.AiReviewsPageState = .{},
 };
 
 const RedrawPlan = struct {
@@ -50,13 +52,15 @@ const ShellHarness = struct {
                 .repo_epoch = self.repo_epoch,
                 .changes_activation_id = self.pages.changes.activation.next_activation_id,
                 .repository_activation_id = self.pages.repository.activation_id,
-                .review_activation_id = self.pages.review.activation.next_activation_id,
+                .compare_activation_id = self.pages.compare.activation.next_activation_id,
+                .ai_reviews_activation_id = self.pages.ai_reviews.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = null,
             },
             .changes_repo_epoch = self.repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
-            .review_repo_epoch = self.repo_epoch,
+            .compare_repo_epoch = self.repo_epoch,
+            .ai_reviews_repo_epoch = self.repo_epoch,
         };
     }
 
@@ -70,7 +74,8 @@ const ShellHarness = struct {
                 .shell = &self.status,
                 .changes = &self.pages.changes.status,
                 .repository = &self.pages.repository.status,
-                .review = &self.pages.review.status,
+                .compare = &self.pages.compare.status,
+                .ai_reviews = &self.pages.ai_reviews.status,
             },
             .redraw = .{ .skip_requested = &self.redraw_plan.skip_requested },
         };
@@ -127,17 +132,17 @@ test "clipboard copy result status uses best-effort wording" {
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
 }
 
-test "Review clipboard terminals and queue failure preserve retained selection authority" {
+test "Compare clipboard terminals and queue failure preserve retained selection authority" {
     const allocator = std.testing.allocator;
-    var app: ShellHarness = .{ .active_page = .review };
-    defer app.pages.review.deinit(allocator);
+    var app: ShellHarness = .{ .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
     defer app.shell_state.clipboard_copies.deinit(allocator);
-    _ = app.pages.review.activate(0);
-    app.pages.review.completed_selection = .{
+    _ = app.pages.compare.activate(0);
+    app.pages.compare.diff.completed_selection = .{
         .token = .{
             .repo_epoch = 0,
             .root_identity = null,
-            .source = diff_surface.selection.SourceBasis.init(.{ .range = "review" }),
+            .source = diff_surface.selection.SourceBasis.init(.{ .range = "compare" }),
             .source_session_revision = 1,
             .display = .{ .loaded = content_fingerprint.Fingerprint.init("diff") },
         },
@@ -156,7 +161,7 @@ test "Review clipboard terminals and queue failure preserve retained selection a
             },
         } },
     };
-    app.pages.review.pinned_selection_basis = .{
+    app.pages.compare.diff.pinned_selection_basis = .{
         .target = .{
             .object_format = .sha1,
             .source_kind = .branch_range,
@@ -165,9 +170,9 @@ test "Review clipboard terminals and queue failure preserve retained selection a
             .diff_base_oid = .{},
         },
     };
-    const retained_token = app.pages.review.completed_selection.?.token;
-    const retained_pin = app.pages.review.pinned_selection_basis.?;
-    const origin: effect_origin.Origin = .{ .page = app.shellEffects().reviewOrigin() };
+    const retained_token = app.pages.compare.diff.completed_selection.?.token;
+    const retained_pin = app.pages.compare.diff.pinned_selection_basis.?;
+    const origin: effect_origin.Origin = .{ .page = app.shellEffects().compareOrigin() };
 
     const outcomes = [_]app_message.ClipboardCopyOutcome{
         .sent,
@@ -183,8 +188,8 @@ test "Review clipboard terminals and queue failure preserve retained selection a
             .request_id = .{ .id = request_id },
             .outcome = outcome,
         });
-        try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
-        try std.testing.expect(app.pages.review.pinned_selection_basis.?.eql(retained_pin));
+        try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
+        try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
     }
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
@@ -194,9 +199,9 @@ test "Review clipboard terminals and queue failure preserve retained selection a
         .label = "diff selection",
         .text = "selected compare",
     });
-    try std.testing.expectEqualStrings("could not prepare clipboard copy", app.pages.review.status.text());
-    try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
-    try std.testing.expect(app.pages.review.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expectEqualStrings("could not prepare clipboard copy", app.pages.compare.status.text());
+    try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 
     var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = allocator };
     defer ctx.runtimeClearPendingEffectCopies();
@@ -206,7 +211,7 @@ test "Review clipboard terminals and queue failure preserve retained selection a
             .finished = ShellHarness.Msg.clipboardFinished,
         });
     }
-    const clipboard_text = try app.pages.review.completed_selection.?.clipboardText(allocator);
+    const clipboard_text = try app.pages.compare.diff.completed_selection.?.clipboardText(allocator);
     defer allocator.free(clipboard_text);
     app.shellEffects().queueClipboard(&ctx, .{
         .origin = origin,
@@ -214,9 +219,9 @@ test "Review clipboard terminals and queue failure preserve retained selection a
         .text = clipboard_text,
     });
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings("clipboard copy already queued", app.pages.review.status.text());
-    try std.testing.expect(app.pages.review.completed_selection.?.token.eql(retained_token));
-    try std.testing.expect(app.pages.review.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expectEqualStrings("clipboard copy already queued", app.pages.compare.status.text());
+    try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 }
 
 test "inactive Changes clipboard completion retains diagnostic without redraw" {

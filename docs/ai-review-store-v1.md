@@ -1,6 +1,6 @@
 # AI Review Store v1
 
-This document describes the side-effect-free read boundary, its read-only `Review` page consumer, the installed binding/publication helpers, and the Store-owned draft/result lifecycle.
+This document describes the side-effect-free read boundary, its read-only `AI Reviews` page consumer, the installed binding/publication helpers, and the Store-owned draft/result lifecycle.
 
 ## Authority
 
@@ -136,13 +136,13 @@ Only an ordered `<oid> commit` or `<oid> missing` record is accepted. Wrong coun
 
 Selection treats scan rows as provisional. It owns a duplicated repository capability, controlled environment, Store-root path, fresh Store descriptor, parsed artifacts, and projection bytes. Before returning it revalidates physical repository locator, Store root device/inode, registry binding, namespace, exact Run artifacts, and object availability, then materializes the existing checkout-independent exact committed projection once. Any drift or missing object returns a typed failure without substituting a scan snapshot, current ref, or similar revision.
 
-## Review page history picker
+## AI Reviews page Run picker
 
-On the `Review` page, `a` opens the keyboard-only `Reviews` picker and starts one fresh asynchronous scan. GitFrame does not scan at startup and does not create a missing Store, registry, binding, namespace, or Run. The fixed `Normal Review` row is always first and is never filtered; valid Run rows remain newest-first and show their artifact-derived `new`, `draft`, `approved`, `needs changes`, or `canceled` status. Missing Git objects are shown independently as `target unavailable`.
+On the `AI Reviews` page, `a` opens the keyboard-only Run picker and starts one fresh asynchronous scan. The initial page is unselected and shows `a: select AI review`; GitFrame does not scan at startup and does not create a missing Store, registry, binding, namespace, or Run. There is no synthetic normal-comparison row. Valid Run rows remain newest-first and show their artifact-derived `new`, `draft`, `approved`, `needs changes`, or `canceled` status. Missing Git objects are shown independently as `target unavailable`.
 
 Use `/` to filter, `j`/`k` or arrow keys to move, Enter to activate, `r` to refresh or retry, and Esc/`q` to close. Query mode accepts printable command letters; Esc clears a non-empty query, then returns to command mode, and a further Esc closes. Invalid-only and unavailable states remain typed, bounded, and retryable.
 
-Selecting a Run revalidates the exact IDs and artifacts before replacing the visible diff atomically. A failed or stale selection leaves the previous normal or pinned presentation intact. In pinned mode, `r` reloads the exact Run and `m` returns through a fresh normal branch-comparison load; it never retargets the pinned OIDs through the base picker. Bare Esc outside the picker does not leave pinned mode.
+Selecting a Run revalidates the exact IDs and artifacts before replacing the visible diff atomically. A failed or stale selection leaves the previous selected Run intact. On the `AI Reviews` page, `r` reloads that exact Run and `m` is unowned; branch comparison and `m` base selection belong only to the separate `Compare` page. Switching to another page and back retains the selected Run and its navigation without reopening the picker, while repository replacement clears the old repository's selection. Bare Esc outside the picker does not clear the selected Run.
 
 ## Draft and result persistence
 
@@ -196,7 +196,7 @@ draft revision and is never coalesced.
 Task completion is matched by operation ID and full Run binding, not the
 current page. The App clones request bytes before admission, so conflict,
 failure, page switch, and repository switch cannot discard or mutate the
-caller's dirty editor state. A matching pinned Review receives its bounded
+caller's dirty editor state. A matching selected AI Review Run receives its bounded
 completion notification; every mismatched, stale, or runtime-undelivered
 payload is still deinitialized exactly once.
 
@@ -217,4 +217,4 @@ dirty state available for explicit reload/reconciliation.
 
 Every success/failure/skip terminal frees parsed arenas, raw artifact bytes, diagnostics, projection buffers, environments, and descriptors exactly once. The focused suite covers success and drift/failure union terminals with `std.testing.allocator`.
 
-Config resolution, scan, selection, picker use, pinned refresh, and return-to-normal create no Store content. Only the two installed explicit producer helpers create bindings or immutable Run pairs; only the mutation owner writes GitFrame-owned draft/result artifacts. No disposition, anchored-note, or terminal-decision UI is introduced by this storage slice. Those consumer surfaces remain follow-up responsibilities.
+Config resolution, scan, selection, picker use, exact selected-Run refresh, and page navigation create no Store content. Only the two installed explicit producer helpers create bindings or immutable Run pairs; only the mutation owner writes GitFrame-owned draft/result artifacts. No disposition, anchored-note, or terminal-decision UI is introduced by this storage slice. Those consumer surfaces remain follow-up responsibilities.

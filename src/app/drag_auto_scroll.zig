@@ -11,7 +11,8 @@ pub const interval_ns: u64 = 80 * std.time.ns_per_ms;
 
 pub const Target = enum {
     changes,
-    review,
+    compare,
+    ai_reviews,
     repository,
 };
 
@@ -165,7 +166,7 @@ test "drag auto-scroll keeps one generation at an edge and rejects stale ticks a
     try std.testing.expect(state.acceptedTick(first.generation) != null);
     state.observe(.changes, .{ .col = 7, .row = 6 }, viewport);
     try std.testing.expect(state.active == null);
-    state.observe(.review, .{ .col = 7, .row = 10 }, viewport);
+    state.observe(.ai_reviews, .{ .col = 7, .row = 10 }, viewport);
     try std.testing.expect(state.active.?.generation != first.generation);
     try std.testing.expect(state.acceptedTick(first.generation) == null);
 }

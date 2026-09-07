@@ -9,7 +9,8 @@ const command_line = @import("command_line.zig");
 const load = @import("load.zig");
 const page = @import("page.zig");
 const push_retry = @import("push_retry.zig");
-const review_input = @import("pages/review/input.zig");
+const compare_input = @import("pages/compare/input.zig");
+const ai_reviews_input = @import("pages/ai_reviews/input.zig");
 const diff_surface = @import("diff_surface.zig");
 const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const repository_page = @import("pages/repository.zig");
@@ -62,7 +63,8 @@ pub const ShellEffectFinished = union(enum) {
 
 pub const MouseSelectionTarget = union(enum) {
     changes: ?changes_message.MousePoint,
-    review: ?diff_surface.MousePoint,
+    compare: ?diff_surface.MousePoint,
+    ai_reviews: ?diff_surface.MousePoint,
     repository: ?repository_layout.BodyPoint,
 };
 
@@ -148,7 +150,8 @@ pub const Msg = union(enum) {
     shell_effect_finished: ShellEffectFinished,
     review_store_operation_finished: ReviewStoreOperationFinished,
     changes: changes_message.Msg,
-    review: review_input.Msg,
+    compare: compare_input.Msg,
+    ai_reviews: ai_reviews_input.Msg,
     repository: repository_page.Msg,
     command_line: command_line.Msg,
     mouse_selection_drag: MouseSelectionContinuation,
@@ -404,8 +407,8 @@ test "undelivered remaining read routes release owned payloads" {
     } } });
     branch_list_msg.deinitUndelivered(allocator);
 
-    var review_msg = Msg.loadFinished(.{ .review = .{ .source = .{
-        .identity = page.RequestIdentity.review(3, 5),
+    var compare_msg = Msg.loadFinished(.{ .compare = .{ .source = .{
+        .identity = page.RequestIdentity.compare(3, 5),
         .generation = 4,
         .result = .{ .loaded = .{
             .basis = .{
@@ -427,17 +430,17 @@ test "undelivered remaining read routes release owned payloads" {
             .diff = .empty,
         } },
     } } });
-    review_msg.deinitUndelivered(allocator);
+    compare_msg.deinitUndelivered(allocator);
 }
 
 test "AI Reviews picker undelivered task terminals preserve semantic store identity" {
     const allocator = std.testing.allocator;
-    const identity = page.RequestIdentity.review(3, 5);
+    const identity = page.RequestIdentity.aiReviews(3, 5);
     var store = try review_store.ConfiguredStore.initConfigured(allocator, "/store");
     defer store.deinit(allocator);
     const store_identity = store.identity();
 
-    var scan = Msg.loadFinished(.{ .review = .{ .history_scan = .{
+    var scan = Msg.loadFinished(.{ .ai_reviews = .{ .history_scan = .{
         .identity = identity,
         .generation = 1,
         .store_identity = store_identity,
@@ -445,7 +448,7 @@ test "AI Reviews picker undelivered task terminals preserve semantic store ident
     } } });
     scan.deinitUndelivered(allocator);
 
-    var selection = Msg.loadFinished(.{ .review = .{ .history_selection = .{
+    var selection = Msg.loadFinished(.{ .ai_reviews = .{ .history_selection = .{
         .identity = identity,
         .generation = 2,
         .store_identity = store_identity,
@@ -453,14 +456,6 @@ test "AI Reviews picker undelivered task terminals preserve semantic store ident
         .result = .{ .failed_static = "selection failed" },
     } } });
     selection.deinitUndelivered(allocator);
-
-    var normal = Msg.loadFinished(.{ .review = .{ .history_normal_return = .{
-        .identity = identity,
-        .generation = 3,
-        .store_identity = store_identity,
-        .result = .{ .failed_static = "normal failed" },
-    } } });
-    normal.deinitUndelivered(allocator);
 }
 
 test "undelivered plain root message is a no-op" {

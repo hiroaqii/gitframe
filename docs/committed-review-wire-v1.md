@@ -31,7 +31,7 @@ A target has exactly five fields in this canonical writer order:
 ```
 
 - `object_format` is `sha1` or `sha256`; all three OIDs are respectively 40 or 64 lowercase hexadecimal bytes.
-- `source_kind` is `branch_range` in v1. It records target construction semantics, not a Review-page mode.
+- `source_kind` is `branch_range` in v1. It records target construction semantics, not a UI page mode.
 - `base_oid` is the commit selected by caller base policy.
 - `head_oid` is the exact reviewed commit and the source tree for versioned `.gitattributes`.
 - `diff_base_oid` is the exact-one best merge base and is the left projection endpoint. It may differ from `base_oid`.
@@ -161,7 +161,7 @@ The artifact domain exposes only a pure admission state derived from already val
 | yes | no | `draft` | admitted | admitted after snapshot validation |
 | no or yes | yes | `completed` | `AlreadyCompleted` | `AlreadyCompleted` |
 
-A submit owner must save and validate the latest draft before create-once result publication. Valid result presence is the terminal authority even when the frozen draft remains stored. Raw invalid-file presence is not valid result evidence. A failed publication leaves the prior valid draft editable and does not serialize cancellation or completion. `canceled` is produced only by an explicit terminal submit and follows the same snapshot and create-once rules. Normal Review return, picker close, page or repository transition, and quit do not synthesize a result.
+A submit owner must save and validate the latest draft before create-once result publication. Valid result presence is the terminal authority even when the frozen draft remains stored. Raw invalid-file presence is not valid result evidence. A failed publication leaves the prior valid draft editable and does not serialize cancellation or completion. `canceled` is produced only by an explicit terminal submit and follows the same snapshot and create-once rules. Picker close, page or repository transition, and quit do not synthesize a result.
 
 Filesystem scanning, regular-file/no-follow admission, locking, draft CAS, atomic save, create-once publication, clock acquisition, mutation serialization, and crash recovery are outside this wire contract.
 
@@ -252,7 +252,7 @@ A consumer admits success only when exit is 0, the first LF is within the header
 
 #106 obtains a target with the installed `review-target` command, places that exact complete target in `review-projection`, validates the frame, and uses the returned payload as generation input. It must not run raw `git diff`, reimplement projection policy, fetch, or fall back after request/frame failure. Both commands must come from the same installed GitFrame binary/version.
 
-Current Branch Review resolves current `HEAD` against the base selected with `m` and uses the same page-neutral committed projection. A future pinned AI Review Run uses its stored exact OID target and does not allow `m` to retarget it. These are modes of the same Review page/diff surface, not duplicated pages.
+`Compare` resolves current `HEAD` against the base selected with `m`. `AI Reviews` displays one selected Run at its stored exact OID target and does not own `m`. They are independent top-level pages with independent activation, requests, and retained navigation; both reuse the same page-neutral committed projection and lower-level diff primitives.
 
 #111 File/Stream views and future History reuse the same committed projection and renderer foundations. Stream rows, hunk positions, and cursor coordinates remain runtime presentation state, not durable authority. This contract does not implement those UIs.
 

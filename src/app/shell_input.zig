@@ -33,11 +33,12 @@ const MousePane = enum {
 
 const ActiveDiffSelectionOwner = union(enum) {
     changes: *const diff_selection.Owner,
-    review: *const diff_selection.Owner,
+    compare: *const diff_selection.Owner,
+    ai_reviews: *const diff_selection.Owner,
 
     fn active(self: ActiveDiffSelectionOwner) bool {
         return switch (self) {
-            inline .changes, .review => |owner| owner.activeMouseSelection(),
+            inline .changes, .compare, .ai_reviews => |owner| owner.activeMouseSelection(),
         };
     }
 };
@@ -54,8 +55,17 @@ pub const ChangesContext = struct {
     sidebar_width: ?u16,
 };
 
-pub const ReviewContext = struct {
-    key: app_input.ReviewContext,
+pub const CompareContext = struct {
+    key: app_input.CompareContext,
+    selection_owner: *const diff_selection.Owner,
+    loaded: ?*const loaded_diff.LoadedDiff,
+    selected_node: usize,
+    sidebar_hidden: bool,
+    sidebar_width: ?u16,
+};
+
+pub const AiReviewsContext = struct {
+    key: app_input.AiReviewsContext,
     selection_owner: *const diff_selection.Owner,
     loaded: ?*const loaded_diff.LoadedDiff,
     selected_node: usize,
@@ -71,7 +81,8 @@ pub const RepositoryContext = struct {
 pub const View = struct {
     active_page: page.Id,
     changes: ChangesContext,
-    review: ReviewContext,
+    compare: CompareContext,
+    ai_reviews: AiReviewsContext,
     repository: RepositoryContext,
     commit_panel_mode: bool,
     repo_picker_mode: bool,
@@ -96,7 +107,8 @@ pub const View = struct {
         return .{
             .active_page = self.active_page,
             .changes = self.changes.key,
-            .review = self.review.key,
+            .compare = self.compare.key,
+            .ai_reviews = self.ai_reviews.key,
             .repository = self.repository.key,
             .commit_panel_mode = self.commit_panel_mode,
             .repo_picker_mode = self.repo_picker_mode,
@@ -117,7 +129,7 @@ pub const View = struct {
 
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
         if (self.command_line_active) return null;
-        if (self.active_page == .review and self.review.key.human_review.open) return null;
+        if (self.active_page == .ai_reviews and self.ai_reviews.key.human_review.open) return null;
         if (self.activeDiffSelectionOwner()) |selection| {
             if (selection.active()) switch (selection) {
                 .changes => switch (mouse.type) {
@@ -131,14 +143,25 @@ pub const View = struct {
                     } },
                     else => {},
                 },
-                .review => switch (mouse.type) {
+                .compare => switch (mouse.type) {
                     .drag => return .{ .mouse_selection_drag = .{
                         .pointer = self.bodyPointerSample(mouse),
-                        .target = .{ .review = self.bodyMousePoint(mouse) },
+                        .target = .{ .compare = self.bodyMousePoint(mouse) },
                     } },
                     .release => return .{ .mouse_selection_release = .{
                         .pointer = self.bodyPointerSample(mouse),
-                        .target = .{ .review = self.bodyMousePoint(mouse) },
+                        .target = .{ .compare = self.bodyMousePoint(mouse) },
+                    } },
+                    else => {},
+                },
+                .ai_reviews => switch (mouse.type) {
+                    .drag => return .{ .mouse_selection_drag = .{
+                        .pointer = self.bodyPointerSample(mouse),
+                        .target = .{ .ai_reviews = self.bodyMousePoint(mouse) },
+                    } },
+                    .release => return .{ .mouse_selection_release = .{
+                        .pointer = self.bodyPointerSample(mouse),
+                        .target = .{ .ai_reviews = self.bodyMousePoint(mouse) },
                     } },
                     else => {},
                 },
@@ -170,8 +193,10 @@ pub const View = struct {
         }
 
         if ((self.active_page == .changes and (self.changes.key.search_mode or self.changes.key.file_search_mode)) or
-            (self.active_page == .review and (self.review.key.search_mode or self.review.key.file_search_mode or
-                self.review.key.base_picker_open or self.review.key.ai_reviews_open)) or
+            (self.active_page == .compare and (self.compare.key.common.search_mode or self.compare.key.common.file_search_mode or
+                self.compare.key.base_picker_open)) or
+            (self.active_page == .ai_reviews and (self.ai_reviews.key.common.search_mode or self.ai_reviews.key.common.file_search_mode or
+                self.ai_reviews.key.picker_open)) or
             (self.active_page == .repository and (self.repository.key.source_search_mode or self.repository.key.file_search_mode)) or
             self.commit_panel_mode or self.repo_picker_mode) return null;
         if (mouse.type != .press) return null;
@@ -232,43 +257,54 @@ pub const View = struct {
             return .{ .repository = repository_msg };
         }
 
-        if (self.active_page == .review) {
-            const pane = self.reviewMousePane(mouse) orelse return null;
+        if (self.active_page == .compare) {
+            const pane = self.committedDiffMousePane(self.compare, mouse) orelse return null;
             return switch (mouse.button) {
                 .left => switch (pane) {
-                    .sidebar => .{ .review = .{ .shared = self.reviewSidebarClickToMsg(mouse) } },
-                    .diff => if (self.review.key.pinned_ai)
-                        .{ .review = .{ .finding_pointer = .{
-                            .point = self.bodyMousePoint(mouse) orelse return null,
-                            .button = .left,
-                        } } }
+                    .sidebar => .{ .compare = .{ .common = .{ .shared = self.committedDiffSidebarClickToMsg(self.compare, mouse) } } },
+                    .diff => .{ .compare = .{ .common = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } } },
+                },
+                .wheel_up => .{ .compare = .{ .common = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_up else .mouse_diff_wheel_up } } },
+                .wheel_down => .{ .compare = .{ .common = .{ .shared = if (pane == .sidebar) .mouse_sidebar_wheel_down else .mouse_diff_wheel_down } } },
+                .wheel_left => if (pane == .diff) .{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_left } } } else null,
+                .wheel_right => if (pane == .diff) .{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_right } } } else null,
+                else => null,
+            };
+        }
+        if (self.active_page == .ai_reviews) {
+            const pane = self.committedDiffMousePane(self.ai_reviews, mouse) orelse return null;
+            return switch (mouse.button) {
+                .left => switch (pane) {
+                    .sidebar => .{ .ai_reviews = .{ .common = .{ .shared = self.committedDiffSidebarClickToMsg(self.ai_reviews, mouse) } } },
+                    .diff => if (self.ai_reviews.key.selected_run)
+                        .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .left } } }
                     else
-                        .{ .review = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } },
+                        .{ .ai_reviews = .{ .common = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } } },
                 },
                 .wheel_up => if (pane == .sidebar)
-                    .{ .review = .{ .shared = .mouse_sidebar_wheel_up } }
-                else if (self.review.key.pinned_ai)
-                    .{ .review = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_up } } }
+                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_sidebar_wheel_up } } }
+                else if (self.ai_reviews.key.selected_run)
+                    .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_up } } }
                 else
-                    .{ .review = .{ .shared = .mouse_diff_wheel_up } },
+                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_diff_wheel_up } } },
                 .wheel_down => if (pane == .sidebar)
-                    .{ .review = .{ .shared = .mouse_sidebar_wheel_down } }
-                else if (self.review.key.pinned_ai)
-                    .{ .review = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_down } } }
+                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_sidebar_wheel_down } } }
+                else if (self.ai_reviews.key.selected_run)
+                    .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_down } } }
                 else
-                    .{ .review = .{ .shared = .mouse_diff_wheel_down } },
+                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_diff_wheel_down } } },
                 .wheel_left => if (pane != .diff)
                     null
-                else if (self.review.key.pinned_ai)
-                    .{ .review = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_left } } }
+                else if (self.ai_reviews.key.selected_run)
+                    .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_left } } }
                 else
-                    .{ .review = .{ .shared = .mouse_diff_wheel_left } },
+                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_diff_wheel_left } } },
                 .wheel_right => if (pane != .diff)
                     null
-                else if (self.review.key.pinned_ai)
-                    .{ .review = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_right } } }
+                else if (self.ai_reviews.key.selected_run)
+                    .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_right } } }
                 else
-                    .{ .review = .{ .shared = .mouse_diff_wheel_right } },
+                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_diff_wheel_right } } },
                 else => null,
             };
         }
@@ -291,33 +327,34 @@ pub const View = struct {
     fn activeDiffSelectionOwner(self: View) ?ActiveDiffSelectionOwner {
         return switch (self.active_page) {
             .changes => .{ .changes = self.changes.selection_owner },
-            .review => .{ .review = self.review.selection_owner },
+            .compare => .{ .compare = self.compare.selection_owner },
+            .ai_reviews => .{ .ai_reviews = self.ai_reviews.selection_owner },
             .repository, .config => null,
         };
     }
 
-    fn reviewMousePane(self: View, mouse: anytype) ?MousePane {
-        _ = self.review.loaded orelse return null;
+    fn committedDiffMousePane(self: View, context: anytype, mouse: anytype) ?MousePane {
+        _ = context.loaded orelse return null;
         const point = self.bodyMousePoint(mouse) orelse return null;
-        if (self.review.sidebar_hidden) return .diff;
+        if (context.sidebar_hidden) return .diff;
         const sidebar_width = changes_layout.sidebarWidth(
             self.layout.content.width,
-            self.review.sidebar_width,
+            context.sidebar_width,
         );
         if (point.col < sidebar_width) return .sidebar;
         if (point.col == sidebar_width) return null;
         return .diff;
     }
 
-    fn reviewSidebarClickToMsg(self: View, mouse: anytype) diff_surface.message.Msg {
+    fn committedDiffSidebarClickToMsg(self: View, context: anytype, mouse: anytype) diff_surface.message.Msg {
         const point = self.bodyMousePoint(mouse) orelse return .focus_sidebar;
         const body_height = self.layout.body.height;
         if (point.row < sidebar_header_rows or body_height <= sidebar_header_rows) return .focus_sidebar;
-        const loaded = self.review.loaded orelse return .focus_sidebar;
+        const loaded = context.loaded orelse return .focus_sidebar;
         const visible_rows: usize = body_height - sidebar_header_rows;
         const body_row: usize = point.row - sidebar_header_rows;
         const node_index = loaded.sidebarNodeAtBodyRow(
-            self.review.selected_node,
+            context.selected_node,
             visible_rows,
             body_row,
         ) orelse return .focus_sidebar;
@@ -458,7 +495,7 @@ test "human review result modal blocks mouse routing while Repository Help scrol
     var selection_owner: diff_selection.Owner = .none;
     var repository_state: repository_page.RepositoryPageState = .{};
     const modal_view: View = .{
-        .active_page = .review,
+        .active_page = .ai_reviews,
         .changes = .{
             .key = .{},
             .selection_owner = &selection_owner,
@@ -467,7 +504,15 @@ test "human review result modal blocks mouse routing while Repository Help scrol
             .sidebar_hidden = false,
             .sidebar_width = null,
         },
-        .review = .{
+        .compare = .{
+            .key = .{},
+            .selection_owner = &selection_owner,
+            .loaded = null,
+            .selected_node = 0,
+            .sidebar_hidden = false,
+            .sidebar_width = null,
+        },
+        .ai_reviews = .{
             .key = .{ .human_review = .{ .open = true } },
             .selection_owner = &selection_owner,
             .loaded = null,
@@ -499,14 +544,14 @@ test "human review result modal blocks mouse routing while Repository Help scrol
     } }) == null);
 }
 
-test "Finding pointer shell preserves the Review body point and button once" {
+test "Finding pointer shell preserves the AI Reviews body point and button once" {
     var overlay: app_state.OverlayState = .{};
     var selection_owner: diff_selection.Owner = .none;
     var repository_state: repository_page.RepositoryPageState = .{};
     var loaded: loaded_diff.LoadedDiff = undefined;
     const layout = app_shell_layout.compute(.{ .width = 80, .height = 24 }, .{ .page_bar_visible = true });
     const view: View = .{
-        .active_page = .review,
+        .active_page = .ai_reviews,
         .changes = .{
             .key = .{},
             .selection_owner = &selection_owner,
@@ -515,8 +560,16 @@ test "Finding pointer shell preserves the Review body point and button once" {
             .sidebar_hidden = false,
             .sidebar_width = null,
         },
-        .review = .{
-            .key = .{ .pinned_ai = true },
+        .compare = .{
+            .key = .{},
+            .selection_owner = &selection_owner,
+            .loaded = null,
+            .selected_node = 0,
+            .sidebar_hidden = false,
+            .sidebar_width = null,
+        },
+        .ai_reviews = .{
+            .key = .{ .selected_run = true },
             .selection_owner = &selection_owner,
             .loaded = &loaded,
             .selected_node = 0,
@@ -536,17 +589,17 @@ test "Finding pointer shell preserves the Review body point and button once" {
     const terminal_row: i16 = @intCast(layout.body.row + point.row);
     const cases = [_]struct {
         event: chasen.Event,
-        review: @import("pages/review/input.zig").FindingPointerEvent.Button,
+        button: @import("pages/ai_reviews/input.zig").FindingPointerEvent.Button,
     }{
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .left, .mods = .{}, .type = .press } }, .review = .left },
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_up, .mods = .{}, .type = .press } }, .review = .wheel_up },
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_down, .mods = .{}, .type = .press } }, .review = .wheel_down },
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_left, .mods = .{}, .type = .press } }, .review = .wheel_left },
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_right, .mods = .{}, .type = .press } }, .review = .wheel_right },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .left, .mods = .{}, .type = .press } }, .button = .left },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_up, .mods = .{}, .type = .press } }, .button = .wheel_up },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_down, .mods = .{}, .type = .press } }, .button = .wheel_down },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_left, .mods = .{}, .type = .press } }, .button = .wheel_left },
+        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_right, .mods = .{}, .type = .press } }, .button = .wheel_right },
     };
     for (cases) |case| {
         try std.testing.expectEqual(
-            app_message.Msg{ .review = .{ .finding_pointer = .{ .point = point, .button = case.review } } },
+            app_message.Msg{ .ai_reviews = .{ .finding_pointer = .{ .point = point, .button = case.button } } },
             view.handleEvent(case.event).?,
         );
     }
@@ -567,9 +620,9 @@ test "Finding pointer shell preserves the Review body point and button once" {
     } }) == null);
 
     var sidebar_view = view;
-    sidebar_view.review.sidebar_hidden = false;
+    sidebar_view.ai_reviews.sidebar_hidden = false;
     try std.testing.expectEqual(
-        app_message.Msg{ .review = .{ .shared = .mouse_sidebar_wheel_down } },
+        app_message.Msg{ .ai_reviews = .{ .common = .{ .shared = .mouse_sidebar_wheel_down } } },
         sidebar_view.handleEvent(.{ .mouse = .{
             .col = @intCast(layout.body.col + 1),
             .row = @intCast(layout.body.row + 5),
@@ -580,9 +633,9 @@ test "Finding pointer shell preserves the Review body point and button once" {
     );
 
     var normal_view = view;
-    normal_view.review.key.pinned_ai = false;
+    normal_view.ai_reviews.key.selected_run = false;
     try std.testing.expectEqual(
-        app_message.Msg{ .review = .{ .shared = .{ .mouse_diff_press = point } } },
+        app_message.Msg{ .ai_reviews = .{ .common = .{ .shared = .{ .mouse_diff_press = point } } } },
         normal_view.handleEvent(.{ .mouse = .{
             .col = terminal_col,
             .row = terminal_row,

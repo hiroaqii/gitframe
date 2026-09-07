@@ -1,4 +1,4 @@
-//! Page-local form state for explicitly finalizing one pinned human Review.
+//! Page-local form state for explicitly finalizing one selected AI review.
 //!
 //! This module owns only ephemeral decision/summary input and diagnostics. It
 //! never owns a Review binding, revision, operation identifier, result time,
@@ -48,7 +48,7 @@ pub const Feedback = enum {
             .edit_blocked => "Review summary is not editable in the current session state",
             .already_completing => "Review completion is already in progress",
             .already_completed => "Review is already completed",
-            .reload_required => "Review state changed unexpectedly; reload the pinned Review",
+            .reload_required => "Review state changed unexpectedly; reload the selected AI review",
             .store_unavailable => "Review Store is unavailable",
             .queue_changed => "Review operation queue changed; retry after the current operation finishes",
             .capacity => "Review operation capacity is temporarily exhausted",

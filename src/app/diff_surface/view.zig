@@ -1554,7 +1554,7 @@ test "Finding discovery renders severity metadata and resolves only visible file
     };
 
     const loaded = test_support.loadedDiffNested();
-    var activation = diff_surface.authority.Lifecycle.init(.review);
+    var activation = diff_surface.authority.Lifecycle.init(.compare);
     var status: app_state.StatusMessage = .{};
     var load = test_support.loadState(loaded);
     defer load.clearCurrent(null);

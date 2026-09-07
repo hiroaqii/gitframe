@@ -77,7 +77,7 @@ fn changesReload(app: *App) changes_reload.Controller {
     };
 }
 
-fn retainedReviewAppForViewTest(
+fn retainedCompareAppForViewTest(
     allocator: std.mem.Allocator,
     terminal_size: chasen.Size,
     mode: diff_render.DisplayMode,
@@ -85,13 +85,15 @@ fn retainedReviewAppForViewTest(
 ) !App {
     var app: App = .{
         .allocator = allocator,
-        .active_page = .review,
+        .active_page = .compare,
         .terminal_size = terminal_size,
         .theme = paletteWithOverride(.selection_action_bg, .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } }),
-        .pages = .{ .review = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .sidebar_hidden = true, .display_mode = mode },
-            .presentation = .{ .normal = .{ .basis = .{
+        .pages = .{ .compare = .{
+            .diff = .{
+                .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+                .viewer = .{ .sidebar_hidden = true, .display_mode = mode },
+            },
+            .basis = .{
                 .base = .{
                     .full_ref = try allocator.dupe(u8, "refs/heads/main"),
                     .display_name = try allocator.dupe(u8, "main"),
@@ -106,10 +108,10 @@ fn retainedReviewAppForViewTest(
                     .diff_base_oid = .{},
                 },
                 .ahead_count = 1,
-            } } },
+            },
         } },
     };
-    errdefer app.pages.review.deinit(allocator);
+    errdefer app.pages.compare.deinit(allocator);
     const drag: diff_selection.DragSelection = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
         .side = side,
@@ -118,14 +120,14 @@ fn retainedReviewAppForViewTest(
         .focus = .{ .hunk_index = 0, .line_index = 3 },
         .moved = true,
     };
-    app.pages.review.completed_selection = try @import("../diff_surface/selection.zig").buildParsed(allocator, .{
+    app.pages.compare.diff.completed_selection = try @import("../diff_surface/selection.zig").buildParsed(allocator, .{
         .repo_epoch = 0,
         .root_identity = null,
-        .source = @import("../diff_surface/selection.zig").SourceBasis.init(.{ .range = "review" }),
-        .source_session_revision = app.pages.review.source_session_revision,
+        .source = @import("../diff_surface/selection.zig").SourceBasis.init(.{ .range = "compare" }),
+        .source_session_revision = app.pages.compare.diff.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
     }, app_test_support.loadedDiffOne().document.files[0], drag);
-    try std.testing.expect(app.pages.review.installPinnedSelectionBasis());
+    try std.testing.expect(app.pages.compare.diff.installPinnedSelectionBasis(app.pages.compare.currentTarget()));
 
     return app;
 }
@@ -208,7 +210,7 @@ test "load empty state shows actionable no changes message" {
     try app_test_support.expectSnapshotContains(&ts, "Press r to reload or q to quit.");
 }
 
-test "Review selection status renders in the fixed header row for unified and both side-by-side sides" {
+test "Compare selection status renders in the fixed header row for unified and both side-by-side sides" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
         size: chasen.Size,
@@ -221,8 +223,8 @@ test "Review selection status renders in the fixed header row for unified and bo
         .{ .size = .{ .width = 120, .height = 32 }, .mode = .side_by_side, .side = .new },
     };
     for (cases) |case| {
-        var app = try retainedReviewAppForViewTest(allocator, case.size, case.mode, case.side);
-        defer app.pages.review.deinit(allocator);
+        var app = try retainedCompareAppForViewTest(allocator, case.size, case.mode, case.side);
+        defer app.pages.compare.deinit(allocator);
         var surface: chasen.testing.TestSurface = undefined;
         try surface.init(case.size.width, case.size.height);
         defer surface.deinit();
@@ -266,14 +268,14 @@ test "Review selection status renders in the fixed header row for unified and bo
 
 test "clean empty state shows branch status chrome" {
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(100, 18);
+    try ts.init(140, 18);
     defer ts.deinit();
 
     var app: App = .{
         .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
-        .terminal_size = .{ .width = 100, .height = 18 },
+        .terminal_size = .{ .width = 140, .height = 18 },
         .repo_session = .{
             .repo_state = .{ .discovery = .{ .single_repo = .{
                 .label = "repo",

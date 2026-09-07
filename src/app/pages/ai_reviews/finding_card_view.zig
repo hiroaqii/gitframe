@@ -1,4 +1,4 @@
-//! Terminal-only painter for Review Finding card rows.
+//! Terminal-only painter for AI Reviews Finding card rows.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -9,7 +9,7 @@ const finding_projection = @import("../../../ai_review/finding_projection.zig");
 const committed_review = @import("../../../committed_review.zig");
 const diff_render = @import("../../../diff/render.zig");
 const human_review_session = @import("../../human_review_session.zig");
-const review_page = @import("../review.zig");
+const ai_reviews_page = @import("../ai_reviews.zig");
 
 pub const footer_text = "s: next  a/d/u: set  r: retry  y: copy  Enter: close  j/k: scroll  Esc/q: back";
 const footer_copy_text = "y: copy";
@@ -26,19 +26,19 @@ pub const CellRange = struct {
 /// Exact fully-painted copy label in whole-card coordinates. Returning null
 /// when the right edge is clipped keeps paint and pointer admission identical.
 pub fn footerCopyTarget(row_width: u16) ?CellRange {
-    const content_width = review_page.findingCardContentWidth(row_width);
+    const content_width = ai_reviews_page.findingCardContentWidth(row_width);
     const byte_start = std.mem.indexOf(u8, footer_text, footer_copy_text) orelse unreachable;
     const local_start = chasen.text.displayWidth(footer_text[0..byte_start]);
     const target_width = chasen.text.displayWidth(footer_copy_text);
     if (local_start + target_width > content_width) return null;
     return .{
-        .start = review_page.FindingCardLayout.content_col + local_start,
-        .end = review_page.FindingCardLayout.content_col + local_start + target_width,
+        .start = ai_reviews_page.FindingCardLayout.content_col + local_start,
+        .end = ai_reviews_page.FindingCardLayout.content_col + local_start + target_width,
     };
 }
 
 pub const Painter = struct {
-    page: *const review_page.ReviewPageState,
+    page: *const ai_reviews_page.AiReviewsPageState,
     row_plan: *const finding_card.RowPlan,
     palette: theme.Palette,
     human_review: ?human_review_session.Presentation,
@@ -59,11 +59,11 @@ pub const Painter = struct {
         line.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = background } });
         if (expanded) paintExpandedBorder(&line, local_row, background, self.palette.color(.accent));
         const content_width = if (expanded)
-            review_page.findingCardContentWidth(line.size().width)
+            ai_reviews_page.findingCardContentWidth(line.size().width)
         else
-            review_page.FindingCardLayout.collapsedContentWidth(line.size().width);
+            ai_reviews_page.FindingCardLayout.collapsedContentWidth(line.size().width);
         if (content_width == 0) return;
-        const content_col = review_page.FindingCardLayout.content_col;
+        const content_col = ai_reviews_page.FindingCardLayout.content_col;
         var content_line = line.child(.{ .col = content_col, .row = 0, .width = content_width, .height = 1 });
 
         if (local_row == finding_card.header_row) {
@@ -115,8 +115,8 @@ fn paintExpandedBorder(
     foreground: chasen.Color,
 ) void {
     const width = line.size().width;
-    const left_col = review_page.FindingCardLayout.border_left_col;
-    const right_col = review_page.FindingCardLayout.borderRightCol(width) orelse return;
+    const left_col = ai_reviews_page.FindingCardLayout.border_left_col;
+    const right_col = ai_reviews_page.FindingCardLayout.borderRightCol(width) orelse return;
     const style: chasen.TextStyle = .{ .fg = foreground, .bg = background };
     const left = if (local_row == finding_card.header_row) "╭" else if (local_row == finding_card.footer_row) "╰" else "│";
     const right = if (local_row == finding_card.header_row) "╮" else if (local_row == finding_card.footer_row) "╯" else "│";
@@ -146,8 +146,8 @@ test "expanded Finding border paints inset rounded rails around all ten rows" {
         paintExpandedBorder(&line, local_row, .default, .default);
     }
 
-    const left = review_page.FindingCardLayout.border_left_col;
-    const right = review_page.FindingCardLayout.borderRightCol(20).?;
+    const left = ai_reviews_page.FindingCardLayout.border_left_col;
+    const right = ai_reviews_page.FindingCardLayout.borderRightCol(20).?;
     try rendered.expectCellText(left, 0, "╭");
     try rendered.expectCellText(left + 1, 0, "─");
     try rendered.expectCellText(right, 0, "╮");
@@ -278,7 +278,7 @@ pub fn preparedWrappedRow(text: []const u8, starts: []const usize, row: usize) ?
     return text[start..end];
 }
 
-test "Review inline Finding wrapped rows are unicode and newline aware" {
+test "AI Reviews inline Finding wrapped rows are unicode and newline aware" {
     var starts: [16]usize = undefined;
     const count = prepareWrappedRows("ab\n猫猫", 2, &starts);
     try std.testing.expectEqual(@as(usize, 3), count);
@@ -366,13 +366,13 @@ test "Finding headers show one-line and ranged anchor locations" {
 
 test "Finding pointer copy target follows the fully visible card footer" {
     const wide = footerCopyTarget(80).?;
-    const content_start: usize = wide.start - review_page.FindingCardLayout.content_col;
-    const content_end: usize = wide.end - review_page.FindingCardLayout.content_col;
+    const content_start: usize = wide.start - ai_reviews_page.FindingCardLayout.content_col;
+    const content_end: usize = wide.end - ai_reviews_page.FindingCardLayout.content_col;
     try std.testing.expectEqualStrings(footer_copy_text, footer_text[content_start..content_end]);
     try std.testing.expect(wide.contains(wide.start));
     try std.testing.expect(wide.contains(wide.end - 1));
     try std.testing.expect(!wide.contains(wide.end));
-    const minimum_row_width = wide.end + 1 + review_page.FindingCardLayout.right_padding;
+    const minimum_row_width = wide.end + 1 + ai_reviews_page.FindingCardLayout.right_padding;
     try std.testing.expect(footerCopyTarget(minimum_row_width - 1) == null);
     try std.testing.expectEqualDeep(wide, footerCopyTarget(minimum_row_width).?);
 }

@@ -11,7 +11,6 @@ const app_shell_layout = @import("../shell_layout.zig");
 const page = @import("../page.zig");
 const page_link = @import("../page_link.zig");
 const repo_session = @import("../repo_session.zig");
-const review_page = @import("../pages/review.zig");
 const repository_page = @import("../pages/repository.zig");
 const repository_coordinator = @import("../pages/repository/coordinator.zig");
 const repository_layout = @import("../pages/repository/layout.zig");
@@ -41,10 +40,10 @@ const loaded_diff = @import("../../loaded_diff.zig");
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
 const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(app_message.Msg);
-const ReviewLoadFinished = app_load.ReviewLoadFinished;
-const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
-const ReviewBranchListFinished = app_load.ReviewBranchListFinished;
-const ReviewBranchListLoadTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
+const CompareLoadFinished = app_load.CompareLoadFinished;
+const CompareLoadTask = app_load.CompareLoadTask(app_message.Msg);
+const CompareBranchListFinished = app_load.CompareBranchListFinished;
+const CompareBranchListLoadTask = app_load.CompareBranchListLoadTask(app_message.Msg);
 const RepositoryManifestTask = repository_tasks.ManifestTask(app_message.Msg);
 const RepositoryBranchTask = repository_tasks.BranchTask(app_message.Msg);
 const RepositoryDocumentTask = repository_tasks.DocumentTask(app_message.Msg);
@@ -70,7 +69,7 @@ fn activateChanges(app: *App) u64 {
     );
 }
 
-test "Review entry resolves default and picker selection queues its full ref" {
+test "Compare entry resolves default and picker selection queues its full ref" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -82,49 +81,49 @@ test "Review entry resolves default and picker selection queues its full ref" {
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.compare.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     _ = activateChanges(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app.update(.{ .switch_page = .review }, &ctx);
+    try app.update(.{ .switch_page = .compare }, &ctx);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    const entry_task: *ReviewLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const entry_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     try std.testing.expect(entry_task.target == null);
     const entry_identity = entry_task.identity;
     const entry_generation = entry_task.generation;
     try abandonSingleQueuedTask(&ctx, allocator);
 
-    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
         allocator,
         entry_identity,
         entry_generation,
         'a',
         'b',
     ) } } }, &ctx);
-    try std.testing.expectEqualStrings("main", app.pages.review.normalBasisConst().?.base.display_name);
-    try std.testing.expect(app.pages.review.load.state == .loaded);
+    try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
+    try std.testing.expect(app.pages.compare.diff.load.state == .loaded);
     try std.testing.expectEqual(@as(usize, 17), app.pages.changes.viewer.diff_scroll);
 
     // The production shared-input route must consume the same-owner bound
     // UpdateAdapter rather than reintroducing a raw controller/resolver pair.
-    try std.testing.expectEqual(diff_surface.Focus.sidebar, app.pages.review.viewer.focus);
-    try app.update(.{ .review = .{ .shared = .toggle_focus } }, &ctx);
-    try std.testing.expectEqual(diff_surface.Focus.diff, app.pages.review.viewer.focus);
+    try std.testing.expectEqual(diff_surface.Focus.sidebar, app.pages.compare.diff.viewer.focus);
+    try app.update(.{ .compare = .{ .common = .{ .shared = .toggle_focus } } }, &ctx);
+    try std.testing.expectEqual(diff_surface.Focus.diff, app.pages.compare.diff.viewer.focus);
 
     const picker_message = app.handleEvent(.{ .key_press = .{ .codepoint = 'm' } }) orelse
-        return error.ExpectedReviewBasePicker;
-    try std.testing.expectEqual(App.Msg{ .review = .open_base_picker }, picker_message);
+        return error.ExpectedCompareBasePicker;
+    try std.testing.expectEqual(App.Msg{ .compare = .open_base_picker }, picker_message);
     try app.update(picker_message, &ctx);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    const picker_task: *ReviewBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const picker_task: *CompareBranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     const picker_identity = picker_task.identity;
     const picker_generation = picker_task.generation;
     try abandonSingleQueuedTask(&ctx, allocator);
 
-    try app.update(.{ .load_finished = .{ .review = .{ .branch_list = .{
+    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
         .identity = picker_identity,
         .generation = picker_generation,
         .result = try branchListForTest(allocator, &.{.{
@@ -133,22 +132,22 @@ test "Review entry resolves default and picker selection queues its full ref" {
         }}),
     } } } }, &ctx);
     const enter_query = app.handleEvent(.{ .key_press = .{ .codepoint = '/' } }) orelse
-        return error.ExpectedReviewBaseQuery;
-    try std.testing.expectEqual(App.Msg{ .review = .base_picker_enter_query }, enter_query);
+        return error.ExpectedCompareBaseQuery;
+    try std.testing.expectEqual(App.Msg{ .compare = .base_picker_enter_query }, enter_query);
     try app.update(enter_query, &ctx);
     for ("topic") |byte| {
         const insert = app.handleEvent(.{ .key_press = .{ .codepoint = byte } }) orelse
-            return error.ExpectedReviewBaseQueryInsert;
+            return error.ExpectedCompareBaseQueryInsert;
         try app.update(insert, &ctx);
     }
-    try std.testing.expectEqualStrings("topic", app.pages.review.base_picker.query.slice());
+    try std.testing.expectEqualStrings("topic", app.pages.compare.base_picker.query.slice());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-    try app.update(.{ .review = .choose_base }, &ctx);
-    try std.testing.expect(!app.pages.review.base_picker.open);
+    try app.update(.{ .compare = .choose_base }, &ctx);
+    try std.testing.expect(!app.pages.compare.base_picker.open);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    const selected_task: *ReviewLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const selected_task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     try std.testing.expectEqualStrings("refs/heads/topic", selected_task.target.?.full_ref);
-    try std.testing.expectEqualStrings("topic", app.pages.review.base_target.?.display_name);
+    try std.testing.expectEqualStrings("topic", app.pages.compare.base_target.?.display_name);
 }
 
 test "repository selection drag routes first and outside release terminates" {
@@ -252,7 +251,7 @@ test "keyboard and page bar mouse share the page switch transition" {
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
-test "page key 3 activates Review without replacing retained Changes state" {
+test "page key 3 activates Compare without replacing retained Changes state" {
     var app: App = .{
         .config = .{ .source = .stdin },
         .pages = .{ .changes = .{
@@ -264,15 +263,15 @@ test "page key 3 activates Review without replacing retained Changes state" {
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
     const message = app.handleEvent(.{ .key_press = .{ .codepoint = '3' } }) orelse
-        return error.ExpectedReviewPageSwitch;
-    try std.testing.expectEqual(App.Msg{ .switch_page = .review }, message);
+        return error.ExpectedComparePageSwitch;
+    try std.testing.expectEqual(App.Msg{ .switch_page = .compare }, message);
     try app.update(message, &ctx);
 
-    try std.testing.expectEqual(page.Id.review, app.active_page);
-    try std.testing.expect(app.pages.review.activation.state == .active);
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try std.testing.expect(app.pages.compare.activation.state == .active);
     try std.testing.expectEqual(
-        page.Id.review,
-        app.pages.review.activation.currentIdentity().?.origin,
+        page.Id.compare,
+        app.pages.compare.activation.currentIdentity().?.origin,
     );
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
     try std.testing.expectEqual(@as(usize, 11), app.pages.changes.viewer.diff_scroll);
@@ -299,7 +298,7 @@ test "repository selection shell blocks transition and cancels on focus or resiz
     try std.testing.expect(app.pages.repository.activeMouseOwner());
     try std.testing.expect(app.pages.repository.activeMouseSourceRange());
 
-    try app.update(.{ .switch_page = .review }, &ctx);
+    try app.update(.{ .switch_page = .compare }, &ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.activeMouseSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
@@ -734,7 +733,7 @@ test "changes repository transition inactive Repository retains contextual selec
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app.update(.{ .switch_page = .review }, &ctx);
+    try app.update(.{ .switch_page = .compare }, &ctx);
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
 
@@ -885,7 +884,7 @@ fn reviewAppLoadedFinished(
     generation: u64,
     base_byte: u8,
     head_byte: u8,
-) !ReviewLoadFinished {
+) !CompareLoadFinished {
     const full_ref = try allocator.dupe(u8, "refs/heads/main");
     errdefer allocator.free(full_ref);
     const display_name = try allocator.dupe(u8, "main");
@@ -922,7 +921,7 @@ fn reviewAppBasisFailureFinished(
     identity: page.RequestIdentity,
     generation: u64,
     name: []const u8,
-) !ReviewLoadFinished {
+) !CompareLoadFinished {
     const full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
     errdefer allocator.free(full_ref);
     return .{

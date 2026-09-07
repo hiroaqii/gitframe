@@ -16,7 +16,6 @@ const app_shell_layout = @import("../shell_layout.zig");
 const page = @import("../page.zig");
 const page_link = @import("../page_link.zig");
 const repo_session = @import("../repo_session.zig");
-const review_page = @import("../pages/review.zig");
 const repository_page = @import("../pages/repository.zig");
 const repository_selection = @import("../pages/repository/selection.zig");
 const repository_tasks = @import("../pages/repository/tasks.zig");
@@ -50,10 +49,10 @@ const loaded_diff = @import("../../loaded_diff.zig");
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
 const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(app_message.Msg);
-const ReviewLoadFinished = app_load.ReviewLoadFinished;
-const ReviewLoadTask = app_load.ReviewLoadTask(app_message.Msg);
-const ReviewBranchListFinished = app_load.ReviewBranchListFinished;
-const ReviewBranchListLoadTask = app_load.ReviewBranchListLoadTask(app_message.Msg);
+const CompareLoadFinished = app_load.CompareLoadFinished;
+const CompareLoadTask = app_load.CompareLoadTask(app_message.Msg);
+const CompareBranchListFinished = app_load.CompareBranchListFinished;
+const CompareBranchListLoadTask = app_load.CompareBranchListLoadTask(app_message.Msg);
 const RepositoryManifestTask = repository_tasks.ManifestTask(app_message.Msg);
 const RepositoryBranchTask = repository_tasks.BranchTask(app_message.Msg);
 const RepositoryDocumentTask = repository_tasks.DocumentTask(app_message.Msg);
@@ -215,49 +214,49 @@ test "grouped result messages keep previous ephemeral status" {
 
 test "branch time pickers sample one real-clock snapshot at every non-skipped redraw tail" {
     const allocator = std.testing.allocator;
-    var app: App = .{ .allocator = allocator, .active_page = .review };
-    defer app.pages.review.deinit(allocator);
-    _ = app.pages.review.activate(app.repo_session.repo_epoch);
-    _ = app.pages.review.beginBasePicker(allocator).?;
+    var app: App = .{ .allocator = allocator, .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    _ = app.pages.compare.beginBasePicker(allocator).?;
     var clock = FakeRealClock.init(1_700_000_059);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = clock.io() };
 
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
-    try std.testing.expectEqual(@as(?i64, 1_700_000_059), app.pages.review.base_picker.render_now_unix);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_059), app.pages.compare.base_picker.render_now_unix);
     try std.testing.expectEqual(@as(usize, 1), clock.samples);
 
     // An unrelated Review source completion crosses the 59s -> 1m boundary
     // through the same common tail instead of a picker-specific handler.
     clock.seconds += 1;
-    const refresh = app.pages.review.beginRefresh().?;
-    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
+    const refresh = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
         allocator,
         refresh.identity,
         refresh.generation,
         'a',
         'b',
     ) } } }, &ctx);
-    try std.testing.expectEqual(@as(?i64, 1_700_000_060), app.pages.review.base_picker.render_now_unix);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_060), app.pages.compare.base_picker.render_now_unix);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
 
     // A stale list terminal resolves to skip and therefore does not sample.
     clock.seconds += 1;
     ctx.resetRedrawSuppressed();
-    try app.update(.{ .load_finished = .{ .review = .{ .branch_list = .{
+    try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
         .identity = refresh.identity,
-        .generation = app.pages.review.base_picker.generation + 1,
+        .generation = app.pages.compare.base_picker.generation + 1,
         .result = .empty,
     } } } }, &ctx);
     try std.testing.expect(ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(?i64, 1_700_000_060), app.pages.review.base_picker.render_now_unix);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_060), app.pages.compare.base_picker.render_now_unix);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
 
     // Hidden and idle picker states do not consult the wall clock.
     app.active_page = .changes;
     try app.update(.{ .terminal_resized = .{ .width = 100, .height = 24 } }, &ctx);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
-    app.active_page = .review;
-    app.pages.review.closeBasePicker(allocator);
+    app.active_page = .compare;
+    app.pages.compare.closeBasePicker(allocator);
     try app.update(.{ .terminal_resized = .{ .width = 90, .height = 20 } }, &ctx);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
 
@@ -286,22 +285,22 @@ test "branch time pickers sample one real-clock snapshot at every non-skipped re
 
 test "branch time pickers fail closed for unavailable and zero-resolution real clocks" {
     const allocator = std.testing.allocator;
-    var app: App = .{ .allocator = allocator, .active_page = .review };
-    defer app.pages.review.deinit(allocator);
-    _ = app.pages.review.activate(app.repo_session.repo_epoch);
-    _ = app.pages.review.beginBasePicker(allocator).?;
+    var app: App = .{ .allocator = allocator, .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    _ = app.pages.compare.beginBasePicker(allocator).?;
     var clock = FakeRealClock.init(1_700_000_000);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = clock.io() };
 
     clock.available = false;
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
-    try std.testing.expect(app.pages.review.base_picker.render_now_unix == null);
+    try std.testing.expect(app.pages.compare.base_picker.render_now_unix == null);
     try std.testing.expectEqual(@as(usize, 0), clock.samples);
 
     clock.available = true;
     clock.resolution_ns = 0;
     try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx);
-    try std.testing.expect(app.pages.review.base_picker.render_now_unix == null);
+    try std.testing.expect(app.pages.compare.base_picker.render_now_unix == null);
     try std.testing.expectEqual(@as(usize, 0), clock.samples);
 
     var repo_root = "/repo".*;
@@ -313,7 +312,7 @@ test "branch time pickers fail closed for unavailable and zero-resolution real c
         .current = true,
         .tip_committer_unix = 1_700_000_000,
     }};
-    app.pages.review.closeBasePicker(allocator);
+    app.pages.compare.closeBasePicker(allocator);
     app.remote_workflow.branch_switch = .{
         .repo_root = &repo_root,
         .current_branch = &branch,
@@ -450,7 +449,8 @@ fn repoSession(app: *App) repo_session.Controller {
         .action_pending = app.action_runtime.view().hasPending(),
         .changes = .{ .page = &app.pages.changes, .navigation = changesNavigation(app), .reload = changesReload(app) },
         .repository = .{ .page = &app.pages.repository },
-        .review = .{ .page = &app.pages.review },
+        .compare = .{ .page = &app.pages.compare },
+        .ai_reviews = .{ .page = &app.pages.ai_reviews },
         .shell = app.remote_workflow.repositoryInvalidationPort(&app.overlay),
     };
 }
@@ -466,22 +466,22 @@ fn commitDiscovery(
     return repoSession(app).commitDiscovered(&ctx, result, active_index, origin);
 }
 
-test "Review completion defers as one bundle during drag and applies afterward" {
+test "Compare completion defers as one bundle during drag and applies afterward" {
     const allocator = std.testing.allocator;
-    var app: App = .{ .allocator = allocator, .active_page = .review };
-    defer app.pages.review.deinit(allocator);
-    _ = app.pages.review.activate(app.repo_session.repo_epoch);
+    var app: App = .{ .allocator = allocator, .active_page = .compare };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
 
-    const initial = app.pages.review.beginRefresh().?;
-    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
+    const initial = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
         allocator,
         initial.identity,
         initial.generation,
         'a',
         'b',
     ) } } }, &ctx);
-    app.pages.review.selection_owner = .{ .diff = .{
+    app.pages.compare.diff.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "b/src/compare.zig" } },
         .side = .new,
         .mode = .line,
@@ -489,8 +489,8 @@ test "Review completion defers as one bundle during drag and applies afterward" 
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
     } };
-    const replacement = app.pages.review.beginRefresh().?;
-    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
+    const replacement = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
         allocator,
         replacement.identity,
         replacement.generation,
@@ -498,41 +498,111 @@ test "Review completion defers as one bundle during drag and applies afterward" 
         'e',
     ) } } }, &ctx);
 
-    try std.testing.expect(app.pages.review.deferred_load_apply != null);
-    try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.review.normalBasisConst().?.target.head_oid.slice());
-    app.pages.review.selection_owner = .none;
+    try std.testing.expect(app.pages.compare.deferred_load_apply != null);
+    try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.compare.basis.?.target.head_oid.slice());
+    app.pages.compare.diff.selection_owner = .none;
     try app.update(.focus_lost, &ctx);
-    try std.testing.expect(app.pages.review.deferred_load_apply == null);
-    try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.review.normalBasisConst().?.target.head_oid.slice());
+    try std.testing.expect(app.pages.compare.deferred_load_apply == null);
+    try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.compare.basis.?.target.head_oid.slice());
 }
 
-test "repository commitment resets Review and refreshes the new physical root" {
+const CompareInactiveCompletionOrder = enum { completion_before_reentry, completion_after_reentry };
+
+test "Compare inactive completion is accepted only before re-entry starts a newer generation" {
+    for ([_]CompareInactiveCompletionOrder{ .completion_before_reentry, .completion_after_reentry }) |order| {
+        try expectCompareInactiveCompletionOrder(order);
+    }
+}
+
+fn expectCompareInactiveCompletionOrder(order: CompareInactiveCompletionOrder) !void {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app: App = .{
         .allocator = allocator,
-        .active_page = .review,
+        .active_page = .compare,
+        .config = .{ .source = .stdin },
+        .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
+    };
+    defer app.pages.compare.deinit(allocator);
+    defer app.repo_session.deinit(allocator);
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    const old = app.pages.compare.beginRefresh().?;
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+    try app.update(.{ .switch_page = .config }, &ctx);
+    try std.testing.expectEqual(page.Id.config, app.active_page);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    app.status.set("visible page sentinel", .{});
+
+    if (order == .completion_before_reentry) {
+        ctx.resetRedrawSuppressed();
+        try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
+            allocator,
+            old.identity,
+            old.generation,
+            'a',
+            'b',
+        ) } } }, &ctx);
+        try std.testing.expect(ctx.redrawWasSuppressed());
+        try std.testing.expectEqual(page.Id.config, app.active_page);
+        try std.testing.expectEqualStrings("visible page sentinel", app.status.text());
+        try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.compare.basis.?.target.head_oid.slice());
+    }
+
+    try app.update(.{ .switch_page = .compare }, &ctx);
+    try std.testing.expectEqual(page.Id.compare, app.active_page);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    const newer: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expect(newer.generation > old.generation);
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
+        allocator,
+        old.identity,
+        old.generation,
+        'c',
+        'd',
+    ) } } }, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+    switch (order) {
+        .completion_before_reentry => try std.testing.expectEqualStrings(
+            reviewAppTestOid('b').slice(),
+            app.pages.compare.basis.?.target.head_oid.slice(),
+        ),
+        .completion_after_reentry => try std.testing.expect(app.pages.compare.basis == null),
+    }
+}
+
+test "repository commitment resets Compare and refreshes the new physical root" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .compare,
         .repo_session = .{
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
     };
-    defer app.pages.review.deinit(allocator);
+    defer app.pages.compare.deinit(allocator);
     defer app.repo_session.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
-    _ = app.pages.review.activate(0);
+    _ = app.pages.compare.activate(0);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    const initial = app.pages.review.beginRefresh().?;
-    try app.update(.{ .load_finished = .{ .review = .{ .source = try reviewAppLoadedFinished(
+    const initial = app.pages.compare.beginRefresh().?;
+    try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
         allocator,
         initial.identity,
         initial.generation,
         'a',
         'b',
     ) } } }, &ctx);
-    try std.testing.expect(app.pages.review.normalBasisConst() != null);
+    try std.testing.expect(app.pages.compare.basis != null);
 
     const changes_activation = app.pages.changes.activation.activate(0, .pending, .unavailable, .unavailable);
     const discovery_generation = app.pages.changes.load.beginRepoDiscovery();
@@ -545,12 +615,12 @@ test "repository commitment resets Review and refreshes the new physical root" {
 
     try std.testing.expectEqual(@as(u64, 1), app.repo_session.view().epoch());
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
-    try std.testing.expect(app.pages.review.normalBasisConst() == null);
-    try std.testing.expect(app.pages.review.base_target == null);
-    try std.testing.expect(app.pages.review.activation.state == .active);
-    try std.testing.expectEqual(@as(u64, 1), app.pages.review.activation.state.active.repo_epoch);
+    try std.testing.expect(app.pages.compare.basis == null);
+    try std.testing.expect(app.pages.compare.base_target == null);
+    try std.testing.expect(app.pages.compare.activation.state == .active);
+    try std.testing.expectEqual(@as(u64, 1), app.pages.compare.activation.state.active.repo_epoch);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    const task: *ReviewLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    const task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
     try std.testing.expect(task.root.identity.eql(app.repo_session.view().activeIdentity().?));
 }
 
@@ -947,7 +1017,7 @@ fn reviewAppLoadedFinished(
     generation: u64,
     base_byte: u8,
     head_byte: u8,
-) !ReviewLoadFinished {
+) !CompareLoadFinished {
     const full_ref = try allocator.dupe(u8, "refs/heads/main");
     errdefer allocator.free(full_ref);
     const display_name = try allocator.dupe(u8, "main");
@@ -984,7 +1054,7 @@ fn reviewAppBasisFailureFinished(
     identity: page.RequestIdentity,
     generation: u64,
     name: []const u8,
-) !ReviewLoadFinished {
+) !CompareLoadFinished {
     const full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
     errdefer allocator.free(full_ref);
     return .{

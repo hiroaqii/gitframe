@@ -13,7 +13,8 @@ const diff_surface_view = @import("diff_surface/view.zig");
 const shell_layout = @import("shell_layout.zig");
 const view_primitives = @import("view_primitives.zig");
 const changes_view = @import("pages/changes/view.zig");
-const review_view = @import("pages/review/view.zig");
+const compare_view = @import("pages/compare/view.zig");
+const ai_reviews_view = @import("pages/ai_reviews/view.zig");
 const repository_view = @import("pages/repository/view.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
@@ -24,7 +25,8 @@ const keymap = @import("keymap");
 const repo_state = @import("../repo/state.zig");
 const theme = @import("theme");
 const changes_page = if (builtin.is_test) @import("pages/changes.zig") else struct {};
-const review_page = if (builtin.is_test) @import("pages/review.zig") else struct {};
+const compare_page = if (builtin.is_test) @import("pages/compare.zig") else struct {};
+const ai_reviews_page = if (builtin.is_test) @import("pages/ai_reviews.zig") else struct {};
 const repository_page = if (builtin.is_test) @import("pages/repository.zig") else struct {};
 const repository_source = if (builtin.is_test) @import("../repository/source.zig") else struct {};
 const content_fingerprint = if (builtin.is_test) @import("../content_fingerprint.zig") else struct {};
@@ -82,7 +84,8 @@ const PageBarMetadata = struct {
 
 pub const Context = struct {
     changes: changes_view.Context,
-    review: review_view.Context,
+    compare: compare_view.Context,
+    ai_reviews: ai_reviews_view.Context,
     repository: repository_view.ViewContext,
     active_page: page.Id,
     page_bar_visible: bool,
@@ -157,8 +160,8 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     var body = surface.child(sections.body);
     try viewBody(app, &body);
 
-    if (!(app.active_page == .review and
-        (app.review.page.ai_reviews.isPickerVisible() or app.review.page.human_review_decision.isOpen())))
+    if (!(app.active_page == .ai_reviews and
+        (app.ai_reviews.page.picker.isPickerVisible() or app.ai_reviews.page.human_review_decision.isOpen())))
     {
         var footer = surface.child(sections.footer);
         viewFooter(app, &footer);
@@ -191,14 +194,14 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.overlay.isPushError() and app.overlay.visibleOn(app.active_page)) {
         try viewPushError(app, surface);
     }
-    if (app.active_page == .review and app.review.page.base_picker.open) {
-        try review_view.viewBasePicker(app.review, surface);
+    if (app.active_page == .compare and app.compare.page.base_picker.open) {
+        try compare_view.viewBasePicker(app.compare, surface);
     }
-    if (app.active_page == .review and app.review.page.ai_reviews.isPickerVisible()) {
-        try review_view.viewAiReviews(app.review, surface);
+    if (app.active_page == .ai_reviews and app.ai_reviews.page.picker.isPickerVisible()) {
+        try ai_reviews_view.viewPicker(app.ai_reviews, surface);
     }
-    if (app.active_page == .review and app.review.page.human_review_decision.isOpen()) {
-        try review_view.viewHumanReviewDecision(app.review, surface);
+    if (app.active_page == .ai_reviews and app.ai_reviews.page.human_review_decision.isOpen()) {
+        try ai_reviews_view.viewHumanReviewDecision(app.ai_reviews, surface);
     }
 }
 
@@ -216,7 +219,8 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
     return switch (app.active_page) {
         .changes => changes_view.view(app.changes, surface),
         .repository => repository_view.view(app.repository, surface),
-        .review => review_view.view(app.review, surface),
+        .compare => compare_view.view(app.compare, surface),
+        .ai_reviews => ai_reviews_view.view(app.ai_reviews, surface),
         .config => viewPlaceholderPage(app.active_page, app.has_active_repo, app.theme, surface),
     };
 }
@@ -225,7 +229,8 @@ fn activePageHeaderPresentation(app: Context) ?page_header.Presentation {
     return switch (app.active_page) {
         .changes => changes_view.pageHeaderPresentation(app.changes),
         .repository => repository_view.pageHeaderPresentation(app.repository),
-        .review => review_view.pageHeaderPresentation(app.review),
+        .compare => compare_view.pageHeaderPresentation(app.compare),
+        .ai_reviews => ai_reviews_view.pageHeaderPresentation(app.ai_reviews),
         .config => null,
     };
 }
@@ -233,7 +238,8 @@ fn activePageHeaderPresentation(app: Context) ?page_header.Presentation {
 fn activePageHeaderLineStats(app: Context) ?file_tree.Stats {
     return switch (app.active_page) {
         .changes => changes_view.pageHeaderLineStats(app.changes),
-        .review => review_view.pageHeaderLineStats(app.review),
+        .compare => compare_view.pageHeaderLineStats(app.compare),
+        .ai_reviews => ai_reviews_view.pageHeaderLineStats(app.ai_reviews),
         .repository, .config => null,
     };
 }
@@ -259,7 +265,7 @@ fn activePageHeaderRemoteActions(app: Context) ?PageBarRemoteActions {
             },
             .detached, .unknown => null,
         },
-        .review, .terminal => null,
+        .comparison, .terminal => null,
     };
 }
 
@@ -446,7 +452,7 @@ fn viewPlaceholderPage(id: page.Id, has_repository: bool, palette: theme.Palette
     if (size.width == 0 or size.height == 0) return;
     const row = size.height / 2;
     draw.copyClippedTextAt(surface, 1, row, id.label(), palette.boldStyle(.accent)) catch {};
-    const description = if (!has_repository and (id == .repository or id == .review))
+    const description = if (!has_repository and (id == .repository or id == .compare or id == .ai_reviews))
         "Repository required"
     else
         id.placeholderDescription();
@@ -467,9 +473,9 @@ const footer_hint_capacity: usize = 8;
 
 const FooterHintPriority = enum {
     repository_switch,
-    review_ai,
+    ai_review_select,
     primary,
-    review_mode,
+    compare_base,
     help,
     focus,
     secondary,
@@ -530,8 +536,8 @@ const FooterProjection = struct {
 /// drift away from the mouse hit target.
 pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     if (app.command_line != null) return null;
-    if (app.active_page == .review and
-        (app.review.page.ai_reviews.isPickerVisible() or app.review.page.human_review_decision.isOpen())) return null;
+    if (app.active_page == .ai_reviews and
+        (app.ai_reviews.page.picker.isPickerVisible() or app.ai_reviews.page.human_review_decision.isOpen())) return null;
     if (width == 0 or app.active_page == .config) return null;
     if (app.action.spinnerPresentation() != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
@@ -649,14 +655,18 @@ fn projectFooter(
             },
         });
     }
-    if (app.active_page == .review) {
-        const review_footer = app.review.footer();
-        if (review_footer.source_label) |label| footer_segments.append(.{
+    const committed_footer = switch (app.active_page) {
+        .compare => app.compare.footer(),
+        .ai_reviews => app.ai_reviews.footer(),
+        else => null,
+    };
+    if (committed_footer) |footer| {
+        if (footer.source_label) |label| footer_segments.append(.{
             .text = label,
             .style = app.theme.style(.prompt),
             .drop_priority = .source,
         });
-        if (review_footer.activation) |activation| footer_segments.append(.{
+        if (footer.activation) |activation| footer_segments.append(.{
             .text = switch (activation) {
                 .validating => "validating",
                 .stale => "stale",
@@ -718,8 +728,8 @@ fn projectFooter(
 }
 
 fn findingFooterText(app: Context, buffer: []u8) ?[]const u8 {
-    if (app.active_page != .review) return null;
-    const summary = app.review.footer().finding_summary orelse return null;
+    if (app.active_page != .ai_reviews) return null;
+    const summary = app.ai_reviews.footer().finding_summary orelse return null;
     return formatFindingFooterSummary(buffer, summary, app.terminal_size.width >= 96);
 }
 
@@ -754,9 +764,9 @@ fn projectFooterHints(
 
     const priority_order = [_]FooterHintPriority{
         .repository_switch,
-        .review_ai,
+        .ai_review_select,
         .primary,
-        .review_mode,
+        .compare_base,
         .help,
         .focus,
         .secondary,
@@ -1787,13 +1797,20 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
             result.append(ui.key_hint.item("q", "quit"), .quit);
         },
-        .review => {
-            const footer = app.review.footer();
-            if (!footer.normal_action_hints_enabled or app.review.page.base_picker.open or
-                app.review.page.ai_reviews.isPickerVisible() or app.review.page.human_review_decision.isOpen() or
-                app.review.page.finding_card.isFocused()) return result;
-            result.append(ui.key_hint.item("a", "AI reviews"), .review_ai);
-            if (review_view.humanReviewActionLabel(app.review)) |label| {
+        .compare => {
+            const footer = app.compare.footer();
+            if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open) return result;
+            appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "base", .compare_base);
+            appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
+            appendFooterAction(app, &result, key_buffers, .help, "help", .help);
+            result.append(ui.key_hint.item("q", "quit"), .quit);
+        },
+        .ai_reviews => {
+            const footer = app.ai_reviews.footer();
+            if (!footer.normal_action_hints_enabled or app.ai_reviews.page.picker.isPickerVisible() or
+                app.ai_reviews.page.human_review_decision.isOpen() or app.ai_reviews.page.finding_card.isFocused()) return result;
+            result.append(ui.key_hint.item("a", "select AI review"), .ai_review_select);
+            if (ai_reviews_view.humanReviewActionLabel(app.ai_reviews)) |label| {
                 appendUnclaimedFooterItem(
                     app,
                     &result,
@@ -1803,14 +1820,6 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                     .primary,
                 );
             }
-            appendUnclaimedFooterItem(
-                app,
-                &result,
-                .{ .codepoint = 'm' },
-                "m",
-                if (app.review.page.isPinnedAi()) "normal" else "base",
-                .review_mode,
-            );
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
             result.append(ui.key_hint.item("q", "quit"), .quit);
@@ -1989,7 +1998,8 @@ fn helpSectionsForPage(help_page: page.Id) []const HelpSection {
     return switch (help_page) {
         .changes => &help_all_sections,
         .repository => &help_repository_sections,
-        .review => &help_review_sections,
+        .compare => &help_compare_sections,
+        .ai_reviews => &help_ai_reviews_sections,
         .config => &help_placeholder_sections,
     };
 }
@@ -2059,7 +2069,7 @@ fn drawHelpLine(
 fn drawHelpItem(app: Context, surface: *chasen.Surface, row: u16, item: HelpItem) !void {
     if (surface.size().width == 0) return;
     const desired_key_width: u16 = switch (app.active_page) {
-        .changes, .repository, .review => 18,
+        .changes, .repository, .compare, .ai_reviews => 18,
         .config => 12,
     };
     const key_width: u16 = @min(desired_key_width, surface.size().width);
@@ -2107,8 +2117,8 @@ test "footer segment fit includes left inset" {
 
 test "Finding discovery footer formats responsive counts before transient status" {
     // Keep the Slice A cross-boundary proofs reachable under this named filter.
-    _ = @import("pages/review/navigation.zig");
-    _ = @import("pages/review/view.zig");
+    _ = @import("pages/ai_reviews/navigation.zig");
+    _ = @import("pages/ai_reviews/view.zig");
 
     const summary: diff_surface_view.FindingSummaryPresentation = .{
         .mapped = 7,
@@ -2320,7 +2330,8 @@ test "changes file search keeps footer status but suppresses unreachable action 
 
 const ShellViewTestHarness = struct {
     changes: changes_page.ChangesPageState = .{},
-    review: review_page.ReviewPageState = .{},
+    compare: compare_page.ComparePageState = .{},
+    ai_reviews: ai_reviews_page.AiReviewsPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
@@ -2349,8 +2360,17 @@ const ShellViewTestHarness = struct {
         const changes = changes_view.Context.init(&self.changes, navigation, self.theme, self.keymap, "working tree", .unstaged, null, .{});
         return .{
             .changes = changes,
-            .review = .{
-                .page = &self.review,
+            .compare = .{
+                .page = &self.compare,
+                .palette = self.theme,
+                .repo_root = self.repo_state.activeRoot(),
+                .repo_epoch = 0,
+                .root_identity = self.repo_state.activeIdentity(),
+                .layout = .{ .width = self.terminal_size.width, .height = self.terminal_size.height },
+                .keymap = self.keymap,
+            },
+            .ai_reviews = .{
+                .page = &self.ai_reviews,
                 .palette = self.theme,
                 .repo_root = self.repo_state.activeRoot(),
                 .repo_epoch = 0,
@@ -2459,11 +2479,10 @@ test "footer normal-mode hints match the decided page lists" {
     });
 
     context = harness.context();
-    context.active_page = .review;
+    context.active_page = .ai_reviews;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("a", "AI reviews"),
-        ui.key_hint.item("m", "base"),
+        ui.key_hint.item("a", "select AI review"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
         ui.key_hint.item("q", "quit"),
@@ -2497,10 +2516,10 @@ test "footer normal-mode hints follow state and local key ownership" {
     config.set(.branch_switch, .{ .plain_codepoint = 'm' });
     harness.keymap = keymap.Effective.fromConfig(config);
     var context = harness.context();
-    context.active_page = .review;
+    context.active_page = .ai_reviews;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("a", "AI reviews"),
+        ui.key_hint.item("a", "select AI review"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
         ui.key_hint.item("q", "quit"),
@@ -2560,10 +2579,10 @@ test "footer hint projection keeps priority items and original display order" {
     try expectProjectedFooterHintItems(&projected, hints.slice());
 }
 
-test "AI Reviews picker footer retention is R then a then m while display order stays a m R help q" {
+test "committed-page footer retention is R then a then m while display order stays a m R help q" {
     var hints: FooterHints = .{};
-    hints.append(ui.key_hint.item("a", "AI reviews"), .review_ai);
-    hints.append(ui.key_hint.item("m", "base"), .review_mode);
+    hints.append(ui.key_hint.item("a", "select AI review"), .ai_review_select);
+    hints.append(ui.key_hint.item("m", "base"), .compare_base);
     hints.append(ui.key_hint.item("R", "switch repo"), .repository_switch);
     hints.append(ui.key_hint.item("?", "help"), .help);
     hints.append(ui.key_hint.item("q", "quit"), .quit);
@@ -2578,13 +2597,13 @@ test "AI Reviews picker footer retention is R then a then m while display order 
 
     projected = projectFooterHints(&hints, r_width + separator_width + a_width, opts);
     try expectProjectedFooterHintItems(&projected, &.{
-        ui.key_hint.item("a", "AI reviews"),
+        ui.key_hint.item("a", "select AI review"),
         ui.key_hint.item("R", "switch repo"),
     });
 
     projected = projectFooterHints(&hints, r_width + a_width + m_width + separator_width * 2, opts);
     try expectProjectedFooterHintItems(&projected, &.{
-        ui.key_hint.item("a", "AI reviews"),
+        ui.key_hint.item("a", "select AI review"),
         ui.key_hint.item("m", "base"),
         ui.key_hint.item("R", "switch repo"),
     });
@@ -2643,26 +2662,26 @@ test "page bar dispatch shows repository requirement for unavailable placeholder
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository required") != null);
 }
 
-test "Review placeholder names its unloaded state when a repository is active" {
+test "AI Reviews placeholder names its unselected state when a repository is active" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(40, 7);
     defer ts.deinit();
 
-    viewPlaceholderPage(.review, true, .default(), &ts.surface);
+    viewPlaceholderPage(.ai_reviews, true, .default(), &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Review: not loaded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "AI Reviews: select a review") != null);
 }
 
-test "direct pinned Review reload does not paint the Reviews picker" {
+test "direct selected-Run reload does not paint the Reviews picker" {
     const committed_review = @import("../committed_review.zig");
     const review_id = try committed_review.ReviewId.parse("723e4567-e89b-42d3-a456-426614174000");
     var harness: ShellViewTestHarness = .{};
     var context = harness.context();
-    context.active_page = .review;
-    context.page_status = &harness.review.status;
+    context.active_page = .ai_reviews;
+    context.page_status = &harness.ai_reviews.status;
 
-    harness.review.ai_reviews.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = true } };
+    harness.ai_reviews.picker.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = true } };
     var direct: chasen.testing.TestSurface = undefined;
     try direct.init(80, 24);
     defer direct.deinit();
@@ -2671,7 +2690,7 @@ test "direct pinned Review reload does not paint the Reviews picker" {
     defer std.testing.allocator.free(direct_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, direct_snapshot, "Reviews") == null);
 
-    harness.review.ai_reviews.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = false } };
+    harness.ai_reviews.picker.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = false } };
     var picker: chasen.testing.TestSurface = undefined;
     try picker.init(80, 24);
     defer picker.deinit();
@@ -2717,18 +2736,18 @@ test "compact page bar keeps only the active label and draws a rule when availab
     try two_rows.init(30, shell_layout.page_bar_rows);
     defer two_rows.deinit();
 
-    viewPageBar(.review, true, .{}, .default(), &two_rows.surface);
+    viewPageBar(.ai_reviews, true, .{}, .default(), &two_rows.surface);
     const snapshot = try two_rows.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Review ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " AI Reviews ") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Changes ") == null);
     try two_rows.expectCellText(0, shell_layout.page_bar_rule_row, "─");
 
     var one_row: chasen.testing.TestSurface = undefined;
     try one_row.init(30, 1);
     defer one_row.deinit();
-    viewPageBar(.review, true, .{}, .default(), &one_row.surface);
-    try one_row.expectCellText(2, shell_layout.page_bar_label_row, "R");
+    viewPageBar(.ai_reviews, true, .{}, .default(), &one_row.surface);
+    try one_row.expectCellText(2, shell_layout.page_bar_label_row, "A");
     try std.testing.expect(one_row.surface.readCell(0, shell_layout.page_bar_rule_row) == null);
 }
 
@@ -2850,7 +2869,7 @@ test "page bar preserves every tab when context is too narrow" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(width, shell_layout.page_bar_rows);
     defer ts.deinit();
-    viewPageBar(.review, false, .{ .presentation = .{ .review = .{
+    viewPageBar(.compare, false, .{ .presentation = .{ .comparison = .{
         .base_display_name = "origin/main",
         .head_display_name = "feature/topic",
         .freshness = .fresh,
@@ -2982,7 +3001,7 @@ test "help popup uses effective document navigation labels and reaches its tail 
     try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "Mouse") != null);
     try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "wheel") != null);
 
-    for ([_]page.Id{ .changes, .review }) |help_page| {
+    for ([_]page.Id{ .changes, .compare, .ai_reviews }) |help_page| {
         harness.overlay.openHelpForPage(help_page);
         const sections = helpSectionsForPage(help_page);
         const shared_section_index: usize = if (help_page == .changes) 2 else 1;
@@ -3207,7 +3226,8 @@ const HelpSection = struct {
 const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
-    .{ .key = .{ .action = .page_review }, .description = "Review page" },
+    .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
+    .{ .key = .{ .action = .page_ai_reviews }, .description = "AI Reviews page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .key = .{ .text = "Tab" }, .description = "focus sidebar / diff" },
     .{ .key = .{ .action = .help }, .description = "open / close help" },
@@ -3228,7 +3248,8 @@ const help_global_items = [_]HelpItem{
 const help_placeholder_items = [_]HelpItem{
     .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
-    .{ .key = .{ .action = .page_review }, .description = "Review page" },
+    .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
+    .{ .key = .{ .action = .page_ai_reviews }, .description = "AI Reviews page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
     .{ .key = .{ .action = .reload }, .description = "reload (not available on this page yet)" },
@@ -3240,10 +3261,18 @@ const help_placeholder_sections = [_]HelpSection{
     .{ .title = "Global", .items = &help_placeholder_items },
 };
 
-const help_review_items = [_]HelpItem{
-    .{ .key = .{ .text = "a" }, .description = "choose normal or AI review" },
-    .{ .key = .{ .text = "m" }, .description = "choose base / return from pinned AI review" },
-    .{ .key = .{ .action = .reload }, .description = "refresh normal base or exact pinned AI review" },
+const help_compare_items = [_]HelpItem{
+    .{ .key = .{ .text = "m" }, .description = "choose comparison base" },
+    .{ .key = .{ .action = .reload }, .description = "refresh comparison" },
+    .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
+    .{ .key = .{ .action = .file_search }, .description = "search files" },
+    .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
+    .{ .key = .{ .text = "y / Y" }, .description = "copy current line / hunk" },
+};
+
+const help_ai_reviews_items = [_]HelpItem{
+    .{ .key = .{ .text = "a" }, .description = "select an AI review Run" },
+    .{ .key = .{ .action = .reload }, .description = "refresh the selected exact Run" },
     .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
@@ -3252,15 +3281,21 @@ const help_review_items = [_]HelpItem{
     .{ .key = .{ .text = "Space / P / U / b" }, .description = "write operations unavailable" },
 };
 
-const help_review_sections = [_]HelpSection{
-    .{ .title = "Review", .items = &help_review_items },
+const help_compare_sections = [_]HelpSection{
+    .{ .title = "Compare", .items = &help_compare_items },
+    .{ .title = "Diff", .items = &help_diff_navigation_items },
+};
+
+const help_ai_reviews_sections = [_]HelpSection{
+    .{ .title = "AI Reviews", .items = &help_ai_reviews_items },
     .{ .title = "Diff", .items = &help_diff_navigation_items },
 };
 
 const help_repository_global_items = [_]HelpItem{
     .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
-    .{ .key = .{ .action = .page_review }, .description = "Review page" },
+    .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
+    .{ .key = .{ .action = .page_ai_reviews }, .description = "AI Reviews page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .key = .{ .action = .help }, .description = "open / close help" },
     .{ .key = .{ .action = .reload }, .description = "force reload" },

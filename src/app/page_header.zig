@@ -32,7 +32,7 @@ pub const HeadContext = union(enum) {
     unknown: Freshness,
 };
 
-pub const ReviewContext = struct {
+pub const ComparisonContext = struct {
     base_display_name: []const u8,
     head_display_name: []const u8,
     freshness: Freshness,
@@ -42,18 +42,18 @@ pub const Terminal = struct {
     kind: Kind,
     state: State,
 
-    pub const Kind = enum { head, review };
+    pub const Kind = enum { head, comparison };
     pub const State = enum { loading, unavailable };
 };
 
 pub const Presentation = union(enum) {
     head: HeadContext,
-    review: ReviewContext,
+    comparison: ComparisonContext,
     terminal: Terminal,
 
     pub fn tone(self: Presentation) Tone {
         return switch (self) {
-            .head, .review => .fact,
+            .head, .comparison => .fact,
             .terminal => .terminal,
         };
     }
@@ -70,7 +70,7 @@ pub fn formatAlloc(
 ) std.mem.Allocator.Error!?[]u8 {
     return switch (presentation) {
         .head => |head| formatHead(allocator, head, available_width),
-        .review => |review| formatReview(allocator, review, available_width),
+        .comparison => |comparison| formatComparison(allocator, comparison, available_width),
         .terminal => |terminal| formatTerminal(allocator, terminal, available_width),
     };
 }
@@ -149,16 +149,16 @@ fn formatHeadLiteral(
     return try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, value, suffix });
 }
 
-fn formatReview(
+fn formatComparison(
     allocator: std.mem.Allocator,
-    review: ReviewContext,
+    comparison: ComparisonContext,
     available_width: u16,
 ) std.mem.Allocator.Error!?[]u8 {
     const prefix = "BASE ";
     const separator = "  …  HEAD ";
-    const freshness = freshnessSuffix(review.freshness);
-    const base_width = chasen.text.displayWidth(review.base_display_name);
-    const head_width = chasen.text.displayWidth(review.head_display_name);
+    const freshness = freshnessSuffix(comparison.freshness);
+    const base_width = chasen.text.displayWidth(comparison.base_display_name);
+    const head_width = chasen.text.displayWidth(comparison.head_display_name);
     if (base_width == 0 or head_width == 0) return null;
 
     const fixed_width = @as(u32, chasen.text.displayWidth(prefix)) +
@@ -167,8 +167,8 @@ fn formatReview(
     if (fixed_width > available_width) return null;
     const names_available: u16 = @intCast(@as(u32, available_width) - fixed_width);
 
-    const base_min = endpointMinimumWidth(review.base_display_name);
-    const head_min = endpointMinimumWidth(review.head_display_name);
+    const base_min = endpointMinimumWidth(comparison.base_display_name);
+    const head_min = endpointMinimumWidth(comparison.head_display_name);
     if (@as(u32, base_min) + head_min > names_available) return null;
 
     var base_budget = base_min;
@@ -185,9 +185,9 @@ fn formatReview(
         }
     }
 
-    const base = (try middleElideAlloc(allocator, review.base_display_name, base_budget)) orelse return null;
+    const base = (try middleElideAlloc(allocator, comparison.base_display_name, base_budget)) orelse return null;
     defer allocator.free(base);
-    const head = (try middleElideAlloc(allocator, review.head_display_name, head_budget)) orelse return null;
+    const head = (try middleElideAlloc(allocator, comparison.head_display_name, head_budget)) orelse return null;
     defer allocator.free(head);
     return try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{
         prefix,
@@ -208,9 +208,9 @@ fn formatTerminal(
             .loading => "HEAD loading",
             .unavailable => "HEAD unavailable",
         },
-        .review => switch (terminal.state) {
-            .loading => "Review context loading",
-            .unavailable => "Review context unavailable",
+        .comparison => switch (terminal.state) {
+            .loading => "Comparison loading",
+            .unavailable => "Comparison unavailable",
         },
     };
     if (chasen.text.displayWidth(text) > available_width) return null;
@@ -403,8 +403,8 @@ test "page header terminals require their complete wording" {
     const cases = [_]Case{
         .{ .terminal = .{ .kind = .head, .state = .loading }, .expected = "HEAD loading" },
         .{ .terminal = .{ .kind = .head, .state = .unavailable }, .expected = "HEAD unavailable" },
-        .{ .terminal = .{ .kind = .review, .state = .loading }, .expected = "Review context loading" },
-        .{ .terminal = .{ .kind = .review, .state = .unavailable }, .expected = "Review context unavailable" },
+        .{ .terminal = .{ .kind = .comparison, .state = .loading }, .expected = "Comparison loading" },
+        .{ .terminal = .{ .kind = .comparison, .state = .unavailable }, .expected = "Comparison unavailable" },
     };
     for (cases) |case| {
         const presentation: Presentation = .{ .terminal = case.terminal };
@@ -416,8 +416,8 @@ test "page header terminals require their complete wording" {
     }
 }
 
-test "page header Review keeps both endpoints or omits the whole pair" {
-    const presentation: Presentation = .{ .review = .{
+test "page header comparison keeps both endpoints or omits the whole pair" {
+    const presentation: Presentation = .{ .comparison = .{
         .base_display_name = "origin/very-long-main",
         .head_display_name = "feature/very-long-topic",
         .freshness = .fresh,
@@ -433,7 +433,7 @@ test "page header Review keeps both endpoints or omits the whole pair" {
     try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
     try std.testing.expect(chasen.text.displayWidth(text) <= 28);
 
-    const short_wide: Presentation = .{ .review = .{
+    const short_wide: Presentation = .{ .comparison = .{
         .base_display_name = "日本",
         .head_display_name = "日本",
         .freshness = .fresh,
@@ -444,8 +444,8 @@ test "page header Review keeps both endpoints or omits the whole pair" {
     try std.testing.expectEqualStrings("BASE 日本  …  HEAD 日本", short_wide_exact);
 }
 
-test "page header Review treats display names as opaque and has no upstream suffix" {
-    const presentation: Presentation = .{ .review = .{
+test "page header comparison treats display names as opaque and has no upstream suffix" {
+    const presentation: Presentation = .{ .comparison = .{
         .base_display_name = "tag:v1.2.3",
         .head_display_name = "HEAD@0123456",
         .freshness = .refreshing,

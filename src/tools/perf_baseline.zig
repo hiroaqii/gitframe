@@ -24,8 +24,8 @@ const diff_search = @import("../diff/search.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
 const committed_review = @import("../committed_review.zig");
-const review_page = @import("../app/pages/review.zig");
-const finding_card_view = @import("../app/pages/review/finding_card_view.zig");
+const ai_reviews_page = @import("../app/pages/ai_reviews.zig");
+const finding_card_view = @import("../app/pages/ai_reviews/finding_card_view.zig");
 
 const huge_file_pairs = 8_000;
 const no_match_pairs = 2_000;
@@ -207,20 +207,20 @@ fn runMaximumFindingBodyScenario(allocator: std.mem.Allocator, io: std.Io) !void
     const maximum_body = try allocator.alloc(u8, committed_review.limits.max_body_bytes);
     defer allocator.free(maximum_body);
     @memset(maximum_body, 'x');
-    const content: review_page.FindingCardContent = .{
+    const content: ai_reviews_page.FindingCardContent = .{
         .producer = &producer,
         .model = &model,
         .title = "maximum body",
         .body = maximum_body,
         .suggestion = maximum_body,
     };
-    const display = try allocator.alloc(u8, review_page.findingCardDisplayTextLength(content));
+    const display = try allocator.alloc(u8, ai_reviews_page.findingCardDisplayTextLength(content));
     defer allocator.free(display);
     const row_starts = try allocator.alloc(usize, display.len + 1);
     defer allocator.free(row_starts);
 
     var fill_timer = Stopwatch.start(io);
-    const text = review_page.findingCardDisplayTextInto(display, content);
+    const text = ai_reviews_page.findingCardDisplayTextInto(display, content);
     const row_count = finding_card_view.prepareWrappedRows(text, 55, row_starts);
     const fill_ns = fill_timer.read();
 

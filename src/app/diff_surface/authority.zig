@@ -1,7 +1,7 @@
 //! Shared diff-page action authority vocabulary.
 //!
 //! Requirements are evaluated against the current page activation and member
-//! freshness vector. Changes and Review retain independent lifecycle state.
+//! freshness vector. Every diff page retains independent lifecycle state.
 
 const std = @import("std");
 const auto_reload = @import("../auto_reload.zig");
@@ -112,29 +112,32 @@ pub const Member = enum {
 /// identities from being admitted accidentally.
 pub const Owner = enum {
     changes,
-    review,
+    compare,
+    ai_reviews,
 
     fn identity(self: Owner, repo_epoch: u64, activation_id: u64) page.RequestIdentity {
         return switch (self) {
             .changes => page.RequestIdentity.changes(repo_epoch, activation_id),
-            .review => page.RequestIdentity.review(repo_epoch, activation_id),
+            .compare => page.RequestIdentity.compare(repo_epoch, activation_id),
+            .ai_reviews => page.RequestIdentity.aiReviews(repo_epoch, activation_id),
         };
     }
 
     fn matches(self: Owner, origin: page.Id) bool {
         return switch (self) {
             .changes => origin == .changes,
-            .review => origin == .review,
+            .compare => origin == .compare,
+            .ai_reviews => origin == .ai_reviews,
         };
     }
 };
 
-/// Persistent Changes or Review activation owner.
+/// Persistent diff-page activation owner.
 ///
 /// Retained documents and reload fingerprints live outside this value. Leaving
 /// the owning page therefore revokes action authority without destroying last-good
-/// display state. A completion may mutate a member only when both its repo
-/// epoch, activation id, and page origin identify the current visible activation.
+/// display state. A completion may mutate its retained page owner only when
+/// its repo epoch, activation id, and page origin identify the latest instance.
 pub const Lifecycle = struct {
     owner: Owner,
     state: ActivationState = .inactive,
@@ -155,6 +158,30 @@ pub const Lifecycle = struct {
     ) u64 {
         self.next_activation_id +%= 1;
         if (self.next_activation_id == 0) self.next_activation_id = 1;
+        const activation_id = self.next_activation_id;
+        self.state = .{ .active = .{
+            .activation_id = activation_id,
+            .repo_epoch = repo_epoch,
+            .members = .{ .source = source, .status = status, .branch = branch },
+        } };
+        self.revalidation_requested = null;
+        self.action_terminal_revalidation_requested = null;
+        return activation_id;
+    }
+
+    /// Re-enters a retained page without minting a new request owner.
+    ///
+    /// AI Reviews uses this when a direct refresh may finish while the page is
+    /// hidden. The completion remains owned by the same page instance, while
+    /// repository replacement still changes the epoch and rejects it.
+    pub fn reactivateRetained(
+        self: *Lifecycle,
+        repo_epoch: u64,
+        source: MemberFreshness,
+        status: MemberFreshness,
+        branch: MemberFreshness,
+    ) u64 {
+        std.debug.assert(self.next_activation_id != 0);
         const activation_id = self.next_activation_id;
         self.state = .{ .active = .{
             .activation_id = activation_id,
@@ -336,22 +363,45 @@ test "lifecycle identity authority is isolated by diff page owner" {
     var changes = Lifecycle.init(.changes);
     const changes_activation = changes.activate(4, .pending, .pending, .pending);
     const changes_identity = changes.currentIdentity().?;
-    const review_for_changes = page.RequestIdentity.review(4, changes_activation);
+    const compare_for_changes = page.RequestIdentity.compare(4, changes_activation);
     try std.testing.expectEqual(page.Id.changes, changes_identity.origin);
     try std.testing.expect(changes.finishMember(changes_identity, .source, .fresh));
-    try std.testing.expect(!changes.finishMember(review_for_changes, .source, .failed));
+    try std.testing.expect(!changes.finishMember(compare_for_changes, .source, .failed));
     try std.testing.expect(changes.acceptsRepoEpoch(changes_identity, 4));
-    try std.testing.expect(!changes.acceptsRepoEpoch(review_for_changes, 4));
+    try std.testing.expect(!changes.acceptsRepoEpoch(compare_for_changes, 4));
 
-    var review = Lifecycle.init(.review);
-    const review_activation = review.activate(4, .pending, .unavailable, .unavailable);
-    const review_identity = review.currentIdentity().?;
-    const changes_for_review = page.RequestIdentity.changes(4, review_activation);
-    try std.testing.expectEqual(page.Id.review, review_identity.origin);
-    try std.testing.expect(review.finishMember(review_identity, .source, .immutable));
-    try std.testing.expect(!review.finishMember(changes_for_review, .source, .failed));
-    try std.testing.expect(review.acceptsRepoEpoch(review_identity, 4));
-    try std.testing.expect(!review.acceptsRepoEpoch(changes_for_review, 4));
+    var compare = Lifecycle.init(.compare);
+    const compare_activation = compare.activate(4, .pending, .unavailable, .unavailable);
+    const compare_identity = compare.currentIdentity().?;
+    const changes_for_compare = page.RequestIdentity.changes(4, compare_activation);
+    const ai_for_compare = page.RequestIdentity.aiReviews(4, compare_activation);
+    try std.testing.expectEqual(page.Id.compare, compare_identity.origin);
+    try std.testing.expect(compare.finishMember(compare_identity, .source, .immutable));
+    try std.testing.expect(!compare.finishMember(changes_for_compare, .source, .failed));
+    try std.testing.expect(!compare.finishMember(ai_for_compare, .source, .failed));
+    try std.testing.expect(compare.acceptsRepoEpoch(compare_identity, 4));
+    try std.testing.expect(!compare.acceptsRepoEpoch(changes_for_compare, 4));
+
+    var ai_reviews = Lifecycle.init(.ai_reviews);
+    _ = ai_reviews.activate(4, .unavailable, .unavailable, .unavailable);
+    const ai_identity = ai_reviews.currentIdentity().?;
+    try std.testing.expectEqual(page.Id.ai_reviews, ai_identity.origin);
+    try std.testing.expect(!ai_reviews.acceptsRepoEpoch(compare_identity, 4));
+}
+
+test "retained reactivation preserves page-instance completion authority" {
+    var lifecycle = Lifecycle.init(.ai_reviews);
+    const activation_id = lifecycle.activate(4, .immutable, .unavailable, .unavailable);
+    const identity = lifecycle.currentIdentity().?;
+    lifecycle.deactivate();
+
+    try std.testing.expect(lifecycle.acceptsPageInstance(identity, 4));
+    try std.testing.expectEqual(
+        activation_id,
+        lifecycle.reactivateRetained(4, .pending, .unavailable, .unavailable),
+    );
+    try std.testing.expect(std.meta.eql(identity, lifecycle.currentIdentity().?));
+    try std.testing.expect(!lifecycle.acceptsPageInstance(identity, 5));
 }
 
 test "queued revalidation belongs to the current activation" {
