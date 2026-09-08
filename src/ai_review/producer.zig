@@ -53,6 +53,53 @@ pub const Input = struct {
     display: ?committed.DisplayMetadata = null,
 };
 
+/// One provider-neutral owned candidate set. Provider adapters populate this
+/// value, while common code alone validates it against deterministic units.
+pub const CandidateBatch = struct {
+    arena: std.heap.ArenaAllocator,
+    payloads: []const protocol.FindingCandidatePayload,
+
+    pub fn deinit(self: *CandidateBatch) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Provider-verified, process-only provenance carried with one candidate
+/// batch. Only `actual_model` and `cli_version` are published; the requested
+/// model remains available to the in-process handoff solely for diagnostics
+/// and compatibility checks.
+pub const ProviderProvenance = struct {
+    allocator: std.mem.Allocator,
+    name: []u8,
+    requested_model: ?[]u8 = null,
+    actual_model: ?[]u8 = null,
+    cli_version: ?[]u8 = null,
+
+    pub fn deinit(self: *ProviderProvenance) void {
+        self.allocator.free(self.name);
+        if (self.requested_model) |value| self.allocator.free(value);
+        if (self.actual_model) |value| self.allocator.free(value);
+        if (self.cli_version) |value| self.allocator.free(value);
+        self.* = undefined;
+    }
+
+    pub fn committedProducer(self: *const ProviderProvenance) committed.Producer {
+        return .{
+            .name = self.name,
+            .model = self.actual_model,
+            .version = self.cli_version,
+            .skill_version = null,
+        };
+    }
+};
+
+pub const CandidateInput = struct {
+    summary: *const protocol.ReviewPlanSummary,
+    units: []const protocol.ReviewUnit,
+    candidates: []const protocol.FindingCandidatePayload,
+};
+
 /// Exact canonical bytes returned to the publication adapter.
 pub const ArtifactBundle = struct {
     manifest_bytes: []u8,
@@ -86,29 +133,12 @@ pub fn buildAlloc(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try validateCompleteInput(allocator, input);
-
-    var resolved: std.ArrayList(ResolvedCandidate) = .empty;
-    var candidate_bytes: usize = 0;
-    for (input.units, input.candidates) |*unit, *payload| {
-        const canonical = payload.writeCanonical(allocator) catch |err| return mapCandidateError(err);
-        defer allocator.free(canonical);
-        candidate_bytes = std.math.add(usize, candidate_bytes, canonical.len) catch
-            return error.CandidateLimitExceeded;
-        if (candidate_bytes > limits.max_candidate_batches_bytes) return error.CandidateLimitExceeded;
-        if (resolved.items.len + payload.findings.len > limits.max_findings_total) {
-            return error.CandidateLimitExceeded;
-        }
-
-        for (payload.findings) |candidate| {
-            const item = try resolveCandidate(unit, candidate);
-            verifier.verify(&input.summary.target, item.anchor) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.AnchorUnavailable => error.AnchorUnavailable,
-            };
-            resolved.append(arena, item) catch return error.OutOfMemory;
-        }
-    }
+    var resolved = try resolveCandidates(allocator, arena, .{
+        .summary = input.summary,
+        .units = input.units,
+        .candidates = input.candidates,
+    }, verifier);
+    defer resolved.deinit(arena);
 
     std.mem.sort(ResolvedCandidate, resolved.items, {}, resolvedLessThan);
     const unique_count = deduplicateSorted(resolved.items);
@@ -165,7 +195,53 @@ pub fn buildAlloc(
     };
 }
 
-fn validateCompleteInput(allocator: std.mem.Allocator, input: Input) BuildError!void {
+/// Validate complete candidate coverage, aggregate bounds, semantic locations,
+/// and every derived committed anchor without creating an artifact or ID.
+pub fn validateCandidates(
+    allocator: std.mem.Allocator,
+    input: CandidateInput,
+    verifier: AnchorVerifier,
+) BuildError!void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var resolved = try resolveCandidates(allocator, arena_state.allocator(), input, verifier);
+    resolved.deinit(arena_state.allocator());
+}
+
+fn resolveCandidates(
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    input: CandidateInput,
+    verifier: AnchorVerifier,
+) BuildError!std.ArrayList(ResolvedCandidate) {
+    try validateCompleteInput(allocator, input);
+
+    var resolved: std.ArrayList(ResolvedCandidate) = .empty;
+    errdefer resolved.deinit(arena);
+    var candidate_bytes: usize = 0;
+    for (input.units, input.candidates) |*unit, *payload| {
+        const canonical = payload.writeCanonical(allocator) catch |err| return mapCandidateError(err);
+        defer allocator.free(canonical);
+        candidate_bytes = std.math.add(usize, candidate_bytes, canonical.len) catch
+            return error.CandidateLimitExceeded;
+        if (candidate_bytes > limits.max_candidate_batches_bytes) return error.CandidateLimitExceeded;
+        if (resolved.items.len + payload.findings.len > limits.max_findings_total) {
+            return error.CandidateLimitExceeded;
+        }
+
+        for (payload.findings) |candidate| {
+            const item = try resolveCandidate(unit, candidate);
+            verifier.verify(&input.summary.target, item.anchor) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.AnchorUnavailable => error.AnchorUnavailable,
+            };
+            resolved.append(arena, item) catch return error.OutOfMemory;
+        }
+    }
+    return resolved;
+}
+
+fn validateCompleteInput(allocator: std.mem.Allocator, input: CandidateInput) BuildError!void {
     const summary_bytes = input.summary.writeCanonical(allocator) catch |err|
         return mapInputError(err);
     defer allocator.free(summary_bytes);

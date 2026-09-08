@@ -101,6 +101,8 @@ pub const ControlledFailure = union(enum) {
     empty_argv,
     unsupported_process_control,
     spawn: anyerror,
+    stdin_start: std.Io.ConcurrentError,
+    stdin: anyerror,
     control_start: std.Io.ConcurrentError,
     capture: anyerror,
     terminate: anyerror,
@@ -110,7 +112,7 @@ pub const ControlledFailure = union(enum) {
         return switch (self) {
             .empty_argv => "EmptyArgv",
             .unsupported_process_control => "UnsupportedProcessControl",
-            inline .spawn, .control_start, .capture, .terminate, .wait => |err| @errorName(err),
+            inline .spawn, .stdin_start, .stdin, .control_start, .capture, .terminate, .wait => |err| @errorName(err),
         };
     }
 };
@@ -609,6 +611,10 @@ fn childExitedWithoutReaping(pid: std.posix.pid_t) anyerror!bool {
     };
 }
 
+fn recordChildExitObserved(hooks: ControlledTestHooks) void {
+    if (hooks.lifecycle_audit) |audit| audit.child_exit_observed.store(true, .release);
+}
+
 fn observeChildExit(
     io: std.Io,
     pid: std.posix.pid_t,
@@ -849,14 +855,216 @@ fn finishControlledCapture(
     };
 }
 
-/// Run a child in a dedicated process group with captured stdout/stderr.
-///
-/// As with `runCaptured`, `options.stdin` is ignored and the child receives
-/// immediate EOF on stdin.
-/// Cancellation and timeout send TERM to the group, wait one second, send
-/// KILL, and always wait/reap the direct child. Sensitive capture uses a
-/// zeroizing allocator from the first growth buffer onward. The existing
-/// unbounded runner entry points intentionally remain separate.
+fn controlledPollTimeout(io: std.Io, control: ProcessControl) std.Io.Timeout {
+    const poll_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(8),
+        .clock = if (control.deadline) |deadline| deadline.clock else std.Io.Clock.awake,
+    });
+    if (control.deadline) |deadline| {
+        if (deadline.compare(.lte, poll_deadline)) return .{ .deadline = deadline };
+    }
+    return .{ .deadline = poll_deadline };
+}
+
+fn controlledLimitError(
+    multi_reader: *std.Io.File.MultiReader,
+    options: Options,
+) ?anyerror {
+    if (options.stdout_limit.toInt()) |limit| {
+        if (multi_reader.reader(0).buffered().len > limit) return error.StdoutLimitExceeded;
+    }
+    if (options.stderr_limit.toInt()) |limit| {
+        if (multi_reader.reader(1).buffered().len > limit) return error.StderrLimitExceeded;
+    }
+    return null;
+}
+
+fn drainControlledPipes(
+    multi_reader: *std.Io.File.MultiReader,
+    io: std.Io,
+    options: Options,
+) ?anyerror {
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromSeconds(2),
+        .clock = .awake,
+    });
+    while (true) {
+        multi_reader.fill(64, .{ .deadline = deadline }) catch |err| switch (err) {
+            error.EndOfStream => return controlledLimitError(multi_reader, options),
+            else => return err,
+        };
+        if (controlledLimitError(multi_reader, options)) |err| return err;
+    }
+}
+
+/// Run a child in one dedicated process group while concurrently pumping a
+/// bounded stdin document and capturing both output streams. Unlike the
+/// existing controlled capture entry below, every terminal drains and empties
+/// the process group before the direct leader is reaped.
+pub fn runWithStdinControlled(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    capture_mode: CaptureMode,
+    control: ProcessControl,
+) ControlledResult {
+    return runWithStdinControlledInternal(allocator, io, options, capture_mode, control, .{});
+}
+
+fn runWithStdinControlledInternal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    capture_mode: CaptureMode,
+    control: ProcessControl,
+    hooks: ControlledTestHooks,
+) ControlledResult {
+    if (options.argv.len == 0) return .{ .failed = .empty_argv };
+    if (comptime !supportsControlledProcessGroups()) {
+        return .{ .failed = .unsupported_process_control };
+    }
+
+    const previous_cancel_protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous_cancel_protection);
+    if (pollControl(io, control)) |terminal| return switch (terminal) {
+        .canceled => .canceled,
+        .timed_out => .timed_out,
+    };
+
+    var child = std.process.spawn(io, .{
+        .argv = options.argv,
+        .cwd = options.cwd,
+        .environ_map = options.environ_map,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    }) catch |err| return .{ .failed = .{ .spawn = err } };
+    const pid = child.id.?;
+    var child_owned = true;
+    defer if (child_owned) child.kill(io);
+
+    var zeroizing_allocator: ZeroizingAllocator = .{ .child = allocator };
+    const capture_allocator = switch (capture_mode) {
+        .ordinary => allocator,
+        .sensitive => zeroizing_allocator.allocator(),
+    };
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(capture_allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdin_file = child.stdin.?;
+    child.stdin = null;
+    var stdin_future: ?std.Io.Future(?anyerror) = null;
+    var stdin_start_error: ?std.Io.ConcurrentError = null;
+    if (options.stdin.len == 0) {
+        stdin_file.close(io);
+    } else {
+        if (io.concurrent(pumpStdin, .{ stdin_file, io, options.stdin })) |future| {
+            stdin_future = future;
+        } else |err| {
+            stdin_start_error = err;
+            stdin_file.close(io);
+        }
+    }
+    defer {
+        if (stdin_future) |*future| _ = future.cancel(io);
+    }
+
+    var leader_ready = false;
+    var observer_error: ?anyerror = null;
+    var capture_error: ?anyerror = null;
+    var stopped: ?ControlTerminal = null;
+    while (stdin_start_error == null) {
+        const exited_before = childExitedWithoutReaping(pid) catch |err| {
+            observer_error = err;
+            break;
+        };
+        if (exited_before) {
+            leader_ready = true;
+            recordChildExitObserved(hooks);
+            break;
+        }
+
+        multi_reader.fill(64, controlledPollTimeout(io, control)) catch |err| switch (err) {
+            error.Timeout, error.EndOfStream => {},
+            else => {
+                capture_error = err;
+                break;
+            },
+        };
+        multi_reader.checkAnyError() catch |err| {
+            capture_error = err;
+            break;
+        };
+        if (controlledLimitError(&multi_reader, options)) |err| {
+            capture_error = err;
+            break;
+        }
+
+        // Check the non-reaping child state on both sides of control polling;
+        // a leader already ready in this observation batch wins the race.
+        const exited_after = childExitedWithoutReaping(pid) catch |err| {
+            observer_error = err;
+            break;
+        };
+        if (exited_after) {
+            leader_ready = true;
+            recordChildExitObserved(hooks);
+            break;
+        }
+        if (pollControl(io, control)) |terminal| {
+            const exited_with_control = childExitedWithoutReaping(pid) catch |err| {
+                observer_error = err;
+                break;
+            };
+            if (exited_with_control) {
+                leader_ready = true;
+                recordChildExitObserved(hooks);
+            } else stopped = terminal;
+            break;
+        }
+    }
+
+    var stdin_error: ?anyerror = null;
+    if (stdin_future) |*future| {
+        stdin_error = future.cancel(io);
+        stdin_future = null;
+        if (stdin_error) |err| {
+            if (err == error.Canceled) stdin_error = null;
+        }
+    }
+
+    var terminate_error = beginGroupTermination(&child, pid, hooks);
+    io.sleep(hooks.terminate_grace, .awake) catch unreachable;
+    synchronizeFinalSignal(io, hooks);
+    if (finishGroupTermination(&child, pid, hooks)) |err| {
+        if (terminate_error == null) terminate_error = err;
+    }
+    const drain_error = drainControlledPipes(&multi_reader, io, options);
+    const term = reapChild(&child, io, hooks) catch |err| {
+        child_owned = false;
+        return .{ .failed = .{ .wait = err } };
+    };
+    child_owned = false;
+
+    if (terminate_error) |err| return .{ .failed = .{ .terminate = err } };
+    if (observer_error) |err| return .{ .failed = .{ .wait = err } };
+    if (stopped) |terminal| return switch (terminal) {
+        .canceled => .canceled,
+        .timed_out => .timed_out,
+    };
+    if (capture_error) |err| return .{ .failed = .{ .capture = err } };
+    if (drain_error) |err| return .{ .failed = .{ .capture = err } };
+    if (stdin_start_error) |err| return .{ .failed = .{ .stdin_start = err } };
+    if (stdin_error) |err| return .{ .failed = .{ .stdin = err } };
+    if (!leader_ready) return .{ .failed = .{ .wait = error.ChildNotObserved } };
+    return finishControlledCapture(allocator, &multi_reader, capture_mode, term);
+}
+
+/// Existing capture-only controlled entry. The Codex path uses the separate
+/// controlled-stdin entry above.
 pub fn runCapturedControlled(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1795,4 +2003,127 @@ test "process group sensitive capture zeroizes success partial failure OOM timeo
         try std.testing.expectEqual(@as(usize, 0), audit.free_count);
         try std.testing.expect(!audit.observed_nonzero_free);
     }
+}
+
+test "controlled stdin drains bidirectional IO and retains the primary capture failure" {
+    try requireControlledProcessTest();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const stdin = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(stdin);
+    @memset(stdin, 'i');
+
+    const success_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "yes o | head -c 98304; yes e | head -c 98304 >&2; cat",
+    };
+    var success = runWithStdinControlledInternal(allocator, io, .{
+        .argv = &success_argv,
+        .stdin = stdin,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(128 * 1024),
+    }, .ordinary, .{}, .{ .terminate_grace = .fromMilliseconds(10) });
+    defer success.deinit(allocator);
+    const captured = switch (success) {
+        .completed => |value| switch (value) {
+            .ordinary => |ordinary| ordinary,
+            .sensitive => return error.ExpectedOrdinaryCapture,
+        },
+        else => return error.ExpectedControlledCompletion,
+    };
+    try std.testing.expectEqual(@as(usize, 98304 + stdin.len), captured.stdout.len);
+    try std.testing.expectEqual(@as(usize, 98304), captured.stderr.len);
+    try std.testing.expectEqualStrings(stdin, captured.stdout[captured.stdout.len - stdin.len ..]);
+
+    const failure_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "exec 0<&-; yes overflow | head -c 131072; exit 9",
+    };
+    var failure = runWithStdinControlledInternal(allocator, io, .{
+        .argv = &failure_argv,
+        .stdin = stdin,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(64),
+    }, .sensitive, .{}, .{ .terminate_grace = .fromMilliseconds(10) });
+    defer failure.deinit(allocator);
+    switch (failure) {
+        .failed => |value| switch (value) {
+            .capture => |err| try std.testing.expectEqual(error.StdoutLimitExceeded, err),
+            else => return error.ExpectedCaptureFailure,
+        },
+        else => return error.ExpectedCaptureFailure,
+    }
+}
+
+test "controlled stdin empties background process groups before one final reap" {
+    try requireControlledProcessTest();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var audit: ControlledLifecycleAudit = .{};
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "sh -c 'trap \"\" TERM; printf \"%s\" \"$$\" > descendant.pid; while :; do sleep 1; done' & printf ok; exit 0",
+    };
+    var result = runWithStdinControlledInternal(allocator, io, .{
+        .argv = &argv,
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = "input",
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    }, .ordinary, .{}, .{
+        .terminate_grace = .fromMilliseconds(20),
+        .lifecycle_audit = &audit,
+    });
+    defer result.deinit(allocator);
+    const term = switch (result) {
+        .completed => |value| switch (value) {
+            .ordinary => |ordinary| ordinary.term,
+            .sensitive => return error.ExpectedOrdinaryCapture,
+        },
+        else => return error.ExpectedControlledCompletion,
+    };
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try expectProcessGone(io, try readTestPid(tmp.dir, io, "descendant.pid"));
+    try std.testing.expectEqual(@as(usize, 1), audit.wait_calls);
+    try std.testing.expectEqual(@as(usize, 1), audit.reaps);
+    try std.testing.expectEqual(@as(usize, 0), audit.signal_attempts_after_reap);
+}
+
+test "controlled stdin cancel and timeout kill TERM-ignoring groups" {
+    try requireControlledProcessTest();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "trap '' TERM; sh -c 'trap \"\" TERM; while :; do sleep 1; done' & while :; do sleep 1; done",
+    };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(60),
+        .clock = .awake,
+    });
+    var timed_out = runWithStdinControlledInternal(allocator, io, .{
+        .argv = &argv,
+        .stdin = "input",
+        .stdout_limit = .limited(64),
+        .stderr_limit = .limited(64),
+    }, .sensitive, .{ .deadline = deadline }, .{ .terminate_grace = .fromMilliseconds(20) });
+    defer timed_out.deinit(allocator);
+    try std.testing.expect(timed_out == .timed_out);
+
+    var canceled_generation: std.atomic.Value(u64) = .init(27);
+    var canceled = runWithStdinControlled(allocator, io, .{
+        .argv = &.{"/definitely/not/a/gitframe-command"},
+        .stdin = "secret",
+    }, .sensitive, .{ .cancellation = .{
+        .canceled_generation = &canceled_generation,
+        .generation = 27,
+    } });
+    defer canceled.deinit(allocator);
+    try std.testing.expect(canceled == .canceled);
 }

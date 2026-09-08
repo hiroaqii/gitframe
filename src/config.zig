@@ -24,6 +24,12 @@ pub const AiReviewConfig = struct {
     /// The Review Store root itself. This slice borrows TOML source bytes;
     /// resolution later copies one immutable startup/helper snapshot.
     store_root: ?[]const u8 = null,
+    /// Absolute path to the trusted native Codex CLI executable. It is kept
+    /// separate from ordinary Codex configuration and is never shell parsed.
+    codex_executable: ?[]const u8 = null,
+    /// Optional opaque requested model. When absent, the Codex runner chooses
+    /// its ordinary default; GitFrame does not maintain a model catalog.
+    codex_model: ?[]const u8 = null,
 };
 
 pub const ReloadConfig = struct {
@@ -318,6 +324,8 @@ const TomlParseError = error{
     InvalidBoolean,
     InvalidReloadInterval,
     InvalidAiReviewStoreRoot,
+    InvalidAiReviewCodexExecutable,
+    InvalidAiReviewCodexModel,
     InvalidString,
     InvalidArray,
     UnsupportedEscape,
@@ -354,6 +362,8 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
     var saw_reload_auto = false;
     var saw_reload_interval = false;
     var saw_ai_review_store_root = false;
+    var saw_ai_review_codex_executable = false;
+    var saw_ai_review_codex_model = false;
 
     var lines = std.mem.splitScalar(u8, input, '\n');
     while (lines.next()) |raw_line| {
@@ -420,13 +430,30 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                 }
             },
             .ai_review => {
-                if (!std.mem.eql(u8, key, "store_root")) return error.UnknownKey;
-                if (saw_ai_review_store_root) return error.DuplicateKey;
-                const store_root = try parseTomlString(value);
-                validateAiReviewStoreRoot(store_root) catch
-                    return error.InvalidAiReviewStoreRoot;
-                config.ai_review.store_root = store_root;
-                saw_ai_review_store_root = true;
+                if (std.mem.eql(u8, key, "store_root")) {
+                    if (saw_ai_review_store_root) return error.DuplicateKey;
+                    const store_root = try parseTomlString(value);
+                    validateAiReviewStoreRoot(store_root) catch
+                        return error.InvalidAiReviewStoreRoot;
+                    config.ai_review.store_root = store_root;
+                    saw_ai_review_store_root = true;
+                } else if (std.mem.eql(u8, key, "codex_executable")) {
+                    if (saw_ai_review_codex_executable) return error.DuplicateKey;
+                    const executable = try parseTomlString(value);
+                    validateAiReviewExecutable(executable) catch
+                        return error.InvalidAiReviewCodexExecutable;
+                    config.ai_review.codex_executable = executable;
+                    saw_ai_review_codex_executable = true;
+                } else if (std.mem.eql(u8, key, "codex_model")) {
+                    if (saw_ai_review_codex_model) return error.DuplicateKey;
+                    const model = try parseTomlString(value);
+                    validateAiReviewModel(model) catch
+                        return error.InvalidAiReviewCodexModel;
+                    config.ai_review.codex_model = model;
+                    saw_ai_review_codex_model = true;
+                } else {
+                    return error.UnknownKey;
+                }
             },
             .action_entry => {
                 if (action_state) |*state| {
@@ -458,6 +485,29 @@ fn validateAiReviewStoreRoot(value: []const u8) error{InvalidStoreRoot}!void {
     while (components.next()) |component| {
         if (component.len == 0 or std.mem.eql(u8, component, ".") or
             std.mem.eql(u8, component, "..")) return error.InvalidStoreRoot;
+    }
+}
+
+fn validateAiReviewExecutable(value: []const u8) error{InvalidExecutable}!void {
+    if (value.len == 0 or value.len > 4095 or value[0] != '/' or
+        value.len == 1 or value[value.len - 1] == '/' or
+        std.mem.indexOfScalar(u8, value, 0) != null)
+    {
+        return error.InvalidExecutable;
+    }
+    var components = std.mem.splitScalar(u8, value[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..")) return error.InvalidExecutable;
+    }
+}
+
+fn validateAiReviewModel(value: []const u8) error{InvalidModel}!void {
+    if (value.len == 0 or value.len > 128 or
+        std.mem.indexOfScalar(u8, value, 0) != null or
+        !std.unicode.utf8ValidateSlice(value))
+    {
+        return error.InvalidModel;
     }
 }
 
@@ -992,6 +1042,44 @@ test "review history backend config admits one canonical Store root" {
         \\root = "/one"
         \\
     ));
+}
+
+test "AI review generation config admits one executable and optional opaque model" {
+    const parsed = try parseConfigToml(
+        \\schema_version = 1
+        \\[ai_review]
+        \\codex_executable = "/opt/codex/bin/codex"
+        \\codex_model = "gpt-5.6-terra"
+        \\
+    );
+    try std.testing.expectEqualStrings("/opt/codex/bin/codex", parsed.ai_review.codex_executable.?);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", parsed.ai_review.codex_model.?);
+    try std.testing.expectError(error.DuplicateKey, parseConfigToml(
+        \\[ai_review]
+        \\codex_executable = "/one/codex"
+        \\codex_executable = "/two/codex"
+        \\
+    ));
+    try std.testing.expectError(error.InvalidAiReviewCodexExecutable, parseConfigToml(
+        \\[ai_review]
+        \\codex_executable = "codex"
+        \\
+    ));
+    try std.testing.expectError(error.DuplicateKey, parseConfigToml(
+        \\[ai_review]
+        \\codex_model = "one"
+        \\codex_model = "two"
+        \\
+    ));
+    try std.testing.expectError(error.InvalidAiReviewCodexModel, parseConfigToml(
+        \\[ai_review]
+        \\codex_model = ""
+        \\
+    ));
+    var too_long: [129]u8 = undefined;
+    @memset(&too_long, 'x');
+    try std.testing.expectError(error.InvalidModel, validateAiReviewModel(&too_long));
+    try std.testing.expectError(error.InvalidModel, validateAiReviewModel(&.{0xff}));
 }
 
 test "review history backend config reports invalid Store root distinctly" {

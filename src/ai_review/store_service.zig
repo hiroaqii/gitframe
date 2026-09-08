@@ -658,11 +658,26 @@ fn admitExactRun(
         .store => |*value| value,
         .failure => |failure| return .{ .failure = mapPublicationToReadFailure(failure) },
     };
+    return admitExactRunLocated(allocator, io, configured_store, .{
+        .capability = &repository.root,
+        .environment = &repository.environment,
+    }, repository.locator, review_id, expected);
+}
+
+fn admitExactRunLocated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    locator: committed_review.GitCommonDirectoryLocator,
+    review_id: committed_review.ReviewId,
+    expected: ?ExpectedPublicationIdentity,
+) std.mem.Allocator.Error!AdmittedExactRun {
     var exact_result = try catalog_store.readExact(
         allocator,
         io,
         configured_store.context(),
-        repository.locator,
+        locator,
         review_id,
         null,
         null,
@@ -701,6 +716,33 @@ fn admitExactRun(
     return .{ .exact = owned };
 }
 
+/// Read one exact publication through retained repository and Store authority.
+pub fn readExactIdentityWithRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    review_id: committed_review.ReviewId,
+    expected: ?ExpectedPublicationIdentity,
+) std.mem.Allocator.Error!ReadResult {
+    const located = try locateForPublication(allocator, io, repository);
+    const locator = switch (located) {
+        .locator => |value| value,
+        .failure => |failure| return .{ .failure = mapPublicationToReadFailure(failure) },
+    };
+    var admitted = try admitExactRunLocated(
+        allocator,
+        io,
+        configured_store,
+        repository,
+        locator,
+        review_id,
+        expected,
+    );
+    defer admitted.deinit(allocator);
+    return identityFromAdmitted(allocator, &admitted, review_id);
+}
+
 /// Generic no-write exact-ID use case. The compatibility result deliberately
 /// exposes identity and lifecycle only, preserving `review-store-read` v1.
 pub fn readExactIdentity(
@@ -720,7 +762,15 @@ pub fn readExactIdentity(
         expected,
     );
     defer admitted.deinit(allocator);
-    const exact = switch (admitted) {
+    return identityFromAdmitted(allocator, &admitted, review_id);
+}
+
+fn identityFromAdmitted(
+    allocator: std.mem.Allocator,
+    admitted: *AdmittedExactRun,
+    review_id: committed_review.ReviewId,
+) std.mem.Allocator.Error!ReadResult {
+    const exact = switch (admitted.*) {
         .failure => |failure| return .{ .failure = failure },
         .exact => |*value| value,
     };
@@ -816,6 +866,62 @@ pub const DraftSaveResult = mutation_store.DraftResult;
 pub const ReviewResultCreateRequest = mutation_store.ResultRequest;
 pub const ReviewResultCreateResult = mutation_store.ResultResult;
 
+const LocatePublicationResult = union(enum) {
+    locator: committed_review.GitCommonDirectoryLocator,
+    failure: PublicationFailure,
+};
+
+fn locateForPublication(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: RepositoryContext,
+) std.mem.Allocator.Error!LocatePublicationResult {
+    return switch (try repository_locator.locate(allocator, io, repository.git())) {
+        .locator => |locator| .{ .locator = locator },
+        .failure => |failure| .{ .failure = switch (failure) {
+            .unsupported_platform => .unsupported_platform,
+            .git_command_failed => .git_failed,
+            else => .repository_invalid,
+        } },
+    };
+}
+
+/// Prepare a binding from already-retained physical repository authority.
+/// `repository_path` is diagnostic registry metadata only.
+pub fn prepareWithRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    repository_path: []const u8,
+) std.mem.Allocator.Error!PrepareResult {
+    const located = try locateForPublication(allocator, io, repository);
+    const locator = switch (located) {
+        .locator => |value| value,
+        .failure => |failure| return .{ .failure = failure },
+    };
+    return prepareLocated(allocator, io, configured_store, locator, repository_path);
+}
+
+fn prepareLocated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    locator: committed_review.GitCommonDirectoryLocator,
+    repository_path: []const u8,
+) std.mem.Allocator.Error!PrepareResult {
+    return switch (try core.prepareBinding(allocator, io, configured_store.context(), .{
+        .locator = locator,
+        .repository_path = repository_path,
+    })) {
+        .success => |value| .{ .success = .{
+            .review_repository_id = value.review_repository_id,
+            .review_id = value.review_id,
+        } },
+        .failure => |failure| .{ .failure = mapPrepareCoreFailure(failure) },
+    };
+}
+
 pub fn prepare(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -833,22 +939,54 @@ pub fn prepare(
         .store => |*value| value,
         .failure => |failure| return .{ .failure = failure },
     };
-    return switch (try core.prepareBinding(allocator, io, configured_store.context(), .{
-        .locator = repository.locator,
-        .repository_path = repository_path,
-    })) {
-        .success => |value| .{ .success = .{
-            .review_repository_id = value.review_repository_id,
-            .review_id = value.review_id,
-        } },
-        .failure => |failure| .{ .failure = mapPrepareCoreFailure(failure) },
+    return prepareLocated(allocator, io, configured_store, repository.locator, repository_path);
+}
+
+/// Publish through the existing Store core using retained physical authority.
+pub fn publishWithRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    request: PublishRequest,
+) std.mem.Allocator.Error!PublishResult {
+    const located = try locateForPublication(allocator, io, repository);
+    const locator = switch (located) {
+        .locator => |value| value,
+        .failure => |failure| return .{ .failure = failure },
     };
+    return publishLocated(allocator, io, configured_store, repository, locator, request);
 }
 
 pub fn publish(
     allocator: std.mem.Allocator,
     io: std.Io,
     environment_map: ?*std.process.Environ.Map,
+    request: PublishRequest,
+) std.mem.Allocator.Error!PublishResult {
+    var repository = switch (try openRepository(allocator, io, environment_map, request.repository_path)) {
+        .context => |value| value,
+        .failure => |failure| return .{ .failure = failure },
+    };
+    defer repository.deinit();
+    var resolved = try resolveConfiguredStore(allocator, io, environment_map);
+    defer resolved.deinit(allocator);
+    const configured_store = switch (resolved) {
+        .store => |*value| value,
+        .failure => |failure| return .{ .failure = failure },
+    };
+    return publishLocated(allocator, io, configured_store, .{
+        .capability = &repository.root,
+        .environment = &repository.environment,
+    }, repository.locator, request);
+}
+
+fn publishLocated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    locator: committed_review.GitCommonDirectoryLocator,
     request: PublishRequest,
 ) std.mem.Allocator.Error!PublishResult {
     var manifest = committed_review.ReviewRunManifest.parseStrict(allocator, request.manifest_bytes) catch |err| switch (err) {
@@ -870,11 +1008,6 @@ pub fn publish(
     manifest.value.validateFindingSet(request.findings_bytes, &findings.value) catch
         return .{ .failure = .invalid_artifact };
 
-    var repository = switch (try openRepository(allocator, io, environment_map, request.repository_path)) {
-        .context => |value| value,
-        .failure => |failure| return .{ .failure = failure },
-    };
-    defer repository.deinit();
     const availability = try git_review.checkTargetAvailability(allocator, io, repository.git(), manifest.value.target);
     switch (availability) {
         .availability => |value| if (value == .missing) return .{ .failure = .target_unavailable },
@@ -885,14 +1018,8 @@ pub fn publish(
         } },
     }
 
-    var resolved = try resolveConfiguredStore(allocator, io, environment_map);
-    defer resolved.deinit(allocator);
-    const configured_store = switch (resolved) {
-        .store => |*value| value,
-        .failure => |failure| return .{ .failure = failure },
-    };
     return switch (try core.publish(allocator, io, configured_store.context(), .{
-        .locator = repository.locator,
+        .locator = locator,
         .review_repository_id = request.review_repository_id,
         .review_id = request.review_id,
         .manifest_bytes = request.manifest_bytes,

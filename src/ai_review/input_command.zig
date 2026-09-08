@@ -25,6 +25,31 @@ pub const CommandOutput = struct {
     }
 };
 
+/// Owned, provider-neutral deterministic input for one model call. All slices
+/// in `summary` and `units` are backed by `arena` and remain valid until
+/// `deinit`.
+pub const PlannedInput = struct {
+    arena: std.heap.ArenaAllocator,
+    summary: protocol.ReviewPlanSummary,
+    units: []const protocol.ReviewUnit,
+
+    pub fn deinit(self: *PlannedInput) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const PlanError = std.mem.Allocator.Error || error{
+    ReviewUnitTooLarge,
+    ReviewLineTooLarge,
+    LimitExceeded,
+    UnsupportedProjection,
+    InvalidProjection,
+    UnsupportedGuidance,
+    GuidanceReadFailed,
+    InvalidPlan,
+};
+
 const Failure = struct {
     exit_code: u8,
     code: []const u8,
@@ -86,26 +111,30 @@ pub fn executeAlloc(
     };
     defer frame.deinit();
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_allocator = arena.allocator();
-    var patch_limit: ?limits.Violation = null;
-    const parsed_patch = patch_plan.parseWithLimit(arena_allocator, frame.target.object_format, frame.patch_bytes, &patch_limit) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ReviewUnitTooLarge => errorOutput(allocator, unitTooLargeFailure(patch_limit.?)),
-        error.ReviewLineTooLarge => errorOutput(allocator, lineTooLargeFailure(patch_limit.?)),
-        error.LimitExceeded => errorOutput(allocator, limitFailure(patch_limit.?)),
-        error.UnsupportedBinary, error.UnsupportedFileType, error.UnsupportedContent, error.MetadataOnly, error.UnsupportedCombinedDiff => errorOutput(allocator, .{
-            .exit_code = 5,
-            .code = "unsupported_projection",
-            .message = "projection contains a file or content form unsupported by AI review v1",
-        }),
-        error.InvalidPatch, error.InvalidPath => errorOutput(allocator, .{
-            .exit_code = 2,
-            .code = "invalid_projection",
-            .message = "projection is not one complete canonical Git patch",
-        }),
-    };
+    // Preserve the command adapter's established validation order: malformed
+    // projection bytes are rejected before the repository path is consulted.
+    // The hosted path calls `planAlloc` directly and parses only once.
+    {
+        var validation_arena = std.heap.ArenaAllocator.init(allocator);
+        defer validation_arena.deinit();
+        var validation_limit: ?limits.Violation = null;
+        _ = patch_plan.parseWithLimit(validation_arena.allocator(), frame.target.object_format, frame.patch_bytes, &validation_limit) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ReviewUnitTooLarge => errorOutput(allocator, unitTooLargeFailure(validation_limit.?)),
+            error.ReviewLineTooLarge => errorOutput(allocator, lineTooLargeFailure(validation_limit.?)),
+            error.LimitExceeded => errorOutput(allocator, limitFailure(validation_limit.?)),
+            error.UnsupportedBinary, error.UnsupportedFileType, error.UnsupportedContent, error.MetadataOnly, error.UnsupportedCombinedDiff => errorOutput(allocator, .{
+                .exit_code = 5,
+                .code = "unsupported_projection",
+                .message = "projection contains a file or content form unsupported by AI review v1",
+            }),
+            error.InvalidPatch, error.InvalidPath => errorOutput(allocator, .{
+                .exit_code = 2,
+                .code = "invalid_projection",
+                .message = "projection is not one complete canonical Git patch",
+            }),
+        };
+    }
 
     var root = root_capability.RootCapability.openCanonical(frame.repository_path) catch
         return errorOutput(allocator, .{
@@ -114,19 +143,31 @@ pub fn executeAlloc(
             .message = "review-input repository path is unavailable or not canonical",
         });
     defer root.deinit();
-    var environment = git_command.LocalGitEnvironment.initFromParent(arena_allocator, environment_map) catch |err| switch (err) {
+    var environment = git_command.LocalGitEnvironment.initFromParent(allocator, environment_map) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return errorOutput(allocator, internalFailure()),
     };
     defer environment.deinit();
-    var guidance_limit: ?limits.Violation = null;
-    const guidance = instructions.materializeWithLimit(arena_allocator, io, .{
+    var violation: ?limits.Violation = null;
+    var planned = planAlloc(allocator, io, .{
         .cwd = root.dir(),
         .environment = &environment,
-    }, frame.target, parsed_patch.files, &guidance_limit) catch |err| return switch (err) {
+    }, frame.target, frame.patch_bytes, &violation) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.LimitExceeded => errorOutput(allocator, limitFailure(guidance_limit.?)),
-        error.InvalidPath, error.ConflictingGuidance, error.UnsupportedGuidance => errorOutput(allocator, .{
+        error.ReviewUnitTooLarge => errorOutput(allocator, unitTooLargeFailure(violation.?)),
+        error.ReviewLineTooLarge => errorOutput(allocator, lineTooLargeFailure(violation.?)),
+        error.LimitExceeded => errorOutput(allocator, limitFailure(violation.?)),
+        error.UnsupportedProjection => errorOutput(allocator, .{
+            .exit_code = 5,
+            .code = "unsupported_projection",
+            .message = "projection contains a file or content form unsupported by AI review v1",
+        }),
+        error.InvalidProjection => errorOutput(allocator, .{
+            .exit_code = 2,
+            .code = "invalid_projection",
+            .message = "projection is not one complete canonical Git patch",
+        }),
+        error.UnsupportedGuidance => errorOutput(allocator, .{
             .exit_code = 5,
             .code = "unsupported_guidance",
             .message = "exact-head repository guidance is invalid or unsupported",
@@ -136,13 +177,13 @@ pub fn executeAlloc(
             .code = "guidance_read_failed",
             .message = "exact-head repository guidance could not be read",
         }),
+        error.InvalidPlan => errorOutput(allocator, internalFailure()),
     };
-
-    var build_limit: ?limits.Violation = null;
-    return buildSuccess(allocator, arena_allocator, frame.target, frame.patch_bytes, parsed_patch, guidance, &build_limit) catch |err| switch (err) {
+    defer planned.deinit();
+    return successOutputFromPlan(allocator, &planned, &violation) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.ReviewUnitTooLarge => errorOutput(allocator, unitTooLargeFailure(build_limit.?)),
-        error.LimitExceeded => errorOutput(allocator, limitFailure(build_limit.?)),
+        error.ReviewUnitTooLarge => errorOutput(allocator, unitTooLargeFailure(violation.?)),
+        error.LimitExceeded => errorOutput(allocator, limitFailure(violation.?)),
         error.InvalidPlan => errorOutput(allocator, internalFailure()),
     };
 }
@@ -187,16 +228,53 @@ pub fn run(
 
 const BuildError = std.mem.Allocator.Error || error{ LimitExceeded, ReviewUnitTooLarge, InvalidPlan };
 
-fn buildSuccess(
-    output_allocator: std.mem.Allocator,
+const PlanValue = struct {
+    summary: protocol.ReviewPlanSummary,
+    units: []const protocol.ReviewUnit,
+};
+
+/// Materialize the same deterministic plan used by `review-input`, but from a
+/// caller-retained physical repository context rather than a path-bearing
+/// command frame.
+pub fn planAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    target: target_mod.CommittedReviewTarget,
+    patch_bytes: []const u8,
+    violation: *?limits.Violation,
+) PlanError!PlannedInput {
+    violation.* = null;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const owned_patch = try arena.dupe(u8, patch_bytes);
+    const parsed_patch = patch_plan.parseWithLimit(arena, target.object_format, owned_patch, violation) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ReviewUnitTooLarge => error.ReviewUnitTooLarge,
+        error.ReviewLineTooLarge => error.ReviewLineTooLarge,
+        error.LimitExceeded => error.LimitExceeded,
+        error.UnsupportedBinary, error.UnsupportedFileType, error.UnsupportedContent, error.MetadataOnly, error.UnsupportedCombinedDiff => error.UnsupportedProjection,
+        error.InvalidPatch, error.InvalidPath => error.InvalidProjection,
+    };
+    const guidance = instructions.materializeWithLimit(arena, io, context, target, parsed_patch.files, violation) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.LimitExceeded => error.LimitExceeded,
+        error.InvalidPath, error.ConflictingGuidance, error.UnsupportedGuidance => error.UnsupportedGuidance,
+        error.GuidanceReadFailed => error.GuidanceReadFailed,
+    };
+    const value = try buildPlanValue(arena, target, owned_patch, parsed_patch, guidance, violation);
+    return .{ .arena = arena_state, .summary = value.summary, .units = value.units };
+}
+
+fn buildPlanValue(
     arena: std.mem.Allocator,
     target: target_mod.CommittedReviewTarget,
     patch_bytes: []const u8,
     parsed_patch: patch_plan.Plan,
     guidance: instructions.Materialized,
     violation: *?limits.Violation,
-) BuildError!CommandOutput {
-    violation.* = null;
+) BuildError!PlanValue {
     if (guidance.chains.len != parsed_patch.files.len) return error.InvalidPlan;
     const chunks = try planChunks(arena, parsed_patch, violation);
     if (chunks.len > limits.max_review_units) {
@@ -223,14 +301,32 @@ fn buildSuccess(
     summary.plan_digest = plan_digest;
     for (units) |*unit| unit.plan_digest = plan_digest;
 
-    const summary_bytes = codec.writePlanSummaryAlloc(arena, &summary) catch |err| return mapCodecBuildError(err, violation, "plan_summary_bytes", limits.max_plan_summary_bytes);
+    return .{ .summary = summary, .units = units };
+}
+
+fn successOutputFromPlan(
+    output_allocator: std.mem.Allocator,
+    planned: *PlannedInput,
+    violation: *?limits.Violation,
+) BuildError!CommandOutput {
+    return successOutputFromValues(output_allocator, planned.arena.allocator(), planned.summary, planned.units, violation);
+}
+
+fn successOutputFromValues(
+    output_allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    summary: protocol.ReviewPlanSummary,
+    units: []const protocol.ReviewUnit,
+    violation: *?limits.Violation,
+) BuildError!CommandOutput {
+    const summary_bytes = codec.writePlanSummaryAlloc(scratch, &summary) catch |err| return mapCodecBuildError(err, violation, "plan_summary_bytes", limits.max_plan_summary_bytes);
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(output_allocator);
     try appendBounded(output_allocator, &output, "{\"schema_version\":1,\"status\":\"ok\",\"summary\":", violation);
     try appendBounded(output_allocator, &output, withoutFinalLf(summary_bytes) orelse return error.InvalidPlan, violation);
     try appendBounded(output_allocator, &output, ",\"units\":[", violation);
     for (units, 0..) |*unit, index| {
-        const unit_bytes = codec.writeReviewUnitAlloc(arena, unit) catch |err| return mapCodecBuildError(err, violation, "unit_bytes", limits.max_unit_bytes);
+        const unit_bytes = codec.writeReviewUnitAlloc(scratch, unit) catch |err| return mapCodecBuildError(err, violation, "unit_bytes", limits.max_unit_bytes);
         if (unit_bytes.len > limits.max_unit_bytes) {
             limits.record(violation, "unit_bytes", unit_bytes.len, limits.max_unit_bytes);
             return error.ReviewUnitTooLarge;
@@ -240,6 +336,22 @@ fn buildSuccess(
     }
     try appendBounded(output_allocator, &output, "]}\n", violation);
     return .{ .exit_code = 0, .bytes = try output.toOwnedSlice(output_allocator) };
+}
+
+// Direct construction seam retained for the existing deterministic domain
+// tests. Production callers use `planAlloc` so all borrowed patch bytes are
+// copied into the returned owner.
+fn buildSuccess(
+    output_allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    target: target_mod.CommittedReviewTarget,
+    patch_bytes: []const u8,
+    parsed_patch: patch_plan.Plan,
+    guidance: instructions.Materialized,
+    violation: *?limits.Violation,
+) BuildError!CommandOutput {
+    const value = try buildPlanValue(arena, target, patch_bytes, parsed_patch, guidance, violation);
+    return successOutputFromValues(output_allocator, arena, value.summary, value.units, violation);
 }
 
 fn planChunks(allocator: std.mem.Allocator, plan: patch_plan.Plan, violation: *?limits.Violation) BuildError![]const Chunk {
