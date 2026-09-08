@@ -148,6 +148,15 @@ pub const Request = struct {
         self.* = undefined;
     }
 
+    pub fn matchesScope(
+        self: *const Request,
+        repository: root_capability.Identity,
+        target: *const committed.CommittedReviewTarget,
+    ) bool {
+        return self.publication.root.identity.eql(repository) and
+            self.publication.target.eql(target);
+    }
+
     fn takePublication(self: *Request) PublicationState {
         std.debug.assert(self.owns_publication);
         self.owns_publication = false;

@@ -27,4 +27,5 @@ pub fn include() void {
     _ = @import("tests/root_shell.zig");
     _ = @import("tests/root_view.zig");
     _ = @import("tests/update_tail.zig");
+    _ = @import("tests/ai_review_jobs.zig");
 }

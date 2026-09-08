@@ -118,6 +118,7 @@ pub const View = struct {
             .amend_confirmation_mode = self.overlay.isAmendCommit(),
             .push_confirmation_mode = self.overlay.isPushBranch(),
             .pull_confirmation_mode = self.overlay.isPullBranch(),
+            .ai_review_quit_confirmation_mode = self.overlay.isQuitAiReviews(),
             .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
             .remote_action_cancelable = self.remote_action_cancelable,

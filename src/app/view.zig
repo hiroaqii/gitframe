@@ -194,6 +194,9 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.overlay.isPushError() and app.overlay.visibleOn(app.active_page)) {
         try viewPushError(app, surface);
     }
+    if (app.overlay.isQuitAiReviews() and app.overlay.visibleOn(app.active_page)) {
+        try viewAiReviewQuitConfirmation(app, surface);
+    }
     if (app.active_page == .compare and app.compare.page.base_picker.open) {
         try compare_view.viewBasePicker(app.compare, surface);
     }
@@ -1337,6 +1340,28 @@ fn viewAmendConfirmation(app: Context, surface: *chasen.Surface) !void {
     try drawCenteredText(&content, start_row, "This rewrites the current branch history.", app.theme.style(.amend));
     if (start_row + 2 < size.height) {
         try drawCenteredText(&content, start_row + 2, "Enter: amend    Esc/q: cancel", app.theme.style(.amend));
+    }
+}
+
+fn viewAiReviewQuitConfirmation(app: Context, surface: *chasen.Surface) !void {
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, confirmation_dialog_width),
+        .dialog_height = @min(surface.size().height, confirmation_dialog_height),
+        .title = "Cancel AI reviews and quit?",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = app.theme.boldStyle(.danger),
+        .border_style = app.theme.style(.danger),
+    };
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
+    const size = content.size();
+    const start_row: u16 = if (size.height > 3) (size.height - 3) / 2 else 0;
+    try drawCenteredText(&content, start_row, "Queued reviews will be canceled; active work will finish cleanup.", app.theme.style(.danger));
+    if (start_row + 2 < size.height) {
+        try drawCenteredText(&content, start_row + 2, "Enter: cancel reviews + quit    Esc/q: stay", app.theme.style(.danger));
     }
 }
 

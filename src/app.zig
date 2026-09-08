@@ -46,6 +46,10 @@ const workflow_remote = @import("app/workflow/remote.zig");
 const shell_effects = @import("app/shell_effects.zig");
 const human_review_session_mod = @import("app/human_review_session.zig");
 const review_store_operations_mod = @import("app/review_store_operations.zig");
+const ai_review_jobs_mod = @import("app/ai_review_jobs.zig");
+const ai_review_job = @import("ai_review/job.zig");
+const ai_review_job_owner = @import("ai_review/job_owner.zig");
+const ai_review_pipeline = @import("ai_review/runner.zig");
 const context = @import("context.zig");
 const config_mod = @import("config.zig");
 const diff_surface = @import("app/diff_surface.zig");
@@ -158,9 +162,13 @@ pub const App = struct {
     shell_effects_state: shell_effects.State = .{},
     human_review_sessions: human_review_session_mod.Owner = .{},
     review_store_operations: review_store_operations_mod.Owner = .{},
+    ai_review_jobs: ai_review_job_owner.Owner = .{},
     /// Retains the user's quit intent after Store drain success until the
     /// existing Git action lifecycle is also terminal.
     quit_after_store_drain: bool = false,
+    /// Retains confirmed quit intent until AI work is terminal and downstream
+    /// quit handling either accepts the intent or requests teardown.
+    quit_after_ai_review_jobs: bool = false,
     drag_auto_scroll: drag_auto_scroll.State = .{},
     command_session: CommandSession = .inactive,
 
@@ -203,7 +211,26 @@ pub const App = struct {
         self.remote_workflow.deinit(deinit_ctx.allocator);
         self.shell_effects_state.deinit(deinit_ctx.allocator);
         self.review_store_operations.deinit(deinit_ctx.allocator);
+        self.ai_review_jobs.deinit();
         self.human_review_sessions.deinit();
+    }
+
+    /// Takes one fully owned, independently rooted review request. The Compare
+    /// submission UI is added by the following slice; this is its sole App
+    /// admission boundary.
+    pub fn enqueueAiReview(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        scope: ai_review_job.Scope,
+        request: ai_review_pipeline.Request,
+    ) ai_review_job_owner.Admission {
+        const admission = self.ai_review_jobs.enqueue(scope, request);
+        self.pumpAiReviewJobs(ctx);
+        return admission;
+    }
+
+    pub fn cancelAiReview(self: *App, key: ai_review_job.Key) bool {
+        return self.ai_review_jobs.cancel(key);
     }
 
     /// Prepare, checked-admit, and infallibly track the current session's
@@ -472,7 +499,7 @@ pub const App = struct {
                 .help = self.overlay.isHelp(),
                 .commit_input = self.localWorkflowView().commitPanelOpen(),
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
-                    self.overlay.isPushBranch() or self.overlay.isPullBranch(),
+                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isQuitAiReviews(),
                 .branch_switch = self.overlay.isSwitchBranch(),
                 .push_error = self.overlay.isPushError(),
                 .git_action = self.actionLifecycleView().hasPending(),
@@ -831,6 +858,7 @@ pub const App = struct {
             ),
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
             .review_store_operation_finished => |finished| self.finishReviewStoreOperation(ctx, finished),
+            .ai_review_job => |message| self.finishAiReviewJob(ctx, message),
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
             .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
             .ai_reviews => |ai_reviews_msg| _ = try self.updateAiReviews(ctx, ai_reviews_msg),
@@ -957,6 +985,8 @@ pub const App = struct {
             },
             .git_action_spinner_tick => if (self.actionLifecycle().tick(ctx)) self.redraw_plan.requestSkip(),
             .cancel_remote_action => _ = self.remoteWorkflow().cancelActiveRemote(false),
+            .confirm_ai_review_quit => self.confirmAiReviewQuit(ctx),
+            .cancel_ai_review_quit => if (self.overlay.isQuitAiReviews()) self.overlay.close(),
             .quit => {
                 self.drag_auto_scroll.clear();
                 self.requestQuit(ctx);
@@ -983,6 +1013,8 @@ pub const App = struct {
         }
         self.actionLifecycle().reconcileSpinner(ctx);
         self.pumpReviewStoreOperations(ctx);
+        self.pumpAiReviewJobs(ctx);
+        self.resumeQuitAfterAiReviewJobs(ctx);
         self.resumeQuitAfterStoreDrain(ctx);
         if (!self.redraw_plan.resolvesToSkip() and self.active_page == .ai_reviews) {
             self.aiReviewsCoordinator().ensureFindingPresentationCache();
@@ -1007,13 +1039,23 @@ pub const App = struct {
             self.setStatus("finish current git action before quitting", .{});
             return;
         }
+        if (self.ai_review_jobs.requestQuit() == .confirmation_required) {
+            if (self.quit_after_ai_review_jobs) {
+                self.setStatus("finishing AI review before quitting", .{});
+            } else {
+                self.overlay.openQuitAiReviews(self.active_page);
+            }
+            return;
+        }
         switch (self.review_store_operations.requestQuit()) {
             .ready => {
+                self.quit_after_ai_review_jobs = false;
                 self.quit_after_store_drain = false;
                 self.teardown_requested = true;
                 ctx.quit();
             },
             .draining => {
+                self.quit_after_ai_review_jobs = false;
                 self.quit_after_store_drain = true;
                 // Store scans/selections are read generations, not accepted
                 // mutations. Invalidate them while retaining the selected
@@ -1042,6 +1084,34 @@ pub const App = struct {
             }
             self.setStatus("could not start AI review save", .{});
         };
+    }
+
+    fn pumpAiReviewJobs(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        const outcome = ai_review_jobs_mod.pump(Msg, &self.ai_review_jobs, ctx);
+        if (outcome.start_failures > 0) {
+            self.setStatus("could not start AI review task", .{});
+        }
+    }
+
+    fn finishAiReviewJob(self: *App, ctx: *chasen.Ctx(Msg), message: ai_review_jobs_mod.Msg) void {
+        const outcome = ai_review_jobs_mod.update(Msg, &self.ai_review_jobs, message, ctx);
+        if (outcome.start_failure) self.setStatus("could not start AI review task", .{});
+    }
+
+    fn resumeQuitAfterAiReviewJobs(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (!self.quit_after_ai_review_jobs or !self.ai_review_jobs.quitReady()) return;
+        self.requestQuit(ctx);
+    }
+
+    fn confirmAiReviewQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        if (!self.overlay.isQuitAiReviews()) return;
+        self.overlay.close();
+        self.quit_after_ai_review_jobs = true;
+        if (self.ai_review_jobs.confirmQuit()) {
+            self.requestQuit(ctx);
+            return;
+        }
+        self.setStatus("finishing AI review before quitting", .{});
     }
 
     fn enqueuePreparedHumanReviewDraft(

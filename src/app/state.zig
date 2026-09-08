@@ -16,6 +16,7 @@ pub const OverlayKind = enum {
     pull_branch,
     switch_branch,
     push_error,
+    quit_ai_reviews,
 };
 
 pub const OverlayMouseMode = enum {
@@ -67,12 +68,16 @@ pub const OverlayState = struct {
         return self.kind == .push_error;
     }
 
+    pub fn isQuitAiReviews(self: OverlayState) bool {
+        return self.kind == .quit_ai_reviews;
+    }
+
     pub fn mouseMode(self: OverlayState) OverlayMouseMode {
         return switch (self.kind) {
             .none => .passthrough,
             .help => .scroll_help,
             .push_error => .scroll_push_error,
-            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch => .block,
+            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch, .quit_ai_reviews => .block,
         };
     }
 
@@ -117,6 +122,11 @@ pub const OverlayState = struct {
         self.kind = .push_error;
         self.owner_page = .changes;
         self.push_error_scroll = 0;
+    }
+
+    pub fn openQuitAiReviews(self: *OverlayState, owner_page: page.Id) void {
+        self.kind = .quit_ai_reviews;
+        self.owner_page = owner_page;
     }
 
     pub fn close(self: *OverlayState) void {

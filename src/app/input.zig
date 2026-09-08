@@ -38,6 +38,7 @@ pub const KeyContext = struct {
     amend_confirmation_mode: bool = false,
     push_confirmation_mode: bool = false,
     pull_confirmation_mode: bool = false,
+    ai_review_quit_confirmation_mode: bool = false,
     branch_switch_mode: bool = false,
     push_error_mode: bool = false,
     remote_action_cancelable: bool = false,
@@ -94,6 +95,8 @@ const Action = enum {
     cancel_branch_switch,
     close_push_error,
     run_interactive_push,
+    confirm_ai_review_quit,
+    cancel_ai_review_quit,
 };
 
 pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
@@ -139,7 +142,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         return .{ .ai_reviews = msg };
     }
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
-    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
+    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.ai_review_quit_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return .{ .commit_panel_paste = text };
     if (context.active_page == .changes) {
         const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
@@ -196,6 +199,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(key);
     if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(key);
     if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(key);
+    if (context.ai_review_quit_confirmation_mode) return aiReviewQuitConfirmationKeyToMsg(key);
     if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
     if (context.push_error_mode) return pushErrorKeyToMsg(key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
@@ -364,6 +368,12 @@ fn pullConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
     return null;
 }
 
+fn aiReviewQuitConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_ai_review_quit);
+    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_ai_review_quit);
+    return null;
+}
+
 fn branchSwitchKeyToMsg(key: chasen.Key) ?app_message.Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_branch_switch);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_branch_switch);
@@ -492,6 +502,8 @@ fn actionToMsg(action: Action) app_message.Msg {
         .cancel_branch_switch => app_message.Msg.cancel_branch_switch,
         .close_push_error => app_message.Msg.close_push_error,
         .run_interactive_push => app_message.Msg.run_interactive_push,
+        .confirm_ai_review_quit => app_message.Msg.confirm_ai_review_quit,
+        .cancel_ai_review_quit => app_message.Msg.cancel_ai_review_quit,
     };
 }
 
@@ -540,6 +552,15 @@ test "human review result modal precedes normal root page and remote-cancel rout
         .{ .ai_reviews = .{ .human_review_decision = .{ .summary_paste = "人の要約" } } },
         pasteToMsg(summary_modal, "人の要約").?,
     );
+}
+
+test "AI review quit confirmation owns keyboard and paste input" {
+    const context: KeyContext = .{ .ai_review_quit_confirmation_mode = true };
+    try std.testing.expectEqual(app_message.Msg.confirm_ai_review_quit, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_ai_review_quit, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.cancel_ai_review_quit, keyToMsg(context, .{ .codepoint = 'q' }).?);
+    try std.testing.expect(keyToMsg(context, .{ .codepoint = 'x' }) == null);
+    try std.testing.expect(eventToMsg(context, .{ .paste = "ignored" }) == null);
 }
 
 test "AI Reviews Finding focus admits page keys but retains card commands" {
