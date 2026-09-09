@@ -6,6 +6,7 @@ const app_load = @import("../../load.zig");
 const app_message = @import("../../message.zig");
 const repo_session = @import("../../repo_session.zig");
 const diff_surface = @import("../../diff_surface.zig");
+const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const compare_page = @import("../compare.zig");
 const compare_input = @import("input.zig");
 const committed_diff_navigation = @import("../committed_diff/navigation.zig");
@@ -16,7 +17,28 @@ const BranchListTask = app_load.CompareBranchListLoadTask(app_message.Msg);
 
 pub const Redraw = enum { default, skip };
 pub const ClipboardEffect = committed_diff_coordinator.ClipboardEffect;
-pub const UpdateOutcome = committed_diff_coordinator.UpdateOutcome;
+pub const UpdateOutcome = struct {
+    clipboard: ?ClipboardEffect = null,
+    auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    start_ai_review: bool = false,
+
+    pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
+        if (self.clipboard) |*effect| effect.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn takeClipboard(self: *UpdateOutcome) ?ClipboardEffect {
+        const effect = self.clipboard;
+        self.clipboard = null;
+        return effect;
+    }
+
+    pub fn takeAiReviewStart(self: *UpdateOutcome) bool {
+        const requested = self.start_ai_review;
+        self.start_ai_review = false;
+        return requested;
+    }
+};
 
 pub const Controller = struct {
     page_state: *compare_page.ComparePageState,
@@ -51,7 +73,14 @@ pub const Controller = struct {
         msg: compare_input.Msg,
     ) !UpdateOutcome {
         switch (msg) {
-            .common => |common| return self.commonCoordinator().update(ctx.allocator(), common),
+            .common => |common| {
+                var outcome = try self.commonCoordinator().update(ctx.allocator(), common);
+                defer outcome.deinit(ctx.allocator());
+                return .{
+                    .clipboard = outcome.takeClipboard(),
+                    .auto_scroll = outcome.auto_scroll,
+                };
+            },
             .open_base_picker => try self.startBasePicker(ctx),
             .close_base_picker => self.page_state.closeBasePicker(ctx.allocator()),
             .base_picker_enter_query => self.page_state.base_picker.enterQuery(),
@@ -65,6 +94,14 @@ pub const Controller = struct {
             .base_picker_previous => self.page_state.base_picker.moveSelection(-1),
             .base_picker_next => self.page_state.base_picker.moveSelection(1),
             .choose_base => if (try self.page_state.chooseBasePickerTarget(ctx.allocator())) try self.refresh(ctx),
+            .open_ai_review => self.page_state.beginAiReviewModal(),
+            .close_ai_review => self.page_state.closeAiReviewModal(),
+            .submit_ai_review => return .{ .start_ai_review = true },
+            .ai_review_context_insert => |codepoint| self.page_state.ai_review_modal.insert(codepoint),
+            .ai_review_context_paste => |text| self.page_state.ai_review_modal.paste(text),
+            .ai_review_context_backspace => self.page_state.ai_review_modal.backspace(),
+            .ai_review_context_move_left => self.page_state.ai_review_modal.moveLeft(),
+            .ai_review_context_move_right => self.page_state.ai_review_modal.moveRight(),
         }
         return .{};
     }

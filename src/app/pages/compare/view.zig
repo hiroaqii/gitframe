@@ -15,6 +15,7 @@ const file_tree = @import("../../../file_tree.zig");
 const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const commit_time = @import("../../branch_commit_time.zig");
+const view_primitives = @import("../../view_primitives.zig");
 
 pub const Context = struct {
     page: *const compare_page.ComparePageState,
@@ -24,6 +25,8 @@ pub const Context = struct {
     root_identity: ?root_capability.Identity,
     layout: diff_surface.Layout,
     keymap: keymap.Effective = .{},
+    codex_configured: bool = false,
+    codex_model: ?[]const u8 = null,
 
     pub fn footer(self: Context) diff_surface.view.FooterView {
         const navigation = navigationView(self);
@@ -194,6 +197,112 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.palette.style(.accent));
 }
 
+pub fn viewAiReviewModal(app: Context, surface: *chasen.Surface) !void {
+    const modal = &app.page.ai_review_modal;
+    if (!modal.open) return;
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, 88),
+        .dialog_height = @min(surface.size().height, 14),
+        .title = "Start AI Review",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = app.palette.boldStyle(.accent),
+        .border_style = app.palette.style(.accent),
+    };
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    var dialog = frame.dialogSurface();
+    dialog.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
+    frame.view();
+    var content = frame.contentSurface();
+    const size = content.size();
+    if (size.width == 0 or size.height == 0) return;
+    const footer_row = size.height - 1;
+    var row: u16 = 0;
+
+    const repository = if (app.repo_root) |root|
+        root
+    else
+        "unavailable";
+    const repository_line = try std.fmt.allocPrint(content.frameAllocator(), "Repository: {s}", .{repository});
+    try draw.copyClippedTextAt(&content, 0, row, repository_line, if (app.repo_root == null) app.palette.style(.danger) else app.palette.style(.muted));
+    row +|= 1;
+
+    if (app.page.currentTarget()) |target| {
+        row = drawExactField(&content, row, footer_row, "Base: ", target.base_oid.slice(), app.palette);
+        row = drawExactField(&content, row, footer_row, "Head: ", target.head_oid.slice(), app.palette);
+    } else if (row < footer_row) {
+        try draw.copyClippedTextAt(&content, 0, row, "Target: unavailable", app.palette.style(.danger));
+        row += 1;
+    }
+
+    if (row < footer_row) {
+        const provider = if (!app.codex_configured)
+            "Codex / executable not configured"
+        else if (app.codex_model) |model|
+            try std.fmt.allocPrint(content.frameAllocator(), "Codex / {s}", .{model})
+        else
+            "Codex / runner default";
+        try draw.copyClippedTextAt(&content, 0, row, provider, if (app.codex_configured) app.palette.style(.prompt) else app.palette.style(.danger));
+        row += 1;
+    }
+
+    if (row < footer_row) {
+        const label = try std.fmt.allocPrint(content.frameAllocator(), "Context ({d}/{d} bytes, optional):", .{
+            modal.context.len,
+            compare_page.ai_review_context_capacity,
+        });
+        try draw.copyClippedTextAt(&content, 0, row, label, app.palette.style(.muted));
+        row += 1;
+    }
+    if (row < footer_row) {
+        const input = modal.context.slice();
+        const presentation = try contextPresentation(content.frameAllocator(), input);
+        const visible_start = view_primitives.inputVisibleStart(presentation, modal.context.cursor, size.width);
+        try draw.copyClippedTextAt(&content, 0, row, presentation[visible_start..], chasen.TextStyle{});
+        view_primitives.showInputCursor(&content, 0, row, presentation, modal.context.cursor);
+        row += 1;
+    }
+    if (modal.failure.text().len > 0 and row < footer_row) {
+        try draw.copyClippedTextAt(&content, 0, row, modal.failure.text(), app.palette.style(.danger));
+    }
+
+    try draw.copyClippedTextAt(&content, 0, footer_row, "Esc: Cancel  Enter: Start", app.palette.style(.accent));
+}
+
+fn drawExactField(
+    surface: *chasen.Surface,
+    start_row: u16,
+    footer_row: u16,
+    label: []const u8,
+    value: []const u8,
+    palette: theme.Palette,
+) u16 {
+    var row = start_row;
+    var offset: usize = 0;
+    var first = true;
+    while (offset < value.len and row < footer_row) : (row += 1) {
+        const prefix = if (first) label else "";
+        const prefix_width: usize = chasen.text.displayWidth(prefix);
+        const width: usize = surface.size().width;
+        if (prefix_width >= width) break;
+        draw.copyClippedTextAt(surface, 0, row, prefix, palette.style(.muted)) catch {};
+        const available = width - prefix_width;
+        const end = @min(value.len, offset + available);
+        draw.copyClippedTextAt(surface, @intCast(prefix_width), row, value[offset..end], chasen.TextStyle{}) catch {};
+        offset = end;
+        first = false;
+    }
+    return row;
+}
+
+fn contextPresentation(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const result = try allocator.dupe(u8, text);
+    for (result) |*byte| {
+        if (byte.* == '\n' or byte.* == '\r' or byte.* == '\t' or byte.* < 0x20) byte.* = ' ';
+    }
+    return result;
+}
+
 fn navigationView(app: Context) committed_diff_navigation.View {
     var key_buffer: [16]u8 = undefined;
     return .{
@@ -212,7 +321,7 @@ fn navigationView(app: Context) committed_diff_navigation.View {
 }
 
 fn displayModeToggleKey(app: Context, buffer: []u8) ?[]const u8 {
-    if (app.page.diff.search.mode or app.page.diff.file_search.mode or app.page.base_picker.open) return null;
+    if (app.page.diff.search.mode or app.page.diff.file_search.mode or app.page.base_picker.open or app.page.ai_review_modal.open) return null;
     return app.keymap.display(.toggle_display_mode, buffer);
 }
 

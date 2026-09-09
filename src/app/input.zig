@@ -42,6 +42,7 @@ pub const KeyContext = struct {
     branch_switch_mode: bool = false,
     push_error_mode: bool = false,
     remote_action_cancelable: bool = false,
+    ai_review_terminal_visible: bool = false,
     command_line_active: bool = false,
     repository_command_available: bool = false,
     keymap: keymap.Effective = .{},
@@ -121,6 +122,10 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         const msg = ai_reviews_input.pasteToMsg(context.ai_reviews, text) orelse return null;
         return .{ .ai_reviews = msg };
     }
+    if (context.active_page == .compare and context.compare.ai_review_modal_open) {
+        const msg = compare_input.pasteToMsg(context.compare, text) orelse return null;
+        return .{ .compare = msg };
+    }
     // Picker search is key-event-only. A visible modal owns paste so bytes
     // cannot leak into a retained diff/file search below it.
     if (context.active_page == .compare and context.compare.base_picker_open) return null;
@@ -168,7 +173,8 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         return .{ .repository = repository_msg };
     }
     if (context.active_page == .compare and
-        (context.compare.common.search_mode or context.compare.common.file_search_mode or context.compare.base_picker_open))
+        (context.compare.common.search_mode or context.compare.common.file_search_mode or
+            context.compare.base_picker_open or context.compare.ai_review_modal_open))
     {
         const msg = compare_input.keyToMsg(context.compare, key) orelse return null;
         return .{ .compare = msg };
@@ -244,6 +250,9 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         if (ai_reviews_input.keyToMsg(context.ai_reviews, routing_key)) |msg| {
             return .{ .ai_reviews = msg };
         }
+    }
+    if (context.ai_review_terminal_visible and routing_key.matches(chasen.Key.escape, .{})) {
+        return .dismiss_ai_review_status;
     }
     if (routing_key.codepoint == 'q' and !key_input.hasCommandModifier(routing_key)) return app_message.Msg.quit;
     return null;
@@ -1297,6 +1306,26 @@ test "remote cancel Escape takes priority while a background action is active" {
     try std.testing.expectEqual(
         app_message.Msg.quit,
         keyToMsg(.{ .remote_action_cancelable = true }, .{ .codepoint = 'q' }).?,
+    );
+}
+
+test "Escape dismisses only an uncovered AI review terminal" {
+    const escape: chasen.Key = .{ .codepoint = chasen.Key.escape };
+    try std.testing.expectEqual(
+        app_message.Msg.dismiss_ai_review_status,
+        keyToMsg(.{ .ai_review_terminal_visible = true }, escape).?,
+    );
+    try expectMsg(
+        .{ .compare = .close_ai_review },
+        keyToMsg(.{
+            .active_page = .compare,
+            .compare = .{ .ai_review_modal_open = true },
+            .ai_review_terminal_visible = true,
+        }, escape).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg.cancel_remote_action,
+        keyToMsg(.{ .remote_action_cancelable = true, .ai_review_terminal_visible = true }, escape).?,
     );
 }
 

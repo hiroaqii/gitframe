@@ -19,6 +19,7 @@ const shell_input = @import("app/shell_input.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
 const compare_page = @import("app/pages/compare.zig");
 const compare_coordinator = @import("app/pages/compare/coordinator.zig");
+const compare_ai_review_submission = @import("app/pages/compare/ai_review_submission.zig");
 const compare_input = @import("app/pages/compare/input.zig");
 const ai_reviews_page = @import("app/pages/ai_reviews.zig");
 const ai_reviews_coordinator = @import("app/pages/ai_reviews/coordinator.zig");
@@ -231,6 +232,13 @@ pub const App = struct {
 
     pub fn cancelAiReview(self: *App, key: ai_review_job.Key) bool {
         return self.ai_review_jobs.cancel(key);
+    }
+
+    fn submitCompareAiReview(self: *App, ctx: *chasen.Ctx(Msg)) void {
+        switch (self.compareAiReviewSubmission().submit(ctx.allocator())) {
+            .accepted => self.pumpAiReviewJobs(ctx),
+            .ignored, .rejected => {},
+        }
     }
 
     /// Prepare, checked-admit, and infallibly track the current session's
@@ -473,6 +481,18 @@ pub const App = struct {
             .layout = .{ .width = body_size.width, .height = body_size.height },
             .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
             .env_map = self.env_map,
+        };
+    }
+
+    fn compareAiReviewSubmission(self: *App) compare_ai_review_submission.Controller {
+        return .{
+            .page = &self.pages.compare,
+            .repo = self.repoSessionView(),
+            .store = if (self.configured_review_store) |*value| value else null,
+            .codex_executable = self.user_config.ai_review.codex_executable,
+            .codex_model = self.user_config.ai_review.codex_model,
+            .env_map = self.env_map,
+            .jobs = &self.ai_review_jobs,
         };
     }
 
@@ -985,6 +1005,7 @@ pub const App = struct {
             },
             .git_action_spinner_tick => if (self.actionLifecycle().tick(ctx)) self.redraw_plan.requestSkip(),
             .cancel_remote_action => _ = self.remoteWorkflow().cancelActiveRemote(false),
+            .dismiss_ai_review_status => _ = self.ai_review_jobs.dismissSelectedTerminal(),
             .confirm_ai_review_quit => self.confirmAiReviewQuit(ctx),
             .cancel_ai_review_quit => if (self.overlay.isQuitAiReviews()) self.overlay.close(),
             .quit => {
@@ -1493,6 +1514,7 @@ pub const App = struct {
                 .selection_generation = effect.selection_generation,
             });
         }
+        if (outcome.takeAiReviewStart()) self.submitCompareAiReview(ctx);
         return auto_scroll;
     }
 
@@ -1589,7 +1611,9 @@ pub const App = struct {
                     }
                 },
                 .history_selection => |result| {
-                    if (try self.aiReviewsCoordinator().finishHistorySelection(ctx, result) == .skip) {
+                    const outcome = try self.aiReviewsCoordinator().finishHistorySelection(ctx, result);
+                    if (outcome.loaded) self.acknowledgeSelectedAiReviewRun();
+                    if (outcome.redraw == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
@@ -1606,6 +1630,12 @@ pub const App = struct {
                 .repo_discovery => |result| try self.finishChangesRepoDiscovery(ctx, result),
             },
         }
+    }
+
+    fn acknowledgeSelectedAiReviewRun(self: *App) void {
+        const selected = self.pages.ai_reviews.selectedRunConst() orelse return;
+        const repository = self.repoSessionView().activeIdentity() orelse return;
+        _ = self.ai_review_jobs.acknowledgeRun(repository, selected.binding().review_id);
     }
 
     fn finishActionResult(self: *App, ctx: *chasen.Ctx(Msg), finished: ActionFinishedMsg) !void {
@@ -1855,6 +1885,8 @@ pub const App = struct {
                 .root_identity = repo_view.activeIdentity(),
                 .layout = .{ .width = body_size.width, .height = body_size.height },
                 .keymap = self.keymap,
+                .codex_configured = self.user_config.ai_review.codex_executable != null,
+                .codex_model = self.user_config.ai_review.codex_model,
             },
             .ai_reviews = .{
                 .page = &self.pages.ai_reviews,
@@ -1880,6 +1912,7 @@ pub const App = struct {
             .action = self.actionLifecycleView(),
             .remote_cancelable = remote.canCancel(self.actionLifecycleView().acceptedPending()),
             .remote_canceling = remote.canceling(),
+            .ai_review_status = self.aiReviewStatusView(),
             .status = &self.status,
             .page_status = self.activePageStatus(),
             .command_line = self.commandLineView(),
@@ -2007,6 +2040,7 @@ pub const App = struct {
                     .base_picker_open = self.pages.compare.base_picker.open,
                     .base_picker_query_mode = self.pages.compare.base_picker.input_mode == .query,
                     .base_picker_query_len = self.pages.compare.base_picker.query.len,
+                    .ai_review_modal_open = self.pages.compare.ai_review_modal.open,
                 },
                 .selection_owner = &self.pages.compare.diff.selection_owner,
                 .loaded = compare_navigation_view.view().activeLoadedDiffConst(),
@@ -2052,12 +2086,37 @@ pub const App = struct {
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
             .remote_action_cancelable = self.remoteWorkflowView().canCancel(self.actionLifecycleView().acceptedPending()),
+            .ai_review_terminal_visible = self.aiReviewTerminalVisible(),
             .command_line_active = self.commandLineView() != null,
             .repository_command_available = self.repositoryCommandAvailable(),
             .keymap = self.keymap,
             .overlay = &self.overlay,
             .layout = layout,
             .footer_status_target = app_view.footerStatusTarget(self.shellViewContext(), layout.footer.width),
+        };
+    }
+
+    fn aiReviewTerminalVisible(self: *const App) bool {
+        if (self.status.text().len > 0 or self.actionLifecycleView().spinnerPresentation() != null) return false;
+        const selected = self.ai_review_jobs.selected() orelse return false;
+        return selected.unread and selected.phase == .terminal;
+    }
+
+    fn aiReviewStatusView(self: *const App) ?app_view.AiReviewStatus {
+        const record = self.ai_review_jobs.selected() orelse return null;
+        const repo = self.repoSessionView();
+        const basename = if (repo.activeIdentity()) |identity|
+            if (identity.eql(record.scope.repository))
+                if (repo.activeRoot()) |root| std.fs.path.basename(root) else null
+            else
+                null
+        else
+            null;
+        return .{
+            .key = record.key,
+            .scope = record.scope,
+            .phase = record.phase,
+            .repository_basename = basename,
         };
     }
 

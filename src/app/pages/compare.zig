@@ -4,6 +4,7 @@ const std = @import("std");
 const ui = @import("chasen_ui");
 const app_state = @import("../state.zig");
 const app_prompt = @import("../prompt.zig");
+const text_edit = @import("../text_edit.zig");
 const app_load = @import("../load.zig");
 const committed_diff = @import("committed_diff.zig");
 const diff_basis = @import("../diff_basis.zig");
@@ -15,6 +16,54 @@ const root_capability = @import("../../repo/root_capability.zig");
 const commit_time = @import("../branch_commit_time.zig");
 
 pub const selection_source: diff_source.SourceMode = .{ .range = "compare" };
+pub const ai_review_context_capacity: usize = 16 * 1024;
+
+pub const AiReviewModalState = struct {
+    open: bool = false,
+    context: text_edit.BoundedTextInput(ai_review_context_capacity) = .{},
+    failure: app_state.StatusMessage = .{},
+
+    pub fn begin(self: *AiReviewModalState) void {
+        self.* = .{ .open = true };
+    }
+
+    pub fn close(self: *AiReviewModalState) void {
+        self.* = .{};
+    }
+
+    pub fn insert(self: *AiReviewModalState, codepoint: u21) void {
+        self.failure.clear();
+        self.context.insert(codepoint) catch
+            self.failure.set("Review context is limited to {d} bytes", .{ai_review_context_capacity});
+    }
+
+    pub fn paste(self: *AiReviewModalState, text: []const u8) void {
+        self.failure.clear();
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            self.failure.set("Review context must be valid UTF-8", .{});
+            return;
+        }
+        self.context.insertSlice(text) catch
+            self.failure.set("Review context is limited to {d} bytes", .{ai_review_context_capacity});
+    }
+
+    pub fn backspace(self: *AiReviewModalState) void {
+        self.failure.clear();
+        self.context.backspace();
+    }
+
+    pub fn moveLeft(self: *AiReviewModalState) void {
+        self.context.moveLeft();
+    }
+
+    pub fn moveRight(self: *AiReviewModalState) void {
+        self.context.moveRight();
+    }
+
+    pub fn markFailure(self: *AiReviewModalState, message: []const u8) void {
+        self.failure.set("{s}", .{message});
+    }
+};
 
 pub const BasePickerRequest = struct {
     identity: page.RequestIdentity,
@@ -289,6 +338,7 @@ pub const ComparePageState = struct {
     basis_failure: ?BasisFailureState = null,
     load_failure: ?[]u8 = null,
     base_picker: BasePickerState = .{},
+    ai_review_modal: AiReviewModalState = .{},
     refresh_generation: u64 = 0,
     deferred_load_apply: ?DeferredLoadApply = null,
 
@@ -341,6 +391,19 @@ pub const ComparePageState = struct {
 
     pub fn closeBasePicker(self: *ComparePageState, allocator: std.mem.Allocator) void {
         self.base_picker.close(allocator);
+    }
+
+    pub fn beginAiReviewModal(self: *ComparePageState) void {
+        if (self.diff.selection_owner.activeMouseSelection() or
+            self.diff.selection_owner.activeKeyboardSideChoice() != null)
+        {
+            self.diff.selection_owner = .none;
+        }
+        self.ai_review_modal.begin();
+    }
+
+    pub fn closeAiReviewModal(self: *ComparePageState) void {
+        self.ai_review_modal.close();
     }
 
     pub fn chooseBasePickerTarget(self: *ComparePageState, allocator: std.mem.Allocator) !bool {
@@ -467,6 +530,7 @@ pub const ComparePageState = struct {
         if (self.basis_failure) |*failure| failure.deinit(allocator);
         if (self.load_failure) |message| allocator.free(message);
         self.base_picker.deinit(allocator);
+        self.ai_review_modal.close();
         if (self.deferred_load_apply) |*deferred| deferred.deinit(allocator);
         self.* = .{};
     }
@@ -553,4 +617,19 @@ test "Compare activation and retained diff state are independent" {
     try std.testing.expect(first != second);
     try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll);
     try std.testing.expectEqual(page.Id.compare, state.activation.currentIdentity().?.origin);
+}
+
+test "Compare AI review context rejects invalid or oversized paste without mutation" {
+    var modal: AiReviewModalState = .{};
+    modal.begin();
+    modal.paste("keep");
+
+    modal.paste("\xff");
+    try std.testing.expectEqualStrings("keep", modal.context.slice());
+    try std.testing.expectEqualStrings("Review context must be valid UTF-8", modal.failure.text());
+
+    var oversized: [ai_review_context_capacity]u8 = [_]u8{'x'} ** ai_review_context_capacity;
+    modal.paste(&oversized);
+    try std.testing.expectEqualStrings("keep", modal.context.slice());
+    try std.testing.expectEqualStrings("Review context is limited to 16384 bytes", modal.failure.text());
 }

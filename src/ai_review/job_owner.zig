@@ -1,6 +1,7 @@
 //! Fixed-capacity serial owner for hosted AI review jobs.
 
 const std = @import("std");
+const committed_review = @import("../committed_review.zig");
 const job = @import("job.zig");
 const pipeline = @import("runner.zig");
 
@@ -226,6 +227,29 @@ pub const Owner = struct {
         return true;
     }
 
+    /// Acknowledges only the terminal produced for the exact Store Run that
+    /// the AI Reviews page has successfully selected.
+    pub fn acknowledgeRun(
+        self: *Owner,
+        repository: @import("../repo/root_capability.zig").Identity,
+        review_id: committed_review.ReviewId,
+    ) bool {
+        for (&self.slots, 0..) |*slot, index| switch (slot.*) {
+            .empty => {},
+            .occupied => |*record| {
+                if (!record.scope.repository.eql(repository) or !record.unread) continue;
+                const terminal_review_id = reviewId(record) orelse continue;
+                if (!terminal_review_id.eql(review_id)) continue;
+                std.debug.assert(self.active_index != index);
+                record.deinit();
+                slot.* = .empty;
+                self.retained_count -= 1;
+                return true;
+            },
+        };
+        return false;
+    }
+
     pub fn dismiss(self: *Owner, key: job.Key, repository: @import("../repo/root_capability.zig").Identity) bool {
         for (&self.slots, 0..) |*slot, index| switch (slot.*) {
             .empty => {},
@@ -240,6 +264,14 @@ pub const Owner = struct {
             },
         };
         return false;
+    }
+
+    /// Dismisses exactly the unread terminal currently selected for the
+    /// one-line projection. Active and queued records are never removed.
+    pub fn dismissSelectedTerminal(self: *Owner) bool {
+        const selected_record = self.selected() orelse return false;
+        if (selected_record.phase != .terminal or !selected_record.unread) return false;
+        return self.dismiss(selected_record.key, selected_record.scope.repository);
     }
 
     pub fn hasOwnedWork(self: *const Owner) bool {
@@ -326,6 +358,22 @@ pub const Owner = struct {
         };
     }
 };
+
+fn reviewId(record: *const job.Record) ?committed_review.ReviewId {
+    const terminal = switch (record.phase) {
+        .terminal => |value| value,
+        .queued, .reviewing, .publishing => return null,
+    };
+    const pipeline_terminal = switch (terminal) {
+        .pipeline => |value| value,
+        .start_failed => return null,
+    };
+    return switch (pipeline_terminal.outcome) {
+        .published => |published| published.review_id,
+        .outcome_unknown => |review_id| review_id,
+        .no_changes, .failed, .canceled => null,
+    };
+}
 
 fn terminalBefore(left: *const job.Record, right: *const job.Record) bool {
     const left_sequence = left.terminal_sequence orelse unreachable;
@@ -525,6 +573,81 @@ test "AI review job owner validates exact handoff cancellation and serial termin
     try std.testing.expect(owner.selected().?.key.eql(first));
     try std.testing.expect(owner.dismiss(first, fixture.root.identity));
     try std.testing.expect(owner.find(first) == null);
+}
+
+test "AI review job owner acknowledges exact published Run and dismisses only selected terminal" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestFixture.init(allocator, io);
+    defer fixture.deinit();
+    var owner: Owner = .{};
+    defer owner.deinit();
+
+    const first_review = try committed_review.ReviewId.parse("11111111-1111-4111-8111-111111111111");
+    const second_review = try committed_review.ReviewId.parse("22222222-2222-4222-8222-222222222222");
+    const absent_review = try committed_review.ReviewId.parse("33333333-3333-4333-8333-333333333333");
+    const first = owner.enqueue(fixture.scope(), try fixture.request()).accepted;
+    const second = owner.enqueue(fixture.scope(), try fixture.request()).accepted;
+    const failed = owner.enqueue(fixture.scope(), try fixture.request()).accepted;
+
+    var started = owner.takeNextReview().?;
+    started.request.deinit();
+    try std.testing.expect(owner.finishReview(first, .{ .outcome = .{ .published = .{
+        .review_id = first_review,
+        .finding_count = 0,
+    } } }));
+    started = owner.takeNextReview().?;
+    started.request.deinit();
+    try std.testing.expect(owner.finishReview(second, .{ .outcome = .{ .outcome_unknown = second_review } }));
+    started = owner.takeNextReview().?;
+    started.request.deinit();
+    try std.testing.expect(owner.finishReview(failed, .{ .outcome = .{ .failed = .provider_failed } }));
+
+    try std.testing.expect(!owner.acknowledgeRun(fixture.root.identity, absent_review));
+    try std.testing.expect(!owner.acknowledgeRun(
+        .{ .device = fixture.root.identity.device + 1, .inode = fixture.root.identity.inode },
+        second_review,
+    ));
+    try std.testing.expect(owner.acknowledgeRun(fixture.root.identity, second_review));
+    try std.testing.expect(owner.find(first).?.unread);
+    try std.testing.expect(owner.find(second) == null);
+    try std.testing.expect(owner.acknowledgeRun(fixture.root.identity, first_review));
+    try std.testing.expect(owner.find(first) == null);
+    try std.testing.expect(!owner.acknowledgeRun(fixture.root.identity, first_review));
+    try std.testing.expect(owner.dismissSelectedTerminal());
+    try std.testing.expect(owner.find(failed) == null);
+    try std.testing.expect(!owner.dismissSelectedTerminal());
+
+    var review_number: u8 = 4;
+    while (review_number < 12) : (review_number += 1) {
+        const key = owner.enqueue(fixture.scope(), try fixture.request()).accepted;
+        started = owner.takeNextReview().?;
+        started.request.deinit();
+        const review = try committed_review.ReviewId.parse(switch (review_number) {
+            4 => "44444444-4444-4444-8444-444444444444",
+            5 => "55555555-5555-4555-8555-555555555555",
+            6 => "66666666-6666-4666-8666-666666666666",
+            7 => "77777777-7777-4777-8777-777777777777",
+            8 => "88888888-8888-4888-8888-888888888888",
+            9 => "99999999-9999-4999-8999-999999999999",
+            10 => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            11 => "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            else => unreachable,
+        });
+        try std.testing.expect(owner.finishReview(key, .{ .outcome = .{ .outcome_unknown = review } }));
+    }
+    try std.testing.expectEqual(@as(usize, capacity), owner.retained_count);
+    const ninth_review = try committed_review.ReviewId.parse("cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+    try std.testing.expect(owner.acknowledgeRun(fixture.root.identity, ninth_review) == false);
+    try std.testing.expect(owner.acknowledgeRun(
+        fixture.root.identity,
+        try committed_review.ReviewId.parse("44444444-4444-4444-8444-444444444444"),
+    ));
+    const ninth = owner.enqueue(fixture.scope(), try fixture.request()).accepted;
+    started = owner.takeNextReview().?;
+    try std.testing.expect(started.key.eql(ninth));
+    started.request.deinit();
 }
 
 test "AI review job owner quit releases queued and waits only for active publication" {

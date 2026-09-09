@@ -17,6 +17,15 @@ pub const Msg = union(enum) {
     base_picker_previous,
     base_picker_next,
     choose_base,
+    open_ai_review,
+    close_ai_review,
+    submit_ai_review,
+    ai_review_context_insert: u21,
+    /// Borrowed from `chasen.Event.paste`; consumed synchronously by update.
+    ai_review_context_paste: []const u8,
+    ai_review_context_backspace,
+    ai_review_context_move_left,
+    ai_review_context_move_right,
 };
 
 pub const Context = struct {
@@ -24,23 +33,37 @@ pub const Context = struct {
     base_picker_open: bool = false,
     base_picker_query_mode: bool = false,
     base_picker_query_len: usize = 0,
+    ai_review_modal_open: bool = false,
 };
 
 pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
+    if (context.ai_review_modal_open) return .{ .ai_review_context_paste = text };
     if (context.base_picker_open) return null;
     return .{ .common = committed_diff_input.pasteToMsg(context.common, text) orelse return null };
 }
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
+    if (context.ai_review_modal_open) return aiReviewModalKeyToMsg(key);
     if (context.base_picker_open) return basePickerKeyToMsg(context, key);
     if (committed_diff_input.keyToMsg(context.common, key)) |msg| return .{ .common = msg };
     if (!key_input.hasCommandModifier(key) and key.codepoint == 'm') return .open_base_picker;
+    if (!key_input.hasCommandModifier(key) and key.codepoint == 'a') return .open_ai_review;
     return null;
 }
 
 pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?Msg {
-    if (context.base_picker_open) return null;
+    if (context.base_picker_open or context.ai_review_modal_open) return null;
     return .{ .common = committed_diff_input.selectionKeyToMsg(context.common, key) orelse return null };
+}
+
+fn aiReviewModalKeyToMsg(key: chasen.Key) ?Msg {
+    if (key.matches(chasen.Key.escape, .{})) return .close_ai_review;
+    if (key.matches(chasen.Key.enter, .{})) return .submit_ai_review;
+    if (key.matches(chasen.Key.backspace, .{})) return .ai_review_context_backspace;
+    if (key.matches(chasen.Key.left, .{})) return .ai_review_context_move_left;
+    if (key.matches(chasen.Key.right, .{})) return .ai_review_context_move_right;
+    if (key_input.textInputCodepoint(key)) |codepoint| return .{ .ai_review_context_insert = codepoint };
+    return null;
 }
 
 fn basePickerKeyToMsg(context: Context, key: chasen.Key) ?Msg {
@@ -66,11 +89,11 @@ fn basePickerKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     return null;
 }
 
-test "Compare owns m and never opens AI Reviews" {
+test "Compare owns independent base and AI review launch keys" {
     const std = @import("std");
     const context: Context = .{};
     try std.testing.expectEqual(Msg.open_base_picker, keyToMsg(context, .{ .codepoint = 'm' }).?);
-    try std.testing.expect(keyToMsg(context, .{ .codepoint = 'a' }) == null);
+    try std.testing.expectEqual(Msg.open_ai_review, keyToMsg(context, .{ .codepoint = 'a' }).?);
 }
 
 test "Compare base picker owns modal input" {
@@ -78,6 +101,15 @@ test "Compare base picker owns modal input" {
     const context: Context = .{ .base_picker_open = true };
     try std.testing.expectEqual(Msg.choose_base, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
     try std.testing.expectEqual(Msg.close_base_picker, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+}
+
+test "Compare AI review modal owns context input and submission" {
+    const std = @import("std");
+    const context: Context = .{ .ai_review_modal_open = true };
+    try std.testing.expectEqual(Msg.submit_ai_review, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(Msg.close_ai_review, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(Msg{ .ai_review_context_insert = 'x' }, keyToMsg(context, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqualStrings("pasted", pasteToMsg(context, "pasted").?.ai_review_context_paste);
 }
 
 comptime {

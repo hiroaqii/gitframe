@@ -88,6 +88,7 @@ pub const View = struct {
     repo_picker_mode: bool,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode,
     remote_action_cancelable: bool = false,
+    ai_review_terminal_visible: bool = false,
     command_line_active: bool = false,
     repository_command_available: bool = false,
     keymap: keymap.Effective,
@@ -122,6 +123,7 @@ pub const View = struct {
             .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
             .remote_action_cancelable = self.remote_action_cancelable,
+            .ai_review_terminal_visible = self.ai_review_terminal_visible,
             .command_line_active = self.command_line_active,
             .repository_command_available = self.repository_command_available,
             .keymap = self.keymap,
@@ -195,7 +197,7 @@ pub const View = struct {
 
         if ((self.active_page == .changes and (self.changes.key.search_mode or self.changes.key.file_search_mode)) or
             (self.active_page == .compare and (self.compare.key.common.search_mode or self.compare.key.common.file_search_mode or
-                self.compare.key.base_picker_open)) or
+                self.compare.key.base_picker_open or self.compare.key.ai_review_modal_open)) or
             (self.active_page == .ai_reviews and (self.ai_reviews.key.common.search_mode or self.ai_reviews.key.common.file_search_mode or
                 self.ai_reviews.key.picker_open)) or
             (self.active_page == .repository and (self.repository.key.source_search_mode or self.repository.key.file_search_mode)) or

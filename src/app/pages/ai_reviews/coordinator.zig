@@ -34,6 +34,11 @@ pub const Redraw = enum {
     skip,
 };
 
+pub const HistorySelectionFinish = struct {
+    redraw: Redraw,
+    loaded: bool = false,
+};
+
 /// Clipboard text may borrow the accepted AI Reviews snapshot or own a short
 /// allocation. Root consumes the effect synchronously before `deinit`.
 pub const ClipboardEffect = struct {
@@ -336,22 +341,23 @@ pub const Controller = struct {
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
         result: app_load.AiReviewSelectionFinished,
-    ) !Redraw {
+    ) !HistorySelectionFinish {
         var finished = result;
         defer finished.deinit(ctx.allocator());
-        const store = self.configuredStore() orelse return .skip;
+        const store = self.configuredStore() orelse return .{ .redraw = .skip };
         if (!self.page_state.picker.acceptsSelection(
             self.repo.epoch(),
             self.repo.activeIdentity(),
             store.identity(),
             &self.page_state.activation,
             finished,
-        )) return .skip;
+        )) return .{ .redraw = .skip };
         const direct = switch (self.page_state.picker.phase) {
             .selection_loading => |loading| loading.direct,
-            else => return .skip,
+            else => return .{ .redraw = .skip },
         };
         const visible = self.page_state.activation.currentIdentity() != null;
+        var loaded = false;
 
         switch (finished.result) {
             .loaded => |*bundle| {
@@ -405,6 +411,7 @@ pub const Controller = struct {
                 if (self.page_state.activation.currentIdentity()) |identity| {
                     _ = self.page_state.activation.finishMember(identity, .source, .immutable);
                 }
+                loaded = true;
             },
             .selection_failed => |failure| {
                 self.failSelection(ctx.allocator(), finished.review_id, direct, failure);
@@ -428,7 +435,10 @@ pub const Controller = struct {
                 }
             },
         }
-        return if (visible) .default else .skip;
+        return .{
+            .redraw = if (visible) .default else .skip,
+            .loaded = loaded,
+        };
     }
 
     pub fn prepareModalRedraw(self: Controller, io: std.Io) void {

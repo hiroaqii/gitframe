@@ -220,6 +220,7 @@ pub const Msg = union(enum) {
     focus_lost,
     git_action_spinner_tick,
     cancel_remote_action,
+    dismiss_ai_review_status,
     confirm_ai_review_quit,
     cancel_ai_review_quit,
     quit,

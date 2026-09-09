@@ -18,6 +18,9 @@ const diff_view_model = @import("../../../diff/view_model.zig");
 const file_tree = @import("../../../file_tree.zig");
 const finding_card = @import("../../../ai_review/finding_card.zig");
 const finding_projection = @import("../../../ai_review/finding_projection.zig");
+const ai_review_job = @import("../../../ai_review/job.zig");
+const ai_review_pipeline = @import("../../../ai_review/runner.zig");
+const codex_adapter = @import("../../../ai_review/adapters/codex/adapter.zig");
 const git_review = @import("../../../git/committed_review.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
 const git_refs = @import("../../../git/refs.zig");
@@ -956,17 +959,35 @@ test "AI Reviews round trip preserves the selected Run and complete navigation w
 }
 
 const DirectRefreshCompletionOrder = enum { completion_while_inactive, completion_after_reentry };
-const DirectRefreshResult = enum { loaded, failed };
+const DirectRefreshResult = enum {
+    loaded,
+    selection_failed,
+    failed_static,
+    empty,
+    stale_identity,
+    stale_generation,
+    stale_store,
+    stale_repository,
+};
 
-test "AI Reviews direct refresh admits both inactive completion orders exactly once" {
+test "AI Reviews direct refresh admits inactive orders and reclaims only an accepted exact Run" {
     const orders = [_]DirectRefreshCompletionOrder{
         .completion_while_inactive,
         .completion_after_reentry,
     };
-    const results = [_]DirectRefreshResult{ .loaded, .failed };
+    const results = [_]DirectRefreshResult{ .loaded, .selection_failed };
     for (orders) |order| {
         for (results) |result| try expectDirectRefreshCompletionOrder(order, result);
     }
+    const remaining = [_]DirectRefreshResult{
+        .failed_static,
+        .empty,
+        .stale_identity,
+        .stale_generation,
+        .stale_store,
+        .stale_repository,
+    };
+    for (remaining) |result| try expectDirectRefreshCompletionOrder(.completion_after_reentry, result);
 }
 
 fn expectDirectRefreshCompletionOrder(
@@ -990,7 +1011,10 @@ fn expectDirectRefreshCompletionOrder(
     defer app.pages.ai_reviews.deinit(allocator);
     defer app.configured_review_store.?.deinit(allocator);
     defer app.repo_session.deinit(allocator);
+    defer app.ai_review_jobs.deinit();
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    var unrelated_root = try repo_root_capability.RootCapability.openCanonical(roots.b);
+    defer unrelated_root.deinit();
     app.pages.ai_reviews = source.page_state;
     source.page_state = .{};
     _ = app.pages.ai_reviews.activate(app.repo_session.repo_epoch);
@@ -1025,6 +1049,35 @@ fn expectDirectRefreshCompletionOrder(
     const store_identity = task.store.identity();
     AiReviewSelectionTask.destroy(task, allocator);
 
+    const unrelated_review_id = try committed_review.ReviewId.parse("a23e4567-e89b-42d3-a456-426614174000");
+    const matching = try seedPublishedAiReviewTerminal(
+        &app,
+        allocator,
+        &app.repo_session.repo_state.root.?,
+        roots.a,
+        target,
+        review_id,
+    );
+    const unrelated_review = try seedPublishedAiReviewTerminal(
+        &app,
+        allocator,
+        &app.repo_session.repo_state.root.?,
+        roots.a,
+        target,
+        unrelated_review_id,
+    );
+    const unrelated_repository = try seedPublishedAiReviewTerminal(
+        &app,
+        allocator,
+        &unrelated_root,
+        roots.b,
+        target,
+        review_id,
+    );
+    try std.testing.expectEqual(@as(usize, 3), app.ai_review_jobs.retained_count);
+    try std.testing.expect(app.ai_review_jobs.selected().?.key.eql(matching));
+    try std.testing.expect(app.ai_review_jobs.find(matching).?.unread);
+
     try app.update(.{ .switch_page = .config }, &ctx);
     try std.testing.expectEqual(page.Id.config, app.active_page);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
@@ -1042,9 +1095,22 @@ fn expectDirectRefreshCompletionOrder(
                 accepted_manifest_ptr = bundle.selection.artifacts.manifest_bytes.ptr;
                 break :blk .{ .loaded = bundle };
             },
-            .failed => .{ .selection_failed = .artifact_drift },
+            .selection_failed => .{ .selection_failed = .artifact_drift },
+            .failed_static => .{ .failed_static = "injected selection failure" },
+            .empty => .empty,
+            .stale_identity, .stale_generation, .stale_store, .stale_repository => .{ .loaded = try directRefreshBundle(allocator, snapshot, repository_id, review_id, target) },
         },
     };
+    switch (result_kind) {
+        .stale_identity => completion.identity.origin = .compare,
+        .stale_generation => completion.generation +%= 1,
+        .stale_store => completion.store_identity.digest[0] ^= 0xff,
+        .stale_repository => {
+            app.repo_session.repo_state.root.?.deinit();
+            app.repo_session.repo_state.root = try unrelated_root.duplicate();
+        },
+        else => {},
+    }
     if (order == .completion_after_reentry) {
         try app.update(.{ .switch_page = .ai_reviews }, &ctx);
         try std.testing.expectEqual(page.Id.ai_reviews, app.active_page);
@@ -1063,7 +1129,15 @@ fn expectDirectRefreshCompletionOrder(
         try app.update(.{ .switch_page = .ai_reviews }, &ctx);
     }
     try std.testing.expectEqual(page.Id.ai_reviews, app.active_page);
-    try std.testing.expect(app.pages.ai_reviews.picker.phase == .closed);
+    const stale = switch (result_kind) {
+        .stale_identity, .stale_generation, .stale_store, .stale_repository => true,
+        else => false,
+    };
+    if (stale) {
+        try std.testing.expect(app.pages.ai_reviews.picker.phase == .selection_loading);
+    } else {
+        try std.testing.expect(app.pages.ai_reviews.picker.phase == .closed);
+    }
     try std.testing.expect(!app.pages.ai_reviews.picker.isPickerVisible());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.pages.ai_reviews.diff.viewer.display_mode);
@@ -1083,11 +1157,23 @@ fn expectDirectRefreshCompletionOrder(
             try std.testing.expect(app.pages.ai_reviews.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr == accepted_manifest_ptr.?);
             try std.testing.expect(app.pages.ai_reviews.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr != original_manifest_ptr);
         },
-        .failed => {
+        .selection_failed => {
             try std.testing.expect(app.pages.ai_reviews.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr == original_manifest_ptr);
             try std.testing.expectEqualStrings("Could not load AI review: artifacts changed", app.pages.ai_reviews.status.text());
         },
+        .failed_static, .empty, .stale_identity, .stale_generation, .stale_store, .stale_repository => try std.testing.expect(app.pages.ai_reviews.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr == original_manifest_ptr),
     }
+
+    if (result_kind == .loaded) {
+        try std.testing.expectEqual(@as(usize, 2), app.ai_review_jobs.retained_count);
+        try std.testing.expect(app.ai_review_jobs.find(matching) == null);
+    } else {
+        try std.testing.expectEqual(@as(usize, 3), app.ai_review_jobs.retained_count);
+        try std.testing.expect(app.ai_review_jobs.find(matching).?.unread);
+        try std.testing.expect(app.ai_review_jobs.selected().?.key.eql(matching));
+    }
+    try std.testing.expect(app.ai_review_jobs.find(unrelated_review).?.unread);
+    try std.testing.expect(app.ai_review_jobs.find(unrelated_repository).?.unread);
 
     var duplicate: app_load.AiReviewSelectionFinished = .{
         .identity = identity,
@@ -1096,19 +1182,78 @@ fn expectDirectRefreshCompletionOrder(
         .review_id = review_id,
         .result = switch (result_kind) {
             .loaded => .{ .loaded = try directRefreshBundle(allocator, snapshot, repository_id, review_id, target) },
-            .failed => .{ .selection_failed = .git_failed },
+            .selection_failed => .{ .selection_failed = .git_failed },
+            .failed_static => .{ .failed_static = "duplicate selection failure" },
+            .empty => .empty,
+            .stale_identity, .stale_generation, .stale_store, .stale_repository => .{ .loaded = try directRefreshBundle(allocator, snapshot, repository_id, review_id, target) },
         },
     };
+    switch (result_kind) {
+        .stale_identity => duplicate.identity.origin = .compare,
+        .stale_generation => duplicate.generation +%= 1,
+        .stale_store => duplicate.store_identity.digest[0] ^= 0xff,
+        else => {},
+    }
+    const replacement_matching = if (result_kind == .loaded)
+        try seedPublishedAiReviewTerminal(
+            &app,
+            allocator,
+            &app.repo_session.repo_state.root.?,
+            roots.a,
+            target,
+            review_id,
+        )
+    else
+        null;
+    const retained_count_before_duplicate = app.ai_review_jobs.retained_count;
     const retained_manifest_ptr = app.pages.ai_reviews.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr;
     ctx.resetRedrawSuppressed();
     try app.update(.{ .load_finished = .{ .ai_reviews = .{ .history_selection = duplicate } } }, &ctx);
     duplicate = undefined;
     try std.testing.expect(ctx.redrawWasSuppressed());
     try std.testing.expect(app.pages.ai_reviews.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr == retained_manifest_ptr);
-    if (result_kind == .failed) {
+    if (result_kind == .selection_failed) {
         try std.testing.expectEqualStrings("Could not load AI review: artifacts changed", app.pages.ai_reviews.status.text());
     }
+    try std.testing.expectEqual(retained_count_before_duplicate, app.ai_review_jobs.retained_count);
+    if (replacement_matching) |key| try std.testing.expect(app.ai_review_jobs.find(key).?.unread);
+    try std.testing.expect(app.ai_review_jobs.find(unrelated_review).?.unread);
+    try std.testing.expect(app.ai_review_jobs.find(unrelated_repository).?.unread);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+}
+
+fn seedPublishedAiReviewTerminal(
+    app: *app_root.App,
+    allocator: std.mem.Allocator,
+    root: *const repo_root_capability.RootCapability,
+    repository_path: []const u8,
+    target: committed_review.CommittedReviewTarget,
+    review_id: committed_review.ReviewId,
+) !ai_review_job.Key {
+    const store = if (app.configured_review_store) |*value| value else return error.ExpectedConfiguredStore;
+    const request = try ai_review_pipeline.Request.init(
+        allocator,
+        root.*,
+        null,
+        store,
+        repository_path,
+        target,
+        null,
+        .{ .codex = try codex_adapter.Request.init(allocator, "/bin/false", null) },
+        "",
+    );
+    const key = switch (app.ai_review_jobs.enqueue(.{ .repository = root.identity, .target = target }, request)) {
+        .accepted => |value| value,
+        .rejected => return error.ExpectedAiReviewAdmission,
+    };
+    var started = app.ai_review_jobs.takeNextReview() orelse return error.ExpectedAiReviewStart;
+    defer started.request.deinit();
+    try std.testing.expect(started.key.eql(key));
+    if (!app.ai_review_jobs.finishReview(key, .{ .outcome = .{ .published = .{
+        .review_id = review_id,
+        .finding_count = 0,
+    } } })) return error.ExpectedAiReviewTerminal;
+    return key;
 }
 
 fn directRefreshBundle(
@@ -1165,13 +1310,13 @@ test "AI Reviews newer refresh and repository replacement stale prior completion
 
     try std.testing.expectEqual(
         ai_reviews_coordinator.Redraw.skip,
-        try harness.controller(layout).finishHistorySelection(&ctx, .{
+        (try harness.controller(layout).finishHistorySelection(&ctx, .{
             .identity = first_identity,
             .generation = first_generation,
             .store_identity = store_identity,
             .review_id = review_id,
             .result = .{ .loaded = try directRefreshBundle(allocator, snapshot, repository_id, review_id, target) },
-        }),
+        })).redraw,
     );
     try std.testing.expect(harness.page_state.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr == original_manifest_ptr);
     try std.testing.expectEqual(second_generation, harness.page_state.picker.generation);
@@ -1188,13 +1333,13 @@ test "AI Reviews newer refresh and repository replacement stale prior completion
     _ = harness.page_state.activate(harness.repository.repo_epoch);
     try std.testing.expectEqual(
         ai_reviews_coordinator.Redraw.skip,
-        try harness.controller(layout).finishHistorySelection(&ctx, .{
+        (try harness.controller(layout).finishHistorySelection(&ctx, .{
             .identity = second_identity,
             .generation = second_generation,
             .store_identity = store_identity,
             .review_id = review_id,
             .result = .{ .loaded = try directRefreshBundle(allocator, snapshot, repository_id, review_id, target) },
-        }),
+        })).redraw,
     );
     try std.testing.expect(harness.page_state.selectedRunConst() == null);
     try std.testing.expect(harness.page_state.picker.phase == .closed);

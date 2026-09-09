@@ -30,6 +30,7 @@ const ai_reviews_page = if (builtin.is_test) @import("pages/ai_reviews.zig") els
 const repository_page = if (builtin.is_test) @import("pages/repository.zig") else struct {};
 const repository_source = if (builtin.is_test) @import("../repository/source.zig") else struct {};
 const content_fingerprint = if (builtin.is_test) @import("../content_fingerprint.zig") else struct {};
+const ai_review_job = @import("../ai_review/job.zig");
 
 /// Rendering-only helpers for App.
 ///
@@ -82,6 +83,13 @@ const PageBarMetadata = struct {
     remote_actions: ?PageBarRemoteActions = null,
 };
 
+pub const AiReviewStatus = struct {
+    key: ai_review_job.Key,
+    scope: ai_review_job.Scope,
+    phase: ai_review_job.Phase,
+    repository_basename: ?[]const u8 = null,
+};
+
 pub const Context = struct {
     changes: changes_view.Context,
     compare: compare_view.Context,
@@ -95,6 +103,7 @@ pub const Context = struct {
     action: action_lifecycle.View,
     remote_cancelable: bool = false,
     remote_canceling: bool = false,
+    ai_review_status: ?AiReviewStatus = null,
     /// Shell notifications temporarily win over the active page diagnostic.
     status: *const app_state.StatusMessage,
     page_status: ?*const app_state.StatusMessage = null,
@@ -199,6 +208,9 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     }
     if (app.active_page == .compare and app.compare.page.base_picker.open) {
         try compare_view.viewBasePicker(app.compare, surface);
+    }
+    if (app.active_page == .compare and app.compare.page.ai_review_modal.open) {
+        try compare_view.viewAiReviewModal(app.compare, surface);
     }
     if (app.active_page == .ai_reviews and app.ai_reviews.page.picker.isPickerVisible()) {
         try ai_reviews_view.viewPicker(app.ai_reviews, surface);
@@ -539,10 +551,12 @@ const FooterProjection = struct {
 /// drift away from the mouse hit target.
 pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     if (app.command_line != null) return null;
+    if (app.active_page == .compare and app.compare.page.ai_review_modal.open) return null;
     if (app.active_page == .ai_reviews and
         (app.ai_reviews.page.picker.isPickerVisible() or app.ai_reviews.page.human_review_decision.isOpen())) return null;
     if (width == 0 or app.active_page == .config) return null;
     if (app.action.spinnerPresentation() != null) return null;
+    if (app.status.text().len == 0 and app.ai_review_status != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
 
     var terminal_buffer: [32]u8 = undefined;
@@ -554,7 +568,8 @@ pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     const hints = footerHints(app, &key_buffers);
     var finding_buffer: [128]u8 = undefined;
     const finding_text = findingFooterText(app, finding_buffer[0..]);
-    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, null);
+    var ai_status_buffer: [256]u8 = undefined;
+    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, null, &ai_status_buffer);
     const status_segment = projection.status_segment orelse return null;
     const range = projection.segments.renderedRange(status_segment, projection.left_limit) orelse return null;
     return .{
@@ -581,7 +596,8 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     const spinner_text = gitActionSpinnerText(app, surface.frameAllocator());
     var finding_buffer: [128]u8 = undefined;
     const finding_text = findingFooterText(app, finding_buffer[0..]);
-    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, spinner_text);
+    var ai_status_buffer: [256]u8 = undefined;
+    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, spinner_text, &ai_status_buffer);
 
     var left_area = surface.child(.{
         .col = 0,
@@ -628,7 +644,18 @@ fn projectFooter(
     terminal_text: []const u8,
     finding_text: ?[]const u8,
     spinner_text: ?[]const u8,
+    ai_status_buffer: []u8,
 ) FooterProjection {
+    const hint_options = footerKeyHintOptions(app.theme);
+    const essential_hint_width = hints.widthForPriority(.repository_switch, hint_options);
+    const essential_reserve = if (essential_hint_width == 0)
+        0
+    else
+        essential_hint_width +| 1;
+    const ai_status_text = if (app.ai_review_status) |status|
+        formatAiReviewStatus(ai_status_buffer, status, width -| essential_reserve -| 1)
+    else
+        null;
     var footer_segments = FooterSegments{};
     footer_segments.append(.{
         .text = terminal_text,
@@ -656,6 +683,7 @@ fn projectFooter(
                 .validating => app.theme.style(.prompt),
                 .stale => app.theme.style(.danger),
             },
+            .drop_priority = .source,
         });
     }
     const committed_footer = switch (app.active_page) {
@@ -678,6 +706,7 @@ fn projectFooter(
                 .validating => app.theme.style(.prompt),
                 .stale => app.theme.style(.danger),
             },
+            .drop_priority = .source,
         });
     }
     if (finding_text) |text| footer_segments.append(.{
@@ -690,22 +719,29 @@ fn projectFooter(
             .text = text,
             .style = app.theme.style(.prompt),
         });
-    } else if (app_state.resolveVisibleStatus(app.status, app.page_status)) |visible| {
+    } else if (app.status.text().len > 0) {
         if (footer_segments.len < footer_segments.items.len) {
             status_segment = footer_segments.len;
             footer_segments.append(.{
-                .text = visible.text,
+                .text = app.status.text(),
+                .style = app.theme.style(.prompt),
+            });
+        }
+    } else if (ai_status_text) |text| {
+        footer_segments.append(.{
+            .text = text,
+            .style = app.theme.style(.prompt),
+        });
+    } else if (app.page_status) |page_status| {
+        if (page_status.text().len > 0 and footer_segments.len < footer_segments.items.len) {
+            status_segment = footer_segments.len;
+            footer_segments.append(.{
+                .text = page_status.text(),
                 .style = app.theme.style(.prompt),
             });
         }
     }
 
-    const hint_options = footerKeyHintOptions(app.theme);
-    const essential_hint_width = hints.widthForPriority(.repository_switch, hint_options);
-    const essential_reserve = if (essential_hint_width == 0)
-        0
-    else
-        essential_hint_width +| 1;
     footer_segments.fit(width -| essential_reserve);
 
     const segment_width = footer_segments.requiredWidth();
@@ -732,8 +768,107 @@ fn projectFooter(
 
 fn findingFooterText(app: Context, buffer: []u8) ?[]const u8 {
     if (app.active_page != .ai_reviews) return null;
+    if (app.ai_review_status != null) return null;
     const summary = app.ai_reviews.footer().finding_summary orelse return null;
     return formatFindingFooterSummary(buffer, summary, app.terminal_size.width >= 96);
+}
+
+fn formatAiReviewStatus(buffer: []u8, status: AiReviewStatus, max_width: u16) ?[]const u8 {
+    var id_buffer: [7]u8 = undefined;
+    const id = formatBase36(&id_buffer, status.key.id);
+    var identity_text: [43]u8 = undefined;
+    const canonical_identity = std.fmt.bufPrint(&identity_text, "{d}:{d}", .{
+        status.scope.repository.device,
+        status.scope.repository.inode,
+    }) catch return null;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical_identity, &digest, .{});
+    var root_hash: [8]u8 = undefined;
+    const hex = "0123456789abcdef";
+    for (digest[0..4], 0..) |byte, index| {
+        root_hash[index * 2] = hex[byte >> 4];
+        root_hash[index * 2 + 1] = hex[byte & 0x0f];
+    }
+    const base = status.scope.target.base_oid.short();
+    const head = status.scope.target.head_oid.short();
+    const state = aiReviewState(status.phase);
+
+    if (status.repository_basename) |basename| {
+        if (validRepositoryBasename(basename)) {
+            const clipped = chasen.text.clipToWidthWithMarker(basename, 24, "…");
+            const full = std.fmt.bufPrint(buffer, "AI {s} {s}{s}#{s}:{s}…{s} {s}", .{
+                id,
+                clipped.prefix,
+                clipped.marker,
+                root_hash,
+                base,
+                head,
+                state.long,
+            }) catch null;
+            if (full) |text| if (chasen.text.displayWidth(text) <= max_width) return text;
+        }
+    }
+
+    const without_basename = std.fmt.bufPrint(buffer, "AI {s} #{s}:{s}…{s} {s}", .{
+        id,
+        root_hash,
+        base,
+        head,
+        state.long,
+    }) catch return null;
+    if (chasen.text.displayWidth(without_basename) <= max_width) return without_basename;
+    return std.fmt.bufPrint(buffer, "AI {s} #{s}:{s}…{s} {c}", .{
+        id,
+        root_hash,
+        base,
+        head,
+        state.short,
+    }) catch null;
+}
+
+const AiReviewState = struct {
+    long: []const u8,
+    short: u8,
+};
+
+fn aiReviewState(phase: ai_review_job.Phase) AiReviewState {
+    return switch (phase) {
+        .queued => .{ .long = "queued", .short = 'q' },
+        .reviewing => .{ .long = "reviewing", .short = 'r' },
+        .publishing => .{ .long = "publishing", .short = 'p' },
+        .terminal => |terminal| switch (terminal) {
+            .start_failed => .{ .long = "failed", .short = 'f' },
+            .pipeline => |value| switch (value.outcome) {
+                .published => .{ .long = "published", .short = 'o' },
+                .no_changes => .{ .long = "no-changes", .short = 'n' },
+                .failed => .{ .long = "failed", .short = 'f' },
+                .canceled => .{ .long = "canceled", .short = 'c' },
+                .outcome_unknown => .{ .long = "outcome-unknown", .short = 'u' },
+            },
+        },
+    };
+}
+
+fn formatBase36(buffer: *[7]u8, value: ai_review_job.Id) []const u8 {
+    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    var remaining = value;
+    var index: usize = buffer.len;
+    while (remaining > 0) {
+        index -= 1;
+        buffer[index] = digits[remaining % 36];
+        remaining /= 36;
+    }
+    if (index == buffer.len) {
+        index -= 1;
+        buffer[index] = '0';
+    }
+    return buffer[index..];
+}
+
+fn validRepositoryBasename(value: []const u8) bool {
+    if (value.len == 0 or !std.unicode.utf8ValidateSlice(value)) return false;
+    for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
 }
 
 fn formatFindingFooterSummary(
@@ -840,7 +975,6 @@ const FooterSegments = struct {
         for (self.items[0..self.len]) |*item| {
             if (item.drop_priority != null and item.drop_priority.? == priority) {
                 item.visible = false;
-                return;
             }
         }
     }
@@ -1824,7 +1958,9 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         },
         .compare => {
             const footer = app.compare.footer();
-            if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open) return result;
+            if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open or
+                app.compare.page.ai_review_modal.open) return result;
+            appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'a' }, "a", "AI review", .ai_review_select);
             appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "base", .compare_base);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
@@ -2177,6 +2313,119 @@ test "Finding discovery footer formats responsive counts before transient status
     defer std.testing.allocator.free(snapshot);
     try std.testing.expectEqual(@as(?usize, 1), std.mem.indexOf(u8, snapshot, compact));
     try std.testing.expectEqual(@as(?usize, 14), std.mem.indexOf(u8, snapshot, "ready"));
+}
+
+test "AI review footer preserves mandatory identity at 56 80 and 120 columns" {
+    const committed = @import("../committed_review.zig");
+    const base = try committed.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const head = try committed.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const status: AiReviewStatus = .{
+        .key = .{ .id = std.math.maxInt(ai_review_job.Id), .generation = 1 },
+        .scope = .{
+            .repository = .{ .device = 12, .inode = 34 },
+            .target = .{
+                .object_format = .sha1,
+                .source_kind = .branch_range,
+                .base_oid = base,
+                .head_oid = head,
+                .diff_base_oid = base,
+            },
+        },
+        .phase = .reviewing,
+        .repository_basename = "repository-with-a-long-name",
+    };
+
+    for ([_]u16{ 38, 62, 102 }) |width| {
+        var buffer: [256]u8 = undefined;
+        const text = formatAiReviewStatus(&buffer, status, width) orelse return error.ExpectedAiReviewStatus;
+        try std.testing.expect(chasen.text.displayWidth(text) <= width);
+        try std.testing.expect(std.mem.indexOf(u8, text, "AI 1z141z3") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "#a5c8d54c:1111111…2222222") != null);
+    }
+
+    var harness: ShellViewTestHarness = .{};
+    _ = harness.compare.activation.activate(0, .pending, .unavailable, .unavailable);
+    for ([_]u16{ 56, 80, 120 }) |width| {
+        harness.terminal_size.width = width;
+        var context = harness.context();
+        context.active_page = .compare;
+        context.page_status = &harness.compare.status;
+        context.ai_review_status = status;
+        var terminal: chasen.testing.TestSurface = undefined;
+        try terminal.init(width, 1);
+        defer terminal.deinit();
+        viewFooter(context, &terminal.surface);
+        const snapshot = try terminal.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "AI 1z141z3") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "#a5c8d54c:1111111…2222222") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "R: switch repo") != null);
+    }
+
+    harness.terminal_size.width = 80;
+    harness.status.set("shell status owns the footer", .{});
+    var covered = harness.context();
+    covered.active_page = .compare;
+    covered.page_status = &harness.compare.status;
+    covered.ai_review_status = status;
+    var shell_surface: chasen.testing.TestSurface = undefined;
+    try shell_surface.init(80, 1);
+    defer shell_surface.deinit();
+    viewFooter(covered, &shell_surface.surface);
+    const shell_snapshot = try shell_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(shell_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, shell_snapshot, "shell status owns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shell_snapshot, "AI 1z141z3") == null);
+
+    harness.status.clear();
+    action_lifecycle.testing.installAccepted(&harness.action_runtime, .{ .generation = 1, .kind = .push });
+    action_lifecycle.testing.setSpinner(&harness.action_runtime, 1, false);
+    var spinner_surface: chasen.testing.TestSurface = undefined;
+    try spinner_surface.init(80, 1);
+    defer spinner_surface.deinit();
+    viewFooter(covered, &spinner_surface.surface);
+    const spinner_snapshot = try spinner_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(spinner_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, spinner_snapshot, "push") != null);
+    try std.testing.expect(std.mem.indexOf(u8, spinner_snapshot, "AI 1z141z3") == null);
+    action_lifecycle.testing.clear(&harness.action_runtime);
+
+    var restored_surface: chasen.testing.TestSurface = undefined;
+    try restored_surface.init(80, 1);
+    defer restored_surface.deinit();
+    viewFooter(covered, &restored_surface.surface);
+    const restored_snapshot = try restored_surface.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(restored_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, restored_snapshot, "AI 1z141z3") != null);
+
+    var finding_buffer: [128]u8 = undefined;
+    var ai_reviews_context = harness.context();
+    ai_reviews_context.active_page = .ai_reviews;
+    ai_reviews_context.ai_review_status = status;
+    try std.testing.expect(findingFooterText(ai_reviews_context, finding_buffer[0..]) == null);
+
+    var narrow_buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "AI 1z141z3 #a5c8d54c:1111111…2222222 r",
+        formatAiReviewStatus(&narrow_buffer, status, 38).?,
+    );
+    var medium_buffer: [256]u8 = undefined;
+    const medium = formatAiReviewStatus(&medium_buffer, status, 62).?;
+    try std.testing.expect(std.mem.indexOf(u8, medium, "repository-with-a-long-name") == null);
+    try std.testing.expect(std.mem.endsWith(u8, medium, " reviewing"));
+    var wide_buffer: [256]u8 = undefined;
+    const wide = formatAiReviewStatus(&wide_buffer, status, 102).?;
+    try std.testing.expect(std.mem.indexOf(u8, wide, "repository-with-a-long") != null);
+    try std.testing.expect(std.mem.endsWith(u8, wide, " reviewing"));
+}
+
+test "AI review footer uses the decided state codes" {
+    try std.testing.expectEqual(@as(u8, 'q'), aiReviewState(.queued).short);
+    try std.testing.expectEqual(@as(u8, 'r'), aiReviewState(.reviewing).short);
+    try std.testing.expectEqual(@as(u8, 'p'), aiReviewState(.publishing).short);
+    try std.testing.expectEqual(@as(u8, 'n'), aiReviewState(.{ .terminal = .{ .pipeline = .{ .outcome = .no_changes } } }).short);
+    try std.testing.expectEqual(@as(u8, 'f'), aiReviewState(.{ .terminal = .{ .start_failed = .review_task_start_failed } }).short);
+    try std.testing.expectEqual(@as(u8, 'c'), aiReviewState(.{ .terminal = .{ .pipeline = .{ .outcome = .canceled } } }).short);
 }
 
 test "footer status target matches clipped rendered cells and retains full text" {
@@ -3287,6 +3536,7 @@ const help_placeholder_sections = [_]HelpSection{
 };
 
 const help_compare_items = [_]HelpItem{
+    .{ .key = .{ .text = "a" }, .description = "start an AI review for the exact comparison" },
     .{ .key = .{ .text = "m" }, .description = "choose comparison base" },
     .{ .key = .{ .action = .reload }, .description = "refresh comparison" },
     .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },

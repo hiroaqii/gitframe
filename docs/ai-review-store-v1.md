@@ -213,6 +213,35 @@ admitted during the responsive drain before teardown. Any Store failure cancels
 quit, reopens admission, reports the typed terminal, and leaves caller-owned
 dirty state available for explicit reload/reconciliation.
 
+## Starting a hosted review from Compare
+
+The `Compare` page can submit its currently accepted committed branch range to
+the Codex CLI. Configure an absolute executable path; the model is optional:
+
+```toml
+[ai_review]
+codex_executable = "/absolute/path/to/codex"
+codex_model = "optional-runner-model"
+```
+
+GitFrame uses the CLI's existing authentication context and does not select,
+inspect, or store whether that context uses a subscription or API billing. If
+`codex_model` is absent, the runner default is used.
+
+Press `a` on `Compare` to inspect the exact base and head OIDs, optionally enter
+up to 16 KiB of review context, and press Enter to start. Submission revalidates
+the accepted repository and target; a configuration, stale-target, or queue
+failure remains in the modal without starting work. An accepted job runs in the
+background and appears in the existing one-line footer as `queued`, `reviewing`,
+`publishing`, or a terminal outcome. Esc dismisses only the currently visible
+unread terminal. Selecting the exact published Run on `AI Reviews` acknowledges
+that job without affecting another Run.
+
+The hosted path publishes through the same Store domain as external producers,
+but it does not invoke the installed `gitframe-ai-review` Skill or `review.py`.
+Runs created externally remain available on `AI Reviews`; they do not have an
+in-memory GitFrame job status.
+
 ## Resource ownership and current non-goals
 
 Every success/failure/skip terminal frees parsed arenas, raw artifact bytes, diagnostics, projection buffers, environments, and descriptors exactly once. The focused suite covers success and drift/failure union terminals with `std.testing.allocator`.

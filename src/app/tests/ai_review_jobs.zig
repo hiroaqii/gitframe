@@ -4,6 +4,7 @@ const app_mod = @import("../../app.zig");
 const app_actions = @import("../actions.zig");
 const app_message = @import("../message.zig");
 const action_lifecycle = @import("../workflow/action_lifecycle.zig");
+const compare_submission = @import("../pages/compare/ai_review_submission.zig");
 const committed = @import("../../committed_review.zig");
 const git_command = @import("../../git/command.zig");
 const git_review = @import("../../git/committed_review.zig");
@@ -11,6 +12,7 @@ const job = @import("../../ai_review/job.zig");
 const codex = @import("../../ai_review/adapters/codex/adapter.zig");
 const pipeline = @import("../../ai_review/runner.zig");
 const root_capability = @import("../../repo/root_capability.zig");
+const repo_discovery = @import("../../repo/discovery.zig");
 const store_service = @import("../../ai_review/store_service.zig");
 
 const App = app_mod.App;
@@ -191,6 +193,118 @@ fn beginAcceptedInertAction(app: *App) app_actions.PendingAction {
     };
     const prepared = lifecycle.prepare(.assist_commit_message);
     return lifecycle.acceptSpawn(std.testing.allocator, prepared).pending;
+}
+
+fn prepareCompareSubmissionApp(app: *App, fixture: *PipelineFixture) !void {
+    const allocator = fixture.allocator;
+    errdefer deinitCompareSubmissionApp(app, allocator);
+    app.user_config.ai_review.codex_executable = fixture.executable;
+    app.configured_review_store = try fixture.store.clone(allocator);
+    app.repo_session.repo_state.discovery = repo_discovery.DiscoveryResult{ .single_repo = .{
+        .label = try allocator.dupe(u8, "repo"),
+        .display_path = try allocator.dupe(u8, fixture.repo_path),
+        .canonical_root = try allocator.dupe(u8, fixture.repo_path),
+    } };
+    app.repo_session.repo_state.root = try fixture.root.duplicate();
+    app.pages.compare.basis = .{
+        .base = .{
+            .full_ref = try allocator.dupe(u8, "refs/heads/review-base"),
+            .display_name = try allocator.dupe(u8, "review-base"),
+            .kind = .local,
+        },
+        .head_display = try allocator.dupe(u8, "main"),
+        .target = fixture.target,
+        .ahead_count = 1,
+    };
+    app.pages.compare.base_target = .{
+        .full_ref = try allocator.dupe(u8, "refs/heads/review-base"),
+        .display_name = try allocator.dupe(u8, "review-base"),
+        .kind = .local,
+    };
+    app.pages.compare.diff.load.state = .{ .empty = .no_changes };
+    app.pages.compare.diff.accepted_repository_identity = .{
+        .repo_epoch = app.repo_session.repo_epoch,
+        .root_identity = fixture.root.identity,
+    };
+    app.pages.compare.beginAiReviewModal();
+    app.pages.compare.ai_review_modal.paste("bounded context");
+}
+
+fn deinitCompareSubmissionApp(app: *App, allocator: std.mem.Allocator) void {
+    app.pages.compare.deinit(allocator);
+    if (app.configured_review_store) |*store| store.deinit(allocator);
+    app.configured_review_store = null;
+    app.repo_session.deinit(allocator);
+    app.ai_review_jobs.deinit();
+}
+
+fn compareSubmissionController(app: *App) compare_submission.Controller {
+    return .{
+        .page = &app.pages.compare,
+        .repo = app.repo_session.view(),
+        .store = if (app.configured_review_store) |*store| store else null,
+        .codex_executable = app.user_config.ai_review.codex_executable,
+        .codex_model = app.user_config.ai_review.codex_model,
+        .env_map = app.env_map,
+        .jobs = &app.ai_review_jobs,
+    };
+}
+
+test "Compare AI review submission owns exact authority and bounded rejection cleanup" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try PipelineFixture.init(allocator, std.testing.io);
+    defer fixture.deinit();
+    var app: App = .{ .allocator = allocator };
+    try prepareCompareSubmissionApp(&app, &fixture);
+    defer deinitCompareSubmissionApp(&app, allocator);
+
+    const accepted = compareSubmissionController(&app).submit(allocator).accepted;
+    const record = app.ai_review_jobs.find(accepted).?;
+    try std.testing.expect(record.scope.repository.eql(fixture.root.identity));
+    try std.testing.expect(record.scope.target.eql(&fixture.target));
+    try std.testing.expect(record.request.?.matchesScope(fixture.root.identity, &fixture.target));
+    try std.testing.expectEqualStrings("bounded context", record.request.?.review_context);
+    try std.testing.expect(!app.pages.compare.ai_review_modal.open);
+
+    app.pages.compare.beginAiReviewModal();
+    app.user_config.ai_review.codex_executable = null;
+    try std.testing.expectEqual(compare_submission.Failure.codex_not_configured, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expect(app.pages.compare.ai_review_modal.open);
+    try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
+    app.user_config.ai_review.codex_executable = fixture.executable;
+
+    const configured_store = app.configured_review_store;
+    app.configured_review_store = null;
+    try std.testing.expectEqual(compare_submission.Failure.store_not_configured, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
+    app.configured_review_store = configured_store;
+
+    app.pages.compare.diff.accepted_repository_identity.?.repo_epoch += 1;
+    try std.testing.expectEqual(compare_submission.Failure.comparison_changed, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
+    app.pages.compare.diff.accepted_repository_identity.?.repo_epoch -= 1;
+
+    const selected_base = app.pages.compare.base_target.?;
+    app.pages.compare.base_target = .{
+        .full_ref = try allocator.dupe(u8, "refs/heads/stale-base"),
+        .display_name = try allocator.dupe(u8, "stale-base"),
+        .kind = .local,
+    };
+    try std.testing.expectEqual(compare_submission.Failure.target_changed, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
+    app.pages.compare.base_target.?.deinit(allocator);
+    app.pages.compare.base_target = selected_base;
+
+    while (app.ai_review_jobs.retained_count < @import("../../ai_review/job_owner.zig").capacity) {
+        const outcome = compareSubmissionController(&app).submit(allocator);
+        try std.testing.expect(outcome == .accepted);
+        app.pages.compare.beginAiReviewModal();
+        app.pages.compare.ai_review_modal.paste("bounded context");
+    }
+    try std.testing.expectEqual(compare_submission.Failure.capacity, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expect(app.pages.compare.ai_review_modal.open);
+    try std.testing.expectEqual(@import("../../ai_review/job_owner.zig").capacity, app.ai_review_jobs.retained_count);
 }
 
 test "AI review App uses two one-shot tasks and exposes publishing before exact terminal" {
