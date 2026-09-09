@@ -548,4 +548,16 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
     const restore = app.pages.changes.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     const override = restore.override orelse return error.ExpectedNavigationOverride;
     try std.testing.expectEqual(@as(usize, 0), override.diff_scroll);
+
+    // A further timer tick at BOF cannot retarget the cursor or endpoint.
+    app.pages.changes.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } };
+    const edge_cursor = app.pages.changes.viewer.diff_cursor;
+    const edge_owner = app.pages.changes.selection_owner;
+    try app.update(.{ .changes = .{ .mouse_diff_auto_scroll_step = .{
+        .direction = .up,
+        .endpoint = .{ .col = 20, .row = diff_render.body_start_row },
+    } } }, &ctx);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqualDeep(edge_cursor, app.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqualDeep(edge_owner, app.pages.changes.selection_owner);
 }

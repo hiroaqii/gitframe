@@ -1904,7 +1904,7 @@ pub const BodyController = struct {
         }
 
         const old_scroll = self.controller.surface.viewer.diff_scroll;
-        self.scrollDiff(if (step.direction == .up) .up else .down);
+        self.scrollDiffWithOrigin(if (step.direction == .up) .up else .down, .drag);
         if (self.controller.surface.viewer.diff_scroll == old_scroll) return .content_edge;
 
         const endpoint: diff_surface.MousePoint = .{
@@ -2069,6 +2069,10 @@ pub const BodyController = struct {
     }
 
     pub fn scrollDiff(self: BodyController, direction: VerticalDirection) void {
+        self.scrollDiffWithOrigin(direction, .pointer);
+    }
+
+    fn scrollDiffWithOrigin(self: BodyController, direction: VerticalDirection, origin: enum { pointer, drag }) void {
         const bounds = self.diffCursorBounds();
         const old_scroll = bounds.clampScroll(self.controller.surface.viewer.diff_scroll);
         const old_cursor_offset = self.view().selectedDiffCursorPresentationOffset();
@@ -2078,7 +2082,21 @@ pub const BodyController = struct {
         };
         const new_scroll = bounds.clampScroll(requested_scroll);
         self.controller.surface.viewer.diff_scroll = new_scroll;
-        if (old_scroll == new_scroll or bounds.visible_rows == 0) return;
+        if (bounds.visible_rows == 0) return;
+        if (old_scroll == new_scroll) {
+            if (origin == .drag or self.controller.surface.selection_owner.activeKeyboardLineSelection()) return;
+            // Step source ordinals, skipping inserted presentation-only rows.
+            const cursor = self.view().selectedDiffCursorOffset() orelse return;
+            const rows = self.view().sourceDiffLineCount();
+            if (rows == 0) return;
+            const target = switch (direction) {
+                .up => cursor -| 1,
+                .down => @min(cursor +| 1, rows - 1),
+            };
+            self.controller.surface.viewer.diff_cursor = self.view().selectedCoordinateAtOffset(target) orelse
+                self.controller.surface.viewer.diff_cursor;
+            return;
+        }
 
         const target = cursor_viewport.retargetCursorAfterViewportScroll(
             bounds,

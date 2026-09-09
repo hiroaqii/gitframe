@@ -61,10 +61,19 @@ fn pageSourceByRows(
     );
 }
 
-/// Source-pane wheel is viewport-primary. Its one-row viewport move is never
-/// reverted to preserve the old cursor, and a clamped no-move preserves that
-/// cursor exactly.
+/// Source-pane wheel is viewport-primary until it reaches a content edge,
+/// where further wheel input steps the cursor one source row at a time.
 pub fn wheelSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry) void {
+    scrollSource(viewer, document, direction, geometry, .pointer);
+}
+
+/// A timer reaching a content edge must not move the cursor before the caller
+/// terminates the drag step without re-hit-testing its endpoint.
+pub fn autoScrollSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry) void {
+    scrollSource(viewer, document, direction, geometry, .drag);
+}
+
+fn scrollSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry, origin: enum { pointer, drag }) void {
     const bounds = sourceBounds(document, geometry);
     const old_scroll = bounds.clampScroll(viewer.source_vertical_scroll);
     const requested_scroll = if (direction < 0)
@@ -75,6 +84,12 @@ pub fn wheelSource(viewer: *model.ViewerState, document: *const source.Document,
         old_scroll;
     const new_scroll = bounds.clampScroll(requested_scroll);
     viewer.source_vertical_scroll = new_scroll;
+    if (old_scroll == new_scroll) {
+        if (origin == .drag or bounds.visible_rows == 0 or direction == 0 or document.contentLineCount() == 0) return;
+        if (viewer.source_cursor >= document.rowCount()) return;
+        moveSourceCursor(viewer, document, if (direction < 0) -1 else 1);
+        return;
+    }
     if (cursor_viewport.retargetCursorAfterViewportScroll(
         bounds,
         old_scroll,
@@ -261,13 +276,61 @@ test "repository source comfort keeps wheel viewport primary at edges and inside
     viewer.source_vertical_scroll = 0;
     wheelSource(&viewer, &document, -1, geometry);
     try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 4), viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 3), viewer.source_cursor);
 
     viewer.source_cursor = 95;
     viewer.source_vertical_scroll = 92;
     wheelSource(&viewer, &document, 1, geometry);
     try std.testing.expectEqual(@as(usize, 92), viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 95), viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 96), viewer.source_cursor);
+}
+
+test "repository wheel reaches both content edges for long short and exact-fit documents" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 1, 4, 8, 100 }) |rows| {
+        var document = try sourceDocumentWithRowsForTest(allocator, rows);
+        defer document.deinit(allocator);
+        const geometry = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 11 }, &document, true);
+        const max_scroll = sourceBounds(&document, geometry).maxScroll();
+        for ([_]isize{ -1, 1 }) |direction| {
+            var viewer: model.ViewerState = .{
+                .source_cursor = rows / 2,
+                .source_vertical_scroll = if (direction < 0) 0 else max_scroll,
+                .source_horizontal_scroll = 7,
+            };
+            const edge_scroll = viewer.source_vertical_scroll;
+            var expected = viewer.source_cursor;
+            for (0..rows + 2) |_| {
+                expected = if (direction < 0) expected -| 1 else @min(expected + 1, rows - 1);
+                wheelSource(&viewer, &document, direction, geometry);
+                try std.testing.expectEqual(expected, viewer.source_cursor);
+                try std.testing.expectEqual(edge_scroll, viewer.source_vertical_scroll);
+                try std.testing.expectEqual(@as(usize, 7), viewer.source_horizontal_scroll);
+            }
+        }
+    }
+}
+
+test "repository wheel edge leaves drag viewport-only zero-height and zero intent cursors unchanged" {
+    const allocator = std.testing.allocator;
+    var document = try sourceDocumentWithRowsForTest(allocator, 4);
+    defer document.deinit(allocator);
+    const geometry = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 11 }, &document, true);
+    var viewer: model.ViewerState = .{ .source_cursor = 2 };
+    for ([_]isize{ -1, 1 }) |direction| {
+        autoScrollSource(&viewer, &document, direction, geometry);
+        scrollSourceViewport(&viewer, &document, direction, geometry);
+        try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
+        try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll);
+    }
+    wheelSource(&viewer, &document, 0, geometry);
+    try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
+    const zero = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 2 }, &document, true);
+    for ([_]isize{ -1, 1 }) |direction| {
+        viewer.source_vertical_scroll = if (direction < 0) 0 else sourceBounds(&document, zero).maxScroll();
+        wheelSource(&viewer, &document, direction, zero);
+        try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
+    }
 }
 
 test "repository source comfort centers pages and places explicit search in band" {

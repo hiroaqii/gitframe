@@ -3913,10 +3913,9 @@ test "diff wheel comfort recenters edge cursor only after viewport movement" {
 
     app.pages.changes.viewer.diff_scroll = 0;
     app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
-    const cursor_at_bof = app.pages.changes.viewer.diff_cursor;
     app.changesNavigation().scrollDiff(.up);
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
-    try std.testing.expectEqual(cursor_at_bof, app.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqual(line_count - 2, app.changesNavigationView().selectedDiffCursorOffset().?);
 
     app.changesNavigation().scrollDiff(.down);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
@@ -3933,6 +3932,32 @@ test "diff wheel comfort recenters edge cursor only after viewport movement" {
         app.pages.changes.viewer.diff_scroll + visible_rows / 2,
         app.changesNavigationView().selectedDiffCursorOffset().?,
     );
+}
+
+test "diff wheel steps to both content edges in long and short viewports" {
+    for ([_]diff_render.DisplayMode{ .unified, .side_by_side }) |mode| {
+        for ([_]u16{ 10, 40 }) |height| {
+            var app = TestHarness.init(.{
+                .load = test_support.loadState(test_support.loadedDiffOne()),
+                .viewer = .{ .display_mode = mode, .sidebar_hidden = true },
+            }, .{ .width = 140, .height = height });
+            const view = app.changesNavigationView();
+            const rows = view.selectedFileLineIndex(view.effectiveDisplayMode()).lineCount();
+            const max_scroll = rows -| view.diffVisibleRows();
+            for ([_]VerticalDirection{ .up, .down }) |direction| {
+                var expected = rows / 2;
+                app.pages.changes.viewer.diff_cursor = view.selectedCoordinateAtOffset(expected).?;
+                const scroll = if (direction == .up) 0 else max_scroll;
+                app.pages.changes.viewer.diff_scroll = scroll;
+                for (0..rows + 2) |_| {
+                    expected = if (direction == .up) expected -| 1 else @min(expected + 1, rows - 1);
+                    app.controller().scrollDiff(direction);
+                    try std.testing.expectEqual(expected, view.selectedDiffCursorOffset().?);
+                    try std.testing.expectEqual(scroll, app.pages.changes.viewer.diff_scroll);
+                }
+            }
+        }
+    }
 }
 
 test "diff row movement continues from wheel-synced visible cursor" {

@@ -2937,7 +2937,7 @@ pub const RepositoryPageState = struct {
 
         const geometry = self.sourceGeometry(body_size, document);
         const old_scroll = self.viewer.source_vertical_scroll;
-        repository_navigation.wheelSource(
+        repository_navigation.autoScrollSource(
             &self.viewer,
             document,
             if (step.direction == .up) -1 else 1,
@@ -6355,12 +6355,16 @@ test "repository drag auto-scroll validates token and steps one projected row" {
         .row = viewport.first_row,
     } }, size);
     state.viewer.source_vertical_scroll = state.currentSource().?.rowCount() -| geometry.visible_source_rows;
+    const edge_cursor = state.viewer.source_cursor;
+    const edge_selection = state.selection_owner;
     var edge = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
         .direction = .down,
         .endpoint = .{ .col = geometry.text_col, .row = viewport.last_row },
     } }, size);
     defer edge.deinit(allocator);
     try std.testing.expectEqual(drag_auto_scroll.StepOutcome.content_edge, edge.auto_scroll.?);
+    try std.testing.expectEqual(edge_cursor, state.viewer.source_cursor);
+    try std.testing.expectEqualDeep(edge_selection, state.selection_owner);
     try std.testing.expect(state.activeMouseSourceRange());
 
     state.repo_epoch += 1;

@@ -2337,6 +2337,49 @@ test "side-by-side Finding pointer keeps pane-local actions and inert padding" {
     try std.testing.expectEqualDeep(card_before_padding, harness.page_state.finding_card);
 }
 
+test "Finding wheel at content edges steps semantic source rows" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 18 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    harness.page_state.diff.viewer.sidebar_hidden = true;
+
+    var frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    defer frame.deinit(allocator);
+    var view = harness.controller(layout).navigationView().withPresentationRows(&frame.presentation_rows);
+    var resolver = view.resolver();
+    const body = view.bodyView(&resolver);
+    const rows = body.sourceDiffLineCount();
+    const visible = view.view().diffVisibleRows();
+    const max_scroll = frame.presentation_rows.total_rows -| visible;
+    try std.testing.expect(frame.presentation_rows.total_rows > rows);
+    for ([_]ai_reviews_input.FindingPointerEvent.Button{ .wheel_up, .wheel_down }) |button| {
+        const scroll = if (button == .wheel_up) 0 else max_scroll;
+        harness.page_state.diff.viewer.diff_scroll = scroll;
+        var expected = rows / 2;
+        harness.page_state.diff.viewer.diff_cursor = body.selectedCoordinateAtOffset(expected).?;
+        // Use a real source cell so the pointer dispatch reaches shared wheel
+        // navigation rather than a finding card's own body scroll.
+        var source_row: ?usize = null;
+        for (scroll..@min(scroll + visible, frame.presentation_rows.total_rows)) |row| {
+            if (body.presentationToSourceOffset(row) != null) {
+                source_row = row;
+                break;
+            }
+        }
+        const point = try findingPointerPoint(&harness, layout, source_row orelse return error.ExpectedSourceRow, 12);
+        for (0..rows + 2) |_| {
+            expected = if (button == .wheel_up) expected -| 1 else @min(expected + 1, rows - 1);
+            var result = try harness.pointer(allocator, layout, point, button);
+            result.deinit(allocator);
+            try std.testing.expectEqual(scroll, harness.page_state.diff.viewer.diff_scroll);
+            try std.testing.expectEqual(expected, body.selectedDiffCursorOffset().?);
+            const presentation = body.selectedDiffCursorPresentationOffset().?;
+            try std.testing.expectEqual(expected, body.presentationToSourceOffset(presentation).?);
+        }
+    }
+}
+
 test "Finding pointer routes exact card cells with one semantic command" {
     const allocator = std.testing.allocator;
     const layout: diff_surface.Layout = .{ .width = 100, .height = 18 };
