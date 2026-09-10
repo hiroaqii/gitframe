@@ -47,6 +47,12 @@ pub const ReviewResultCreateRequest = store_service.ReviewResultCreateRequest;
 pub const ReviewResultCreateResult = store_service.ReviewResultCreateResult;
 pub const saveDraft = store_service.saveDraft;
 pub const createResult = store_service.createResult;
+pub const DeleteRequest = store_service.DeleteRequest;
+pub const DeleteResult = store_service.DeleteResult;
+pub const MaintenanceFailure = store_service.MaintenanceFailure;
+pub const CleanupResult = store_service.CleanupResult;
+pub const deleteRun = store_service.deleteRun;
+pub const cleanupTrash = store_service.cleanupTrash;
 
 test {
     _ = @import("review_store/path.zig");
@@ -58,4 +64,5 @@ test {
     _ = @import("review_store/history.zig");
     _ = @import("review_store/publication.zig");
     _ = @import("review_store/mutation.zig");
+    _ = @import("review_store/maintenance.zig");
 }

@@ -865,6 +865,51 @@ pub const DraftSaveRequest = mutation_store.DraftRequest;
 pub const DraftSaveResult = mutation_store.DraftResult;
 pub const ReviewResultCreateRequest = mutation_store.ResultRequest;
 pub const ReviewResultCreateResult = mutation_store.ResultResult;
+pub const DeleteRequest = core.DeleteRequest;
+pub const DeleteResult = core.DeleteResult;
+pub const MaintenanceFailure = core.MaintenanceFailure;
+pub const CleanupResult = core.CleanupResult;
+
+/// Physical repository identity is checked without requiring retained Git objects.
+pub fn deleteRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    request: DeleteRequest,
+) std.mem.Allocator.Error!DeleteResult {
+    if (try maintenanceBindingFailure(allocator, io, repository, request.store)) |failure|
+        return .{ .failure = failure };
+    return core.deleteRun(allocator, io, configured_store.context(), request);
+}
+
+pub fn cleanupTrash(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    expected: StoreSnapshot,
+) std.mem.Allocator.Error!CleanupResult {
+    if (try maintenanceBindingFailure(allocator, io, repository, expected)) |failure|
+        return .{ .failure = failure };
+    return core.cleanupTrash(allocator, io, configured_store.context(), expected);
+}
+
+fn maintenanceBindingFailure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: RepositoryContext,
+    expected: StoreSnapshot,
+) std.mem.Allocator.Error!?MaintenanceFailure {
+    return switch (try repository_locator.locate(allocator, io, repository.git())) {
+        .locator => |locator| if (locator.eql(expected.repository_locator)) null else .binding_changed,
+        .failure => |failure| switch (failure) {
+            .unsupported_platform => .unsupported,
+            .git_command_failed => .io_failed,
+            else => .binding_changed,
+        },
+    };
+}
 
 const LocatePublicationResult = union(enum) {
     locator: committed_review.GitCommonDirectoryLocator,
@@ -1764,6 +1809,86 @@ fn directoryInventory(
     errdefer result.deinit(allocator);
     for (lines.items) |line| try result.appendSlice(allocator, line);
     return result.toOwnedSlice(allocator);
+}
+
+test "review store deletion service preserves Git and sibling Runs without target objects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "repo", .default_dir);
+    var repo = try tmp.dir.openDir(io, "repo", .{});
+    defer repo.close(io);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "--initial-branch=main" },
+        &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "fixture" },
+    }) |argv| allocator.free(try runTestGit(io, repo, argv));
+    try repo.writeFile(io, .{ .sub_path = "local.txt", .data = "keep staged\n" });
+    allocator.free(try runTestGit(io, repo, &.{ "git", "add", "local.txt" }));
+    try repo.writeFile(io, .{ .sub_path = "local.txt", .data = "keep unstaged\n" });
+    const repo_path = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo_path);
+    var repo_capability = try root_capability.RootCapability.openCanonical(repo_path);
+    defer repo_capability.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    const repository: RepositoryContext = .{ .capability = &repo_capability, .environment = &environment };
+    const locator = (try repository_locator.locate(allocator, io, repository.git())).locator;
+    try tmp.dir.createDir(io, "store", .fromMode(0o700));
+    const store_path_text = try tmp.dir.realPathFileAlloc(io, "store", allocator);
+    defer allocator.free(store_path_text);
+    var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
+    defer configured.deinit(allocator);
+    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = locator, .repository_path = repo_path })).success;
+    var store = try tmp.dir.openDir(io, "store", .{});
+    defer store.close(io);
+    const repository_text = prepared.review_repository_id.canonical();
+    var locks = try store.openDir(io, ".locks", .{});
+    defer locks.close(io);
+    try locks.createDir(io, &repository_text, .fromMode(0o700));
+    try store.createDir(io, &repository_text, .fromMode(0o700));
+    var namespace = try store.openDir(io, &repository_text, .{});
+    defer namespace.close(io);
+    // These object IDs have never existed in this Git repository.
+    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const target: committed_review.CommittedReviewTarget = .{ .object_format = .sha1, .source_kind = .branch_range, .base_oid = oid, .head_oid = oid, .diff_base_oid = oid };
+    const sibling = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, prepared.review_id, target, "2026-08-20T08:00:00Z", .completed_invalid_draft);
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, sibling, target, "2026-08-20T08:00:00Z", .draft);
+    const other = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = .{ .device = 7, .inode = 11 }, .repository_path = "/test/other" })).success;
+    try store.createDir(io, &other.review_repository_id.canonical(), .fromMode(0o700));
+    var other_namespace = try store.openDir(io, &other.review_repository_id.canonical(), .{});
+    defer other_namespace.close(io);
+    try seedTestRun(allocator, io, other_namespace, other.review_repository_id, prepared.review_id, target, "2026-08-20T08:00:00Z", .completed);
+    var scanned = try catalog_store.scan(allocator, io, configured.context(), locator);
+    defer scanned.deinit(allocator);
+    const catalog = &scanned.catalog;
+    const artifacts: ArtifactSnapshot = found: {
+        for (catalog.rows) |row| if (row.review_id.eql(prepared.review_id)) break :found row.artifact_snapshot;
+        return error.MissingFixtureRun;
+    };
+    const state_context: ReadStateContext = .{ .repository = repo, .repository_path = repo_path, .store_path = store_path_text };
+    var before = try captureReadOnlyState(allocator, io, state_context);
+    defer before.deinit(allocator);
+    var mismatched = catalog.snapshot;
+    mismatched.repository_locator.inode +%= 1;
+    try std.testing.expectEqual(MaintenanceFailure.binding_changed, (try deleteRun(allocator, io, &configured, repository, .{ .store = mismatched, .review_id = prepared.review_id, .artifacts = artifacts })).failure);
+    const deleted = try deleteRun(allocator, io, &configured, repository, .{ .store = catalog.snapshot, .review_id = prepared.review_id, .artifacts = artifacts });
+    try std.testing.expectEqualDeep(DeleteResult{ .deleted = .complete }, deleted);
+    var after = try captureReadOnlyState(allocator, io, state_context);
+    defer after.deinit(allocator);
+    inline for (.{ "head", "branch", "index", "local_config", "worktree" }) |field|
+        try std.testing.expectEqualStrings(@field(before, field), @field(after, field));
+    var remaining = try catalog_store.scan(allocator, io, configured.context(), locator);
+    defer remaining.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), remaining.catalog.rows.len);
+    try std.testing.expect(remaining.catalog.rows[0].review_id.eql(sibling));
+    var other_run = try other_namespace.openDir(io, &prepared.review_id.canonical(), .{});
+    other_run.close(io);
+    var absent = try catalog_store.readExact(allocator, io, configured.context(), locator, prepared.review_id, null, null);
+    defer absent.deinit(allocator);
+    try std.testing.expect(absent == .absent);
+    try std.testing.expectEqual(@as(usize, 0), (try cleanupTrash(allocator, io, &configured, repository, catalog.snapshot)).cleaned);
 }
 
 fn seedTestRun(

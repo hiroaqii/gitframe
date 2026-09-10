@@ -58,6 +58,9 @@ pub const File = struct {
     pub fn lock(self: File, io: std.Io, kind: std.Io.File.Lock) !void {
         try self.ioFile().lock(io, kind);
     }
+    pub fn tryLock(self: File, io: std.Io, kind: std.Io.File.Lock) !bool {
+        return self.ioFile().tryLock(io, kind);
+    }
     pub fn unlock(self: File, io: std.Io) void {
         self.ioFile().unlock(io);
     }

@@ -8,6 +8,7 @@ const committed_review = @import("../committed_review.zig");
 const durable = @import("../fs/durable.zig");
 const capability = @import("capability.zig");
 const mutation = @import("mutation.zig");
+const maintenance = @import("maintenance.zig");
 const registry = @import("registry.zig");
 const store_path = @import("path.zig");
 
@@ -191,7 +192,7 @@ pub fn prepareBinding(
         return .{ .failure = mapPrepareMutationError(err) };
     };
     defer locks.deinit();
-    var lock = acquireLock(io, locks, "registry.lock") catch |err| {
+    var lock = acquireLock(io, locks, "registry.lock", .wait) catch |err| {
         return .{ .failure = mapPrepareMutationError(err) };
     };
     defer lock.deinit();
@@ -358,7 +359,7 @@ pub fn publish(
         return .{ .failure = mapPublishMutationError(err) };
     };
     defer repository_locks.deinit();
-    var lock = acquireLock(io, repository_locks, "publish.lock") catch |err| {
+    var lock = acquireLock(io, repository_locks, "publish.lock", .wait) catch |err| {
         return .{ .failure = mapPublishMutationError(err) };
     };
     defer lock.deinit();
@@ -428,21 +429,29 @@ pub fn createResult(
     return mutation.createResultAt(allocator, io, configured, request);
 }
 
-const HeldLock = struct {
+pub const DeleteRequest = maintenance.DeleteRequest;
+pub const DeleteResult = maintenance.DeleteResult;
+pub const MaintenanceFailure = maintenance.Failure;
+pub const CleanupResult = maintenance.CleanupResult;
+pub const deleteRun = maintenance.deleteRun;
+pub const cleanupTrash = maintenance.cleanupTrash;
+
+pub const HeldLock = struct {
     file: @FieldType(durable.FileAcquisition, "file"),
     io: std.Io,
 
-    fn deinit(self: *HeldLock) void {
+    pub fn deinit(self: *HeldLock) void {
         self.file.unlock(self.io);
         self.file.deinit();
         self.* = undefined;
     }
 };
 
-fn acquireLock(
+pub fn acquireLock(
     io: std.Io,
     directory: capability.DirectoryCapability,
     name: []const u8,
+    mode: enum { wait, try_lock },
 ) !HeldLock {
     const acquired = switch (capability.acquireRegularFile(directory, name, .{})) {
         .not_completed => |err| return err,
@@ -451,11 +460,14 @@ fn acquireLock(
     var file = acquired.value.file;
     errdefer file.deinit();
     if (acquired.after_error) |err| return err;
-    try file.lock(io, .exclusive);
+    switch (mode) {
+        .wait => try file.lock(io, .exclusive),
+        .try_lock => if (!try file.tryLock(io, .exclusive)) return error.Locked,
+    }
     return .{ .file = file, .io = io };
 }
 
-fn acquireDirectory(
+pub fn acquireDirectory(
     io: std.Io,
     parent: capability.DirectoryCapability,
     name: []const u8,

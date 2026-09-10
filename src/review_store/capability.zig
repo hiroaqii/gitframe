@@ -324,6 +324,7 @@ const direct_consumers = [_][]const u8{
     "src/review_store/core.zig",
     "src/review_store/catalog.zig",
     "src/review_store/mutation.zig",
+    "src/review_store/maintenance.zig",
 };
 
 fn expectTypedFinalSurfaces() !void {
@@ -510,8 +511,8 @@ fn expectProductionLineCeilings(allocator: std.mem.Allocator, io: std.Io) !void 
         "src/fs/capability.zig",
         "src/fs/durable.zig",
     };
-    const core_ceiling: usize = 2000;
-    const complete_ceiling: usize = 3700;
+    const core_ceiling: usize = 2400;
+    const complete_ceiling: usize = 4100;
     var core: usize = 0;
     var complete = core;
     for (neutral_owner_paths) |path| {
@@ -564,6 +565,7 @@ fn hasForbiddenStoreAccess(source: []const u8, allow_facade_neutral: bool) bool 
 fn durableOwner(path: []const u8) bool {
     return std.mem.eql(u8, path, "src/review_store/capability.zig") or
         std.mem.eql(u8, path, "src/review_store/core.zig") or
+        std.mem.eql(u8, path, "src/review_store/maintenance.zig") or
         std.mem.eql(u8, path, "src/review_store/mutation.zig");
 }
 

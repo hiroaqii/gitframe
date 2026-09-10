@@ -101,6 +101,8 @@ pub const InvalidReason = enum {
     result_invalid,
     scan_artifact_bytes_exceeded,
     enumeration_failed,
+    permission_denied,
+    io_failed,
 };
 
 pub const LoadResult = union(enum) {
@@ -125,11 +127,11 @@ pub fn loadValidated(
     budget: *ArtifactBudget,
 ) std.mem.Allocator.Error!LoadResult {
     const review_text = review_id.canonical();
-    var run_dir = namespace.openDirectory(&review_text) catch return .{ .invalid = .run_missing_or_unsafe };
+    var run_dir = namespace.openDirectory(&review_text) catch |err| return mapReadErrorAs(err, .run_missing_or_unsafe);
     defer run_dir.deinit();
 
     const entries = enumerateAuthorityEntries(io, run_dir) catch |err|
-        return .{ .invalid = if (err == error.UnknownRunEntry) .unknown_run_entry else .enumeration_failed };
+        return mapReadErrorAs(err, if (err == error.UnknownRunEntry) .unknown_run_entry else .enumeration_failed);
     if (!entries.manifest or !entries.findings) return .{ .invalid = .immutable_file_invalid };
 
     var manifest_bytes: ?[]u8 = null;
@@ -202,8 +204,9 @@ pub fn loadValidated(
         if (entries.draft) {
             // A completed Run never needs retained draft authority. Unsafe or
             // malformed retained evidence is diagnostic-only.
-            if (run_dir.admitChild("review_state.json", .regular_file)) |_| {
-                draft_bytes = readAuthority(
+            if (run_dir.admitChild("review_state.json", .regular_file)) |metadata| {
+                // Keep empty invalid evidence in the exact snapshot too.
+                draft_bytes = if (metadata.size == 0) try allocator.dupe(u8, "") else readAuthority(
                     allocator,
                     io,
                     run_dir,
@@ -215,6 +218,8 @@ pub fn loadValidated(
                     if (err == error.ScanArtifactBytesExceeded) {
                         return .{ .invalid = .scan_artifact_bytes_exceeded };
                     }
+                    const classified = try mapReadErrorAs(err, .draft_invalid);
+                    if (classified.invalid == .permission_denied or classified.invalid == .io_failed) return classified;
                     retained_draft_diagnostic = .invalid;
                     break :blk null;
                 };
@@ -308,19 +313,28 @@ fn readAuthority(
 }
 
 fn mapReadError(err: anyerror) std.mem.Allocator.Error!LoadResult {
-    if (err == error.OutOfMemory) return error.OutOfMemory;
-    return .{ .invalid = if (err == error.ScanArtifactBytesExceeded)
-        .scan_artifact_bytes_exceeded
-    else
-        .immutable_file_invalid };
+    return mapReadErrorAs(err, .immutable_file_invalid);
 }
 
 fn mapReadErrorAs(err: anyerror, reason: InvalidReason) std.mem.Allocator.Error!LoadResult {
     if (err == error.OutOfMemory) return error.OutOfMemory;
-    return .{ .invalid = if (err == error.ScanArtifactBytesExceeded)
-        .scan_artifact_bytes_exceeded
-    else
-        reason };
+    return .{ .invalid = switch (err) {
+        error.ScanArtifactBytesExceeded => .scan_artifact_bytes_exceeded,
+        error.AccessDenied, error.PermissionDenied => .permission_denied,
+        error.FileNotFound,
+        error.WrongType,
+        error.WrongOwner,
+        error.WrongMode,
+        error.CrossDevice,
+        error.MultipleLinks,
+        error.SymLinkLoop,
+        error.NotDir,
+        error.FileSizeOutOfBounds,
+        error.FileChangedWhileReading,
+        error.UnknownRunEntry,
+        => reason,
+        else => .io_failed,
+    } };
 }
 
 test "review history backend artifact budget is aggregate and fail closed" {
