@@ -97,7 +97,8 @@ fn findingAnnotationForFile(
 }
 
 pub fn humanReviewActionLabel(app: Context) ?[]const u8 {
-    if (app.page.human_review_decision.isOpen() or app.page.picker.isOpen()) return null;
+    if (app.page.human_review_decision.isOpen() or app.page.picker.isOpen() or
+        app.page.delete_confirmation.isOpen()) return null;
     const presentation = matchingHumanReviewPresentation(app) orelse return null;
     return switch (presentation.lifecycle) {
         .saving, .finalizing, .completed => "result",
@@ -271,7 +272,15 @@ pub fn viewPicker(app: Context, surface: *chasen.Surface) !void {
             detail_row += 1;
         }
         if (detail_row < footer_row) {
-            if (try aiReviewsStateMessage(app, content.frameAllocator())) |message| {
+            if (app.page.status.text().len > 0) {
+                try draw.copyClippedTextAt(
+                    &content,
+                    0,
+                    detail_row,
+                    firstLine(app.page.status.text()),
+                    app.palette.style(.prompt),
+                );
+            } else if (try aiReviewsStateMessage(app, content.frameAllocator())) |message| {
                 try draw.copyClippedTextAt(&content, 0, detail_row, message.text, messageStyle(app, message.failure));
             } else if (picker.selectedRow()) |selected| {
                 try drawAiReviewDetail(app, &content, detail_row, selected);
@@ -279,7 +288,97 @@ pub fn viewPicker(app: Context, surface: *chasen.Surface) !void {
         }
     }
 
-    try draw.copyClippedTextAt(&content, 0, footer_row, aiReviewsFooterText(picker), app.palette.style(.accent));
+    try draw.copyClippedTextAt(&content, 0, footer_row, aiReviewsFooterText(picker, size.width), app.palette.style(.accent));
+    if (app.page.delete_confirmation.isOpen()) try viewDeleteConfirmation(app, surface);
+}
+
+pub fn viewDeleteConfirmation(app: Context, surface: *chasen.Surface) !void {
+    const summary = app.page.delete_confirmation.summary() orelse return;
+    const deleting = app.page.delete_confirmation.isDeleting();
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, 88),
+        .dialog_height = @min(surface.size().height, 15),
+        .title = if (deleting) "Deleting AI review Run" else "Delete AI review Run?",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = app.palette.boldStyle(if (deleting) .prompt else .danger),
+        .border_style = app.palette.style(if (deleting) .prompt else .danger),
+    };
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    var dialog = frame.dialogSurface();
+    dialog.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
+    frame.view();
+    var content = frame.contentSurface();
+    const size = content.size();
+    if (size.height == 0) return;
+    const footer_row = size.height - 1;
+    var row: u16 = 0;
+
+    if (row < footer_row) {
+        const review_id = summary.request.review_id.canonical();
+        const identity = try std.fmt.allocPrint(content.frameAllocator(), "Run {s}", .{&review_id});
+        try draw.copyClippedTextAt(&content, 0, row, identity, app.palette.boldStyle(.accent));
+        row += 1;
+    }
+    if (row < footer_row) {
+        const producer = if (summary.producer_model) |model|
+            try std.fmt.allocPrint(content.frameAllocator(), "Producer: {s}  Model: {s}", .{ summary.producer_name, model })
+        else
+            try std.fmt.allocPrint(content.frameAllocator(), "Producer: {s}", .{summary.producer_name});
+        try draw.copyClippedTextAt(&content, 0, row, producer, chasen.TextStyle{});
+        row += 1;
+    }
+    if (row < footer_row) {
+        const target = try std.fmt.allocPrint(content.frameAllocator(), "Target: {s}@{s} -> {s}@{s}", .{
+            summary.base_label orelse "base",
+            summary.target.base_oid.short(),
+            summary.head_label orelse "head",
+            summary.target.head_oid.short(),
+        });
+        try draw.copyClippedTextAt(&content, 0, row, target, app.palette.style(.muted));
+        row += 1;
+    }
+    if (row < footer_row) {
+        const facts = try std.fmt.allocPrint(content.frameAllocator(), "Status: {s}  Current: {s}  Findings: {d}  Created: {s}", .{
+            ai_reviews_page.runSummaryStatusText(summary.status),
+            if (app.page.isCurrentReview(summary.request.review_id)) "yes" else "no",
+            summary.finding_count,
+            &summary.created_at,
+        });
+        try draw.copyClippedTextAt(&content, 0, row, facts, app.palette.style(.muted));
+        row += 1;
+    }
+    if (row < footer_row) row += 1;
+    if (summary.unfinished() and row < footer_row) {
+        try draw.copyClippedTextAt(
+            &content,
+            0,
+            row,
+            "WARNING: This Run is unfinished. Draft state will be removed.",
+            app.palette.boldStyle(.danger),
+        );
+        row += 1;
+    }
+    if (row < footer_row) {
+        try draw.copyClippedTextAt(
+            &content,
+            0,
+            row,
+            if (deleting) "Deleting the exact Run from the Review Store..." else "This permanently removes this exact Run from the Review Store.",
+            app.palette.style(if (deleting) .prompt else .danger),
+        );
+        row += 1;
+    }
+    if (!deleting and row < footer_row) {
+        try draw.copyClippedTextAt(&content, 0, row, "[ Cancel ]    Delete (y)", app.palette.boldStyle(.accent));
+    }
+    try draw.copyClippedTextAt(
+        &content,
+        0,
+        footer_row,
+        if (deleting) "Please wait" else "Enter/Esc/n: cancel  y: delete",
+        app.palette.style(.accent),
+    );
 }
 
 pub fn viewHumanReviewDecision(app: Context, surface: *chasen.Surface) !void {
@@ -595,7 +694,7 @@ fn drawAiReviewRow(
     focused: bool,
 ) !void {
     const focus_marker: []const u8 = if (focused) ">" else " ";
-    const current_marker: []const u8 = if (app.page.isCurrentReviewTarget(&item.target)) "*" else " ";
+    const current_marker: []const u8 = if (app.page.isCurrentReview(item.review_id)) "*" else " ";
     const status = if (item.availability == .missing) "target unavailable" else ai_reviews_page.runSummaryStatusText(item.status);
     const relative = commit_time.formatRelative(item.created_at_unix, app.page.picker.render_now_unix);
     const finding_label: []const u8 = if (item.finding_count == 1) "finding" else "findings";
@@ -641,11 +740,16 @@ fn drawAiReviewDetail(
     try draw.copyClippedTextAt(surface, 0, start_row + 1, detail, app.palette.style(.muted));
 }
 
-fn aiReviewsFooterText(picker: *const ai_reviews_page.AiReviewsPickerState) []const u8 {
+fn aiReviewsFooterText(picker: *const ai_reviews_page.AiReviewsPickerState, width: u16) []const u8 {
     const capabilities = picker.interactionCapabilities();
     if (picker.queryMode()) return "Type: filter  Up/Down: move  Tab: command  Esc: clear/list";
     if (capabilities.cancel) return "r: retry  Esc: cancel";
-    if (capabilities.list) return "/: filter  j/k: move  Enter: open  r: refresh/retry  Esc/q: close";
+    if (capabilities.list) return if (width >= 78)
+        "/: filter  j/k: move  Enter: open  c: close current  D: delete  r: refresh"
+    else if (width >= 58)
+        "Enter: open  c: close current  D: delete  r: refresh  Esc: close"
+    else
+        "Enter open  c close  D delete  Esc close";
     return "r: retry  Esc/q: close";
 }
 

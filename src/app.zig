@@ -249,6 +249,7 @@ pub const App = struct {
     ) !HumanReviewSaveOutcome {
         const session = self.human_review_sessions.currentSession() orelse
             return error.NoHumanReviewSession;
+        if (self.aiReviewDeletionHolds(session.binding)) return .{ .rejected = .admission_closed };
         const token = self.review_store_operations.queueToken(session.binding);
         const preparation = session.prepareSave(ctx.allocator(), token, .dirty_only) catch |err| {
             self.recordHumanReviewPreparationFailure(ctx, session, &token, .draft, null, err);
@@ -303,6 +304,7 @@ pub const App = struct {
     ) !HumanReviewFinalizeOutcome {
         const session = self.human_review_sessions.currentSession() orelse
             return error.NoHumanReviewSession;
+        if (self.aiReviewDeletionHolds(session.binding)) return .{ .rejected = .admission_closed };
         const store = if (self.configured_review_store) |*value| value else {
             session.markAdmissionFailure(.result, decision, .store_unavailable);
             return .{ .rejected = .store_unavailable };
@@ -397,6 +399,7 @@ pub const App = struct {
         ctx: *chasen.Ctx(Msg),
         request: review_store.DraftSaveRequest,
     ) !review_store_operations_mod.Admission {
+        if (self.aiReviewDeletionHolds(request.binding)) return .{ .rejected = .admission_closed };
         const store = if (self.configured_review_store) |*value| value else return .{ .rejected = .store_unavailable };
         if (!store.isConfigured()) return .{ .rejected = .store_unavailable };
         const admission = try self.review_store_operations.enqueueDraft(
@@ -414,6 +417,7 @@ pub const App = struct {
         ctx: *chasen.Ctx(Msg),
         request: review_store.ReviewResultCreateRequest,
     ) !review_store_operations_mod.Admission {
+        if (self.aiReviewDeletionHolds(request.binding)) return .{ .rejected = .admission_closed };
         const store = if (self.configured_review_store) |*value| value else return .{ .rejected = .store_unavailable };
         if (!store.isConfigured()) return .{ .rejected = .store_unavailable };
         const admission = try self.review_store_operations.enqueueResult(
@@ -429,6 +433,13 @@ pub const App = struct {
         return self.repo_session.view();
     }
 
+    fn aiReviewDeletionHolds(self: *const App, binding: review_store.ReviewRunBinding) bool {
+        return self.pages.ai_reviews.delete_confirmation.holdsRun(
+            binding.review_repository_id,
+            binding.review_id,
+        );
+    }
+
     fn repoSession(self: *App) repo_session.Controller {
         const home = if (self.env_map) |map| blk: {
             const value = map.get("HOME") orelse break :blk null;
@@ -441,7 +452,8 @@ pub const App = struct {
             .source = self.config.source,
             .home = home,
             .env_map = self.env_map,
-            .action_pending = self.actionLifecycleView().hasPending(),
+            .action_pending = self.actionLifecycleView().hasPending() or
+                self.pages.ai_reviews.delete_confirmation.isOpen(),
             .changes = self.changesRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
             .compare = .{ .page = &self.pages.compare },
@@ -470,6 +482,7 @@ pub const App = struct {
             .env_map = self.env_map,
             .store = if (self.configured_review_store) |*value| value else null,
             .sessions = &self.human_review_sessions,
+            .operations = &self.review_store_operations,
         };
     }
 
@@ -519,7 +532,8 @@ pub const App = struct {
                 .help = self.overlay.isHelp(),
                 .commit_input = self.localWorkflowView().commitPanelOpen(),
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
-                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isQuitAiReviews(),
+                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isQuitAiReviews() or
+                    self.pages.ai_reviews.delete_confirmation.isOpen(),
                 .branch_switch = self.overlay.isSwitchBranch(),
                 .push_error = self.overlay.isPushError(),
                 .git_action = self.actionLifecycleView().hasPending(),
@@ -878,6 +892,11 @@ pub const App = struct {
             ),
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
             .review_store_operation_finished => |finished| self.finishReviewStoreOperation(ctx, finished),
+            .ai_review_delete_finished => |finished| {
+                if (try self.aiReviewsCoordinator().finishDelete(ctx, finished) == .skip) {
+                    self.redraw_plan.requestSkip();
+                }
+            },
             .ai_review_job => |message| self.finishAiReviewJob(ctx, message),
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
             .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
@@ -2065,6 +2084,8 @@ pub const App = struct {
                     .picker_query_mode = self.pages.ai_reviews.picker.queryMode(),
                     .picker_query_len = self.pages.ai_reviews.picker.query.len,
                     .picker_loading = self.pages.ai_reviews.picker.loading(),
+                    .delete_confirmation_open = self.pages.ai_reviews.delete_confirmation.isOpen(),
+                    .delete_confirmation_deleting = self.pages.ai_reviews.delete_confirmation.isDeleting(),
                     .selected_run = self.pages.ai_reviews.selectedRunConst() != null,
                     .human_review = self.pages.ai_reviews.human_review_decision.inputContext(
                         self.humanReviewPresentation(),
@@ -2715,12 +2736,15 @@ test "human review result session App bridge tracks every accepted draft and res
         .findings = &.{},
     };
     var app: App = .{
+        .active_page = .ai_reviews,
         .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
         .allocator = allocator,
     };
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
+    defer app.pages.ai_reviews.deinit(allocator);
+    _ = app.pages.ai_reviews.activate(0);
     app.human_review_sessions.current = try human_review_session_mod.Session.init(
         allocator,
         binding,
@@ -2730,6 +2754,55 @@ test "human review result session App bridge tracks every accepted draft and res
     );
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     defer ctx.runtimeClearPendingEffectCopies();
+
+    var delete_row: review_store.RunSummary = .{
+        .review_id = review_id,
+        .target = binding.target,
+        .status = .draft,
+        .created_at = "2026-08-27T00:00:00Z".*,
+        .created_at_unix = 0,
+        .producer_name = @constCast("test"),
+        .producer_model = null,
+        .base_label = null,
+        .head_label = null,
+        .finding_count = 0,
+        .availability = .available,
+        .artifact_snapshot = .{
+            .manifest_digest = committed.Sha256Digest.hash("manifest"),
+            .findings_digest = binding.findings_digest,
+            .draft_state = .valid,
+            .draft_digest = committed.Sha256Digest.hash("draft"),
+            .result_digest = null,
+        },
+    };
+    try app.pages.ai_reviews.delete_confirmation.begin(allocator, .{
+        .root_device = 1,
+        .root_inode = 2,
+        .repository_locator = .{ .device = 3, .inode = 4 },
+        .review_repository_id = repository_id,
+    }, &delete_row, null);
+    try app.human_review_sessions.currentSession().?.editSummary(allocator, "blocked");
+    try std.testing.expect((try app.saveHumanReviewSession(&ctx)) == .rejected);
+    try app.update(.{ .switch_page = .config }, &ctx);
+    try std.testing.expectEqual(page.Id.ai_reviews, app.active_page);
+    try std.testing.expectEqualStrings("finish confirmation before switching pages", app.status.text());
+
+    _ = app.pages.ai_reviews.delete_confirmation.confirm(
+        app.pages.ai_reviews.activation.currentIdentity().?,
+        .{ .device = 5, .inode = 6 },
+        app.configured_review_store.?.identity(),
+    ).?;
+    try app.repoSession().enterPicker(allocator);
+    try std.testing.expect(!app.repo_session.repo_picker.mode);
+    try std.testing.expectEqualStrings("finish current git action before switching repos", app.status.text());
+    try std.testing.expect((try app.saveHumanReviewSession(&ctx)) == .rejected);
+    try std.testing.expectEqual(
+        human_review_session_mod.AdmissionFailure.admission_closed,
+        (try app.finalizeHumanReviewSession(&ctx, .needs_changes)).rejected,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.human_review_sessions.currentSessionConst().?.operationCount());
+    app.pages.ai_reviews.delete_confirmation.restoreConfirmation();
+    try std.testing.expect(app.pages.ai_reviews.delete_confirmation.cancel(allocator));
 
     try app.human_review_sessions.currentSession().?.editSummary(allocator, "first");
     const first = try app.saveHumanReviewSession(&ctx);

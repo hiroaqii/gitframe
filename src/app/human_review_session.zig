@@ -1078,6 +1078,35 @@ pub const Owner = struct {
         return session.presentation();
     }
 
+    pub fn currentHoldsRun(
+        self: *const Owner,
+        review_repository_id: committed_review.ReviewRepositoryId,
+        review_id: committed_review.ReviewId,
+    ) bool {
+        const session = self.currentSessionConst() orelse return false;
+        return bindingNamesRun(session.binding, review_repository_id, review_id);
+    }
+
+    pub fn detachedHoldsRun(
+        self: *const Owner,
+        review_repository_id: committed_review.ReviewRepositoryId,
+        review_id: committed_review.ReviewId,
+    ) bool {
+        for (self.detached[0..self.detached_len]) |*session| {
+            if (bindingNamesRun(session.binding, review_repository_id, review_id)) return true;
+        }
+        return false;
+    }
+
+    pub fn holdsRun(
+        self: *const Owner,
+        review_repository_id: committed_review.ReviewRepositoryId,
+        review_id: committed_review.ReviewId,
+    ) bool {
+        return self.currentHoldsRun(review_repository_id, review_id) or
+            self.detachedHoldsRun(review_repository_id, review_id);
+    }
+
     pub fn prepareInstall(
         self: *const Owner,
         candidate: *Session,
@@ -1250,6 +1279,15 @@ pub const Owner = struct {
         return result;
     }
 };
+
+fn bindingNamesRun(
+    binding: review_store.ReviewRunBinding,
+    review_repository_id: committed_review.ReviewRepositoryId,
+    review_id: committed_review.ReviewId,
+) bool {
+    return binding.review_repository_id.eql(review_repository_id) and
+        binding.review_id.eql(review_id);
+}
 
 fn lastDraft(session: *const Session) ?*const OperationEntry {
     var index = session.operations_len;
@@ -1959,6 +1997,23 @@ fn testCompletion(
         .completed_at = completed_at,
         .failure = failure,
     };
+}
+
+test "human review owner reports current and detached nominal Run ownership" {
+    const allocator = std.testing.allocator;
+    const binding = try testBinding(111);
+    const findings = testFindingSet(binding, &.{});
+    var owner: Owner = .{};
+    defer owner.deinit();
+    owner.current = try Session.init(allocator, binding, &findings, null, null);
+    try std.testing.expect(owner.currentHoldsRun(binding.review_repository_id, binding.review_id));
+    try std.testing.expect(owner.holdsRun(binding.review_repository_id, binding.review_id));
+
+    owner.detached[0] = owner.current.?;
+    owner.current = null;
+    owner.detached_len = 1;
+    try std.testing.expect(owner.detachedHoldsRun(binding.review_repository_id, binding.review_id));
+    try std.testing.expect(owner.holdsRun(binding.review_repository_id, binding.review_id));
 }
 
 fn testBinding(suffix: u8) !review_store.ReviewRunBinding {

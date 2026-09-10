@@ -22,6 +22,7 @@ const root_capability = @import("../../repo/root_capability.zig");
 const review_store = @import("../../review_store.zig");
 const commit_time = @import("../branch_commit_time.zig");
 const human_review_decision = @import("ai_reviews/human_review_decision.zig");
+const delete_confirmation = @import("ai_reviews/delete_confirmation.zig");
 
 pub const selection_source: diff_source.SourceMode = .{ .range = "review" };
 
@@ -358,6 +359,24 @@ pub const AiReviewsPickerState = struct {
         const source_index = self.filter.sourceIndex(self.focus) orelse return null;
         if (source_index >= history_value.rows.len) return null;
         return &history_value.rows[source_index];
+    }
+
+    pub fn selectedStoreSnapshot(self: *const AiReviewsPickerState) ?review_store.StoreSnapshot {
+        const history_value = self.historyConst() orelse return null;
+        return history_value.snapshot;
+    }
+
+    /// Prefer the next visible row, then the previous one, after deleting the
+    /// focused Run. The returned identity remains valid after the scan owner is
+    /// released because ReviewId is a value type.
+    pub fn adjacentSelectedReviewId(self: *const AiReviewsPickerState) ?committed_review.ReviewId {
+        const history_value = self.historyConst() orelse return null;
+        const count = self.filter.source_indexes.len;
+        if (count <= 1 or self.focus >= count) return null;
+        const visible_index = if (self.focus + 1 < count) self.focus + 1 else self.focus - 1;
+        const source_index = self.filter.sourceIndex(visible_index) orelse return null;
+        if (source_index >= history_value.rows.len) return null;
+        return history_value.rows[source_index].review_id;
     }
 
     pub fn rows(self: *const AiReviewsPickerState) []const review_store.RunSummary {
@@ -946,6 +965,7 @@ pub const AiReviewsPageState = struct {
     diff: committed_diff.State = .{},
     selected_run: ?SelectedRunPresentation = null,
     picker: AiReviewsPickerState = .{},
+    delete_confirmation: delete_confirmation.State = .{},
     human_review_decision: human_review_decision.State = .{},
     finding_card: finding_card.State = .unfocused,
 
@@ -979,6 +999,11 @@ pub const AiReviewsPageState = struct {
     pub fn activeReviewId(self: *const AiReviewsPageState) ?committed_review.ReviewId {
         const selected = if (self.selected_run) |*value| value else return null;
         return selected.reviewId();
+    }
+
+    pub fn isCurrentReview(self: *const AiReviewsPageState, review_id: committed_review.ReviewId) bool {
+        const current = self.activeReviewId() orelse return false;
+        return current.eql(review_id);
     }
 
     pub fn currentTarget(self: *const AiReviewsPageState) ?committed_review.CommittedReviewTarget {
@@ -1034,6 +1059,19 @@ pub const AiReviewsPageState = struct {
 
     pub fn clearRetainedSelection(self: *AiReviewsPageState, allocator: std.mem.Allocator) void {
         self.diff.clearRetainedSelection(allocator);
+    }
+
+    /// Release a clean selected Run without affecting the open history picker.
+    pub fn closeSelectedRun(self: *AiReviewsPageState, allocator: std.mem.Allocator) void {
+        self.human_review_decision.close();
+        self.finding_card = .unfocused;
+        self.diff.deinit(allocator);
+        self.diff = .{};
+        if (self.selected_run) |*selected| selected.deinit(allocator);
+        self.selected_run = null;
+        if (self.activation.currentIdentity()) |identity| {
+            _ = self.activation.finishMember(identity, .source, .unavailable);
+        }
     }
 
     pub fn commitSelectedRun(
@@ -1118,6 +1156,7 @@ pub const AiReviewsPageState = struct {
         self.diff.deinit(allocator);
         if (self.selected_run) |*selected| selected.deinit(allocator);
         self.picker.deinit(allocator);
+        self.delete_confirmation.deinit(allocator);
         self.human_review_decision.deinit();
         self.* = .{};
     }

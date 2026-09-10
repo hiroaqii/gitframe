@@ -22,6 +22,11 @@ pub const Msg = union(enum) {
     picker_next,
     picker_activate,
     picker_refresh_or_retry,
+    open_run_delete,
+    cancel_run_delete,
+    confirm_run_delete,
+    close_selected_run,
+    delete_owned_noop,
     open_human_review_decision,
     human_review_decision: human_review_decision.Msg,
     finding_navigation: FindingNavigationIntent,
@@ -71,6 +76,8 @@ pub const Context = struct {
     picker_query_mode: bool = false,
     picker_query_len: usize = 0,
     picker_loading: bool = false,
+    delete_confirmation_open: bool = false,
+    delete_confirmation_deleting: bool = false,
     selected_run: bool = false,
     human_review: human_review_decision.InputContext = .{},
     finding_card_focused: bool = false,
@@ -78,6 +85,7 @@ pub const Context = struct {
 };
 
 pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
+    if (context.delete_confirmation_open) return null;
     if (context.human_review.open) {
         return .{ .human_review_decision = human_review_decision.pasteToMsg(context.human_review, text) orelse return null };
     }
@@ -86,6 +94,7 @@ pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
 }
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
+    if (context.delete_confirmation_open) return deleteKeyToMsg(context, key);
     if (context.human_review.open) {
         return .{ .human_review_decision = human_review_decision.keyToMsg(context.human_review, key) orelse return null };
     }
@@ -126,9 +135,23 @@ fn pickerKeyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.codepoint == '/') return .picker_enter_query;
     if (key.codepoint == 'q') return .close_picker;
     if (key.codepoint == 'r') return .picker_refresh_or_retry;
+    if (key_input.matchesShiftedAscii(key, 'd', 'D')) return .open_run_delete;
+    if (key.codepoint == 'c' and !key_input.hasCommandModifier(key)) return .close_selected_run;
     if (key.codepoint == 'k') return .picker_previous;
     if (key.codepoint == 'j') return .picker_next;
     return null;
+}
+
+fn deleteKeyToMsg(context: Context, key: chasen.Key) ?Msg {
+    if (context.delete_confirmation_deleting) return .delete_owned_noop;
+    if (key.matches(chasen.Key.enter, .{}) or
+        key.matches(chasen.Key.escape, .{}) or
+        (!key_input.hasCommandModifier(key) and (key.codepoint == 'n' or key.codepoint == 'q')))
+    {
+        return .cancel_run_delete;
+    }
+    if (!key_input.hasCommandModifier(key) and key.codepoint == 'y') return .confirm_run_delete;
+    return .delete_owned_noop;
 }
 
 fn normalKeyToMsg(context: Context, key: chasen.Key) ?Msg {
@@ -215,5 +238,26 @@ test "AI Reviews picker and Finding overlay retain separate input grammars" {
     try std.testing.expectEqual(
         Msg{ .finding_card = .accept },
         keyToMsg(.{ .finding_card_focused = true, .selected_run = true }, .{ .codepoint = 'a' }).?,
+    );
+}
+
+test "AI Reviews picker reserves uppercase D for exact Run deletion only in command mode" {
+    try std.testing.expectEqual(
+        Msg.open_run_delete,
+        keyToMsg(.{ .picker_open = true }, .{ .codepoint = 'D' }).?,
+    );
+    try std.testing.expectEqual(
+        Msg{ .picker_insert = 'D' },
+        keyToMsg(.{ .picker_open = true, .picker_query_mode = true }, .{ .codepoint = 'D' }).?,
+    );
+}
+
+test "AI Reviews Run deletion defaults Enter to cancel and requires y" {
+    const context: Context = .{ .picker_open = true, .delete_confirmation_open = true };
+    try std.testing.expectEqual(Msg.cancel_run_delete, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(Msg.confirm_run_delete, keyToMsg(context, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(
+        Msg.delete_owned_noop,
+        keyToMsg(.{ .picker_open = true, .delete_confirmation_open = true, .delete_confirmation_deleting = true }, .{ .codepoint = 'y' }).?,
     );
 }

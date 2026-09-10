@@ -11,6 +11,7 @@ const page = @import("page.zig");
 const push_retry = @import("push_retry.zig");
 const compare_input = @import("pages/compare/input.zig");
 const ai_reviews_input = @import("pages/ai_reviews/input.zig");
+const ai_review_delete = @import("pages/ai_reviews/delete_confirmation.zig");
 const diff_surface = @import("diff_surface.zig");
 const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const repository_page = @import("pages/repository.zig");
@@ -150,6 +151,7 @@ pub const Msg = union(enum) {
     push_upstream_finalize_finished: push_retry.FinalizeFinished,
     shell_effect_finished: ShellEffectFinished,
     review_store_operation_finished: ReviewStoreOperationFinished,
+    ai_review_delete_finished: ai_review_delete.Finished,
     ai_review_job: ai_review_jobs.Msg,
     changes: changes_message.Msg,
     compare: compare_input.Msg,
@@ -271,6 +273,7 @@ pub const Msg = union(enum) {
             .action_finished => |*finished| finished.deinit(allocator),
             .push_inspection_finished => |*finished| finished.deinit(allocator),
             .review_store_operation_finished => |*finished| finished.deinit(allocator),
+            .ai_review_delete_finished => |*finished| finished.deinit(allocator),
             .ai_review_job => |*message| message.deinit(),
             .repository => |*repository_msg| repository_msg.deinitUndelivered(allocator),
             else => {},
@@ -291,6 +294,7 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         .push_upstream_finalize_finished,
         .shell_effect_finished,
         .review_store_operation_finished,
+        .ai_review_delete_finished,
         .ai_review_job,
         .auto_reload_tick,
         .drag_auto_scroll_tick,

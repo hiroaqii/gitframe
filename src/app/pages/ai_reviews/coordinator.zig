@@ -24,10 +24,13 @@ const ai_reviews_navigation = @import("navigation.zig");
 const finding_card_view = @import("finding_card_view.zig");
 const review_store = @import("../../../review_store.zig");
 const human_review_session = @import("../../human_review_session.zig");
+const review_store_operations = @import("../../review_store_operations.zig");
 const committed_review = @import("../../../committed_review.zig");
+const delete_confirmation = @import("delete_confirmation.zig");
 
 const HistoryScanTask = app_load.AiReviewScanTask(app_message.Msg);
 const HistorySelectionTask = app_load.AiReviewSelectionTask(app_message.Msg);
+const DeleteTask = delete_confirmation.Task(app_message.Msg);
 
 pub const Redraw = enum {
     default,
@@ -92,6 +95,7 @@ pub const Controller = struct {
     env_map: ?*std.process.Environ.Map,
     store: ?*const review_store.ConfiguredStore = null,
     sessions: *human_review_session.Owner,
+    operations: ?*review_store_operations.Owner = null,
 
     pub fn navigation(self: Controller) ai_reviews_navigation.Controller {
         return .{
@@ -120,6 +124,10 @@ pub const Controller = struct {
         ctx: *chasen.Ctx(app_message.Msg),
         msg: ai_reviews_input.Msg,
     ) !UpdateOutcome {
+        if (self.page_state.delete_confirmation.isOpen()) switch (msg) {
+            .cancel_run_delete, .confirm_run_delete, .delete_owned_noop => {},
+            else => return .{},
+        };
         self.ensureFindingPresentationCache();
         switch (msg) {
             .common => |common_msg| switch (common_msg) {
@@ -143,6 +151,11 @@ pub const Controller = struct {
             .picker_next => self.page_state.picker.moveSelection(1),
             .picker_activate => try self.activateSelection(ctx),
             .picker_refresh_or_retry => try self.retryPicker(ctx),
+            .open_run_delete => try self.openRunDelete(ctx.allocator()),
+            .cancel_run_delete => _ = self.page_state.delete_confirmation.cancel(ctx.allocator()),
+            .confirm_run_delete => try self.confirmRunDelete(ctx),
+            .close_selected_run => self.closeSelectedRun(ctx.allocator()),
+            .delete_owned_noop => {},
             .open_human_review_decision => try self.openHumanReviewDecision(ctx.allocator()),
             .human_review_decision => |decision_msg| {
                 if (decision_msg == .close) {
@@ -311,6 +324,7 @@ pub const Controller = struct {
     }
 
     pub fn refresh(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        if (self.page_state.delete_confirmation.isOpen()) return;
         if (self.page_state.selectedRunConst() == null) {
             self.page_state.status.set("Select an AI review before refreshing", .{});
             return;
@@ -344,6 +358,7 @@ pub const Controller = struct {
     ) !HistorySelectionFinish {
         var finished = result;
         defer finished.deinit(ctx.allocator());
+        if (self.page_state.delete_confirmation.isOpen()) return .{ .redraw = .skip };
         const store = self.configuredStore() orelse return .{ .redraw = .skip };
         if (!self.page_state.picker.acceptsSelection(
             self.repo.epoch(),
@@ -441,8 +456,183 @@ pub const Controller = struct {
         };
     }
 
+    pub fn finishDelete(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        result: delete_confirmation.Finished,
+    ) !Redraw {
+        var finished = result;
+        defer finished.deinit(ctx.allocator());
+        const store = self.configuredStore() orelse return .skip;
+        const accepted = self.page_state.delete_confirmation.accept(
+            ctx.allocator(),
+            self.repo.epoch(),
+            self.repo.activeIdentity(),
+            store.identity(),
+            self.page_state.activation.acceptsPageInstance(finished.identity, self.repo.epoch()),
+            finished,
+        ) orelse return .skip;
+
+        switch (accepted.result) {
+            .failed_static => |message| self.page_state.status.set("Could not delete AI review: {s}", .{message}),
+            .result => |delete_result| switch (delete_result) {
+                .failure => |failure| self.page_state.status.set(
+                    "Could not delete AI review: {s}",
+                    .{deleteFailureText(failure)},
+                ),
+                .deleted => |cleanup| {
+                    switch (cleanup) {
+                        .complete => self.page_state.status.set("Deleted AI review Run", .{}),
+                        .pending => |failure| self.page_state.status.set(
+                            "Deleted AI review Run; cleanup pending: {s}",
+                            .{deleteFailureText(failure)},
+                        ),
+                    }
+                    try self.startHistoryScanPreferred(ctx, accepted.fallback_review_id, true);
+                },
+            },
+        }
+        return .default;
+    }
+
     pub fn prepareModalRedraw(self: Controller, io: std.Io) void {
         self.page_state.picker.prepareModalRedraw(io);
+    }
+
+    fn openRunDelete(self: Controller, allocator: std.mem.Allocator) !void {
+        if (self.page_state.delete_confirmation.isOpen()) return;
+        switch (self.page_state.picker.phase) {
+            .ready, .selection_failed => {},
+            .scan_loading, .selection_loading => {
+                self.page_state.status.set("Wait for the current AI review load before deleting", .{});
+                return;
+            },
+            .closed, .empty, .scan_failed => return,
+        }
+        const row = self.page_state.picker.selectedRow() orelse return;
+        const store = self.page_state.picker.selectedStoreSnapshot() orelse return;
+        if (self.deleteBlocked(store.review_repository_id, row.review_id)) return;
+        try self.page_state.delete_confirmation.begin(
+            allocator,
+            store,
+            row,
+            self.page_state.picker.adjacentSelectedReviewId(),
+        );
+    }
+
+    fn confirmRunDelete(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        const summary = self.page_state.delete_confirmation.summary() orelse return;
+        const repository_id = summary.request.store.review_repository_id;
+        const review_id = summary.request.review_id;
+        if (self.deleteBlocked(repository_id, review_id)) return;
+        const identity = self.page_state.activation.currentIdentity() orelse {
+            self.page_state.status.set("Could not delete AI review: page unavailable", .{});
+            return;
+        };
+        const root_identity = self.repo.activeIdentity() orelse {
+            self.page_state.status.set("Could not delete AI review: repository unavailable", .{});
+            return;
+        };
+        const store = self.configuredStore() orelse {
+            self.page_state.status.set("Could not delete AI review: Store unavailable", .{});
+            return;
+        };
+        const capability = self.repo.activeCapability() orelse {
+            self.page_state.status.set("Could not delete AI review: repository unavailable", .{});
+            return;
+        };
+        const request = self.page_state.delete_confirmation.confirm(
+            identity,
+            root_identity,
+            store.identity(),
+        ) orelse return;
+        const task = ctx.allocator().create(DeleteTask) catch |err| {
+            self.page_state.delete_confirmation.restoreConfirmation();
+            self.page_state.status.set("Could not allocate AI review deletion", .{});
+            return err;
+        };
+        task.* = DeleteTask.init(
+            request,
+            store,
+            capability.*,
+            self.env_map,
+            ctx.allocator(),
+        ) catch |err| {
+            ctx.allocator().destroy(task);
+            self.page_state.delete_confirmation.restoreConfirmation();
+            self.page_state.status.set("Could not prepare AI review deletion", .{});
+            return err;
+        };
+        ctx.task().spawnWith(.{ .ctx = task, .run = DeleteTask.run, .failed = DeleteTask.failed }) catch |err| {
+            task.destroy(ctx.allocator());
+            self.page_state.delete_confirmation.restoreConfirmation();
+            self.page_state.status.set("Could not start AI review deletion", .{});
+            return err;
+        };
+    }
+
+    fn deleteBlocked(
+        self: Controller,
+        repository_id: committed_review.ReviewRepositoryId,
+        review_id: committed_review.ReviewId,
+    ) bool {
+        if (self.page_state.selectedRunConst()) |selected| {
+            const binding = selected.binding();
+            if (binding.review_repository_id.eql(repository_id) and binding.review_id.eql(review_id)) {
+                self.page_state.status.set("Close the selected Run with c before deleting it", .{});
+                return true;
+            }
+        }
+        if (self.sessions.holdsRun(repository_id, review_id)) {
+            self.page_state.status.set("Close the active or recovery session before deleting this Run", .{});
+            return true;
+        }
+        if (self.operations) |operations| {
+            if (operations.holdsRun(repository_id, review_id)) {
+                self.page_state.status.set("Finish the pending review save before deleting this Run", .{});
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn closeSelectedRun(self: Controller, allocator: std.mem.Allocator) void {
+        if (self.page_state.picker.loading()) {
+            self.page_state.status.set("Wait for the current AI review load before closing the selected Run", .{});
+            return;
+        }
+        const selected = self.page_state.selectedRunConst() orelse {
+            self.page_state.status.set("No selected AI review Run to close", .{});
+            return;
+        };
+        const binding = selected.binding();
+        if (self.operations) |operations| {
+            if (operations.holdsRun(binding.review_repository_id, binding.review_id)) {
+                self.page_state.status.set("Finish the pending review save before closing this Run", .{});
+                return;
+            }
+        }
+        if (self.sessions.detachedHoldsRun(binding.review_repository_id, binding.review_id)) {
+            self.page_state.status.set("This Run has retained recovery state and cannot be closed here", .{});
+            return;
+        }
+        if (self.sessions.currentSessionConst() != null and
+            !self.sessions.currentHoldsRun(binding.review_repository_id, binding.review_id))
+        {
+            self.page_state.status.set("Selected Run session ownership is inconsistent", .{});
+            return;
+        }
+        const plan = self.sessions.prepareClear() catch {
+            self.page_state.status.set("Save or resolve this Run before closing it", .{});
+            return;
+        };
+        if (plan == .detach) {
+            self.page_state.status.set("This Run has recovery state and cannot be closed here", .{});
+            return;
+        }
+        self.sessions.commitClear(plan);
+        self.page_state.closeSelectedRun(allocator);
+        self.page_state.status.set("Closed selected AI review Run", .{});
     }
 
     /// Common update-tail admission for the one selected-Run presentation
@@ -484,15 +674,24 @@ pub const Controller = struct {
     }
 
     fn startHistoryScan(self: Controller, ctx: *chasen.Ctx(app_message.Msg), retain_query: bool) !void {
+        const preferred = if (retain_query)
+            if (self.page_state.picker.selectedRow()) |row| row.review_id else self.page_state.activeReviewId()
+        else
+            self.page_state.activeReviewId();
+        try self.startHistoryScanPreferred(ctx, preferred, retain_query);
+    }
+
+    fn startHistoryScanPreferred(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        preferred: ?committed_review.ReviewId,
+        retain_query: bool,
+    ) !void {
         const identity = self.page_state.activation.currentIdentity() orelse return;
         const root_identity = self.repo.activeIdentity() orelse {
             self.page_state.status.set("AI reviews require a repository", .{});
             return;
         };
-        const preferred = if (retain_query)
-            if (self.page_state.picker.selectedRow()) |row| row.review_id else self.page_state.activeReviewId()
-        else
-            self.page_state.activeReviewId();
         const request = self.page_state.picker.beginScan(
             ctx.allocator(),
             identity,
@@ -1369,4 +1568,18 @@ fn findingCardCopyText(
         .{ content.title, content.body, suggestion },
     );
     return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ content.title, content.body });
+}
+
+fn deleteFailureText(failure: review_store.MaintenanceFailure) []const u8 {
+    return switch (failure) {
+        .not_found => "Run not found",
+        .conflict => "Run changed",
+        .unfinished => "Run is unfinished",
+        .binding_changed => "repository binding changed",
+        .run_invalid => "Run is invalid",
+        .permission_denied => "permission denied",
+        .io_failed => "I/O failed",
+        .store_unavailable => "Store unavailable",
+        .unsupported => "unsupported filesystem",
+    };
 }

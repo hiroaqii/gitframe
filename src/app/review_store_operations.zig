@@ -542,6 +542,20 @@ pub const Owner = struct {
         return false;
     }
 
+    /// Deletion admission uses the nominal Store namespace and Run identity;
+    /// immutable target or digest drift must not hide an active write owner.
+    pub fn holdsRun(
+        self: *const Owner,
+        review_repository_id: committed_review.ReviewRepositoryId,
+        review_id: committed_review.ReviewId,
+    ) bool {
+        for (self.slots[0..self.slots_len]) |*slot| {
+            if (slot.binding.review_repository_id.eql(review_repository_id) and
+                slot.binding.review_id.eql(review_id)) return true;
+        }
+        return false;
+    }
+
     fn planDraft(
         self: *const Owner,
         request: review_store.DraftSaveRequest,
@@ -832,6 +846,28 @@ test "review state persistence operation owner coalesces drafts serializes resul
     try std.testing.expect(result_outcome.quit_ready);
     try std.testing.expect(!owner.last_completion.?.notified_review);
     try std.testing.expect(!owner.hasWork());
+}
+
+test "review Store operation owner reports a nominal Run despite immutable binding drift" {
+    const allocator = std.testing.allocator;
+    var store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused");
+    defer store.deinit(allocator);
+    var owner: Owner = .{};
+    defer owner.deinit(allocator);
+    const binding = try testBinding(42);
+    _ = try owner.enqueueDraft(allocator, &store, testDraft(binding, 0, "pending"));
+    try std.testing.expect(owner.holdsRun(binding.review_repository_id, binding.review_id));
+
+    var drifted = binding;
+    drifted.findings_digest = committed_review.Sha256Digest.hash("different findings");
+    try std.testing.expect(owner.holdsRun(drifted.review_repository_id, drifted.review_id));
+
+    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    try std.testing.expectEqual(@as(usize, 1), try owner.pump(&ctx));
+    try std.testing.expect(owner.holdsRun(binding.review_repository_id, binding.review_id));
+    const tasks = ctx.takePendingTasksWith();
+    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
 }
 
 test "review state persistence operation owner cancels failed drain and enforces finite Run cap" {

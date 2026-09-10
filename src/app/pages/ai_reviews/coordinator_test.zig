@@ -36,6 +36,7 @@ const ai_reviews_navigation = @import("navigation.zig");
 const ai_reviews_view = @import("view.zig");
 const human_review_decision = @import("human_review_decision.zig");
 const human_review_session = @import("../../human_review_session.zig");
+const review_store_operations = @import("../../review_store_operations.zig");
 
 const AiReviewScanTask = app_load.AiReviewScanTask(app_message.Msg);
 const AiReviewSelectionTask = app_load.AiReviewSelectionTask(app_message.Msg);
@@ -48,6 +49,7 @@ const TestApp = struct {
     layout: diff_surface.Layout = .{ .width = 100, .height = 30 },
     store: ?review_store.ConfiguredStore = null,
     sessions: human_review_session.Owner = .{},
+    operations: review_store_operations.Owner = .{},
 
     const Msg = app_message.Msg;
 
@@ -59,6 +61,7 @@ const TestApp = struct {
             .env_map = null,
             .store = if (self.store) |*value| value else null,
             .sessions = &self.sessions,
+            .operations = &self.operations,
         };
     }
 
@@ -92,6 +95,362 @@ test "AI Reviews reload remains task-free until a Run is selected" {
     try std.testing.expect(app.pages.ai_reviews.picker.phase == .closed);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     try std.testing.expectEqualStrings("Select an AI review before refreshing", app.pages.ai_reviews.status.text());
+}
+
+test "AI Reviews deletion confirmation owns the focused Run and renders an unfinished warning" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: TestApp = .{
+        .allocator = allocator,
+        .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
+        .store = try review_store.ConfiguredStore.initConfigured(allocator, "/delete-confirmation-store"),
+    };
+    defer app.store.?.deinit(allocator);
+    defer app.operations.deinit(allocator);
+    defer app.sessions.deinit();
+    defer app.pages.ai_reviews.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = app.pages.ai_reviews.activate(app.repo_session.repo_epoch);
+
+    const review_id = try committed_review.ReviewId.parse("623e4567-e89b-42d3-a456-426614174000");
+    const repository_id = try committed_review.ReviewRepositoryId.parse("723e4567-e89b-42d3-a456-426614174000");
+    const rows = try allocator.alloc(review_store.RunSummary, 1);
+    rows[0] = try reviewHistoryRow(allocator, review_id, .available);
+    rows[0].status = .draft;
+    rows[0].producer_model = try allocator.dupe(u8, "gpt-test");
+    app.pages.ai_reviews.picker.scan_result = .{ .history = .{
+        .snapshot = .{
+            .root_device = 1,
+            .root_inode = 2,
+            .repository_locator = .{ .device = 3, .inode = 4 },
+            .review_repository_id = repository_id,
+        },
+        .rows = rows,
+        .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
+        .skipped_count = 0,
+        .orphan_count = 0,
+    } };
+    const labels = [_][]const u8{"reviewer"};
+    try app.pages.ai_reviews.picker.filter.apply(allocator, &labels, "");
+    app.pages.ai_reviews.picker.phase = .ready;
+
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    try std.testing.expect(app.pages.ai_reviews.delete_confirmation.isOpen());
+    try std.testing.expect(app.pages.ai_reviews.delete_confirmation.summary().?.request.review_id.eql(review_id));
+    try app.update(.{ .ai_reviews = .picker_next }, &ctx);
+    try app.update(.{ .ai_reviews = .picker_refresh_or_retry }, &ctx);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.ai_reviews.picker.focus);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+
+    for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 80, .height = 24 } }) |size| {
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(size.width, size.height);
+        defer surface.deinit();
+        try ai_reviews_view.viewDeleteConfirmation(.{
+            .page = &app.pages.ai_reviews,
+            .palette = .default(),
+            .repo_root = roots.a,
+            .repo_epoch = app.repo_session.repo_epoch,
+            .root_identity = app.repo_session.view().activeIdentity(),
+            .layout = .{ .width = size.width, .height = size.height },
+        }, &surface.surface);
+        const snapshot = try surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Delete AI review Run?") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Current: no") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "WARNING: This Run is unfinished") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Enter/Esc/n: cancel  y: delete") != null);
+    }
+
+    const identity = app.pages.ai_reviews.activation.currentIdentity().?;
+    _ = app.pages.ai_reviews.delete_confirmation.confirm(
+        identity,
+        app.repo_session.view().activeIdentity().?,
+        app.store.?.identity(),
+    ).?;
+    const late = try app.controller().finishHistorySelection(&ctx, .{
+        .identity = identity,
+        .generation = app.pages.ai_reviews.picker.generation,
+        .store_identity = app.store.?.identity(),
+        .review_id = review_id,
+        .result = .{ .loaded = try reviewHistoryPinnedBundle(
+            allocator,
+            app.pages.ai_reviews.picker.selectedStoreSnapshot().?,
+            repository_id,
+            review_id,
+            rows[0].target,
+            false,
+        ) },
+    });
+    try std.testing.expectEqual(ai_reviews_coordinator.Redraw.skip, late.redraw);
+    try std.testing.expect(!late.loaded);
+    try std.testing.expect(app.pages.ai_reviews.selectedRunConst() == null);
+    try std.testing.expect(app.pages.ai_reviews.delete_confirmation.isDeleting());
+    app.pages.ai_reviews.delete_confirmation.restoreConfirmation();
+    try app.update(.{ .ai_reviews = .cancel_run_delete }, &ctx);
+    try std.testing.expect(!app.pages.ai_reviews.delete_confirmation.isOpen());
+    try std.testing.expect(app.pages.ai_reviews.picker.phase == .ready);
+}
+
+test "AI Reviews deletion admission honors session and Store operation owners" {
+    const allocator = std.testing.allocator;
+    const repository_id = try committed_review.ReviewRepositoryId.parse("733e4567-e89b-42d3-a456-426614174000");
+    const review_id = try committed_review.ReviewId.parse("633e4567-e89b-42d3-a456-426614174000");
+    const target: committed_review.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = reviewAppTestOid('a'),
+        .head_oid = reviewAppTestOid('b'),
+        .diff_base_oid = reviewAppTestOid('a'),
+    };
+    const snapshot: review_store.StoreSnapshot = .{
+        .root_device = 1,
+        .root_inode = 2,
+        .repository_locator = .{ .device = 3, .inode = 4 },
+        .review_repository_id = repository_id,
+    };
+    var bundle = try reviewHistoryPinnedBundle(allocator, snapshot, repository_id, review_id, target, false);
+    defer bundle.deinit(allocator);
+    const binding: review_store.ReviewRunBinding = .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .target = target,
+        .findings_digest = bundle.selection.artifacts.manifest.value.findings_digest,
+    };
+    var app: TestApp = .{
+        .store = try review_store.ConfiguredStore.initConfigured(allocator, "/delete-owner-store"),
+    };
+    defer app.store.?.deinit(allocator);
+    defer app.operations.deinit(allocator);
+    defer app.sessions.deinit();
+    defer app.pages.ai_reviews.deinit(allocator);
+    _ = app.pages.ai_reviews.activate(0);
+    const rows = try allocator.alloc(review_store.RunSummary, 1);
+    rows[0] = try reviewHistoryRow(allocator, review_id, .available);
+    app.pages.ai_reviews.picker.scan_result = .{ .history = .{
+        .snapshot = snapshot,
+        .rows = rows,
+        .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
+        .skipped_count = 0,
+        .orphan_count = 0,
+    } };
+    const labels = [_][]const u8{"reviewer"};
+    try app.pages.ai_reviews.picker.filter.apply(allocator, &labels, "");
+    app.pages.ai_reviews.picker.phase = .ready;
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+
+    app.sessions.current = try human_review_session.Session.init(
+        allocator,
+        binding,
+        &bundle.selection.artifacts.findings.value,
+        null,
+        null,
+    );
+    try app.sessions.currentSession().?.editSummary(allocator, "dirty");
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    try std.testing.expect(!app.pages.ai_reviews.delete_confirmation.isOpen());
+    try std.testing.expectEqualStrings("Close the active or recovery session before deleting this Run", app.pages.ai_reviews.status.text());
+
+    app.sessions.deinit();
+    app.sessions.current = try human_review_session.Session.init(
+        allocator,
+        binding,
+        &bundle.selection.artifacts.findings.value,
+        null,
+        null,
+    );
+    app.sessions.currentSession().?.markAdmissionFailure(.draft, null, .store_unavailable);
+    const clear = try app.sessions.prepareClear();
+    try std.testing.expect(clear == .detach);
+    app.sessions.commitClear(clear);
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    try std.testing.expect(!app.pages.ai_reviews.delete_confirmation.isOpen());
+    try std.testing.expectEqualStrings("Close the active or recovery session before deleting this Run", app.pages.ai_reviews.status.text());
+
+    app.sessions.deinit();
+    const admission = try app.operations.enqueueDraft(allocator, &app.store.?, .{
+        .binding = binding,
+        .expected_revision = 0,
+        .summary = "pending",
+        .finding_dispositions = &.{},
+        .anchored_notes = &.{},
+    });
+    try std.testing.expect(admission == .accepted);
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    try std.testing.expect(!app.pages.ai_reviews.delete_confirmation.isOpen());
+    try std.testing.expectEqualStrings("Finish the pending review save before deleting this Run", app.pages.ai_reviews.status.text());
+
+    try std.testing.expectEqual(@as(usize, 1), try app.operations.pump(&ctx));
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    try std.testing.expect(!app.pages.ai_reviews.delete_confirmation.isOpen());
+    try std.testing.expectEqualStrings("Finish the pending review save before deleting this Run", app.pages.ai_reviews.status.text());
+    const tasks = ctx.takePendingTasksWith();
+    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+}
+
+test "AI Reviews clean close releases the pinned owner before deletion admission" {
+    const allocator = std.testing.allocator;
+    const repository_id = try committed_review.ReviewRepositoryId.parse("823e4567-e89b-42d3-a456-426614174000");
+    const review_id = try committed_review.ReviewId.parse("923e4567-e89b-42d3-a456-426614174000");
+    const target: committed_review.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = reviewAppTestOid('a'),
+        .head_oid = reviewAppTestOid('b'),
+        .diff_base_oid = reviewAppTestOid('a'),
+    };
+    const snapshot: review_store.StoreSnapshot = .{
+        .root_device = 1,
+        .root_inode = 2,
+        .repository_locator = .{ .device = 3, .inode = 4 },
+        .review_repository_id = repository_id,
+    };
+    var bundle = try reviewHistoryPinnedBundle(allocator, snapshot, repository_id, review_id, target, false);
+    var app: TestApp = .{};
+    defer app.operations.deinit(allocator);
+    defer app.sessions.deinit();
+    defer app.pages.ai_reviews.deinit(allocator);
+    _ = app.pages.ai_reviews.activate(0);
+    app.sessions.current = try human_review_session.Session.init(
+        allocator,
+        .{
+            .review_repository_id = repository_id,
+            .review_id = review_id,
+            .target = target,
+            .findings_digest = bundle.selection.artifacts.manifest.value.findings_digest,
+        },
+        &bundle.selection.artifacts.findings.value,
+        null,
+        null,
+    );
+    app.pages.ai_reviews.selected_run = .{
+        .selection = bundle.selection,
+        .base_display = try allocator.dupe(u8, "base"),
+        .head_display = try allocator.dupe(u8, "head"),
+    };
+    bundle.selection = undefined;
+
+    const rows = try allocator.alloc(review_store.RunSummary, 1);
+    rows[0] = try reviewHistoryRow(allocator, review_id, .available);
+    app.pages.ai_reviews.picker.scan_result = .{ .history = .{
+        .snapshot = snapshot,
+        .rows = rows,
+        .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
+        .skipped_count = 0,
+        .orphan_count = 0,
+    } };
+    const labels = [_][]const u8{"reviewer"};
+    try app.pages.ai_reviews.picker.filter.apply(allocator, &labels, "");
+    app.pages.ai_reviews.picker.phase = .ready;
+
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    try std.testing.expect(!app.pages.ai_reviews.delete_confirmation.isOpen());
+    try std.testing.expectEqualStrings("Close the selected Run with c before deleting it", app.pages.ai_reviews.status.text());
+
+    var surface: chasen.testing.TestSurface = undefined;
+    try surface.init(100, 30);
+    defer surface.deinit();
+    try ai_reviews_view.viewPicker(.{
+        .page = &app.pages.ai_reviews,
+        .palette = .default(),
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = 100, .height = 30 },
+    }, &surface.surface);
+    const snapshot_text = try surface.snapshot(allocator);
+    defer allocator.free(snapshot_text);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        snapshot_text,
+        "Close the selected Run with c before deleting it",
+    ) != null);
+
+    try app.update(.{ .ai_reviews = .close_selected_run }, &ctx);
+    try std.testing.expect(app.pages.ai_reviews.selectedRunConst() == null);
+    try std.testing.expect(app.sessions.currentSessionConst() == null);
+    try std.testing.expect(app.pages.ai_reviews.picker.phase == .ready);
+
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    try std.testing.expect(app.pages.ai_reviews.delete_confirmation.isOpen());
+}
+
+test "AI Reviews deletion failure retains the list while success reloads toward the adjacent Run" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: TestApp = .{
+        .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
+        .store = try review_store.ConfiguredStore.initConfigured(allocator, "/delete-completion-store"),
+    };
+    defer app.store.?.deinit(allocator);
+    defer app.operations.deinit(allocator);
+    defer app.sessions.deinit();
+    defer app.pages.ai_reviews.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    _ = app.pages.ai_reviews.activate(app.repo_session.repo_epoch);
+    const identity = app.pages.ai_reviews.activation.currentIdentity().?;
+    const root_identity = app.repo_session.view().activeIdentity().?;
+    const first_id = try committed_review.ReviewId.parse("a23e4567-e89b-42d3-a456-426614174000");
+    const second_id = try committed_review.ReviewId.parse("b23e4567-e89b-42d3-a456-426614174000");
+    const repository_id = try committed_review.ReviewRepositoryId.parse("c23e4567-e89b-42d3-a456-426614174000");
+    const rows = try allocator.alloc(review_store.RunSummary, 2);
+    rows[0] = try reviewHistoryRow(allocator, first_id, .available);
+    rows[1] = try reviewHistoryRow(allocator, second_id, .available);
+    app.pages.ai_reviews.picker.scan_result = .{ .history = .{
+        .snapshot = .{
+            .root_device = 1,
+            .root_inode = 2,
+            .repository_locator = .{ .device = 3, .inode = 4 },
+            .review_repository_id = repository_id,
+        },
+        .rows = rows,
+        .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
+        .skipped_count = 0,
+        .orphan_count = 0,
+    } };
+    const labels = [_][]const u8{ "first", "second" };
+    try app.pages.ai_reviews.picker.filter.apply(allocator, &labels, "");
+    app.pages.ai_reviews.picker.phase = .ready;
+
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    const failed_request = app.pages.ai_reviews.delete_confirmation.confirm(identity, root_identity, app.store.?.identity()).?;
+    const failed_redraw = try app.controller().finishDelete(&ctx, .{
+        .identity = identity,
+        .generation = failed_request.generation,
+        .root_identity = root_identity,
+        .store_identity = app.store.?.identity(),
+        .review_id = first_id,
+        .result = .{ .result = .{ .failure = .conflict } },
+    });
+    try std.testing.expectEqual(ai_reviews_coordinator.Redraw.default, failed_redraw);
+    try std.testing.expect(app.pages.ai_reviews.picker.phase == .ready);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqualStrings("Could not delete AI review: Run changed", app.pages.ai_reviews.status.text());
+
+    try app.update(.{ .ai_reviews = .open_run_delete }, &ctx);
+    const success_request = app.pages.ai_reviews.delete_confirmation.confirm(identity, root_identity, app.store.?.identity()).?;
+    _ = try app.controller().finishDelete(&ctx, .{
+        .identity = identity,
+        .generation = success_request.generation,
+        .root_identity = root_identity,
+        .store_identity = app.store.?.identity(),
+        .review_id = first_id,
+        .result = .{ .result = .{ .deleted = .complete } },
+    });
+    try std.testing.expect(app.pages.ai_reviews.picker.phase == .scan_loading);
+    try std.testing.expect(app.pages.ai_reviews.picker.refocus_review_id.?.eql(second_id));
+    const queued = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    const scan_task: *AiReviewScanTask = @ptrCast(@alignCast(queued[0].ctx));
+    AiReviewScanTask.destroy(scan_task, allocator);
 }
 
 test "AI Reviews picker requests return to the event loop before captured workers complete" {
