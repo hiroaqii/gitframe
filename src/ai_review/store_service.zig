@@ -656,7 +656,7 @@ fn admitExactRun(
     defer resolved.deinit(allocator);
     const configured_store = switch (resolved) {
         .store => |*value| value,
-        .failure => |failure| return .{ .failure = mapPublicationToReadFailure(failure) },
+        .failure => return .{ .failure = .store_invalid },
     };
     return admitExactRunLocated(allocator, io, configured_store, .{
         .capability = &repository.root,
@@ -774,6 +774,10 @@ fn identityFromAdmitted(
         .failure => |failure| return .{ .failure = failure },
         .exact => |*value| value,
     };
+    return identityFromExact(allocator, exact, review_id);
+}
+
+fn identityFromExact(allocator: std.mem.Allocator, exact: *const catalog_store.ExactRun, review_id: committed_review.ReviewId) std.mem.Allocator.Error!ReadResult {
     const manifest = &exact.artifacts.manifest.value;
     const artifacts = exact.artifact_snapshot;
     const producer_name = try allocator.dupe(u8, manifest.producer.name);
@@ -895,6 +899,150 @@ pub fn cleanupTrash(
     return core.cleanupTrash(allocator, io, configured_store.context(), expected);
 }
 
+/// Owned display facts and freshness assertions, never a retained Store handle.
+pub const DeletePreview = struct {
+    store: StoreSnapshot,
+    exact: ExactIdentity,
+    status: RunSummaryStatus,
+
+    pub fn deinit(self: *DeletePreview, allocator: std.mem.Allocator) void {
+        self.exact.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const DeletePreviewResult = union(enum) {
+    preview: DeletePreview,
+    failure: MaintenanceFailure,
+
+    pub fn deinit(self: *DeletePreviewResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .preview => |*value| value.deinit(allocator),
+            .failure => {},
+        }
+        self.* = .{ .failure = .io_failed };
+    }
+};
+
+/// Confirmation reads the named Run only and does not require its Git objects.
+pub fn previewDelete(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: ?*std.process.Environ.Map,
+    repository_path: []const u8,
+    review_id: committed_review.ReviewId,
+) std.mem.Allocator.Error!DeletePreviewResult {
+    var repository = switch (try openRepository(allocator, io, environment, repository_path)) {
+        .context => |value| value,
+        .failure => |failure| return .{ .failure = maintenancePublicationFailure(failure) },
+    };
+    defer repository.deinit();
+    var resolved = try resolveConfiguredStore(allocator, io, environment);
+    defer resolved.deinit(allocator);
+    const configured = switch (resolved) {
+        .store => |*value| value,
+        .failure => |failure| return .{ .failure = maintenanceConfigFailure(failure) },
+    };
+    return previewDeleteLocated(allocator, io, configured, repository.locator, review_id);
+}
+
+fn previewDeleteLocated(allocator: std.mem.Allocator, io: std.Io, configured: *const ConfiguredStore, locator: committed_review.GitCommonDirectoryLocator, review_id: committed_review.ReviewId) std.mem.Allocator.Error!DeletePreviewResult {
+    var read = try catalog_store.readExact(allocator, io, configured.context(), locator, review_id, null, null);
+    defer read.deinit(allocator);
+    const exact = switch (read) {
+        .exact => |*value| value,
+        .absent => return .{ .failure = .not_found },
+        .failure => |failure| return .{ .failure = maintenanceReadFailure(failure) },
+    };
+    const identity = try identityFromExact(allocator, exact, review_id);
+    return .{ .preview = .{
+        .store = exact.snapshot,
+        .exact = identity.exact,
+        .status = if (exact.artifacts.result) |result| switch (result.value.result) {
+            .approved => .approved,
+            .needs_changes => .needs_changes,
+            .canceled => .canceled,
+        } else if (exact.artifacts.state == .draft) .draft else .new,
+    } };
+}
+
+/// Freshly resolve the process input; deletion revalidates the preview assertions.
+pub fn deleteFromPath(allocator: std.mem.Allocator, io: std.Io, environment: ?*std.process.Environ.Map, repository_path: []const u8, request: DeleteRequest) std.mem.Allocator.Error!DeleteResult {
+    var repository = switch (try openRepository(allocator, io, environment, repository_path)) {
+        .context => |value| value,
+        .failure => |failure| return .{ .failure = maintenancePublicationFailure(failure) },
+    };
+    defer repository.deinit();
+    var resolved = try resolveConfiguredStore(allocator, io, environment);
+    defer resolved.deinit(allocator);
+    const configured = switch (resolved) {
+        .store => |*value| value,
+        .failure => |failure| return .{ .failure = maintenanceConfigFailure(failure) },
+    };
+    return deleteRun(allocator, io, configured, .{ .capability = &repository.root, .environment = &repository.environment }, request);
+}
+
+pub fn cleanupFromPath(allocator: std.mem.Allocator, io: std.Io, environment: ?*std.process.Environ.Map, repository_path: []const u8) std.mem.Allocator.Error!CleanupResult {
+    var repository = switch (try openRepository(allocator, io, environment, repository_path)) {
+        .context => |value| value,
+        .failure => |failure| return .{ .failure = maintenancePublicationFailure(failure) },
+    };
+    defer repository.deinit();
+    var resolved = try resolveConfiguredStore(allocator, io, environment);
+    defer resolved.deinit(allocator);
+    const configured = switch (resolved) {
+        .store => |*value| value,
+        .failure => |failure| return .{ .failure = maintenanceConfigFailure(failure) },
+    };
+    var scanned = try catalog_store.scan(allocator, io, configured.context(), repository.locator);
+    defer scanned.deinit(allocator);
+    const snapshot = switch (scanned) {
+        .unbound => return .{ .failure = .not_found },
+        .bound_empty => |value| value.snapshot,
+        .catalog => |value| value.snapshot,
+        .failure => |failure| return .{ .failure = switch (failure) {
+            .permission_denied => .permission_denied,
+            .io_failed, .registry_unavailable, .enumeration_failed => .io_failed,
+            .store_unavailable => .store_unavailable,
+            .unsupported_platform, .unsupported_filesystem => .unsupported,
+            .registry_invalid => .binding_changed,
+            .store_invalid, .namespace_invalid, .scan_limit_exceeded => .run_invalid,
+        } },
+    };
+    return cleanupTrash(allocator, io, configured, .{ .capability = &repository.root, .environment = &repository.environment }, snapshot);
+}
+
+fn maintenanceReadFailure(failure: catalog_store.ReadFailure) MaintenanceFailure {
+    return switch (failure) {
+        .permission_denied => .permission_denied,
+        .io_failed, .registry_unavailable => .io_failed,
+        .store_unavailable => .store_unavailable,
+        .unsupported_platform, .unsupported_filesystem => .unsupported,
+        .root_changed, .binding_changed, .registry_invalid => .binding_changed,
+        .artifact_changed, .concurrent_conflict => .conflict,
+        .store_invalid, .namespace_invalid, .artifact_invalid => .run_invalid,
+    };
+}
+
+fn maintenanceConfigFailure(failure: config.ConfigLoadFailure) MaintenanceFailure {
+    return switch (failure) {
+        .read_permission_denied => .permission_denied,
+        .read_failed => .io_failed,
+        else => .run_invalid,
+    };
+}
+
+fn maintenancePublicationFailure(failure: PublicationFailure) MaintenanceFailure {
+    return switch (failure) {
+        .store_unavailable => .store_unavailable,
+        .unsupported_platform, .unsupported_filesystem => .unsupported,
+        .repository_invalid, .binding_mismatch => .binding_changed,
+        .store_invalid, .invalid_artifact => .run_invalid,
+        .duplicate_review_id, .concurrent_conflict => .conflict,
+        .target_unavailable, .git_failed, .io_failed => .io_failed,
+    };
+}
+
 fn maintenanceBindingFailure(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -982,7 +1130,7 @@ pub fn prepare(
     defer resolved.deinit(allocator);
     const configured_store = switch (resolved) {
         .store => |*value| value,
-        .failure => |failure| return .{ .failure = failure },
+        .failure => return .{ .failure = .store_invalid },
     };
     return prepareLocated(allocator, io, configured_store, repository.locator, repository_path);
 }
@@ -1018,7 +1166,7 @@ pub fn publish(
     defer resolved.deinit(allocator);
     const configured_store = switch (resolved) {
         .store => |*value| value,
-        .failure => |failure| return .{ .failure = failure },
+        .failure => return .{ .failure = .store_invalid },
     };
     return publishLocated(allocator, io, configured_store, .{
         .capability = &repository.root,
@@ -1150,14 +1298,14 @@ fn openRepository(
 
 const ResolvedConfiguredStore = union(enum) {
     store: ConfiguredStore,
-    failure: PublicationFailure,
+    failure: config.ConfigLoadFailure,
 
     fn deinit(self: *ResolvedConfiguredStore, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .store => |*value| value.deinit(allocator),
             .failure => {},
         }
-        self.* = .{ .failure = .store_unavailable };
+        self.* = .{ .failure = .read_failed };
     }
 };
 
@@ -1172,11 +1320,11 @@ fn resolveConfiguredStore(
     defer loaded.deinit();
     const configured = switch (loaded) {
         .success => |*owned| owned.value.ai_review.store_root,
-        .failure => return .{ .failure = .store_invalid },
+        .failure => |failure| return .{ .failure = failure },
     };
     const value = ConfiguredStore.init(allocator, configured, environment_map) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidStoreRoot => return .{ .failure = .store_invalid },
+        error.InvalidStoreRoot => return .{ .failure = .invalid_ai_review_store_root },
     };
     return .{ .store = value };
 }
@@ -1197,6 +1345,8 @@ fn expectedIdentityMatches(
 
 fn mapCatalogScanFailure(failure: catalog_store.ScanFailure) ScanFailure {
     return switch (failure) {
+        .permission_denied => .store_unavailable,
+        .io_failed => .store_invalid,
         .store_invalid => .store_invalid,
         .store_unavailable => .store_unavailable,
         .unsupported_platform => .unsupported_platform,
@@ -1266,6 +1416,8 @@ fn deinitDiagnostics(allocator: std.mem.Allocator, values: *std.ArrayList(Diagno
 
 fn mapExactSelectionFailure(failure: catalog_store.ReadFailure) SelectionFailure {
     return switch (failure) {
+        .permission_denied => .root_drift,
+        .io_failed => .run_invalid,
         .root_changed => .root_drift,
         .binding_changed => .binding_drift,
         .artifact_changed => .artifact_drift,
@@ -1277,6 +1429,8 @@ fn mapExactSelectionFailure(failure: catalog_store.ReadFailure) SelectionFailure
 
 fn mapExactIdentityFailure(failure: catalog_store.ReadFailure) ReadFailure {
     return switch (failure) {
+        .permission_denied => .store_unavailable,
+        .io_failed => .io_failed,
         .store_unavailable => .store_unavailable,
         .unsupported_platform => .unsupported_platform,
         .unsupported_filesystem => .unsupported_filesystem,
@@ -1867,6 +2021,17 @@ test "review store deletion service preserves Git and sibling Runs without targe
         for (catalog.rows) |row| if (row.review_id.eql(prepared.review_id)) break :found row.artifact_snapshot;
         return error.MissingFixtureRun;
     };
+    var preview_result = try previewDeleteLocated(allocator, io, &configured, locator, prepared.review_id);
+    defer preview_result.deinit(allocator);
+    const preview = &preview_result.preview;
+    try std.testing.expect(preview.exact.review_id.eql(prepared.review_id));
+    try std.testing.expect(preview.exact.identity.target.eql(&target));
+    try std.testing.expectEqual(RunSummaryStatus.approved, preview.status);
+    try std.testing.expectEqual(run.DraftSnapshotState.invalid, preview.exact.artifacts.draft_state);
+    try std.testing.expect(preview.exact.artifacts.eql(artifacts));
+    var draft_preview = try previewDeleteLocated(allocator, io, &configured, locator, sibling);
+    defer draft_preview.deinit(allocator);
+    try std.testing.expectEqual(RunSummaryStatus.draft, draft_preview.preview.status);
     const state_context: ReadStateContext = .{ .repository = repo, .repository_path = repo_path, .store_path = store_path_text };
     var before = try captureReadOnlyState(allocator, io, state_context);
     defer before.deinit(allocator);
@@ -1888,6 +2053,9 @@ test "review store deletion service preserves Git and sibling Runs without targe
     var absent = try catalog_store.readExact(allocator, io, configured.context(), locator, prepared.review_id, null, null);
     defer absent.deinit(allocator);
     try std.testing.expect(absent == .absent);
+    var missing_preview = try previewDeleteLocated(allocator, io, &configured, locator, prepared.review_id);
+    defer missing_preview.deinit(allocator);
+    try std.testing.expectEqual(MaintenanceFailure.not_found, missing_preview.failure);
     try std.testing.expectEqual(@as(usize, 0), (try cleanupTrash(allocator, io, &configured, repository, catalog.snapshot)).cleaned);
 }
 
@@ -2779,4 +2947,61 @@ fn expectExactIdentityMismatch(
     defer result.deinit(allocator);
     try std.testing.expect(result == .failure);
     try std.testing.expectEqual(ReadFailure.expected_mismatch, result.failure);
+}
+
+test "review run maintenance error mapping preserves new causes and legacy vocabularies" {
+    try std.testing.expectEqual(MaintenanceFailure.permission_denied, maintenanceReadFailure(.permission_denied));
+    try std.testing.expectEqual(MaintenanceFailure.io_failed, maintenanceReadFailure(.io_failed));
+    try std.testing.expectEqual(MaintenanceFailure.conflict, maintenanceReadFailure(.concurrent_conflict));
+    try std.testing.expectEqual(MaintenanceFailure.run_invalid, maintenanceReadFailure(.artifact_invalid));
+    try std.testing.expectEqual(ReadFailure.store_unavailable, mapExactIdentityFailure(.permission_denied));
+    try std.testing.expectEqual(ReadFailure.io_failed, mapExactIdentityFailure(.io_failed));
+    try std.testing.expectEqual(ScanFailure.store_unavailable, mapCatalogScanFailure(.permission_denied));
+    try std.testing.expectEqual(ScanFailure.store_invalid, mapCatalogScanFailure(.io_failed));
+}
+
+test "review run maintenance config failures stay distinct before Store mutation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "repo", .fromMode(0o700));
+    var repo = try tmp.dir.openDir(io, "repo", .{});
+    defer repo.close(io);
+    try runTestGitDiscard(io, repo, &.{ "git", "init", "--initial-branch=main" });
+    const repo_path = try repo.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(repo_path);
+    try tmp.dir.createDir(io, "gitframe", .fromMode(0o700));
+    const home = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("XDG_CONFIG_HOME", home);
+    try environment.put("XDG_STATE_HOME", home);
+    const id = try committed_review.ReviewId.parse("123e4567-e89b-42d3-a456-426614174000");
+    for ([_]MaintenanceFailure{ .permission_denied, .io_failed, .run_invalid }) |expected| {
+        const path = "gitframe/config.toml";
+        if (expected == .io_failed) {
+            // A configuration symlink loop deterministically exercises read_failed.
+            try tmp.dir.symLink(io, "config.toml", path, .{});
+        } else {
+            try tmp.dir.writeFile(io, .{ .sub_path = path, .data = if (expected == .run_invalid) "invalid = [" else "schema_version = 1\n" });
+        }
+        defer tmp.dir.deleteFile(io, path) catch unreachable;
+        if (expected == .permission_denied) {
+            var file = try tmp.dir.openFile(io, path, .{});
+            defer file.close(io);
+            try file.setPermissions(io, .fromMode(0o000));
+        }
+        var preview = try previewDelete(allocator, io, &environment, repo_path, id);
+        defer preview.deinit(allocator);
+        try std.testing.expectEqual(expected, preview.failure);
+        try std.testing.expectEqual(expected, (try cleanupFromPath(allocator, io, &environment, repo_path)).failure);
+        // Existing producer/read consumers keep their original public contract.
+        try std.testing.expectEqual(PublicationFailure.store_invalid, (try prepare(allocator, io, &environment, repo_path)).failure);
+        var legacy = try readExactIdentity(allocator, io, &environment, repo_path, id, null);
+        defer legacy.deinit(allocator);
+        try std.testing.expectEqual(ReadFailure.store_invalid, legacy.failure);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(io, "gitframe/ai-reviews", .{}));
+    }
 }

@@ -57,7 +57,7 @@ pub const ReadResult = union(enum) {
     missing,
     registry: ParsedRegistry,
     invalid,
-    unavailable,
+    unavailable: enum { permission_denied, io_failed },
 
     pub fn deinit(self: *ReadResult) void {
         switch (self.*) {
@@ -85,12 +85,12 @@ pub fn read(
 }
 
 fn classifyReadError(err: anyerror) ReadResult {
-    const name = @errorName(err);
-    if (std.mem.eql(u8, name, "FileNotFound")) return .missing;
-    if (std.mem.eql(u8, name, "AccessDenied") or
-        std.mem.eql(u8, name, "PermissionDenied") or
-        std.mem.eql(u8, name, "InputOutput")) return .unavailable;
-    return .invalid;
+    return switch (err) {
+        error.FileNotFound => .missing,
+        error.AccessDenied, error.PermissionDenied => .{ .unavailable = .permission_denied },
+        error.WrongType, error.WrongOwner, error.WrongMode, error.CrossDevice, error.MultipleLinks, error.SymLinkLoop, error.NotDir, error.FileSizeOutOfBounds, error.FileChangedWhileReading => .invalid,
+        else => .{ .unavailable = .io_failed },
+    };
 }
 
 pub fn parseStrict(allocator: std.mem.Allocator, bytes: []const u8) strict.ParseError!ParsedRegistry {
@@ -388,4 +388,14 @@ test "review history backend registry golden and negative files stay exact" {
     );
     defer allocator.free(duplicate);
     try std.testing.expectError(error.InvalidValue, parseStrict(allocator, duplicate));
+}
+
+test "review history backend registry keeps permission and IO separate from invalid authority" {
+    try std.testing.expectEqual(.permission_denied, classifyReadError(error.AccessDenied).unavailable);
+    try std.testing.expectEqual(.permission_denied, classifyReadError(error.PermissionDenied).unavailable);
+    try std.testing.expectEqual(.io_failed, classifyReadError(error.InputOutput).unavailable);
+    try std.testing.expectEqual(.io_failed, classifyReadError(error.SystemResources).unavailable);
+    try std.testing.expect(classifyReadError(error.FileNotFound) == .missing);
+    for ([_]anyerror{ error.WrongType, error.WrongOwner, error.WrongMode, error.CrossDevice, error.MultipleLinks, error.SymLinkLoop, error.NotDir, error.FileSizeOutOfBounds, error.FileChangedWhileReading }) |err|
+        try std.testing.expect(classifyReadError(err) == .invalid);
 }

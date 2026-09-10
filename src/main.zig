@@ -121,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const HelperCommand = enum {
+    ai_review,
     review_capabilities,
     review_input,
     review_producer,
@@ -134,6 +135,7 @@ const HelperCommand = enum {
 
 fn helperCommand(args: []const []const u8) ?HelperCommand {
     if (args.len < 2) return null;
+    if (std.mem.eql(u8, args[1], "ai-review")) return .ai_review;
     if (std.mem.eql(u8, args[1], "review-capabilities")) return .review_capabilities;
     if (std.mem.eql(u8, args[1], "review-input")) return .review_input;
     if (std.mem.eql(u8, args[1], "review-producer")) return .review_producer;
@@ -148,6 +150,7 @@ fn helperCommand(args: []const []const u8) ?HelperCommand {
 
 fn runHelper(command: HelperCommand, init: std.process.Init, arguments: []const []const u8) !u8 {
     return switch (command) {
+        .ai_review => gitframe.review_maintenance_command.run(init.gpa, init.io, init.environ_map, arguments, .stdin(), .stdout(), .stderr()),
         .review_capabilities => gitframe.review_capabilities_command.run(
             init.gpa,
             init.io,
@@ -436,6 +439,7 @@ test "wantsHelp detects help flags" {
 }
 
 test "helper first-token dispatch precedes global help scanning" {
+    try std.testing.expectEqual(HelperCommand.ai_review, helperCommand(&.{ "gitframe", "ai-review", "delete" }).?);
     const capability_args = [_][]const u8{ "gitframe", "review-capabilities", "--help" };
     try std.testing.expectEqual(HelperCommand.review_capabilities, helperCommand(&capability_args).?);
     try std.testing.expect(wantsHelp(&capability_args));

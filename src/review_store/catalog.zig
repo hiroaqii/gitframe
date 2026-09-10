@@ -99,6 +99,8 @@ pub const Catalog = struct {
 pub const BoundEmpty = struct { snapshot: StoreSnapshot };
 
 pub const ScanFailure = enum {
+    permission_denied,
+    io_failed,
     store_invalid,
     store_unavailable,
     unsupported_platform,
@@ -147,7 +149,10 @@ pub fn scan(
         .missing => return .unbound,
         .registry => |*value| value,
         .invalid => return .{ .failure = .registry_invalid },
-        .unavailable => return .{ .failure = .registry_unavailable },
+        .unavailable => |reason| return .{ .failure = switch (reason) {
+            .permission_denied => .permission_denied,
+            .io_failed => .io_failed,
+        } },
     };
     const repository_id = parsed_registry.lookup(locator) orelse return .unbound;
     const snapshot = snapshotFrom(opened.snapshot, locator, repository_id);
@@ -156,7 +161,7 @@ pub fn scan(
         return if (err == error.FileNotFound)
             .{ .bound_empty = .{ .snapshot = snapshot } }
         else
-            .{ .failure = .namespace_invalid };
+            .{ .failure = classifyAccess(err, ScanFailure.namespace_invalid) };
     };
     defer namespace.deinit();
 
@@ -169,7 +174,7 @@ pub fn scan(
     var skipped_count: usize = 0;
     var orphan_count: usize = 0;
     var iterator = namespace.iterate();
-    while (iterator.next(namespace, io) catch return .{ .failure = .enumeration_failed }) |entry| {
+    while (iterator.next(namespace, io) catch |err| return .{ .failure = classifyAccess(err, ScanFailure.enumeration_failed) }) |entry| {
         entry_count += 1;
         name_bytes = std.math.add(usize, name_bytes, entry.name.len) catch
             return .{ .failure = .scan_limit_exceeded };
@@ -258,6 +263,8 @@ pub fn scan(
 }
 
 pub const ReadFailure = enum {
+    permission_denied,
+    io_failed,
     store_unavailable,
     unsupported_platform,
     unsupported_filesystem,
@@ -359,7 +366,10 @@ fn readExactWithHook(
         .missing => return if (expected_store == null) .absent else .{ .failure = .binding_changed },
         .registry => |*value| value,
         .invalid => return .{ .failure = .registry_invalid },
-        .unavailable => return .{ .failure = .registry_unavailable },
+        .unavailable => |reason| return .{ .failure = switch (reason) {
+            .permission_denied => .permission_denied,
+            .io_failed => .io_failed,
+        } },
     };
     const repository_id = parsed_registry.lookup(locator) orelse
         return if (expected_store == null) .absent else .{ .failure = .binding_changed };
@@ -375,7 +385,7 @@ fn readExactWithHook(
         return if (err == error.FileNotFound)
             if (expected_store == null) .absent else .{ .failure = .artifact_changed }
         else
-            .{ .failure = .namespace_invalid };
+            .{ .failure = classifyAccess(err, ReadFailure.namespace_invalid) };
     };
     defer namespace.deinit();
     const review_text = review_id.canonical();
@@ -383,7 +393,7 @@ fn readExactWithHook(
         return if (err == error.FileNotFound)
             if (expected_store == null) .absent else .{ .failure = .artifact_changed }
         else
-            .{ .failure = .artifact_invalid };
+            .{ .failure = classifyAccess(err, ReadFailure.artifact_invalid) };
     };
 
     var budget: run.ArtifactBudget = .{};
@@ -398,7 +408,7 @@ fn readExactWithHook(
     defer loaded_result.deinit(allocator);
     const loaded = switch (loaded_result) {
         .loaded => |*value| value,
-        .invalid => return .{ .failure = .artifact_invalid },
+        .invalid => |reason| return .{ .failure = loadFailure(reason) },
     };
     const artifact_snapshot = run.ArtifactSnapshot.fromLoaded(loaded);
     if (expected_artifacts) |expected| {
@@ -413,7 +423,7 @@ fn readExactWithHook(
         repository_id,
         review_id,
         artifact_snapshot,
-    )) return .{ .failure = .concurrent_conflict };
+    )) |failure| return .{ .failure = failure };
     if (try bindingChangedAfterAdmission(
         allocator,
         io,
@@ -421,7 +431,7 @@ fn readExactWithHook(
         opened.snapshot,
         locator,
         repository_id,
-    )) return .{ .failure = .concurrent_conflict };
+    )) |failure| return .{ .failure = failure };
 
     const artifacts = loaded.*;
     loaded_result = .{ .invalid = .artifact_invalid };
@@ -441,22 +451,28 @@ fn bindingChangedAfterAdmission(
     expected_root: core.RootSnapshot,
     locator: committed_review.GitCommonDirectoryLocator,
     repository_id: committed_review.ReviewRepositoryId,
-) std.mem.Allocator.Error!bool {
+) std.mem.Allocator.Error!?ReadFailure {
     var current = switch (context.openExisting()) {
         .opened => |value| value,
-        .missing, .unavailable, .failure => return true,
+        .missing => return .concurrent_conflict,
+        .unavailable => return .store_unavailable,
+        .failure => |failure| return mapReadOpenFailure(failure),
     };
     defer current.deinit();
-    if (!current.snapshot.eql(expected_root)) return true;
+    if (!current.snapshot.eql(expected_root)) return .concurrent_conflict;
     var registry_result = try registry.read(allocator, io, current.root.directory);
     defer registry_result.deinit();
     return switch (registry_result) {
-        .missing => true,
+        .missing => .concurrent_conflict,
         .registry => |*parsed| if (parsed.lookup(locator)) |found|
-            !found.eql(repository_id)
+            if (found.eql(repository_id)) null else .concurrent_conflict
         else
-            true,
-        .invalid, .unavailable => true,
+            .concurrent_conflict,
+        .invalid => .registry_invalid,
+        .unavailable => |reason| switch (reason) {
+            .permission_denied => .permission_denied,
+            .io_failed => .io_failed,
+        },
     };
 }
 
@@ -467,7 +483,7 @@ fn artifactsChangedAfterAdmission(
     repository_id: committed_review.ReviewRepositoryId,
     review_id: committed_review.ReviewId,
     admitted: run.ArtifactSnapshot,
-) std.mem.Allocator.Error!bool {
+) std.mem.Allocator.Error!?ReadFailure {
     var budget: run.ArtifactBudget = .{};
     var current = try run.loadValidated(
         allocator,
@@ -479,15 +495,20 @@ fn artifactsChangedAfterAdmission(
     );
     defer current.deinit(allocator);
     return switch (current) {
-        .loaded => |*value| !run.ArtifactSnapshot.fromLoaded(value).eql(admitted),
-        .invalid => true,
+        .loaded => |*value| if (run.ArtifactSnapshot.fromLoaded(value).eql(admitted)) null else .concurrent_conflict,
+        .invalid => |reason| switch (reason) {
+            .permission_denied => .permission_denied,
+            .io_failed => .io_failed,
+            else => .concurrent_conflict,
+        },
     };
 }
 
 fn mapOpenFailure(failure: core.OpenFailure) ScanFailure {
     return switch (failure) {
-        .permission_denied => .store_unavailable,
-        .io_unavailable, .unsafe_authority, .invalid => .store_invalid,
+        .permission_denied => .permission_denied,
+        .io_unavailable => .io_failed,
+        .unsafe_authority, .invalid => .store_invalid,
         .unsupported_platform => .unsupported_platform,
         .unsupported_filesystem => .unsupported_filesystem,
     };
@@ -495,10 +516,27 @@ fn mapOpenFailure(failure: core.OpenFailure) ScanFailure {
 
 fn mapReadOpenFailure(failure: core.OpenFailure) ReadFailure {
     return switch (failure) {
-        .permission_denied => .store_unavailable,
-        .io_unavailable, .unsafe_authority, .invalid => .store_invalid,
+        .permission_denied => .permission_denied,
+        .io_unavailable => .io_failed,
+        .unsafe_authority, .invalid => .store_invalid,
         .unsupported_platform => .unsupported_platform,
         .unsupported_filesystem => .unsupported_filesystem,
+    };
+}
+
+fn classifyAccess(err: anyerror, comptime invalid: anytype) @TypeOf(invalid) {
+    return switch (err) {
+        error.AccessDenied, error.PermissionDenied => .permission_denied,
+        error.WrongType, error.WrongOwner, error.WrongMode, error.CrossDevice, error.MultipleLinks, error.SymLinkLoop, error.NotDir, error.FileSizeOutOfBounds, error.FileChangedWhileReading => invalid,
+        else => .io_failed,
+    };
+}
+
+fn loadFailure(reason: run.InvalidReason) ReadFailure {
+    return switch (reason) {
+        .permission_denied => .permission_denied,
+        .io_failed => .io_failed,
+        else => .artifact_invalid,
     };
 }
 
@@ -758,6 +796,35 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
         try std.testing.expectEqual(ReadFailure.artifact_invalid, invalid.failure);
     }
 
+    // A valid but unreadable file is operational failure, not an invalid Run.
+    var registry_file = try store.openFile(io, "registry.json", .{ .mode = .read_write });
+    defer registry_file.close(io);
+    try registry_file.setPermissions(io, .fromMode(0o000));
+    {
+        defer registry_file.setPermissions(io, .fromMode(0o600)) catch unreachable;
+        var denied = try readExact(allocator, io, &context, locator, result_id, null, null);
+        defer denied.deinit(allocator);
+        try std.testing.expectEqual(ReadFailure.permission_denied, denied.failure);
+        var denied_scan = try scan(allocator, io, &context, locator);
+        defer denied_scan.deinit(allocator);
+        try std.testing.expectEqual(ScanFailure.permission_denied, denied_scan.failure);
+        try std.testing.expectEqual(ReadFailure.permission_denied, (try bindingChangedAfterAdmission(allocator, io, &context, expected_store.root(), locator, repository_id)).?);
+    }
+    var selected_dir = try namespace.openDir(io, &result_id.canonical(), .{});
+    defer selected_dir.close(io);
+    var manifest_file = try selected_dir.openFile(io, "manifest.json", .{ .mode = .read_write });
+    defer manifest_file.close(io);
+    try manifest_file.setPermissions(io, .fromMode(0o000));
+    {
+        defer manifest_file.setPermissions(io, .fromMode(0o600)) catch unreachable;
+        var denied = try readExact(allocator, io, &context, locator, result_id, null, null);
+        defer denied.deinit(allocator);
+        try std.testing.expectEqual(ReadFailure.permission_denied, denied.failure);
+        var namespace_cap = try exact_result.exact.root.root.directory.openDirectory(&repository_text);
+        defer namespace_cap.deinit();
+        try std.testing.expectEqual(ReadFailure.permission_denied, (try artifactsChangedAfterAdmission(allocator, io, namespace_cap, repository_id, result_id, expected_artifacts)).?);
+    }
+
     var over_limit = try scan(allocator, io, &context, locator);
     defer over_limit.deinit(allocator);
     try std.testing.expectEqual(ScanFailure.scan_limit_exceeded, over_limit.failure);
@@ -770,8 +837,8 @@ test "review history backend preserves open-error compatibility over the lossles
         expected_read: ReadFailure,
     };
     const cases = [_]Case{
-        .{ .core_failure = .permission_denied, .expected_scan = .store_unavailable, .expected_read = .store_unavailable },
-        .{ .core_failure = .io_unavailable, .expected_scan = .store_invalid, .expected_read = .store_invalid },
+        .{ .core_failure = .permission_denied, .expected_scan = .permission_denied, .expected_read = .permission_denied },
+        .{ .core_failure = .io_unavailable, .expected_scan = .io_failed, .expected_read = .io_failed },
         .{ .core_failure = .unsafe_authority, .expected_scan = .store_invalid, .expected_read = .store_invalid },
         .{ .core_failure = .invalid, .expected_scan = .store_invalid, .expected_read = .store_invalid },
         .{ .core_failure = .unsupported_platform, .expected_scan = .unsupported_platform, .expected_read = .unsupported_platform },
