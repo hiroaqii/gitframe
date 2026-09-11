@@ -874,6 +874,129 @@ pub const DeleteResult = core.DeleteResult;
 pub const MaintenanceFailure = core.MaintenanceFailure;
 pub const CleanupResult = core.CleanupResult;
 
+/// Owned Store-only facts used by maintenance commands. These deliberately
+/// omit Git availability and retain no Store capability.
+pub const MaintenanceRow = struct {
+    review_id: committed_review.ReviewId,
+    target: committed_review.CommittedReviewTarget,
+    status: RunSummaryStatus,
+    created_at: [20]u8,
+    created_at_unix: i64,
+    producer_name: []u8,
+    producer_model: ?[]u8,
+    finding_count: u32,
+    artifacts: ArtifactSnapshot,
+    logical_bytes: u64,
+
+    pub fn deinit(self: *MaintenanceRow, allocator: std.mem.Allocator) void {
+        if (self.producer_model) |value| allocator.free(value);
+        allocator.free(self.producer_name);
+        self.* = undefined;
+    }
+};
+
+pub const MaintenanceCatalog = struct {
+    store: StoreSnapshot,
+    rows: []MaintenanceRow,
+    diagnostics: []Diagnostic,
+    skipped_count: usize,
+    orphan_count: usize,
+
+    pub fn deinit(self: *MaintenanceCatalog, allocator: std.mem.Allocator) void {
+        for (self.rows) |*row| row.deinit(allocator);
+        allocator.free(self.rows);
+        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
+        allocator.free(self.diagnostics);
+        self.* = undefined;
+    }
+};
+
+pub const MaintenanceScanResult = union(enum) {
+    unbound,
+    bound_empty: StoreSnapshot,
+    catalog: MaintenanceCatalog,
+    failure: MaintenanceFailure,
+
+    pub fn deinit(self: *MaintenanceScanResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .catalog => |*value| value.deinit(allocator),
+            .unbound, .bound_empty, .failure => {},
+        }
+        self.* = .unbound;
+    }
+};
+
+/// Scan the current repository namespace without requiring retained Git
+/// objects. Mutation still goes through deleteFromPath and its fresh checks.
+pub fn scanMaintenanceFromPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: ?*std.process.Environ.Map,
+    repository_path: []const u8,
+) std.mem.Allocator.Error!MaintenanceScanResult {
+    var repository = switch (try openRepository(allocator, io, environment, repository_path)) {
+        .context => |value| value,
+        .failure => |failure| return .{ .failure = maintenancePublicationFailure(failure) },
+    };
+    defer repository.deinit();
+    var resolved = try resolveConfiguredStore(allocator, io, environment);
+    defer resolved.deinit(allocator);
+    const configured = switch (resolved) {
+        .store => |*value| value,
+        .failure => |failure| return .{ .failure = maintenanceConfigFailure(failure) },
+    };
+    return scanMaintenanceLocated(allocator, io, configured, repository.locator);
+}
+
+fn scanMaintenanceLocated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured: *const ConfiguredStore,
+    locator: committed_review.GitCommonDirectoryLocator,
+) std.mem.Allocator.Error!MaintenanceScanResult {
+    var scanned = try catalog_store.scan(allocator, io, configured.context(), locator);
+    defer scanned.deinit(allocator);
+    const source = switch (scanned) {
+        .unbound => return .unbound,
+        .bound_empty => |value| return .{ .bound_empty = value.snapshot },
+        .failure => |failure| return .{ .failure = maintenanceScanFailure(failure) },
+        .catalog => |*value| value,
+    };
+
+    var rows: std.ArrayList(MaintenanceRow) = .empty;
+    defer deinitMaintenanceRows(allocator, &rows);
+    for (source.rows) |*row| {
+        const owned = try maintenanceRowFromCatalog(allocator, row);
+        rows.append(allocator, owned) catch |err| {
+            var value = owned;
+            value.deinit(allocator);
+            return err;
+        };
+    }
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer deinitDiagnostics(allocator, &diagnostics);
+    for (source.diagnostics) |diagnostic|
+        try appendDiagnostic(allocator, &diagnostics, diagnostic.kind, diagnostic.text);
+
+    const owned_rows = try rows.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_rows) |*row| row.deinit(allocator);
+        allocator.free(owned_rows);
+    }
+    const owned_diagnostics = try diagnostics.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_diagnostics) |*diagnostic| diagnostic.deinit(allocator);
+        allocator.free(owned_diagnostics);
+    }
+    return .{ .catalog = .{
+        .store = source.snapshot,
+        .rows = owned_rows,
+        .diagnostics = owned_diagnostics,
+        .skipped_count = source.skipped_count,
+        .orphan_count = source.orphan_count,
+    } };
+}
+
 /// Physical repository identity is checked without requiring retained Git objects.
 pub fn deleteRun(
     allocator: std.mem.Allocator,
@@ -1022,6 +1145,38 @@ fn maintenanceReadFailure(failure: catalog_store.ReadFailure) MaintenanceFailure
         .artifact_changed, .concurrent_conflict => .conflict,
         .store_invalid, .namespace_invalid, .artifact_invalid => .run_invalid,
     };
+}
+
+fn maintenanceScanFailure(failure: catalog_store.ScanFailure) MaintenanceFailure {
+    return switch (failure) {
+        .permission_denied => .permission_denied,
+        .io_failed, .registry_unavailable, .enumeration_failed => .io_failed,
+        .store_unavailable => .store_unavailable,
+        .unsupported_platform, .unsupported_filesystem => .unsupported,
+        .registry_invalid => .binding_changed,
+        .store_invalid, .namespace_invalid, .scan_limit_exceeded => .run_invalid,
+    };
+}
+
+fn maintenanceRowFromCatalog(
+    allocator: std.mem.Allocator,
+    row: *const catalog_store.CatalogRow,
+) std.mem.Allocator.Error!MaintenanceRow {
+    var owned: MaintenanceRow = .{
+        .review_id = row.review_id,
+        .target = row.target,
+        .status = row.status,
+        .created_at = row.created_at,
+        .created_at_unix = row.created_at_unix,
+        .producer_name = try allocator.dupe(u8, row.producer_name),
+        .producer_model = null,
+        .finding_count = row.finding_count,
+        .artifacts = row.artifact_snapshot,
+        .logical_bytes = row.logical_bytes,
+    };
+    errdefer owned.deinit(allocator);
+    if (row.producer_model) |value| owned.producer_model = try allocator.dupe(u8, value);
+    return owned;
 }
 
 fn maintenanceConfigFailure(failure: config.ConfigLoadFailure) MaintenanceFailure {
@@ -1409,6 +1564,11 @@ fn deinitRows(allocator: std.mem.Allocator, rows: *std.ArrayList(RunSummary)) vo
     rows.deinit(allocator);
 }
 
+fn deinitMaintenanceRows(allocator: std.mem.Allocator, rows: *std.ArrayList(MaintenanceRow)) void {
+    for (rows.items) |*row| row.deinit(allocator);
+    rows.deinit(allocator);
+}
+
 fn deinitDiagnostics(allocator: std.mem.Allocator, values: *std.ArrayList(Diagnostic)) void {
     for (values.items) |*value| value.deinit(allocator);
     values.deinit(allocator);
@@ -1738,6 +1898,7 @@ const TestRunMode = enum {
     completed_canceled,
     completed_invalid_draft,
     completed_unsafe_draft,
+    completed_oversized_draft,
     invalid_result,
     unknown_entry,
 };
@@ -2059,6 +2220,127 @@ test "review store deletion service preserves Git and sibling Runs without targe
     try std.testing.expectEqual(@as(usize, 0), (try cleanupTrash(allocator, io, &configured, repository, catalog.snapshot)).cleaned);
 }
 
+test "review store maintenance prune scan and sequential delete use a disposable Store" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "repo", .default_dir);
+    var repo = try tmp.dir.openDir(io, "repo", .{});
+    defer repo.close(io);
+    for ([_][]const []const u8{
+        &.{ "git", "init", "--initial-branch=main" },
+        &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "fixture" },
+    }) |argv| allocator.free(try runTestGit(io, repo, argv));
+    const repo_path = try tmp.dir.realPathFileAlloc(io, "repo", allocator);
+    defer allocator.free(repo_path);
+    var repo_capability = try root_capability.RootCapability.openCanonical(repo_path);
+    defer repo_capability.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    const repository: RepositoryContext = .{ .capability = &repo_capability, .environment = &environment };
+    const locator = (try repository_locator.locate(allocator, io, repository.git())).locator;
+
+    try tmp.dir.createDir(io, "store", .fromMode(0o700));
+    const store_path_text = try tmp.dir.realPathFileAlloc(io, "store", allocator);
+    defer allocator.free(store_path_text);
+    var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
+    defer configured.deinit(allocator);
+    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = locator, .repository_path = repo_path })).success;
+    var store = try tmp.dir.openDir(io, "store", .{});
+    defer store.close(io);
+    const repository_text = prepared.review_repository_id.canonical();
+    var locks = try store.openDir(io, ".locks", .{});
+    defer locks.close(io);
+    try locks.createDir(io, &repository_text, .fromMode(0o700));
+    try store.createDir(io, &repository_text, .fromMode(0o700));
+    var namespace = try store.openDir(io, &repository_text, .{});
+    defer namespace.close(io);
+
+    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const target: committed_review.CommittedReviewTarget = .{ .object_format = .sha1, .source_kind = .branch_range, .base_oid = oid, .head_oid = oid, .diff_base_oid = oid };
+    const unsafe_id = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
+    const oversized_id = try committed_review.ReviewId.parse("323e4567-e89b-42d3-a456-426614174000");
+    const malformed_id = try committed_review.ReviewId.parse("423e4567-e89b-42d3-a456-426614174000");
+    const older_id = try committed_review.ReviewId.parse("523e4567-e89b-42d3-a456-426614174000");
+    const oldest_id = try committed_review.ReviewId.parse("623e4567-e89b-42d3-a456-426614174000");
+    const draft_id = try committed_review.ReviewId.parse("723e4567-e89b-42d3-a456-426614174000");
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, prepared.review_id, target, "2026-08-20T09:00:00Z", .completed);
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, unsafe_id, target, "2026-08-20T08:00:00Z", .completed_unsafe_draft);
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, oversized_id, target, "2026-08-20T07:00:00Z", .completed_oversized_draft);
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, malformed_id, target, "2026-08-20T06:00:00Z", .completed_invalid_draft);
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, older_id, target, "2026-08-20T05:00:00Z", .completed);
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, oldest_id, target, "2026-08-20T04:00:00Z", .completed);
+    try seedTestRun(allocator, io, namespace, prepared.review_repository_id, draft_id, target, "2026-08-20T03:00:00Z", .draft);
+
+    const other = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = .{ .device = 17, .inode = 19 }, .repository_path = "/test/prune-other" })).success;
+    try store.createDir(io, &other.review_repository_id.canonical(), .fromMode(0o700));
+    var other_namespace = try store.openDir(io, &other.review_repository_id.canonical(), .{});
+    defer other_namespace.close(io);
+    try seedTestRun(allocator, io, other_namespace, other.review_repository_id, older_id, target, "2026-08-20T01:00:00Z", .completed);
+
+    var first_scan = try scanMaintenanceLocated(allocator, io, &configured, locator);
+    defer first_scan.deinit(allocator);
+    const first = &first_scan.catalog;
+    try std.testing.expectEqual(@as(usize, 7), first.rows.len);
+    const unsafe_row = try maintenanceTestRow(first, unsafe_id);
+    try std.testing.expectEqual(run.DraftSnapshotState.unsafe, unsafe_row.artifacts.draft_state);
+    try std.testing.expect(unsafe_row.artifacts.draft_digest == null);
+    const oversized_row = try maintenanceTestRow(first, oversized_id);
+    try std.testing.expectEqual(run.DraftSnapshotState.invalid, oversized_row.artifacts.draft_state);
+    try std.testing.expect(oversized_row.artifacts.draft_digest == null);
+    const malformed_row = try maintenanceTestRow(first, malformed_id);
+    try std.testing.expectEqual(run.DraftSnapshotState.invalid, malformed_row.artifacts.draft_state);
+    try std.testing.expect(malformed_row.artifacts.draft_digest != null);
+    try std.testing.expectEqual(try logicalTestRunBytes(io, namespace, malformed_id), malformed_row.logical_bytes);
+
+    {
+        var malformed_directory = try namespace.openDir(io, &malformed_id.canonical(), .{});
+        defer malformed_directory.close(io);
+        var retained_draft = try malformed_directory.openFile(io, "review_state.json", .{ .mode = .read_write });
+        defer retained_draft.close(io);
+        try retained_draft.setTimestampsNow(io);
+    }
+    var second_scan = try scanMaintenanceLocated(allocator, io, &configured, locator);
+    defer second_scan.deinit(allocator);
+    const second = &second_scan.catalog;
+    try std.testing.expectEqual(first.rows.len, second.rows.len);
+    try std.testing.expectEqual(malformed_row.created_at_unix, (try maintenanceTestRow(second, malformed_id)).created_at_unix);
+
+    for ([_]committed_review.ReviewId{ malformed_id, older_id, oldest_id }) |id| {
+        const row = try maintenanceTestRow(second, id);
+        const deleted = try deleteRun(allocator, io, &configured, repository, .{
+            .store = second.store,
+            .review_id = id,
+            .artifacts = row.artifacts,
+        });
+        try std.testing.expect(deleted == .deleted);
+    }
+    var remaining_scan = try scanMaintenanceLocated(allocator, io, &configured, locator);
+    defer remaining_scan.deinit(allocator);
+    const remaining = &remaining_scan.catalog;
+    try std.testing.expectEqual(@as(usize, 4), remaining.rows.len);
+    for ([_]committed_review.ReviewId{ prepared.review_id, unsafe_id, oversized_id, draft_id }) |id|
+        _ = try maintenanceTestRow(remaining, id);
+    var other_run = try other_namespace.openDir(io, &older_id.canonical(), .{});
+    other_run.close(io);
+}
+
+fn maintenanceTestRow(catalog: *const MaintenanceCatalog, id: committed_review.ReviewId) !*const MaintenanceRow {
+    for (catalog.rows) |*row| if (row.review_id.eql(id)) return row;
+    return error.MissingFixtureRun;
+}
+
+fn logicalTestRunBytes(io: std.Io, namespace: std.Io.Dir, id: committed_review.ReviewId) !u64 {
+    var directory = try namespace.openDir(io, &id.canonical(), .{});
+    defer directory.close(io);
+    var total: u64 = 0;
+    inline for (.{ "manifest.json", "findings.json", "review_state.json", "result.json" }) |name|
+        total = try std.math.add(u64, total, (try directory.statFile(io, name, .{})).size);
+    return total;
+}
+
 fn seedTestRun(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2125,6 +2407,7 @@ fn seedTestRun(
         .completed_canceled,
         .completed_invalid_draft,
         .completed_unsafe_draft,
+        .completed_oversized_draft,
         => {
             const result: committed_review.RevisionReviewResult = .{
                 .schema_version = 1,
@@ -2148,6 +2431,10 @@ fn seedTestRun(
                 try writePrivate(io, directory, "review_state.json", "");
             } else if (mode == .completed_unsafe_draft) {
                 try directory.symLink(io, "manifest.json", "review_state.json", .{});
+            } else if (mode == .completed_oversized_draft) {
+                var file = try directory.createFile(io, "review_state.json", .{ .permissions = .fromMode(0o600) });
+                defer file.close(io);
+                try file.setLength(io, committed_review.limits.max_artifact_bytes + 1);
             }
         },
         .unknown_entry => try writePrivate(io, directory, "unexpected.tmp", "x"),

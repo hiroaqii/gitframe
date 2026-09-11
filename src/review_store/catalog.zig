@@ -51,6 +51,7 @@ pub const CatalogRow = struct {
     head_label: ?[]u8,
     finding_count: u32,
     artifact_snapshot: run.ArtifactSnapshot,
+    logical_bytes: u64,
 
     pub fn deinit(self: *CatalogRow, allocator: std.mem.Allocator) void {
         if (self.head_label) |value| allocator.free(value);
@@ -221,7 +222,9 @@ pub fn scan(
         defer loaded_result.deinit(allocator);
         switch (loaded_result) {
             .loaded => |*loaded| {
-                const row = try rowFromLoaded(allocator, loaded);
+                const logical_bytes = logicalArtifactBytes(loaded) orelse
+                    return .{ .failure = .scan_limit_exceeded };
+                const row = try rowFromLoaded(allocator, loaded, logical_bytes);
                 rows.append(allocator, row) catch |err| {
                     var owned = row;
                     owned.deinit(allocator);
@@ -556,6 +559,7 @@ fn snapshotFrom(
 fn rowFromLoaded(
     allocator: std.mem.Allocator,
     loaded: *const run.LoadedRunArtifacts,
+    logical_bytes: u64,
 ) std.mem.Allocator.Error!CatalogRow {
     const manifest = &loaded.manifest.value;
     var row: CatalogRow = .{
@@ -572,6 +576,7 @@ fn rowFromLoaded(
         .head_label = null,
         .finding_count = manifest.finding_count,
         .artifact_snapshot = run.ArtifactSnapshot.fromLoaded(loaded),
+        .logical_bytes = logical_bytes,
     };
     errdefer row.deinit(allocator);
     @memcpy(&row.created_at, manifest.created_at);
@@ -583,6 +588,17 @@ fn rowFromLoaded(
         if (display.head_label) |value| row.head_label = try allocator.dupe(u8, value);
     }
     return row;
+}
+
+fn logicalArtifactBytes(loaded: *const run.LoadedRunArtifacts) ?u64 {
+    var total: u64 = 0;
+    total = std.math.add(u64, total, std.math.cast(u64, loaded.manifest_bytes.len) orelse return null) catch return null;
+    total = std.math.add(u64, total, std.math.cast(u64, loaded.findings_bytes.len) orelse return null) catch return null;
+    if (loaded.draft_bytes) |bytes|
+        total = std.math.add(u64, total, std.math.cast(u64, bytes.len) orelse return null) catch return null;
+    if (loaded.result_bytes) |bytes|
+        total = std.math.add(u64, total, std.math.cast(u64, bytes.len) orelse return null) catch return null;
+    return total;
 }
 
 fn statusFromLoaded(loaded: *const run.LoadedRunArtifacts) RunStatus {
