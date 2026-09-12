@@ -436,6 +436,7 @@ const TestFixture = struct {
             null,
             .{ .codex = try codex.Request.init(self.allocator, "/bin/false", null) },
             "",
+            .{},
         );
     }
 

@@ -126,6 +126,7 @@ const PipelineFixture = struct {
             null,
             .{ .codex = try codex.Request.init(self.allocator, executable, null) },
             "bounded context",
+            .{},
         );
     }
 
@@ -737,7 +738,7 @@ test "AI review input diagnostic survives task delivery page changes and exact d
     defer app.ai_review_jobs.deinit();
     var tc: chasen.testing.TestCtx(App.Msg) = .{};
     defer tc.resetTransient();
-    const request = try pipeline.Request.init(allocator, fixture.root, null, &fixture.store, fixture.repo_path, fixture.target, .{ .base_label = "base-枝" ** 30, .head_label = "head-枝" ** 30 }, .{ .codex = try codex.Request.init(allocator, "/must-not-launch-codex", null) }, "x" ** (codex.max_context_bytes + 1));
+    const request = try pipeline.Request.init(allocator, fixture.root, null, &fixture.store, fixture.repo_path, fixture.target, .{ .base_label = "base-枝" ** 30, .head_label = "head-枝" ** 30 }, .{ .codex = try codex.Request.init(allocator, "/must-not-launch-codex", null) }, "x" ** (codex.max_context_bytes + 1), .{});
     const key = app.enqueueAiReview(&tc.ctx, fixture.scope(), request).accepted;
     app.repo_session.repo_epoch = 99;
     app.active_page = .config;
@@ -892,6 +893,7 @@ test "AI review pipeline classifies pre-provider validation and Store failures" 
             null,
             .{ .codex = try codex.Request.init(allocator, fixture.executable, null) },
             "bounded context",
+            .{},
         );
         var reviewed = pipeline.review(allocator, io, request, .{});
         defer reviewed.deinit();

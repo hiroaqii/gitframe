@@ -1600,6 +1600,7 @@ fn seedPublishedAiReviewTerminal(
         null,
         .{ .codex = try codex_adapter.Request.init(allocator, "/bin/false", null) },
         "",
+        .{},
     );
     const key = switch (app.ai_review_jobs.enqueue(.{ .repository = root.identity, .target = target }, request)) {
         .accepted => |value| value,

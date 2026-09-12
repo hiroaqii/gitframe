@@ -6,15 +6,12 @@ const process_runner = @import("../../../process/runner.zig");
 const producer = @import("../../producer.zig");
 const protocol = @import("../../protocol.zig");
 const diagnostic = @import("../../diagnostic.zig");
+const execution = @import("../../execution.zig");
 
 pub const CleanupWarning = environment.CleanupWarning;
 
 pub const max_context_bytes: usize = 16 * 1024;
-pub const max_input_bytes: usize = 128 * 1024;
-pub const max_jsonl_bytes: usize = 2 * 1024 * 1024;
-pub const max_final_bytes: usize = 64 * 1024;
 pub const max_stderr_bytes: usize = 64 * 1024;
-pub const timeout: std.Io.Duration = .fromSeconds(15 * 60);
 const version_timeout: std.Io.Duration = .fromSeconds(5);
 
 const instruction =
@@ -110,9 +107,10 @@ pub fn run(
     io: std.Io,
     request: Request,
     batch: ReviewBatch,
+    limits: execution.Limits,
     caller_control: process_runner.ProcessControl,
-) std.mem.Allocator.Error!Result {
-    return runWithCleanupFailureInjection(allocator, io, request, batch, caller_control, false);
+) error{ OutOfMemory, InvalidExecutionLimits }!Result {
+    return runWithCleanupFailureInjection(allocator, io, request, batch, limits, caller_control, false);
 }
 
 fn runWithCleanupFailureInjection(
@@ -120,14 +118,16 @@ fn runWithCleanupFailureInjection(
     io: std.Io,
     request: Request,
     batch: ReviewBatch,
+    limits: execution.Limits,
     caller_control: process_runner.ProcessControl,
     inject_cleanup_failure: bool,
-) std.mem.Allocator.Error!Result {
+) error{ OutOfMemory, InvalidExecutionLimits }!Result {
     var owned = request;
     defer owned.deinit();
+    if (limits.validate() != null) return error.InvalidExecutionLimits;
 
     var violation: ?diagnostic.Limit = null;
-    const prompt = buildPrompt(allocator, batch, &violation) catch |err| return switch (err) {
+    const prompt = buildPrompt(allocator, batch, limits, &violation) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InputTooLarge => .{ .outcome = .{ .failed = .{ .input_too_large = violation } } },
         error.InvalidInput => .{ .outcome = .{ .failed = .{ .invalid_provider_result = .input } } },
@@ -141,7 +141,7 @@ fn runWithCleanupFailureInjection(
     var invocation = environment.create(allocator, io, output_schema, &rollback_warning) catch |err|
         return creationFailure(err, rollback_warning);
     if (inject_cleanup_failure) invocation.cleanup_failure_injected = true;
-    const outcome = runInvocation(allocator, io, &owned, batch, prompt, &invocation, caller_control, timeout, version_timeout) catch
+    const outcome = runInvocation(allocator, io, &owned, batch, prompt, &invocation, caller_control, limits, version_timeout) catch
         Outcome{ .failed = .internal_error };
     const cleanup_warning = invocation.deinit();
     return .{ .outcome = outcome, .cleanup_warning = cleanup_warning };
@@ -166,11 +166,11 @@ fn runInvocation(
     prompt: []const u8,
     invocation: *const environment.Invocation,
     caller_control: process_runner.ProcessControl,
-    adapter_budget: std.Io.Duration,
+    limits: execution.Limits,
     probe_budget: std.Io.Duration,
 ) std.mem.Allocator.Error!Outcome {
     const started = std.Io.Clock.Timestamp.now(io, .awake);
-    const selected = selectControl(started, caller_control, adapter_budget);
+    const selected = selectControl(started, caller_control, limits.timeout());
     const control = selected.control;
     // Keep the selected absolute deadline through both processes. Only the
     // diagnostic budget is a snapshot; probing never restarts the timer.
@@ -191,7 +191,7 @@ fn runInvocation(
         .argv = argv_owner.items,
         .cwd = .{ .path = invocation.work_path },
         .stdin = prompt,
-        .stdout_limit = .limited(max_jsonl_bytes),
+        .stdout_limit = .limited(limits.max_stream_output_bytes),
         .stderr_limit = .limited(max_stderr_bytes),
     }, .sensitive, control);
     defer process_result.deinit(allocator);
@@ -199,7 +199,7 @@ fn runInvocation(
     var candidates = switch (process_result) {
         .canceled => return .canceled,
         .timed_out => return .{ .timed_out = timing },
-        .failed => |failure| return .{ .failed = mapProcessFailure(failure) },
+        .failed => |failure| return .{ .failed = mapProcessFailure(failure, limits) },
         .completed => |*captured| switch (captured.*) {
             .ordinary => unreachable,
             .sensitive => |*value| decoded: {
@@ -207,7 +207,7 @@ fn runInvocation(
                     return .{ .failed = .{ .provider_exit = classifyExit(value.term, value.stderr.bytes()) } };
                 }
                 var output_violation: ?diagnostic.Limit = null;
-                break :decoded decodeJsonl(allocator, value.stdout.bytes(), batch.units.len, &output_violation) catch |err| switch (err) {
+                break :decoded decodeJsonl(allocator, value.stdout.bytes(), batch.units.len, limits, &output_violation) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.OutputTooLarge => return .{ .failed = .{ .final_answer_too_large = output_violation.? } },
                     error.UnexpectedEvent => return .{ .failed = .{ .provider_incompatible = .unexpected_event } },
@@ -260,7 +260,7 @@ fn validModel(value: []const u8) bool {
 
 const PromptError = error{ OutOfMemory, InputTooLarge, InvalidInput };
 
-fn buildPrompt(allocator: std.mem.Allocator, batch: ReviewBatch, violation: *?diagnostic.Limit) PromptError![]u8 {
+fn buildPrompt(allocator: std.mem.Allocator, batch: ReviewBatch, limits: execution.Limits, violation: *?diagnostic.Limit) PromptError![]u8 {
     violation.* = null;
     if (batch.context.len > max_context_bytes) {
         violation.* = .{ .resource = .context_bytes, .allowed = max_context_bytes, .observed = batch.context.len, .observation = .exact };
@@ -299,16 +299,16 @@ fn buildPrompt(allocator: std.mem.Allocator, batch: ReviewBatch, violation: *?di
         stringify.objectField("unit") catch return error.OutOfMemory;
         stringify.write(parsed.value) catch return error.OutOfMemory;
         stringify.endObject() catch return error.OutOfMemory;
-        if (output.written().len > max_input_bytes) {
-            violation.* = .{ .resource = .provider_input_bytes, .allowed = max_input_bytes, .observed = output.written().len, .observation = .at_least };
+        if (output.written().len > limits.max_input_bytes) {
+            violation.* = .{ .resource = .provider_input_bytes, .allowed = limits.max_input_bytes, .observed = output.written().len, .observation = .at_least };
             return error.InputTooLarge;
         }
     }
     stringify.endArray() catch return error.OutOfMemory;
     stringify.endObject() catch return error.OutOfMemory;
     output.writer.writeByte('\n') catch return error.OutOfMemory;
-    if (output.written().len > max_input_bytes) {
-        violation.* = .{ .resource = .provider_input_bytes, .allowed = max_input_bytes, .observed = output.written().len, .observation = .exact };
+    if (output.written().len > limits.max_input_bytes) {
+        violation.* = .{ .resource = .provider_input_bytes, .allowed = limits.max_input_bytes, .observed = output.written().len, .observation = .exact };
         return error.InputTooLarge;
     }
     return output.toOwnedSlice() catch error.OutOfMemory;
@@ -432,7 +432,7 @@ fn controlTerminal(io: std.Io, control: process_runner.ProcessControl) ?enum { c
     return null;
 }
 
-fn mapProcessFailure(failure: process_runner.ControlledFailure) FailureCode {
+fn mapProcessFailure(failure: process_runner.ControlledFailure, limits: execution.Limits) FailureCode {
     return switch (failure) {
         .empty_argv => .{ .provider_unavailable = .launch_failed },
         .spawn => |err| .{ .provider_unavailable = switch (err) {
@@ -443,8 +443,8 @@ fn mapProcessFailure(failure: process_runner.ControlledFailure) FailureCode {
         .unsupported_process_control => .{ .provider_incompatible = .process_control },
         .capture => |err| if (err == error.StdoutLimitExceeded or err == error.StderrLimitExceeded) .{ .stream_too_large = .{
             .resource = if (err == error.StdoutLimitExceeded) .stdout_bytes else .stderr_bytes,
-            .allowed = if (err == error.StdoutLimitExceeded) max_jsonl_bytes else max_stderr_bytes,
-            .observed = (if (err == error.StdoutLimitExceeded) max_jsonl_bytes else max_stderr_bytes) + 1,
+            .allowed = if (err == error.StdoutLimitExceeded) limits.max_stream_output_bytes else max_stderr_bytes,
+            .observed = (if (err == error.StdoutLimitExceeded) limits.max_stream_output_bytes else max_stderr_bytes) + 1,
             .observation = .at_least,
         } } else .provider_failed,
         .stdin_start, .stdin, .control_start, .terminate, .wait => .provider_failed,
@@ -528,9 +528,9 @@ const FindingWire = struct {
 
 const DecodeError = error{ OutOfMemory, InvalidJsonl, InvalidOutput, UnexpectedEvent, OutputTooLarge };
 
-fn decodeJsonl(allocator: std.mem.Allocator, bytes: []const u8, unit_count: usize, violation: *?diagnostic.Limit) DecodeError!producer.CandidateBatch {
+fn decodeJsonl(allocator: std.mem.Allocator, bytes: []const u8, unit_count: usize, limits: execution.Limits, violation: *?diagnostic.Limit) DecodeError!producer.CandidateBatch {
     violation.* = null;
-    if (bytes.len == 0 or bytes.len > max_jsonl_bytes) return error.InvalidJsonl;
+    if (bytes.len == 0 or bytes.len > limits.max_stream_output_bytes) return error.InvalidJsonl;
     var final_text: ?[]const u8 = null;
     errdefer if (final_text) |value| {
         std.crypto.secureZero(u8, @constCast(value));
@@ -580,8 +580,8 @@ fn decodeJsonl(allocator: std.mem.Allocator, bytes: []const u8, unit_count: usiz
         if (final_text != null) return error.InvalidJsonl;
         const text_value = item_value.object.get("text") orelse return error.InvalidJsonl;
         if (text_value != .string) return error.InvalidJsonl;
-        if (text_value.string.len > max_final_bytes) {
-            violation.* = .{ .resource = .final_answer_bytes, .allowed = max_final_bytes, .observed = text_value.string.len, .observation = .exact };
+        if (text_value.string.len > limits.max_final_output_bytes) {
+            violation.* = .{ .resource = .final_answer_bytes, .allowed = limits.max_final_output_bytes, .observed = text_value.string.len, .observation = .exact };
             return error.OutputTooLarge;
         }
         final_text = try allocator.dupe(u8, text_value.string);
@@ -638,7 +638,7 @@ test "Codex JSONL accepts one exact ordered candidate document" {
         \\{"type":"turn.completed"}
     ;
     var violation: ?diagnostic.Limit = null;
-    var candidates = try decodeJsonl(std.testing.allocator, jsonl, 1, &violation);
+    var candidates = try decodeJsonl(std.testing.allocator, jsonl, 1, .{}, &violation);
     defer candidates.deinit();
     try std.testing.expectEqual(@as(usize, 1), candidates.payloads.len);
 }
@@ -651,19 +651,19 @@ test "Codex bounds its canonical input before process launch" {
     try std.testing.expectError(error.InputTooLarge, buildPrompt(std.testing.allocator, .{
         .units = &.{},
         .context = context,
-    }, &violation));
+    }, .{}, &violation));
 }
 
 test "Codex context boundary and invalid UTF-8 retain accurate diagnostic evidence" {
     const allocator = std.testing.allocator;
     var violation: ?diagnostic.Limit = null;
     const context = "x" ** max_context_bytes;
-    const prompt = try buildPrompt(allocator, .{ .units = &.{}, .context = context }, &violation);
+    const prompt = try buildPrompt(allocator, .{ .units = &.{}, .context = context }, .{}, &violation);
     defer allocator.free(prompt);
     try std.testing.expect(violation == null);
-    try std.testing.expectError(error.InvalidInput, buildPrompt(allocator, .{ .units = &.{}, .context = "\xff" }, &violation));
+    try std.testing.expectError(error.InvalidInput, buildPrompt(allocator, .{ .units = &.{}, .context = "\xff" }, .{}, &violation));
     try std.testing.expect(violation == null);
-    var result = try run(allocator, std.testing.io, try Request.init(allocator, "/must-not-launch-codex", null), .{ .units = &.{}, .context = context ++ "x" }, .{});
+    var result = try run(allocator, std.testing.io, try Request.init(allocator, "/must-not-launch-codex", null), .{ .units = &.{}, .context = context ++ "x" }, .{}, .{});
     defer result.deinit();
     const limit = result.outcome.failed.input_too_large.?;
     try std.testing.expectEqual(.context_bytes, limit.resource);
@@ -674,6 +674,7 @@ test "Codex context boundary and invalid UTF-8 retain accurate diagnostic eviden
 
 test "Codex prompt exact boundary and partial multi-unit overflow diagnostics" {
     const allocator = std.testing.allocator;
+    const limits: execution.Limits = .{ .max_input_bytes = 128 * 1024 };
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "testdata/ai-review-producer-v1/protocol/unit.json", allocator, .limited(256 * 1024));
     defer allocator.free(bytes);
     var parsed = try protocol.ReviewUnit.parseStrict(allocator, bytes);
@@ -684,26 +685,26 @@ test "Codex prompt exact boundary and partial multi-unit overflow diagnostics" {
     metadata[7] = "";
     unit.metadata_lines = &metadata;
     var violation: ?diagnostic.Limit = null;
-    const initial = try buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, &violation);
-    const missing = max_input_bytes - initial.len;
+    const initial = try buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, limits, &violation);
+    const missing = limits.max_input_bytes - initial.len;
     allocator.free(initial);
     try std.testing.expect(missing < padding.len);
     metadata[7] = padding[0..missing];
-    const exact = try buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, &violation);
+    const exact = try buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, limits, &violation);
     defer allocator.free(exact);
-    try std.testing.expectEqual(max_input_bytes, exact.len);
+    try std.testing.expectEqual(limits.max_input_bytes, exact.len);
     metadata[7] = padding[0 .. missing + 1];
-    try std.testing.expectError(error.InputTooLarge, buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, &violation));
-    try std.testing.expectEqual(max_input_bytes + 1, violation.?.observed);
+    try std.testing.expectError(error.InputTooLarge, buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, limits, &violation));
+    try std.testing.expectEqual(limits.max_input_bytes + 1, violation.?.observed);
     try std.testing.expectEqual(.exact, violation.?.observation);
     // At this boundary the third unit has not been visited or counted.
     unit.metadata_lines = metadata[0..4];
-    try std.testing.expectError(error.InputTooLarge, buildPrompt(allocator, .{ .units = &.{ unit, unit, unit }, .context = "" }, &violation));
+    try std.testing.expectError(error.InputTooLarge, buildPrompt(allocator, .{ .units = &.{ unit, unit, unit }, .context = "" }, limits, &violation));
     try std.testing.expectEqual(.provider_input_bytes, violation.?.resource);
-    try std.testing.expectEqual(max_input_bytes, violation.?.allowed);
-    try std.testing.expect(violation.?.observed > max_input_bytes);
+    try std.testing.expectEqual(limits.max_input_bytes, violation.?.allowed);
+    try std.testing.expect(violation.?.observed > limits.max_input_bytes);
     try std.testing.expectEqual(.at_least, violation.?.observation);
-    var result = try run(allocator, std.testing.io, try Request.init(allocator, "/must-not-launch-codex", null), .{ .units = &.{ unit, unit, unit }, .context = "" }, .{});
+    var result = try run(allocator, std.testing.io, try Request.init(allocator, "/must-not-launch-codex", null), .{ .units = &.{ unit, unit, unit }, .context = "" }, limits, .{});
     defer result.deinit();
     try std.testing.expectEqualDeep(violation, result.outcome.failed.input_too_large);
 }
@@ -722,7 +723,7 @@ test "Codex JSONL rejects tool events duplicates and unknown handshakes" {
         \\{"type":"item.completed","item":{"type":"command_execution","command":"bad"}}
         \\{"type":"turn.completed"}
     ;
-    try std.testing.expectError(error.UnexpectedEvent, decodeJsonl(std.testing.allocator, tool, 1, &violation));
+    try std.testing.expectError(error.UnexpectedEvent, decodeJsonl(std.testing.allocator, tool, 1, .{}, &violation));
     const duplicate =
         \\{"type":"thread.started","thread_id":"t"}
         \\{"type":"turn.started"}
@@ -730,20 +731,20 @@ test "Codex JSONL rejects tool events duplicates and unknown handshakes" {
         \\{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}
         \\{"type":"turn.completed"}
     ;
-    try std.testing.expectError(error.InvalidJsonl, decodeJsonl(std.testing.allocator, duplicate, 1, &violation));
+    try std.testing.expectError(error.InvalidJsonl, decodeJsonl(std.testing.allocator, duplicate, 1, .{}, &violation));
     const handshake =
         \\{"type":"thread.started","thread_id":"t"}
         \\{"type":"turn.started"}
         \\{"type":"mcp.handshake"}
     ;
-    try std.testing.expectError(error.UnexpectedEvent, decodeJsonl(std.testing.allocator, handshake, 1, &violation));
+    try std.testing.expectError(error.UnexpectedEvent, decodeJsonl(std.testing.allocator, handshake, 1, .{}, &violation));
     const schema_external =
         \\{"type":"thread.started","thread_id":"t"}
         \\{"type":"turn.started"}
         \\{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[],\"publication_authority\":true}"}}
         \\{"type":"turn.completed"}
     ;
-    try std.testing.expectError(error.InvalidOutput, decodeJsonl(std.testing.allocator, schema_external, 0, &violation));
+    try std.testing.expectError(error.InvalidOutput, decodeJsonl(std.testing.allocator, schema_external, 0, .{}, &violation));
     const invalid_documents = [_][]const u8{
         "{\"schema_version\":2,\"units\":[]}",
         "{\"schema_version\":1,\"units\":[{\"ordinal\":2,\"candidate\":{\"findings\":[]}}]}",
@@ -754,7 +755,7 @@ test "Codex JSONL rejects tool events duplicates and unknown handshakes" {
         defer std.testing.allocator.free(encoded);
         const jsonl = try std.fmt.allocPrint(std.testing.allocator, "{{\"type\":\"thread.started\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{s}}}}}\n{{\"type\":\"turn.completed\"}}\n", .{encoded});
         defer std.testing.allocator.free(jsonl);
-        try std.testing.expectError(error.InvalidOutput, decodeJsonl(std.testing.allocator, jsonl, 1, &violation));
+        try std.testing.expectError(error.InvalidOutput, decodeJsonl(std.testing.allocator, jsonl, 1, .{}, &violation));
         try std.testing.expect(violation == null);
     }
 }
@@ -867,7 +868,7 @@ test "Codex adapter preserves success when private-root cleanup reports a warnin
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, chmod_result.term);
 
     const request = try Request.init(allocator, executable, "gpt-review");
-    var result = try runWithCleanupFailureInjection(allocator, io, request, .{ .units = &.{}, .context = "bounded context" }, .{}, true);
+    var result = try runWithCleanupFailureInjection(allocator, io, request, .{ .units = &.{}, .context = "bounded context" }, .{}, .{}, true);
     defer result.deinit();
     try std.testing.expect(result.outcome == .success);
     try std.testing.expectEqual(environment.CleanupWarning.private_root_residue, result.cleanup_warning.?);
@@ -876,7 +877,7 @@ test "Codex adapter preserves success when private-root cleanup reports a warnin
     try std.testing.expectEqualStrings("999.0", result.outcome.success.provenance.cli_version.?);
     try std.testing.expect(result.outcome.success.provenance.committedProducer().model == null);
 
-    const stdin = try tmp.dir.readFileAlloc(io, "stdin.log", allocator, .limited(max_input_bytes));
+    const stdin = try tmp.dir.readFileAlloc(io, "stdin.log", allocator, .limited((execution.Limits{}).max_input_bytes));
     defer allocator.free(stdin);
     try std.testing.expect(std.mem.startsWith(u8, stdin, instruction));
     try std.testing.expect(std.mem.indexOf(u8, stdin, "\"review_context\":\"bounded context\"") != null);
@@ -896,7 +897,7 @@ test "Codex adapter preserves success when private-root cleanup reports a warnin
 test "Codex adapter preserves known failure when private-root cleanup reports a warning" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const request = try Request.init(std.testing.allocator, "/definitely/missing/gitframe-codex", "owned-model");
-    var result = try runWithCleanupFailureInjection(std.testing.allocator, std.testing.io, request, .{ .units = &.{}, .context = "" }, .{}, true);
+    var result = try runWithCleanupFailureInjection(std.testing.allocator, std.testing.io, request, .{ .units = &.{}, .context = "" }, .{}, .{}, true);
     defer result.deinit();
     try std.testing.expect(result.outcome == .failed);
     try std.testing.expectEqual(.executable_missing, result.outcome.failed.provider_unavailable);
@@ -917,7 +918,7 @@ const test_answer =
 ;
 
 fn runDiagnosticScript(script: []const u8, options: struct {
-    budget: std.Io.Duration = .fromSeconds(3),
+    limits: execution.Limits = .{ .timeout_seconds = 3 },
     probe: std.Io.Duration = .fromSeconds(1),
     caller: ?std.Io.Duration = null,
     cancellation: ?process_runner.CancellationView = null,
@@ -944,12 +945,12 @@ fn runDiagnosticScript(script: []const u8, options: struct {
         .deadline = if (options.caller) |duration| .fromNow(io, .{ .raw = duration, .clock = .awake }) else null,
         .cancellation = options.cancellation,
     };
-    return .{ .outcome = try runInvocation(allocator, io, &request, .{ .units = &.{}, .context = "" }, "", &invocation, control, options.budget, options.probe) };
+    return .{ .outcome = try runInvocation(allocator, io, &request, .{ .units = &.{}, .context = "" }, "", &invocation, control, options.limits, options.probe) };
 }
 
 test "Codex stream bounds distinguish stdout stderr and preserve lower bounds" {
     for ([_]bool{ false, true }) |stderr| {
-        const limit = if (stderr) max_stderr_bytes else max_jsonl_bytes;
+        const limit = if (stderr) max_stderr_bytes else (execution.Limits{}).max_stream_output_bytes;
         for ([_]usize{ limit, limit + 1 }) |size| {
             const script = try std.fmt.allocPrint(std.testing.allocator, "{s}/usr/bin/head -c {d} /dev/zero {s}\n{s}\n", .{
                 test_version, size, if (stderr) ">&2" else "", if (stderr) test_answer else "",
@@ -968,28 +969,29 @@ test "Codex stream bounds distinguish stdout stderr and preserve lower bounds" {
             } else try std.testing.expectEqual(.answer, result.outcome.failed.invalid_provider_result);
         }
     }
-    try std.testing.expectEqual(.process_control, mapProcessFailure(.unsupported_process_control).provider_incompatible);
-    try std.testing.expectEqual(.executable_denied, mapProcessFailure(.{ .spawn = error.AccessDenied }).provider_unavailable);
-    try std.testing.expectEqualDeep(FailureCode.provider_failed, mapProcessFailure(.{ .capture = error.InputOutput }));
+    try std.testing.expectEqual(.process_control, mapProcessFailure(.unsupported_process_control, .{}).provider_incompatible);
+    try std.testing.expectEqual(.executable_denied, mapProcessFailure(.{ .spawn = error.AccessDenied }, .{}).provider_unavailable);
+    try std.testing.expectEqualDeep(FailureCode.provider_failed, mapProcessFailure(.{ .capture = error.InputOutput }, .{}));
 }
 
 test "Codex final bound measures decoded bytes and rejects malformed output independently" {
     const allocator = std.testing.allocator;
+    const limits: execution.Limits = .{ .max_final_output_bytes = 64 * 1024 };
     var violation: ?diagnostic.Limit = null;
-    for ([_]usize{ max_final_bytes, max_final_bytes + 1 }) |size| {
+    for ([_]usize{ limits.max_final_output_bytes, limits.max_final_output_bytes + 1 }) |size| {
         // Wire escapes are six bytes each; evidence must count decoded bytes.
         const escaped = try allocator.alloc(u8, size * 6);
         defer allocator.free(escaped);
         for (0..size) |i| @memcpy(escaped[i * 6 ..][0..6], "\\u0078");
         const jsonl = try std.fmt.allocPrint(allocator, "{{\"type\":\"thread.started\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"{s}\"}}}}\n{{\"type\":\"turn.completed\"}}\n", .{escaped});
         defer allocator.free(jsonl);
-        try std.testing.expectError(if (size > max_final_bytes) error.OutputTooLarge else error.InvalidOutput, decodeJsonl(allocator, jsonl, 0, &violation));
-        if (size > max_final_bytes) {
-            try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .final_answer_bytes, .allowed = max_final_bytes, .observed = size, .observation = .exact }, violation.?);
+        try std.testing.expectError(if (size > limits.max_final_output_bytes) error.OutputTooLarge else error.InvalidOutput, decodeJsonl(allocator, jsonl, 0, limits, &violation));
+        if (size > limits.max_final_output_bytes) {
+            try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .final_answer_bytes, .allowed = limits.max_final_output_bytes, .observed = size, .observation = .exact }, violation.?);
         } else try std.testing.expect(violation == null);
     }
     // A valid boundary answer remains accepted, including its JSON whitespace.
-    const final = try allocator.alloc(u8, max_final_bytes);
+    const final = try allocator.alloc(u8, limits.max_final_output_bytes);
     defer allocator.free(final);
     @memset(final, ' ');
     const valid = "{\"schema_version\":1,\"units\":[]}";
@@ -998,21 +1000,22 @@ test "Codex final bound measures decoded bytes and rejects malformed output inde
     defer allocator.free(encoded);
     const jsonl = try std.fmt.allocPrint(allocator, "{{\"type\":\"thread.started\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{s}}}}}\n{{\"type\":\"turn.completed\"}}\n", .{encoded});
     defer allocator.free(jsonl);
-    var batch = try decodeJsonl(allocator, jsonl, 0, &violation);
+    var batch = try decodeJsonl(allocator, jsonl, 0, limits, &violation);
     defer batch.deinit();
     try std.testing.expect(violation == null);
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, decodeJsonl(failing.allocator(), jsonl, 0, &violation));
+    try std.testing.expectError(error.OutOfMemory, decodeJsonl(failing.allocator(), jsonl, 0, limits, &violation));
     var result = try runDiagnosticScript(test_version ++
         "printf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.started\"}'\n" ++
         "printf '%s' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"'\n" ++
         "/usr/bin/head -c 65537 /dev/zero | /usr/bin/tr '\\000' x\n" ++
-        "printf '%s\\n' '\"}}' '{\"type\":\"turn.completed\"}'\n", .{});
+        "printf '%s\\n' '\"}}' '{\"type\":\"turn.completed\"}'\n", .{ .limits = limits });
     defer result.deinit();
-    try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .final_answer_bytes, .allowed = max_final_bytes, .observed = max_final_bytes + 1, .observation = .exact }, result.outcome.failed.final_answer_too_large);
+    try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .final_answer_bytes, .allowed = limits.max_final_output_bytes, .observed = limits.max_final_output_bytes + 1, .observation = .exact }, result.outcome.failed.final_answer_too_large);
 }
 
 test "Codex diagnostic deadline selection preserves caller ties and entry budget" {
+    const timeout = (execution.Limits{ .timeout_seconds = 19 }).timeout();
     const started: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = .{ .nanoseconds = 1000 } };
     const adapter = selectControl(started, .{}, timeout);
     try std.testing.expectEqual(.adapter, adapter.timing.owner);
@@ -1043,12 +1046,12 @@ test "Codex local probe cap continues but caller and shared adapter deadlines fa
     defer caller.deinit();
     try std.testing.expectEqual(.provider_execution, caller.outcome.timed_out.?.stage);
     try std.testing.expectEqual(.caller, caller.outcome.timed_out.?.owner);
-    // Main alone fits 600 ms; probe + main does not. Restarting at main fails this proof.
-    var adapter = try runDiagnosticScript("if [ \"$1\" = --version ]; then /bin/sleep 0.2; printf 'test\\n'; exit 0; fi\n/bin/sleep 0.5\n" ++ test_answer, .{ .budget = .fromMilliseconds(600) });
+    // Main alone fits one second; probe + main does not. Restarting at main fails this proof.
+    var adapter = try runDiagnosticScript("if [ \"$1\" = --version ]; then /bin/sleep 0.4; printf 'test\\n'; exit 0; fi\n/bin/sleep 0.8\n" ++ test_answer, .{ .limits = .{ .timeout_seconds = 1 } });
     defer adapter.deinit();
     try std.testing.expectEqual(.provider_execution, adapter.outcome.timed_out.?.stage);
     try std.testing.expectEqual(.adapter, adapter.outcome.timed_out.?.owner);
-    try std.testing.expectEqualDeep(std.Io.Duration.fromMilliseconds(600), adapter.outcome.timed_out.?.budget);
+    try std.testing.expectEqualDeep(std.Io.Duration.fromSeconds(1), adapter.outcome.timed_out.?.budget);
 }
 
 fn cancelDiagnosticRun(io: std.Io, generation: *std.atomic.Value(u64)) std.Io.Cancelable!void {
@@ -1091,4 +1094,170 @@ test "Codex finite provider failures retain evidence without response text" {
     try std.testing.expectEqual(.answer, malformed.outcome.failed.invalid_provider_result);
     try std.testing.expect(@sizeOf(FailureCode) <= 256);
     try std.testing.expect(@sizeOf(?diagnostic.Timeout) <= 256);
+}
+
+test "Codex validates direct execution limits before allocation or launch" {
+    const allocator = std.testing.allocator;
+    const cases = [_]execution.Limits{
+        .{ .max_input_bytes = 0 },                                    .{ .max_final_output_bytes = 0 },
+        .{ .max_stream_output_bytes = 0 },                            .{ .timeout_seconds = 0 },
+        .{ .max_input_bytes = execution.max_byte_limit + 1 },         .{ .max_final_output_bytes = execution.final_answer_ceiling + 1 },
+        .{ .max_stream_output_bytes = execution.max_byte_limit + 1 }, .{ .max_stream_output_bytes = 1 },
+    };
+    for (cases) |limits| {
+        const request = try Request.init(allocator, "/must-not-launch-codex", "owned");
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.InvalidExecutionLimits, run(failing.allocator(), std.testing.io, request, .{ .units = &.{}, .context = "" }, limits, .{}));
+        try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    }
+}
+
+test "Codex one and two MiB prompt boundaries include instruction context escaping and all units" {
+    const allocator = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "testdata/ai-review-producer-v1/protocol/unit.json", allocator, .limited(256 * 1024));
+    defer allocator.free(bytes);
+    var parsed = try protocol.ReviewUnit.parseStrict(allocator, bytes);
+    defer parsed.deinit();
+    const padding = "x" ** (16 * 1024);
+    const context = "\\" ** max_context_bytes;
+    const ordinary_metadata: [7][]const u8 = @splat(padding);
+    const storage = try allocator.alloc(u8, 16 * 1024 * 1024);
+    defer allocator.free(storage);
+    for ([_]usize{ 1024 * 1024, 2 * 1024 * 1024 }) |limit| {
+        const limits: execution.Limits = .{ .max_input_bytes = limit };
+        const count: usize = if (limit == 1024 * 1024) 9 else 18;
+        var units: [18]protocol.ReviewUnit = @splat(parsed.value);
+        for (units[0..count], 0..) |*unit, index| {
+            unit.unit_id = .{ .ordinal = @intCast(index + 1) };
+            unit.ordinal = @intCast(index + 1);
+            unit.unit_count = @intCast(count);
+            unit.metadata_lines = &ordinary_metadata;
+        }
+        var metadata: [7][]const u8 = @splat("");
+        units[count - 1].metadata_lines = &metadata;
+        const batch: ReviewBatch = .{ .units = units[0..count], .context = context };
+        var violation: ?diagnostic.Limit = null;
+        const initial = try buildPrompt(allocator, batch, limits, &violation);
+        const initial_len = initial.len;
+        allocator.free(initial);
+        for ([_]usize{ limit - 1, limit, limit + 1 }) |target| {
+            var missing = target - initial_len;
+            for (&metadata) |*line| {
+                const take = @min(missing, padding.len);
+                line.* = padding[0..take];
+                missing -= take;
+            }
+            try std.testing.expectEqual(@as(usize, 0), missing);
+            const full = try buildPrompt(allocator, batch, .{ .max_input_bytes = 4 * 1024 * 1024 }, &violation);
+            defer allocator.free(full);
+            try std.testing.expectEqual(target, full.len);
+            try std.testing.expect(std.mem.startsWith(u8, full, instruction));
+            try std.testing.expect(std.mem.indexOf(u8, full, "\\\\") != null);
+            // The same production generator also fits the design's finite arena.
+            var fixed: std.heap.FixedBufferAllocator = .init(storage);
+            for ([_]std.mem.Allocator{ allocator, fixed.allocator() }) |bounded| {
+                if (target <= limit) {
+                    const prompt = try buildPrompt(bounded, batch, limits, &violation);
+                    defer bounded.free(prompt);
+                    try std.testing.expectEqualStrings(full, prompt);
+                    try std.testing.expect(violation == null);
+                } else {
+                    try std.testing.expectError(error.InputTooLarge, buildPrompt(bounded, batch, limits, &violation));
+                    try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .provider_input_bytes, .allowed = limit, .observed = target, .observation = .exact }, violation.?);
+                }
+            }
+        }
+    }
+}
+
+fn testPromptAllocationFailure(allocator: std.mem.Allocator, batch: ReviewBatch) !void {
+    var violation: ?diagnostic.Limit = null;
+    const prompt = try buildPrompt(allocator, batch, .{}, &violation);
+    defer allocator.free(prompt);
+}
+
+test "Codex prompt allocation failures release partially generated input" {
+    const allocator = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "testdata/ai-review-producer-v1/protocol/unit.json", allocator, .limited(256 * 1024));
+    defer allocator.free(bytes);
+    var parsed = try protocol.ReviewUnit.parseStrict(allocator, bytes);
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(allocator, testPromptAllocationFailure, .{ReviewBatch{ .units = &.{parsed.value}, .context = "escaped \\" }});
+}
+
+fn testJsonl(allocator: std.mem.Allocator, final: []const u8) ![]u8 {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, final, .{});
+    defer allocator.free(encoded);
+    return std.fmt.allocPrint(allocator, "{{\"type\":\"thread.started\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{s}}}}}\n{{\"type\":\"turn.completed\"}}\n", .{encoded});
+}
+
+test "Codex custom stream boundary never succeeds with truncated capture" {
+    const allocator = std.testing.allocator;
+    const limits: execution.Limits = .{ .max_final_output_bytes = 512, .max_stream_output_bytes = 1024 };
+    const jsonl = try testJsonl(allocator, "{\"schema_version\":1,\"units\":[]}");
+    defer allocator.free(jsonl);
+    for ([_]usize{ 1023, 1024, 1025 }) |size| {
+        const script = try std.fmt.allocPrint(allocator, "{s}printf '%s' '{s}'\n/usr/bin/head -c {d} /dev/zero | /usr/bin/tr '\\000' '\\n'\n", .{ test_version, jsonl, size - jsonl.len });
+        defer allocator.free(script);
+        var result = try runDiagnosticScript(script, .{ .limits = limits });
+        defer result.deinit();
+        if (size <= limits.max_stream_output_bytes) {
+            try std.testing.expect(result.outcome == .success);
+        } else {
+            try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .stdout_bytes, .allowed = 1024, .observed = 1025, .observation = .at_least }, result.outcome.failed.stream_too_large);
+        }
+    }
+}
+
+test "Codex custom final boundary accepts complete answers and rejects the whole oversized answer" {
+    const allocator = std.testing.allocator;
+    const limits: execution.Limits = .{ .max_final_output_bytes = 1024, .max_stream_output_bytes = 8192 };
+    for ([_]usize{ 1023, 1024, 1025 }) |size| {
+        const final = try allocator.alloc(u8, size);
+        defer allocator.free(final);
+        @memset(final, ' ');
+        const valid = "{\"schema_version\":1,\"units\":[]}";
+        @memcpy(final[0..valid.len], valid);
+        const jsonl = try testJsonl(allocator, final);
+        defer allocator.free(jsonl);
+        const script = try std.fmt.allocPrint(allocator, "{s}printf '%s' '{s}'\n", .{ test_version, jsonl });
+        defer allocator.free(script);
+        var result = try runDiagnosticScript(script, .{ .limits = limits });
+        defer result.deinit();
+        if (size <= limits.max_final_output_bytes) {
+            try std.testing.expect(result.outcome == .success);
+        } else {
+            try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .final_answer_bytes, .allowed = 1024, .observed = 1025, .observation = .exact }, result.outcome.failed.final_answer_too_large);
+        }
+    }
+}
+
+test "Codex runtime final ceiling is independent of valid per-unit candidate payloads" {
+    const allocator = std.testing.allocator;
+    const findings: [8]protocol.FindingCandidate = @splat(.{
+        .start_location = try protocol.LocationId.parse("a0001"),
+        .end_location = try protocol.LocationId.parse("a0001"),
+        .severity = .warning,
+        .title = "bounded finding",
+        .body = "x" ** (16 * 1024),
+    });
+    const payload: protocol.FindingCandidatePayload = .{ .findings = &findings };
+    const canonical = try payload.writeCanonical(allocator);
+    defer allocator.free(canonical);
+    var parsed = try protocol.FindingCandidatePayload.parseStrict(allocator, canonical);
+    defer parsed.deinit();
+    try std.testing.expect(canonical.len < @import("../../limits.zig").max_candidate_batch_bytes);
+    try std.testing.expect(canonical.len * 2 < @import("../../limits.zig").max_candidate_batches_bytes);
+    const final = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"units\":[{{\"ordinal\":1,\"candidate\":{s}}},{{\"ordinal\":2,\"candidate\":{s}}}]}}", .{ canonical, canonical });
+    defer allocator.free(final);
+    try std.testing.expect(final.len > execution.final_answer_ceiling);
+    const jsonl = try testJsonl(allocator, final);
+    defer allocator.free(jsonl);
+    var violation: ?diagnostic.Limit = null;
+    try std.testing.expectError(error.OutputTooLarge, decodeJsonl(allocator, jsonl, 2, .{}, &violation));
+    try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .final_answer_bytes, .allowed = execution.final_answer_ceiling, .observed = final.len, .observation = .exact }, violation.?);
+    var invalid_findings = findings;
+    invalid_findings[0].body = "x" ** (16 * 1024 + 1);
+    const invalid_payload: protocol.FindingCandidatePayload = .{ .findings = &invalid_findings };
+    try std.testing.expectError(error.LimitExceeded, invalid_payload.writeCanonical(allocator));
 }

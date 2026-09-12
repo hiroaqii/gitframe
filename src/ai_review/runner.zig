@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
+const execution = @import("execution.zig");
 const committed = @import("../committed_review.zig");
 const git_command = @import("../git/command.zig");
 const git_review = @import("../git/committed_review.zig");
@@ -98,6 +99,7 @@ pub const Request = struct {
     provider: ProviderRequest,
     owns_provider: bool = true,
     review_context: []u8,
+    limits: execution.Limits,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -109,9 +111,11 @@ pub const Request = struct {
         display: ?committed.DisplayMetadata,
         provider: ProviderRequest,
         review_context: []const u8,
+        limits: execution.Limits,
     ) !Request {
         var owned_provider = provider;
         errdefer owned_provider.deinit();
+        if (limits.validate() != null) return error.InvalidExecutionLimits;
         var duplicate = try root.duplicate();
         errdefer duplicate.deinit();
         var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment);
@@ -145,6 +149,7 @@ pub const Request = struct {
             },
             .provider = owned_provider,
             .review_context = context,
+            .limits = limits,
         };
     }
 
@@ -268,7 +273,7 @@ pub fn review(
         .codex => |provider_value| codex.run(allocator, io, provider_value, .{
             .units = plan.units,
             .context = owned.review_context,
-        }, control) catch {
+        }, owned.limits, control) catch {
             plan.deinit();
             return failed(.{ .internal_error = null });
         },
@@ -536,7 +541,7 @@ fn testProvenance(
     };
 }
 
-test "ReviewPipeline consumes a canceled request before repository work" {
+test "ReviewPipeline validates limits and consumes cancellation before repository work" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -555,8 +560,23 @@ test "ReviewPipeline consumes a canceled request before repository work" {
     defer root.deinit();
     var store = try store_service.ConfiguredStore.initConfigured(allocator, store_path);
     defer store.deinit(allocator);
+    const invalid_limits = [_]execution.Limits{
+        .{ .max_input_bytes = 0 },                            .{ .timeout_seconds = 0 },
+        .{ .max_input_bytes = execution.max_byte_limit + 1 }, .{ .max_final_output_bytes = execution.final_answer_ceiling + 1 },
+        .{ .max_stream_output_bytes = 1 },
+    };
+    for (invalid_limits) |limits| {
+        const provider: ProviderRequest = .{ .codex = try codex.Request.init(allocator, "/must-not-launch-codex", "owned") };
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.InvalidExecutionLimits, Request.init(failing.allocator(), root, null, &store, repo_path, try testTarget(), null, provider, "context", limits));
+        try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    }
     const provider_request: ProviderRequest = .{ .codex = try codex.Request.init(allocator, "/bin/false", "requested") };
-    const request = try Request.init(allocator, root, null, &store, repo_path, try testTarget(), null, provider_request, "context");
+    var limits: execution.Limits = .{ .max_input_bytes = 4096, .timeout_seconds = 7 };
+    const request = try Request.init(allocator, root, null, &store, repo_path, try testTarget(), null, provider_request, "context", limits);
+    limits = .{};
+    try std.testing.expectEqual(@as(usize, 4096), request.limits.max_input_bytes);
+    try std.testing.expectEqual(@as(u32, 7), request.limits.timeout_seconds);
     var canceled_generation: std.atomic.Value(u64) = .init(9);
     var result = review(allocator, io, request, .{ .cancellation = .{
         .canceled_generation = &canceled_generation,
