@@ -3809,15 +3809,24 @@ test "AI review failure footer and details expose causes at normal and narrow si
             .diff_base_oid = oid,
         } },
     };
-    const cases = [_]struct { failure: pipeline.FailureCode, cause: []const u8 }{
+    const cases = [_]struct { failure: pipeline.FailureCode, cause: []const u8, config_key: ?[]const u8 = null, evidence: ?[]const u8 = null }{
         .{ .failure = .repository_unavailable, .cause = "repository unavailable" },
         .{ .failure = .target_unavailable, .cause = "target unavailable" },
         .{ .failure = .projection_failed, .cause = "projection failed" },
         .{ .failure = .input_failed, .cause = "input generation failed" },
-        .{ .failure = .{ .stream_too_large = .{ .resource = .stdout_bytes, .allowed = 2097152, .observed = 2097153, .observation = .at_least } }, .cause = "stdout too large" },
+        .{ .failure = .{ .input_too_large = .{ .resource = .provider_input_bytes, .allowed = 512, .observed = 1024, .observation = .exact } }, .cause = "input too large", .config_key = "max_input_bytes", .evidence = "Limit: 512 bytes\nObserved: 1024 bytes" },
+        .{ .failure = .{ .input_too_large = .{ .resource = .context_bytes, .allowed = 16384, .observed = 16385, .observation = .exact } }, .cause = "input too large" },
+        .{ .failure = .{ .input_too_large = .{ .resource = .diff_line_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } }, .cause = "input too large" },
+        .{ .failure = .{ .input_too_large = null }, .cause = "input too large" },
+        .{ .failure = .{ .stream_too_large = .{ .resource = .stdout_bytes, .allowed = 4096, .observed = 4097, .observation = .at_least } }, .cause = "stdout too large", .config_key = "max_stream_output_bytes", .evidence = "Limit: 4096 bytes (4 KiB)\nObserved at least: 4097 bytes" },
+        .{ .failure = .{ .stream_too_large = .{ .resource = .stderr_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } }, .cause = "stderr too large" },
+        .{ .failure = .{ .final_answer_too_large = .{ .resource = .final_answer_bytes, .allowed = 256, .observed = 257, .observation = .exact } }, .cause = "answer too large", .config_key = "max_final_output_bytes", .evidence = "Limit: 256 bytes\nObserved: 257 bytes" },
         .{ .failure = .{ .provider_exit = .{ .classification = .authentication_response, .term = .{ .exited = 17 } } }, .cause = "auth-related response" },
         .{ .failure = .{ .invalid_provider_result = .answer }, .cause = "invalid answer" },
-        .{ .failure = .{ .timed_out = .{ .stage = .provider_execution, .owner = .adapter, .budget = .fromSeconds(900) } }, .cause = "timed out" },
+        .{ .failure = .{ .timed_out = .{ .stage = .provider_execution, .owner = .adapter, .budget = .fromSeconds(7) } }, .cause = "timed out", .config_key = "timeout_seconds", .evidence = "Budget at entry: 7s" },
+        .{ .failure = .{ .timed_out = .{ .stage = .version_probe, .owner = .caller, .budget = .fromSeconds(3) } }, .cause = "timed out" },
+        .{ .failure = .{ .timed_out = .{ .stage = .before_provider, .owner = .caller, .budget = .fromSeconds(2) } }, .cause = "timed out" },
+        .{ .failure = .{ .timed_out = null }, .cause = "timed out" },
         .{ .failure = .invalid_candidates, .cause = "invalid candidates" },
         .{ .failure = .store_prepare_failed, .cause = "save setup failed" },
         .{ .failure = .artifact_failed, .cause = "artifact creation failed" },
@@ -3828,6 +3837,16 @@ test "AI review failure footer and details expose causes at normal and narrow si
     var harness: ShellViewTestHarness = .{};
     for (cases) |case| {
         record.phase = .{ .terminal = .{ .pipeline = .{ .outcome = .{ .failed = case.failure } } } };
+        var buffer: [2048]u8 = undefined;
+        const formatted = ai_review_diagnostics.format(&buffer, &record);
+        if (case.config_key) |key| {
+            try std.testing.expect(std.mem.indexOf(u8, formatted, "[ai_review].") != null);
+            try std.testing.expect(std.mem.indexOf(u8, formatted, key) != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, formatted, "[ai_review].") == null);
+        }
+        if (case.evidence) |evidence| try std.testing.expect(std.mem.indexOf(u8, formatted, evidence) != null);
+        if (case.failure == .final_answer_too_large) try std.testing.expect(std.mem.indexOf(u8, formatted, "runtime ceiling 262144 bytes") != null);
         for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 56, .height = 16 } }) |size| {
             harness.terminal_size = size;
             var context = harness.context();
@@ -3853,7 +3872,8 @@ test "AI review failure footer and details expose causes at normal and narrow si
             const top = try detail.snapshot(std.testing.allocator);
             defer std.testing.allocator.free(top);
             try std.testing.expect(std.mem.indexOf(u8, top, case.cause) != null);
-            try std.testing.expect(std.mem.indexOf(u8, top, "Stage:") != null);
+            const stage_label = if (case.failure == .timed_out and case.failure.timed_out == null) "Stage / duration / deadline owner: unknown" else "Stage:";
+            try std.testing.expect(std.mem.indexOf(u8, top, stage_label) != null);
             harness.overlay.kind.ai_review_details.scroll = aiReviewDetailViewport(size, &record).max_scroll;
             try viewAiReviewDetails(context, &detail.surface, &record);
             const bottom = try detail.snapshot(std.testing.allocator);

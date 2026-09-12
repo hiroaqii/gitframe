@@ -1,6 +1,7 @@
 const std = @import("std");
 const keymap = @import("keymap");
 const theme = @import("theme");
+const execution = @import("ai_review/execution.zig");
 
 const max_config_bytes = 64 * 1024;
 pub const supported_schema_version = 1;
@@ -30,6 +31,7 @@ pub const AiReviewConfig = struct {
     /// Optional opaque requested model. When absent, the Codex runner chooses
     /// its ordinary default; GitFrame does not maintain a model catalog.
     codex_model: ?[]const u8 = null,
+    limits: execution.Limits = .{},
 };
 
 pub const ReloadConfig = struct {
@@ -129,7 +131,7 @@ pub const LoadWarning = enum {
     read_failed,
 };
 
-pub const ConfigLoadFailure = enum {
+pub const ConfigLoadFailure = union(enum) {
     read_failed,
     read_permission_denied,
     read_is_directory,
@@ -139,6 +141,7 @@ pub const ConfigLoadFailure = enum {
     missing_action_input,
     duplicate_action_input,
     invalid_ai_review_store_root,
+    invalid_ai_review_limit: execution.InvalidSetting,
     unsupported_schema_version,
     unsupported_action_schema,
 };
@@ -273,8 +276,10 @@ fn loadTomlConfig(
             else => .{ .failure = classifyConfigReadError(err) },
         };
     };
-    const config = parseConfigToml(bytes) catch |err| {
+    var invalid_limit: ?execution.InvalidSetting = null;
+    const config = parseConfigTomlDiagnostic(bytes, &invalid_limit) catch |err| {
         allocator.free(bytes);
+        if (invalid_limit) |invalid| return .{ .failure = .{ .invalid_ai_review_limit = invalid } };
         return .{ .failure = classifyConfigParseError(err) };
     };
 
@@ -326,6 +331,7 @@ const TomlParseError = error{
     InvalidAiReviewStoreRoot,
     InvalidAiReviewCodexExecutable,
     InvalidAiReviewCodexModel,
+    InvalidAiReviewLimit,
     InvalidString,
     InvalidArray,
     UnsupportedEscape,
@@ -354,6 +360,11 @@ const TomlParseError = error{
 };
 
 fn parseConfigToml(input: []const u8) TomlParseError!Config {
+    return parseConfigTomlDiagnostic(input, null);
+}
+
+fn parseConfigTomlDiagnostic(input: []const u8, invalid_limit: ?*?execution.InvalidSetting) TomlParseError!Config {
+    if (invalid_limit) |output| output.* = null;
     var config: Config = .{};
     var section: ConfigSection = .root;
     var action_state: ?ExternalActionParseState = null;
@@ -364,6 +375,7 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
     var saw_ai_review_store_root = false;
     var saw_ai_review_codex_executable = false;
     var saw_ai_review_codex_model = false;
+    var saw_ai_review_limits: std.EnumSet(execution.Key) = .initEmpty();
 
     var lines = std.mem.splitScalar(u8, input, '\n');
     while (lines.next()) |raw_line| {
@@ -429,7 +441,20 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
                     return error.UnknownKey;
                 }
             },
-            .ai_review => {
+            .ai_review => ai_review: {
+                inline for (comptime std.meta.tags(execution.Key)) |limit_key| {
+                    if (std.mem.eql(u8, key, @tagName(limit_key))) {
+                        if (saw_ai_review_limits.contains(limit_key))
+                            return invalidAiReviewLimit(invalid_limit, .{ .key = limit_key, .reason = .duplicate });
+                        const number = std.fmt.parseInt(i64, value, 10) catch |err|
+                            return invalidAiReviewLimit(invalid_limit, .{ .key = limit_key, .reason = if (err == error.Overflow) .out_of_range else .integer_required });
+                        if (number <= 0) return invalidAiReviewLimit(invalid_limit, .{ .key = limit_key, .reason = .positive_required });
+                        @field(config.ai_review.limits, @tagName(limit_key)) = std.math.cast(@TypeOf(@field(config.ai_review.limits, @tagName(limit_key))), number) orelse
+                            return invalidAiReviewLimit(invalid_limit, .{ .key = limit_key, .reason = .out_of_range });
+                        saw_ai_review_limits.insert(limit_key);
+                        break :ai_review;
+                    }
+                }
                 if (std.mem.eql(u8, key, "store_root")) {
                     if (saw_ai_review_store_root) return error.DuplicateKey;
                     const store_root = try parseTomlString(value);
@@ -471,7 +496,13 @@ fn parseConfigToml(input: []const u8) TomlParseError!Config {
     try validateExternalActionsConfig(config.actions);
     if (!keymap.validateConfig(config.keymap)) return error.InvalidKeyBinding;
     if (config.schema_version != supported_schema_version) return error.UnsupportedSchemaVersion;
+    if (config.ai_review.limits.validate()) |invalid| return invalidAiReviewLimit(invalid_limit, invalid);
     return config;
+}
+
+fn invalidAiReviewLimit(output: ?*?execution.InvalidSetting, invalid: execution.InvalidSetting) TomlParseError {
+    if (output) |value| value.* = invalid;
+    return error.InvalidAiReviewLimit;
 }
 
 fn validateAiReviewStoreRoot(value: []const u8) error{InvalidStoreRoot}!void {
@@ -820,6 +851,90 @@ fn loadJson(
         .value = parsed.value,
         .parsed = parsed,
     } };
+}
+
+test "parse config merges common AI review limits with defaults and legacy settings" {
+    const defaults: execution.Limits = .{};
+    for ([_][]const u8{ "", "[ai_review]\n", "[ai_review]\nstore_root = \"/tmp/reviews\"\ncodex_executable = \"/usr/bin/codex\"\ncodex_model = \"requested\"\n" }) |input| {
+        try std.testing.expectEqualDeep(defaults, (try parseConfigToml(input)).ai_review.limits);
+    }
+    inline for (comptime std.meta.tags(execution.Key)) |key| {
+        const parsed = try parseConfigToml("[ai_review]\n" ++ @tagName(key) ++ " = 262144\n");
+        var expected = defaults;
+        @field(expected, @tagName(key)) = 262144;
+        try std.testing.expectEqualDeep(expected, parsed.ai_review.limits);
+    }
+    const all = try parseConfigToml(
+        \\[ai_review]
+        \\store_root = "/tmp/reviews"
+        \\codex_executable = "/usr/bin/codex"
+        \\codex_model = "requested"
+        \\max_input_bytes = 2048
+        \\max_final_output_bytes = 512
+        \\max_stream_output_bytes = 8192
+        \\timeout_seconds = 12
+    );
+    try std.testing.expectEqualDeep(execution.Limits{ .max_input_bytes = 2048, .max_final_output_bytes = 512, .max_stream_output_bytes = 8192, .timeout_seconds = 12 }, all.ai_review.limits);
+    try std.testing.expectEqualStrings("/tmp/reviews", all.ai_review.store_root.?);
+    try std.testing.expectEqualStrings("/usr/bin/codex", all.ai_review.codex_executable.?);
+    try std.testing.expectEqualStrings("requested", all.ai_review.codex_model.?);
+    var buffer: [256]u8 = undefined;
+    const largest = try parseConfigToml(try std.fmt.bufPrint(&buffer, "[ai_review]\nmax_input_bytes = {d}\nmax_stream_output_bytes = {d}\ntimeout_seconds = {d}\n", .{ execution.max_byte_limit, execution.max_byte_limit, std.math.maxInt(u32) }));
+    try std.testing.expectEqual(execution.max_byte_limit, largest.ai_review.limits.max_input_bytes);
+    try std.testing.expectEqual(execution.max_byte_limit, largest.ai_review.limits.max_stream_output_bytes);
+    try std.testing.expectEqual(std.math.maxInt(u32), largest.ai_review.limits.timeout_seconds);
+    try std.testing.expectEqualDeep(execution.Limits{ .max_input_bytes = 1, .max_final_output_bytes = 1, .max_stream_output_bytes = 1, .timeout_seconds = 1 }, (try parseConfigToml("[ai_review]\nmax_input_bytes = 1\nmax_final_output_bytes = 1\nmax_stream_output_bytes = 1\ntimeout_seconds = 1\n")).ai_review.limits);
+}
+
+test "loadConfig reports owned keys and reasons for every invalid AI review limit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    const path = try std.fs.path.join(allocator, &.{ directory, "config.toml" });
+    defer allocator.free(path);
+    var missing = loadConfig(allocator, io, path);
+    defer missing.deinit();
+    try std.testing.expectEqualDeep(execution.Limits{}, missing.success.value.ai_review.limits);
+    const bad_values = [_]struct { text: []const u8, reason: execution.Reason }{
+        .{ .text = "1.5", .reason = .integer_required },
+        .{ .text = "\"12\"", .reason = .integer_required },
+        .{ .text = "true", .reason = .integer_required },
+        .{ .text = "-1", .reason = .positive_required },
+        .{ .text = "0", .reason = .positive_required },
+        .{ .text = "18446744073709551616", .reason = .out_of_range },
+    };
+    var buffer: [256]u8 = undefined;
+    for (std.meta.tags(execution.Key)) |key| {
+        for (bad_values) |bad| {
+            const contents = try std.fmt.bufPrint(&buffer, "[ai_review]\n{s} = {s}\n", .{ @tagName(key), bad.text });
+            try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = contents });
+            var loaded = loadConfig(allocator, io, path);
+            defer loaded.deinit();
+            try std.testing.expectEqualDeep(execution.InvalidSetting{ .key = key, .reason = bad.reason }, loaded.failure.invalid_ai_review_limit);
+        }
+        const duplicate = try std.fmt.bufPrint(&buffer, "[ai_review]\n{s} = 262144\n{s} = 262144\n", .{ @tagName(key), @tagName(key) });
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = duplicate });
+        var loaded = loadConfig(allocator, io, path);
+        defer loaded.deinit();
+        try std.testing.expectEqualDeep(execution.InvalidSetting{ .key = key, .reason = .duplicate }, loaded.failure.invalid_ai_review_limit);
+    }
+    const boundaries = [_]struct { key: execution.Key, value: u64, reason: execution.Reason }{
+        .{ .key = .max_input_bytes, .value = @as(u64, execution.max_byte_limit) + 1, .reason = .out_of_range },
+        .{ .key = .max_stream_output_bytes, .value = @as(u64, execution.max_byte_limit) + 1, .reason = .out_of_range },
+        .{ .key = .timeout_seconds, .value = @as(u64, std.math.maxInt(u32)) + 1, .reason = .out_of_range },
+        .{ .key = .max_final_output_bytes, .value = 262145, .reason = .final_ceiling },
+        .{ .key = .max_stream_output_bytes, .value = 262143, .reason = .stream_smaller_than_final },
+    };
+    for (boundaries) |boundary| {
+        const contents = try std.fmt.bufPrint(&buffer, "[ai_review]\n{s} = {d}\n", .{ @tagName(boundary.key), boundary.value });
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = contents });
+        var loaded = loadConfig(allocator, io, path);
+        defer loaded.deinit();
+        try std.testing.expectEqualDeep(execution.InvalidSetting{ .key = boundary.key, .reason = boundary.reason }, loaded.failure.invalid_ai_review_limit);
+    }
 }
 
 test "resolvePaths uses XDG locations when present" {

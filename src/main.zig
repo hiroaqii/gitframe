@@ -287,6 +287,17 @@ fn configForStartup(
                     "gitframe: cannot load config {s}: invalid AI review Store root\n",
                     .{display_path},
                 ),
+                .invalid_ai_review_limit => |invalid| try stderr.print(
+                    "gitframe: cannot load config {s}: [ai_review].{s}: {s}\n",
+                    .{ display_path, @tagName(invalid.key), switch (invalid.reason) {
+                        .integer_required => "must be an integer",
+                        .positive_required => "must be greater than zero",
+                        .out_of_range => "integer is outside the supported range",
+                        .final_ceiling => "must not exceed 262144 bytes (whole-answer runtime ceiling)",
+                        .stream_smaller_than_final => "must be at least max_final_output_bytes",
+                        .duplicate => "duplicate key",
+                    } },
+                ),
                 .unsupported_schema_version => try stderr.print(
                     "gitframe: cannot load config {s}: unsupported schema version\n",
                     .{display_path},
@@ -513,6 +524,55 @@ test "config startup rejects every failure reason before runtime setup" {
             configForStartup(&result, "/tmp/config.toml", &stderr.writer),
         );
         try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "/tmp/config.toml") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stderr.written(), case.reason) != null);
+    }
+}
+
+test "config startup names invalid AI review keys and reasons from actual files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    const path = try std.fs.path.join(allocator, &.{ directory, "config.toml" });
+    defer allocator.free(path);
+    var buffer: [256]u8 = undefined;
+    const cases = [_]struct { value: []const u8, reason: []const u8 }{
+        .{ .value = "1.5", .reason = "must be an integer" },
+        .{ .value = "\"12\"", .reason = "must be an integer" },
+        .{ .value = "false", .reason = "must be an integer" },
+        .{ .value = "-1", .reason = "must be greater than zero" },
+        .{ .value = "0", .reason = "must be greater than zero" },
+        .{ .value = "18446744073709551616", .reason = "outside the supported range" },
+    };
+    for ([_][]const u8{ "max_input_bytes", "max_final_output_bytes", "max_stream_output_bytes", "timeout_seconds" }) |key| {
+        for (cases) |case| {
+            const contents = try std.fmt.bufPrint(&buffer, "[ai_review]\n{s} = {s}\n", .{ key, case.value });
+            try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = contents });
+            var result = gitframe.config.loadConfig(allocator, io, path);
+            defer result.deinit();
+            var stderr: std.Io.Writer.Allocating = .init(allocator);
+            defer stderr.deinit();
+            try std.testing.expectError(error.InvalidConfig, configForStartup(&result, path, &stderr.writer));
+            try std.testing.expect(std.mem.indexOf(u8, stderr.written(), path) != null);
+            try std.testing.expect(std.mem.indexOf(u8, stderr.written(), key) != null);
+            try std.testing.expect(std.mem.indexOf(u8, stderr.written(), case.reason) != null);
+        }
+    }
+    const specific = [_]struct { field: []const u8, reason: []const u8 }{
+        .{ .field = "max_final_output_bytes = 262145", .reason = "[ai_review].max_final_output_bytes: must not exceed 262144 bytes (whole-answer runtime ceiling)" },
+        .{ .field = "max_stream_output_bytes = 262143", .reason = "[ai_review].max_stream_output_bytes: must be at least max_final_output_bytes" },
+        .{ .field = "timeout_seconds = 1\ntimeout_seconds = 2", .reason = "[ai_review].timeout_seconds: duplicate key" },
+    };
+    for (specific) |case| {
+        const contents = try std.fmt.bufPrint(&buffer, "[ai_review]\n{s}\n", .{case.field});
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = contents });
+        var result = gitframe.config.loadConfig(allocator, io, path);
+        defer result.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(allocator);
+        defer stderr.deinit();
+        try std.testing.expectError(error.InvalidConfig, configForStartup(&result, path, &stderr.writer));
         try std.testing.expect(std.mem.indexOf(u8, stderr.written(), case.reason) != null);
     }
 }

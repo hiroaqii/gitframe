@@ -246,6 +246,7 @@ fn compareSubmissionController(app: *App) compare_submission.Controller {
         .store = if (app.configured_review_store) |*store| store else null,
         .codex_executable = app.user_config.ai_review.codex_executable,
         .codex_model = app.user_config.ai_review.codex_model,
+        .limits = app.user_config.ai_review.limits,
         .env_map = app.env_map,
         .jobs = &app.ai_review_jobs,
     };
@@ -336,6 +337,73 @@ test "Compare AI review submission owns exact authority and bounded rejection cl
     try std.testing.expect(app.pages.compare.ai_review_modal.open);
     try std.testing.expectEqualStrings("AI review queue is full; dismiss a finished job", app.pages.compare.ai_review_modal.failure.text());
     try std.testing.expectEqual(@import("../../ai_review/job_owner.zig").capacity, app.ai_review_jobs.retained_count);
+}
+
+test "Compare AI review queued requests retain independent configured limits" {
+    const allocator = std.testing.allocator;
+    var fixture = try PipelineFixture.init(allocator, std.testing.io);
+    defer fixture.deinit();
+    var app: App = .{ .allocator = allocator };
+    try prepareCompareSubmissionApp(&app, &fixture);
+    defer deinitCompareSubmissionApp(&app, allocator);
+    const execution = @import("../../ai_review/execution.zig");
+    const first_limits: execution.Limits = .{ .max_input_bytes = 512, .max_final_output_bytes = 128, .max_stream_output_bytes = 4096, .timeout_seconds = 7 };
+    const second_limits: execution.Limits = .{ .max_input_bytes = 2048, .max_final_output_bytes = 256, .max_stream_output_bytes = 8192, .timeout_seconds = 19 };
+    app.user_config.ai_review.limits = first_limits;
+    const first = compareSubmissionController(&app).submit(allocator).accepted;
+    app.pages.compare.beginAiReviewModal();
+    app.user_config.ai_review.limits = second_limits;
+    const second = compareSubmissionController(&app).submit(allocator).accepted;
+    app.user_config.ai_review.limits = .{};
+    try std.testing.expectEqualDeep(first_limits, app.ai_review_jobs.find(first).?.request.?.limits);
+    try std.testing.expectEqualDeep(second_limits, app.ai_review_jobs.find(second).?.request.?.limits);
+    var first_start = app.ai_review_jobs.takeNextReview().?;
+    defer first_start.request.deinit();
+    try std.testing.expect(first.eql(first_start.key));
+    try std.testing.expectEqualDeep(first_limits, first_start.request.limits);
+    try std.testing.expect(app.ai_review_jobs.reviewTaskStartFailed(first));
+    var second_start = app.ai_review_jobs.takeNextReview().?;
+    defer second_start.request.deinit();
+    try std.testing.expect(second.eql(second_start.key));
+    try std.testing.expectEqualDeep(second_limits, second_start.request.limits);
+    try std.testing.expect(app.ai_review_jobs.reviewTaskStartFailed(second));
+    try std.testing.expect(try fixture.storeEmpty());
+}
+
+test "AI review configured input limit reaches retained F2 through actual App submission" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try PipelineFixture.init(allocator, io);
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = "[ai_review]\nmax_input_bytes = 512\n" });
+    const path = try fixture.tmp.dir.realPathFileAlloc(io, "config.toml", allocator);
+    defer allocator.free(path);
+    var loaded = @import("../../config.zig").loadConfig(allocator, io, path);
+    defer loaded.deinit();
+    var app: App = .{ .allocator = allocator, .active_page = .compare, .user_config = loaded.success.value };
+    try prepareCompareSubmissionApp(&app, &fixture);
+    defer deinitCompareSubmissionApp(&app, allocator);
+    app.user_config.ai_review.codex_executable = "/must-not-launch-codex";
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+    try app.update(.{ .compare = .submit_ai_review }, &tc.ctx);
+    app.user_config.ai_review.limits = .{};
+    const message = try runOnlyTask(&tc.ctx, allocator, io);
+    const key = message.ai_review_job.review_finished.key;
+    try app.update(message, &tc.ctx);
+    const record = app.ai_review_jobs.find(key).?;
+    const limit = record.phase.terminal.pipeline.outcome.failed.input_too_large.?;
+    try std.testing.expectEqual(.provider_input_bytes, limit.resource);
+    try std.testing.expectEqual(@as(usize, 512), limit.allowed);
+    try std.testing.expect(limit.observed > limit.allowed);
+    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.f2 } }).?, &tc.ctx);
+    try std.testing.expect(app.overlay.kind.ai_review_details.key.eql(key));
+    var buffer: [2048]u8 = undefined;
+    const detail = @import("../ai_review_diagnostics.zig").format(&buffer, record);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Limit: 512 bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "[ai_review].max_input_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Provider limits still apply") != null);
+    try std.testing.expect(try fixture.storeEmpty());
 }
 
 test "AI review App uses two one-shot tasks and exposes publishing before exact terminal" {

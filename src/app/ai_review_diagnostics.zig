@@ -116,11 +116,19 @@ fn formatFailure(writer: *std.Io.Writer, failure: pipeline.FailureCode) void {
             writer.writeAll("Stage: Before Codex starts\n") catch unreachable;
             formatLimit(writer, limit);
             writer.writeAll("Next: Reduce the review range or Context.\n") catch unreachable;
+            if (limit) |value| if (value.resource == .provider_input_bytes) {
+                writer.writeAll("Config: [ai_review].max_input_bytes (generated prompt bytes). Provider limits still apply.\n") catch unreachable;
+            };
         },
         .stream_too_large, .final_answer_too_large => |limit| {
             writer.print("Stage: {s}\n", .{if (failure == .stream_too_large) "Provider execution" else "Answer decoding"}) catch unreachable;
             formatLimit(writer, limit);
             writer.writeAll("Next: Reduce the review range; check provider output.\n") catch unreachable;
+            switch (limit.resource) {
+                .stdout_bytes => writer.writeAll("Config: [ai_review].max_stream_output_bytes (stdout wire bytes).\n") catch unreachable,
+                .final_answer_bytes => writer.writeAll("Config: [ai_review].max_final_output_bytes (decoded whole answer; runtime ceiling 262144 bytes).\n") catch unreachable,
+                else => {},
+            }
         },
         .timed_out => |timing| {
             if (timing) |value| {
@@ -136,6 +144,9 @@ fn formatFailure(writer: *std.Io.Writer, failure: pipeline.FailureCode) void {
                 }) catch unreachable;
             } else writer.writeAll("Stage / duration / deadline owner: unknown\n") catch unreachable;
             writer.writeAll("Next: Reduce the review range; check provider responsiveness.\n") catch unreachable;
+            if (timing) |value| if (value.owner == .adapter) {
+                writer.writeAll("Config: [ai_review].timeout_seconds (version probe through provider completion).\n") catch unreachable;
+            };
         },
         .provider_unavailable => |reason| {
             writer.print("Stage: {s}\nNext: {s}\n", .{

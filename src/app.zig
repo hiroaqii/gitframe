@@ -504,6 +504,7 @@ pub const App = struct {
             .store = if (self.configured_review_store) |*value| value else null,
             .codex_executable = self.user_config.ai_review.codex_executable,
             .codex_model = self.user_config.ai_review.codex_model,
+            .limits = self.user_config.ai_review.limits,
             .env_map = self.env_map,
             .jobs = &self.ai_review_jobs,
         };

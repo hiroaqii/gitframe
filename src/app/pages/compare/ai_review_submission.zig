@@ -9,6 +9,7 @@ const ai_review_jobs = @import("../../../ai_review/job_owner.zig");
 const pipeline = @import("../../../ai_review/runner.zig");
 const codex = @import("../../../ai_review/adapters/codex/adapter.zig");
 const store_service = @import("../../../ai_review/store_service.zig");
+const execution = @import("../../../ai_review/execution.zig");
 
 pub const Failure = enum {
     codex_not_configured,
@@ -43,6 +44,7 @@ pub const Controller = struct {
     store: ?*store_service.ConfiguredStore,
     codex_executable: ?[]const u8,
     codex_model: ?[]const u8,
+    limits: execution.Limits,
     env_map: ?*std.process.Environ.Map,
     jobs: *ai_review_jobs.Owner,
 
@@ -97,7 +99,7 @@ pub const Controller = struct {
             .{ .base_label = basis.base.display_name, .head_label = basis.head_display },
             .{ .codex = provider },
             review_context,
-            .{},
+            self.limits,
         ) catch return reject(modal, .request_failed);
 
         const admission = self.jobs.enqueue(.{ .repository = repository, .target = target }, request);

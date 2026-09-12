@@ -222,6 +222,12 @@ the Codex CLI. Configure an absolute executable path; the model is optional:
 [ai_review]
 codex_executable = "/absolute/path/to/codex"
 codex_model = "optional-runner-model"
+
+# Common execution limits; all four may be omitted.
+max_input_bytes = 1048576
+max_final_output_bytes = 262144
+max_stream_output_bytes = 8388608
+timeout_seconds = 1800
 ```
 
 GitFrame uses the CLI's existing authentication context and does not select,
@@ -241,6 +247,47 @@ The hosted path publishes through the same Store domain as external producers,
 but it does not invoke the installed `gitframe-ai-review` Skill or `review.py`.
 Runs created externally remain available on `AI Reviews`; they do not have an
 in-memory GitFrame job status.
+
+### Common execution limits
+
+These are provider-neutral limits under `[ai_review]`, not Codex/model overrides.
+Missing files, omitted keys, partial settings, and the existing Store/executable/model
+settings retain their defaults. Values are decimal integers; startup rejects
+non-integers, negative/zero values, overflow, duplicate keys, and unsupported
+combinations with the key and reason. There is no zero/unlimited value.
+
+| Key | Default | Meaning and supported range |
+| --- | --- | --- |
+| `max_input_bytes` | 1048576 (1 MiB) | Entire generated prompt: instruction, context, serialized Review Units, and JSON escaping. `1..maxInt(usize)/2`. |
+| `max_final_output_bytes` | 262144 (256 KiB) | Decoded final answer for one complete provider call, including its multi-unit envelope. `1..262144`. |
+| `max_stream_output_bytes` | 8388608 (8 MiB) | All stdout wire bytes, including intermediate JSONL events and escaping. `1..maxInt(usize)/2`, and at least `max_final_output_bytes`. |
+| `timeout_seconds` | 1800 (30 minutes) | Shared execution budget, `1..4294967295` seconds. |
+
+Exactly the configured byte limit is accepted; exceeding it fails the whole
+operation. No truncated prompt or partial answer becomes a successful review.
+The machine-sized byte ceiling leaves room for bounded-reader arithmetic and
+the `N+1` overflow observation. It does not reserve that much memory.
+`stream >= final` does not guarantee that JSONL overhead/escaping will fit.
+
+Configuration is loaded at startup; each accepted Compare request copies all
+four values. Queued/running requests and retained diagnostics keep that snapshot.
+Changes require a restart and affect only new requests; there is no hot reload.
+The timeout starts immediately before the version probe and uses the same
+absolute deadline through the main provider process. Queue wait, Git/input
+preparation, prompt/private-environment creation, answer decoding/validation,
+and Store publication are excluded. An earlier caller deadline still wins.
+The probe also retains its separate, non-terminal 5-second local cap.
+
+These limits do not replace provider/model service limits or protocol/Store
+validation. Context remains 16 KiB, stderr remains 64 KiB, per-unit candidate
+payloads remain 256 KiB, and the candidate aggregate remains 16 MiB. The 256 KiB
+whole-answer ceiling is a separate GitFrame runtime/product limit, not a claim
+that the per-unit protocol ceiling applies to a multi-unit answer.
+
+Existing F2 details show the failed job's allowed/observed bytes or timeout
+budget and point to the applicable common key. Protocol/context/stderr limits
+and caller-owned deadlines do not suggest an unrelated setting. Raising an
+input setting does not guarantee acceptance by a model or provider.
 
 ## Resource ownership and current non-goals
 
