@@ -43,6 +43,8 @@ pub const KeyContext = struct {
     push_error_mode: bool = false,
     remote_action_cancelable: bool = false,
     ai_review_terminal_visible: bool = false,
+    ai_review_details_open: bool = false,
+    active_selection_gesture: bool = false,
     command_line_active: bool = false,
     repository_command_available: bool = false,
     keymap: keymap.Effective = .{},
@@ -113,6 +115,7 @@ pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
 }
 
 fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
+    if (context.ai_review_details_open) return null;
     if (context.command_line_active) return .{ .command_line = if (text.len > 0 and std.unicode.utf8ValidateSlice(text))
         .{ .paste = text }
     else
@@ -157,6 +160,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 }
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
+    if (context.ai_review_details_open) return detailsKeyToMsg(key);
     if (context.command_line_active) return .{ .command_line = commandLineKeyToMsg(key) };
     if (context.active_page == .ai_reviews and context.ai_reviews.human_review.open) {
         const msg = ai_reviews_input.keyToMsg(context.ai_reviews, key) orelse return null;
@@ -194,7 +198,8 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     }
     if (context.active_page == .ai_reviews and
         (context.ai_reviews.common.search_mode or context.ai_reviews.common.file_search_mode or
-            context.ai_reviews.picker_open or context.ai_reviews.human_review.open or context.ai_reviews.finding_card_focused))
+            context.ai_reviews.picker_open or context.ai_reviews.human_review.open or
+            (context.ai_reviews.finding_card_focused and !key.matches(chasen.Key.f2, .{}))))
     {
         const msg = ai_reviews_input.keyToMsg(context.ai_reviews, key) orelse return null;
         return .{ .ai_reviews = msg };
@@ -210,6 +215,8 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.push_error_mode) return pushErrorKeyToMsg(key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
     if (selectionKeyToMsg(context, key)) |msg| return msg;
+    if (context.ai_review_terminal_visible and !context.active_selection_gesture and key.matches(chasen.Key.f2, .{}))
+        return .{ .ai_review_details = .open };
     const routing_key = normalRoutingKey(key);
     if (pageForKey(context.keymap, routing_key)) |target| return .{ .switch_page = target };
     if (context.keymap.spec(.help)) |spec| if (spec.matches(routing_key)) return app_message.Msg.open_help;
@@ -255,6 +262,18 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         return .dismiss_ai_review_status;
     }
     if (routing_key.codepoint == 'q' and !key_input.hasCommandModifier(routing_key)) return app_message.Msg.quit;
+    return null;
+}
+
+fn detailsKeyToMsg(key: chasen.Key) ?app_message.Msg {
+    const DetailsAction = @import("ai_review_diagnostics.zig").Action;
+    const bindings = .{
+        .{ chasen.Key.escape, DetailsAction.close }, .{ chasen.Key.f2, DetailsAction.close },        .{ 'q', DetailsAction.close },
+        .{ chasen.Key.up, DetailsAction.up },        .{ 'k', DetailsAction.up },                     .{ chasen.Key.down, DetailsAction.down },
+        .{ 'j', DetailsAction.down },                .{ chasen.Key.page_up, DetailsAction.page_up }, .{ chasen.Key.page_down, DetailsAction.page_down },
+        .{ chasen.Key.home, DetailsAction.home },    .{ chasen.Key.end, DetailsAction.end },
+    };
+    inline for (bindings) |binding| if (key.matches(binding[0], .{})) return .{ .ai_review_details = binding[1] };
     return null;
 }
 
@@ -1405,4 +1424,29 @@ fn shiftedLowerOnly(lower: u21) chasen.Key {
         .codepoint = lower,
         .mods = .{ .shift = true },
     };
+}
+
+test "AI review details own keys and paste while opening respects existing owners" {
+    const f2: chasen.Key = .{ .codepoint = chasen.Key.f2 };
+    try std.testing.expect(keyToMsg(.{}, f2) == null);
+    const normal: KeyContext = .{ .ai_review_terminal_visible = true };
+    try std.testing.expectEqual(.open, keyToMsg(normal, f2).?.ai_review_details);
+    const blockers = [_]KeyContext{
+        .{ .command_line_active = true },                                           .{ .help_mode = true },                   .{ .repo_picker_mode = true },
+        .{ .commit_panel_mode = true },                                             .{ .discard_confirmation_mode = true },   .{ .push_error_mode = true },
+        .{ .active_selection_gesture = true },                                      .{ .changes = .{ .search_mode = true } }, .{ .active_page = .compare, .compare = .{ .base_picker_open = true } },
+        .{ .active_page = .compare, .compare = .{ .ai_review_modal_open = true } },
+    };
+    for (blockers) |blocked| {
+        var context = blocked;
+        context.ai_review_terminal_visible = true;
+        if (keyToMsg(context, f2)) |msg| try std.testing.expect(msg != .ai_review_details);
+    }
+    const open: KeyContext = .{ .ai_review_details_open = true, .ai_review_terminal_visible = true };
+    for ([_]u21{ 'q', chasen.Key.escape, chasen.Key.f2 }) |key|
+        try std.testing.expectEqual(.close, keyToMsg(open, .{ .codepoint = key }).?.ai_review_details);
+    try std.testing.expectEqual(.down, keyToMsg(open, .{ .codepoint = 'j' }).?.ai_review_details);
+    try std.testing.expectEqual(.end, keyToMsg(open, .{ .codepoint = chasen.Key.end }).?.ai_review_details);
+    for ([_]u21{ '1', 'R', '/', 'a', ':' }) |key| try std.testing.expect(keyToMsg(open, .{ .codepoint = key }) == null);
+    try std.testing.expect(pasteToMsg(open, "do not route") == null);
 }

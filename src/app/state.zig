@@ -7,7 +7,7 @@ const session_hunk_mark = @import("pages/changes/session_hunk_mark.zig");
 const page = @import("page.zig");
 const remote_request = @import("remote_request.zig");
 
-pub const OverlayKind = enum {
+pub const OverlayKind = union(enum) {
     none,
     help,
     discard_file,
@@ -17,6 +17,7 @@ pub const OverlayKind = enum {
     switch_branch,
     push_error,
     quit_ai_reviews,
+    ai_review_details: @import("ai_review_diagnostics.zig").Selection,
 };
 
 pub const OverlayMouseMode = enum {
@@ -39,6 +40,10 @@ pub const OverlayState = struct {
     /// Async results captured by an older surface must not present in a newer
     /// popup merely because both have the same overlay kind.
     push_error_instance_id: u64 = 0,
+
+    pub fn isAiReviewDetails(self: OverlayState) bool {
+        return self.kind == .ai_review_details;
+    }
 
     pub fn isHelp(self: OverlayState) bool {
         return self.kind == .help;
@@ -77,6 +82,7 @@ pub const OverlayState = struct {
             .none => .passthrough,
             .help => .scroll_help,
             .push_error => .scroll_push_error,
+            .ai_review_details => .block,
             .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch, .quit_ai_reviews => .block,
         };
     }

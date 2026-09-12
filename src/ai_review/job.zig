@@ -56,6 +56,7 @@ pub const Record = struct {
     sequence: u64,
     terminal_sequence: ?u64 = null,
     scope: Scope,
+    display: @import("diagnostic.zig").Display = .{},
     phase: Phase = .queued,
     request: ?pipeline.Request,
     canceled_generation: std.atomic.Value(u64) = .init(0),
@@ -67,6 +68,7 @@ pub const Record = struct {
             .key = key,
             .sequence = sequence,
             .scope = scope,
+            .display = request.displaySnapshot(),
             .request = request,
         };
     }

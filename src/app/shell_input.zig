@@ -124,6 +124,8 @@ pub const View = struct {
             .push_error_mode = self.overlay.isPushError(),
             .remote_action_cancelable = self.remote_action_cancelable,
             .ai_review_terminal_visible = self.ai_review_terminal_visible,
+            .ai_review_details_open = self.overlay.isAiReviewDetails(),
+            .active_selection_gesture = if (self.activeDiffSelectionOwner()) |selection| selection.active() else self.active_page == .repository and self.repository.page_state.activeMouseOwner(),
             .command_line_active = self.command_line_active,
             .repository_command_available = self.repository_command_available,
             .keymap = self.keymap,
@@ -131,6 +133,11 @@ pub const View = struct {
     }
 
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
+        if (self.overlay.isAiReviewDetails()) return if (mouse.type == .press) switch (mouse.button) {
+            .wheel_up => .{ .ai_review_details = .up },
+            .wheel_down => .{ .ai_review_details = .down },
+            else => null,
+        } else null;
         if (self.command_line_active) return null;
         if (self.active_page == .ai_reviews and self.ai_reviews.key.human_review.open) return null;
         if (self.activeDiffSelectionOwner()) |selection| {
@@ -545,6 +552,23 @@ test "human review result modal blocks mouse routing while Repository Help scrol
         .mods = .{},
         .type = .press,
     } }) == null);
+    overlay.kind = .{ .ai_review_details = .{ .key = .{ .id = 1, .generation = 2 } } };
+    try std.testing.expectEqual(.down, modal_view.handleEvent(.{ .mouse = .{
+        .col = 2,
+        .row = 2,
+        .button = .wheel_down,
+        .mods = .{},
+        .type = .press,
+    } }).?.ai_review_details);
+    inline for (.{ .press, .drag, .release }) |event_type| {
+        try std.testing.expect(modal_view.handleEvent(.{ .mouse = .{
+            .col = 2,
+            .row = 2,
+            .button = .left,
+            .mods = .{},
+            .type = event_type,
+        } }) == null);
+    }
 }
 
 test "Finding pointer shell preserves the AI Reviews body point and button once" {

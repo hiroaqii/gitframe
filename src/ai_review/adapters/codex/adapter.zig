@@ -5,6 +5,7 @@ const environment = @import("environment.zig");
 const process_runner = @import("../../../process/runner.zig");
 const producer = @import("../../producer.zig");
 const protocol = @import("../../protocol.zig");
+const diagnostic = @import("../../diagnostic.zig");
 
 pub const CleanupWarning = environment.CleanupWarning;
 
@@ -66,9 +67,9 @@ pub const ReviewBatch = struct {
     context: []const u8,
 };
 
-pub const FailureCode = enum {
+pub const FailureCode = union(enum) {
     internal_error,
-    input_too_large,
+    input_too_large: ?diagnostic.Limit,
     provider_unavailable,
     provider_incompatible,
     provider_failed,
@@ -122,9 +123,10 @@ fn runWithCleanupFailureInjection(
     var owned = request;
     defer owned.deinit();
 
-    const prompt = buildPrompt(allocator, batch) catch |err| return switch (err) {
+    var violation: ?diagnostic.Limit = null;
+    const prompt = buildPrompt(allocator, batch, &violation) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.InputTooLarge => .{ .outcome = .{ .failed = .input_too_large } },
+        error.InputTooLarge => .{ .outcome = .{ .failed = .{ .input_too_large = violation } } },
         error.InvalidInput => .{ .outcome = .{ .failed = .invalid_provider_result } },
     };
     defer {
@@ -237,12 +239,18 @@ fn validModel(value: []const u8) bool {
 
 const PromptError = error{ OutOfMemory, InputTooLarge, InvalidInput };
 
-fn buildPrompt(allocator: std.mem.Allocator, batch: ReviewBatch) PromptError![]u8 {
-    if (batch.context.len > max_context_bytes or !std.unicode.utf8ValidateSlice(batch.context)) {
+fn buildPrompt(allocator: std.mem.Allocator, batch: ReviewBatch, violation: *?diagnostic.Limit) PromptError![]u8 {
+    violation.* = null;
+    if (batch.context.len > max_context_bytes) {
+        violation.* = .{ .resource = .context_bytes, .allowed = max_context_bytes, .observed = batch.context.len, .observation = .exact };
         return error.InputTooLarge;
     }
+    if (!std.unicode.utf8ValidateSlice(batch.context)) return error.InvalidInput;
     var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
+    errdefer {
+        std.crypto.secureZero(u8, output.written());
+        output.deinit();
+    }
     output.writer.writeAll(instruction) catch return error.OutOfMemory;
     output.writer.writeAll("\nINPUT\n") catch return error.OutOfMemory;
     var stringify: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
@@ -270,12 +278,18 @@ fn buildPrompt(allocator: std.mem.Allocator, batch: ReviewBatch) PromptError![]u
         stringify.objectField("unit") catch return error.OutOfMemory;
         stringify.write(parsed.value) catch return error.OutOfMemory;
         stringify.endObject() catch return error.OutOfMemory;
-        if (output.written().len > max_input_bytes) return error.InputTooLarge;
+        if (output.written().len > max_input_bytes) {
+            violation.* = .{ .resource = .provider_input_bytes, .allowed = max_input_bytes, .observed = output.written().len, .observation = .at_least };
+            return error.InputTooLarge;
+        }
     }
     stringify.endArray() catch return error.OutOfMemory;
     stringify.endObject() catch return error.OutOfMemory;
     output.writer.writeByte('\n') catch return error.OutOfMemory;
-    if (output.written().len > max_input_bytes) return error.InputTooLarge;
+    if (output.written().len > max_input_bytes) {
+        violation.* = .{ .resource = .provider_input_bytes, .allowed = max_input_bytes, .observed = output.written().len, .observation = .exact };
+        return error.InputTooLarge;
+    }
     return output.toOwnedSlice() catch error.OutOfMemory;
 }
 
@@ -594,10 +608,65 @@ test "Codex bounds its canonical input before process launch" {
     const context = try std.testing.allocator.alloc(u8, max_context_bytes + 1);
     defer std.testing.allocator.free(context);
     @memset(context, 'x');
+    var violation: ?diagnostic.Limit = null;
     try std.testing.expectError(error.InputTooLarge, buildPrompt(std.testing.allocator, .{
         .units = &.{},
         .context = context,
-    }));
+    }, &violation));
+}
+
+test "Codex context boundary and invalid UTF-8 retain accurate diagnostic evidence" {
+    const allocator = std.testing.allocator;
+    var violation: ?diagnostic.Limit = null;
+    const context = "x" ** max_context_bytes;
+    const prompt = try buildPrompt(allocator, .{ .units = &.{}, .context = context }, &violation);
+    defer allocator.free(prompt);
+    try std.testing.expect(violation == null);
+    try std.testing.expectError(error.InvalidInput, buildPrompt(allocator, .{ .units = &.{}, .context = "\xff" }, &violation));
+    try std.testing.expect(violation == null);
+    var result = try run(allocator, std.testing.io, try Request.init(allocator, "/must-not-launch-codex", null), .{ .units = &.{}, .context = context ++ "x" }, .{});
+    defer result.deinit();
+    const limit = result.outcome.failed.input_too_large.?;
+    try std.testing.expectEqual(.context_bytes, limit.resource);
+    try std.testing.expectEqual(max_context_bytes, limit.allowed);
+    try std.testing.expectEqual(max_context_bytes + 1, limit.observed);
+    try std.testing.expectEqual(.exact, limit.observation);
+}
+
+test "Codex prompt exact boundary and partial multi-unit overflow diagnostics" {
+    const allocator = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "testdata/ai-review-producer-v1/protocol/unit.json", allocator, .limited(256 * 1024));
+    defer allocator.free(bytes);
+    var parsed = try protocol.ReviewUnit.parseStrict(allocator, bytes);
+    defer parsed.deinit();
+    var unit = parsed.value;
+    const padding = "x" ** (16 * 1024);
+    var metadata: [8][]const u8 = @splat(padding);
+    metadata[7] = "";
+    unit.metadata_lines = &metadata;
+    var violation: ?diagnostic.Limit = null;
+    const initial = try buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, &violation);
+    const missing = max_input_bytes - initial.len;
+    allocator.free(initial);
+    try std.testing.expect(missing < padding.len);
+    metadata[7] = padding[0..missing];
+    const exact = try buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, &violation);
+    defer allocator.free(exact);
+    try std.testing.expectEqual(max_input_bytes, exact.len);
+    metadata[7] = padding[0 .. missing + 1];
+    try std.testing.expectError(error.InputTooLarge, buildPrompt(allocator, .{ .units = &.{unit}, .context = "" }, &violation));
+    try std.testing.expectEqual(max_input_bytes + 1, violation.?.observed);
+    try std.testing.expectEqual(.exact, violation.?.observation);
+    // At this boundary the third unit has not been visited or counted.
+    unit.metadata_lines = metadata[0..4];
+    try std.testing.expectError(error.InputTooLarge, buildPrompt(allocator, .{ .units = &.{ unit, unit, unit }, .context = "" }, &violation));
+    try std.testing.expectEqual(.provider_input_bytes, violation.?.resource);
+    try std.testing.expectEqual(max_input_bytes, violation.?.allowed);
+    try std.testing.expect(violation.?.observed > max_input_bytes);
+    try std.testing.expectEqual(.at_least, violation.?.observation);
+    var result = try run(allocator, std.testing.io, try Request.init(allocator, "/must-not-launch-codex", null), .{ .units = &.{ unit, unit, unit }, .context = "" }, .{});
+    defer result.deinit();
+    try std.testing.expectEqualDeep(violation, result.outcome.failed.input_too_large);
 }
 
 test "Codex exit diagnostics distinguish auth compatibility and provider failure" {

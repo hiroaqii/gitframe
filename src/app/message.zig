@@ -223,6 +223,7 @@ pub const Msg = union(enum) {
     git_action_spinner_tick,
     cancel_remote_action,
     dismiss_ai_review_status,
+    ai_review_details: @import("ai_review_diagnostics.zig").Action,
     confirm_ai_review_quit,
     cancel_ai_review_quit,
     quit,

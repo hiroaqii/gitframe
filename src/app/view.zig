@@ -31,6 +31,7 @@ const repository_page = if (builtin.is_test) @import("pages/repository.zig") els
 const repository_source = if (builtin.is_test) @import("../repository/source.zig") else struct {};
 const content_fingerprint = if (builtin.is_test) @import("../content_fingerprint.zig") else struct {};
 const ai_review_job = @import("../ai_review/job.zig");
+const ai_review_diagnostics = @import("ai_review_diagnostics.zig");
 
 /// Rendering-only helpers for App.
 ///
@@ -104,6 +105,7 @@ pub const Context = struct {
     remote_cancelable: bool = false,
     remote_canceling: bool = false,
     ai_review_status: ?AiReviewStatus = null,
+    ai_review_detail: ?*const ai_review_job.Record = null,
     /// Shell notifications temporarily win over the active page diagnostic.
     status: *const app_state.StatusMessage,
     page_status: ?*const app_state.StatusMessage = null,
@@ -202,6 +204,9 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     }
     if (app.overlay.isPushError() and app.overlay.visibleOn(app.active_page)) {
         try viewPushError(app, surface);
+    }
+    if (app.overlay.isAiReviewDetails() and app.overlay.visibleOn(app.active_page)) {
+        if (app.ai_review_detail) |record| try viewAiReviewDetails(app, surface, record);
     }
     if (app.overlay.isQuitAiReviews() and app.overlay.visibleOn(app.active_page)) {
         try viewAiReviewQuitConfirmation(app, surface);
@@ -792,6 +797,26 @@ fn formatAiReviewStatus(buffer: []u8, status: AiReviewStatus, max_width: u16) ?[
     const base = status.scope.target.base_oid.short();
     const head = status.scope.target.head_oid.short();
     const state = aiReviewState(status.phase);
+
+    if (status.phase == .terminal) {
+        const cause = if (ai_review_diagnostics.inputTooLarge(status.phase)) "failed: input too large" else state.long;
+        const basename = status.repository_basename orelse "";
+        const clipped = chasen.text.clipToWidthWithMarker(basename, 24, "…");
+        const full = std.fmt.bufPrint(buffer, "AI {s} {s}{s}#{s}:{s}…{s} {s}  F2 details", .{
+            id, clipped.prefix, clipped.marker, root_hash, base, head, cause,
+        }) catch return null;
+        if (chasen.text.displayWidth(full) <= max_width) return full;
+        const target = std.fmt.bufPrint(buffer, "AI {s} #{s}:{s}…{s} {s}  F2 details", .{ id, root_hash, base, head, cause }) catch return null;
+        if (chasen.text.displayWidth(target) <= max_width) return target;
+        const repository = std.fmt.bufPrint(buffer, "AI {s} #{s} {s}  F2 details", .{ id, root_hash, cause }) catch return null;
+        if (chasen.text.displayWidth(repository) <= max_width) return repository;
+        const compact = std.fmt.bufPrint(buffer, "AI {s} {s}  F2 details", .{ id, cause }) catch return null;
+        if (chasen.text.displayWidth(compact) <= max_width) return compact;
+        const short = std.fmt.bufPrint(buffer, "AI {s} {s} F2", .{
+            id, if (ai_review_diagnostics.inputTooLarge(status.phase)) "input too large" else state.long,
+        }) catch return null;
+        return short;
+    }
 
     if (status.repository_basename) |basename| {
         if (validRepositoryBasename(basename)) {
@@ -1678,6 +1703,36 @@ fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
     const half = visible / 2;
     const max_start = len - visible;
     return @min(selected -| half, max_start);
+}
+
+fn aiReviewDetailOptions(size: chasen.Size) ui.Modal.ViewOptions {
+    return .{ .dialog_width = @min(size.width, 90), .dialog_height = @min(size.height, 32), .title = "AI review details", .backdrop = false, .border = .rounded };
+}
+
+pub fn aiReviewDetailViewport(size: chasen.Size, record: *const ai_review_job.Record) struct { rows: usize, max_scroll: usize } {
+    const content = modalContentSizeForRect(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, aiReviewDetailOptions(size));
+    const rows = content.height -| 2;
+    var buffer: [2048]u8 = undefined;
+    const text = ai_review_diagnostics.format(&buffer, record);
+    return .{ .rows = rows, .max_scroll = if (content.width == 0) 0 else paragraphMaxScroll(text, content.width, rows) };
+}
+
+fn viewAiReviewDetails(app: Context, surface: *chasen.Surface, record: *const ai_review_job.Record) !void {
+    var opts = aiReviewDetailOptions(surface.size());
+    opts.title_style = app.theme.boldStyle(.danger);
+    opts.border_style = app.theme.style(.danger);
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
+    const size = content.size();
+    var buffer: [2048]u8 = undefined;
+    // Wrapped drawing borrows glyphs until frame completion.
+    const text = try content.copyText(ai_review_diagnostics.format(&buffer, record));
+    var body = content.child(.{ .col = 0, .row = 0, .width = size.width, .height = size.height -| 2 });
+    _ = drawWrappedTextScrolled(&body, text, app.overlay.kind.ai_review_details.scroll, .{});
+    if (size.height > 0)
+        try draw.copyClippedTextAt(&content, 0, size.height - 1, "j/k: scroll  Esc/q/F2: close", app.theme.style(.muted));
 }
 
 fn viewPushError(app: Context, surface: *chasen.Surface) !void {
@@ -3668,3 +3723,70 @@ const help_all_sections = [_]HelpSection{
     .{ .title = "Changes diff", .items = &help_changes_diff_items },
     .{ .title = "Mouse", .items = &help_mouse_items },
 };
+
+test "AI review input footer and scrolled details remain readable at normal and narrow widths" {
+    const committed = @import("../committed_review.zig");
+    const diagnostic = @import("../ai_review/diagnostic.zig");
+    const base = try committed.ObjectId.parse(.sha256, "1" ** 64);
+    const head = try committed.ObjectId.parse(.sha256, "2" ** 64);
+    var record: ai_review_job.Record = .{
+        .key = .{ .id = 4294967295, .generation = 9 },
+        .sequence = 1,
+        .request = null,
+        .scope = .{ .repository = .{ .device = 12, .inode = 34 }, .target = .{
+            .object_format = .sha256,
+            .source_kind = .branch_range,
+            .base_oid = base,
+            .head_oid = head,
+            .diff_base_oid = base,
+        } },
+        .display = .{ .repository = diagnostic.Label.init("長いrepo" ** 30), .base = diagnostic.Label.init("base枝" ** 30), .head = diagnostic.Label.init("head枝" ** 30) },
+        .phase = .{ .terminal = .{ .pipeline = .{ .outcome = .{ .failed = .{ .input_too_large = .{
+            .resource = .provider_input_bytes,
+            .allowed = 131072,
+            .observed = 145678,
+            .observation = .at_least,
+        } } } } } },
+    };
+    var harness: ShellViewTestHarness = .{};
+    for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 80, .height = 24 }, .{ .width = 56, .height = 16 } }) |size| {
+        harness.terminal_size = size;
+        var context = harness.context();
+        context.ai_review_status = .{ .key = record.key, .scope = record.scope, .phase = record.phase, .repository_basename = record.display.repository.slice() };
+        var footer: chasen.testing.TestSurface = undefined;
+        try footer.init(size.width, 1);
+        defer footer.deinit();
+        viewFooter(context, &footer.surface);
+        const snapshot = try footer.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "input too large") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "F2") != null);
+        harness.overlay.kind = .{ .ai_review_details = .{ .key = record.key } };
+        harness.overlay.owner_page = .changes;
+        var detail: chasen.testing.TestSurface = undefined;
+        try detail.init(size.width, size.height);
+        defer detail.deinit();
+        try viewAiReviewDetails(context, &detail.surface, &record);
+        const first = try detail.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(first);
+        try std.testing.expect(std.mem.indexOf(u8, first, "Failed: input too large") != null);
+        try std.testing.expect(std.mem.indexOf(u8, first, "Before Codex starts") != null);
+        try std.testing.expect(std.mem.indexOf(u8, first, "131072 bytes (128 KiB)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, first, "Observed at least: 145678 bytes") != null);
+        harness.overlay.kind.ai_review_details.scroll = aiReviewDetailViewport(size, &record).max_scroll;
+        try viewAiReviewDetails(context, &detail.surface, &record);
+        const last = try detail.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(last);
+        try std.testing.expect(std.mem.indexOf(u8, last, "Head:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, last, "2222222222222222") != null);
+    }
+    var buffer: [2048]u8 = undefined;
+    record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .review_units, .allowed = 256, .observed = 257, .observation = .at_least };
+    const counted = ai_review_diagnostics.format(&buffer, &record);
+    try std.testing.expect(std.mem.indexOf(u8, counted, "Limit: 256 count") != null);
+    try std.testing.expect(std.mem.indexOf(u8, counted, "KiB") == null);
+    record.phase.terminal.pipeline.outcome.failed.input_too_large.?.resource = .unknown;
+    try std.testing.expect(std.mem.indexOf(u8, ai_review_diagnostics.format(&buffer, &record), "unit unknown") != null);
+    record.phase.terminal.pipeline.outcome.failed.input_too_large = null;
+    try std.testing.expect(std.mem.indexOf(u8, ai_review_diagnostics.format(&buffer, &record), "Limit / observation: unknown") != null);
+}

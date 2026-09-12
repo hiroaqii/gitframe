@@ -532,7 +532,7 @@ pub const App = struct {
                 .help = self.overlay.isHelp(),
                 .commit_input = self.localWorkflowView().commitPanelOpen(),
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
-                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isQuitAiReviews() or
+                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isQuitAiReviews() or self.overlay.isAiReviewDetails() or
                     self.pages.ai_reviews.delete_confirmation.isOpen(),
                 .branch_switch = self.overlay.isSwitchBranch(),
                 .push_error = self.overlay.isPushError(),
@@ -1024,6 +1024,7 @@ pub const App = struct {
             },
             .git_action_spinner_tick => if (self.actionLifecycle().tick(ctx)) self.redraw_plan.requestSkip(),
             .cancel_remote_action => _ = self.remoteWorkflow().cancelActiveRemote(false),
+            .ai_review_details => |action| self.updateAiReviewDetails(action),
             .dismiss_ai_review_status => _ = self.ai_review_jobs.dismissSelectedTerminal(),
             .confirm_ai_review_quit => self.confirmAiReviewQuit(ctx),
             .cancel_ai_review_quit => if (self.overlay.isQuitAiReviews()) self.overlay.close(),
@@ -1039,6 +1040,7 @@ pub const App = struct {
         try self.changesRead().maybeStartQueuedRevalidation(ctx);
         try self.repositoryCoordinator().startPending(ctx);
         self.reconcileCommandLine();
+        self.clampAiReviewDetails();
         const revalidation_queued_before_projection = self.changesRead().hasQueuedFullRevalidation();
         if (self.active_page == .changes) try self.changesRead().ensureProjection(ctx);
         // Boundary inert retention queues its repair revalidation inside
@@ -1932,6 +1934,7 @@ pub const App = struct {
             .remote_cancelable = remote.canCancel(self.actionLifecycleView().acceptedPending()),
             .remote_canceling = remote.canceling(),
             .ai_review_status = self.aiReviewStatusView(),
+            .ai_review_detail = if (self.overlay.isAiReviewDetails()) self.ai_review_jobs.find(self.overlay.kind.ai_review_details.key) else null,
             .status = &self.status,
             .page_status = self.activePageStatus(),
             .command_line = self.commandLineView(),
@@ -2123,21 +2126,54 @@ pub const App = struct {
         return selected.unread and selected.phase == .terminal;
     }
 
+    fn updateAiReviewDetails(self: *App, action: @import("app/ai_review_diagnostics.zig").Action) void {
+        if (action == .open) {
+            if (self.overlay.kind != .none or !self.aiReviewTerminalVisible()) return;
+            const record = self.ai_review_jobs.selected() orelse return;
+            self.overlay.kind = .{ .ai_review_details = .{ .key = record.key } };
+            self.overlay.owner_page = self.active_page;
+            return;
+        }
+        if (!self.overlay.isAiReviewDetails()) return;
+        if (action == .close) {
+            self.overlay.close();
+            return;
+        }
+        const selection = &self.overlay.kind.ai_review_details;
+        const record = self.ai_review_jobs.find(selection.key) orelse {
+            self.overlay.close();
+            return;
+        };
+        const viewport = app_view.aiReviewDetailViewport(self.shellLayout().contentSize(), record);
+        selection.scroll = switch (action) {
+            .up => selection.scroll -| 1,
+            .down => selection.scroll +| 1,
+            .page_up => selection.scroll -| @max(viewport.rows, 1),
+            .page_down => selection.scroll +| @max(viewport.rows, 1),
+            .home => 0,
+            .end => viewport.max_scroll,
+            .open, .close => unreachable,
+        };
+        selection.scroll = @min(selection.scroll, viewport.max_scroll);
+    }
+
+    fn clampAiReviewDetails(self: *App) void {
+        if (!self.overlay.isAiReviewDetails()) return;
+        const selection = &self.overlay.kind.ai_review_details;
+        const record = self.ai_review_jobs.find(selection.key) orelse {
+            self.overlay.close();
+            return;
+        };
+        selection.scroll = @min(selection.scroll, app_view.aiReviewDetailViewport(self.shellLayout().contentSize(), record).max_scroll);
+    }
+
     fn aiReviewStatusView(self: *const App) ?app_view.AiReviewStatus {
         const record = self.ai_review_jobs.selected() orelse return null;
-        const repo = self.repoSessionView();
-        const basename = if (repo.activeIdentity()) |identity|
-            if (identity.eql(record.scope.repository))
-                if (repo.activeRoot()) |root| std.fs.path.basename(root) else null
-            else
-                null
-        else
-            null;
         return .{
             .key = record.key,
             .scope = record.scope,
             .phase = record.phase,
-            .repository_basename = basename,
+            .repository_basename = record.display.repository.slice(),
         };
     }
 

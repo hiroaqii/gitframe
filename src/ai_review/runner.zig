@@ -1,6 +1,7 @@
 //! Concrete provider-neutral two-entry ReviewPipeline for hosted AI review.
 
 const std = @import("std");
+const diagnostic = @import("diagnostic.zig");
 const committed = @import("../committed_review.zig");
 const git_command = @import("../git/command.zig");
 const git_review = @import("../git/committed_review.zig");
@@ -23,13 +24,13 @@ pub const ProviderRequest = union(enum) {
     }
 };
 
-pub const FailureCode = enum {
+pub const FailureCode = union(enum) {
     timed_out,
     repository_unavailable,
     target_unavailable,
     projection_failed,
     input_failed,
-    input_too_large,
+    input_too_large: ?diagnostic.Limit,
     provider_unavailable,
     provider_incompatible,
     provider_failed,
@@ -41,6 +42,10 @@ pub const FailureCode = enum {
     exact_reconciliation_failed,
     internal_error,
 };
+
+comptime {
+    std.debug.assert(@sizeOf(FailureCode) <= 256);
+}
 
 pub const Published = struct {
     review_id: committed.ReviewId,
@@ -148,6 +153,15 @@ pub const Request = struct {
         self.* = undefined;
     }
 
+    pub fn displaySnapshot(self: *const Request) diagnostic.Display {
+        const display = self.publication.display;
+        return .{
+            .repository = diagnostic.Label.init(std.fs.path.basename(self.publication.repository_path)),
+            .base = diagnostic.Label.init(if (display) |value| value.base_label orelse "(unknown)" else "(unknown)"),
+            .head = diagnostic.Label.init(if (display) |value| value.head_label orelse "(unknown)" else "(unknown)"),
+        };
+    }
+
     pub fn matchesScope(
         self: *const Request,
         repository: root_capability.Identity,
@@ -228,7 +242,7 @@ pub fn review(
     var violation: ?@import("limits.zig").Violation = null;
     var plan = input_command.planAlloc(allocator, io, directory, owned.publication.target, projection.patch_bytes, &violation) catch |err| return switch (err) {
         error.OutOfMemory => failed(.internal_error),
-        error.LimitExceeded, error.ReviewUnitTooLarge, error.ReviewLineTooLarge => failed(.input_too_large),
+        error.LimitExceeded, error.ReviewUnitTooLarge, error.ReviewLineTooLarge => failed(.{ .input_too_large = diagnostic.Limit.fromViolation(violation) }),
         else => failed(.input_failed),
     };
     errdefer plan.deinit();
@@ -381,7 +395,7 @@ fn controlTerminal(io: std.Io, control: process_runner.ProcessControl) ?Terminal
 fn mapCodexFailure(code: codex.FailureCode) FailureCode {
     return switch (code) {
         .internal_error => .internal_error,
-        .input_too_large => .input_too_large,
+        .input_too_large => |value| .{ .input_too_large = value },
         .provider_unavailable => .provider_unavailable,
         .provider_incompatible => .provider_incompatible,
         .provider_failed => .provider_failed,
@@ -696,4 +710,18 @@ test "publishReady creates exact zero and nonzero publications and rejects a bad
         if (previous_id) |id| try std.testing.expect(!id.eql(terminal.outcome.published.review_id));
         previous_id = terminal.outcome.published.review_id;
     }
+}
+
+test "ReviewPipeline preserves input limit payload from plan and Codex" {
+    const planned = diagnostic.Limit.fromViolation(.{ .resource = "review_units", .allowed = 256, .observed = 257 });
+    const plan_terminal = failedTerminal(.{ .input_too_large = planned }, null);
+    try std.testing.expectEqualDeep(planned, plan_terminal.outcome.failed.input_too_large);
+    const adapter_result: codex.Result = .{ .outcome = .{ .failed = .{ .input_too_large = .{
+        .resource = .provider_input_bytes,
+        .allowed = 131072,
+        .observed = 140000,
+        .observation = .at_least,
+    } } } };
+    try std.testing.expectEqualDeep(adapter_result.outcome.failed.input_too_large, mapAdapterTerminal(&adapter_result).?.outcome.failed.input_too_large);
+    try std.testing.expect(@sizeOf(FailureCode) <= 256);
 }

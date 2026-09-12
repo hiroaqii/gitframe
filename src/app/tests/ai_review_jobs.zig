@@ -625,3 +625,90 @@ test "AI review undelivered ReadyToPublish releases payload without changing App
     try std.testing.expect(app.ai_review_jobs.find(key).?.phase == .reviewing);
     try std.testing.expect(try fixture.storeEmpty());
 }
+
+test "AI review input diagnostic survives task delivery page changes and exact detail selection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try PipelineFixture.init(allocator, io);
+    defer fixture.deinit();
+    var app: App = .{ .allocator = allocator, .active_page = .compare, .terminal_size = .{ .width = 56, .height = 16 } };
+    defer app.ai_review_jobs.deinit();
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+    const request = try pipeline.Request.init(allocator, fixture.root, null, &fixture.store, fixture.repo_path, fixture.target, .{ .base_label = "base-枝" ** 30, .head_label = "head-枝" ** 30 }, .{ .codex = try codex.Request.init(allocator, "/must-not-launch-codex", null) }, "x" ** (codex.max_context_bytes + 1));
+    const key = app.enqueueAiReview(&tc.ctx, fixture.scope(), request).accepted;
+    app.repo_session.repo_epoch = 99;
+    app.active_page = .config;
+    const message = try runOnlyTask(&tc.ctx, allocator, io);
+    const evidence = message.ai_review_job.review_finished.outcome.pipeline.terminal.outcome.failed.input_too_large;
+    var stale = message;
+    stale.ai_review_job.review_finished.key.generation += 1;
+    try app.update(stale, &tc.ctx);
+    try std.testing.expect(app.ai_review_jobs.find(key).?.phase == .reviewing);
+    var discarded = message;
+    discarded.deinitUndelivered(allocator);
+    try app.update(message, &tc.ctx);
+    const record = app.ai_review_jobs.find(key).?;
+    try std.testing.expectEqualDeep(evidence, record.phase.terminal.pipeline.outcome.failed.input_too_large);
+    try std.testing.expectEqualStrings("repo", record.display.repository.slice());
+    try std.testing.expect(std.mem.endsWith(u8, record.display.base.slice(), "…"));
+    try std.testing.expect(record.scope.eql(&fixture.scope()));
+    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.f2 } }).?, &tc.ctx);
+    try std.testing.expect(app.overlay.kind.ai_review_details.key.eql(key));
+    try std.testing.expect(record.unread);
+    try app.update(.{ .ai_review_details = .end }, &tc.ctx);
+    try std.testing.expect(app.overlay.kind.ai_review_details.scroll > 0);
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &tc.ctx);
+    const viewport = @import("../view.zig").aiReviewDetailViewport(@import("../shell_layout.zig").contentSize(app.terminal_size), record);
+    try std.testing.expect(app.overlay.kind.ai_review_details.scroll <= viewport.max_scroll);
+    const second = app.enqueueAiReview(&tc.ctx, fixture.scope(), try fixture.requestWithExecutable("/missing-codex")).accepted;
+    try app.update(try runOnlyTask(&tc.ctx, allocator, io), &tc.ctx);
+    try std.testing.expect(app.ai_review_jobs.find(second).?.phase == .terminal);
+    try std.testing.expect(app.overlay.kind.ai_review_details.key.eql(key));
+    try app.update(.{ .ai_review_details = .close }, &tc.ctx);
+    try std.testing.expect(record.unread);
+    try app.update(.{ .ai_review_details = .open }, &tc.ctx);
+    try std.testing.expect(app.ai_review_jobs.dismiss(key, fixture.root.identity));
+    const third = app.enqueueAiReview(&tc.ctx, fixture.scope(), try fixture.requestWithExecutable("/missing-codex")).accepted;
+    try app.update(try runOnlyTask(&tc.ctx, allocator, io), &tc.ctx);
+    try std.testing.expect(app.overlay.kind == .none);
+    try std.testing.expect(app.ai_review_jobs.find(key) == null);
+    try std.testing.expect(!third.eql(key));
+    try std.testing.expect(try fixture.storeEmpty());
+}
+
+test "AI review pipeline plan limit reaches retained job without provider launch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try PipelineFixture.init(allocator, io);
+    defer fixture.deinit();
+    const limits = @import("../../ai_review/limits.zig");
+    try fixture.repo.writeFile(io, .{ .sub_path = "sample.txt", .data = "x" ** (limits.max_diff_line_bytes + 1) ++ "\n" });
+    try runCommand(allocator, io, fixture.repo, &.{ "git", "add", "sample.txt" });
+    try runCommand(allocator, io, fixture.repo, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "oversized line" });
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    const resolved = try git_review.resolveTarget(allocator, io, .{ .cwd = fixture.root.dir(), .environment = &environment }, .{
+        .source_kind = .branch_range,
+        .base = "refs/heads/review-base",
+        .head = "refs/heads/main",
+    });
+    fixture.target = resolved.target;
+    var app: App = .{ .allocator = allocator };
+    defer app.ai_review_jobs.deinit();
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+    const key = app.enqueueAiReview(&tc.ctx, fixture.scope(), try fixture.requestWithExecutable("/must-not-launch-codex")).accepted;
+    try app.update(try runOnlyTask(&tc.ctx, allocator, io), &tc.ctx);
+    const record = app.ai_review_jobs.find(key).?;
+    const limit = record.phase.terminal.pipeline.outcome.failed.input_too_large.?;
+    try std.testing.expectEqual(.diff_line_bytes, limit.resource);
+    try std.testing.expectEqual(limits.max_diff_line_bytes, limit.allowed);
+    try std.testing.expect(limit.observed > limit.allowed);
+    try std.testing.expectEqual(.at_least, limit.observation);
+    var buffer: [2048]u8 = undefined;
+    const detail = @import("../ai_review_diagnostics.zig").format(&buffer, record);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Resource: diff_line_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Before Codex starts") != null);
+    try std.testing.expect(try fixture.storeEmpty());
+}
