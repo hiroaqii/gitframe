@@ -454,6 +454,72 @@ test "AI review App uses two one-shot tasks and exposes publishing before exact 
     try std.testing.expect(record.phase.terminal.pipeline.outcome == .published);
     try app.update(.quit, &tc.ctx);
     try std.testing.expect(tc.ctx.shouldQuit());
+
+    {
+        var compare_fixture = try PipelineFixture.init(allocator, io);
+        defer compare_fixture.deinit();
+        try runCommand(allocator, io, compare_fixture.repo, &.{ "git", "branch", "-m", "main", "review-head" });
+        var compare_app: App = .{ .allocator = allocator, .active_page = .compare };
+        try prepareCompareSubmissionApp(&compare_app, &compare_fixture);
+        defer deinitCompareSubmissionApp(&compare_app, allocator);
+        if (compare_app.pages.compare.basis) |*basis| {
+            allocator.free(basis.head_display);
+            basis.head_display = try allocator.dupe(u8, "review-head");
+        }
+        var compare_tc: chasen.testing.TestCtx(App.Msg) = .{};
+        defer compare_tc.resetTransient();
+
+        try compare_app.update(.{ .compare = .submit_ai_review }, &compare_tc.ctx);
+        try runCommand(allocator, io, compare_fixture.repo, &.{ "git", "branch", "-m", "review-base", "moved-base" });
+        try runCommand(allocator, io, compare_fixture.repo, &.{ "git", "branch", "-m", "review-head", "moved-head" });
+        if (compare_app.pages.compare.basis) |*basis| {
+            allocator.free(basis.base.display_name);
+            basis.base.display_name = try allocator.dupe(u8, "mutated-base");
+            allocator.free(basis.head_display);
+            basis.head_display = try allocator.dupe(u8, "mutated-head");
+        }
+
+        const compare_review_message = try runOnlyTask(&compare_tc.ctx, allocator, io);
+        const compare_key = compare_review_message.ai_review_job.review_finished.key;
+        try compare_app.update(compare_review_message, &compare_tc.ctx);
+        try std.testing.expect(compare_app.ai_review_jobs.find(compare_key).?.phase == .publishing);
+        try compare_app.update(try runOnlyTask(&compare_tc.ctx, allocator, io), &compare_tc.ctx);
+        const compare_record = compare_app.ai_review_jobs.find(compare_key).?;
+        try std.testing.expect(compare_record.phase.terminal.pipeline.outcome == .published);
+        try std.testing.expectEqualStrings("review-base", compare_record.display.base.slice());
+        try std.testing.expectEqualStrings("review-head", compare_record.display.head.slice());
+
+        var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+        defer environment.deinit();
+        var scanned = try store_service.scan(allocator, io, &compare_fixture.store, .{
+            .capability = &compare_fixture.root,
+            .environment = &environment,
+        });
+        defer scanned.deinit(allocator);
+        const history = switch (scanned) {
+            .history => |*value| value,
+            else => return error.ExpectedPublishedHistory,
+        };
+        try std.testing.expectEqual(@as(usize, 1), history.rows.len);
+        try std.testing.expectEqualStrings("review-base", history.rows[0].base_label.?);
+        try std.testing.expectEqualStrings("review-head", history.rows[0].head_label.?);
+        var selected = try store_service.selectExact(
+            allocator,
+            io,
+            &compare_fixture.store,
+            .{ .capability = &compare_fixture.root, .environment = &environment },
+            history.snapshot,
+            history.rows[0].review_id,
+            history.rows[0].artifact_snapshot,
+        );
+        defer selected.deinit(allocator);
+        const manifest = switch (selected) {
+            .selected => |*value| &value.artifacts.manifest.value,
+            .failure => return error.ExpectedPublishedSelection,
+        };
+        try std.testing.expectEqualStrings("review-base", manifest.display.?.base_label.?);
+        try std.testing.expectEqualStrings("review-head", manifest.display.?.head_label.?);
+    }
 }
 
 test "AI review App rejects stale ReadyToPublish and honors cancellation at the adoption gate" {

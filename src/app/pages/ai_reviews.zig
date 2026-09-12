@@ -1183,4 +1183,56 @@ test "AI Reviews reuses its retained activation without selecting a Run" {
     try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll);
     try std.testing.expectEqual(page.Id.ai_reviews, state.activation.currentIdentity().?.origin);
     try std.testing.expect(state.selectedRunConst() == null);
+
+    const rows = try allocator.alloc(review_store.RunSummary, 2);
+    const target: committed_review.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = try committed_review.ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .head_oid = try committed_review.ObjectId.parse(.sha1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        .diff_base_oid = try committed_review.ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    };
+    for (rows, 0..) |*row, index| {
+        row.* = .{
+            .review_id = try committed_review.ReviewId.parse(if (index == 0)
+                "123e4567-e89b-42d3-a456-426614174000"
+            else
+                "223e4567-e89b-42d3-a456-426614174000"),
+            .target = target,
+            .status = if (index == 0) .approved else .needs_changes,
+            .created_at = if (index == 0) "2026-09-12T09:00:00Z".* else "2026-09-12T09:01:00Z".*,
+            .created_at_unix = 1_000 + @as(i64, @intCast(index)),
+            .producer_name = try allocator.dupe(u8, if (index == 0) "first" else "second"),
+            .producer_model = null,
+            .base_label = try allocator.dupe(u8, "release-base"),
+            .head_label = try allocator.dupe(u8, "feature-head"),
+            .finding_count = @intCast(index + 1),
+            .availability = .available,
+            .artifact_snapshot = .{
+                .manifest_digest = committed_review.Sha256Digest.hash(if (index == 0) "manifest-a" else "manifest-b"),
+                .findings_digest = committed_review.Sha256Digest.hash(if (index == 0) "findings-a" else "findings-b"),
+                .draft_state = .absent,
+                .draft_digest = null,
+                .result_digest = null,
+            },
+        };
+    }
+    state.picker.scan_result = .{ .history = .{
+        .snapshot = .{
+            .root_device = 1,
+            .root_inode = 2,
+            .repository_locator = .{ .device = 3, .inode = 4 },
+            .review_repository_id = try committed_review.ReviewRepositoryId.parse("323e4567-e89b-42d3-a456-426614174000"),
+        },
+        .rows = rows,
+        .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
+        .skipped_count = 0,
+        .orphan_count = 0,
+    } };
+    try state.picker.rebuildSearch(allocator);
+    const search_labels: []const []const u8 = state.picker.search_labels;
+    try state.picker.filter.apply(allocator, search_labels, "release-base");
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, state.picker.filter.source_indexes);
+    try state.picker.filter.apply(allocator, search_labels, "feature-head");
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, state.picker.filter.source_indexes);
 }

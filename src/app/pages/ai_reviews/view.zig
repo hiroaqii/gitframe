@@ -17,6 +17,7 @@ const keymap = @import("keymap");
 const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const committed_review = @import("../../../committed_review.zig");
+const git_review = @import("../../../git/committed_review.zig");
 const review_store = @import("../../../review_store.zig");
 const human_review_session = @import("../../human_review_session.zig");
 const human_review_decision = @import("human_review_decision.zig");
@@ -253,10 +254,18 @@ pub fn viewPicker(app: Context, surface: *chasen.Surface) !void {
             const source_index = picker.filter.sourceIndex(visible_index) orelse continue;
             const rows = picker.rows();
             if (source_index >= rows.len) continue;
-            try drawAiReviewRow(app, &content, next_row + row_offset, rows[source_index], picker.focus == visible_index);
+            try drawAiReviewRow(
+                app.palette,
+                picker.render_now_unix,
+                app.page.isCurrentReview(rows[source_index].review_id),
+                &content,
+                next_row + row_offset,
+                rows[source_index],
+                picker.focus == visible_index,
+            );
         }
     } else if (next_row < list_end) {
-        if (try aiReviewsStateMessage(app, content.frameAllocator())) |message| {
+        if (try aiReviewsStateMessage(app, content.frameAllocator(), size.width)) |message| {
             try draw.copyClippedTextAt(&content, 0, next_row, message.text, messageStyle(app, message.failure));
         } else if (picker.query.len > 0) {
             const message = try std.fmt.allocPrint(content.frameAllocator(), "No AI reviews match \"{s}\"", .{picker.query.slice()});
@@ -280,7 +289,7 @@ pub fn viewPicker(app: Context, surface: *chasen.Surface) !void {
                     firstLine(app.page.status.text()),
                     app.palette.style(.prompt),
                 );
-            } else if (try aiReviewsStateMessage(app, content.frameAllocator())) |message| {
+            } else if (try aiReviewsStateMessage(app, content.frameAllocator(), size.width)) |message| {
                 try draw.copyClippedTextAt(&content, 0, detail_row, message.text, messageStyle(app, message.failure));
             } else if (picker.selectedRow()) |selected| {
                 try drawAiReviewDetail(app, &content, detail_row, selected);
@@ -329,12 +338,15 @@ pub fn viewDeleteConfirmation(app: Context, surface: *chasen.Surface) !void {
         row += 1;
     }
     if (row < footer_row) {
-        const target = try std.fmt.allocPrint(content.frameAllocator(), "Target: {s}@{s} -> {s}@{s}", .{
-            summary.base_label orelse "base",
-            summary.target.base_oid.short(),
-            summary.head_label orelse "head",
-            summary.target.head_oid.short(),
-        });
+        const pair = try targetPairAlloc(
+            content.frameAllocator(),
+            &summary.target,
+            summary.base_label,
+            summary.head_label,
+            true,
+            size.width -| content.displayWidth("Target: "),
+        );
+        const target = try std.fmt.allocPrint(content.frameAllocator(), "Target: {s}", .{pair});
         try draw.copyClippedTextAt(&content, 0, row, target, app.palette.style(.muted));
         row += 1;
     }
@@ -645,21 +657,24 @@ const AiReviewsStateMessage = struct {
 fn aiReviewsStateMessage(
     app: Context,
     allocator: std.mem.Allocator,
+    available_width: u16,
 ) !?AiReviewsStateMessage {
     const picker = &app.page.picker;
     return switch (picker.phase) {
         .closed, .ready => null,
         .scan_loading => .{ .text = "Loading AI reviews..." },
-        .selection_loading => if (picker.selectedRow()) |selected|
-            .{ .text = try std.fmt.allocPrint(allocator, "Loading review... {s}  {s}@{s} -> {s}@{s}", .{
-                selected.producer_name,
-                selected.base_label orelse "base",
-                selected.target.base_oid.short(),
-                selected.head_label orelse "head",
-                selected.target.head_oid.short(),
-            }) }
-        else
-            .{ .text = "Loading review..." },
+        .selection_loading => if (picker.selectedRow()) |selected| blk: {
+            const prefix = try std.fmt.allocPrint(allocator, "Loading review... {s}  ", .{selected.producer_name});
+            const pair = try targetPairAlloc(
+                allocator,
+                &selected.target,
+                selected.base_label,
+                selected.head_label,
+                true,
+                available_width -| chasen.text.displayWidth(prefix),
+            );
+            break :blk .{ .text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, pair }) };
+        } else .{ .text = "Loading review..." },
         .scan_failed => |message| .{ .text = firstLine(message), .failure = true },
         .selection_failed => |failure| .{ .text = firstLine(failure.message), .failure = true },
         .empty => |kind| switch (kind) {
@@ -687,39 +702,82 @@ fn messageStyle(app: Context, failure: bool) chasen.TextStyle {
 }
 
 fn drawAiReviewRow(
-    app: Context,
+    palette: theme.Palette,
+    render_now_unix: ?i64,
+    current: bool,
     surface: *chasen.Surface,
     row_index: u16,
     item: review_store.RunSummary,
     focused: bool,
 ) !void {
     const focus_marker: []const u8 = if (focused) ">" else " ";
-    const current_marker: []const u8 = if (app.page.isCurrentReview(item.review_id)) "*" else " ";
+    const current_marker: []const u8 = if (current) "*" else " ";
     const status = if (item.availability == .missing) "target unavailable" else ai_reviews_page.runSummaryStatusText(item.status);
-    const relative = commit_time.formatRelative(item.created_at_unix, app.page.picker.render_now_unix);
-    const finding_label: []const u8 = if (item.finding_count == 1) "finding" else "findings";
+    const relative = commit_time.formatRelative(item.created_at_unix, render_now_unix);
     const width = surface.size().width;
-    const text = if (width >= 96 and item.producer_model != null)
-        try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s}  {s}  {d} {s}  {s}  {s}", .{
-            focus_marker, current_marker, item.producer_name, item.producer_model.?, item.finding_count, finding_label, status, relative.text(),
-        })
-    else if (width >= 68)
-        try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s}  {d} {s}  {s}  {s}", .{
-            focus_marker, current_marker, item.producer_name, item.finding_count, finding_label, status, relative.text(),
-        })
-    else if (width >= 42)
-        try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s}  {d} {s}  {s}", .{
-            focus_marker, current_marker, item.producer_name, item.finding_count, finding_label, status,
-        })
-    else
-        try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s}  {s}", .{ focus_marker, current_marker, item.producer_name, status });
-    try draw.copyClippedTextAt(
-        surface,
-        0,
-        row_index,
-        text,
-        if (focused) app.palette.boldStyle(.accent) else chasen.TextStyle{},
-    );
+    const allocator = surface.frameAllocator();
+    const facts = try aiReviewRowFactsAlloc(allocator, surface, item, status, relative.text(), width);
+    const facts_width = @min(width -| 3, surface.displayWidth(facts));
+    const facts_col = width - facts_width;
+    const pair_end = facts_col -| 2;
+    const style = if (focused) palette.boldStyle(.accent) else chasen.TextStyle{};
+    const markers = try std.fmt.allocPrint(allocator, "{s}{s} ", .{ focus_marker, current_marker });
+    try draw.copyClippedTextAt(surface, 0, row_index, markers, style);
+    if (pair_end > 3) {
+        var pair_surface = surface.child(.{
+            .col = 3,
+            .row = row_index,
+            .width = pair_end - 3,
+            .height = 1,
+        });
+        const pair = try targetPairAlloc(
+            allocator,
+            &item.target,
+            item.base_label,
+            item.head_label,
+            false,
+            pair_surface.size().width,
+        );
+        try draw.copyClippedTextAt(&pair_surface, 0, 0, pair, style);
+    }
+    try draw.copyClippedTextAt(surface, facts_col, row_index, facts, style);
+}
+
+fn aiReviewRowFactsAlloc(
+    allocator: std.mem.Allocator,
+    surface: *const chasen.Surface,
+    item: review_store.RunSummary,
+    status: []const u8,
+    relative: []const u8,
+    width: u16,
+) ![]const u8 {
+    const maximum = width -| 21;
+    const finding_label: []const u8 = if (item.finding_count == 1) "finding" else "findings";
+    if (width >= 96) if (item.producer_model) |model| {
+        const text = try std.fmt.allocPrint(allocator, "{s}  {s}  {d} {s}  {s}  {s}", .{
+            item.producer_name, model, item.finding_count, finding_label, status, relative,
+        });
+        if (surface.displayWidth(text) <= maximum) return text;
+    };
+    if (width >= 68) {
+        const text = try std.fmt.allocPrint(allocator, "{s}  {d} {s}  {s}  {s}", .{
+            item.producer_name, item.finding_count, finding_label, status, relative,
+        });
+        if (surface.displayWidth(text) <= maximum) return text;
+    }
+    if (width >= 54) {
+        const text = try std.fmt.allocPrint(allocator, "{s}  {d}  {s}  {s}", .{
+            item.producer_name, item.finding_count, status, relative,
+        });
+        if (surface.displayWidth(text) <= maximum) return text;
+    }
+    if (width >= 42) {
+        const text = try std.fmt.allocPrint(allocator, "{s}  {d}  {s}", .{
+            item.producer_name, item.finding_count, status,
+        });
+        if (surface.displayWidth(text) <= maximum) return text;
+    }
+    return status;
 }
 
 fn drawAiReviewDetail(
@@ -728,16 +786,144 @@ fn drawAiReviewDetail(
     start_row: u16,
     item: *const review_store.RunSummary,
 ) !void {
-    const base_label = item.base_label orelse "base";
-    const head_label = item.head_label orelse "head";
-    const target = try std.fmt.allocPrint(surface.frameAllocator(), "{s}@{s} -> {s}@{s}", .{
-        base_label, item.target.base_oid.short(), head_label, item.target.head_oid.short(),
-    });
+    const target = try targetPairAlloc(
+        surface.frameAllocator(),
+        &item.target,
+        item.base_label,
+        item.head_label,
+        true,
+        surface.size().width,
+    );
     try draw.copyClippedTextAt(surface, 0, start_row, target, app.palette.style(.muted));
     if (start_row + 1 >= surface.size().height -| 1) return;
     const review_id = item.review_id.canonical();
-    const detail = try std.fmt.allocPrint(surface.frameAllocator(), "created {s}  review {s}", .{ &item.created_at, review_id[0..8] });
+    const displayed_review_id: []const u8 = if (surface.size().width >= 73) &review_id else review_id[0..8];
+    const detail = try std.fmt.allocPrint(surface.frameAllocator(), "created {s}  review {s}", .{ &item.created_at, displayed_review_id });
     try draw.copyClippedTextAt(surface, 0, start_row + 1, detail, app.palette.style(.muted));
+}
+
+fn targetPairAlloc(
+    allocator: std.mem.Allocator,
+    target: *const committed_review.CommittedReviewTarget,
+    base_label: ?[]const u8,
+    head_label: ?[]const u8,
+    detailed: bool,
+    available_width: u16,
+) ![]const u8 {
+    const separator = " → ";
+    const separator_width = chasen.text.displayWidth(separator);
+    if (available_width <= separator_width) return clippedTextAlloc(allocator, separator, available_width);
+
+    const endpoint_width = available_width - separator_width;
+    const base_full_width = targetEndpointWidth(base_label, target.base_oid.short(), detailed);
+    const head_full_width = targetEndpointWidth(head_label, target.head_oid.short(), detailed);
+    const base_min_width = targetEndpointMinimumWidth(base_label, target.base_oid.short(), detailed);
+    const head_min_width = targetEndpointMinimumWidth(head_label, target.head_oid.short(), detailed);
+    const budgets = targetEndpointBudgets(
+        endpoint_width,
+        base_full_width,
+        head_full_width,
+        base_min_width,
+        head_min_width,
+    );
+    const base = try targetEndpointAlloc(
+        allocator,
+        base_label,
+        target.base_oid.short(),
+        detailed,
+        budgets.base,
+    );
+    const head = try targetEndpointAlloc(
+        allocator,
+        head_label,
+        target.head_oid.short(),
+        detailed,
+        budgets.head,
+    );
+    return std.fmt.allocPrint(allocator, "{s} → {s}", .{ base, head });
+}
+
+const TargetEndpointBudgets = struct {
+    base: u16,
+    head: u16,
+};
+
+fn targetEndpointBudgets(
+    available_width: u16,
+    base_full_width: u16,
+    head_full_width: u16,
+    base_min_width: u16,
+    head_min_width: u16,
+) TargetEndpointBudgets {
+    if (@as(u32, base_full_width) + head_full_width <= available_width) {
+        return .{ .base = base_full_width, .head = head_full_width };
+    }
+
+    const half = available_width / 2;
+    if (base_full_width <= half and head_min_width <= available_width - base_full_width) {
+        return .{ .base = base_full_width, .head = available_width - base_full_width };
+    }
+    if (head_full_width <= available_width - half and base_min_width <= available_width - head_full_width) {
+        return .{ .base = available_width - head_full_width, .head = head_full_width };
+    }
+
+    var base = half;
+    var head = available_width - half;
+    if (@as(u32, base_min_width) + head_min_width <= available_width) {
+        if (base < base_min_width) {
+            base = base_min_width;
+            head = available_width - base;
+        } else if (head < head_min_width) {
+            head = head_min_width;
+            base = available_width - head;
+        }
+    }
+    return .{ .base = base, .head = head };
+}
+
+fn targetEndpointWidth(label: ?[]const u8, short_oid: []const u8, detailed: bool) u16 {
+    return if (label) |value|
+        chasen.text.displayWidth(value) + if (detailed) 1 + chasen.text.displayWidth(short_oid) else 0
+    else
+        chasen.text.displayWidth(short_oid);
+}
+
+fn targetEndpointMinimumWidth(label: ?[]const u8, short_oid: []const u8, detailed: bool) u16 {
+    const full_width = targetEndpointWidth(label, short_oid, detailed);
+    if (label != null and detailed) {
+        return @min(full_width, 2 + chasen.text.displayWidth(short_oid));
+    }
+
+    const text = label orelse short_oid;
+    var graphemes = chasen.text.graphemeIterator(text);
+    const first = graphemes.next() orelse return 0;
+    const first_width = chasen.text.displayWidth(first.bytes(text));
+    return @min(full_width, first_width + 1);
+}
+
+fn targetEndpointAlloc(
+    allocator: std.mem.Allocator,
+    label: ?[]const u8,
+    short_oid: []const u8,
+    detailed: bool,
+    available_width: u16,
+) ![]const u8 {
+    const value = label orelse return clippedTextAlloc(allocator, short_oid, available_width);
+    if (!detailed) return clippedTextAlloc(allocator, value, available_width);
+
+    const suffix_width = 1 + chasen.text.displayWidth(short_oid);
+    if (available_width < suffix_width) return clippedTextAlloc(allocator, short_oid, available_width);
+    const clipped_label = try clippedTextAlloc(allocator, value, available_width - suffix_width);
+    return std.fmt.allocPrint(allocator, "{s}@{s}", .{ clipped_label, short_oid });
+}
+
+fn clippedTextAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    available_width: u16,
+) ![]const u8 {
+    const clipped = chasen.text.clipToWidthWithMarker(text, available_width, "…");
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ clipped.prefix, clipped.marker });
 }
 
 fn aiReviewsFooterText(picker: *const ai_reviews_page.AiReviewsPickerState, width: u16) []const u8 {
@@ -875,7 +1061,53 @@ fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
     return @min(selected -| (visible / 2), len - visible);
 }
 
+fn testRunSummaryAlloc(
+    allocator: std.mem.Allocator,
+    review_id_text: []const u8,
+    base_label: ?[]const u8,
+    head_label: ?[]const u8,
+    finding_count: u32,
+    availability: git_review.TargetAvailability,
+) !review_store.RunSummary {
+    const producer_name = try allocator.dupe(u8, "codex");
+    errdefer allocator.free(producer_name);
+    const producer_model = try allocator.dupe(u8, "gpt-6-test");
+    errdefer allocator.free(producer_model);
+    const owned_base = if (base_label) |label| try allocator.dupe(u8, label) else null;
+    errdefer if (owned_base) |label| allocator.free(label);
+    const owned_head = if (head_label) |label| try allocator.dupe(u8, label) else null;
+    errdefer if (owned_head) |label| allocator.free(label);
+    return .{
+        .review_id = try committed_review.ReviewId.parse(review_id_text),
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = try committed_review.ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            .head_oid = try committed_review.ObjectId.parse(.sha1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            .diff_base_oid = try committed_review.ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        },
+        .status = .approved,
+        .created_at = "2026-09-12T09:00:00Z".*,
+        .created_at_unix = 1_000,
+        .producer_name = producer_name,
+        .producer_model = producer_model,
+        .base_label = owned_base,
+        .head_label = owned_head,
+        .finding_count = finding_count,
+        .availability = availability,
+        .artifact_snapshot = .{
+            .manifest_digest = committed_review.Sha256Digest.hash("manifest"),
+            .findings_digest = committed_review.Sha256Digest.hash("findings"),
+            .draft_state = .absent,
+            .draft_digest = null,
+            .result_digest = null,
+        },
+    };
+}
+
 test "AI Reviews initial page is stable and Run selection is explicit" {
+    const long_base = "base/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const long_head = "機能改善/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     var rendered: chasen.testing.TestSurface = undefined;
     try rendered.init(60, 12);
     defer rendered.deinit();
@@ -891,4 +1123,157 @@ test "AI Reviews initial page is stable and Run selection is explicit" {
     }, &rendered.surface);
     try rendered.expectCellText(1, 6, "N");
     try rendered.expectCellText(1, 8, "a");
+
+    const rows = try std.testing.allocator.alloc(review_store.RunSummary, 2);
+    rows[0] = try testRunSummaryAlloc(
+        std.testing.allocator,
+        "123e4567-e89b-42d3-a456-426614174000",
+        long_base,
+        long_head,
+        2,
+        .available,
+    );
+    rows[1] = try testRunSummaryAlloc(
+        std.testing.allocator,
+        "223e4567-e89b-42d3-a456-426614174000",
+        null,
+        null,
+        1,
+        .missing,
+    );
+    state.picker.scan_result = .{ .history = .{
+        .snapshot = .{
+            .root_device = 1,
+            .root_inode = 2,
+            .repository_locator = .{ .device = 3, .inode = 4 },
+            .review_repository_id = try committed_review.ReviewRepositoryId.parse("323e4567-e89b-42d3-a456-426614174000"),
+        },
+        .rows = rows,
+        .diagnostics = try std.testing.allocator.alloc(review_store.Diagnostic, 0),
+        .skipped_count = 0,
+        .orphan_count = 0,
+    } };
+    const filter_labels = [_][]const u8{ "first", "second" };
+    try state.picker.filter.apply(std.testing.allocator, &filter_labels, "");
+    state.picker.phase = .ready;
+    state.picker.render_now_unix = 1_120;
+
+    for ([_]chasen.Size{
+        .{ .width = 120, .height = 32 },
+        .{ .width = 80, .height = 24 },
+        .{ .width = 56, .height = 16 },
+    }) |size| {
+        var picker_surface: chasen.testing.TestSurface = undefined;
+        try picker_surface.init(size.width, size.height);
+        defer picker_surface.deinit();
+        try viewPicker(.{
+            .page = &state,
+            .palette = theme.Palette.default(),
+            .repo_root = "/repo",
+            .repo_epoch = 1,
+            .root_identity = null,
+            .layout = .{ .width = size.width, .height = size.height },
+        }, &picker_surface.surface);
+        const snapshot = try picker_surface.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "base/") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "機") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, " → ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "…") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "aaaaaaa → bbbbbbb") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "approved") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "aaaaaaa") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "bbbbbbb") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "@aaaaaaa") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "@bbbbbbb") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "base@") == null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "head@") == null);
+
+        const pair_width = size.width - 20;
+        for ([_]struct {
+            base_label: ?[]const u8,
+            head_label: ?[]const u8,
+            base_fragment: []const u8,
+            head_fragment: []const u8,
+            clipped: bool,
+        }{
+            .{ .base_label = long_base, .head_label = "head", .base_fragment = "base/", .head_fragment = "head", .clipped = true },
+            .{ .base_label = "base", .head_label = long_head, .base_fragment = "base", .head_fragment = "機能改善/", .clipped = true },
+            .{ .base_label = long_base, .head_label = long_head, .base_fragment = "base/", .head_fragment = "機能改善/", .clipped = true },
+            .{ .base_label = null, .head_label = null, .base_fragment = "aaaaaaa", .head_fragment = "bbbbbbb", .clipped = false },
+        }) |case| {
+            const pair = try targetPairAlloc(
+                picker_surface.surface.frameAllocator(),
+                &rows[0].target,
+                case.base_label,
+                case.head_label,
+                false,
+                pair_width,
+            );
+            try std.testing.expect(chasen.text.displayWidth(pair) <= pair_width);
+            try std.testing.expect(std.mem.indexOf(u8, pair, case.base_fragment) != null);
+            try std.testing.expect(std.mem.indexOf(u8, pair, " → ") != null);
+            try std.testing.expect(std.mem.indexOf(u8, pair, case.head_fragment) != null);
+            try std.testing.expectEqual(case.clipped, std.mem.indexOf(u8, pair, "…") != null);
+        }
+
+        const detailed_pair = try targetPairAlloc(
+            picker_surface.surface.frameAllocator(),
+            &rows[0].target,
+            long_base,
+            long_head,
+            true,
+            pair_width,
+        );
+        try std.testing.expect(chasen.text.displayWidth(detailed_pair) <= pair_width);
+        try std.testing.expect(std.mem.indexOf(u8, detailed_pair, "…") != null);
+        try std.testing.expect(std.mem.indexOf(u8, detailed_pair, "aaaaaaa") != null);
+        try std.testing.expect(std.mem.indexOf(u8, detailed_pair, " → ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, detailed_pair, "bbbbbbb") != null);
+        if (size.width >= 120) {
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "gpt-6-test") != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 findings") != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "123e4567-e89b-42d3-a456-426614174000") != null);
+        } else if (size.width >= 80) {
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "gpt-6-test") == null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 findings") != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "123e4567-e89b-42d3-a456-426614174000") != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "gpt-6-test") == null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "findings") == null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "review 123e4567") != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "123e4567-e89b-42d3-a456-426614174000") == null);
+        }
+    }
+
+    var marker_surface: chasen.testing.TestSurface = undefined;
+    try marker_surface.init(56, 1);
+    defer marker_surface.deinit();
+    try drawAiReviewRow(
+        theme.Palette.default(),
+        1_120,
+        true,
+        &marker_surface.surface,
+        0,
+        rows[0],
+        true,
+    );
+    try marker_surface.expectCellText(0, 0, ">");
+    try marker_surface.expectCellText(1, 0, "*");
+
+    state.picker.phase = .{ .selection_loading = .{
+        .review_id = rows[0].review_id,
+        .direct = false,
+    } };
+    const loading = (try aiReviewsStateMessage(.{
+        .page = &state,
+        .palette = theme.Palette.default(),
+        .repo_root = "/repo",
+        .repo_epoch = 1,
+        .root_identity = null,
+        .layout = .{ .width = 80, .height = 24 },
+    }, marker_surface.surface.frameAllocator(), 80)).?;
+    try std.testing.expect(std.mem.indexOf(u8, loading.text, "aaaaaaa") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loading.text, " → ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loading.text, "bbbbbbb") != null);
 }
