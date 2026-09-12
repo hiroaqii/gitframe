@@ -9,6 +9,7 @@ const protocol = @import("protocol.zig");
 pub const gitframe_version = "0.0.0";
 
 const v1 = [_]u16{1};
+const v2 = [_]u16{2};
 
 /// Exact cumulative list after installed artifact production exists.
 pub const capabilities = [_]protocol.Capability{
@@ -17,7 +18,7 @@ pub const capabilities = [_]protocol.Capability{
     .{ .name = "committed-review.artifact", .versions = &v1 },
     .{ .name = "committed-review.instructions", .versions = &v1 },
     .{ .name = "committed-review.projection", .versions = &v1 },
-    .{ .name = "committed-review.target", .versions = &v1 },
+    .{ .name = "committed-review.target", .versions = &v2 },
     .{ .name = "review-store.prepare", .versions = &v1 },
     .{ .name = "review-store.publish", .versions = &v1 },
     .{ .name = "review-store.result-read", .versions = &v1 },
@@ -103,7 +104,7 @@ test "AI review protocol capabilities command emits the exact honest installed p
         .{ .name = "committed-review.artifact", .version = 1 },
         .{ .name = "committed-review.instructions", .version = 1 },
         .{ .name = "committed-review.projection", .version = 1 },
-        .{ .name = "committed-review.target", .version = 1 },
+        .{ .name = "committed-review.target", .version = 2 },
         .{ .name = "review-store.prepare", .version = 1 },
         .{ .name = "review-store.publish", .version = 1 },
         .{ .name = "review-store.result-read", .version = 1 },

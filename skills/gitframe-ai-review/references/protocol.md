@@ -1,7 +1,8 @@
 # Candidate and lifecycle protocol
 
-The driver requires GitFrame v1 capabilities for target, projection,
-instructions, input, producer artifacts, Store prepare and Store publish.
+The driver requires `committed-review.target@2` and GitFrame v1 capabilities
+for projection, instructions, input, producer artifacts, Store prepare and
+Store publish.
 There is no provider SDK or shell interpolation. All child invocations use the
 one absolute GitFrame executable admitted by `begin`.
 
@@ -35,12 +36,23 @@ the final strict and semantic validation.
 
 ## Lifecycle boundaries
 
-`begin` first checks all required capabilities, then resolves a target,
-materializes its committed projection, and constructs deterministic units. An
+`begin` first checks the exact required capability memberships and strict
+capability shape/order, then admits one target@2 snapshot. The target response
+has exact ordered `target` and `display` objects; both display keys are present
+and each value is a bounded single-line string or `null`. GitFrame obtains
+those optional labels from the same opened physical repository used to pin the
+target. The driver never invokes raw Git or reopens a repository path for
+labels. It then materializes the committed projection and constructs
+deterministic units. An
 empty plan returns `no_changes` before Store prepare. A non-empty plan calls
 prepare once, receives fresh identifiers, and creates one private `0700`
 workspace beneath the platform temporary root. The raw 256-bit nonce appears
 only in the `ready` handoff; `invocation.json` stores its SHA-256 digest.
+
+When one or both labels are present, `invocation.json` stores the complete
+nullable display object immediately after `target`. Both `null` omits the
+field. This is an immutable creation-time snapshot: later ref rename, deletion,
+or movement does not cause refresh or re-resolution.
 
 The invocation binds caller-supplied agent provenance before publication.
 `producer.name` identifies the agent product performing the semantic review,
@@ -53,7 +65,9 @@ slug in the current turn. That value is authoritative for the turn; a
 selection can override it.
 
 `complete` admits the exact direct-child workspace, ownership/mode, nonce,
-saved input hashes and candidate inventory. Pre-publication failures do not
+canonical optional display shape, saved input hashes and candidate inventory.
+It passes unchanged non-null labels immediately after `producer` in the
+artifact header; a corrupt display fails without repair. Pre-publication failures do not
 call publish. Valid input calls `review-producer artifacts` once, verifies the
 entire binary frame and calls `review-store-publish` at most once. There is no
 automatic retry. Duplicate or concurrent use of one complete handoff is not a

@@ -492,15 +492,17 @@ fn requestForTargetAlloc(
 fn expectedTargetSuccessAlloc(
     allocator: std.mem.Allocator,
     target: target_mod.CommittedReviewTarget,
+    canonical_display: []const u8,
 ) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{{\"schema_version\":1,\"status\":\"ok\",\"target\":{{\"object_format\":\"{s}\",\"source_kind\":\"branch_range\",\"base_oid\":\"{s}\",\"head_oid\":\"{s}\",\"diff_base_oid\":\"{s}\"}}}}\n",
+        "{{\"schema_version\":2,\"status\":\"ok\",\"target\":{{\"object_format\":\"{s}\",\"source_kind\":\"branch_range\",\"base_oid\":\"{s}\",\"head_oid\":\"{s}\",\"diff_base_oid\":\"{s}\"}},\"display\":{s}}}\n",
         .{
             if (target.object_format == .sha1) "sha1" else "sha256",
             target.base_oid.slice(),
             target.head_oid.slice(),
             target.diff_base_oid.slice(),
+            canonical_display,
         },
     );
 }
@@ -833,7 +835,11 @@ test "partial-clone two-command flow keeps target success and projection failure
         .head_oid = try target_mod.ObjectId.parse(.sha1, head_oid),
         .diff_base_oid = try target_mod.ObjectId.parse(.sha1, base_oid),
     };
-    const expected_target = try expectedTargetSuccessAlloc(std.testing.allocator, target);
+    const expected_target = try expectedTargetSuccessAlloc(
+        std.testing.allocator,
+        target,
+        "{\"base_label\":null,\"head_label\":null}",
+    );
     defer std.testing.allocator.free(expected_target);
     var complete_target_output = try target_command.executeAlloc(
         std.testing.allocator,
@@ -950,7 +956,11 @@ test "projection frame admits exact sixteen MiB and keeps overflow error-only" {
         .base = "refs/heads/main",
         .head = "HEAD",
     }));
-    const expected_target = try expectedTargetSuccessAlloc(std.testing.allocator, oversized_target);
+    const expected_target = try expectedTargetSuccessAlloc(
+        std.testing.allocator,
+        oversized_target,
+        "{\"base_label\":\"main\",\"head_label\":\"oversized\"}",
+    );
     defer std.testing.allocator.free(expected_target);
     const repository = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repository);

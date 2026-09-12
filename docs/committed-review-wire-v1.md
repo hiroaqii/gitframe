@@ -179,16 +179,18 @@ gitframe review-target \
 
 Each option appears exactly once and has one value of 1...4,096 bytes. Unknown, duplicate, missing, positional, or option-like values fail with `invalid_arguments`. The command is dispatched by its exact first token before global help scanning, config loading, terminal setup, TUI startup, or Store access. Consequently `review-target --help` is a versioned `invalid_arguments` terminal; `gitframe --help` retains normal human help.
 
-Success is one compact JSON document plus LF:
+Success is one compact schema-v2 JSON document plus LF. `display` and both of
+its keys are required; each label value is either a valid bounded short-text
+string or `null`:
 
 ```json
-{"schema_version":1,"status":"ok","target":{"object_format":"sha1","source_kind":"branch_range","base_oid":"0000000000000000000000000000000000000000","head_oid":"1111111111111111111111111111111111111111","diff_base_oid":"0000000000000000000000000000000000000000"}}
+{"schema_version":2,"status":"ok","target":{"object_format":"sha1","source_kind":"branch_range","base_oid":"0000000000000000000000000000000000000000","head_oid":"1111111111111111111111111111111111111111","diff_base_oid":"0000000000000000000000000000000000000000"},"display":{"base_label":"review-base","head_label":"feature"}}
 ```
 
-Failure has no partial target:
+Failure has no partial target or display:
 
 ```json
-{"schema_version":1,"status":"error","error":{"code":"no_merge_base","message":"base and head have no merge base"}}
+{"schema_version":2,"status":"error","error":{"code":"no_merge_base","message":"base and head have no merge base"}}
 ```
 
 Exit allocation is:
@@ -202,7 +204,18 @@ Exit allocation is:
 | 5 | `git_command_failed` |
 | 70 | `internal_error` or output transport failure |
 
-The command calls only `resolveTarget`; it never computes ahead, projection, or anchor data.
+The command opens the absolute repository once as a physical
+`RootCapability`, creates one controlled local Git environment, and borrows
+that same directory context until the complete target/display snapshot is
+encoded. It first calls `resolveTarget`. For each endpoint independently it
+then runs bounded `rev-parse --symbolic-full-name --verify` on the original
+revision, accepts only `refs/heads/*` or `refs/remotes/*`, and resolves that
+exact full ref as a commit. The namespace-stripped label is retained only when
+the full commit OID exactly equals the already pinned endpoint OID. A moved
+ref, tag, OID, detached `HEAD`, ancestry expression, invalid output, or Git
+failure makes only that label `null`. Allocation and target failures remain
+hard failures. The repository path is not reopened, and the command never
+computes ahead, projection, or anchor data.
 
 ## Installed projection command
 

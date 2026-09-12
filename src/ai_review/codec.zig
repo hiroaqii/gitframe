@@ -2862,8 +2862,9 @@ test "AI review protocol capability framing and compatibility are exact" {
     defer parsed.deinit();
     try std.testing.expectError(
         error.IncompatibleCapabilities,
-        protocol.requireCapabilities(&parsed.value, &.{.{ .name = "committed-review.target", .version = 2 }}),
+        protocol.requireCapabilities(&parsed.value, &.{.{ .name = "committed-review.target", .version = 1 }}),
     );
+    try protocol.requireCapabilities(&parsed.value, &.{.{ .name = "committed-review.target", .version = 2 }});
     try std.testing.expectError(error.InvalidJson, protocol.CapabilityResponse.parseStrict(allocator, bytes[0 .. bytes.len - 1]));
 
     const extra_lf = try std.mem.concat(allocator, u8, &.{ bytes, "\n" });

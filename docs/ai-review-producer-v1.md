@@ -33,13 +33,13 @@ does not open a repository, config, Store, TUI, or installation state. Success
 is one `CapabilityResponse`:
 
 ```json
-{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"ai-review.input","versions":[1]},{"name":"ai-review.producer","versions":[1]},{"name":"committed-review.artifact","versions":[1]},{"name":"committed-review.instructions","versions":[1]},{"name":"committed-review.projection","versions":[1]},{"name":"committed-review.target","versions":[1]},{"name":"review-store.prepare","versions":[1]},{"name":"review-store.publish","versions":[1]},{"name":"review-store.result-read","versions":[1]}]}
+{"schema_version":1,"status":"ok","gitframe_version":"0.0.0","capabilities":[{"name":"ai-review.input","versions":[1]},{"name":"ai-review.producer","versions":[1]},{"name":"committed-review.artifact","versions":[1]},{"name":"committed-review.instructions","versions":[1]},{"name":"committed-review.projection","versions":[1]},{"name":"committed-review.target","versions":[2]},{"name":"review-store.prepare","versions":[1]},{"name":"review-store.publish","versions":[1]},{"name":"review-store.result-read","versions":[1]}]}
 ```
 
 Capability names are strictly increasing by unsigned UTF-8 bytes. Each
 versions array is non-empty, positive, strictly increasing, and unique.
 Compatibility is exact name/version membership; GitFrame semver is diagnostic
-only and a future-only `[2]` does not satisfy a v1 requirement.
+only and a future-only version does not satisfy a required version.
 
 The installed producer release advertises exactly, in order:
 
@@ -48,7 +48,7 @@ The installed producer release advertises exactly, in order:
 3. `committed-review.artifact@1`
 4. `committed-review.instructions@1`
 5. `committed-review.projection@1`
-6. `committed-review.target@1`
+6. `committed-review.target@2`
 7. `review-store.prepare@1`
 8. `review-store.publish@1`
 9. `review-store.result-read@1`
@@ -57,6 +57,13 @@ The installed producer release advertises exactly, in order:
 below. `review-store.result-read@1` separately names the exact human-result
 reader; neither capability implies Skill installation, retry, recovery, or a
 provider capability.
+
+The bundled Skill requires `committed-review.target@2` and the other seven
+production/publication capabilities at v1. It strictly validates capability
+entry shape, order, names, and increasing integer versions. Target success has
+the exact schema-v2 order `schema_version`, `status`, `target`, `display`; the
+display object always contains nullable `base_label` then `head_label` under
+the existing 256-byte single-line text bound.
 
 Any argument, including `--help`, returns exit 2 and a bounded canonical error
 line. Allocation/internal failure returns exit 70. Successful output is capped
@@ -398,6 +405,11 @@ bounded candidate size for every ordered review unit; their aggregate is at
 most 16 MiB. The header is at most 16 KiB and the review-input segment at most
 32 MiB. Unknown, duplicate, missing, reordered, short, extra, or over-limit
 content rejects the complete frame.
+
+When present, `display` contains one or both non-null creation-time labels in
+`base_label`, `head_label` order. The producer copies those values into the
+manifest without resolving refs. An object with both values absent is not a
+producer header and is omitted by the bundled Skill.
 
 The command strictly admits the successful review-input wrapper and each
 candidate payload, then re-emits and compares every nested plan summary and

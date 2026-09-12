@@ -17,16 +17,17 @@ import tempfile
 import time
 
 SCHEMA = 1
+TARGET_SCHEMA = 2
 SKILL_VERSION = "0.1.0"
 CAPABILITIES = {
-    "ai-review.input",
-    "ai-review.producer",
-    "committed-review.artifact",
-    "committed-review.instructions",
-    "committed-review.projection",
-    "committed-review.target",
-    "review-store.prepare",
-    "review-store.publish",
+    "ai-review.input": 1,
+    "ai-review.producer": 1,
+    "committed-review.artifact": 1,
+    "committed-review.instructions": 1,
+    "committed-review.projection": 1,
+    "committed-review.target": TARGET_SCHEMA,
+    "review-store.prepare": 1,
+    "review-store.publish": 1,
 }
 RESULT_CAPABILITY = "review-store.result-read"
 RESULT_ERROR_CODES = frozenset({
@@ -158,6 +159,66 @@ def validate_target(value):
         if (not isinstance(oid, str) or len(oid) != width
                 or any(character not in "0123456789abcdef" for character in oid)):
             raise ValueError("target object ID")
+
+
+def validate_display(value, allow_empty):
+    if not isinstance(value, dict) or list(value) != ["base_label", "head_label"]:
+        raise ValueError("display shape")
+    for label in value.values():
+        if label is not None:
+            validate_text(label, 256, False)
+    if not allow_empty and value["base_label"] is None and value["head_label"] is None:
+        raise ValueError("empty display")
+
+
+def require_capabilities(document, required, message):
+    try:
+        if (not isinstance(document, dict)
+                or list(document) != ["schema_version", "status", "gitframe_version", "capabilities"]
+                or not schema_v1(document["schema_version"]) or document["status"] != "ok"):
+            raise ValueError("capability terminal")
+        validate_text(document["gitframe_version"], 256, False)
+        entries = document["capabilities"]
+        if not isinstance(entries, list) or len(entries) > 64:
+            raise ValueError("capability collection")
+        offered = {}
+        previous = None
+        for item in entries:
+            if not isinstance(item, dict) or list(item) != ["name", "versions"]:
+                raise ValueError("capability shape")
+            name = item["name"]
+            validate_text(name, 128, False)
+            if previous is not None and name <= previous:
+                raise ValueError("capability order")
+            previous = name
+            versions = item["versions"]
+            if not isinstance(versions, list) or not versions or len(versions) > 16:
+                raise ValueError("capability versions")
+            last = 0
+            for version in versions:
+                if type(version) is not int or not 1 <= version <= 65535 or version <= last:
+                    raise ValueError("capability version")
+                last = version
+            offered[name] = versions
+        if any(version not in offered.get(name, ()) for name, version in required.items()):
+            raise ValueError("missing capability")
+    except (KeyError, TypeError, UnicodeError, ValueError) as error:
+        raise Failure("incompatible_gitframe", message) from error
+
+
+def target_snapshot(document):
+    try:
+        if (not isinstance(document, dict)
+                or list(document) != ["schema_version", "status", "target", "display"]
+                or type(document["schema_version"]) is not int
+                or document["schema_version"] != TARGET_SCHEMA or document["status"] != "ok"):
+            raise ValueError("target terminal")
+        validate_target(document["target"])
+        validate_display(document["display"], True)
+    except (KeyError, TypeError, UnicodeError, ValueError) as error:
+        raise Failure("invalid_target", "review-target did not return a valid target snapshot") from error
+    display = document["display"]
+    return document["target"], display if any(label is not None for label in display.values()) else None
 
 
 def validate_text(value, maximum, multiline):
@@ -390,17 +451,12 @@ def begin(args):
     repository = validate_repository(args.repository)
     wire = repository_wire(repository)
     capabilities = strict_json(helper(gitframe, ["review-capabilities"], timeout=10), 16384)
-    require_keys(capabilities, ["schema_version", "status", "gitframe_version", "capabilities"])
-    offered = {item.get("name") for item in capabilities["capabilities"] if 1 in item.get("versions", [])}
-    if capabilities["schema_version"] != SCHEMA or capabilities["status"] != "ok" or not CAPABILITIES <= offered:
-        raise Failure("incompatible_gitframe", "GitFrame does not advertise every required v1 capability")
+    require_capabilities(capabilities, CAPABILITIES,
+        "GitFrame does not advertise the required review capability versions")
     head = args.head or "HEAD"
     target_doc = strict_json(helper(gitframe, ["review-target", "--repository", repository,
         "--source-kind", "branch_range", "--base", args.base, "--head", head]), 8192)
-    require_keys(target_doc, ["schema_version", "status", "target"])
-    if target_doc["schema_version"] != SCHEMA or target_doc["status"] != "ok":
-        raise Failure("invalid_target", "review-target did not return a target")
-    target = target_doc["target"]
+    target, display = target_snapshot(target_doc)
     projection_request = encoded({"schema_version": SCHEMA, "repository": wire, "target": target})
     projection = parse_projection(helper(gitframe, ["review-projection"], projection_request,
         cap=16 * 1024 * 1024 + 2048), target)
@@ -447,10 +503,13 @@ def begin(args):
                     "unit_sha256": digest(unit_bytes)})
             invocation = {"schema_version": SCHEMA, "gitframe": gitframe, "repository": repository,
                 "temporary_root": os.path.dirname(workspace), "nonce_sha256": digest(bytes.fromhex(nonce)),
-                "request": {"base": args.base, "head": head}, "target": target,
+                "request": {"base": args.base, "head": head}, "target": target}
+            if display is not None:
+                invocation["display"] = display
+            invocation.update({
                 "review_repository_id": prepared["review_repository_id"], "review_id": prepared["review_id"],
                 "producer": producer, "input_size": len(review_input), "input_sha256": digest(review_input),
-                "summary": input_doc["summary"], "units": inventory}
+                "summary": input_doc["summary"], "units": inventory})
             write_private(directory_fd, "invocation.json", encoded(invocation))
         finally:
             os.close(directory_fd)
@@ -554,18 +613,8 @@ def read_result(args):
 
     capabilities = strict_json(helper(gitframe, ["review-capabilities"], timeout=10,
         error_codes=frozenset()), MAX_READ_HEADER)
-    require_keys(capabilities, ["schema_version", "status", "gitframe_version", "capabilities"])
-    offered = set()
-    entries = capabilities["capabilities"]
-    if isinstance(entries, list):
-        for item in entries:
-            if (isinstance(item, dict) and isinstance(item.get("name"), str)
-                    and isinstance(item.get("versions"), list)
-                    and any(type(version) is int and version == 1 for version in item["versions"])):
-                offered.add(item["name"])
-    if (not schema_v1(capabilities["schema_version"]) or capabilities["status"] != "ok"
-            or RESULT_CAPABILITY not in offered):
-        raise Failure("incompatible_gitframe", "GitFrame does not advertise result-read v1")
+    require_capabilities(capabilities, {RESULT_CAPABILITY: 1},
+        "GitFrame does not advertise result-read v1")
     frame = helper(gitframe, ["review-result-read"], request_bytes,
         cap=MAX_READ_HEADER + MAX_RESULT, error_codes=RESULT_ERROR_CODES)
     return validate_result_frame(frame, args.review_id, expected)
@@ -594,9 +643,18 @@ def open_workspace(path, nonce):
         invocation = read_private(directory_fd, "invocation.json", 1024 * 1024)
         doc = strict_json(invocation, 1024 * 1024)
         keys = ["schema_version", "gitframe", "repository", "temporary_root", "nonce_sha256", "request",
-            "target", "review_repository_id", "review_id", "producer", "input_size", "input_sha256",
-            "summary", "units"]
+            "target"]
+        if "display" in doc:
+            keys.append("display")
+        keys.extend(["review_repository_id", "review_id", "producer", "input_size", "input_sha256",
+            "summary", "units"])
         require_keys(doc, keys)
+        try:
+            validate_target(doc["target"])
+            if "display" in doc:
+                validate_display(doc["display"], False)
+        except (KeyError, TypeError, UnicodeError, ValueError) as error:
+            raise Failure("invalid_handoff", "workspace target snapshot is invalid") from error
         units = doc["units"]
         if (doc["schema_version"] != SCHEMA or doc["temporary_root"] != os.path.dirname(path)
                 or not os.path.basename(path).startswith(PREFIX)
@@ -705,8 +763,13 @@ def complete_admitted(directory_fd, invocation):
         os.close(directory_fd)
     header = {"schema_version": SCHEMA, "repository": repository_wire(invocation["repository"]),
         "review_repository_id": invocation["review_repository_id"], "review_id": invocation["review_id"],
-        "producer": invocation["producer"], "review_input_size": len(review_input),
+        "producer": invocation["producer"]}
+    if "display" in invocation:
+        header["display"] = {key: value for key, value in invocation["display"].items()
+            if value is not None}
+    header.update({"review_input_size": len(review_input),
         "candidate_sizes": [len(value) for value in candidates]}
+    )
     artifact_frame = helper(invocation["gitframe"], ["review-producer", "artifacts"],
         encoded(header) + review_input + b"".join(candidates), cap=17 * 1024 * 1024)
     artifact, manifest, findings = parse_artifacts(artifact_frame, invocation)

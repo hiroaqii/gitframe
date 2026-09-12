@@ -67,6 +67,19 @@ pub const TargetResolutionResult = union(enum) {
     failure: TargetResolutionFailure,
 };
 
+/// Allocator-owned, creation-time labels for display only. The corresponding
+/// target OIDs remain the sole endpoint authority.
+pub const TargetDisplayLabels = struct {
+    base_label: ?[]u8 = null,
+    head_label: ?[]u8 = null,
+
+    pub fn deinit(self: *TargetDisplayLabels, allocator: std.mem.Allocator) void {
+        if (self.head_label) |label| allocator.free(label);
+        if (self.base_label) |label| allocator.free(label);
+        self.* = undefined;
+    }
+};
+
 /// Display-only graph-count terminals for a previously pinned target.
 pub const AheadDisplayFailure = enum {
     ahead_graph_unavailable,
@@ -331,6 +344,98 @@ pub fn resolveTarget(
     input: TargetInput,
 ) std.mem.Allocator.Error!TargetResolutionResult {
     return resolveTargetWithHooks(allocator, io, context, input, null);
+}
+
+/// Resolve optional branch labels for an already-pinned target without
+/// reopening repository authority. Each endpoint is admitted independently:
+/// Git must identify the original revision as a local or remote branch ref,
+/// and that exact ref must still resolve to the pinned endpoint commit.
+pub fn resolveDisplayLabelsAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    input: TargetInput,
+    target: CommittedReviewTarget,
+) std.mem.Allocator.Error!TargetDisplayLabels {
+    target.validate() catch return .{};
+    var labels: TargetDisplayLabels = .{};
+    errdefer labels.deinit(allocator);
+    labels.base_label = try resolveDisplayLabelAlloc(
+        allocator,
+        io,
+        context,
+        input.base,
+        target.object_format,
+        target.base_oid,
+    );
+    labels.head_label = try resolveDisplayLabelAlloc(
+        allocator,
+        io,
+        context,
+        input.head,
+        target.object_format,
+        target.head_oid,
+    );
+    return labels;
+}
+
+fn resolveDisplayLabelAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    revision: []const u8,
+    format: ObjectFormat,
+    expected_oid: ObjectId,
+) std.mem.Allocator.Error!?[]u8 {
+    const symbolic_argv = [_][]const u8{
+        strict_prefix[0], strict_prefix[1],       strict_prefix[2], strict_prefix[3],
+        "rev-parse",      "--symbolic-full-name", "--verify",       revision,
+    };
+    var symbolic = try git_command.runCapturedBounded(allocator, io, context, .{
+        .argv = &symbolic_argv,
+        .stdout_limit = .limited("refs/remotes/".len + wire.limits.max_short_text_bytes + 1),
+        .stderr_limit = .limited(stderr_capture_bytes),
+    });
+    defer symbolic.deinit(allocator);
+    const symbolic_completed = switch (symbolic) {
+        .completed => |value| value,
+        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return null,
+    };
+    if (!termExited(symbolic_completed.term, 0)) return null;
+    const full_ref = singleLfLine(symbolic_completed.stdout) orelse return null;
+    const label = displayLabelFromFullRef(full_ref) orelse return null;
+    wire.strict_json.validateText(label, wire.limits.max_short_text_bytes, false) catch return null;
+
+    const expression = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{full_ref});
+    defer allocator.free(expression);
+    const oid_argv = [_][]const u8{
+        strict_prefix[0], strict_prefix[1], strict_prefix[2], strict_prefix[3],
+        "rev-parse",      "--verify",       expression,
+    };
+    var resolved = try git_command.runCapturedBounded(allocator, io, context, .{
+        .argv = &oid_argv,
+        .stdout_limit = .limited(format.oidHexLength() + 1),
+        .stderr_limit = .limited(stderr_capture_bytes),
+    });
+    defer resolved.deinit(allocator);
+    const resolved_completed = switch (resolved) {
+        .completed => |value| value,
+        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return null,
+    };
+    if (!termExited(resolved_completed.term, 0)) return null;
+    const actual_oid = parseSingleOid(format, resolved_completed.stdout) orelse return null;
+    if (!actual_oid.eql(&expected_oid)) return null;
+    return try allocator.dupe(u8, label);
+}
+
+fn displayLabelFromFullRef(full_ref: []const u8) ?[]const u8 {
+    const prefixes = [_][]const u8{ "refs/heads/", "refs/remotes/" };
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, full_ref, prefix) and full_ref.len > prefix.len) {
+            return full_ref[prefix.len..];
+        }
+    }
+    return null;
 }
 
 const TargetResolutionTestHooks = struct {
@@ -3287,6 +3392,84 @@ test "resolver keeps endpoint OIDs pinned when refs move before merge-base" {
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
     const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+
+    const stable_target = try expectTarget(try resolveTarget(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "refs/heads/main",
+        .head = "refs/heads/feature",
+    }));
+    var local_labels = try resolveDisplayLabelsAlloc(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "refs/heads/main",
+        .head = "refs/heads/feature",
+    }, stable_target);
+    defer local_labels.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("main", local_labels.base_label.?);
+    try std.testing.expectEqualStrings("feature", local_labels.head_label.?);
+
+    var attached_labels = try resolveDisplayLabelsAlloc(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "main",
+        .head = "HEAD",
+    }, stable_target);
+    defer attached_labels.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("main", attached_labels.base_label.?);
+    try std.testing.expectEqualStrings("feature", attached_labels.head_label.?);
+
+    try runTestGit(io, tmp.dir, &.{ "git", "update-ref", "refs/remotes/origin/review-feature", head_oid });
+    var remote_labels = try resolveDisplayLabelsAlloc(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "refs/heads/main",
+        .head = "refs/remotes/origin/review-feature",
+    }, stable_target);
+    defer remote_labels.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("origin/review-feature", remote_labels.head_label.?);
+
+    try runTestGit(io, tmp.dir, &.{ "git", "tag", "release", head_oid });
+    const unsupported_inputs = [_][]const u8{ head_oid, "release", "feature~0" };
+    for (unsupported_inputs) |revision| {
+        var labels = try resolveDisplayLabelsAlloc(std.testing.allocator, io, context, .{
+            .source_kind = .branch_range,
+            .base = base_oid,
+            .head = revision,
+        }, stable_target);
+        defer labels.deinit(std.testing.allocator);
+        try std.testing.expect(labels.base_label == null);
+        try std.testing.expect(labels.head_label == null);
+    }
+
+    try runTestGit(io, tmp.dir, &.{ "git", "switch", "--detach", head_oid });
+    var detached_labels = try resolveDisplayLabelsAlloc(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = base_oid,
+        .head = "HEAD",
+    }, stable_target);
+    defer detached_labels.deinit(std.testing.allocator);
+    try std.testing.expect(detached_labels.head_label == null);
+    try runTestGit(io, tmp.dir, &.{ "git", "switch", "feature" });
+
+    const long_label = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "long/{s}/{s}",
+        .{ "x" ** 126, "y" ** 126 },
+    );
+    defer std.testing.allocator.free(long_label);
+    const long_ref = try std.fmt.allocPrint(std.testing.allocator, "refs/heads/{s}", .{long_label});
+    defer std.testing.allocator.free(long_ref);
+    try runTestGit(io, tmp.dir, &.{ "git", "update-ref", long_ref, head_oid });
+    var long_labels = try resolveDisplayLabelsAlloc(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "refs/heads/main",
+        .head = long_ref,
+    }, stable_target);
+    defer long_labels.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("main", long_labels.base_label.?);
+    try std.testing.expect(long_labels.head_label == null);
+    try std.testing.expectEqualStrings("name", displayLabelFromFullRef("refs/heads/name").?);
+    try std.testing.expectEqualStrings("origin/name", displayLabelFromFullRef("refs/remotes/origin/name").?);
+    try std.testing.expect(displayLabelFromFullRef("refs/tags/name") == null);
+    try std.testing.expect(displayLabelFromFullRef("refs/heads/") == null);
+
     const target = try expectTarget(try resolveTargetWithHooks(std.testing.allocator, io, context, .{
         .source_kind = .branch_range,
         .base = "refs/heads/main",
@@ -3295,4 +3478,44 @@ test "resolver keeps endpoint OIDs pinned when refs move before merge-base" {
     try std.testing.expectEqualStrings(base_oid, target.base_oid.slice());
     try std.testing.expectEqualStrings(head_oid, target.head_oid.slice());
     try std.testing.expectEqualStrings(base_oid, target.diff_base_oid.slice());
+
+    var moved_labels = try resolveDisplayLabelsAlloc(std.testing.allocator, io, context, .{
+        .source_kind = .branch_range,
+        .base = "refs/heads/main",
+        .head = "refs/heads/feature",
+    }, target);
+    defer moved_labels.deinit(std.testing.allocator);
+    try std.testing.expect(moved_labels.base_label == null);
+    try std.testing.expect(moved_labels.head_label == null);
+
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_path);
+    const fake_git =
+        "#!/bin/sh\n" ++
+        "case \"$FAKE_MODE\" in\n" ++
+        "  invalid) printf 'refs/heads/name\\nextra\\n' ;;\n" ++
+        "  invalid_text) printf 'refs/heads/bad\\033name\\n' ;;\n" ++
+        "  overflow) i=0; while [ \"$i\" -lt 300 ]; do printf x; i=$((i + 1)); done ;;\n" ++
+        "  *) exit 7 ;;\n" ++
+        "esac\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "git", .data = fake_git });
+    try runTestGit(io, tmp.dir, &.{ "chmod", "+x", "git" });
+    var fake_parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer fake_parent.deinit();
+    try fake_parent.put("PATH", root_path);
+    try fake_parent.put("FAKE_MODE", "invalid");
+    var fake_environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, &fake_parent);
+    defer fake_environment.deinit();
+    const fake_context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &fake_environment };
+    for ([_][]const u8{ "invalid", "invalid_text", "overflow", "nonzero" }) |mode| {
+        try fake_environment.map.put("FAKE_MODE", mode);
+        var labels = try resolveDisplayLabelsAlloc(std.testing.allocator, io, fake_context, .{
+            .source_kind = .branch_range,
+            .base = "main",
+            .head = "feature",
+        }, stable_target);
+        defer labels.deinit(std.testing.allocator);
+        try std.testing.expect(labels.base_label == null);
+        try std.testing.expect(labels.head_label == null);
+    }
 }

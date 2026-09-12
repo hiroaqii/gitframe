@@ -1,12 +1,11 @@
-//! Process adapter for the target-only `gitframe review-target` command.
+//! Process adapter for the target snapshot `gitframe review-target` command.
 //!
-//! Argument admission and JSON/exit mapping live here; Git object resolution
-//! remains owned by `git.committed_review.resolveTarget` and no later review
-//! operation is reachable from this module.
+//! Argument admission and JSON/exit mapping live here; Git target and optional
+//! branch-label resolution remain owned by `git.committed_review`, and no later
+//! review operation is reachable from this module.
 
 const std = @import("std");
 const codec = @import("codec.zig");
-const limits = @import("limits.zig");
 const target_mod = @import("target.zig");
 const git_command = @import("../git/command.zig");
 const git_review = @import("../git/committed_review.zig");
@@ -18,6 +17,8 @@ pub const max_argument_bytes: usize = 4096;
 pub const max_success_bytes: usize = 2 * 1024;
 /// Complete error JSON line cap, including its terminating LF.
 pub const max_error_bytes: usize = 4 * 1024;
+/// Independent installed target snapshot schema.
+pub const schema_version: u64 = 2;
 
 /// Complete stdout terminal for one helper invocation.
 ///
@@ -47,6 +48,21 @@ const ArgumentResult = union(enum) {
     failure: Failure,
 };
 
+const ResolvedTarget = struct {
+    target: target_mod.CommittedReviewTarget,
+    display: git_review.TargetDisplayLabels,
+
+    fn deinit(self: *ResolvedTarget, allocator: std.mem.Allocator) void {
+        self.display.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const ResolutionResult = union(enum) {
+    snapshot: ResolvedTarget,
+    failure: git_review.TargetResolutionFailure,
+};
+
 const Resolver = struct {
     context: ?*anyopaque = null,
     call: *const fn (
@@ -55,7 +71,7 @@ const Resolver = struct {
         io: std.Io,
         directory: git_command.DirectoryContext,
         input: git_review.TargetInput,
-    ) std.mem.Allocator.Error!git_review.TargetResolutionResult,
+    ) std.mem.Allocator.Error!ResolutionResult,
 };
 
 const Failure = struct {
@@ -120,7 +136,7 @@ fn executeWithResolver(
     };
     defer environment.deinit();
 
-    const result = try resolver.call(resolver.context, allocator, io, .{
+    var result = try resolver.call(resolver.context, allocator, io, .{
         .cwd = root.dir(),
         .environment = &environment,
     }, .{
@@ -129,9 +145,12 @@ fn executeWithResolver(
         .head = parsed.head,
     });
     return switch (result) {
-        .target => |target| successOutputAlloc(allocator, &target) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.CapacityExceeded => errorOutputAlloc(allocator, internalFailure()),
+        .snapshot => |*snapshot| blk: {
+            defer snapshot.deinit(allocator);
+            break :blk successOutputAlloc(allocator, &snapshot.target, &snapshot.display) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.CapacityExceeded => errorOutputAlloc(allocator, internalFailure()),
+            };
         },
         .failure => |failure| errorOutputAlloc(allocator, resolutionFailure(failure)),
     };
@@ -186,6 +205,7 @@ fn parseArguments(arguments: []const []const u8) ArgumentResult {
 fn successOutputAlloc(
     allocator: std.mem.Allocator,
     target: *const target_mod.CommittedReviewTarget,
+    display: *const git_review.TargetDisplayLabels,
 ) BuildError!CommandOutput {
     target.validate() catch return error.CapacityExceeded;
     const storage = try allocator.alloc(u8, max_success_bytes);
@@ -194,11 +214,24 @@ fn successOutputAlloc(
     var stringify: std.json.Stringify = .{ .writer = &writer, .options = .{} };
     stringify.beginObject() catch return error.CapacityExceeded;
     stringify.objectField("schema_version") catch return error.CapacityExceeded;
-    stringify.write(limits.schema_version) catch return error.CapacityExceeded;
+    stringify.write(schema_version) catch return error.CapacityExceeded;
     stringify.objectField("status") catch return error.CapacityExceeded;
     stringify.write("ok") catch return error.CapacityExceeded;
     stringify.objectField("target") catch return error.CapacityExceeded;
     codec.writeTarget(&stringify, target) catch return error.CapacityExceeded;
+    stringify.objectField("display") catch return error.CapacityExceeded;
+    stringify.beginObject() catch return error.CapacityExceeded;
+    stringify.objectField("base_label") catch return error.CapacityExceeded;
+    if (display.base_label) |label|
+        stringify.write(label) catch return error.CapacityExceeded
+    else
+        stringify.write(null) catch return error.CapacityExceeded;
+    stringify.objectField("head_label") catch return error.CapacityExceeded;
+    if (display.head_label) |label|
+        stringify.write(label) catch return error.CapacityExceeded
+    else
+        stringify.write(null) catch return error.CapacityExceeded;
+    stringify.endObject() catch return error.CapacityExceeded;
     stringify.endObject() catch return error.CapacityExceeded;
     writer.writeByte('\n') catch return error.CapacityExceeded;
     return .{
@@ -210,8 +243,8 @@ fn successOutputAlloc(
 fn errorOutputAlloc(allocator: std.mem.Allocator, failure: Failure) std.mem.Allocator.Error!CommandOutput {
     const bytes = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema_version\":1,\"status\":\"error\",\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}\n",
-        .{ failure.code, failure.message },
+        "{{\"schema_version\":{d},\"status\":\"error\",\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}\n",
+        .{ schema_version, failure.code, failure.message },
     );
     std.debug.assert(bytes.len <= max_error_bytes);
     return .{ .exit_code = failure.exit_code, .bytes = bytes };
@@ -223,8 +256,14 @@ fn resolveCore(
     io: std.Io,
     directory: git_command.DirectoryContext,
     input: git_review.TargetInput,
-) std.mem.Allocator.Error!git_review.TargetResolutionResult {
-    return git_review.resolveTarget(allocator, io, directory, input);
+) std.mem.Allocator.Error!ResolutionResult {
+    const resolved = try git_review.resolveTarget(allocator, io, directory, input);
+    const target = switch (resolved) {
+        .target => |value| value,
+        .failure => |failure| return .{ .failure = failure },
+    };
+    const display = try git_review.resolveDisplayLabelsAlloc(allocator, io, directory, input, target);
+    return .{ .snapshot = .{ .target = target, .display = display } };
 }
 
 fn resolutionFailure(failure: git_review.TargetResolutionFailure) Failure {
@@ -268,7 +307,7 @@ fn writeEmergency(stdout_file: std.Io.File, io: std.Io) !u8 {
     var buffer: [256]u8 = undefined;
     var writer = stdout_file.writerStreaming(io, &buffer);
     try writer.interface.writeAll(
-        "{\"schema_version\":1,\"status\":\"error\",\"error\":{\"code\":\"internal_error\",\"message\":\"review-target could not complete\"}}\n",
+        "{\"schema_version\":2,\"status\":\"error\",\"error\":{\"code\":\"internal_error\",\"message\":\"review-target could not complete\"}}\n",
     );
     try writer.interface.flush();
     return 70;
@@ -320,17 +359,86 @@ fn expectTarget(result: git_review.TargetResolutionResult) !target_mod.Committed
 fn expectedSuccessAlloc(
     allocator: std.mem.Allocator,
     target: target_mod.CommittedReviewTarget,
+    base_label: ?[]const u8,
+    head_label: ?[]const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"schema_version\":1,\"status\":\"ok\",\"target\":{{\"object_format\":\"{s}\",\"source_kind\":\"branch_range\",\"base_oid\":\"{s}\",\"head_oid\":\"{s}\",\"diff_base_oid\":\"{s}\"}}}}\n",
-        .{
-            if (target.object_format == .sha1) "sha1" else "sha256",
-            target.base_oid.slice(),
-            target.head_oid.slice(),
-            target.diff_base_oid.slice(),
+    const owned_base = if (base_label) |label| try allocator.dupe(u8, label) else null;
+    errdefer if (owned_base) |label| allocator.free(label);
+    var display: git_review.TargetDisplayLabels = .{
+        .base_label = owned_base,
+        .head_label = if (head_label) |label| try allocator.dupe(u8, label) else null,
+    };
+    defer display.deinit(allocator);
+    const output = try successOutputAlloc(allocator, &target, &display);
+    return output.bytes;
+}
+
+fn expectOpenedRootSurvivesReplacement(replace_ancestor: bool) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository_name = if (replace_ancestor) "base/repo" else "repo";
+    try tmp.dir.createDirPath(io, repository_name);
+    var repository_dir = try tmp.dir.openDir(io, repository_name, .{});
+    defer repository_dir.close(io);
+    try runTestProcess(io, repository_dir, &.{ "git", "init", "--initial-branch=main" });
+    try repository_dir.writeFile(io, .{ .sub_path = "file.txt", .data = "base\n" });
+    try runTestProcess(io, repository_dir, &.{ "git", "add", "file.txt" });
+    try runTestProcess(io, repository_dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+    try runTestProcess(io, repository_dir, &.{ "git", "switch", "-c", "feature" });
+    try repository_dir.writeFile(io, .{ .sub_path = "file.txt", .data = "base\nhead\n" });
+    try runTestProcess(io, repository_dir, &.{ "git", "add", "file.txt" });
+    try runTestProcess(io, repository_dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "head" });
+
+    try tmp.dir.createDir(io, "outside", .default_dir);
+    try runTestProcess(io, tmp.dir, &.{ "git", "clone", "--quiet", repository_name, "outside/repo" });
+    var replacement_dir = try tmp.dir.openDir(io, "outside/repo", .{});
+    defer replacement_dir.close(io);
+    try runTestProcess(io, replacement_dir, &.{ "git", "branch", "-m", "impostor" });
+    const repository_path = try tmp.dir.realPathFileAlloc(io, repository_name, std.testing.allocator);
+    defer std.testing.allocator.free(repository_path);
+
+    const ReplacementResolver = struct {
+        parent: *std.Io.Dir,
+        replace_ancestor: bool,
+
+        fn call(
+            opaque_context: ?*anyopaque,
+            allocator: std.mem.Allocator,
+            child_io: std.Io,
+            directory: git_command.DirectoryContext,
+            input: git_review.TargetInput,
+        ) std.mem.Allocator.Error!ResolutionResult {
+            const self: *@This() = @ptrCast(@alignCast(opaque_context.?));
+            if (self.replace_ancestor) {
+                self.parent.rename("base", self.parent.*, "opened-base", child_io) catch unreachable;
+                self.parent.symLink(child_io, "outside", "base", .{ .is_directory = true }) catch unreachable;
+            } else {
+                self.parent.rename("repo", self.parent.*, "opened-repo", child_io) catch unreachable;
+                self.parent.symLink(child_io, "outside/repo", "repo", .{ .is_directory = true }) catch unreachable;
+            }
+            return resolveCore(null, allocator, child_io, directory, input);
+        }
+    };
+    var replacement: ReplacementResolver = .{
+        .parent = &tmp.dir,
+        .replace_ancestor = replace_ancestor,
+    };
+    var output = try executeWithResolver(
+        std.testing.allocator,
+        io,
+        null,
+        &.{
+            "--repository", repository_path,   "--source-kind", "branch_range",
+            "--base",       "refs/heads/main", "--head",        "HEAD",
         },
+        .{ .context = &replacement, .call = ReplacementResolver.call },
     );
+    defer output.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), output.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, output.bytes, "\"base_label\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.bytes, "\"head_label\":\"feature\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.bytes, "impostor") == null);
 }
 
 test "review-target requires its exact four-option namespace" {
@@ -339,7 +447,7 @@ test "review-target requires its exact four-option namespace" {
     try std.testing.expectEqual(@as(u8, 2), output.exit_code);
     const invalid_fixture = try readFixture(
         std.testing.allocator,
-        "testdata/committed-review-v1/helper/target/invalid-arguments.json",
+        "testdata/committed-review-v2/helper/target/invalid-arguments.json",
     );
     defer std.testing.allocator.free(invalid_fixture);
     try std.testing.expectEqualStrings(invalid_fixture, output.bytes);
@@ -379,16 +487,22 @@ test "review-target success invokes only one target resolver and uses canonical 
 
         fn call(
             opaque_context: ?*anyopaque,
-            _: std.mem.Allocator,
+            allocator: std.mem.Allocator,
             _: std.Io,
             _: git_command.DirectoryContext,
             input: git_review.TargetInput,
-        ) std.mem.Allocator.Error!git_review.TargetResolutionResult {
+        ) std.mem.Allocator.Error!ResolutionResult {
             const self: *@This() = @ptrCast(@alignCast(opaque_context.?));
             self.calls += 1;
             self.saw_base = std.mem.eql(u8, input.base, "main");
             self.saw_head = std.mem.eql(u8, input.head, "HEAD");
-            return .{ .target = testTarget() };
+            return .{ .snapshot = .{
+                .target = testTarget(),
+                .display = .{
+                    .base_label = try allocator.dupe(u8, "main"),
+                    .head_label = try allocator.dupe(u8, "feature"),
+                },
+            } };
         }
     };
     var recorder: RecordingResolver = .{};
@@ -409,7 +523,7 @@ test "review-target success invokes only one target resolver and uses canonical 
     try std.testing.expectEqual(@as(u8, 0), output.exit_code);
     const success_fixture = try readFixture(
         std.testing.allocator,
-        "testdata/committed-review-v1/helper/target/success.json",
+        "testdata/committed-review-v2/helper/target/success.json",
     );
     defer std.testing.allocator.free(success_fixture);
     try std.testing.expectEqualStrings(success_fixture, output.bytes);
@@ -432,7 +546,7 @@ test "review-target success invokes only one target resolver and uses canonical 
         .{ .cwd = tmp.dir, .environment = &core_environment },
         .{ .source_kind = .branch_range, .base = "refs/heads/main", .head = "HEAD" },
     ));
-    const expected = try expectedSuccessAlloc(std.testing.allocator, core_target);
+    const expected = try expectedSuccessAlloc(std.testing.allocator, core_target, "main", "feature");
     defer std.testing.allocator.free(expected);
 
     var core_output = try executeAlloc(
@@ -472,6 +586,9 @@ test "review-target success invokes only one target resolver and uses canonical 
     for (forbidden_operations) |operation| {
         try std.testing.expect(std.mem.indexOf(u8, production, operation) == null);
     }
+
+    try expectOpenedRootSurvivesReplacement(false);
+    try expectOpenedRootSurvivesReplacement(true);
 }
 
 test "review-target preserves operation-specific failure exits" {
@@ -511,7 +628,7 @@ test "review-target preserves operation-specific failure exits" {
     }
     const error_fixture = try readFixtureMatrix(
         std.testing.allocator,
-        "testdata/committed-review-v1/helper/target/errors.jsonl",
+        "testdata/committed-review-v2/helper/target/errors.jsonl",
     );
     defer std.testing.allocator.free(error_fixture);
     try std.testing.expectEqualStrings(error_fixture, actual.items);
@@ -520,7 +637,7 @@ test "review-target preserves operation-specific failure exits" {
     defer no_merge_base.deinit(std.testing.allocator);
     const no_merge_fixture = try readFixture(
         std.testing.allocator,
-        "testdata/committed-review-v1/helper/target/no-merge-base.json",
+        "testdata/committed-review-v2/helper/target/no-merge-base.json",
     );
     defer std.testing.allocator.free(no_merge_fixture);
     try std.testing.expectEqualStrings(no_merge_fixture, no_merge_base.bytes);

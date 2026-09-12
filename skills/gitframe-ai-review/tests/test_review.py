@@ -32,10 +32,35 @@ cmd=sys.argv[1:]; name=" ".join(cmd[:2]) if cmd[:1]==["review-producer"] else cm
 target={"object_format":"sha1","source_kind":"branch_range","base_oid":"1"*40,"head_oid":"2"*40,"diff_base_oid":"1"*40}
 if name=="review-capabilities":
  names=["ai-review.input","ai-review.producer","committed-review.artifact","committed-review.instructions","committed-review.projection","committed-review.target","review-store.prepare","review-store.publish"]
+ if os.environ.get("FAKE_NO_TARGET_CAPABILITY")=="1": names.remove("committed-review.target")
  if os.environ.get("FAKE_NO_RESULT_CAPABILITY")!="1": names.append("review-store.result-read")
- capabilities=[{"name":n,"versions":[True if n=="review-store.result-read" and os.environ.get("FAKE_BOOLEAN_RESULT_CAPABILITY")=="1" else 2 if n=="review-store.result-read" and os.environ.get("FAKE_FUTURE_RESULT_CAPABILITY")=="1" else 1]} for n in names]
+ capabilities=[]
+ for n in names:
+  version=2 if n=="committed-review.target" else 1
+  if n=="committed-review.target" and os.environ.get("FAKE_TARGET_V1_CAPABILITY")=="1": version=1
+  if n=="committed-review.target" and os.environ.get("FAKE_FUTURE_TARGET_CAPABILITY")=="1": version=3
+  if n=="committed-review.target" and os.environ.get("FAKE_BOOLEAN_TARGET_CAPABILITY")=="1": version=True
+  if n=="review-store.result-read" and os.environ.get("FAKE_BOOLEAN_RESULT_CAPABILITY")=="1": version=True
+  if n=="review-store.result-read" and os.environ.get("FAKE_FUTURE_RESULT_CAPABILITY")=="1": version=2
+  capabilities.append({"name":n,"versions":[version]})
  sys.stdout.buffer.write(enc({"schema_version":True if os.environ.get("FAKE_BOOLEAN_CAPABILITY_SCHEMA")=="1" else 1,"status":"ok","gitframe_version":"0.0.0-test","capabilities":capabilities}))
-elif name=="review-target": sys.stdout.buffer.write(enc({"schema_version":1,"status":"ok","target":target}))
+elif name=="review-target":
+ mode=os.environ.get("FAKE_TARGET_MODE","")
+ display={"base_label":"review-base","head_label":"feature"}
+ if mode=="all_null": display={"base_label":None,"head_label":None}
+ if mode=="base_only": display={"base_label":"review-base","head_label":None}
+ if mode=="changed": display={"base_label":"renamed-base","head_label":"renamed-head"}
+ if mode=="reordered_display": display={"head_label":"feature","base_label":"review-base"}
+ if mode=="extra_display": display={"base_label":"review-base","head_label":"feature","extra":None}
+ if mode=="invalid_text": display={"base_label":"bad\x1bname","head_label":"feature"}
+ if mode=="long_text": display={"base_label":"x"*257,"head_label":"feature"}
+ if mode=="invalid_type": display={"base_label":1,"head_label":"feature"}
+ response={"schema_version":2,"status":"ok","target":target,"display":display}
+ if mode=="schema_v1": response["schema_version"]=1
+ if mode=="boolean_schema": response["schema_version"]=True
+ if mode=="missing_display": response.pop("display")
+ if mode=="reordered_response": response={"schema_version":2,"status":"ok","display":display,"target":target}
+ sys.stdout.buffer.write(enc(response))
 elif name=="review-projection":
  patch=b"" if os.environ.get("FAKE_EMPTY")=="1" else b"diff"
  sys.stdout.buffer.write(enc({"schema_version":1,"status":"ok","target":target,"patch_size":len(patch)})+patch)
@@ -47,7 +72,9 @@ elif name=="review-input":
 elif name=="review-store-prepare":
  sys.stdout.buffer.write(enc({"status":"ok","schema_version":1,"review_repository_id":"223e4567-e89b-42d3-a456-426614174000","review_id":str(uuid.uuid4())}))
 elif name=="review-producer artifacts":
- data=sys.stdin.buffer.read(); header=json.loads(data.split(b"\n",1)[0]); manifest=b'{"artifact":"manifest"}\n'; findings=b'{"artifact":"findings"}\n'
+ data=sys.stdin.buffer.read(); header=json.loads(data.split(b"\n",1)[0]); manifest_doc={"artifact":"manifest"}
+ if "display" in header: manifest_doc["display"]=header["display"]
+ manifest=enc(manifest_doc); findings=b'{"artifact":"findings"}\n'
  out={"schema_version":1,"status":"ok","review_repository_id":header["review_repository_id"],"review_id":header["review_id"],"target":target,"producer":header["producer"],"created_at":"2026-08-27T00:00:00Z","finding_count":0,"manifest_sha256":sha(manifest),"findings_sha256":sha(findings),"manifest_size":len(manifest),"findings_size":len(findings)}
  sys.stdout.buffer.write(enc(out)+manifest+findings)
 elif name=="review-store-publish":
@@ -106,6 +133,7 @@ elif name=="review-store-read":
 REVIEW_ID = "123e4567-e89b-42d3-a456-426614174000"
 TARGET = {"object_format": "sha1", "source_kind": "branch_range", "base_oid": "1" * 40,
     "head_oid": "2" * 40, "diff_base_oid": "1" * 40}
+DISPLAY = {"base_label": "review-base", "head_label": "feature"}
 FINDINGS_DIGEST = review.digest(b"findings\n")
 PRODUCER_ARGS = ("--producer-name", "codex", "--producer-model", "gpt-test",
     "--producer-version", "codex-test")
@@ -169,6 +197,11 @@ class DriverTests(unittest.TestCase):
         header, payload = data.split(b"\n", 1)
         return json.loads(header), payload
 
+    def stored_manifest(self, review_id):
+        header, payload = self.split_frame((self.store / review_id).read_bytes())
+        size = header["manifest_size"]
+        return json.loads(payload[:size])
+
     def test_argument_failures_are_one_canonical_json_terminal_without_children(self):
         cases = [
             (),
@@ -195,6 +228,8 @@ class DriverTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
         invocation = json.loads((workspace / "invocation.json").read_bytes())
         self.assertEqual(invocation["producer"], PRODUCER)
+        self.assertEqual(invocation["display"], DISPLAY)
+        self.assertEqual(list(invocation)[list(invocation).index("target") + 1], "display")
         self.assertNotIn("0.0.0-test", invocation["producer"].values())
 
         completed, handoff = self.start(producer_args=("--producer-name", "claude-code"))
@@ -204,6 +239,27 @@ class DriverTests(unittest.TestCase):
         invocation = json.loads((workspace / "invocation.json").read_bytes())
         self.assertEqual(invocation["producer"], {
             "name": "claude-code", "skill_version": "0.1.0"})
+
+    def test_begin_requires_target_v2_and_strict_capability_membership(self):
+        cases = ({"FAKE_TARGET_V1_CAPABILITY": "1"}, {"FAKE_NO_TARGET_CAPABILITY": "1"},
+            {"FAKE_BOOLEAN_TARGET_CAPABILITY": "1"}, {"FAKE_FUTURE_TARGET_CAPABILITY": "1"})
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.log.unlink(missing_ok=True)
+                completed, result = self.start(extra)
+                self.assertEqual((completed.returncode, result["code"]),
+                    (1, "incompatible_gitframe"))
+                self.assertEqual(self.events(), ["review-capabilities"])
+
+    def test_begin_rejects_invalid_target_v2_display_before_projection(self):
+        modes = ("schema_v1", "boolean_schema", "missing_display", "reordered_response",
+            "reordered_display", "extra_display", "invalid_text", "long_text", "invalid_type")
+        for mode in modes:
+            with self.subTest(mode=mode):
+                self.log.unlink(missing_ok=True)
+                completed, result = self.start({"FAKE_TARGET_MODE": mode})
+                self.assertEqual((completed.returncode, result["code"]), (1, "invalid_target"))
+                self.assertEqual(self.events(), ["review-capabilities", "review-target"])
 
     def test_begin_rejects_missing_or_invalid_provenance_before_children(self):
         base = ("begin", "--gitframe", str(self.fake), "--repository",
@@ -394,11 +450,53 @@ class DriverTests(unittest.TestCase):
         workspace = Path(handoff["workspace"])
         self.candidate(handoff)
         finished, result = self.invoke("complete", "--workspace", str(workspace),
-            "--workspace-nonce", handoff["workspace_nonce"])
+            "--workspace-nonce", handoff["workspace_nonce"],
+            extra={"FAKE_TARGET_MODE": "changed"})
         self.assertEqual((finished.returncode, result["status"]), (0, "ok"))
         self.assertFalse(workspace.exists())
+        self.assertEqual(self.stored_manifest(handoff["review_id"]),
+            {"artifact": "manifest", "display": DISPLAY})
         self.assertEqual(self.events().count("review-producer artifacts"), 1)
         self.assertEqual(self.events().count("review-store-publish"), 1)
+
+    def test_nullable_display_is_omitted_or_forwarded_without_repair(self):
+        cases = {
+            "all_null": (None, {"artifact": "manifest"}),
+            "base_only": ({"base_label": "review-base", "head_label": None},
+                {"artifact": "manifest", "display": {"base_label": "review-base"}}),
+        }
+        for mode, (invocation_display, manifest) in cases.items():
+            with self.subTest(mode=mode):
+                self.log.unlink(missing_ok=True)
+                _, handoff = self.start({"FAKE_TARGET_MODE": mode})
+                workspace = Path(handoff["workspace"])
+                invocation = json.loads((workspace / "invocation.json").read_bytes())
+                if invocation_display is None:
+                    self.assertNotIn("display", invocation)
+                else:
+                    self.assertEqual(invocation["display"], invocation_display)
+                self.candidate(handoff)
+                completed, result = self.invoke("complete", "--workspace", str(workspace),
+                    "--workspace-nonce", handoff["workspace_nonce"],
+                    extra={"FAKE_TARGET_MODE": "changed"})
+                self.assertEqual((completed.returncode, result["status"]), (0, "ok"))
+                self.assertEqual(self.stored_manifest(handoff["review_id"]), manifest)
+
+    def test_corrupt_workspace_display_stops_before_artifacts(self):
+        _, handoff = self.start()
+        workspace = Path(handoff["workspace"])
+        invocation_path = workspace / "invocation.json"
+        invocation = json.loads(invocation_path.read_bytes())
+        invocation["display"] = {"base_label": None, "head_label": None}
+        invocation_path.write_bytes(review.encoded(invocation))
+        self.candidate(handoff)
+        completed, result = self.invoke("complete", "--workspace", str(workspace),
+            "--workspace-nonce", handoff["workspace_nonce"])
+        self.assertEqual((completed.returncode, result["code"]), (1, "invalid_handoff"))
+        self.assertTrue(workspace.is_dir())
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        self.assertNotIn("review-producer artifacts", self.events())
+        self.assertNotIn("review-store-publish", self.events())
 
     def test_empty_plan_never_prepares_or_publishes(self):
         completed, result = self.start({"FAKE_EMPTY": "1"})

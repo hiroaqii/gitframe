@@ -38,7 +38,8 @@ agents, but it cannot discover an active model that its host does not expose.
 
 The runtime requires Python 3 with only its standard library, a POSIX host,
 and one absolute path to a GitFrame executable. `begin` and `complete` require
-the eight v1 AI review and Review Store publication capabilities;
+`committed-review.target@2` plus the other seven v1 AI review and Review Store
+publication capabilities;
 `read-result` independently requires `review-store.result-read@1`. The reviewed
 repository must be an absolute local path accepted by that GitFrame
 installation. The driver does not invoke an AI provider, raw `git diff`, a
@@ -75,6 +76,14 @@ private workspace, a secret nonce, the target, Review IDs and ordered unit
 files. Give the AI the installed Skill instructions. It reads those unit files
 and writes one owner-only `candidate-NNNN.json` per unit.
 
+The target@2 helper supplies the authoritative target and nullable
+creation-time local/remote branch labels from one opened physical repository.
+The driver validates the complete response and does not invoke raw Git or
+reopen the repository to derive labels. If at least one label is present, it
+copies both nullable fields into `invocation.json`; if both are `null`, it
+omits `display`. A later ref rename, deletion, or move does not update that
+saved snapshot.
+
 Finish once with the exact values returned by `begin`:
 
 ```text
@@ -90,6 +99,10 @@ Base64 `repository`, exact `review_id`, and complete `expected` object from the
 unknown terminal. Workspace cleanup is best effort and a
 `cleanup.status=residue` field is diagnostic only. Remove residue only by its
 exact returned path after retaining any evidence needed to resolve the Run.
+Before artifact creation, `complete` revalidates the optional display at its
+canonical invocation position. It forwards the unchanged non-null labels
+immediately after `producer` in the producer header and does not repair a
+corrupt value.
 
 Read a human decision later with the same installed package and one exact
 Review ID:
