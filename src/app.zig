@@ -1129,15 +1129,11 @@ pub const App = struct {
     }
 
     fn pumpAiReviewJobs(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        const outcome = ai_review_jobs_mod.pump(Msg, &self.ai_review_jobs, ctx);
-        if (outcome.start_failures > 0) {
-            self.setStatus("could not start AI review task", .{});
-        }
+        _ = ai_review_jobs_mod.pump(Msg, &self.ai_review_jobs, ctx);
     }
 
     fn finishAiReviewJob(self: *App, ctx: *chasen.Ctx(Msg), message: ai_review_jobs_mod.Msg) void {
-        const outcome = ai_review_jobs_mod.update(Msg, &self.ai_review_jobs, message, ctx);
-        if (outcome.start_failure) self.setStatus("could not start AI review task", .{});
+        _ = ai_review_jobs_mod.update(Msg, &self.ai_review_jobs, message, ctx);
     }
 
     fn resumeQuitAfterAiReviewJobs(self: *App, ctx: *chasen.Ctx(Msg)) void {

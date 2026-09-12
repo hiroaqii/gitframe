@@ -423,3 +423,27 @@ test "Compare empty state distinguishes commits from net file diff" {
     const message = try emptyStateMessage(arena.allocator(), "main", 1);
     try std.testing.expectEqualStrings("No file changes against main", message.title);
 }
+
+test "Compare AI review admission reason is visible at normal and narrow sizes" {
+    var page_state: compare_page.ComparePageState = .{};
+    page_state.beginAiReviewModal();
+    page_state.ai_review_modal.markFailure("Set [ai_review].codex_executable before starting");
+    for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 56, .height = 16 } }) |size| {
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(size.width, size.height);
+        defer surface.deinit();
+        try viewAiReviewModal(.{
+            .page = &page_state,
+            .palette = .default(),
+            .repo_root = "/repo",
+            .repo_epoch = 1,
+            .root_identity = null,
+            .layout = .{ .width = size.width, .height = size.height },
+        }, &surface.surface);
+        const snapshot = try surface.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Codex / executable not configured") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Set [ai_review].codex_executable before starting") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Enter: Start") != null);
+    }
+}

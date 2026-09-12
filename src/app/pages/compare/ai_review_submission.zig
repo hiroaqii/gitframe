@@ -22,7 +22,8 @@ pub const Failure = enum {
     target_missing,
     target_changed,
     invalid_context,
-    invalid_runner,
+    invalid_executable,
+    invalid_model,
     request_failed,
     capacity,
     admission_closed,
@@ -80,8 +81,12 @@ pub const Controller = struct {
             return reject(modal, .invalid_context);
         }
 
-        const provider = codex.Request.init(allocator, executable, self.codex_model) catch
-            return reject(modal, .invalid_runner);
+        const provider = codex.Request.init(allocator, executable, self.codex_model) catch |err|
+            return reject(modal, switch (err) {
+                error.InvalidExecutable => .invalid_executable,
+                error.InvalidModel => .invalid_model,
+                error.OutOfMemory => .request_failed,
+            });
         const request = pipeline.Request.init(
             allocator,
             capability.*,
@@ -112,20 +117,21 @@ pub const Controller = struct {
 
 fn reject(modal: *compare_page.AiReviewModalState, failure: Failure) Outcome {
     modal.markFailure(switch (failure) {
-        .codex_not_configured => "Configure [ai_review].codex_executable first",
-        .store_not_configured => "Configure [ai_review].store_root first",
+        .codex_not_configured => "Set [ai_review].codex_executable before starting",
+        .store_not_configured => "Set [ai_review].store_root before starting",
         .repository_missing => "Compare AI Review requires a repository",
         .repository_authority_missing => "Repository authority is unavailable",
         .repository_identity_missing => "Repository identity is unavailable",
         .repository_changed => "Repository changed; reload Compare before starting",
         .comparison_not_ready => "Comparison is not ready; reload before starting",
         .comparison_changed, .scope_mismatch => "Comparison changed; reload before starting",
-        .target_missing => "Comparison target is unavailable",
+        .target_missing => "Comparison target is unavailable; reload Compare",
         .target_changed => "Comparison target changed; reload before starting",
         .invalid_context => "Review context must be valid UTF-8 within 16 KiB",
-        .invalid_runner => "Codex runner configuration is invalid",
-        .request_failed => "Could not prepare immutable AI review request",
-        .capacity => "AI review queue is full",
+        .invalid_executable => "Codex executable must be an absolute file path",
+        .invalid_model => "Configured Codex model is invalid",
+        .request_failed => "Could not prepare AI review; check repository access and runtime resources",
+        .capacity => "AI review queue is full; dismiss a finished job",
         .admission_closed => "AI review admission is closed",
         .identity_exhausted => "AI review job identity is exhausted",
     });

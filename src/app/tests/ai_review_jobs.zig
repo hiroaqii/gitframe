@@ -271,19 +271,48 @@ test "Compare AI review submission owns exact authority and bounded rejection cl
     app.user_config.ai_review.codex_executable = null;
     try std.testing.expectEqual(compare_submission.Failure.codex_not_configured, compareSubmissionController(&app).submit(allocator).rejected);
     try std.testing.expect(app.pages.compare.ai_review_modal.open);
+    try std.testing.expectEqualStrings("Set [ai_review].codex_executable before starting", app.pages.compare.ai_review_modal.failure.text());
+    try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
+    app.user_config.ai_review.codex_executable = "codex";
+    try std.testing.expectEqual(compare_submission.Failure.invalid_executable, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expectEqualStrings("Codex executable must be an absolute file path", app.pages.compare.ai_review_modal.failure.text());
     try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
     app.user_config.ai_review.codex_executable = fixture.executable;
+    app.user_config.ai_review.codex_model = "x" ** 129;
+    try std.testing.expectEqual(compare_submission.Failure.invalid_model, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expectEqualStrings("Configured Codex model is invalid", app.pages.compare.ai_review_modal.failure.text());
+    try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
+    app.user_config.ai_review.codex_model = null;
 
     const configured_store = app.configured_review_store;
     app.configured_review_store = null;
     try std.testing.expectEqual(compare_submission.Failure.store_not_configured, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expectEqualStrings("Set [ai_review].store_root before starting", app.pages.compare.ai_review_modal.failure.text());
     try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
     app.configured_review_store = configured_store;
+
+    const accepted_base = app.pages.compare.base_target;
+    app.pages.compare.base_target = null;
+    try std.testing.expectEqual(compare_submission.Failure.target_missing, compareSubmissionController(&app).submit(allocator).rejected);
+    try std.testing.expectEqualStrings("Comparison target is unavailable; reload Compare", app.pages.compare.ai_review_modal.failure.text());
+    try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
+    app.pages.compare.base_target = accepted_base;
 
     app.pages.compare.diff.accepted_repository_identity.?.repo_epoch += 1;
     try std.testing.expectEqual(compare_submission.Failure.comparison_changed, compareSubmissionController(&app).submit(allocator).rejected);
     try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
     app.pages.compare.diff.accepted_repository_identity.?.repo_epoch -= 1;
+
+    {
+        const capability = &app.repo_session.repo_state.root.?;
+        const valid_handle = capability.handle;
+        capability.handle = -1;
+        defer capability.handle = valid_handle;
+        try std.testing.expectEqual(compare_submission.Failure.request_failed, compareSubmissionController(&app).submit(allocator).rejected);
+        try std.testing.expectEqualStrings("Could not prepare AI review; check repository access and runtime resources", app.pages.compare.ai_review_modal.failure.text());
+        try std.testing.expect(std.mem.indexOf(u8, app.pages.compare.ai_review_modal.failure.text(), "memory") == null);
+        try std.testing.expectEqual(@as(usize, 1), app.ai_review_jobs.retained_count);
+    }
 
     const selected_base = app.pages.compare.base_target.?;
     app.pages.compare.base_target = .{
@@ -304,6 +333,7 @@ test "Compare AI review submission owns exact authority and bounded rejection cl
     }
     try std.testing.expectEqual(compare_submission.Failure.capacity, compareSubmissionController(&app).submit(allocator).rejected);
     try std.testing.expect(app.pages.compare.ai_review_modal.open);
+    try std.testing.expectEqualStrings("AI review queue is full; dismiss a finished job", app.pages.compare.ai_review_modal.failure.text());
     try std.testing.expectEqual(@import("../../ai_review/job_owner.zig").capacity, app.ai_review_jobs.retained_count);
 }
 
@@ -402,6 +432,27 @@ test "AI review App maps immediate review and publication queue failures to type
     {
         var app: App = .{ .allocator = allocator };
         defer app.ai_review_jobs.deinit();
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        var failed_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator() };
+        defer failed_ctx.runtimeClearPendingEffectCopies();
+        const key = app.enqueueAiReview(&failed_ctx, fixture.scope(), try fixture.request()).accepted;
+        const record = app.ai_review_jobs.find(key).?;
+        try std.testing.expectEqual(job.StartFailure.review_task_start_failed, record.phase.terminal.start_failed);
+        var buffer: [2048]u8 = undefined;
+        const detail = @import("../ai_review_diagnostics.zig").format(&buffer, record);
+        try std.testing.expect(std.mem.indexOf(u8, detail, "Stage: Review task start") != null);
+        try std.testing.expect(std.mem.indexOf(u8, detail, "OutOfMemory") == null);
+        try std.testing.expectEqualStrings("", app.status.text());
+        var normal_ctx: chasen.testing.TestCtx(App.Msg) = .{};
+        defer normal_ctx.resetTransient();
+        const open_details = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.f2 } }) orelse return error.ExpectedAiReviewDetails;
+        try app.update(open_details, &normal_ctx.ctx);
+        try std.testing.expect(app.overlay.kind.ai_review_details.key.eql(key));
+    }
+
+    {
+        var app: App = .{ .allocator = allocator };
+        defer app.ai_review_jobs.deinit();
         var tc: chasen.testing.TestCtx(App.Msg) = .{};
         defer tc.resetTransient();
         try std.testing.expect(fillTaskQueue(&tc.ctx) > 0);
@@ -445,6 +496,10 @@ test "AI review publication context allocation failure is terminal before Store 
     try app.update(ready, &failed_ctx);
     try std.testing.expectEqual(job.StartFailure.publication_task_start_failed, app.ai_review_jobs.find(key).?.phase.terminal.start_failed);
     try std.testing.expect(try fixture.storeEmpty());
+    try std.testing.expectEqualStrings("", app.status.text());
+    const open_details = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.f2 } }) orelse return error.ExpectedAiReviewDetails;
+    try app.update(open_details, &normal.ctx);
+    try std.testing.expect(app.overlay.kind.ai_review_details.key.eql(key));
 }
 
 test "AI review App task failure callbacks terminalize exact jobs and start the next FIFO item" {
@@ -464,6 +519,10 @@ test "AI review App task failure callbacks terminalize exact jobs and start the 
     try app.update(failure_message, &tc.ctx);
     try std.testing.expect(app.ai_review_jobs.find(first).?.phase.terminal == .start_failed);
     try std.testing.expectEqual(job.StartFailure.review_task_start_failed, app.ai_review_jobs.find(first).?.phase.terminal.start_failed);
+    var detail_buffer: [2048]u8 = undefined;
+    const detail = @import("../ai_review_diagnostics.zig").format(&detail_buffer, app.ai_review_jobs.find(first).?);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Stage: Review task start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "injected") == null);
     try std.testing.expect(app.ai_review_jobs.find(second).?.phase == .reviewing);
 
     var abandoned = try failOnlyTask(&tc.ctx, allocator, .runtime_abandoned);
@@ -512,7 +571,15 @@ test "AI review App publication runtime-start failure performs no Store mutation
     const failure_message = try failOnlyTask(&tc.ctx, allocator, .{ .start_failed = "injected" });
     try app.update(failure_message, &tc.ctx);
     try std.testing.expectEqual(job.StartFailure.publication_task_start_failed, app.ai_review_jobs.find(key).?.phase.terminal.start_failed);
+    var detail_buffer: [2048]u8 = undefined;
+    const detail = @import("../ai_review_diagnostics.zig").format(&detail_buffer, app.ai_review_jobs.find(key).?);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Stage: Save task start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "injected") == null);
     try std.testing.expect(try fixture.storeEmpty());
+    try std.testing.expectEqualStrings("", app.status.text());
+    const open_details = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.f2 } }) orelse return error.ExpectedAiReviewDetails;
+    try app.update(open_details, &tc.ctx);
+    try std.testing.expect(app.overlay.kind.ai_review_details.key.eql(key));
 }
 
 test "AI review App quit confirmation cancels review before ReadyToPublish adoption" {
@@ -626,6 +693,41 @@ test "AI review undelivered ReadyToPublish releases payload without changing App
     try std.testing.expect(try fixture.storeEmpty());
 }
 
+test "AI review runtime-abandoned callbacks only release review and publication payloads" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try PipelineFixture.init(allocator, io);
+    defer fixture.deinit();
+
+    {
+        var app: App = .{ .allocator = allocator };
+        defer app.ai_review_jobs.deinit();
+        var tc: chasen.testing.TestCtx(App.Msg) = .{};
+        defer tc.resetTransient();
+        const key = app.enqueueAiReview(&tc.ctx, fixture.scope(), try fixture.request()).accepted;
+        var abandoned = try failOnlyTask(&tc.ctx, allocator, .runtime_abandoned);
+        abandoned.deinitUndelivered(allocator);
+        try std.testing.expect(app.ai_review_jobs.find(key).?.phase == .reviewing);
+        try std.testing.expect(!app.ai_review_jobs.find(key).?.unread);
+    }
+
+    {
+        var app: App = .{ .allocator = allocator };
+        defer app.ai_review_jobs.deinit();
+        var tc: chasen.testing.TestCtx(App.Msg) = .{};
+        defer tc.resetTransient();
+        const key = app.enqueueAiReview(&tc.ctx, fixture.scope(), try fixture.request()).accepted;
+        try app.update(try runOnlyTask(&tc.ctx, allocator, io), &tc.ctx);
+        try std.testing.expect(app.ai_review_jobs.find(key).?.phase == .publishing);
+        var abandoned = try failOnlyTask(&tc.ctx, allocator, .runtime_abandoned);
+        abandoned.deinitUndelivered(allocator);
+        try std.testing.expect(app.ai_review_jobs.find(key).?.phase == .publishing);
+        try std.testing.expect(!app.ai_review_jobs.find(key).?.unread);
+        try std.testing.expect(try fixture.storeEmpty());
+    }
+}
+
 test "AI review input diagnostic survives task delivery page changes and exact detail selection" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -713,7 +815,97 @@ test "AI review pipeline plan limit reaches retained job without provider launch
     try std.testing.expect(try fixture.storeEmpty());
 }
 
-test "AI review provider diagnostics retain exact job identity through messages and F2" {
+test "AI review pipeline classifies pre-provider validation and Store failures" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    {
+        var fixture = try PipelineFixture.init(allocator, io);
+        defer fixture.deinit();
+        const request = try fixture.requestWithExecutable("/must-not-launch-codex");
+        try fixture.repo.deleteTree(io, ".git");
+        try fixture.repo.writeFile(io, .{ .sub_path = ".git", .data = "gitdir: missing\n" });
+        var result = pipeline.review(allocator, io, request, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(pipeline.FailureCode.repository_unavailable, result.terminal.outcome.failed);
+    }
+
+    {
+        var fixture = try PipelineFixture.init(allocator, io);
+        defer fixture.deinit();
+        fixture.target.head_oid = try committed.ObjectId.parse(.sha1, "f" ** 40);
+        var result = pipeline.review(allocator, io, try fixture.requestWithExecutable("/must-not-launch-codex"), .{});
+        defer result.deinit();
+        try std.testing.expectEqual(pipeline.FailureCode.target_unavailable, result.terminal.outcome.failed);
+    }
+
+    {
+        var fixture = try PipelineFixture.init(allocator, io);
+        defer fixture.deinit();
+        try runCommand(allocator, io, fixture.repo, &.{ "git", "config", "diff.algorithm", "definitely-invalid" });
+        var result = pipeline.review(allocator, io, try fixture.requestWithExecutable("/must-not-launch-codex"), .{});
+        defer result.deinit();
+        try std.testing.expectEqual(pipeline.FailureCode.projection_failed, result.terminal.outcome.failed);
+    }
+
+    {
+        var fixture = try PipelineFixture.init(allocator, io);
+        defer fixture.deinit();
+        const invalid_script =
+            \\#!/bin/sh
+            \\if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
+            \\  printf '%s\n' 'codex-cli 999.0'
+            \\  exit 0
+            \\fi
+            \\/bin/cat >/dev/null
+            \\printf '%s\n' \
+            \\  '{"type":"thread.started","thread_id":"fake"}' \
+            \\  '{"type":"turn.started"}' \
+            \\  '{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[{\"start_location\":\"a9999\",\"end_location\":\"a9999\",\"severity\":\"warning\",\"title\":\"SECRET-CODE-SENTINEL\",\"body\":\"invalid anchor\"}]}}]}"}}' \
+            \\  '{"type":"turn.completed"}'
+        ;
+        try fixture.tmp.dir.writeFile(io, .{ .sub_path = "codex-invalid-anchor", .data = invalid_script });
+        const executable = try fixture.tmp.dir.realPathFileAlloc(io, "codex-invalid-anchor", allocator);
+        defer allocator.free(executable);
+        try runCommand(allocator, io, fixture.tmp.dir, &.{ "/bin/chmod", "0700", executable });
+        var result = pipeline.review(allocator, io, try fixture.requestWithExecutable(executable), .{});
+        defer result.deinit();
+        try std.testing.expectEqual(pipeline.FailureCode.invalid_candidates, result.terminal.outcome.failed);
+    }
+
+    {
+        var fixture = try PipelineFixture.init(allocator, io);
+        defer fixture.deinit();
+        try fixture.tmp.dir.writeFile(io, .{ .sub_path = "store-file", .data = "not a directory\n" });
+        const store_file = try fixture.tmp.dir.realPathFileAlloc(io, "store-file", allocator);
+        defer allocator.free(store_file);
+        var unusable_store = try store_service.ConfiguredStore.initConfigured(allocator, store_file);
+        defer unusable_store.deinit(allocator);
+        const request = try pipeline.Request.init(
+            allocator,
+            fixture.root,
+            null,
+            &unusable_store,
+            fixture.repo_path,
+            fixture.target,
+            null,
+            .{ .codex = try codex.Request.init(allocator, fixture.executable, null) },
+            "bounded context",
+        );
+        var reviewed = pipeline.review(allocator, io, request, .{});
+        defer reviewed.deinit();
+        const ready = switch (reviewed) {
+            .ready => |value| value,
+            .terminal => return error.ExpectedReadyToPublish,
+        };
+        reviewed = .{ .terminal = .{ .outcome = .canceled } };
+        const terminal = pipeline.publishReady(allocator, io, ready);
+        try std.testing.expectEqual(pipeline.FailureCode.store_prepare_failed, terminal.outcome.failed);
+    }
+}
+
+test "AI review diagnostics retain exact job identity through messages and F2" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var fixture = try PipelineFixture.init(allocator, io);
@@ -729,7 +921,17 @@ test "AI review provider diagnostics retain exact job identity through messages 
     try std.testing.expectEqual(.before_provider, before.stage);
     try std.testing.expectEqual(.caller, before.owner);
     try std.testing.expectEqualDeep(std.Io.Duration.zero, before.budget);
-    const cases = [_]struct { outcome: pipeline.TerminalOutcome, expected: []const u8 }{
+    const uncertain_id = try committed.ReviewId.parse("123e4567-e89b-42d3-a456-426614174000");
+    const cases = [_]struct {
+        outcome: pipeline.TerminalOutcome,
+        expected: []const u8,
+        additional: ?[]const u8 = null,
+        forbidden: ?[]const u8 = null,
+    }{
+        .{ .outcome = .{ .failed = .repository_unavailable }, .expected = "Reload the repository" },
+        .{ .outcome = .{ .failed = .target_unavailable }, .expected = "Restore or reload the fixed review target" },
+        .{ .outcome = .{ .failed = .projection_failed }, .expected = "Stage: Before Codex starts" },
+        .{ .outcome = .{ .failed = .input_failed }, .expected = "Check the review target and Context" },
         .{ .outcome = expired.terminal.outcome, .expected = "Remaining caller budget at pipeline entry" },
         .{ .outcome = .{ .failed = .{ .stream_too_large = .{ .resource = .stdout_bytes, .allowed = 2097152, .observed = 2097153, .observation = .at_least } } }, .expected = "Observed at least: 2097153 bytes" },
         .{ .outcome = .{ .failed = .{ .stream_too_large = .{ .resource = .stderr_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } } }, .expected = "Resource: stderr_bytes" },
@@ -744,6 +946,14 @@ test "AI review provider diagnostics retain exact job identity through messages 
         .{ .outcome = .{ .failed = .{ .provider_exit = .{ .classification = .other, .term = .{ .signal = @enumFromInt(9) } } } }, .expected = "Signal: 9" },
         .{ .outcome = .{ .failed = .{ .invalid_provider_result = .answer } }, .expected = "The answer was not accepted." },
         .{ .outcome = .{ .failed = .provider_failed }, .expected = "provider I/O" },
+        .{ .outcome = .{ .failed = .invalid_candidates }, .expected = "Stage: Candidate validation" },
+        .{ .outcome = .{ .failed = .store_prepare_failed }, .expected = "Stage: Store preparation" },
+        .{ .outcome = .{ .failed = .artifact_failed }, .expected = "Stage: Artifact creation" },
+        .{ .outcome = .{ .failed = .publish_failed }, .expected = "The final save state could not be confirmed.", .forbidden = "The review was not saved." },
+        .{ .outcome = .{ .failed = .exact_reconciliation_failed }, .expected = "could not be verified against the expected metadata", .forbidden = "did not match" },
+        .{ .outcome = .{ .failed = .{ .internal_error = .before_provider } }, .expected = "Check available memory and runtime resources" },
+        .{ .outcome = .{ .failed = .{ .internal_error = null } }, .expected = "Stage: Unknown" },
+        .{ .outcome = .{ .outcome_unknown = uncertain_id }, .expected = "Review ID: 123e4567-e89b-42d3-a456-426614174000", .additional = "Stage: Store publication or save verification" },
         .{ .outcome = .canceled, .expected = "Canceled by user" },
     };
     for (cases) |case| {
@@ -767,6 +977,8 @@ test "AI review provider diagnostics retain exact job identity through messages 
         var buffer: [2048]u8 = undefined;
         const detail = @import("../ai_review_diagnostics.zig").format(&buffer, record);
         try std.testing.expect(std.mem.indexOf(u8, detail, case.expected) != null);
+        if (case.additional) |additional| try std.testing.expect(std.mem.indexOf(u8, detail, additional) != null);
+        if (case.forbidden) |forbidden| try std.testing.expect(std.mem.indexOf(u8, detail, forbidden) == null);
         try std.testing.expect(std.mem.indexOf(u8, detail, fixture.target.head_oid.slice()) != null);
         try std.testing.expect(std.mem.indexOf(u8, detail, "SECRET-CODE-SENTINEL") == null);
         try app.update(.{ .ai_review_details = .close }, &tc.ctx);

@@ -43,7 +43,7 @@ pub const FailureCode = union(enum) {
     artifact_failed,
     publish_failed,
     exact_reconciliation_failed,
-    internal_error,
+    internal_error: ?diagnostic.InternalStage,
 };
 
 comptime {
@@ -212,7 +212,7 @@ pub const ReviewResult = union(enum) {
             .ready => |*value| value.deinit(),
             .terminal => {},
         }
-        self.* = .{ .terminal = failedTerminal(.internal_error, null) };
+        self.* = .{ .terminal = failedTerminal(.{ .internal_error = null }, null) };
     }
 };
 
@@ -249,7 +249,7 @@ pub fn review(
     };
     var violation: ?@import("limits.zig").Violation = null;
     var plan = input_command.planAlloc(allocator, io, directory, owned.publication.target, projection.patch_bytes, &violation) catch |err| return switch (err) {
-        error.OutOfMemory => failed(.internal_error),
+        error.OutOfMemory => failed(.{ .internal_error = .before_provider }),
         error.LimitExceeded, error.ReviewUnitTooLarge, error.ReviewLineTooLarge => failed(.{ .input_too_large = diagnostic.Limit.fromViolation(violation) }),
         else => failed(.input_failed),
     };
@@ -270,7 +270,7 @@ pub fn review(
             .context = owned.review_context,
         }, control) catch {
             plan.deinit();
-            return failed(.internal_error);
+            return failed(.{ .internal_error = null });
         },
     };
     defer adapter_result.deinit();
@@ -350,7 +350,7 @@ pub fn publishReady(allocator: std.mem.Allocator, io: std.Io, ready: ReadyToPubl
     }) catch return makeTerminal(.{ .outcome_unknown = binding.review_id }, cleanup_warning);
     switch (publication) {
         .success => {},
-        .failure => return failedTerminal(.publish_failed, cleanup_warning),
+        .failure => |failure| return publicationFailureTerminal(failure, cleanup_warning),
     }
     var exact = store_service.readExactIdentityWithRepository(allocator, io, &owned.publication.store, repository, binding.review_id, .{
         .review_repository_id = binding.review_repository_id,
@@ -364,7 +364,7 @@ pub fn publishReady(allocator: std.mem.Allocator, io: std.Io, ready: ReadyToPubl
     defer exact.deinit(allocator);
     return switch (exact) {
         .exact => |value| makeTerminal(.{ .published = .{ .review_id = value.review_id, .finding_count = value.identity.finding_count } }, cleanup_warning),
-        .failure => makeTerminal(.{ .outcome_unknown = binding.review_id }, cleanup_warning),
+        .failure => |failure| reconciliationFailureTerminal(failure, cleanup_warning),
     };
 }
 
@@ -402,7 +402,7 @@ fn controlTerminal(io: std.Io, control: process_runner.ProcessControl, timing: ?
 
 fn mapCodexFailure(code: codex.FailureCode) FailureCode {
     return switch (code) {
-        .internal_error => .internal_error,
+        .internal_error => .{ .internal_error = null },
         .input_too_large => |value| .{ .input_too_large = value },
         .provider_unavailable => |value| .{ .provider_unavailable = value },
         .provider_incompatible => |value| .{ .provider_incompatible = value },
@@ -442,6 +442,14 @@ fn failedTerminal(code: FailureCode, cleanup_warning: ?CleanupWarning) Terminal 
     return makeTerminal(.{ .failed = code }, cleanup_warning);
 }
 
+fn publicationFailureTerminal(_: store_service.PublicationFailure, cleanup_warning: ?CleanupWarning) Terminal {
+    return failedTerminal(.publish_failed, cleanup_warning);
+}
+
+fn reconciliationFailureTerminal(_: store_service.ReadFailure, cleanup_warning: ?CleanupWarning) Terminal {
+    return failedTerminal(.exact_reconciliation_failed, cleanup_warning);
+}
+
 fn makeTerminal(outcome: TerminalOutcome, cleanup_warning: ?CleanupWarning) Terminal {
     return .{ .outcome = outcome, .cleanup_warning = cleanup_warning };
 }
@@ -475,6 +483,19 @@ test "ReviewPipeline terminal taxonomy keeps prepublication and exact-ID uncerta
     try std.testing.expectEqual(CleanupWarning.private_root_residue, no_changes.cleanup_warning.?);
     const uncertain = makeTerminal(.{ .outcome_unknown = id }, null);
     try std.testing.expect(uncertain.outcome.outcome_unknown.eql(id));
+}
+
+test "ReviewPipeline maps typed publication failures without inventing OS detail" {
+    for ([_]store_service.PublicationFailure{ .store_unavailable, .target_unavailable, .io_failed }) |failure| {
+        const terminal = publicationFailureTerminal(failure, .private_root_residue);
+        try std.testing.expectEqual(FailureCode.publish_failed, terminal.outcome.failed);
+        try std.testing.expectEqual(CleanupWarning.private_root_residue, terminal.cleanup_warning.?);
+    }
+    for ([_]store_service.ReadFailure{ .expected_mismatch, .artifact_changed, .store_unavailable }) |failure| {
+        const terminal = reconciliationFailureTerminal(failure, null);
+        try std.testing.expectEqual(FailureCode.exact_reconciliation_failed, terminal.outcome.failed);
+        try std.testing.expectEqual(@as(?CleanupWarning, null), terminal.cleanup_warning);
+    }
 }
 
 test "ReviewPipeline keeps a provider failure primary while exposing its cleanup warning" {
@@ -734,19 +755,21 @@ test "ReviewPipeline preserves input limit payload from plan and Codex" {
         .observation = .at_least,
     } } } };
     try std.testing.expectEqualDeep(adapter_result.outcome.failed.input_too_large, mapAdapterTerminal(&adapter_result).?.outcome.failed.input_too_large);
+    const input_internal = failedTerminal(.{ .internal_error = .before_provider }, null);
+    try std.testing.expectEqual(diagnostic.InternalStage.before_provider, input_internal.outcome.failed.internal_error.?);
     try std.testing.expect(@sizeOf(FailureCode) <= 256);
 }
 
 test "ReviewPipeline preserves each provider diagnostic and timeout through terminal mapping" {
     const cases = [_]codex.FailureCode{
-        .{ .provider_unavailable = .executable_missing },                                                                                .{ .provider_incompatible = .unexpected_event }, .provider_failed,
-        .{ .provider_exit = .{ .classification = .authentication_response, .term = .{ .exited = 17 } } },                                .{ .invalid_provider_result = .answer },         .{ .stream_too_large = .{ .resource = .stderr_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } },
-        .{ .final_answer_too_large = .{ .resource = .final_answer_bytes, .allowed = 65536, .observed = 65537, .observation = .exact } },
+        .internal_error,                                                                                  .{ .provider_unavailable = .executable_missing }, .{ .provider_incompatible = .unexpected_event },                                                                        .provider_failed,
+        .{ .provider_exit = .{ .classification = .authentication_response, .term = .{ .exited = 17 } } }, .{ .invalid_provider_result = .answer },          .{ .stream_too_large = .{ .resource = .stderr_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } }, .{ .final_answer_too_large = .{ .resource = .final_answer_bytes, .allowed = 65536, .observed = 65537, .observation = .exact } },
     };
     for (cases) |failure| {
         const result: codex.Result = .{ .outcome = .{ .failed = failure } };
         const terminal = mapAdapterTerminal(&result).?;
         switch (failure) {
+            .internal_error => try std.testing.expectEqual(@as(?diagnostic.InternalStage, null), terminal.outcome.failed.internal_error),
             inline else => |payload, tag| try std.testing.expectEqualDeep(payload, @field(terminal.outcome.failed, @tagName(tag))),
         }
     }

@@ -3793,7 +3793,7 @@ test "AI review input footer and scrolled details remain readable at normal and 
     try std.testing.expect(std.mem.indexOf(u8, ai_review_diagnostics.format(&buffer, &record), "Limit / observation: unknown") != null);
 }
 
-test "AI review provider footer and details expose causes at normal and narrow sizes" {
+test "AI review failure footer and details expose causes at normal and narrow sizes" {
     const committed = @import("../committed_review.zig");
     const pipeline = @import("../ai_review/runner.zig");
     const oid = try committed.ObjectId.parse(.sha1, "1234567890123456789012345678901234567890");
@@ -3810,10 +3810,20 @@ test "AI review provider footer and details expose causes at normal and narrow s
         } },
     };
     const cases = [_]struct { failure: pipeline.FailureCode, cause: []const u8 }{
+        .{ .failure = .repository_unavailable, .cause = "repository unavailable" },
+        .{ .failure = .target_unavailable, .cause = "target unavailable" },
+        .{ .failure = .projection_failed, .cause = "projection failed" },
+        .{ .failure = .input_failed, .cause = "input generation failed" },
         .{ .failure = .{ .stream_too_large = .{ .resource = .stdout_bytes, .allowed = 2097152, .observed = 2097153, .observation = .at_least } }, .cause = "stdout too large" },
         .{ .failure = .{ .provider_exit = .{ .classification = .authentication_response, .term = .{ .exited = 17 } } }, .cause = "auth-related response" },
         .{ .failure = .{ .invalid_provider_result = .answer }, .cause = "invalid answer" },
         .{ .failure = .{ .timed_out = .{ .stage = .provider_execution, .owner = .adapter, .budget = .fromSeconds(900) } }, .cause = "timed out" },
+        .{ .failure = .invalid_candidates, .cause = "invalid candidates" },
+        .{ .failure = .store_prepare_failed, .cause = "save setup failed" },
+        .{ .failure = .artifact_failed, .cause = "artifact creation failed" },
+        .{ .failure = .publish_failed, .cause = "save operation failed" },
+        .{ .failure = .exact_reconciliation_failed, .cause = "save verification failed" },
+        .{ .failure = .{ .internal_error = .before_provider }, .cause = "internal error" },
     };
     var harness: ShellViewTestHarness = .{};
     for (cases) |case| {
@@ -3849,6 +3859,37 @@ test "AI review provider footer and details expose causes at normal and narrow s
             const bottom = try detail.snapshot(std.testing.allocator);
             defer std.testing.allocator.free(bottom);
             try std.testing.expect(std.mem.indexOf(u8, bottom, oid.slice()) != null);
+        }
+    }
+
+    const uncertain_id = try committed.ReviewId.parse("123e4567-e89b-42d3-a456-426614174000");
+    const terminals = [_]struct { phase: ai_review_job.Phase, footer: []const u8, detail: []const u8 }{
+        .{ .phase = .{ .terminal = .{ .start_failed = .review_task_start_failed } }, .footer = "review start failed", .detail = "Stage: Review task start" },
+        .{ .phase = .{ .terminal = .{ .start_failed = .publication_task_start_failed } }, .footer = "save start failed", .detail = "Stage: Save task start" },
+        .{ .phase = .{ .terminal = .{ .pipeline = .{ .outcome = .{ .outcome_unknown = uncertain_id } } } }, .footer = "outcome-unknown", .detail = "Review ID: 123e4567-e89b-42d3-a456-426614174000" },
+    };
+    for (terminals) |case| {
+        record.phase = case.phase;
+        for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 56, .height = 16 } }) |size| {
+            harness.terminal_size = size;
+            var context = harness.context();
+            context.ai_review_status = .{ .key = record.key, .scope = record.scope, .phase = record.phase };
+            var footer: chasen.testing.TestSurface = undefined;
+            try footer.init(size.width, 1);
+            defer footer.deinit();
+            viewFooter(context, &footer.surface);
+            const footer_text = try footer.snapshot(std.testing.allocator);
+            defer std.testing.allocator.free(footer_text);
+            try std.testing.expect(std.mem.indexOf(u8, footer_text, case.footer) != null);
+            try std.testing.expect(std.mem.indexOf(u8, footer_text, "F2") != null);
+            harness.overlay.kind = .{ .ai_review_details = .{ .key = record.key } };
+            var detail: chasen.testing.TestSurface = undefined;
+            try detail.init(size.width, size.height);
+            defer detail.deinit();
+            try viewAiReviewDetails(context, &detail.surface, &record);
+            const detail_text = try detail.snapshot(std.testing.allocator);
+            defer std.testing.allocator.free(detail_text);
+            try std.testing.expect(std.mem.indexOf(u8, detail_text, case.detail) != null);
         }
     }
 }

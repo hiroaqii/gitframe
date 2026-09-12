@@ -8,8 +8,22 @@ pub const Selection = struct { key: job.Key, scroll: usize = 0 };
 pub const Action = enum { open, close, up, down, page_up, page_down, home, end };
 
 pub fn cause(phase: job.Phase) ?[]const u8 {
-    if (phase != .terminal or phase.terminal != .pipeline or phase.terminal.pipeline.outcome != .failed) return null;
-    return switch (phase.terminal.pipeline.outcome.failed) {
+    const terminal = switch (phase) {
+        .terminal => |value| value,
+        .queued, .reviewing, .publishing => return null,
+    };
+    const failure = switch (terminal) {
+        .start_failed => |value| return if (value == .review_task_start_failed) "review start failed" else "save start failed",
+        .pipeline => |value| switch (value.outcome) {
+            .failed => |failure| failure,
+            .published, .no_changes, .canceled, .outcome_unknown => return null,
+        },
+    };
+    return switch (failure) {
+        .repository_unavailable => "repository unavailable",
+        .target_unavailable => "target unavailable",
+        .projection_failed => "projection failed",
+        .input_failed => "input generation failed",
         .input_too_large => "input too large",
         .stream_too_large => |limit| if (limit.resource == .stderr_bytes) "stderr too large" else "stdout too large",
         .final_answer_too_large => "answer too large",
@@ -28,29 +42,45 @@ pub fn cause(phase: job.Phase) ?[]const u8 {
             .other => "provider exited",
         },
         .invalid_provider_result => |stage| if (stage == .input) "invalid review input" else "invalid answer",
-        else => null,
+        .invalid_candidates => "invalid candidates",
+        .store_prepare_failed => "save setup failed",
+        .artifact_failed => "artifact creation failed",
+        .publish_failed => "save operation failed",
+        .exact_reconciliation_failed => "save verification failed",
+        .internal_error => "internal error",
     };
 }
 
 /// All inputs have fixed bounds; no provider text, paths, or prompt is retained.
 pub fn format(buffer: *[2048]u8, record: *const job.Record) []const u8 {
     var writer: std.Io.Writer = .fixed(buffer);
-    if (cause(record.phase)) |summary| {
-        writer.print("Failed: {s}\n", .{summary}) catch unreachable;
-        formatFailure(&writer, record.phase.terminal.pipeline.outcome.failed);
-    } else if (record.phase == .terminal and record.phase.terminal == .pipeline and record.phase.terminal.pipeline.outcome == .canceled) {
-        writer.writeAll("Canceled by user.\n") catch unreachable;
-    } else {
-        // Later slices add evidence at each producer; do not infer it here.
-        writer.writeAll("AI review terminal\n") catch unreachable;
-        if (record.phase == .terminal) switch (record.phase.terminal) {
-            .start_failed => |failure| writer.print("Result: {s}\n", .{@tagName(failure)}) catch unreachable,
-            .pipeline => |terminal| {
-                writer.print("Result: {s}\n", .{@tagName(terminal.outcome)}) catch unreachable;
-                if (terminal.outcome == .failed)
-                    writer.print("Cause: {s}\n", .{@tagName(terminal.outcome.failed)}) catch unreachable;
+    switch (record.phase) {
+        .terminal => |terminal| switch (terminal) {
+            .start_failed => |failure| {
+                writer.print("Failed: {s}\n", .{cause(record.phase).?}) catch unreachable;
+                formatStartFailure(&writer, failure);
             },
-        };
+            .pipeline => |pipeline_terminal| switch (pipeline_terminal.outcome) {
+                .failed => |failure| {
+                    writer.print("Failed: {s}\n", .{cause(record.phase).?}) catch unreachable;
+                    formatFailure(&writer, failure);
+                },
+                .canceled => writer.writeAll("Canceled by user.\n") catch unreachable,
+                .outcome_unknown => |review_id| {
+                    const canonical = review_id.canonical();
+                    writer.print(
+                        "Outcome unknown.\nStage: Store publication or save verification\nReview ID: {s}\nNext: Reload AI Reviews and check this exact review ID before starting another review.\n",
+                        .{&canonical},
+                    ) catch unreachable;
+                },
+                .published => |published| {
+                    const canonical = published.review_id.canonical();
+                    writer.print("Published review {s} with {d} findings.\n", .{ &canonical, published.finding_count }) catch unreachable;
+                },
+                .no_changes => writer.writeAll("Completed with no changes.\n") catch unreachable,
+            },
+        },
+        .queued, .reviewing, .publishing => writer.writeAll("AI review is still running.\n") catch unreachable,
     }
     writer.print("\nJob: {d} (generation {d})\nRepository: {s}\nPhysical identity: {d}:{d}\nBase: {s}\n{s}\nHead: {s}\n{s}", .{
         record.key.id,                        record.key.generation,         record.display.repository.slice(),
@@ -78,6 +108,10 @@ fn formatLimit(writer: *std.Io.Writer, maybe_limit: ?diagnostic.Limit) void {
 
 fn formatFailure(writer: *std.Io.Writer, failure: pipeline.FailureCode) void {
     switch (failure) {
+        .repository_unavailable => writer.writeAll("Stage: Before Codex starts\nNext: Reload the repository and review target.\n") catch unreachable,
+        .target_unavailable => writer.writeAll("Stage: Before Codex starts\nNext: Restore or reload the fixed review target.\n") catch unreachable,
+        .projection_failed => writer.writeAll("Stage: Before Codex starts\nNext: Reload the review target and check repository data.\n") catch unreachable,
+        .input_failed => writer.writeAll("Stage: Before Codex starts\nNext: Check the review target and Context, then reduce the range if needed.\n") catch unreachable,
         .input_too_large => |limit| {
             writer.writeAll("Stage: Before Codex starts\n") catch unreachable;
             formatLimit(writer, limit);
@@ -133,6 +167,21 @@ fn formatFailure(writer: *std.Io.Writer, failure: pipeline.FailureCode) void {
         else
             "Stage: Answer decoding\nThe answer was not accepted.\nNext: Check Codex CLI output and compatibility.\n") catch unreachable,
         .provider_failed => writer.writeAll("Stage: Provider execution\nNext: Check provider I/O and process availability.\n") catch unreachable,
-        else => {},
+        .invalid_candidates => writer.writeAll("Stage: Candidate validation\nThe answer was not accepted.\nNext: Reload the fixed target and check provider output.\n") catch unreachable,
+        .store_prepare_failed => writer.writeAll("Stage: Store preparation\nNo review was saved.\nNext: Check the configured Store destination and permissions.\n") catch unreachable,
+        .artifact_failed => writer.writeAll("Stage: Artifact creation\nThe answer was not published.\nNext: Reload the fixed target and check repository data.\n") catch unreachable,
+        .publish_failed => writer.writeAll("Stage: Store publication\nThe final save state could not be confirmed.\nNext: Reload AI Reviews and inspect the Store before starting another review.\n") catch unreachable,
+        .exact_reconciliation_failed => writer.writeAll("Stage: Save verification\nThe review result could not be verified against the expected metadata.\nNext: Reload AI Reviews and inspect the Store.\n") catch unreachable,
+        .internal_error => |stage| {
+            writer.print("Stage: {s}\nNext: Check available memory and runtime resources.\n", .{
+                if (stage == .before_provider) "Before Codex starts" else "Unknown",
+            }) catch unreachable;
+        },
     }
+}
+
+fn formatStartFailure(writer: *std.Io.Writer, failure: job.StartFailure) void {
+    writer.print("Stage: {s}\nNext: Check available runtime resources.\n", .{
+        if (failure == .review_task_start_failed) "Review task start" else "Save task start",
+    }) catch unreachable;
 }

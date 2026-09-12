@@ -62,6 +62,7 @@ pub const Limit = struct {
 pub const Unavailable = enum { private_environment, executable_missing, executable_denied, launch_failed };
 pub const Incompatible = enum { environment, process_control, unexpected_event, model_mismatch };
 pub const InvalidResultStage = enum { input, answer };
+pub const InternalStage = enum { before_provider };
 pub const Exit = struct {
     classification: enum { authentication_response, cli_response, other },
     term: std.process.Child.Term,
