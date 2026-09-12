@@ -25,16 +25,19 @@ pub const ProviderRequest = union(enum) {
 };
 
 pub const FailureCode = union(enum) {
-    timed_out,
+    timed_out: ?diagnostic.Timeout,
     repository_unavailable,
     target_unavailable,
     projection_failed,
     input_failed,
     input_too_large: ?diagnostic.Limit,
-    provider_unavailable,
-    provider_incompatible,
+    provider_unavailable: diagnostic.Unavailable,
+    provider_incompatible: diagnostic.Incompatible,
     provider_failed,
-    invalid_provider_result,
+    provider_exit: diagnostic.Exit,
+    stream_too_large: diagnostic.Limit,
+    final_answer_too_large: diagnostic.Limit,
+    invalid_provider_result: diagnostic.InvalidResultStage,
     invalid_candidates,
     store_prepare_failed,
     artifact_failed,
@@ -221,7 +224,12 @@ pub fn review(
 ) ReviewResult {
     var owned = request;
     defer owned.deinit();
-    if (controlTerminal(io, control)) |terminal| return .{ .terminal = terminal };
+    const timing: ?diagnostic.Timeout = if (control.deadline) |deadline| .{
+        .stage = .before_provider,
+        .owner = .caller,
+        .budget = diagnostic.Timeout.remaining(std.Io.Clock.Timestamp.now(io, deadline.clock), deadline),
+    } else null;
+    if (controlTerminal(io, control, timing)) |terminal| return .{ .terminal = terminal };
     const directory: git_command.DirectoryContext = .{
         .cwd = owned.publication.root.dir(),
         .environment = &owned.publication.environment,
@@ -250,7 +258,7 @@ pub fn review(
         plan.deinit();
         return .{ .terminal = makeTerminal(.no_changes, null) };
     }
-    if (controlTerminal(io, control)) |terminal| {
+    if (controlTerminal(io, control, timing)) |terminal| {
         plan.deinit();
         return .{ .terminal = terminal };
     }
@@ -273,7 +281,7 @@ pub fn review(
     const cleanup_warning = mapCleanupWarning(adapter_result.cleanup_warning);
     var adapter_output = switch (adapter_result.outcome) {
         .success => |value| blk: {
-            adapter_result.outcome = .{ .failed = .invalid_provider_result };
+            adapter_result.outcome = .{ .failed = .{ .invalid_provider_result = .answer } };
             break :blk value;
         },
         .canceled, .timed_out, .failed => unreachable,
@@ -382,11 +390,11 @@ const GitVerifier = struct {
     }
 };
 
-fn controlTerminal(io: std.Io, control: process_runner.ProcessControl) ?Terminal {
+fn controlTerminal(io: std.Io, control: process_runner.ProcessControl, timing: ?diagnostic.Timeout) ?Terminal {
     if (control.cancellation) |cancellation| if (cancellation.requested()) return makeTerminal(.canceled, null);
     if (control.deadline) |deadline| {
         if (deadline.compare(.lte, std.Io.Clock.Timestamp.now(io, deadline.clock))) {
-            return failedTerminal(.timed_out, null);
+            return failedTerminal(.{ .timed_out = timing }, null);
         }
     }
     return null;
@@ -396,10 +404,13 @@ fn mapCodexFailure(code: codex.FailureCode) FailureCode {
     return switch (code) {
         .internal_error => .internal_error,
         .input_too_large => |value| .{ .input_too_large = value },
-        .provider_unavailable => .provider_unavailable,
-        .provider_incompatible => .provider_incompatible,
+        .provider_unavailable => |value| .{ .provider_unavailable = value },
+        .provider_incompatible => |value| .{ .provider_incompatible = value },
         .provider_failed => .provider_failed,
-        .invalid_provider_result => .invalid_provider_result,
+        .provider_exit => |value| .{ .provider_exit = value },
+        .stream_too_large => |value| .{ .stream_too_large = value },
+        .final_answer_too_large => |value| .{ .final_answer_too_large = value },
+        .invalid_provider_result => |value| .{ .invalid_provider_result = value },
     };
 }
 
@@ -408,7 +419,7 @@ fn mapAdapterTerminal(result: *const codex.Result) ?Terminal {
     return switch (result.outcome) {
         .success => null,
         .canceled => makeTerminal(.canceled, cleanup_warning),
-        .timed_out => failedTerminal(.timed_out, cleanup_warning),
+        .timed_out => |value| failedTerminal(.{ .timed_out = value }, cleanup_warning),
         .failed => |code| failedTerminal(mapCodexFailure(code), cleanup_warning),
     };
 }
@@ -468,12 +479,12 @@ test "ReviewPipeline terminal taxonomy keeps prepublication and exact-ID uncerta
 
 test "ReviewPipeline keeps a provider failure primary while exposing its cleanup warning" {
     const provider_result: codex.Result = .{
-        .outcome = .{ .failed = .provider_unavailable },
+        .outcome = .{ .failed = .{ .provider_unavailable = .private_environment } },
         .cleanup_warning = .private_root_residue,
     };
     const resolved = mapAdapterTerminal(&provider_result).?;
     try std.testing.expect(resolved.outcome == .failed);
-    try std.testing.expectEqual(FailureCode.provider_unavailable, resolved.outcome.failed);
+    try std.testing.expectEqual(.private_environment, resolved.outcome.failed.provider_unavailable);
     try std.testing.expectEqual(CleanupWarning.private_root_residue, resolved.cleanup_warning.?);
 }
 
@@ -724,4 +735,30 @@ test "ReviewPipeline preserves input limit payload from plan and Codex" {
     } } } };
     try std.testing.expectEqualDeep(adapter_result.outcome.failed.input_too_large, mapAdapterTerminal(&adapter_result).?.outcome.failed.input_too_large);
     try std.testing.expect(@sizeOf(FailureCode) <= 256);
+}
+
+test "ReviewPipeline preserves each provider diagnostic and timeout through terminal mapping" {
+    const cases = [_]codex.FailureCode{
+        .{ .provider_unavailable = .executable_missing },                                                                                .{ .provider_incompatible = .unexpected_event }, .provider_failed,
+        .{ .provider_exit = .{ .classification = .authentication_response, .term = .{ .exited = 17 } } },                                .{ .invalid_provider_result = .answer },         .{ .stream_too_large = .{ .resource = .stderr_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } },
+        .{ .final_answer_too_large = .{ .resource = .final_answer_bytes, .allowed = 65536, .observed = 65537, .observation = .exact } },
+    };
+    for (cases) |failure| {
+        const result: codex.Result = .{ .outcome = .{ .failed = failure } };
+        const terminal = mapAdapterTerminal(&result).?;
+        switch (failure) {
+            inline else => |payload, tag| try std.testing.expectEqualDeep(payload, @field(terminal.outcome.failed, @tagName(tag))),
+        }
+    }
+    const timing: diagnostic.Timeout = .{ .stage = .version_probe, .owner = .caller, .budget = .fromMilliseconds(123) };
+    for ([_]?diagnostic.Timeout{ null, timing }) |value| {
+        const result: codex.Result = .{ .outcome = .{ .timed_out = value } };
+        try std.testing.expectEqualDeep(value, mapAdapterTerminal(&result).?.outcome.failed.timed_out);
+    }
+    const canceled: codex.Result = .{ .outcome = .canceled };
+    try std.testing.expect(mapAdapterTerminal(&canceled).?.outcome == .canceled);
+    const started = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    const before: diagnostic.Timeout = .{ .stage = .before_provider, .owner = .caller, .budget = .fromMilliseconds(250) };
+    const terminal = controlTerminal(std.testing.io, .{ .deadline = started }, before).?;
+    try std.testing.expectEqualDeep(before, terminal.outcome.failed.timed_out.?);
 }

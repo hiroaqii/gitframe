@@ -6,6 +6,9 @@ pub const Resource = enum {
     unknown,
     context_bytes,
     provider_input_bytes,
+    stdout_bytes,
+    stderr_bytes,
+    final_answer_bytes,
     projection_frame_bytes,
     projection_header_bytes,
     projection_bytes,
@@ -53,6 +56,24 @@ pub const Limit = struct {
             .observed = value.observed,
             .observation = .at_least,
         };
+    }
+};
+
+pub const Unavailable = enum { private_environment, executable_missing, executable_denied, launch_failed };
+pub const Incompatible = enum { environment, process_control, unexpected_event, model_mismatch };
+pub const InvalidResultStage = enum { input, answer };
+pub const Exit = struct {
+    classification: enum { authentication_response, cli_response, other },
+    term: std.process.Child.Term,
+};
+
+pub const Timeout = struct {
+    stage: enum { before_provider, version_probe, provider_execution },
+    owner: enum { caller, adapter },
+    budget: std.Io.Duration,
+
+    pub fn remaining(now: std.Io.Clock.Timestamp, deadline: std.Io.Clock.Timestamp) std.Io.Duration {
+        return .fromNanoseconds(@max(0, now.durationTo(deadline).raw.nanoseconds));
     }
 };
 
@@ -115,7 +136,8 @@ test "AI review diagnostic owns limit names and preserves unknown observations" 
         "input_header_bytes",       "review_input_frame_bytes", "plan_summary_bytes",      "unit_bytes",
         "unit_raw_fragment_bytes",  "guidance_per_unit_bytes",  "input_output_bytes",      "guidance_file_bytes",
         "guidance_aggregate_bytes", "diff_line_bytes",          "raw_path_bytes",          "hunk_section_bytes",
-        "metadata_line_bytes",      "display_path_bytes",       "projection_header_bytes",
+        "metadata_line_bytes",      "display_path_bytes",       "projection_header_bytes", "stdout_bytes",
+        "stderr_bytes",             "final_answer_bytes",
     };
     const count_names = [_][]const u8{
         "review_units",            "locations_per_side",  "lines_per_unit", "coverage_spans_per_unit",

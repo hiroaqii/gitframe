@@ -759,7 +759,7 @@ fn projectFooter(
     const projected_hints = projectFooterHints(hints, hint_budget, hint_options);
     const hint_width = ui.key_hint.width(projected_hints.slice(), hint_options);
     var hint_col = if (hint_width == 0) width else width -| hint_width;
-    if (hint_col > segment_width) hint_col -= 1;
+    if (hint_col > segment_width +| 1) hint_col -= 1;
     const left_limit = if (projected_hints.len == 0) width else hint_col;
 
     return .{
@@ -799,7 +799,9 @@ fn formatAiReviewStatus(buffer: []u8, status: AiReviewStatus, max_width: u16) ?[
     const state = aiReviewState(status.phase);
 
     if (status.phase == .terminal) {
-        const cause = if (ai_review_diagnostics.inputTooLarge(status.phase)) "failed: input too large" else state.long;
+        var cause_buffer: [96]u8 = undefined;
+        const summary = ai_review_diagnostics.cause(status.phase);
+        const cause = if (summary) |value| std.fmt.bufPrint(&cause_buffer, "failed: {s}", .{value}) catch return null else state.long;
         const basename = status.repository_basename orelse "";
         const clipped = chasen.text.clipToWidthWithMarker(basename, 24, "…");
         const full = std.fmt.bufPrint(buffer, "AI {s} {s}{s}#{s}:{s}…{s} {s}  F2 details", .{
@@ -813,7 +815,7 @@ fn formatAiReviewStatus(buffer: []u8, status: AiReviewStatus, max_width: u16) ?[
         const compact = std.fmt.bufPrint(buffer, "AI {s} {s}  F2 details", .{ id, cause }) catch return null;
         if (chasen.text.displayWidth(compact) <= max_width) return compact;
         const short = std.fmt.bufPrint(buffer, "AI {s} {s} F2", .{
-            id, if (ai_review_diagnostics.inputTooLarge(status.phase)) "input too large" else state.long,
+            id, summary orelse state.long,
         }) catch return null;
         return short;
     }
@@ -3789,4 +3791,64 @@ test "AI review input footer and scrolled details remain readable at normal and 
     try std.testing.expect(std.mem.indexOf(u8, ai_review_diagnostics.format(&buffer, &record), "unit unknown") != null);
     record.phase.terminal.pipeline.outcome.failed.input_too_large = null;
     try std.testing.expect(std.mem.indexOf(u8, ai_review_diagnostics.format(&buffer, &record), "Limit / observation: unknown") != null);
+}
+
+test "AI review provider footer and details expose causes at normal and narrow sizes" {
+    const committed = @import("../committed_review.zig");
+    const pipeline = @import("../ai_review/runner.zig");
+    const oid = try committed.ObjectId.parse(.sha1, "1234567890123456789012345678901234567890");
+    var record: ai_review_job.Record = .{
+        .key = .{ .id = 1, .generation = 2 },
+        .sequence = 1,
+        .request = null,
+        .scope = .{ .repository = .{ .device = 12, .inode = 34 }, .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = oid,
+            .head_oid = oid,
+            .diff_base_oid = oid,
+        } },
+    };
+    const cases = [_]struct { failure: pipeline.FailureCode, cause: []const u8 }{
+        .{ .failure = .{ .stream_too_large = .{ .resource = .stdout_bytes, .allowed = 2097152, .observed = 2097153, .observation = .at_least } }, .cause = "stdout too large" },
+        .{ .failure = .{ .provider_exit = .{ .classification = .authentication_response, .term = .{ .exited = 17 } } }, .cause = "auth-related response" },
+        .{ .failure = .{ .invalid_provider_result = .answer }, .cause = "invalid answer" },
+        .{ .failure = .{ .timed_out = .{ .stage = .provider_execution, .owner = .adapter, .budget = .fromSeconds(900) } }, .cause = "timed out" },
+    };
+    var harness: ShellViewTestHarness = .{};
+    for (cases) |case| {
+        record.phase = .{ .terminal = .{ .pipeline = .{ .outcome = .{ .failed = case.failure } } } };
+        for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 56, .height = 16 } }) |size| {
+            harness.terminal_size = size;
+            var context = harness.context();
+            context.ai_review_status = .{ .key = record.key, .scope = record.scope, .phase = record.phase };
+            var footer: chasen.testing.TestSurface = undefined;
+            try footer.init(size.width, 1);
+            defer footer.deinit();
+            viewFooter(context, &footer.surface);
+            const text = try footer.snapshot(std.testing.allocator);
+            defer std.testing.allocator.free(text);
+            try std.testing.expect(std.mem.indexOf(u8, text, case.cause) != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "F2") != null);
+            if (std.mem.indexOf(u8, text, "F2 details")) |index| {
+                const after = index + "F2 details".len;
+                if (after < text.len) try std.testing.expect(text[after] == ' ' or text[after] == '\n');
+            }
+            harness.overlay.kind = .{ .ai_review_details = .{ .key = record.key } };
+            harness.overlay.owner_page = .changes;
+            var detail: chasen.testing.TestSurface = undefined;
+            try detail.init(size.width, size.height);
+            defer detail.deinit();
+            try viewAiReviewDetails(context, &detail.surface, &record);
+            const top = try detail.snapshot(std.testing.allocator);
+            defer std.testing.allocator.free(top);
+            try std.testing.expect(std.mem.indexOf(u8, top, case.cause) != null);
+            try std.testing.expect(std.mem.indexOf(u8, top, "Stage:") != null);
+            harness.overlay.kind.ai_review_details.scroll = aiReviewDetailViewport(size, &record).max_scroll;
+            try viewAiReviewDetails(context, &detail.surface, &record);
+            const bottom = try detail.snapshot(std.testing.allocator);
+            defer std.testing.allocator.free(bottom);
+            try std.testing.expect(std.mem.indexOf(u8, bottom, oid.slice()) != null);
+        }
+    }
 }

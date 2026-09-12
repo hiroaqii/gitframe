@@ -486,8 +486,8 @@ test "AI review App adopts a provider failure before starting the next FIFO item
     const second = app.enqueueAiReview(&tc.ctx, fixture.scope(), try fixture.request()).accepted;
     try app.update(try runOnlyTask(&tc.ctx, allocator, io), &tc.ctx);
     try std.testing.expectEqual(
-        pipeline.FailureCode.provider_unavailable,
-        app.ai_review_jobs.find(first).?.phase.terminal.pipeline.outcome.failed,
+        .executable_missing,
+        app.ai_review_jobs.find(first).?.phase.terminal.pipeline.outcome.failed.provider_unavailable,
     );
     try std.testing.expect(app.ai_review_jobs.find(second).?.phase == .reviewing);
     var abandoned = try failOnlyTask(&tc.ctx, allocator, .runtime_abandoned);
@@ -710,5 +710,69 @@ test "AI review pipeline plan limit reaches retained job without provider launch
     const detail = @import("../ai_review_diagnostics.zig").format(&buffer, record);
     try std.testing.expect(std.mem.indexOf(u8, detail, "Resource: diff_line_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "Before Codex starts") != null);
+    try std.testing.expect(try fixture.storeEmpty());
+}
+
+test "AI review provider diagnostics retain exact job identity through messages and F2" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try PipelineFixture.init(allocator, io);
+    defer fixture.deinit();
+    var app: App = .{ .allocator = allocator, .active_page = .compare, .terminal_size = .{ .width = 56, .height = 16 } };
+    defer app.ai_review_jobs.deinit();
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+    const deadline = std.Io.Clock.Timestamp.now(io, .awake);
+    var expired = pipeline.review(allocator, io, try fixture.requestWithExecutable("/must-not-start-provider"), .{ .deadline = deadline });
+    defer expired.deinit();
+    const before = expired.terminal.outcome.failed.timed_out.?;
+    try std.testing.expectEqual(.before_provider, before.stage);
+    try std.testing.expectEqual(.caller, before.owner);
+    try std.testing.expectEqualDeep(std.Io.Duration.zero, before.budget);
+    const cases = [_]struct { outcome: pipeline.TerminalOutcome, expected: []const u8 }{
+        .{ .outcome = expired.terminal.outcome, .expected = "Remaining caller budget at pipeline entry" },
+        .{ .outcome = .{ .failed = .{ .stream_too_large = .{ .resource = .stdout_bytes, .allowed = 2097152, .observed = 2097153, .observation = .at_least } } }, .expected = "Observed at least: 2097153 bytes" },
+        .{ .outcome = .{ .failed = .{ .stream_too_large = .{ .resource = .stderr_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } } }, .expected = "Resource: stderr_bytes" },
+        .{ .outcome = .{ .failed = .{ .final_answer_too_large = .{ .resource = .final_answer_bytes, .allowed = 65536, .observed = 65537, .observation = .exact } } }, .expected = "Observed: 65537 bytes" },
+        .{ .outcome = .{ .failed = .{ .timed_out = .{ .stage = .provider_execution, .owner = .adapter, .budget = .fromSeconds(900) } } }, .expected = "Budget at entry: 15m" },
+        .{ .outcome = .{ .failed = .{ .timed_out = .{ .stage = .version_probe, .owner = .caller, .budget = .fromMilliseconds(123) } } }, .expected = "Deadline owner: caller" },
+        .{ .outcome = .{ .failed = .{ .timed_out = null } }, .expected = "duration / deadline owner: unknown" },
+        .{ .outcome = .{ .failed = .{ .provider_unavailable = .executable_missing } }, .expected = "executable not found" },
+        .{ .outcome = .{ .failed = .{ .provider_incompatible = .unexpected_event } }, .expected = "Stage: Answer decoding" },
+        .{ .outcome = .{ .failed = .{ .provider_exit = .{ .classification = .authentication_response, .term = .{ .exited = 17 } } } }, .expected = "cause is not confirmed" },
+        .{ .outcome = .{ .failed = .{ .provider_exit = .{ .classification = .cli_response, .term = .{ .exited = 2 } } } }, .expected = "Exit code: 2" },
+        .{ .outcome = .{ .failed = .{ .provider_exit = .{ .classification = .other, .term = .{ .signal = @enumFromInt(9) } } } }, .expected = "Signal: 9" },
+        .{ .outcome = .{ .failed = .{ .invalid_provider_result = .answer } }, .expected = "The answer was not accepted." },
+        .{ .outcome = .{ .failed = .provider_failed }, .expected = "provider I/O" },
+        .{ .outcome = .canceled, .expected = "Canceled by user" },
+    };
+    for (cases) |case| {
+        const key = app.enqueueAiReview(&tc.ctx, fixture.scope(), try fixture.requestWithExecutable("/must-not-exist-provider")).accepted;
+        var message = try runOnlyTask(&tc.ctx, allocator, io);
+        message.ai_review_job.review_finished.outcome.pipeline.terminal.outcome = case.outcome;
+        var stale = message;
+        stale.ai_review_job.review_finished.key.generation += 1;
+        try app.update(stale, &tc.ctx);
+        try std.testing.expect(app.ai_review_jobs.find(key).?.phase == .reviewing);
+        var undelivered = message;
+        undelivered.deinitUndelivered(allocator);
+        app.active_page = .config;
+        app.repo_session.repo_epoch += 1;
+        try app.update(message, &tc.ctx);
+        const record = app.ai_review_jobs.find(key).?;
+        try std.testing.expectEqualDeep(case.outcome, record.phase.terminal.pipeline.outcome);
+        try std.testing.expect(record.scope.eql(&fixture.scope()));
+        try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.f2 } }).?, &tc.ctx);
+        try std.testing.expect(app.overlay.kind.ai_review_details.key.eql(key));
+        var buffer: [2048]u8 = undefined;
+        const detail = @import("../ai_review_diagnostics.zig").format(&buffer, record);
+        try std.testing.expect(std.mem.indexOf(u8, detail, case.expected) != null);
+        try std.testing.expect(std.mem.indexOf(u8, detail, fixture.target.head_oid.slice()) != null);
+        try std.testing.expect(std.mem.indexOf(u8, detail, "SECRET-CODE-SENTINEL") == null);
+        try app.update(.{ .ai_review_details = .close }, &tc.ctx);
+        try std.testing.expect(record.unread);
+        try app.update(.dismiss_ai_review_status, &tc.ctx);
+        try std.testing.expect(app.ai_review_jobs.find(key) == null);
+    }
     try std.testing.expect(try fixture.storeEmpty());
 }

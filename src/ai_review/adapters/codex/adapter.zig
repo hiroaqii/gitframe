@@ -70,10 +70,13 @@ pub const ReviewBatch = struct {
 pub const FailureCode = union(enum) {
     internal_error,
     input_too_large: ?diagnostic.Limit,
-    provider_unavailable,
-    provider_incompatible,
+    provider_unavailable: diagnostic.Unavailable,
+    provider_incompatible: diagnostic.Incompatible,
     provider_failed,
-    invalid_provider_result,
+    provider_exit: diagnostic.Exit,
+    stream_too_large: diagnostic.Limit,
+    final_answer_too_large: diagnostic.Limit,
+    invalid_provider_result: diagnostic.InvalidResultStage,
 };
 
 pub const Outcome = union(enum) {
@@ -82,7 +85,7 @@ pub const Outcome = union(enum) {
         provenance: producer.ProviderProvenance,
     },
     canceled,
-    timed_out,
+    timed_out: ?diagnostic.Timeout,
     failed: FailureCode,
 };
 
@@ -98,7 +101,7 @@ pub const Result = struct {
             },
             .canceled, .timed_out, .failed => {},
         }
-        self.* = .{ .outcome = .{ .failed = .invalid_provider_result } };
+        self.* = .{ .outcome = .{ .failed = .{ .invalid_provider_result = .answer } } };
     }
 };
 
@@ -127,7 +130,7 @@ fn runWithCleanupFailureInjection(
     const prompt = buildPrompt(allocator, batch, &violation) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InputTooLarge => .{ .outcome = .{ .failed = .{ .input_too_large = violation } } },
-        error.InvalidInput => .{ .outcome = .{ .failed = .invalid_provider_result } },
+        error.InvalidInput => .{ .outcome = .{ .failed = .{ .invalid_provider_result = .input } } },
     };
     defer {
         std.crypto.secureZero(u8, @constCast(prompt));
@@ -138,7 +141,7 @@ fn runWithCleanupFailureInjection(
     var invocation = environment.create(allocator, io, output_schema, &rollback_warning) catch |err|
         return creationFailure(err, rollback_warning);
     if (inject_cleanup_failure) invocation.cleanup_failure_injected = true;
-    const outcome = runInvocation(allocator, io, &owned, batch, prompt, &invocation, caller_control) catch
+    const outcome = runInvocation(allocator, io, &owned, batch, prompt, &invocation, caller_control, timeout, version_timeout) catch
         Outcome{ .failed = .internal_error };
     const cleanup_warning = invocation.deinit();
     return .{ .outcome = outcome, .cleanup_warning = cleanup_warning };
@@ -148,8 +151,8 @@ fn creationFailure(err: environment.Failure, cleanup_warning: ?environment.Clean
     return .{
         .outcome = .{ .failed = switch (err) {
             error.OutOfMemory => .internal_error,
-            error.UnsupportedCodexEnvironment => .provider_incompatible,
-            error.PrivateEnvironmentFailed => .provider_unavailable,
+            error.UnsupportedCodexEnvironment => .{ .provider_incompatible = .environment },
+            error.PrivateEnvironmentFailed => .{ .provider_unavailable = .private_environment },
         } },
         .cleanup_warning = cleanup_warning,
     };
@@ -163,20 +166,24 @@ fn runInvocation(
     prompt: []const u8,
     invocation: *const environment.Invocation,
     caller_control: process_runner.ProcessControl,
+    adapter_budget: std.Io.Duration,
+    probe_budget: std.Io.Duration,
 ) std.mem.Allocator.Error!Outcome {
-    var control = caller_control;
-    const adapter_deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = timeout, .clock = .awake });
-    if (control.deadline == null or adapter_deadline.compare(.lt, control.deadline.?)) {
-        control.deadline = adapter_deadline;
-    }
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const selected = selectControl(started, caller_control, adapter_budget);
+    const control = selected.control;
+    // Keep the selected absolute deadline through both processes. Only the
+    // diagnostic budget is a snapshot; probing never restarts the timer.
+    var timing = selected.timing;
 
     var cli_version: ?[]u8 = null;
     defer if (cli_version) |value| allocator.free(value);
-    switch (probeVersion(allocator, io, owned.executable, invocation.work_path, control)) {
+    switch (probeVersion(allocator, io, owned.executable, invocation.work_path, control, probe_budget)) {
         .value => |value| cli_version = value,
         .canceled => return .canceled,
-        .timed_out => return .timed_out,
+        .timed_out => return .{ .timed_out = timing },
     }
+    timing.stage = .provider_execution;
 
     var argv_owner = try buildArgv(allocator, owned, invocation);
     defer argv_owner.deinit();
@@ -191,18 +198,20 @@ fn runInvocation(
 
     var candidates = switch (process_result) {
         .canceled => return .canceled,
-        .timed_out => return .timed_out,
+        .timed_out => return .{ .timed_out = timing },
         .failed => |failure| return .{ .failed = mapProcessFailure(failure) },
         .completed => |*captured| switch (captured.*) {
             .ordinary => unreachable,
             .sensitive => |*value| decoded: {
                 if (value.term != .exited or value.term.exited != 0) {
-                    return .{ .failed = classifyExit(value.stderr.bytes()) };
+                    return .{ .failed = .{ .provider_exit = classifyExit(value.term, value.stderr.bytes()) } };
                 }
-                break :decoded decodeJsonl(allocator, value.stdout.bytes(), batch.units.len) catch |err| switch (err) {
+                var output_violation: ?diagnostic.Limit = null;
+                break :decoded decodeJsonl(allocator, value.stdout.bytes(), batch.units.len, &output_violation) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.UnexpectedEvent => return .{ .failed = .provider_incompatible },
-                    error.InvalidJsonl, error.InvalidOutput => return .{ .failed = .invalid_provider_result },
+                    error.OutputTooLarge => return .{ .failed = .{ .final_answer_too_large = output_violation.? } },
+                    error.UnexpectedEvent => return .{ .failed = .{ .provider_incompatible = .unexpected_event } },
+                    error.InvalidJsonl, error.InvalidOutput => return .{ .failed = .{ .invalid_provider_result = .answer } },
                 };
             },
         },
@@ -221,10 +230,22 @@ fn runInvocation(
         error.OutOfMemory => return error.OutOfMemory,
         error.ModelMismatch => {
             candidates.deinit();
-            return .{ .failed = .provider_incompatible };
+            return .{ .failed = .{ .provider_incompatible = .model_mismatch } };
         },
     };
     return .{ .success = .{ .candidates = candidates, .provenance = provenance } };
+}
+
+fn selectControl(started: std.Io.Clock.Timestamp, caller: process_runner.ProcessControl, budget: std.Io.Duration) struct { control: process_runner.ProcessControl, timing: diagnostic.Timeout } {
+    var control = caller;
+    const adapter_deadline = started.addDuration(.{ .raw = budget, .clock = started.clock });
+    const adapter_owns = caller.deadline == null or adapter_deadline.compare(.lt, caller.deadline.?);
+    if (adapter_owns) control.deadline = adapter_deadline;
+    return .{ .control = control, .timing = .{
+        .stage = .version_probe,
+        .owner = if (adapter_owns) .adapter else .caller,
+        .budget = if (adapter_owns) budget else diagnostic.Timeout.remaining(started, caller.deadline.?),
+    } };
 }
 
 fn validExecutable(value: []const u8) bool {
@@ -368,9 +389,10 @@ fn probeVersion(
     executable: []const u8,
     work_path: []const u8,
     caller_control: process_runner.ProcessControl,
+    budget: std.Io.Duration,
 ) VersionProbe {
     var control = caller_control;
-    const probe_deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = version_timeout, .clock = .awake });
+    const probe_deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = budget, .clock = .awake });
     if (control.deadline == null or probe_deadline.compare(.lt, control.deadline.?)) control.deadline = probe_deadline;
     const version_argv = [_][]const u8{ executable, "--version" };
     var result = process_runner.runWithStdinControlled(allocator, io, .{
@@ -412,15 +434,26 @@ fn controlTerminal(io: std.Io, control: process_runner.ProcessControl) ?enum { c
 
 fn mapProcessFailure(failure: process_runner.ControlledFailure) FailureCode {
     return switch (failure) {
-        .empty_argv, .spawn => .provider_unavailable,
-        .unsupported_process_control => .provider_incompatible,
-        .stdin_start, .stdin, .control_start, .capture, .terminate, .wait => .provider_failed,
+        .empty_argv => .{ .provider_unavailable = .launch_failed },
+        .spawn => |err| .{ .provider_unavailable = switch (err) {
+            error.FileNotFound => .executable_missing,
+            error.AccessDenied => .executable_denied,
+            else => .launch_failed,
+        } },
+        .unsupported_process_control => .{ .provider_incompatible = .process_control },
+        .capture => |err| if (err == error.StdoutLimitExceeded or err == error.StderrLimitExceeded) .{ .stream_too_large = .{
+            .resource = if (err == error.StdoutLimitExceeded) .stdout_bytes else .stderr_bytes,
+            .allowed = if (err == error.StdoutLimitExceeded) max_jsonl_bytes else max_stderr_bytes,
+            .observed = (if (err == error.StdoutLimitExceeded) max_jsonl_bytes else max_stderr_bytes) + 1,
+            .observation = .at_least,
+        } } else .provider_failed,
+        .stdin_start, .stdin, .control_start, .terminate, .wait => .provider_failed,
     };
 }
 
-fn classifyExit(stderr: []const u8) FailureCode {
+fn classifyExit(term: std.process.Child.Term, stderr: []const u8) diagnostic.Exit {
     if (containsAnyIgnoreCase(stderr, &.{ "not logged in", "authentication", "unauthorized", "api key", "401" })) {
-        return .provider_unavailable;
+        return .{ .term = term, .classification = .authentication_response };
     }
     if (containsAnyIgnoreCase(stderr, &.{
         "unexpected argument",
@@ -429,8 +462,8 @@ fn classifyExit(stderr: []const u8) FailureCode {
         "unknown field",
         "strict config",
         "failed to parse config",
-    })) return .provider_incompatible;
-    return .provider_failed;
+    })) return .{ .term = term, .classification = .cli_response };
+    return .{ .term = term, .classification = .other };
 }
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
@@ -493,9 +526,10 @@ const FindingWire = struct {
     suggestion: ?[]const u8 = null,
 };
 
-const DecodeError = error{ OutOfMemory, InvalidJsonl, InvalidOutput, UnexpectedEvent };
+const DecodeError = error{ OutOfMemory, InvalidJsonl, InvalidOutput, UnexpectedEvent, OutputTooLarge };
 
-fn decodeJsonl(allocator: std.mem.Allocator, bytes: []const u8, unit_count: usize) DecodeError!producer.CandidateBatch {
+fn decodeJsonl(allocator: std.mem.Allocator, bytes: []const u8, unit_count: usize, violation: *?diagnostic.Limit) DecodeError!producer.CandidateBatch {
+    violation.* = null;
     if (bytes.len == 0 or bytes.len > max_jsonl_bytes) return error.InvalidJsonl;
     var final_text: ?[]const u8 = null;
     errdefer if (final_text) |value| {
@@ -545,7 +579,11 @@ fn decodeJsonl(allocator: std.mem.Allocator, bytes: []const u8, unit_count: usiz
         if (!std.mem.eql(u8, item_type_value.string, "agent_message")) return error.UnexpectedEvent;
         if (final_text != null) return error.InvalidJsonl;
         const text_value = item_value.object.get("text") orelse return error.InvalidJsonl;
-        if (text_value != .string or text_value.string.len > max_final_bytes) return error.InvalidJsonl;
+        if (text_value != .string) return error.InvalidJsonl;
+        if (text_value.string.len > max_final_bytes) {
+            violation.* = .{ .resource = .final_answer_bytes, .allowed = max_final_bytes, .observed = text_value.string.len, .observation = .exact };
+            return error.OutputTooLarge;
+        }
         final_text = try allocator.dupe(u8, text_value.string);
     }
     const final = final_text orelse return error.InvalidJsonl;
@@ -599,7 +637,8 @@ test "Codex JSONL accepts one exact ordered candidate document" {
         \\{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[]}}]}"}}
         \\{"type":"turn.completed"}
     ;
-    var candidates = try decodeJsonl(std.testing.allocator, jsonl, 1);
+    var violation: ?diagnostic.Limit = null;
+    var candidates = try decodeJsonl(std.testing.allocator, jsonl, 1, &violation);
     defer candidates.deinit();
     try std.testing.expectEqual(@as(usize, 1), candidates.payloads.len);
 }
@@ -670,19 +709,20 @@ test "Codex prompt exact boundary and partial multi-unit overflow diagnostics" {
 }
 
 test "Codex exit diagnostics distinguish auth compatibility and provider failure" {
-    try std.testing.expectEqual(FailureCode.provider_unavailable, classifyExit("not logged in"));
-    try std.testing.expectEqual(FailureCode.provider_incompatible, classifyExit("unknown config key"));
-    try std.testing.expectEqual(FailureCode.provider_failed, classifyExit("remote service failed"));
+    try std.testing.expectEqual(.authentication_response, classifyExit(.{ .exited = 1 }, "not logged in").classification);
+    try std.testing.expectEqual(.cli_response, classifyExit(.{ .exited = 2 }, "unknown config key").classification);
+    try std.testing.expectEqualDeep(diagnostic.Exit{ .term = .{ .signal = @enumFromInt(9) }, .classification = .other }, classifyExit(.{ .signal = @enumFromInt(9) }, "remote service failed"));
 }
 
 test "Codex JSONL rejects tool events duplicates and unknown handshakes" {
+    var violation: ?diagnostic.Limit = null;
     const tool =
         \\{"type":"thread.started","thread_id":"t"}
         \\{"type":"turn.started"}
         \\{"type":"item.completed","item":{"type":"command_execution","command":"bad"}}
         \\{"type":"turn.completed"}
     ;
-    try std.testing.expectError(error.UnexpectedEvent, decodeJsonl(std.testing.allocator, tool, 1));
+    try std.testing.expectError(error.UnexpectedEvent, decodeJsonl(std.testing.allocator, tool, 1, &violation));
     const duplicate =
         \\{"type":"thread.started","thread_id":"t"}
         \\{"type":"turn.started"}
@@ -690,20 +730,33 @@ test "Codex JSONL rejects tool events duplicates and unknown handshakes" {
         \\{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}
         \\{"type":"turn.completed"}
     ;
-    try std.testing.expectError(error.InvalidJsonl, decodeJsonl(std.testing.allocator, duplicate, 1));
+    try std.testing.expectError(error.InvalidJsonl, decodeJsonl(std.testing.allocator, duplicate, 1, &violation));
     const handshake =
         \\{"type":"thread.started","thread_id":"t"}
         \\{"type":"turn.started"}
         \\{"type":"mcp.handshake"}
     ;
-    try std.testing.expectError(error.UnexpectedEvent, decodeJsonl(std.testing.allocator, handshake, 1));
+    try std.testing.expectError(error.UnexpectedEvent, decodeJsonl(std.testing.allocator, handshake, 1, &violation));
     const schema_external =
         \\{"type":"thread.started","thread_id":"t"}
         \\{"type":"turn.started"}
         \\{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[],\"publication_authority\":true}"}}
         \\{"type":"turn.completed"}
     ;
-    try std.testing.expectError(error.InvalidOutput, decodeJsonl(std.testing.allocator, schema_external, 0));
+    try std.testing.expectError(error.InvalidOutput, decodeJsonl(std.testing.allocator, schema_external, 0, &violation));
+    const invalid_documents = [_][]const u8{
+        "{\"schema_version\":2,\"units\":[]}",
+        "{\"schema_version\":1,\"units\":[{\"ordinal\":2,\"candidate\":{\"findings\":[]}}]}",
+        "{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[{\"start_location\":\"invalid\",\"end_location\":\"a0001\",\"severity\":\"error\",\"title\":\"SECRET-CODE-SENTINEL\",\"body\":\"body\"}]}}]}",
+    };
+    for (invalid_documents) |document| {
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, document, .{});
+        defer std.testing.allocator.free(encoded);
+        const jsonl = try std.fmt.allocPrint(std.testing.allocator, "{{\"type\":\"thread.started\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{s}}}}}\n{{\"type\":\"turn.completed\"}}\n", .{encoded});
+        defer std.testing.allocator.free(jsonl);
+        try std.testing.expectError(error.InvalidOutput, decodeJsonl(std.testing.allocator, jsonl, 1, &violation));
+        try std.testing.expect(violation == null);
+    }
 }
 
 fn expectRecipe(requested_model: ?[]const u8) !void {
@@ -846,7 +899,7 @@ test "Codex adapter preserves known failure when private-root cleanup reports a 
     var result = try runWithCleanupFailureInjection(std.testing.allocator, std.testing.io, request, .{ .units = &.{}, .context = "" }, .{}, true);
     defer result.deinit();
     try std.testing.expect(result.outcome == .failed);
-    try std.testing.expectEqual(FailureCode.provider_unavailable, result.outcome.failed);
+    try std.testing.expectEqual(.executable_missing, result.outcome.failed.provider_unavailable);
     try std.testing.expectEqual(environment.CleanupWarning.private_root_residue, result.cleanup_warning.?);
 }
 
@@ -854,6 +907,188 @@ test "Codex adapter preserves partial-create failure and rollback warning" {
     var result = creationFailure(error.PrivateEnvironmentFailed, .private_root_residue);
     defer result.deinit();
     try std.testing.expect(result.outcome == .failed);
-    try std.testing.expectEqual(FailureCode.provider_unavailable, result.outcome.failed);
+    try std.testing.expectEqual(.private_environment, result.outcome.failed.provider_unavailable);
     try std.testing.expectEqual(environment.CleanupWarning.private_root_residue, result.cleanup_warning.?);
+}
+
+const test_version = "if [ \"$1\" = --version ]; then printf 'codex-cli test\\n'; exit 0; fi\n";
+const test_answer =
+    \\printf '%s\n' '{"type":"thread.started"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[]}"}}' '{"type":"turn.completed"}'
+;
+
+fn runDiagnosticScript(script: []const u8, options: struct {
+    budget: std.Io.Duration = .fromSeconds(3),
+    probe: std.Io.Duration = .fromSeconds(1),
+    caller: ?std.Io.Duration = null,
+    cancellation: ?process_runner.CancellationView = null,
+}) !Result {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_bytes = try std.mem.concat(allocator, u8, &.{ "#!/bin/sh\n", script });
+    defer allocator.free(script_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "provider", .data = script_bytes });
+    const executable = try tmp.dir.realPathFileAlloc(io, "provider", allocator);
+    defer allocator.free(executable);
+    const chmod = try process_runner.runCaptured(allocator, io, .{ .argv = &.{ "/bin/chmod", "0700", executable } });
+    defer chmod.deinit(allocator);
+    try std.testing.expectEqualDeep(std.process.Child.Term{ .exited = 0 }, chmod.term);
+    var request = try Request.init(allocator, executable, null);
+    defer request.deinit();
+    var warning: ?CleanupWarning = null;
+    var invocation = try environment.create(allocator, io, output_schema, &warning);
+    defer std.debug.assert(invocation.deinit() == null);
+    const control: process_runner.ProcessControl = .{
+        .deadline = if (options.caller) |duration| .fromNow(io, .{ .raw = duration, .clock = .awake }) else null,
+        .cancellation = options.cancellation,
+    };
+    return .{ .outcome = try runInvocation(allocator, io, &request, .{ .units = &.{}, .context = "" }, "", &invocation, control, options.budget, options.probe) };
+}
+
+test "Codex stream bounds distinguish stdout stderr and preserve lower bounds" {
+    for ([_]bool{ false, true }) |stderr| {
+        const limit = if (stderr) max_stderr_bytes else max_jsonl_bytes;
+        for ([_]usize{ limit, limit + 1 }) |size| {
+            const script = try std.fmt.allocPrint(std.testing.allocator, "{s}/usr/bin/head -c {d} /dev/zero {s}\n{s}\n", .{
+                test_version, size, if (stderr) ">&2" else "", if (stderr) test_answer else "",
+            });
+            defer std.testing.allocator.free(script);
+            var result = try runDiagnosticScript(script, .{});
+            defer result.deinit();
+            if (size > limit) {
+                const evidence = result.outcome.failed.stream_too_large;
+                try std.testing.expectEqual(if (stderr) diagnostic.Resource.stderr_bytes else .stdout_bytes, evidence.resource);
+                try std.testing.expectEqual(limit, evidence.allowed);
+                try std.testing.expectEqual(limit + 1, evidence.observed);
+                try std.testing.expectEqual(.at_least, evidence.observation);
+            } else if (stderr) {
+                try std.testing.expect(result.outcome == .success);
+            } else try std.testing.expectEqual(.answer, result.outcome.failed.invalid_provider_result);
+        }
+    }
+    try std.testing.expectEqual(.process_control, mapProcessFailure(.unsupported_process_control).provider_incompatible);
+    try std.testing.expectEqual(.executable_denied, mapProcessFailure(.{ .spawn = error.AccessDenied }).provider_unavailable);
+    try std.testing.expectEqualDeep(FailureCode.provider_failed, mapProcessFailure(.{ .capture = error.InputOutput }));
+}
+
+test "Codex final bound measures decoded bytes and rejects malformed output independently" {
+    const allocator = std.testing.allocator;
+    var violation: ?diagnostic.Limit = null;
+    for ([_]usize{ max_final_bytes, max_final_bytes + 1 }) |size| {
+        // Wire escapes are six bytes each; evidence must count decoded bytes.
+        const escaped = try allocator.alloc(u8, size * 6);
+        defer allocator.free(escaped);
+        for (0..size) |i| @memcpy(escaped[i * 6 ..][0..6], "\\u0078");
+        const jsonl = try std.fmt.allocPrint(allocator, "{{\"type\":\"thread.started\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"{s}\"}}}}\n{{\"type\":\"turn.completed\"}}\n", .{escaped});
+        defer allocator.free(jsonl);
+        try std.testing.expectError(if (size > max_final_bytes) error.OutputTooLarge else error.InvalidOutput, decodeJsonl(allocator, jsonl, 0, &violation));
+        if (size > max_final_bytes) {
+            try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .final_answer_bytes, .allowed = max_final_bytes, .observed = size, .observation = .exact }, violation.?);
+        } else try std.testing.expect(violation == null);
+    }
+    // A valid boundary answer remains accepted, including its JSON whitespace.
+    const final = try allocator.alloc(u8, max_final_bytes);
+    defer allocator.free(final);
+    @memset(final, ' ');
+    const valid = "{\"schema_version\":1,\"units\":[]}";
+    @memcpy(final[0..valid.len], valid);
+    const encoded = try std.json.Stringify.valueAlloc(allocator, final, .{});
+    defer allocator.free(encoded);
+    const jsonl = try std.fmt.allocPrint(allocator, "{{\"type\":\"thread.started\"}}\n{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{s}}}}}\n{{\"type\":\"turn.completed\"}}\n", .{encoded});
+    defer allocator.free(jsonl);
+    var batch = try decodeJsonl(allocator, jsonl, 0, &violation);
+    defer batch.deinit();
+    try std.testing.expect(violation == null);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, decodeJsonl(failing.allocator(), jsonl, 0, &violation));
+    var result = try runDiagnosticScript(test_version ++
+        "printf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.started\"}'\n" ++
+        "printf '%s' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"'\n" ++
+        "/usr/bin/head -c 65537 /dev/zero | /usr/bin/tr '\\000' x\n" ++
+        "printf '%s\\n' '\"}}' '{\"type\":\"turn.completed\"}'\n", .{});
+    defer result.deinit();
+    try std.testing.expectEqualDeep(diagnostic.Limit{ .resource = .final_answer_bytes, .allowed = max_final_bytes, .observed = max_final_bytes + 1, .observation = .exact }, result.outcome.failed.final_answer_too_large);
+}
+
+test "Codex diagnostic deadline selection preserves caller ties and entry budget" {
+    const started: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = .{ .nanoseconds = 1000 } };
+    const adapter = selectControl(started, .{}, timeout);
+    try std.testing.expectEqual(.adapter, adapter.timing.owner);
+    try std.testing.expectEqualDeep(timeout, adapter.timing.budget);
+    const tied = selectControl(started, .{ .deadline = adapter.control.deadline }, timeout);
+    try std.testing.expectEqual(.caller, tied.timing.owner);
+    try std.testing.expectEqualDeep(timeout, tied.timing.budget);
+    const earlier = started.addDuration(.{ .raw = .fromMilliseconds(123), .clock = .awake });
+    const caller = selectControl(started, .{ .deadline = earlier }, timeout);
+    try std.testing.expectEqualDeep(earlier, caller.control.deadline.?);
+    try std.testing.expectEqualDeep(std.Io.Duration.fromMilliseconds(123), caller.timing.budget);
+    const expired = selectControl(started, .{ .deadline = started.subDuration(.{ .raw = .fromSeconds(1), .clock = .awake }) }, timeout);
+    try std.testing.expectEqualDeep(std.Io.Duration.zero, expired.timing.budget);
+    try std.testing.expectEqual(.caller, expired.timing.owner);
+}
+
+test "Codex local probe cap continues but caller and shared adapter deadlines fail" {
+    var local = try runDiagnosticScript("if [ \"$1\" = --version ]; then /bin/sleep 1; exit 0; fi\n" ++ test_answer, .{ .probe = .fromMilliseconds(80) });
+    defer local.deinit();
+    try std.testing.expect(local.outcome == .success);
+    try std.testing.expect(local.outcome.success.provenance.cli_version == null);
+    var probe = try runDiagnosticScript("if [ \"$1\" = --version ]; then /bin/sleep 1; exit 0; fi\nexit 99\n", .{ .caller = .fromMilliseconds(150) });
+    defer probe.deinit();
+    try std.testing.expectEqual(.version_probe, probe.outcome.timed_out.?.stage);
+    try std.testing.expectEqual(.caller, probe.outcome.timed_out.?.owner);
+    try std.testing.expect(probe.outcome.timed_out.?.budget.nanoseconds <= std.Io.Duration.fromMilliseconds(150).nanoseconds);
+    var caller = try runDiagnosticScript(test_version ++ "/bin/sleep 1\n" ++ test_answer, .{ .caller = .fromMilliseconds(150) });
+    defer caller.deinit();
+    try std.testing.expectEqual(.provider_execution, caller.outcome.timed_out.?.stage);
+    try std.testing.expectEqual(.caller, caller.outcome.timed_out.?.owner);
+    // Main alone fits 600 ms; probe + main does not. Restarting at main fails this proof.
+    var adapter = try runDiagnosticScript("if [ \"$1\" = --version ]; then /bin/sleep 0.2; printf 'test\\n'; exit 0; fi\n/bin/sleep 0.5\n" ++ test_answer, .{ .budget = .fromMilliseconds(600) });
+    defer adapter.deinit();
+    try std.testing.expectEqual(.provider_execution, adapter.outcome.timed_out.?.stage);
+    try std.testing.expectEqual(.adapter, adapter.outcome.timed_out.?.owner);
+    try std.testing.expectEqualDeep(std.Io.Duration.fromMilliseconds(600), adapter.outcome.timed_out.?.budget);
+}
+
+fn cancelDiagnosticRun(io: std.Io, generation: *std.atomic.Value(u64)) std.Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(150), .awake);
+    generation.store(7, .release);
+}
+
+test "Codex cancellation during probe and main remains distinct from timeout" {
+    const io = std.testing.io;
+    var generation: std.atomic.Value(u64) = .init(0);
+    const view: process_runner.CancellationView = .{ .generation = 7, .canceled_generation = &generation };
+    for ([_][]const u8{ "/bin/sleep 1\nexit 0\n", test_version ++ "/bin/sleep 1\n" ++ test_answer }) |script| {
+        generation.store(0, .release);
+        var future = try io.concurrent(cancelDiagnosticRun, .{ io, &generation });
+        defer future.await(io) catch {};
+        var result = try runDiagnosticScript(script, .{ .cancellation = view });
+        defer result.deinit();
+        try std.testing.expect(result.outcome == .canceled);
+    }
+    const expired = std.Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectEqual(.canceled, controlTerminal(io, .{ .deadline = expired, .cancellation = view }).?);
+}
+
+test "Codex finite provider failures retain evidence without response text" {
+    const cases = [_]struct { text: []const u8, classification: @FieldType(diagnostic.Exit, "classification") }{
+        .{ .text = "authentication SECRET-CODE-SENTINEL", .classification = .authentication_response },
+        .{ .text = "unknown config SECRET-CODE-SENTINEL", .classification = .cli_response },
+        .{ .text = "unrecognized failure SECRET-CODE-SENTINEL", .classification = .other },
+    };
+    for (cases) |case| {
+        const script = try std.fmt.allocPrint(std.testing.allocator, "{s}printf '%s' '{s}' >&2\nexit 17\n", .{ test_version, case.text });
+        defer std.testing.allocator.free(script);
+        var result = try runDiagnosticScript(script, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.classification, result.outcome.failed.provider_exit.classification);
+        try std.testing.expectEqual(@as(u8, 17), result.outcome.failed.provider_exit.term.exited);
+    }
+    var malformed = try runDiagnosticScript(test_version ++ "printf '{invalid'\n", .{});
+    defer malformed.deinit();
+    try std.testing.expectEqual(.answer, malformed.outcome.failed.invalid_provider_result);
+    try std.testing.expect(@sizeOf(FailureCode) <= 256);
+    try std.testing.expect(@sizeOf(?diagnostic.Timeout) <= 256);
 }
