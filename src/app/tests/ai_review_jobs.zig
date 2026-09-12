@@ -997,7 +997,7 @@ test "AI review pipeline classifies pre-provider validation and Store failures" 
             \\printf '%s\n' \
             \\  '{"type":"thread.started","thread_id":"fake"}' \
             \\  '{"type":"turn.started"}' \
-            \\  '{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[{\"start_location\":\"a9999\",\"end_location\":\"a9999\",\"severity\":\"warning\",\"title\":\"SECRET-CODE-SENTINEL\",\"body\":\"invalid anchor\"}]}}]}"}}' \
+            \\  '{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[{\"start_location\":\"a9999\",\"end_location\":\"a9999\",\"severity\":\"warning\",\"title\":\"SECRET-CODE-SENTINEL\",\"body\":\"invalid anchor\",\"suggestion\":null}]}}]}"}}' \
             \\  '{"type":"turn.completed"}'
         ;
         try fixture.tmp.dir.writeFile(io, .{ .sub_path = "codex-invalid-anchor", .data = invalid_script });

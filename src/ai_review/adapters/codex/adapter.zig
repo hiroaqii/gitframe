@@ -21,7 +21,7 @@ const instruction =
 ;
 
 pub const output_schema =
-    \\{"type":"object","additionalProperties":false,"required":["schema_version","units"],"properties":{"schema_version":{"const":1},"units":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["ordinal","candidate"],"properties":{"ordinal":{"type":"integer","minimum":1,"maximum":256},"candidate":{"type":"object","additionalProperties":false,"required":["findings"],"properties":{"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["start_location","end_location","severity","title","body"],"properties":{"start_location":{"type":"string","pattern":"^[ba][0-9]{4}$"},"end_location":{"type":"string","pattern":"^[ba][0-9]{4}$"},"severity":{"enum":["info","warning","error"]},"title":{"type":"string"},"body":{"type":"string"},"suggestion":{"type":"string"}}}}}}}}}}
+    \\{"type":"object","additionalProperties":false,"required":["schema_version","units"],"properties":{"schema_version":{"type":"integer","const":1},"units":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["ordinal","candidate"],"properties":{"ordinal":{"type":"integer","minimum":1,"maximum":256},"candidate":{"type":"object","additionalProperties":false,"required":["findings"],"properties":{"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["start_location","end_location","severity","title","body","suggestion"],"properties":{"start_location":{"type":"string","pattern":"^[ba][0-9]{4}$"},"end_location":{"type":"string","pattern":"^[ba][0-9]{4}$"},"severity":{"type":"string","enum":["info","warning","error"]},"title":{"type":"string"},"body":{"type":"string"},"suggestion":{"type":["string","null"]}}}}}}}}}}}
 ;
 
 pub const Request = struct {
@@ -523,7 +523,7 @@ const FindingWire = struct {
     severity: []const u8,
     title: []const u8,
     body: []const u8,
-    suggestion: ?[]const u8 = null,
+    suggestion: ?[]const u8,
 };
 
 const DecodeError = error{ OutOfMemory, InvalidJsonl, InvalidOutput, UnexpectedEvent, OutputTooLarge };
@@ -629,18 +629,107 @@ fn admitNonToolItem(item: std.json.Value) DecodeError!void {
         !std.mem.eql(u8, item_type.string, "agent_message")) return error.UnexpectedEvent;
 }
 
+test "Codex output schema matches the Structured Outputs contract" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output_schema, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+
+    const root_properties = parsed.value.object.get("properties") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(root_properties == .object);
+    const schema_version = root_properties.object.get("schema_version") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(schema_version == .object);
+    const schema_version_type = schema_version.object.get("type") orelse return error.TestUnexpectedResult;
+    const schema_version_const = schema_version.object.get("const") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(schema_version_type == .string);
+    try std.testing.expectEqualStrings("integer", schema_version_type.string);
+    try std.testing.expect(schema_version_const == .integer);
+    try std.testing.expectEqual(@as(i64, 1), schema_version_const.integer);
+
+    const units = root_properties.object.get("units") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(units == .object);
+    const unit_items = units.object.get("items") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(unit_items == .object);
+    const unit_properties = unit_items.object.get("properties") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(unit_properties == .object);
+    const candidate = unit_properties.object.get("candidate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(candidate == .object);
+    const candidate_properties = candidate.object.get("properties") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(candidate_properties == .object);
+    const findings = candidate_properties.object.get("findings") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(findings == .object);
+    const finding = findings.object.get("items") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(finding == .object);
+    const finding_properties = finding.object.get("properties") orelse return error.TestUnexpectedResult;
+    const finding_required = finding.object.get("required") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(finding_properties == .object);
+    try std.testing.expect(finding_required == .array);
+
+    const expected_names = [_][]const u8{ "start_location", "end_location", "severity", "title", "body", "suggestion" };
+    try std.testing.expectEqual(expected_names.len, finding_properties.object.count());
+    try std.testing.expectEqual(expected_names.len, finding_required.array.items.len);
+    for (expected_names) |name| {
+        try std.testing.expect(finding_properties.object.contains(name));
+        var occurrences: usize = 0;
+        for (finding_required.array.items) |required| {
+            try std.testing.expect(required == .string);
+            if (std.mem.eql(u8, name, required.string)) occurrences += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), occurrences);
+    }
+
+    const severity = finding_properties.object.get("severity") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(severity == .object);
+    const severity_type = severity.object.get("type") orelse return error.TestUnexpectedResult;
+    const severity_enum = severity.object.get("enum") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(severity_type == .string);
+    try std.testing.expectEqualStrings("string", severity_type.string);
+    try std.testing.expect(severity_enum == .array);
+    const expected_severities = [_][]const u8{ "info", "warning", "error" };
+    try std.testing.expectEqual(expected_severities.len, severity_enum.array.items.len);
+    for (expected_severities, severity_enum.array.items) |expected, actual| {
+        try std.testing.expect(actual == .string);
+        try std.testing.expectEqualStrings(expected, actual.string);
+    }
+
+    const suggestion = finding_properties.object.get("suggestion") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(suggestion == .object);
+    const suggestion_type = suggestion.object.get("type") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(suggestion_type == .array);
+    const expected_suggestion_types = [_][]const u8{ "string", "null" };
+    try std.testing.expectEqual(expected_suggestion_types.len, suggestion_type.array.items.len);
+    for (expected_suggestion_types, suggestion_type.array.items) |expected, actual| {
+        try std.testing.expect(actual == .string);
+        try std.testing.expectEqualStrings(expected, actual.string);
+    }
+}
+
 test "Codex JSONL accepts one exact ordered candidate document" {
     const jsonl =
         \\{"type":"thread.started","thread_id":"t","model":"not-authoritative","tools":[{"type":"function"}],"input":[{"type":"additional_tools"}]}
         \\{"type":"turn.started"}
         \\{"type":"item.completed","item":{"type":"reasoning","text":"hidden"}}
-        \\{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[]}}]}"}}
+        \\{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[{\"start_location\":\"a0001\",\"end_location\":\"a0001\",\"severity\":\"info\",\"title\":\"without suggestion\",\"body\":\"body one\",\"suggestion\":null},{\"start_location\":\"a0002\",\"end_location\":\"a0002\",\"severity\":\"warning\",\"title\":\"with suggestion\",\"body\":\"body two\",\"suggestion\":\"replacement\"}]}}]}"}}
         \\{"type":"turn.completed"}
     ;
     var violation: ?diagnostic.Limit = null;
     var candidates = try decodeJsonl(std.testing.allocator, jsonl, 1, .{}, &violation);
     defer candidates.deinit();
     try std.testing.expectEqual(@as(usize, 1), candidates.payloads.len);
+    try std.testing.expectEqual(@as(usize, 2), candidates.payloads[0].findings.len);
+    try std.testing.expect(candidates.payloads[0].findings[0].suggestion == null);
+    try std.testing.expectEqualStrings("replacement", candidates.payloads[0].findings[1].suggestion.?);
+}
+
+test "Codex JSONL rejects a finding with missing suggestion" {
+    const jsonl =
+        \\{"type":"thread.started","thread_id":"t"}
+        \\{"type":"turn.started"}
+        \\{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[{\"start_location\":\"a0001\",\"end_location\":\"a0001\",\"severity\":\"info\",\"title\":\"title\",\"body\":\"body\"}]}}]}"}}
+        \\{"type":"turn.completed"}
+    ;
+    var violation: ?diagnostic.Limit = null;
+    try std.testing.expectError(error.InvalidOutput, decodeJsonl(std.testing.allocator, jsonl, 1, .{}, &violation));
+    try std.testing.expect(violation == null);
 }
 
 test "Codex bounds its canonical input before process launch" {
@@ -748,7 +837,7 @@ test "Codex JSONL rejects tool events duplicates and unknown handshakes" {
     const invalid_documents = [_][]const u8{
         "{\"schema_version\":2,\"units\":[]}",
         "{\"schema_version\":1,\"units\":[{\"ordinal\":2,\"candidate\":{\"findings\":[]}}]}",
-        "{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[{\"start_location\":\"invalid\",\"end_location\":\"a0001\",\"severity\":\"error\",\"title\":\"SECRET-CODE-SENTINEL\",\"body\":\"body\"}]}}]}",
+        "{\"schema_version\":1,\"units\":[{\"ordinal\":1,\"candidate\":{\"findings\":[{\"start_location\":\"invalid\",\"end_location\":\"a0001\",\"severity\":\"error\",\"title\":\"SECRET-CODE-SENTINEL\",\"body\":\"body\",\"suggestion\":null}]}}]}",
     };
     for (invalid_documents) |document| {
         const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, document, .{});
