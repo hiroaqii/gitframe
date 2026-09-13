@@ -511,7 +511,14 @@ fn selectExactWithArtifactPolicy(
 
 fn immutableArtifactIdentityEql(actual: ArtifactSnapshot, expected: ArtifactSnapshot) bool {
     return actual.manifest_digest.eql(expected.manifest_digest) and
-        actual.findings_digest.eql(expected.findings_digest);
+        actual.findings_digest.eql(expected.findings_digest) and
+        if (actual.run_location) |actual_location|
+            if (expected.run_location) |expected_location|
+                actual_location.eql(expected_location)
+            else
+                false
+        else
+            expected.run_location == null;
 }
 
 pub const ExpectedPublicationIdentity = struct {
@@ -861,6 +868,9 @@ pub fn readExactResult(
 
 pub const PublicationFailure = enum {
     invalid_artifact,
+    target_label_invalid,
+    local_time_unavailable,
+    run_name_collision,
     target_unavailable,
     store_unavailable,
     unsupported_platform,
@@ -1214,9 +1224,9 @@ fn maintenancePublicationFailure(failure: PublicationFailure) MaintenanceFailure
         .store_unavailable => .store_unavailable,
         .unsupported_platform, .unsupported_filesystem => .unsupported,
         .repository_invalid, .main_worktree_unavailable, .repository_name_invalid, .binding_mismatch => .binding_changed,
-        .store_invalid, .invalid_artifact => .run_invalid,
-        .duplicate_review_id, .repository_namespace_collision, .concurrent_conflict => .conflict,
-        .target_unavailable, .git_failed, .io_failed => .io_failed,
+        .store_invalid, .invalid_artifact, .target_label_invalid => .run_invalid,
+        .duplicate_review_id, .repository_namespace_collision, .run_name_collision, .concurrent_conflict => .conflict,
+        .target_unavailable, .local_time_unavailable, .git_failed, .io_failed => .io_failed,
     };
 }
 
@@ -1659,6 +1669,9 @@ fn mapPublicationToReadFailure(failure: PublicationFailure) ReadFailure {
         .binding_mismatch => .binding_invalid,
         .concurrent_conflict => .concurrent_conflict,
         .invalid_artifact => .artifact_invalid,
+        .target_label_invalid => .artifact_invalid,
+        .local_time_unavailable => .io_failed,
+        .run_name_collision => .concurrent_conflict,
         .target_unavailable => .target_unavailable,
         .duplicate_review_id => .io_failed,
     };
@@ -1681,6 +1694,9 @@ fn mapPrepareCoreFailure(failure: core.PrepareBindingFailure) PublicationFailure
 fn mapPublishCoreFailure(failure: core.PublishFailure) PublicationFailure {
     return switch (failure) {
         .invalid_artifact => .invalid_artifact,
+        .target_label_invalid => .target_label_invalid,
+        .local_time_unavailable => .local_time_unavailable,
+        .run_name_collision => .run_name_collision,
         .store_unavailable => .store_unavailable,
         .unsupported_platform => .unsupported_platform,
         .unsupported_filesystem => .unsupported_filesystem,
@@ -2368,7 +2384,8 @@ test "review store deletion service preserves Git and sibling Runs without targe
     defer remaining.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), remaining.catalog.rows.len);
     try std.testing.expect(remaining.catalog.rows[0].review_id.eql(sibling));
-    var other_run = try other_namespace.openDir(io, &prepared.review_id.canonical(), .{});
+    const other_run_name = try testRunDirectoryName(prepared.review_id);
+    var other_run = try other_namespace.openDir(io, other_run_name.slice(), .{});
     other_run.close(io);
     var absent = try catalog_store.readExact(allocator, io, configured.context(), locator, prepared.review_id, null, null);
     defer absent.deinit(allocator);
@@ -2453,7 +2470,8 @@ test "review store maintenance prune scan and sequential delete use a disposable
     try std.testing.expectEqual(try logicalTestRunBytes(io, namespace, malformed_id), malformed_row.logical_bytes);
 
     {
-        var malformed_directory = try namespace.openDir(io, &malformed_id.canonical(), .{});
+        const malformed_name = try testRunDirectoryName(malformed_id);
+        var malformed_directory = try namespace.openDir(io, malformed_name.slice(), .{});
         defer malformed_directory.close(io);
         var retained_draft = try malformed_directory.openFile(io, "review_state.json", .{ .mode = .read_write });
         defer retained_draft.close(io);
@@ -2480,7 +2498,8 @@ test "review store maintenance prune scan and sequential delete use a disposable
     try std.testing.expectEqual(@as(usize, 4), remaining.rows.len);
     for ([_]committed_review.ReviewId{ prepared.review_id, unsafe_id, oversized_id, draft_id }) |id|
         _ = try maintenanceTestRow(remaining, id);
-    var other_run = try other_namespace.openDir(io, &older_id.canonical(), .{});
+    const other_run_name = try testRunDirectoryName(older_id);
+    var other_run = try other_namespace.openDir(io, other_run_name.slice(), .{});
     other_run.close(io);
 }
 
@@ -2490,7 +2509,8 @@ fn maintenanceTestRow(catalog: *const MaintenanceCatalog, id: committed_review.R
 }
 
 fn logicalTestRunBytes(io: std.Io, namespace: std.Io.Dir, id: committed_review.ReviewId) !u64 {
-    var directory = try namespace.openDir(io, &id.canonical(), .{});
+    const directory_name = try testRunDirectoryName(id);
+    var directory = try namespace.openDir(io, directory_name.slice(), .{});
     defer directory.close(io);
     var total: u64 = 0;
     inline for (.{ "manifest.json", "findings.json", "review_state.json", "result.json" }) |name|
@@ -2508,9 +2528,9 @@ fn seedTestRun(
     created_at: []const u8,
     mode: TestRunMode,
 ) !void {
-    const review_text = review_id.canonical();
-    try namespace.createDir(io, &review_text, .fromMode(0o700));
-    var directory = try namespace.openDir(io, &review_text, .{});
+    const directory_name = try testRunDirectoryName(review_id);
+    try namespace.createDir(io, directory_name.slice(), .fromMode(0o700));
+    var directory = try namespace.openDir(io, directory_name.slice(), .{});
     defer directory.close(io);
 
     const producer: committed_review.Producer = .{ .name = "codex", .model = "gpt-test" };
@@ -2596,6 +2616,21 @@ fn seedTestRun(
         },
         .unknown_entry => try writePrivate(io, directory, "unexpected.tmp", "x"),
     }
+    const location_bytes = try run.writeLocationCanonicalAlloc(allocator, .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .directory_name = directory_name,
+    });
+    defer allocator.free(location_bytes);
+    const location_name = store_path.RunLocationName.format(review_id);
+    try writePrivate(io, namespace, location_name.slice(), location_bytes);
+}
+
+fn testRunDirectoryName(review_id: committed_review.ReviewId) !store_name.RunDirectoryName {
+    var storage: [255]u8 = undefined;
+    const review_text = review_id.canonical();
+    const rendered = try std.fmt.bufPrint(&storage, "20260820-0800-main-{s}", .{review_text[0..8]});
+    return store_name.RunDirectoryName.fromStored(rendered, review_id);
 }
 
 fn testSummary(history: *const History, review_id: committed_review.ReviewId) !*const RunSummary {
@@ -2917,8 +2952,13 @@ test "Finding disposition exact reload keeps AI Review Store selection identity 
     try std.testing.expect(absent == .unbound);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(io, missing_store, .{}));
 
-    const valid_text = valid_id.canonical();
-    var valid_directory = try namespace.openDir(io, &valid_text, .{});
+    const valid_location = valid_row.artifact_snapshot.run_location orelse
+        return error.ExpectedRunLocation;
+    var valid_directory = try namespace.openDir(
+        io,
+        valid_location.location.record.directory_name.slice(),
+        .{},
+    );
     defer valid_directory.close(io);
     const changed_result: committed_review.RevisionReviewResult = .{
         .schema_version = 1,

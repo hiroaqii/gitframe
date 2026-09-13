@@ -28,6 +28,9 @@ const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
 const committed_review = @import("../../../committed_review.zig");
 const review_store = @import("../../../review_store.zig");
+const review_store_capability = @import("../../../review_store/capability.zig");
+const review_store_name = @import("../../../review_store/name.zig");
+const review_store_run = @import("../../../review_store/run.zig");
 const ai_reviews_page = @import("../ai_reviews.zig");
 const ai_reviews_coordinator = @import("coordinator.zig");
 const finding_card_view = @import("finding_card_view.zig");
@@ -3175,6 +3178,7 @@ fn findingNavigationPinnedBundle(
             .state = .new,
             .created_at_unix = 0,
             .retained_draft_diagnostic = null,
+            .run_location = try fixtureRunLocation(repository_id, review_id),
         },
         .projection = projection,
         .finding_projection = index,
@@ -3296,11 +3300,52 @@ fn reviewHistoryPinnedBundle(
                 .state = .new,
                 .created_at_unix = 0,
                 .retained_draft_diagnostic = null,
+                .run_location = try fixtureRunLocation(repository_id, review_id),
             },
             .projection = projection,
             .finding_projection = index,
         },
         .diff = .empty,
+    };
+}
+
+fn fixtureRunLocation(
+    repository_id: committed_review.ReviewRepositoryId,
+    review_id: committed_review.ReviewId,
+) !review_store_run.RunLocationSnapshot {
+    const review_text = review_id.canonical();
+    var storage: [255]u8 = undefined;
+    const text = try std.fmt.bufPrint(&storage, "20260820-0000-topic-{s}", .{review_text[0..8]});
+    const directory_name = try review_store_name.RunDirectoryName.fromStored(text, review_id);
+    const location_metadata: review_store_capability.Metadata = .{
+        .kind = .regular_file,
+        .device = 1,
+        .inode = 2,
+        .uid = 3,
+        .mode = 0o600,
+        .link_count = 1,
+        .size = 1,
+    };
+    const run_metadata: review_store_capability.Metadata = .{
+        .kind = .directory,
+        .device = 1,
+        .inode = 4,
+        .uid = 3,
+        .mode = 0o700,
+        .link_count = 1,
+        .size = 1,
+    };
+    return .{
+        .location = .{
+            .record = .{
+                .review_repository_id = repository_id,
+                .review_id = review_id,
+                .directory_name = directory_name,
+            },
+            .metadata = location_metadata,
+            .digest = committed_review.Sha256Digest.hash("fixture location"),
+        },
+        .run_metadata = run_metadata,
     };
 }
 

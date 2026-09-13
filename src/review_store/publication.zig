@@ -140,6 +140,57 @@ const capability = @import("capability.zig");
 const registry = @import("registry.zig");
 const run_artifacts = @import("run.zig");
 
+const TestArtifactPair = struct {
+    manifest_bytes: []u8,
+    findings_bytes: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        repository_id: committed_review.ReviewRepositoryId,
+        review_id: committed_review.ReviewId,
+        target: committed_review.CommittedReviewTarget,
+        created_at: []const u8,
+        display: ?committed_review.DisplayMetadata,
+    ) !TestArtifactPair {
+        const producer: committed_review.Producer = .{
+            .name = "publication-test",
+            .model = "fixture",
+        };
+        const findings: committed_review.FindingSet = .{
+            .schema_version = 1,
+            .review_id = review_id,
+            .created_at = created_at,
+            .timing = .{ .duration_ms = 7 },
+            .target = target,
+            .producer = producer,
+            .findings = &.{},
+        };
+        const findings_bytes = try findings.writeCanonical(allocator);
+        errdefer allocator.free(findings_bytes);
+        const manifest: committed_review.ReviewRunManifest = .{
+            .schema_version = 1,
+            .review_id = review_id,
+            .review_repository_id = repository_id,
+            .target = target,
+            .created_at = created_at,
+            .display = display,
+            .finding_count = 0,
+            .producer = producer,
+            .findings_digest = committed_review.Sha256Digest.hash(findings_bytes),
+        };
+        return .{
+            .manifest_bytes = try manifest.writeCanonical(allocator),
+            .findings_bytes = findings_bytes,
+        };
+    }
+
+    fn deinit(self: *TestArtifactPair, allocator: std.mem.Allocator) void {
+        allocator.free(self.manifest_bytes);
+        allocator.free(self.findings_bytes);
+        self.* = undefined;
+    }
+};
+
 fn runTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !void {
     const result = try std.process.run(std.testing.allocator, io, .{
         .argv = argv,
@@ -360,8 +411,18 @@ test "review run publication preserves exact bytes rejects duplicates and reopen
     defer root.deinit();
     var namespace = try root.directory.openDirectory(identities.repository_directory_name.slice());
     defer namespace.deinit();
-    const review_id_text = identities.review_id.canonical();
-    var run_dir = try namespace.openDirectory(&review_id_text);
+    const location = switch (try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        identities.review_repository_id,
+        identities.review_id,
+        null,
+    )) {
+        .location => |value| value,
+        else => return error.ExpectedPublishedLocation,
+    };
+    var run_dir = try namespace.openDirectory(location.record.directory_name.slice());
     defer run_dir.deinit();
     const stored_manifest = try run_dir.readRegularAlloc(
         allocator,
@@ -393,6 +454,99 @@ test "review run publication preserves exact bytes rejects duplicates and reopen
     try std.testing.expect(loaded == .loaded);
     try std.testing.expectEqualSlices(u8, manifest_bytes, loaded.loaded.manifest_bytes);
     try std.testing.expectEqualSlices(u8, findings_bytes, loaded.loaded.findings_bytes);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        location.record.directory_name.slice(),
+        "-head-",
+    ) != null);
+
+    const first_collision_id = try committed_review.ReviewId.parse(
+        "a23e4567-e89b-42d3-a456-426614174000",
+    );
+    const second_collision_id = try committed_review.ReviewId.parse(
+        "a23e4567-f89b-42d3-a456-426614174000",
+    );
+    var first_collision_artifacts = try TestArtifactPair.init(
+        allocator,
+        identities.review_repository_id,
+        first_collision_id,
+        target,
+        "2026-08-21T03:00:30Z",
+        .{ .base_label = "base", .head_label = "collision" },
+    );
+    defer first_collision_artifacts.deinit(allocator);
+    const first_collision = try publish(allocator, io, &environment, .{
+        .repository_path = repository_path,
+        .review_repository_id = identities.review_repository_id,
+        .review_id = first_collision_id,
+        .manifest_bytes = first_collision_artifacts.manifest_bytes,
+        .findings_bytes = first_collision_artifacts.findings_bytes,
+    });
+    try std.testing.expect(first_collision == .success);
+    var second_collision_artifacts = try TestArtifactPair.init(
+        allocator,
+        identities.review_repository_id,
+        second_collision_id,
+        target,
+        "2026-08-21T03:00:30Z",
+        .{ .base_label = "base", .head_label = "collision" },
+    );
+    defer second_collision_artifacts.deinit(allocator);
+    const second_collision = try publish(allocator, io, &environment, .{
+        .repository_path = repository_path,
+        .review_repository_id = identities.review_repository_id,
+        .review_id = second_collision_id,
+        .manifest_bytes = second_collision_artifacts.manifest_bytes,
+        .findings_bytes = second_collision_artifacts.findings_bytes,
+    });
+    try std.testing.expect(second_collision == .failure);
+    try std.testing.expectEqual(Failure.run_name_collision, second_collision.failure);
+    try std.testing.expect((try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        identities.review_repository_id,
+        first_collision_id,
+        null,
+    )) == .location);
+    try std.testing.expect((try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        identities.review_repository_id,
+        second_collision_id,
+        null,
+    )) == .absent);
+
+    const invalid_label_id = try committed_review.ReviewId.parse(
+        "b23e4567-e89b-42d3-a456-426614174000",
+    );
+    var invalid_label_artifacts = try TestArtifactPair.init(
+        allocator,
+        identities.review_repository_id,
+        invalid_label_id,
+        target,
+        "2026-08-21T03:00:31Z",
+        .{ .base_label = "base", .head_label = "///" },
+    );
+    defer invalid_label_artifacts.deinit(allocator);
+    const invalid_label = try publish(allocator, io, &environment, .{
+        .repository_path = repository_path,
+        .review_repository_id = identities.review_repository_id,
+        .review_id = invalid_label_id,
+        .manifest_bytes = invalid_label_artifacts.manifest_bytes,
+        .findings_bytes = invalid_label_artifacts.findings_bytes,
+    });
+    try std.testing.expect(invalid_label == .failure);
+    try std.testing.expectEqual(Failure.target_label_invalid, invalid_label.failure);
+    try std.testing.expect((try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        identities.review_repository_id,
+        invalid_label_id,
+        null,
+    )) == .absent);
 
     const next_prepared = try prepare(allocator, io, &environment, repository_path);
     const next = switch (next_prepared) {
@@ -408,12 +562,14 @@ test "review run publication preserves exact bytes rejects duplicates and reopen
     });
     try std.testing.expect(mismatched_artifact == .failure);
     try std.testing.expectEqual(Failure.invalid_artifact, mismatched_artifact.failure);
-    const next_id_text = next.review_id.canonical();
-    if (namespace.openDirectory(&next_id_text)) |unexpected| {
-        var owned = unexpected;
-        owned.deinit();
-        return error.UnexpectedInvalidArtifactRun;
-    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
+    try std.testing.expect((try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        next.review_repository_id,
+        next.review_id,
+        null,
+    )) == .absent);
 
     const wrong_repository_id = try committed_review.ReviewRepositoryId.parse(
         "123e4567-e89b-42d3-b456-426614174000",
@@ -456,6 +612,46 @@ test "review run publication preserves exact bytes rejects duplicates and reopen
         owned.deinit();
         return error.UnexpectedMismatchedBindingNamespace;
     } else |err| try std.testing.expectEqual(error.FileNotFound, err);
+
+    var fallback_artifacts = try TestArtifactPair.init(
+        allocator,
+        next.review_repository_id,
+        next.review_id,
+        target,
+        "2026-08-21T03:01:00Z",
+        null,
+    );
+    defer fallback_artifacts.deinit(allocator);
+    const fallback_publication = try publish(allocator, io, &environment, .{
+        .repository_path = repository_path,
+        .review_repository_id = next.review_repository_id,
+        .review_id = next.review_id,
+        .manifest_bytes = fallback_artifacts.manifest_bytes,
+        .findings_bytes = fallback_artifacts.findings_bytes,
+    });
+    try std.testing.expect(fallback_publication == .success);
+    const fallback_location = switch (try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        next.review_repository_id,
+        next.review_id,
+        null,
+    )) {
+        .location => |value| value,
+        else => return error.ExpectedPublishedLocation,
+    };
+    var fallback_needle_storage: [32]u8 = undefined;
+    const fallback_needle = try std.fmt.bufPrint(
+        &fallback_needle_storage,
+        "-commit-{s}-",
+        .{head_text[0..7]},
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fallback_location.record.directory_name.slice(),
+        fallback_needle,
+    ) != null);
 
     const missing_prepared = try prepare(allocator, io, &environment, repository_path);
     const missing = switch (missing_prepared) {
@@ -502,10 +698,12 @@ test "review run publication preserves exact bytes rejects duplicates and reopen
     });
     try std.testing.expect(unavailable == .failure);
     try std.testing.expectEqual(Failure.target_unavailable, unavailable.failure);
-    const missing_id_text = missing.review_id.canonical();
-    if (namespace.openDirectory(&missing_id_text)) |unexpected| {
-        var owned = unexpected;
-        owned.deinit();
-        return error.UnexpectedUnavailableTargetRun;
-    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
+    try std.testing.expect((try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        missing.review_repository_id,
+        missing.review_id,
+        null,
+    )) == .absent);
 }

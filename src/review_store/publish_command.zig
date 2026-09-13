@@ -247,6 +247,9 @@ fn errorOutputAlloc(allocator: std.mem.Allocator, failure: Failure) std.mem.Allo
 fn failureTerminal(failure: store_service.PublicationFailure) Failure {
     return switch (failure) {
         .invalid_artifact => .{ .exit_code = 64, .code = "invalid_artifact", .message = "manifest/findings artifacts are invalid" },
+        .target_label_invalid => .{ .exit_code = 65, .code = "target_label_invalid", .message = "saved target label is invalid" },
+        .local_time_unavailable => .{ .exit_code = 74, .code = "local_time_unavailable", .message = "local calendar time is unavailable" },
+        .run_name_collision => .{ .exit_code = 73, .code = "run_name_collision", .message = "review Run namespace already exists" },
         .target_unavailable => .{ .exit_code = 66, .code = "target_unavailable", .message = "target commit objects are unavailable" },
         .store_unavailable => .{ .exit_code = 69, .code = "store_unavailable", .message = "Review Store is unavailable" },
         .unsupported_platform => .{ .exit_code = 69, .code = "unsupported_platform", .message = "Review Store writer is unsupported on this platform" },
@@ -310,4 +313,25 @@ test "review run publication frame is exact bounded and binary safe" {
     defer invalid_arguments.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 64), invalid_arguments.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, invalid_arguments.bytes, "\"code\":\"invalid_arguments\"") != null);
+}
+
+test "review run publication exposes stable schema-1 naming codes" {
+    const cases = [_]struct {
+        failure: store_service.PublicationFailure,
+        exit_code: u8,
+        code: []const u8,
+    }{
+        .{ .failure = .target_label_invalid, .exit_code = 65, .code = "target_label_invalid" },
+        .{ .failure = .local_time_unavailable, .exit_code = 74, .code = "local_time_unavailable" },
+        .{ .failure = .run_name_collision, .exit_code = 73, .code = "run_name_collision" },
+    };
+    for (cases) |case| {
+        var output = try errorOutputAlloc(std.testing.allocator, failureTerminal(case.failure));
+        defer output.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.exit_code, output.exit_code);
+        try std.testing.expect(std.mem.startsWith(u8, output.bytes, "{\"status\":\"error\",\"schema_version\":1,"));
+        var needle_storage: [96]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_storage, "\"code\":\"{s}\"", .{case.code});
+        try std.testing.expect(std.mem.indexOf(u8, output.bytes, needle) != null);
+    }
 }

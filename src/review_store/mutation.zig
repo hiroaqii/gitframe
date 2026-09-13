@@ -11,6 +11,7 @@ const durable = @import("../fs/durable.zig");
 const capability = @import("capability.zig");
 const registry = @import("registry.zig");
 const run_artifacts = @import("run.zig");
+const store_name = @import("name.zig");
 const store_path = @import("path.zig");
 
 pub const Failure = enum { conflict, draft_required, already_completed, binding_changed, run_invalid, clock_unavailable, unsupported, io_failed };
@@ -177,9 +178,11 @@ fn saveDraftWith(allocator: std.mem.Allocator, io: std.Io, store_root: []const u
     defer if (bytes_owned) allocator.free(bytes);
 
     writeMutationFile(
+        allocator,
         io,
         run.namespace,
         run.run,
+        run.loaded.run_location,
         request.binding.review_id,
         .draft,
         "review_state.json",
@@ -252,9 +255,11 @@ fn createResultWith(allocator: std.mem.Allocator, io: std.Io, store_root: []cons
     defer if (bytes_owned) allocator.free(bytes);
 
     writeMutationFile(
+        allocator,
         io,
         run.namespace,
         run.run,
+        run.loaded.run_location,
         request.binding.review_id,
         .result,
         "result.json",
@@ -355,8 +360,18 @@ fn openLockedRun(
         return .{ .failure = mapBindingOpenError(err) };
     var namespace_owned = true;
     defer if (namespace_owned) namespace.deinit();
-    const review_text = binding.review_id.canonical();
-    var run = namespace.openDirectory(&review_text) catch |err|
+    const location = switch (try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        binding.review_repository_id,
+        binding.review_id,
+        null,
+    )) {
+        .location => |value| value,
+        .absent, .invalid => return .{ .failure = .run_invalid },
+    };
+    var run = namespace.openDirectory(location.record.directory_name.slice()) catch |err|
         return .{ .failure = mapBindingOpenError(err) };
     var run_owned = true;
     defer if (run_owned) run.deinit();
@@ -366,13 +381,16 @@ fn openLockedRun(
         .loaded => |value| value,
         .invalid => return .{ .failure = .run_invalid },
     };
-    var current_run = namespace.openDirectory(&review_text) catch |err| {
+    var current_run = namespace.openDirectory(location.record.directory_name.slice()) catch |err| {
         var owned = loaded;
         owned.deinit(allocator);
         return .{ .failure = mapBindingOpenError(err) };
     };
     defer current_run.deinit();
-    if (!current_run.metadata.sameObject(run.metadata)) {
+    if (!loaded.run_location.location.eql(location) or
+        !loaded.run_location.run_metadata.sameObject(run.metadata) or
+        !current_run.metadata.sameObject(run.metadata))
+    {
         var owned = loaded;
         owned.deinit(allocator);
         return .{ .failure = .binding_changed };
@@ -416,9 +434,11 @@ fn reopenRun(
 const RenameMode = enum { replace, no_replace };
 
 fn writeMutationFile(
+    allocator: std.mem.Allocator,
     io: std.Io,
     namespace: capability.DirectoryCapability,
     run: capability.DirectoryCapability,
+    expected_location: run_artifacts.RunLocationSnapshot,
     review_id: committed_review.ReviewId,
     kind: store_path.NamespaceTempKind,
     final_name: []const u8,
@@ -456,6 +476,7 @@ fn writeMutationFile(
     try completedVoid(durable.writeAll(io, file, bytes, observer));
     try completedVoid(durable.syncFile(io, file, observer));
     try completedVoid(capability.syncDirectory(io, namespace, observer));
+    try validateRunLocation(allocator, io, namespace, expected_location);
     const moved = switch (rename_mode) {
         .replace => capability.moveReplacing(io, namespace, temp_name, run, final_name, observer),
         .no_replace => capability.movePreserving(io, namespace, temp_name, run, final_name, observer),
@@ -469,6 +490,32 @@ fn writeMutationFile(
     }
     try completedVoid(capability.syncDirectory(io, run, observer));
     try completedVoid(capability.syncDirectory(io, namespace, observer));
+    try validateRunLocation(allocator, io, namespace, expected_location);
+}
+
+fn validateRunLocation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    expected: run_artifacts.RunLocationSnapshot,
+) !void {
+    const current_location = switch (try run_artifacts.readLocation(
+        allocator,
+        io,
+        namespace,
+        expected.location.record.review_repository_id,
+        expected.location.record.review_id,
+        null,
+    )) {
+        .location => |value| value,
+        .absent, .invalid => return error.Conflict,
+    };
+    if (!current_location.eql(expected.location)) return error.Conflict;
+    const current_run = namespace.admitChild(
+        expected.location.record.directory_name.slice(),
+        .directory,
+    ) catch return error.Conflict;
+    if (!current_run.sameObject(expected.run_metadata)) return error.Conflict;
 }
 
 fn cleanupOwnTemp(io: std.Io, namespace: capability.DirectoryCapability, name: []const u8) void {
@@ -525,6 +572,7 @@ fn mapBindingOpenError(err: anyerror) Failure {
 }
 
 fn mapMutationError(err: anyerror) Failure {
+    if (err == error.Conflict) return .conflict;
     if (err == error.UnsupportedPlatform or
         err == error.UnsupportedFilesystem or
         err == error.OperationUnsupported) return .unsupported;
@@ -894,8 +942,15 @@ const TestFixture = struct {
         var namespace = try store.openDir(io, "repository-123e4567", .{});
         errdefer namespace.close(io);
         const review_text = review_id.canonical();
-        try namespace.createDir(io, &review_text, .fromMode(0o700));
-        var run = try namespace.openDir(io, &review_text, .{});
+        var run_name_storage: [255]u8 = undefined;
+        const run_name_text = try std.fmt.bufPrint(
+            &run_name_storage,
+            "20260821-0000-commit-0123456-{s}",
+            .{review_text[0..8]},
+        );
+        const run_name = try store_name.RunDirectoryName.fromStored(run_name_text, review_id);
+        try namespace.createDir(io, run_name.slice(), .fromMode(0o700));
+        var run = try namespace.openDir(io, run_name.slice(), .{});
         errdefer run.close(io);
 
         const finding_set: committed_review.FindingSet = .{
@@ -924,6 +979,14 @@ const TestFixture = struct {
         defer allocator.free(manifest_bytes);
         try writePrivate(io, run, "manifest.json", manifest_bytes);
         try writePrivate(io, run, "findings.json", findings_bytes);
+        const location_bytes = try run_artifacts.writeLocationCanonicalAlloc(allocator, .{
+            .review_repository_id = repository_id,
+            .review_id = review_id,
+            .directory_name = run_name,
+        });
+        defer allocator.free(location_bytes);
+        const location_name = store_path.RunLocationName.format(review_id);
+        try writePrivate(io, namespace, location_name.slice(), location_bytes);
 
         const path = try parent.realPathFileAlloc(io, name, allocator);
         errdefer allocator.free(path);

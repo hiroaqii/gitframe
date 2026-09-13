@@ -3557,12 +3557,18 @@ const HumanReviewStoreFixture = struct {
         try store.createDir(io, "repository-123e4567", .fromMode(0o700));
         var namespace = try store.openDir(io, "repository-123e4567", .{});
         defer namespace.close(io);
-        const review_text = review_id.canonical();
-        try namespace.createDir(io, &review_text, .fromMode(0o700));
-        var run = try namespace.openDir(io, &review_text, .{});
+        const run_directory_name = "20260828-0000-test-223e4567";
+        try namespace.createDir(io, run_directory_name, .fromMode(0o700));
+        var run = try namespace.openDir(io, run_directory_name, .{});
         defer run.close(io);
         try writeHumanReviewFixtureFile(io, run, "manifest.json", manifest_bytes);
         try writeHumanReviewFixtureFile(io, run, "findings.json", findings_bytes);
+        try writeHumanReviewFixtureFile(
+            io,
+            namespace,
+            ".run-223e4567-e89b-42d3-a456-426614174000",
+            "{\"schema_version\":1,\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"review_id\":\"223e4567-e89b-42d3-a456-426614174000\",\"directory_name\":\"20260828-0000-test-223e4567\"}\n",
+        );
         try writeHumanReviewFixtureFile(
             io,
             store,

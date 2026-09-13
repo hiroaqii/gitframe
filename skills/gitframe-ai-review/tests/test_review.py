@@ -79,6 +79,10 @@ elif name=="review-producer artifacts":
  sys.stdout.buffer.write(enc(out)+manifest+findings)
 elif name=="review-store-publish":
  data=sys.stdin.buffer.read(); header=json.loads(data.split(b"\n",1)[0]); path=os.path.join(os.environ["FAKE_STORE"],header["review_id"])
+ publish_error=os.environ.get("FAKE_PUBLISH_ERROR")
+ if publish_error:
+  exits={"target_label_invalid":65,"local_time_unavailable":74,"run_name_collision":73}
+  sys.stdout.buffer.write(enc({"status":"error","schema_version":1,"code":publish_error,"message":"publication naming failed"}));sys.exit(exits[publish_error])
  try:
   fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
   with os.fdopen(fd,"wb") as f: f.write(data)
@@ -458,6 +462,22 @@ class DriverTests(unittest.TestCase):
             {"artifact": "manifest", "display": DISPLAY})
         self.assertEqual(self.events().count("review-producer artifacts"), 1)
         self.assertEqual(self.events().count("review-store-publish"), 1)
+
+    def test_publication_naming_failures_are_preserved_without_retry(self):
+        for code in ("target_label_invalid", "local_time_unavailable", "run_name_collision"):
+            with self.subTest(code=code):
+                self.log.unlink(missing_ok=True)
+                _, handoff = self.start()
+                workspace = Path(handoff["workspace"])
+                self.candidate(handoff)
+                completed, result = self.invoke("complete", "--workspace", str(workspace),
+                    "--workspace-nonce", handoff["workspace_nonce"],
+                    extra={"FAKE_PUBLISH_ERROR": code})
+                self.assertEqual((completed.returncode, result["status"], result["error"]["code"]),
+                    (1, "rejected", code))
+                self.assertEqual(self.events().count("review-store-publish"), 1)
+                self.assertFalse(workspace.exists())
+                self.assertFalse((self.store / handoff["review_id"]).exists())
 
     def test_nullable_display_is_omitted_or_forwarded_without_repair(self):
         cases = {

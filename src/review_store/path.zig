@@ -92,7 +92,31 @@ pub fn validateAbsoluteCanonical(value: []const u8) PathError!void {
     }
 }
 
-pub const NamespaceTempKind = enum { publish, draft, result };
+pub const NamespaceTempKind = enum { publish, location, draft, result };
+
+/// Direct, full-ID key for one immutable Run location record.
+pub const RunLocationName = struct {
+    bytes: [41]u8,
+
+    pub fn format(review_id: committed_review.ReviewId) RunLocationName {
+        var result: RunLocationName = undefined;
+        @memcpy(result.bytes[0..5], ".run-");
+        const id = review_id.canonical();
+        @memcpy(result.bytes[5..], &id);
+        return result;
+    }
+
+    pub fn parse(raw: []const u8) error{InvalidRunLocationName}!committed_review.ReviewId {
+        if (raw.len != 41 or !std.mem.startsWith(u8, raw, ".run-")) {
+            return error.InvalidRunLocationName;
+        }
+        return committed_review.ReviewId.parse(raw[5..]) catch error.InvalidRunLocationName;
+    }
+
+    pub fn slice(self: *const RunLocationName) []const u8 {
+        return &self.bytes;
+    }
+};
 
 /// Exact repository-namespace sibling staging name shared by every later writer.
 pub const NamespaceTempName = struct {
@@ -100,7 +124,7 @@ pub const NamespaceTempName = struct {
     review_id: committed_review.ReviewId,
     token: [16]u8,
 
-    pub const max_name_bytes: usize = 82;
+    pub const max_name_bytes: usize = 83;
 
     pub const Formatted = struct {
         bytes: [max_name_bytes]u8 = undefined,
@@ -154,6 +178,7 @@ const PrefixMatch = struct { prefix: []const u8, kind: NamespaceTempKind };
 fn prefixKind(name: []const u8) ?PrefixMatch {
     inline for (.{
         PrefixMatch{ .prefix = ".tmp-publish-", .kind = .publish },
+        PrefixMatch{ .prefix = ".tmp-location-", .kind = .location },
         PrefixMatch{ .prefix = ".tmp-draft-", .kind = .draft },
         PrefixMatch{ .prefix = ".tmp-result-", .kind = .result },
     }) |candidate| {
@@ -165,6 +190,7 @@ fn prefixKind(name: []const u8) ?PrefixMatch {
 fn kindPrefix(kind: NamespaceTempKind) []const u8 {
     return switch (kind) {
         .publish => ".tmp-publish-",
+        .location => ".tmp-location-",
         .draft => ".tmp-draft-",
         .result => ".tmp-result-",
     };
@@ -241,7 +267,7 @@ test "review history backend canonical Store paths reject expansion and aliases"
 test "review history backend NamespaceTempName has one exact shared grammar" {
     const review_id = try committed_review.ReviewId.parse("123e4567-e89b-42d3-a456-426614174000");
     const token = [_]u8{0xab} ** 16;
-    inline for (.{ NamespaceTempKind.publish, .draft, .result }) |kind| {
+    inline for (.{ NamespaceTempKind.publish, .location, .draft, .result }) |kind| {
         const value: NamespaceTempName = .{ .kind = kind, .review_id = review_id, .token = token };
         const formatted = value.format();
         const parsed = try NamespaceTempName.parse(formatted.slice());
@@ -256,4 +282,12 @@ test "review history backend NamespaceTempName has one exact shared grammar" {
         ".tmp-draft-123e4567-e89b-42d3-a456-426614174000-abab",
     };
     for (invalid) |name| try std.testing.expectError(error.InvalidNamespaceTempName, NamespaceTempName.parse(name));
+}
+
+test "review run location key is exactly the complete canonical UUID" {
+    const review_id = try committed_review.ReviewId.parse("123e4567-e89b-42d3-a456-426614174000");
+    const name = RunLocationName.format(review_id);
+    try std.testing.expectEqualStrings(".run-123e4567-e89b-42d3-a456-426614174000", name.slice());
+    try std.testing.expect((try RunLocationName.parse(name.slice())).eql(review_id));
+    try std.testing.expectError(error.InvalidRunLocationName, RunLocationName.parse("123e4567-e89b-42d3-a456-426614174000"));
 }

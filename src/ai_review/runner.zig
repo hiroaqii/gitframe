@@ -464,6 +464,9 @@ fn storeCause(failure: store_service.PublicationFailure) diagnostic.StoreCause {
         .main_worktree_unavailable => .main_worktree_unavailable,
         .repository_name_invalid => .repository_name_invalid,
         .repository_namespace_collision => .repository_namespace_collision,
+        .target_label_invalid => .target_label_invalid,
+        .local_time_unavailable => .local_time_unavailable,
+        .run_name_collision => .run_name_collision,
         .git_failed => .git_failed,
         .io_failed => .io_failed,
         .binding_mismatch => .binding_mismatch,
@@ -511,7 +514,7 @@ test "ReviewPipeline terminal taxonomy keeps prepublication and exact-ID uncerta
 }
 
 test "ReviewPipeline maps typed Store failures without inventing OS detail" {
-    for ([_]store_service.PublicationFailure{ .store_unavailable, .target_unavailable, .io_failed, .main_worktree_unavailable, .repository_name_invalid, .repository_namespace_collision }) |failure| {
+    for ([_]store_service.PublicationFailure{ .store_unavailable, .target_unavailable, .io_failed, .main_worktree_unavailable, .repository_name_invalid, .repository_namespace_collision, .target_label_invalid, .local_time_unavailable, .run_name_collision }) |failure| {
         const terminal = publicationFailureTerminal(failure, .private_root_residue);
         try std.testing.expectEqual(storeCause(failure), terminal.outcome.failed.publish_failed);
         try std.testing.expectEqual(CleanupWarning.private_root_residue, terminal.cleanup_warning.?);

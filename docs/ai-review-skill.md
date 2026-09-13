@@ -104,6 +104,13 @@ canonical invocation position. It forwards the unchanged non-null labels
 immediately after `producer` in the producer header and does not repair a
 corrupt value.
 
+On success, the Store keeps the complete Review ID as lookup authority through
+`.run-<review-id>` and saves a readable creation-time folder name. The helper
+does not construct, scan for, or later recompute that folder. Naming rejections
+such as `target_label_invalid`, `local_time_unavailable`, and
+`run_name_collision` are returned as `rejected` with the exact stable code and
+are never retried or repaired.
+
 Read a human decision later with the same installed package and one exact
 Review ID:
 

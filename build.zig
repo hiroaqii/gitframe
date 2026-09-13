@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(
         usize,
         "expected_package_root_test_count",
-        if (!provider_enabled and test_filters.len == 0) 2249 else 0,
+        if (!provider_enabled and test_filters.len == 0) 2258 else 0,
     );
 
     const mod = mod: {
@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
             .none => break :mod b.addModule("gitframe", .{
                 .root_source_file = b.path("src/root.zig"),
                 .target = target,
+                .link_libc = target.result.os.tag == .linux or target.result.os.tag == .macos,
                 .imports = &base_imports,
             }),
             .flow_syntax => {
@@ -90,6 +91,7 @@ pub fn build(b: *std.Build) void {
                 break :mod b.addModule("gitframe", .{
                     .root_source_file = b.path("src/root.zig"),
                     .target = target,
+                    .link_libc = target.result.os.tag == .linux or target.result.os.tag == .macos,
                     .imports = &flow_imports,
                 });
             },
@@ -108,6 +110,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
             },
         }),
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     configureFlowSyntaxArtifact(exe, target, provider_enabled);
     b.installArtifact(exe);
@@ -123,6 +127,8 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
         .filters = test_filters,
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     configureFlowSyntaxArtifact(mod_tests, target, provider_enabled);
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -132,6 +138,8 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
         .filters = test_filters,
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     configureFlowSyntaxArtifact(exe_tests, target, provider_enabled);
     const run_exe_tests = b.addRunArtifact(exe_tests);

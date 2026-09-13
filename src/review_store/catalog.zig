@@ -19,6 +19,22 @@ pub const max_enumerated_name_bytes: usize = 256 * 1024;
 pub const max_diagnostics: usize = 8;
 pub const max_diagnostic_bytes: usize = 256;
 
+const CandidateName = struct {
+    bytes: [store_name.max_component_bytes]u8 = undefined,
+    len: u8,
+
+    fn init(raw: []const u8) CandidateName {
+        std.debug.assert(raw.len <= store_name.max_component_bytes);
+        var result: CandidateName = .{ .len = @intCast(raw.len) };
+        @memcpy(result.bytes[0..raw.len], raw);
+        return result;
+    }
+
+    fn slice(self: *const CandidateName) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 pub const StoreSnapshot = struct {
     root_device: u64,
     root_inode: u64,
@@ -170,8 +186,10 @@ pub fn scan(
     };
     defer namespace.deinit();
 
-    var candidates: std.ArrayList(committed_review.ReviewId) = .empty;
+    var candidates: std.ArrayList(CandidateName) = .empty;
     defer candidates.deinit(allocator);
+    var location_ids: std.ArrayList(committed_review.ReviewId) = .empty;
+    defer location_ids.deinit(allocator);
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer deinitDiagnostics(allocator, &diagnostics);
     var entry_count: usize = 0;
@@ -186,11 +204,22 @@ pub fn scan(
         if (entry_count > max_namespace_entries or name_bytes > max_enumerated_name_bytes) {
             return .{ .failure = .scan_limit_exceeded };
         }
-        if (committed_review.ReviewId.parse(entry.name)) |review_id| {
+        if (store_path.RunLocationName.parse(entry.name)) |location_id| {
+            _ = namespace.admitChild(entry.name, .regular_file) catch {
+                skipped_count += 1;
+                try appendDiagnostic(allocator, &diagnostics, .unsafe_or_unknown_entry, entry.name);
+                continue;
+            };
+            if (location_ids.items.len == max_run_candidates) return .{ .failure = .scan_limit_exceeded };
+            try location_ids.append(allocator, location_id);
+            continue;
+        } else |_| {}
+
+        if (store_name.RunDirectoryName.admitCandidate(entry.name)) {
             if (candidates.items.len == max_run_candidates) {
                 return .{ .failure = .scan_limit_exceeded };
             }
-            try candidates.append(allocator, review_id);
+            try candidates.append(allocator, CandidateName.init(entry.name));
             continue;
         } else |_| {}
 
@@ -210,17 +239,19 @@ pub fn scan(
     }
     if (entry_count == 0) return .{ .bound_empty = .{ .snapshot = snapshot } };
 
-    std.mem.sort(committed_review.ReviewId, candidates.items, {}, reviewIdLessThan);
+    std.mem.sort(committed_review.ReviewId, location_ids.items, {}, reviewIdLessThan);
+    std.mem.sort(CandidateName, candidates.items, {}, candidateNameLessThan);
+
     var rows: std.ArrayList(CatalogRow) = .empty;
     defer deinitRows(allocator, &rows);
     var artifact_budget: run.ArtifactBudget = .{};
-    for (candidates.items) |review_id| {
+    for (location_ids.items) |location_id| {
         var loaded_result = try run.loadValidated(
             allocator,
             io,
             namespace,
             repository_id,
-            review_id,
+            location_id,
             &artifact_budget,
         );
         defer loaded_result.deinit(allocator);
@@ -235,7 +266,7 @@ pub fn scan(
                     return err;
                 };
                 if (loaded.retained_draft_diagnostic != null) {
-                    const text = review_id.canonical();
+                    const text = location_id.canonical();
                     try appendDiagnostic(allocator, &diagnostics, .retained_draft_invalid, &text);
                 }
             },
@@ -244,10 +275,16 @@ pub fn scan(
                     return .{ .failure = .scan_limit_exceeded };
                 }
                 skipped_count += 1;
-                const text = review_id.canonical();
-                try appendDiagnostic(allocator, &diagnostics, .invalid_run, &text);
+                const location_name = store_path.RunLocationName.format(location_id);
+                try appendDiagnostic(allocator, &diagnostics, .invalid_run, location_name.slice());
             },
         }
+    }
+    std.mem.sort(CatalogRow, rows.items, {}, rowReviewIdLessThan);
+    for (candidates.items) |candidate| {
+        if (containsActualName(rows.items, candidate.slice())) continue;
+        skipped_count += 1;
+        try appendDiagnostic(allocator, &diagnostics, .invalid_run, candidate.slice());
     }
 
     const owned_rows = try rows.toOwnedSlice(allocator);
@@ -267,6 +304,14 @@ pub fn scan(
         .skipped_count = skipped_count,
         .orphan_count = orphan_count,
     } };
+}
+
+fn containsActualName(rows: []const CatalogRow, actual_name: []const u8) bool {
+    for (rows) |*row| {
+        const location = row.artifact_snapshot.run_location orelse continue;
+        if (std.mem.eql(u8, location.location.record.directory_name.slice(), actual_name)) return true;
+    }
+    return false;
 }
 
 pub const ReadFailure = enum {
@@ -403,15 +448,20 @@ fn readExactWithHook(
             classifyAccess(err, ReadFailure.namespace_invalid) };
     };
     defer namespace.deinit();
-    const review_text = review_id.canonical();
-    _ = namespace.admitChild(&review_text, .directory) catch |err| {
-        return if (err == error.FileNotFound)
-            if (expected_store == null) .absent else .{ .failure = .artifact_changed }
-        else
-            .{ .failure = classifyAccess(err, ReadFailure.artifact_invalid) };
-    };
-
     var budget: run.ArtifactBudget = .{};
+    const location_result = try run.readLocation(
+        allocator,
+        io,
+        namespace,
+        repository_id,
+        review_id,
+        null,
+    );
+    switch (location_result) {
+        .absent => return if (expected_store == null) .absent else .{ .failure = .artifact_changed },
+        .invalid => |reason| return .{ .failure = loadFailure(reason) },
+        .location => {},
+    }
     var loaded_result = try run.loadValidated(
         allocator,
         io,
@@ -650,6 +700,16 @@ fn statusFromLoaded(loaded: *const run.LoadedRunArtifacts) RunStatus {
     };
 }
 
+fn rowReviewIdLessThan(_: void, left: CatalogRow, right: CatalogRow) bool {
+    const left_text = left.review_id.canonical();
+    const right_text = right.review_id.canonical();
+    return std.mem.lessThan(u8, &left_text, &right_text);
+}
+
+fn candidateNameLessThan(_: void, left: CandidateName, right: CandidateName) bool {
+    return std.mem.lessThan(u8, left.slice(), right.slice());
+}
+
 fn reviewIdLessThan(_: void, left: committed_review.ReviewId, right: committed_review.ReviewId) bool {
     const left_text = left.canonical();
     const right_text = right.canonical();
@@ -719,6 +779,11 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
     const registry_bytes = try registry.writeCanonicalAlloc(allocator, &bindings);
     defer allocator.free(registry_bytes);
     try writePrivate(io, store, "registry.json", registry_bytes);
+    try store.createDir(io, ".locks", .fromMode(0o700));
+    var locks = try store.openDir(io, ".locks", .{});
+    defer locks.close(io);
+    const repository_text = repository_id.canonical();
+    try locks.createDir(io, &repository_text, .fromMode(0o700));
     try store.createDir(io, repository_directory_name, .fromMode(0o700));
     var namespace = try store.openDir(io, repository_directory_name, .{});
     defer namespace.close(io);
@@ -737,11 +802,13 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
     const invalid_draft_id = try committed_review.ReviewId.parse("523e4567-e89b-42d3-a456-426614174000");
     const invalid_result_id = try committed_review.ReviewId.parse("623e4567-e89b-42d3-a456-426614174000");
     const absent_id = try committed_review.ReviewId.parse("723e4567-e89b-42d3-a456-426614174000");
+    const overflow_lifecycle_id = try committed_review.ReviewId.parse("823e4567-e89b-42d3-a456-426614174000");
     try seedTestRun(allocator, io, namespace, repository_id, new_id, target, "2026-08-24T00:00:00Z", .new);
     try seedTestRun(allocator, io, namespace, repository_id, draft_id, target, "2026-08-24T00:01:00Z", .draft);
     try seedTestRun(allocator, io, namespace, repository_id, result_id, target, "2026-08-24T00:02:00Z", .result_with_invalid_retained_draft);
     try seedTestRun(allocator, io, namespace, repository_id, invalid_draft_id, target, "2026-08-24T00:03:00Z", .invalid_active_draft);
     try seedTestRun(allocator, io, namespace, repository_id, invalid_result_id, target, "2026-08-24T00:04:00Z", .invalid_result);
+    try seedTestRun(allocator, io, namespace, repository_id, overflow_lifecycle_id, target, "2026-08-24T00:05:00Z", .new);
 
     for (0..max_namespace_entries + 1) |index| {
         var name_buffer: [48]u8 = undefined;
@@ -751,6 +818,68 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
 
     var context = try core.Context.initConfigured(allocator, store_root);
     defer context.deinit(allocator);
+    var overflow_exact = try readExact(
+        allocator,
+        io,
+        &context,
+        locator,
+        overflow_lifecycle_id,
+        null,
+        null,
+    );
+    defer overflow_exact.deinit(allocator);
+    const overflow_run = switch (overflow_exact) {
+        .exact => |*value| value,
+        else => return error.ExpectedExactReviewRun,
+    };
+    var overflow_draft = try core.saveDraft(allocator, io, &context, .{
+        .binding = .{
+            .review_repository_id = repository_id,
+            .review_id = overflow_lifecycle_id,
+            .target = target,
+            .findings_digest = overflow_run.artifacts.manifest.value.findings_digest,
+        },
+        .expected_revision = 0,
+        .summary = "direct beyond scan limit",
+        .finding_dispositions = &.{},
+        .anchored_notes = &.{},
+    });
+    defer overflow_draft.deinit(allocator);
+    try std.testing.expect(overflow_draft == .committed);
+    var drafted_exact = try readExact(
+        allocator,
+        io,
+        &context,
+        locator,
+        overflow_lifecycle_id,
+        null,
+        null,
+    );
+    defer drafted_exact.deinit(allocator);
+    try std.testing.expectEqual(
+        committed_review.ReviewRunState.draft,
+        drafted_exact.exact.artifacts.state,
+    );
+    const deleted = try core.deleteRun(allocator, io, &context, .{
+        .store = drafted_exact.exact.snapshot,
+        .review_id = overflow_lifecycle_id,
+        .artifacts = drafted_exact.exact.artifact_snapshot,
+        .allow_unfinished = true,
+    });
+    try std.testing.expect(deleted == .deleted);
+    try std.testing.expect(deleted.deleted == .complete);
+    var deleted_exact = try readExact(
+        allocator,
+        io,
+        &context,
+        locator,
+        overflow_lifecycle_id,
+        null,
+        null,
+    );
+    defer deleted_exact.deinit(allocator);
+    try std.testing.expect(deleted_exact == .absent);
+
     var exact_result = try readExact(allocator, io, &context, locator, result_id, null, null);
     defer exact_result.deinit(allocator);
     const exact = switch (exact_result) {
@@ -872,7 +1001,8 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
             expected_store.repository_directory_name,
         )).?);
     }
-    var selected_dir = try namespace.openDir(io, &result_id.canonical(), .{});
+    const result_directory_name = try testRunDirectoryName(result_id);
+    var selected_dir = try namespace.openDir(io, result_directory_name.slice(), .{});
     defer selected_dir.close(io);
     var manifest_file = try selected_dir.openFile(io, "manifest.json", .{ .mode = .read_write });
     defer manifest_file.close(io);
@@ -916,20 +1046,25 @@ test "review store exact read closes post-admission replacements as concurrent c
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) {
         return error.SkipZigTest;
     }
-    inline for (.{ PostAdmissionReplacement.root, .binding, .artifact }) |replacement| {
+    inline for (.{ PostAdmissionReplacement.root, .binding, .location, .run_directory, .artifact }) |replacement| {
         try expectPostAdmissionConflict(replacement);
     }
 }
 
-const PostAdmissionReplacement = enum { root, binding, artifact };
+const PostAdmissionReplacement = enum { root, binding, location, run_directory, artifact };
 
 const RaceHookState = struct {
     io: std.Io,
     parent: std.Io.Dir,
     store: std.Io.Dir,
+    namespace: std.Io.Dir,
     run_directory: std.Io.Dir,
     replacement: PostAdmissionReplacement,
     replacement_registry: []const u8,
+    location_name: []const u8,
+    replacement_location: []const u8,
+    run_name: []const u8,
+    replacement_run_name: []const u8,
     replacement_manifest: []const u8,
     replacement_findings: []const u8,
     failure: ?anyerror = null,
@@ -952,6 +1087,18 @@ const RaceHookState = struct {
                 self.store,
                 "registry.json",
                 self.replacement_registry,
+            ),
+            .location => try writePrivate(
+                self.io,
+                self.namespace,
+                self.location_name,
+                self.replacement_location,
+            ),
+            .run_directory => try self.namespace.rename(
+                self.run_name,
+                self.namespace,
+                self.replacement_run_name,
+                self.io,
             ),
             .artifact => {
                 try writePrivate(
@@ -1042,9 +1189,20 @@ fn expectPostAdmissionConflict(replacement: PostAdmissionReplacement) !void {
         "2026-08-24T00:00:00Z",
         .new,
     );
-    const review_text = review_id.canonical();
-    var run_directory = try namespace.openDir(io, &review_text, .{});
+    const run_directory_name = try testRunDirectoryName(review_id);
+    var run_directory = try namespace.openDir(io, run_directory_name.slice(), .{});
     defer run_directory.close(io);
+    const replacement_directory_name = try store_name.RunDirectoryName.fromStored(
+        "20260824-0001-main-323e4567",
+        review_id,
+    );
+    const replacement_location = try run.writeLocationCanonicalAlloc(allocator, .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .directory_name = replacement_directory_name,
+    });
+    defer allocator.free(replacement_location);
+    const location_name = store_path.RunLocationName.format(review_id);
 
     const producer: committed_review.Producer = .{
         .name = "codex",
@@ -1081,9 +1239,14 @@ fn expectPostAdmissionConflict(replacement: PostAdmissionReplacement) !void {
         .io = io,
         .parent = tmp.dir,
         .store = store,
+        .namespace = namespace,
         .run_directory = run_directory,
         .replacement = replacement,
         .replacement_registry = replacement_registry,
+        .location_name = location_name.slice(),
+        .replacement_location = replacement_location,
+        .run_name = run_directory_name.slice(),
+        .replacement_run_name = "20260824-0002-main-323e4567",
         .replacement_manifest = replacement_manifest,
         .replacement_findings = replacement_findings,
     };
@@ -1130,9 +1293,9 @@ fn seedTestRun(
     created_at: []const u8,
     mode: TestRunMode,
 ) !void {
-    const review_text = review_id.canonical();
-    try namespace.createDir(io, &review_text, .fromMode(0o700));
-    var directory = try namespace.openDir(io, &review_text, .{});
+    const directory_name = try testRunDirectoryName(review_id);
+    try namespace.createDir(io, directory_name.slice(), .fromMode(0o700));
+    var directory = try namespace.openDir(io, directory_name.slice(), .{});
     defer directory.close(io);
 
     const producer: committed_review.Producer = .{
@@ -1205,4 +1368,19 @@ fn seedTestRun(
         .invalid_active_draft => try writePrivate(io, directory, "review_state.json", "{}\n"),
         .invalid_result => try writePrivate(io, directory, "result.json", "{}\n"),
     }
+    const location_bytes = try run.writeLocationCanonicalAlloc(allocator, .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .directory_name = directory_name,
+    });
+    defer allocator.free(location_bytes);
+    const location_name = store_path.RunLocationName.format(review_id);
+    try writePrivate(io, namespace, location_name.slice(), location_bytes);
+}
+
+fn testRunDirectoryName(review_id: committed_review.ReviewId) !store_name.RunDirectoryName {
+    const review_text = review_id.canonical();
+    var storage: [255]u8 = undefined;
+    const text = try std.fmt.bufPrint(&storage, "20260824-0000-main-{s}", .{review_text[0..8]});
+    return store_name.RunDirectoryName.fromStored(text, review_id);
 }

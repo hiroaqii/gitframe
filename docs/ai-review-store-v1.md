@@ -37,9 +37,11 @@ The resolver performs no filesystem call. It rejects `/`, relative paths, `~`, e
   registry.json                               0600, link count 1
   <repository-display-name>-<repository-id-first-8>/  0700
     .tmp-publish-<review-id>-<32 lower hex>/  0700 inert staging evidence
+    .tmp-location-<review-id>-<32 lower hex>   0600, link count 1
     .tmp-draft-<review-id>-<32 lower hex>      0600, link count 1
     .tmp-result-<review-id>-<32 lower hex>     0600, link count 1
-    <review-id>/                              0700
+    .run-<complete-review-id>                  0600, immutable location record
+    YYYYMMDD-HHMM-<target-label>-<review-id-first-8>/  0700
       manifest.json                           0600, link count 1
       findings.json                           0600, link count 1
       review_state.json                       0600, link count 1, optional
@@ -52,7 +54,7 @@ Linux admits only an explicit local filesystem allowlist (ext family, XFS, Btrfs
 
 ## Namespace staging grammar
 
-`NamespaceTempName` is the only shared parser/formatter for future publication and mutation staging. It accepts exactly one of `publish`, `draft`, or `result`, one lowercase canonical UUIDv4, and exactly 32 lowercase hexadecimal token characters.
+`NamespaceTempName` is the only shared parser/formatter for publication and mutation staging. It accepts exactly one of `publish`, `location`, `draft`, or `result`, one lowercase canonical UUIDv4, and exactly 32 lowercase hexadecimal token characters.
 
 A name becomes inert orphan evidence only after its expected file/directory metadata passes no-follow admission. Safe orphans are bounded diagnostics and never hide a canonical Run. Malformed names, unsafe objects, and all other namespace entries are non-selectable diagnostics and are never followed or cleaned by the reader. No temporary name is valid inside a canonical Run.
 
@@ -95,15 +97,17 @@ Concurrent first prepare requests converge on the winner's binding. For a new bi
 
 The manifest is capped at 256 KiB and findings at 16 MiB. Truncation, extra bytes, overflow, invalid sizes, and a second document fail before Store mutation. Publication strictly parses both artifacts, checks caller/artifact IDs, validates the manifest against the exact findings-byte digest and decoded FindingSet, and preserves both caller byte sequences without canonical rewriting.
 
-Before taking the per-repository `publish.lock`, the helper freshly opens the repository, resolves the physical locator and active Store root, validates the registry mapping to the expected repository ID and saved actual repository directory name, and checks all three exact target OIDs as local commit objects with no fetch, replacement, or ref resolution. Under the full-ID lock it revalidates Store identity/binding, opens the saved actual directory, and rejects any existing final review name without comparing or replacing content.
+Before taking the per-repository `publish.lock`, the helper freshly opens the repository, resolves the physical locator and active Store root, validates the registry mapping to the expected repository ID and saved actual repository directory name, and checks all three exact target OIDs as local commit objects with no fetch, replacement, or ref resolution. Under the lock it revalidates Store identity/binding and first reads only `.run-<complete-review-id>`. An exact existing Run is a duplicate; a malformed, mismatched, or incomplete location is ordinary invalid Store state. No scan, short-ID lookup, label guess, or repair is used.
 
-Publication writes only one `.tmp-publish-<review-id>-<128-bit-lower-hex>` owner-only directory in the bound namespace. It exclusively creates and syncs exact `manifest.json` and `findings.json`, syncs the staging directory and namespace, atomically renames without replacement to `<review-id>`, and syncs the namespace again. Before rename, every failure exposes no canonical Run. Cleanup unlinks only the two expected files and then the exact operation-owned empty staging directory; it never recursively deletes or touches another temporary/final entry. A failure after the no-replace rename may leave the complete byte-valid Run visible and a retry returns `duplicate_review_id`.
+Only when that location is absent, publication converts the manifest's exact UTC second once to the OS local calendar minute. A saved non-null `display.head_label` is used as-is except that each slash run becomes one `-` and component-edge hyphens are removed. It must then be valid UTF-8, contain no ASCII control, be nonempty and neither `.` nor `..`, and fit 232 bytes. A present-invalid label fails without fallback. Only an absent head label uses `commit-<first 7 head-OID hex>`. The final stored component is `YYYYMMDD-HHMM-<target-label>-<first 8 review-ID hex>` and is never recomputed after publication.
 
-Both helpers emit one canonical JSON terminal plus LF/EOF. Repository preparation preserves the stable codes `main_worktree_unavailable`, `repository_name_invalid`, and `repository_namespace_collision`; hosted Compare jobs carry the same bounded causes through the existing footer and F2 details. Exit groups are: `0` success; `64` request/schema/artifact errors; `65` invalid repository name; `66` unavailable target objects; `69` unavailable/unsupported Store platform or filesystem; `73` duplicate review ID or repository namespace collision; `74` invalid Store/repository, unavailable main worktree, Git, or I/O failure; `75` binding/concurrent conflict; and `70` allocation or unclassified internal failure. Stderr text, raw names, and Store paths are never machine authority.
+Publication writes one `.tmp-publish-...` directory containing the exact immutable artifacts and one same-token `.tmp-location-...` regular file containing strict canonical schema-1 JSON: full repository ID, full review ID, and the actual directory component. After both are synced, it atomically installs `.run-<complete-review-id>` without replacement, syncs the namespace, then atomically installs the Run directory under its readable name and syncs again. A final-name collision returns `run_name_collision`; it never regenerates the UUID, retries, extends the suffix, or chooses another name. Before the Run rename, cleanup may remove only the operation-owned byte- and metadata-identical locator and staging entries. Once the Run rename commits, both entries are retained; a following durability error is reconciled by the full-ID locator and exact artifact bytes, without republishing.
+
+Both helpers emit one canonical JSON terminal plus LF/EOF. Repository preparation preserves `main_worktree_unavailable`, `repository_name_invalid`, and `repository_namespace_collision`; publication preserves `target_label_invalid`, `local_time_unavailable`, and `run_name_collision`. Hosted Compare jobs carry the same bounded causes through the existing footer and F2 details. Exit groups are: `0` success; `64` request/schema/artifact errors; `65` invalid repository or target label; `66` unavailable target objects; `69` unavailable/unsupported Store platform or filesystem; `73` duplicate review ID or repository/Run name collision; `74` invalid Store/repository, unavailable main worktree/local time, Git, or I/O failure; `75` binding/concurrent conflict; and `70` allocation or unclassified internal failure. Stderr text, raw names, and Store paths are never machine authority.
 
 ## Run admission and result precedence
 
-A canonical Run directory must contain required `manifest.json` and `findings.json`, plus at most optional `review_state.json` and `result.json`. Any other Run-internal entry invalidates that Run.
+A stored Run directory must contain required `manifest.json` and `findings.json`, plus at most optional `review_state.json` and `result.json`. Its manifest full IDs, strict `.run-<complete-review-id>` record, saved actual directory name, and repository binding must agree. Any other Run-internal entry invalidates that Run.
 
 Immutable artifacts are strictly parsed and cross-validated for directory/manifest IDs, repository namespace, schema, target, producer, `created_at`, finding count, and the digest of every exact `findings.json` byte. Zero findings and optional producer timing are valid.
 
@@ -117,7 +121,7 @@ An explicit scan performs:
 2. read-only Store-root open;
 3. strict registry lookup without get-or-create;
 4. repository namespace open;
-5. complete bounded enumeration and per-Run admission;
+5. complete bounded enumeration of readable-name candidates and full-ID location records, followed by their strict pairwise admission;
 6. one bounded Git availability batch for all valid targets;
 7. full deterministic sort.
 
@@ -157,8 +161,9 @@ summary, every finding disposition, and every anchored note. Existing notes are
 therefore retained only when the caller includes them in the next snapshot.
 
 Under the per-Run lock, the writer freshly validates registry binding, opens
-the binding's saved actual repository directory, and validates the complete
-Run. A valid result returns `already_completed` before draft
+the binding's saved actual repository directory, directly resolves the full
+review ID through its unchanged location record, and validates the saved actual
+Run directory. A valid result returns `already_completed` before draft
 inspection, including when a retained draft is missing or invalid. Without a
 result, the actual draft revision must exactly equal the request. GitFrame
 assigns revision `1` or the checked next revision, validates the constructed
@@ -167,7 +172,7 @@ artifact, and never auto-merges or overwrites a conflicting snapshot.
 Draft bytes are exclusively created as one shared-grammar
 `.tmp-draft-<review-id>-<token>` namespace sibling with mode `0600`. The write
 order is complete bytes, file sync, namespace sync, atomic replacement rename
-to `<review-id>/review_state.json`, Run-directory sync, then namespace sync.
+to the saved actual Run's `review_state.json`, Run-directory sync, then namespace sync.
 Before-rename failure leaves the old draft authoritative; post-rename sync
 failure may leave the new complete draft authoritative. Retry always reopens
 the Run instead of rolling back.

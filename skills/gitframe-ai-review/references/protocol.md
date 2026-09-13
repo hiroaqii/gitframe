@@ -74,6 +74,17 @@ automatic retry. Duplicate or concurrent use of one complete handoff is not a
 supported operation; GitFrame's create-once Store remains the final
 no-replacement guard.
 
+GitFrame derives the Store folder only during that single publish call. A
+saved head label is formatted only by collapsing slash runs and trimming
+component-edge hyphens; an absent label alone uses the fixed head OID. The
+folder's eight-character UUID suffix is display-only. The complete Review ID
+selects an immutable schema-1 `.run-<review-id>` location record, and every
+later exact read uses its saved actual folder name without re-resolving a ref,
+timezone, or label. `target_label_invalid`, `local_time_unavailable`, and
+`run_name_collision` are ordinary strict publish rejection codes and are
+returned unchanged; the driver neither repairs the input nor retries with a
+different ID or name.
+
 Timeouts are 10 seconds for capabilities and 120 seconds for each remaining
 helper. Stdout, stderr and every stored payload have fixed bounds. A publish
 timeout, signal, overflow, empty output or malformed terminal after child

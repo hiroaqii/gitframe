@@ -218,6 +218,9 @@ fn failureTerminal(failure: store_service.PublicationFailure) Failure {
         .concurrent_conflict => .{ .exit_code = 75, .code = "concurrent_conflict", .message = "Review Store authority changed concurrently" },
         .binding_mismatch => .{ .exit_code = 75, .code = "binding_mismatch", .message = "repository binding does not match" },
         .invalid_artifact => .{ .exit_code = 64, .code = "invalid_artifact", .message = "artifact is invalid" },
+        .target_label_invalid => .{ .exit_code = 65, .code = "target_label_invalid", .message = "saved target label is invalid" },
+        .local_time_unavailable => .{ .exit_code = 74, .code = "local_time_unavailable", .message = "local calendar time is unavailable" },
+        .run_name_collision => .{ .exit_code = 73, .code = "run_name_collision", .message = "review Run namespace already exists" },
         .target_unavailable => .{ .exit_code = 66, .code = "target_unavailable", .message = "target objects are unavailable" },
         .duplicate_review_id => .{ .exit_code = 73, .code = "duplicate_review_id", .message = "review ID already exists" },
     };

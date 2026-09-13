@@ -11,6 +11,7 @@ const mutation = @import("mutation.zig");
 const maintenance = @import("maintenance.zig");
 const store_name = @import("name.zig");
 const registry = @import("registry.zig");
+const run_store = @import("run.zig");
 const store_path = @import("path.zig");
 
 pub const UnavailableReason = store_path.Resolved.Unavailable;
@@ -426,6 +427,9 @@ fn prepareBindingWithObserver(
 
 pub const PublishFailure = enum {
     invalid_artifact,
+    target_label_invalid,
+    local_time_unavailable,
+    run_name_collision,
     store_unavailable,
     unsupported_platform,
     unsupported_filesystem,
@@ -537,25 +541,95 @@ pub fn publish(
         return .{ .failure = if (err == error.FileNotFound) .store_invalid else mapPublishMutationError(err) };
     };
     defer namespace.deinit();
-    const review_id_text = request.review_id.canonical();
-    if (namespace.openDirectory(&review_id_text)) |existing_run| {
-        var owned = existing_run;
-        owned.deinit();
-        return .{ .failure = .duplicate_review_id };
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return .{ .failure = .store_invalid },
+    if (try existingReviewFailure(allocator, io, namespace, request.review_repository_id, request.review_id)) |failure| {
+        return .{ .failure = failure };
     }
+    const target_label = if (manifest.value.display) |display|
+        if (display.head_label) |saved|
+            store_name.TargetLabel.fromSaved(saved) catch
+                return .{ .failure = .target_label_invalid }
+        else
+            store_name.TargetLabel.fromHeadObjectId(&manifest.value.target.head_oid)
+    else
+        store_name.TargetLabel.fromHeadObjectId(&manifest.value.target.head_oid);
+    const unix_seconds = committed_review.strict_json.timestampToUnixSeconds(manifest.value.created_at) catch
+        return .{ .failure = .invalid_artifact };
+    const local_minute = store_name.LocalCalendarMinute.fromUnixSeconds(unix_seconds) catch
+        return .{ .failure = .local_time_unavailable };
+    const run_directory_name = store_name.RunDirectoryName.format(
+        local_minute,
+        &target_label,
+        request.review_id,
+    );
 
-    publishIntoNamespace(io, namespace, request, .{}) catch |err| {
-        return .{ .failure = if (err == error.DuplicateReviewId)
-            .duplicate_review_id
+    return publishReconciledIntoNamespace(
+        allocator,
+        io,
+        namespace,
+        request,
+        run_directory_name,
+        .{},
+    );
+}
+
+fn publishReconciledIntoNamespace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    request: PublishRequest,
+    run_directory_name: store_name.RunDirectoryName,
+    observer: durable.Observer,
+) std.mem.Allocator.Error!PublishResult {
+    publishIntoNamespace(allocator, io, namespace, request, run_directory_name, observer) catch |err| {
+        if (try publishedRequestMatches(
+            allocator,
+            io,
+            namespace,
+            request,
+            run_directory_name,
+        )) return .success;
+        if (err == error.LocationConflict) {
+            return .{ .failure = (try existingReviewFailure(
+                allocator,
+                io,
+                namespace,
+                request.review_repository_id,
+                request.review_id,
+            )) orelse .concurrent_conflict };
+        }
+        return .{ .failure = if (err == error.RunNameCollision)
+            .run_name_collision
         else if (err == error.ConcurrentStagingConflict)
             .concurrent_conflict
         else
             mapPublishMutationError(err) };
     };
     return .success;
+}
+
+fn publishedRequestMatches(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    request: PublishRequest,
+    directory_name: store_name.RunDirectoryName,
+) std.mem.Allocator.Error!bool {
+    var budget: run_store.ArtifactBudget = .{};
+    var loaded = try run_store.loadValidated(
+        allocator,
+        io,
+        namespace,
+        request.review_repository_id,
+        request.review_id,
+        &budget,
+    );
+    defer loaded.deinit(allocator);
+    return switch (loaded) {
+        .loaded => |*value| value.run_location.location.record.directory_name.eql(&directory_name) and
+            std.mem.eql(u8, value.manifest_bytes, request.manifest_bytes) and
+            std.mem.eql(u8, value.findings_bytes, request.findings_bytes),
+        .invalid => false,
+    };
 }
 
 pub const DraftRequest = mutation.DraftRequest;
@@ -742,13 +816,68 @@ fn cleanupOwnedEmptyNamespace(
     _ = capability.syncDirectory(io, root, .{});
 }
 
+fn existingReviewFailure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    repository_id: committed_review.ReviewRepositoryId,
+    review_id: committed_review.ReviewId,
+) std.mem.Allocator.Error!?PublishFailure {
+    var budget: run_store.ArtifactBudget = .{};
+    const location = try run_store.readLocation(
+        allocator,
+        io,
+        namespace,
+        repository_id,
+        review_id,
+        &budget,
+    );
+    switch (location) {
+        .absent => return null,
+        .invalid => |reason| return publishFailureFromRun(reason),
+        .location => {},
+    }
+    var loaded = try run_store.loadValidated(
+        allocator,
+        io,
+        namespace,
+        repository_id,
+        review_id,
+        &budget,
+    );
+    defer loaded.deinit(allocator);
+    return switch (loaded) {
+        .loaded => .duplicate_review_id,
+        .invalid => |reason| publishFailureFromRun(reason),
+    };
+}
+
+fn publishFailureFromRun(reason: run_store.InvalidReason) PublishFailure {
+    return switch (reason) {
+        .permission_denied => .store_unavailable,
+        .io_failed => .io_failed,
+        else => .store_invalid,
+    };
+}
+
 fn publishIntoNamespace(
+    allocator: std.mem.Allocator,
     io: std.Io,
     namespace: capability.DirectoryCapability,
     request: PublishRequest,
+    run_directory_name: store_name.RunDirectoryName,
     observer: durable.Observer,
 ) !void {
+    const location_record: run_store.LocationRecord = .{
+        .review_repository_id = request.review_repository_id,
+        .review_id = request.review_id,
+        .directory_name = run_directory_name,
+    };
+    const location_bytes = try run_store.writeLocationCanonicalAlloc(allocator, location_record);
+    defer allocator.free(location_bytes);
+
     var temp_name_storage: store_path.NamespaceTempName.Formatted = undefined;
+    var staging_token: [16]u8 = undefined;
     var staging_created = false;
     var create_after_error: ?anyerror = null;
     for (0..8) |_| {
@@ -759,6 +888,7 @@ fn publishIntoNamespace(
             .review_id = request.review_id,
             .token = token,
         };
+        staging_token = token;
         temp_name_storage = temp_value.format();
         switch (capability.createDirectory(io, namespace, temp_name_storage.slice(), observer)) {
             .not_completed => |err| if (err == error.PathAlreadyExists) continue else return err,
@@ -781,15 +911,116 @@ fn publishIntoNamespace(
     try writeExactFile(io, staging, "findings.json", request.findings_bytes, observer);
     try completedVoid(capability.syncDirectory(io, staging, observer));
     try completedVoid(capability.syncDirectory(io, namespace, observer));
-    const review_id_text = request.review_id.canonical();
-    switch (capability.movePreserving(io, namespace, temp_name, namespace, &review_id_text, observer)) {
-        .not_completed => |err| return if (err == error.PathAlreadyExists) error.DuplicateReviewId else err,
+
+    const location_temp = (store_path.NamespaceTempName{
+        .kind = .location,
+        .review_id = request.review_id,
+        .token = staging_token,
+    }).format();
+    const acquired_location = switch (capability.createFile(namespace, location_temp.slice(), observer)) {
+        .not_completed => |err| return if (err == error.PathAlreadyExists)
+            error.ConcurrentStagingConflict
+        else
+            err,
+        .completed => |result| result,
+    };
+    var location_file = acquired_location.value;
+    defer location_file.deinit();
+    var location_temp_present = true;
+    defer if (location_temp_present) {
+        _ = capability.removeFile(io, namespace, location_temp.slice(), .{});
+    };
+    if (acquired_location.after_error) |err| return err;
+    try completedVoid(durable.writeAll(io, location_file, location_bytes, observer));
+    try completedVoid(durable.syncFile(io, location_file, observer));
+    try completedVoid(capability.syncDirectory(io, namespace, observer));
+
+    const location_name = store_path.RunLocationName.format(request.review_id);
+    switch (capability.movePreserving(
+        io,
+        namespace,
+        location_temp.slice(),
+        namespace,
+        location_name.slice(),
+        observer,
+    )) {
+        .not_completed => |err| return if (err == error.PathAlreadyExists) error.LocationConflict else err,
+        .completed => |result| {
+            location_temp_present = false;
+            if (result.after_error) |err| {
+                if (!cleanupOwnedLocation(
+                    allocator,
+                    io,
+                    namespace,
+                    location_name.slice(),
+                    location_file.metadata,
+                    location_bytes,
+                )) return error.ConcurrentStagingConflict;
+                return err;
+            }
+        },
+    }
+    completedVoid(capability.syncDirectory(io, namespace, observer)) catch |err| {
+        if (!cleanupOwnedLocation(
+            allocator,
+            io,
+            namespace,
+            location_name.slice(),
+            location_file.metadata,
+            location_bytes,
+        )) return error.ConcurrentStagingConflict;
+        return err;
+    };
+
+    switch (capability.movePreserving(
+        io,
+        namespace,
+        temp_name,
+        namespace,
+        run_directory_name.slice(),
+        observer,
+    )) {
+        .not_completed => |err| {
+            if (!cleanupOwnedLocation(
+                allocator,
+                io,
+                namespace,
+                location_name.slice(),
+                location_file.metadata,
+                location_bytes,
+            )) return error.ConcurrentStagingConflict;
+            return if (err == error.PathAlreadyExists) error.RunNameCollision else err;
+        },
         .completed => |result| {
             published = true;
             if (result.after_error) |err| return err;
         },
     }
     try completedVoid(capability.syncDirectory(io, namespace, observer));
+}
+
+fn cleanupOwnedLocation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    name: []const u8,
+    expected_metadata: capability.Metadata,
+    expected_bytes: []const u8,
+) bool {
+    const current = namespace.admitChild(name, .regular_file) catch return false;
+    if (!current.sameObject(expected_metadata) or current.size != expected_bytes.len) return false;
+    const bytes = namespace.readRegularAlloc(allocator, io, name, run_store.max_location_bytes) catch
+        return false;
+    defer allocator.free(bytes);
+    if (!std.mem.eql(u8, bytes, expected_bytes)) return false;
+    switch (capability.removeFile(io, namespace, name, .{})) {
+        .not_completed => return false,
+        .completed => |result| if (result.after_error != null) return false,
+    }
+    return switch (capability.syncDirectory(io, namespace, .{})) {
+        .not_completed => false,
+        .completed => |result| result.after_error == null,
+    };
 }
 
 fn writeExactFile(
@@ -1285,18 +1516,27 @@ test "review run publication fault boundaries expose all-or-nothing final direct
         .{ .step = .{ .operation = .create_directory, .edge = .after } },
         .{ .step = .{ .operation = .create_file, .edge = .after }, .occurrence = 0 },
         .{ .step = .{ .operation = .create_file, .edge = .after }, .occurrence = 1 },
+        .{ .step = .{ .operation = .create_file, .edge = .after }, .occurrence = 2 },
         .{ .step = .{ .operation = .sync_file, .edge = .before }, .occurrence = 0 },
         .{ .step = .{ .operation = .sync_file, .edge = .after }, .occurrence = 0 },
         .{ .step = .{ .operation = .sync_file, .edge = .before }, .occurrence = 1 },
         .{ .step = .{ .operation = .sync_file, .edge = .after }, .occurrence = 1 },
+        .{ .step = .{ .operation = .sync_file, .edge = .before }, .occurrence = 2 },
+        .{ .step = .{ .operation = .sync_file, .edge = .after }, .occurrence = 2 },
         .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 0 },
         .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 0 },
         .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 1 },
         .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 1 },
-        .{ .step = .{ .operation = .rename_preserve, .edge = .before } },
-        .{ .step = .{ .operation = .rename_preserve, .edge = .after }, .published = true },
-        .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 2, .published = true },
-        .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 2, .published = true },
+        .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 2 },
+        .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 2 },
+        .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 3 },
+        .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 3 },
+        .{ .step = .{ .operation = .rename_preserve, .edge = .before }, .occurrence = 0 },
+        .{ .step = .{ .operation = .rename_preserve, .edge = .after }, .occurrence = 0 },
+        .{ .step = .{ .operation = .rename_preserve, .edge = .before }, .occurrence = 1 },
+        .{ .step = .{ .operation = .rename_preserve, .edge = .after }, .occurrence = 1, .published = true },
+        .{ .step = .{ .operation = .sync_directory, .edge = .before }, .occurrence = 4, .published = true },
+        .{ .step = .{ .operation = .sync_directory, .edge = .after }, .occurrence = 4, .published = true },
     };
     for (cases, 0..) |case, index| {
         var id_bytes = [_]u8{0} ** 16;
@@ -1311,13 +1551,20 @@ test "review run publication fault boundaries expose all-or-nothing final direct
             .manifest_bytes = "manifest-exact\n",
             .findings_bytes = "findings-exact\x00\n",
         };
+        const review_id_text = review_id.canonical();
+        var directory_storage: [255]u8 = undefined;
+        const directory_text = try std.fmt.bufPrint(
+            &directory_storage,
+            "20260913-1000-test-{s}",
+            .{review_id_text[0..8]},
+        );
+        const run_directory_name = try store_name.RunDirectoryName.fromStored(directory_text, review_id);
         var fault: TestStepObserver = .{ .selected = case.step, .occurrence = case.occurrence };
         try std.testing.expectError(
             error.InjectedPublicationFault,
-            publishIntoNamespace(io, namespace, request, fault.observer()),
+            publishIntoNamespace(allocator, io, namespace, request, run_directory_name, fault.observer()),
         );
-        const review_id_text = review_id.canonical();
-        if (namespace.openDirectory(&review_id_text)) |final| {
+        if (namespace.openDirectory(run_directory_name.slice())) |final| {
             var owned = final;
             defer owned.deinit();
             try std.testing.expect(case.published);
@@ -1331,15 +1578,104 @@ test "review run publication fault boundaries expose all-or-nothing final direct
             try std.testing.expect(!case.published);
             try std.testing.expectEqual(error.FileNotFound, err);
         }
+        const location_name = store_path.RunLocationName.format(review_id);
+        if (namespace.admitChild(location_name.slice(), .regular_file)) |_| {
+            try std.testing.expect(case.published);
+        } else |err| {
+            try std.testing.expect(!case.published);
+            try std.testing.expectEqual(error.FileNotFound, err);
+        }
     }
 
     var iterator = namespace.iterate();
     var canonical_count: usize = 0;
     while (try iterator.next(namespace, io)) |entry| {
-        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".tmp-publish-"));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".tmp-publish-") and
+            !std.mem.startsWith(u8, entry.name, ".tmp-location-"));
         canonical_count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), canonical_count);
+    try std.testing.expectEqual(@as(usize, 6), canonical_count);
+
+    var boundary_namespace = try acquireDirectory(io, root.directory, "boundary-123e4567", .{});
+    defer boundary_namespace.deinit();
+    var raw_store = try tmp.dir.openDir(io, "store", .{});
+    defer raw_store.close(io);
+    var raw_boundary = try raw_store.openDir(io, "boundary-123e4567", .{});
+    defer raw_boundary.close(io);
+    for (0..512) |index| {
+        const review_id = testReviewId(index);
+        var artifacts = try TestPublishArtifacts.init(allocator, repository_id, review_id);
+        defer artifacts.deinit(allocator);
+        const run_directory_name = testRunDirectoryName(review_id);
+        try raw_boundary.createDir(io, run_directory_name.slice(), .fromMode(0o700));
+        var raw_run = try raw_boundary.openDir(io, run_directory_name.slice(), .{});
+        defer raw_run.close(io);
+        try raw_run.writeFile(io, .{
+            .sub_path = "manifest.json",
+            .data = artifacts.manifest,
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+        try raw_run.writeFile(io, .{
+            .sub_path = "findings.json",
+            .data = artifacts.findings,
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+        const location_bytes = try run_store.writeLocationCanonicalAlloc(allocator, .{
+            .review_repository_id = repository_id,
+            .review_id = review_id,
+            .directory_name = run_directory_name,
+        });
+        defer allocator.free(location_bytes);
+        const location_name = store_path.RunLocationName.format(review_id);
+        try raw_boundary.writeFile(io, .{
+            .sub_path = location_name.slice(),
+            .data = location_bytes,
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+    }
+
+    const boundary_review_id = testReviewId(512);
+    var boundary_artifacts = try TestPublishArtifacts.init(allocator, repository_id, boundary_review_id);
+    defer boundary_artifacts.deinit(allocator);
+    const boundary_request: PublishRequest = .{
+        .locator = .{ .device = 0, .inode = 0 },
+        .review_repository_id = repository_id,
+        .review_id = boundary_review_id,
+        .manifest_bytes = boundary_artifacts.manifest,
+        .findings_bytes = boundary_artifacts.findings,
+    };
+    const boundary_run_name = testRunDirectoryName(boundary_review_id);
+    var post_publish_fault: TestStepObserver = .{
+        .selected = .{ .operation = .rename_preserve, .edge = .after },
+        .occurrence = 1,
+    };
+    try std.testing.expectEqual(
+        PublishResult.success,
+        try publishReconciledIntoNamespace(
+            allocator,
+            io,
+            boundary_namespace,
+            boundary_request,
+            boundary_run_name,
+            post_publish_fault.observer(),
+        ),
+    );
+    var budget: run_store.ArtifactBudget = .{};
+    var loaded = try run_store.loadValidated(
+        allocator,
+        io,
+        boundary_namespace,
+        repository_id,
+        boundary_review_id,
+        &budget,
+    );
+    defer loaded.deinit(allocator);
+    switch (loaded) {
+        .loaded => |*value| try std.testing.expect(value.run_location.location.record.directory_name.eql(
+            &boundary_run_name,
+        )),
+        .invalid => return error.ExpectedPublishedBoundaryRun,
+    }
 }
 
 const PublicationFaultCase = struct {
@@ -1347,6 +1683,74 @@ const PublicationFaultCase = struct {
     occurrence: usize = 0,
     published: bool = false,
 };
+
+const TestPublishArtifacts = struct {
+    manifest: []u8,
+    findings: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        repository_id: committed_review.ReviewRepositoryId,
+        review_id: committed_review.ReviewId,
+    ) !TestPublishArtifacts {
+        const oid = try committed_review.ObjectId.parse(
+            .sha1,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        const target: committed_review.CommittedReviewTarget = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = oid,
+            .head_oid = oid,
+            .diff_base_oid = oid,
+        };
+        const findings_value: committed_review.FindingSet = .{
+            .schema_version = 1,
+            .review_id = review_id,
+            .created_at = "2026-09-13T10:00:00Z",
+            .target = target,
+            .producer = .{ .name = "test" },
+            .findings = &.{},
+        };
+        const findings = try findings_value.writeCanonical(allocator);
+        errdefer allocator.free(findings);
+        const manifest_value: committed_review.ReviewRunManifest = .{
+            .schema_version = 1,
+            .review_id = review_id,
+            .review_repository_id = repository_id,
+            .target = target,
+            .created_at = findings_value.created_at,
+            .display = .{ .head_label = "test" },
+            .finding_count = 0,
+            .producer = findings_value.producer,
+            .findings_digest = committed_review.Sha256Digest.hash(findings),
+        };
+        return .{
+            .manifest = try manifest_value.writeCanonical(allocator),
+            .findings = findings,
+        };
+    }
+
+    fn deinit(self: *TestPublishArtifacts, allocator: std.mem.Allocator) void {
+        allocator.free(self.manifest);
+        allocator.free(self.findings);
+        self.* = undefined;
+    }
+};
+
+fn testReviewId(index: usize) committed_review.ReviewId {
+    var bytes = [_]u8{0} ** 16;
+    bytes[0] = @intCast((index >> 8) & 0xff);
+    bytes[1] = @intCast(index & 0xff);
+    bytes[6] = 0x40;
+    bytes[8] = 0x80;
+    return .{ .bytes = bytes };
+}
+
+fn testRunDirectoryName(review_id: committed_review.ReviewId) store_name.RunDirectoryName {
+    const label = store_name.TargetLabel.fromStored("test") catch unreachable;
+    return .format(.{ .year = 2026, .month = 9, .day = 13, .hour = 10, .minute = 0 }, &label, review_id);
+}
 
 const TestStepObserver = struct {
     selected: durable.Step,

@@ -8,6 +8,7 @@ const core = @import("core.zig");
 const catalog = @import("catalog.zig");
 const registry = @import("registry.zig");
 const run = @import("run.zig");
+const store_path = @import("path.zig");
 
 pub const Failure = enum {
     not_found,
@@ -38,6 +39,7 @@ pub const CleanupResult = union(enum) {
 
 const artifact_names = [_][]const u8{ "manifest.json", "findings.json", "review_state.json", "result.json" };
 const TrashName = [69]u8;
+const LocationTrashName = [74]u8;
 const max_trash_entries = 512;
 
 pub fn deleteRun(
@@ -78,7 +80,24 @@ fn deleteLocked(
     try validateBinding(allocator, io, opened.root.directory, request.store);
     var namespace = try opened.root.directory.openDirectory(request.store.repository_directory_name.slice());
     defer namespace.deinit();
-    var selected = try namespace.openDirectory(&review_name);
+    const current_location = switch (try run.readLocation(
+        allocator,
+        io,
+        namespace,
+        request.store.review_repository_id,
+        request.review_id,
+        null,
+    )) {
+        .location => |value| value,
+        .absent => return error.FileNotFound,
+        .invalid => return error.InvalidRun,
+    };
+    const expected_location = request.artifacts.run_location orelse return error.InvalidRun;
+    if (!expected_location.location.record.review_repository_id.eql(request.store.review_repository_id) or
+        !expected_location.location.record.review_id.eql(request.review_id)) return error.Conflict;
+    if (!current_location.eql(expected_location.location)) return error.Conflict;
+    const actual_name = current_location.record.directory_name.slice();
+    var selected = try namespace.openDirectory(actual_name);
     defer selected.deinit();
 
     var locks = opened.root.directory.openDirectory(".locks") catch |err| return missingLock(err);
@@ -92,7 +111,7 @@ fn deleteLocked(
     var run_lock = try core.acquireLock(io, repository_locks, &lock_name, .try_lock);
     defer run_lock.deinit();
 
-    try validateLocation(allocator, io, context, request.store, namespace, selected, &review_name);
+    try validateLocation(allocator, io, context, request.store, namespace, selected, expected_location);
     try validateFiles(io, selected);
     var budget: run.ArtifactBudget = .{};
     var loaded = try run.loadValidated(allocator, io, namespace, request.store.review_repository_id, request.review_id, &budget);
@@ -121,18 +140,52 @@ fn deleteLocked(
     const nonce_text = std.fmt.bytesToHex(nonce, .lower);
     var name: TrashName = undefined;
     _ = try std.fmt.bufPrint(&name, "{s}-{s}", .{ review_name, nonce_text });
+    var location_trash_name: LocationTrashName = undefined;
+    _ = try std.fmt.bufPrint(&location_trash_name, ".run-{s}-{s}", .{ review_name, nonce_text });
 
-    try validateLocation(allocator, io, context, request.store, namespace, selected, &review_name);
+    try validateLocation(allocator, io, context, request.store, namespace, selected, expected_location);
     // From completed rename onward, failures can only describe cleanup pending.
     try validateTrash(opened.root.directory, trash, repository_trash, &repository_name);
-    const moved = switch (capability.movePreserving(io, namespace, &review_name, repository_trash, &name, observer)) {
+    const moved = switch (capability.movePreserving(io, namespace, actual_name, repository_trash, &name, observer)) {
         .not_completed => |err| return if (err == error.FileNotFound) error.Conflict else err,
         .completed => |value| value,
     };
     completed(capability.syncDirectory(io, namespace, observer)) catch |err| return .{ .pending = classify(err) };
     completed(capability.syncDirectory(io, repository_trash, observer)) catch |err| return .{ .pending = classify(err) };
     if (moved.after_error) |err| return .{ .pending = classify(err) };
+    validateMovedRun(
+        allocator,
+        io,
+        namespace,
+        repository_trash,
+        selected,
+        expected_location,
+        &name,
+    ) catch |err| return .{ .pending = classify(err) };
+    const location_name = store_path.RunLocationName.format(request.review_id);
+    const location_moved = switch (capability.movePreserving(
+        io,
+        namespace,
+        location_name.slice(),
+        repository_trash,
+        &location_trash_name,
+        observer,
+    )) {
+        .not_completed => |err| return .{ .pending = classify(if (err == error.FileNotFound) error.Conflict else err) },
+        .completed => |value| value,
+    };
+    completed(capability.syncDirectory(io, namespace, observer)) catch |err| return .{ .pending = classify(err) };
+    completed(capability.syncDirectory(io, repository_trash, observer)) catch |err| return .{ .pending = classify(err) };
+    if (location_moved.after_error) |err| return .{ .pending = classify(err) };
     removeResidue(io, repository_trash, &name, observer) catch |err| return .{ .pending = classify(err) };
+    removeLocationResidue(
+        allocator,
+        io,
+        repository_trash,
+        &location_trash_name,
+        expected_location.location,
+        observer,
+    ) catch |err| return .{ .pending = classify(err) };
     return .complete;
 }
 
@@ -182,26 +235,71 @@ fn cleanupWith(
     var namespace = try fresh.root.directory.openDirectory(expected.repository_directory_name.slice());
     defer namespace.deinit();
 
-    // Inventory before mutation: fixed grammar bounds both count and name bytes.
+    // Inventory before mutation: fixed grammars bound both count and name bytes.
+    // A location entry is admitted only with its same-token Run residue.
     var names: [max_trash_entries]TrashName = undefined;
+    var location_names: [max_trash_entries]LocationTrashName = undefined;
     var count: usize = 0;
+    var location_count: usize = 0;
     var iterator = repository_trash.iterate();
     while (try iterator.next(repository_trash, io)) |entry| {
-        if (count == names.len or !validTrashName(entry.name)) return error.InvalidRun;
-        @memcpy(&names[count], entry.name);
-        count += 1;
+        if (validTrashName(entry.name)) {
+            if (count == names.len) return error.InvalidRun;
+            _ = repository_trash.admitChild(entry.name, .directory) catch return error.InvalidRun;
+            @memcpy(&names[count], entry.name);
+            count += 1;
+        } else if (validLocationTrashName(entry.name)) {
+            if (location_count == location_names.len) return error.InvalidRun;
+            _ = repository_trash.admitChild(entry.name, .regular_file) catch return error.InvalidRun;
+            @memcpy(&location_names[location_count], entry.name);
+            location_count += 1;
+        } else {
+            return error.InvalidRun;
+        }
     }
     try completed(capability.syncDirectory(io, namespace, observer));
     try completed(capability.syncDirectory(io, repository_trash, observer));
-    for (names[0..count], 0..) |*name, index| {
-        removeResidue(io, repository_trash, name, observer) catch |err| return .{ .stopped = .{
-            .cleaned = index,
-            .unprocessed = count - index - 1,
+    var cleaned: usize = 0;
+    const orphan_locations = countOrphanLocations(names[0..count], location_names[0..location_count]);
+    const total = count + orphan_locations;
+    for (names[0..count]) |*name| {
+        cleanupTrashRun(
+            allocator,
+            io,
+            namespace,
+            repository_trash,
+            expected.review_repository_id,
+            name,
+            observer,
+        ) catch |err| return .{ .stopped = .{
+            .cleaned = cleaned,
+            .unprocessed = total - cleaned - 1,
             .name = name.*,
             .failure = classify(err),
         } };
+        cleaned += 1;
     }
-    return .{ .cleaned = count };
+    for (location_names[0..location_count]) |*location_name| {
+        if (containsTrashRun(names[0..count], location_name[5..])) continue;
+        var run_name: TrashName = undefined;
+        @memcpy(&run_name, location_name[5..]);
+        cleanupLocationOnly(
+            allocator,
+            io,
+            namespace,
+            repository_trash,
+            expected.review_repository_id,
+            location_name,
+            observer,
+        ) catch |err| return .{ .stopped = .{
+            .cleaned = cleaned,
+            .unprocessed = total - cleaned - 1,
+            .name = run_name,
+            .failure = classify(err),
+        } };
+        cleaned += 1;
+    }
+    return .{ .cleaned = cleaned };
 }
 
 fn validTrashName(name: []const u8) bool {
@@ -209,6 +307,25 @@ fn validTrashName(name: []const u8) bool {
     _ = review.ReviewId.parse(name[0..36]) catch return false;
     for (name[37..]) |byte| if (!(byte >= '0' and byte <= '9') and !(byte >= 'a' and byte <= 'f')) return false;
     return true;
+}
+
+fn validLocationTrashName(name: []const u8) bool {
+    return name.len == @sizeOf(LocationTrashName) and
+        std.mem.startsWith(u8, name, ".run-") and
+        validTrashName(name[5..]);
+}
+
+fn containsTrashRun(names: []const TrashName, wanted: []const u8) bool {
+    for (names) |*name| if (std.mem.eql(u8, name, wanted)) return true;
+    return false;
+}
+
+fn countOrphanLocations(names: []const TrashName, location_names: []const LocationTrashName) usize {
+    var count: usize = 0;
+    for (location_names) |*location_name| {
+        if (!containsTrashRun(names, location_name[5..])) count += 1;
+    }
+    return count;
 }
 
 fn validateFiles(io: std.Io, directory: capability.DirectoryCapability) !void {
@@ -225,6 +342,196 @@ fn validateFiles(io: std.Io, directory: capability.DirectoryCapability) !void {
         _ = directory.admitChild(entry.name, .regular_file) catch |err| return if (err == error.FileNotFound) error.Conflict else err;
         count += 1;
     }
+}
+
+fn validateMovedRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    repository_trash: capability.DirectoryCapability,
+    selected: capability.DirectoryCapability,
+    expected: run.RunLocationSnapshot,
+    trash_name: []const u8,
+) !void {
+    const moved = try repository_trash.admitChild(trash_name, .directory);
+    if (!moved.sameObject(selected.metadata)) return error.Conflict;
+    _ = namespace.admitChild(expected.location.record.directory_name.slice(), .directory) catch |err| {
+        if (err != error.FileNotFound) return err;
+        const current_location = switch (try run.readLocation(
+            allocator,
+            io,
+            namespace,
+            expected.location.record.review_repository_id,
+            expected.location.record.review_id,
+            null,
+        )) {
+            .location => |value| value,
+            .absent, .invalid => return error.Conflict,
+        };
+        if (!current_location.eql(expected.location)) return error.Conflict;
+        return;
+    };
+    return error.Conflict;
+}
+
+fn cleanupTrashRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    repository_trash: capability.DirectoryCapability,
+    repository_id: review.ReviewRepositoryId,
+    trash_name: *const TrashName,
+    observer: durable.Observer,
+) !void {
+    const review_id = review.ReviewId.parse(trash_name[0..36]) catch return error.InvalidRun;
+    var directory = try repository_trash.openDirectory(trash_name);
+    defer directory.deinit();
+    try validateFiles(io, directory);
+
+    var location_trash_name: LocationTrashName = undefined;
+    _ = try std.fmt.bufPrint(&location_trash_name, ".run-{s}", .{trash_name.*});
+    const expected_location = blk: {
+        if (repository_trash.admitChild(&location_trash_name, .regular_file)) |_| {
+            break :blk try readLocationResidue(
+                allocator,
+                io,
+                repository_trash,
+                &location_trash_name,
+                repository_id,
+                review_id,
+            );
+        } else |err| if (err != error.FileNotFound) return err;
+        const manifest_bytes = try directory.readRegularAlloc(
+            allocator,
+            io,
+            "manifest.json",
+            review.limits.max_manifest_bytes,
+        );
+        defer allocator.free(manifest_bytes);
+        var manifest = review.ReviewRunManifest.parseStrict(allocator, manifest_bytes) catch |parse_err| {
+            if (parse_err == error.OutOfMemory) return parse_err;
+            return error.InvalidRun;
+        };
+        defer manifest.deinit();
+        if (!manifest.value.review_repository_id.eql(repository_id) or
+            !manifest.value.review_id.eql(review_id)) return error.InvalidRun;
+        const canonical = switch (try run.readLocation(
+            allocator,
+            io,
+            namespace,
+            repository_id,
+            review_id,
+            null,
+        )) {
+            .location => |value| value,
+            .absent => return error.InvalidRun,
+            .invalid => return error.InvalidRun,
+        };
+        try requireActualRunAbsent(namespace, canonical.record.directory_name.slice());
+        const location_name = store_path.RunLocationName.format(review_id);
+        const moved = switch (capability.movePreserving(
+            io,
+            namespace,
+            location_name.slice(),
+            repository_trash,
+            &location_trash_name,
+            observer,
+        )) {
+            .not_completed => |move_err| return move_err,
+            .completed => |value| value,
+        };
+        try completed(capability.syncDirectory(io, namespace, observer));
+        try completed(capability.syncDirectory(io, repository_trash, observer));
+        if (moved.after_error) |move_err| return move_err;
+        break :blk canonical;
+    };
+    try requireActualRunAbsent(namespace, expected_location.record.directory_name.slice());
+    try removeResidue(io, repository_trash, trash_name, observer);
+    try removeLocationResidue(
+        allocator,
+        io,
+        repository_trash,
+        &location_trash_name,
+        expected_location,
+        observer,
+    );
+}
+
+fn cleanupLocationOnly(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    repository_trash: capability.DirectoryCapability,
+    repository_id: review.ReviewRepositoryId,
+    location_name: *const LocationTrashName,
+    observer: durable.Observer,
+) !void {
+    const review_id = review.ReviewId.parse(location_name[5..41]) catch return error.InvalidRun;
+    const location = try readLocationResidue(
+        allocator,
+        io,
+        repository_trash,
+        location_name,
+        repository_id,
+        review_id,
+    );
+    try requireActualRunAbsent(namespace, location.record.directory_name.slice());
+    try removeLocationResidue(allocator, io, repository_trash, location_name, location, observer);
+}
+
+fn readLocationResidue(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent: capability.DirectoryCapability,
+    name: []const u8,
+    repository_id: review.ReviewRepositoryId,
+    review_id: review.ReviewId,
+) !run.LocationSnapshot {
+    const metadata = try parent.admitChild(name, .regular_file);
+    const bytes = try parent.readRegularAlloc(allocator, io, name, run.max_location_bytes);
+    defer allocator.free(bytes);
+    if (bytes.len != metadata.size) return error.InvalidRun;
+    const record = run.parseLocationStrict(allocator, bytes) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidRun;
+    };
+    if (!record.review_repository_id.eql(repository_id) or !record.review_id.eql(review_id)) {
+        return error.InvalidRun;
+    }
+    return .{
+        .record = record,
+        .metadata = metadata,
+        .digest = review.Sha256Digest.hash(bytes),
+    };
+}
+
+fn removeLocationResidue(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent: capability.DirectoryCapability,
+    name: []const u8,
+    expected: run.LocationSnapshot,
+    observer: durable.Observer,
+) !void {
+    const current = try readLocationResidue(
+        allocator,
+        io,
+        parent,
+        name,
+        expected.record.review_repository_id,
+        expected.record.review_id,
+    );
+    if (!current.eql(expected)) return error.Conflict;
+    try completed(capability.removeFile(io, parent, name, observer));
+    try completed(capability.syncDirectory(io, parent, observer));
+}
+
+fn requireActualRunAbsent(namespace: capability.DirectoryCapability, actual_name: []const u8) !void {
+    _ = namespace.admitChild(actual_name, .directory) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    return error.Conflict;
 }
 
 fn removeResidue(io: std.Io, parent: capability.DirectoryCapability, name: []const u8, observer: durable.Observer) !void {
@@ -288,14 +595,28 @@ fn validateLocation(
     expected: catalog.StoreSnapshot,
     namespace: capability.DirectoryCapability,
     selected: capability.DirectoryCapability,
-    review_name: []const u8,
+    location: run.RunLocationSnapshot,
 ) !void {
     var fresh = try openExpected(context, expected);
     defer fresh.deinit();
     try validateBinding(allocator, io, fresh.root.directory, expected);
     const namespace_now = try fresh.root.directory.admitChild(expected.repository_directory_name.slice(), .directory);
-    const run_now = try namespace.admitChild(review_name, .directory);
-    if (!namespace_now.sameObject(namespace.metadata) or !run_now.sameObject(selected.metadata)) return error.Conflict;
+    const current_location = switch (try run.readLocation(
+        allocator,
+        io,
+        namespace,
+        expected.review_repository_id,
+        location.location.record.review_id,
+        null,
+    )) {
+        .location => |value| value,
+        .absent, .invalid => return error.Conflict,
+    };
+    const run_now = try namespace.admitChild(location.location.record.directory_name.slice(), .directory);
+    if (!namespace_now.sameObject(namespace.metadata) or
+        !current_location.eql(location.location) or
+        !run_now.sameObject(selected.metadata) or
+        !run_now.sameObject(location.run_metadata)) return error.Conflict;
 }
 
 fn completed(outcome: durable.Outcome(void)) !void {
@@ -472,6 +793,40 @@ test "review store deletion fault boundaries preserve rename durability before u
 test "review store deletion cleanup refuses foreign names and unsafe residue" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    {
+        var orphan_tmp = std.testing.tmpDir(.{});
+        defer orphan_tmp.cleanup();
+        var orphan_fixture = try TestFixture.init(orphan_tmp.dir);
+        defer orphan_fixture.deinit();
+        var move_fault: TestFault = .{ .operation = .rename_preserve, .edge = .after };
+        _ = try deleteWith(
+            allocator,
+            io,
+            &orphan_fixture.context,
+            orphan_fixture.request,
+            .{ .context = &move_fault, .observe_fn = TestFault.observe },
+        );
+        var namespace = try orphan_fixture.store.openDir(
+            io,
+            orphan_fixture.request.store.repository_directory_name.slice(),
+            .{},
+        );
+        defer namespace.close(io);
+        const location_name = store_path.RunLocationName.format(orphan_fixture.request.review_id);
+        try namespace.deleteFile(io, location_name.slice());
+        const stopped = (try cleanupTrash(
+            allocator,
+            io,
+            &orphan_fixture.context,
+            orphan_fixture.request.store,
+        )).stopped;
+        try std.testing.expectEqual(Failure.run_invalid, stopped.failure);
+        var trash = try orphan_fixture.openTrash();
+        defer trash.close(io);
+        var trash_entries = trash.iterate();
+        try std.testing.expect((try trash_entries.next(io)) != null);
+    }
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var fixture = try TestFixture.init(tmp.dir);
@@ -579,10 +934,26 @@ const TestFixture = struct {
         try std.testing.expectEqual(core.PublishResult.success, published);
         var opened = context.openExisting().opened;
         defer opened.deinit();
+        var namespace = try opened.root.directory.openDirectory(prepared.repository_directory_name.slice());
+        defer namespace.deinit();
+        var budget: run.ArtifactBudget = .{};
+        var loaded = try run.loadValidated(
+            allocator,
+            io,
+            namespace,
+            prepared.review_repository_id,
+            prepared.review_id,
+            &budget,
+        );
+        defer loaded.deinit(allocator);
+        const artifacts = switch (loaded) {
+            .loaded => |*value| run.ArtifactSnapshot.fromLoaded(value),
+            .invalid => return error.InvalidRun,
+        };
         return .{ .context = context, .store = try parent.openDir(io, "store", .{}), .request = .{
             .store = .{ .root_device = opened.snapshot.device, .root_inode = opened.snapshot.inode, .repository_locator = locator, .review_repository_id = prepared.review_repository_id, .repository_display_name = prepared.repository_display_name, .repository_directory_name = prepared.repository_directory_name },
             .review_id = prepared.review_id,
-            .artifacts = .{ .manifest_digest = review.Sha256Digest.hash(manifest_bytes), .findings_digest = manifest.findings_digest, .draft_state = .absent, .draft_digest = null, .result_digest = null },
+            .artifacts = artifacts,
             .allow_unfinished = true,
         } };
     }
@@ -618,7 +989,11 @@ const TestFixture = struct {
     fn openRun(self: *const TestFixture) !std.Io.Dir {
         var namespace = try self.store.openDir(std.testing.io, self.request.store.repository_directory_name.slice(), .{});
         defer namespace.close(std.testing.io);
-        return namespace.openDir(std.testing.io, &self.request.review_id.canonical(), .{});
+        return namespace.openDir(
+            std.testing.io,
+            self.request.artifacts.run_location.?.location.record.directory_name.slice(),
+            .{},
+        );
     }
 
     fn openTrash(self: *const TestFixture) !std.Io.Dir {

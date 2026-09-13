@@ -2,6 +2,9 @@
 const std = @import("std");
 const review = @import("../committed_review.zig");
 const service = @import("store_service.zig");
+const store_name = @import("../review_store/name.zig");
+const store_path_types = @import("../review_store/path.zig");
+const store_run = @import("../review_store/run.zig");
 
 const PruneMode = enum { dry_run, apply };
 
@@ -737,7 +740,8 @@ test "review run maintenance prune command uses one disposable Store authority" 
     defer after_apply.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 4), after_apply.catalog.rows.len);
     for ([_]review.ReviewId{ prepared.review_id, unsafe_id, oversized_id, unfinished_id }) |id| _ = try pruneTestRow(&after_apply.catalog, id);
-    var other_run = try other_namespace.openDir(io, &older_id.canonical(), .{});
+    const other_run_name = try pruneTestRunDirectoryName(older_id);
+    var other_run = try other_namespace.openDir(io, other_run_name.slice(), .{});
     other_run.close(io);
 
     const first_failure_id = try review.ReviewId.parse("923e4567-e89b-42d3-a456-426614174000");
@@ -785,10 +789,13 @@ test "review run maintenance prune command uses one disposable Store authority" 
     const failure_output = try tmp.dir.readFileAlloc(io, "failure-stderr", allocator, .limited(64 * 1024));
     defer allocator.free(failure_output);
     try expectPruneCandidates(failure_output, &.{ first_failure_id, failed_id, unprocessed_id });
-    try std.testing.expectError(error.FileNotFound, namespace.openDir(io, &first_failure_id.canonical(), .{}));
-    var failed_run = try namespace.openDir(io, &failed_id.canonical(), .{});
+    const first_failure_name = try pruneTestRunDirectoryName(first_failure_id);
+    try std.testing.expectError(error.FileNotFound, namespace.openDir(io, first_failure_name.slice(), .{}));
+    const failed_name = try pruneTestRunDirectoryName(failed_id);
+    var failed_run = try namespace.openDir(io, failed_name.slice(), .{});
     failed_run.close(io);
-    var unprocessed_run = try namespace.openDir(io, &unprocessed_id.canonical(), .{});
+    const unprocessed_name = try pruneTestRunDirectoryName(unprocessed_id);
+    var unprocessed_run = try namespace.openDir(io, unprocessed_name.slice(), .{});
     unprocessed_run.close(io);
 
     const registry_after = try store.readFileAlloc(io, "registry.json", allocator, .limited(64 * 1024));
@@ -819,7 +826,11 @@ const PruneTestDelete = struct {
     fn call(raw: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io, environment: ?*std.process.Environ.Map, repository_path: []const u8, request: service.DeleteRequest) !service.DeleteResult {
         const self: *PruneTestDelete = @ptrCast(@alignCast(raw.?));
         if (self.calls == 1) {
-            var run_directory = try self.namespace.openDir(io, &request.review_id.canonical(), .{});
+            var run_directory = try self.namespace.openDir(
+                io,
+                request.artifacts.run_location.?.location.record.directory_name.slice(),
+                .{},
+            );
             defer run_directory.close(io);
             try writePruneTestFile(io, run_directory, "manifest.json", "{}\n");
         }
@@ -829,9 +840,9 @@ const PruneTestDelete = struct {
 };
 
 fn seedPruneTestRun(allocator: std.mem.Allocator, io: std.Io, namespace: std.Io.Dir, repository_id: review.ReviewRepositoryId, review_id: review.ReviewId, target: review.CommittedReviewTarget, created_at: []const u8, mode: PruneTestRunMode) !void {
-    const name = review_id.canonical();
-    try namespace.createDir(io, &name, .fromMode(0o700));
-    var directory = try namespace.openDir(io, &name, .{});
+    const name = try pruneTestRunDirectoryName(review_id);
+    try namespace.createDir(io, name.slice(), .fromMode(0o700));
+    var directory = try namespace.openDir(io, name.slice(), .{});
     defer directory.close(io);
     const producer: review.Producer = .{ .name = "codex", .model = "gpt-test" };
     const finding_set: review.FindingSet = .{
@@ -860,6 +871,14 @@ fn seedPruneTestRun(allocator: std.mem.Allocator, io: std.Io, namespace: std.Io.
     defer allocator.free(manifest_bytes);
     try writePruneTestFile(io, directory, "manifest.json", manifest_bytes);
     try writePruneTestFile(io, directory, "findings.json", findings_bytes);
+    const location_bytes = try store_run.writeLocationCanonicalAlloc(allocator, .{
+        .review_repository_id = repository_id,
+        .review_id = review_id,
+        .directory_name = name,
+    });
+    defer allocator.free(location_bytes);
+    const location_name = store_path_types.RunLocationName.format(review_id);
+    try writePruneTestFile(io, namespace, location_name.slice(), location_bytes);
     if (mode == .unfinished) return;
     const result: review.RevisionReviewResult = .{
         .schema_version = 1,
@@ -885,6 +904,13 @@ fn seedPruneTestRun(allocator: std.mem.Allocator, io: std.Io, namespace: std.Io.
             try file.setLength(io, review.limits.max_artifact_bytes + 1);
         },
     }
+}
+
+fn pruneTestRunDirectoryName(review_id: review.ReviewId) !store_name.RunDirectoryName {
+    const review_text = review_id.canonical();
+    var storage: [255]u8 = undefined;
+    const text = try std.fmt.bufPrint(&storage, "20260820-0000-main-{s}", .{review_text[0..8]});
+    return store_name.RunDirectoryName.fromStored(text, review_id);
 }
 
 fn writePruneTestFile(io: std.Io, directory: std.Io.Dir, name: []const u8, bytes: []const u8) !void {

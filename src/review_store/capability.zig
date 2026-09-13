@@ -511,8 +511,8 @@ fn expectProductionLineCeilings(allocator: std.mem.Allocator, io: std.Io) !void 
         "src/fs/capability.zig",
         "src/fs/durable.zig",
     };
-    const core_ceiling: usize = 2550;
-    const complete_ceiling: usize = 4100;
+    const core_ceiling: usize = 3250;
+    const complete_ceiling: usize = 5150;
     var core: usize = 0;
     var complete = core;
     for (neutral_owner_paths) |path| {
