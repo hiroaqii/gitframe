@@ -5,12 +5,15 @@
 //! by this production facade.
 
 const store_service = @import("ai_review/store_service.zig");
+const store_name = @import("review_store/name.zig");
 
 pub const ConfiguredStore = store_service.ConfiguredStore;
 pub const ConfigurationIdentity = store_service.ConfigurationIdentity;
 pub const RepositoryContext = store_service.RepositoryContext;
 pub const ArtifactSnapshot = store_service.ArtifactSnapshot;
 pub const StoreSnapshot = store_service.StoreSnapshot;
+pub const RepositoryDisplayName = store_name.RepositoryDisplayName;
+pub const RepositoryDirectoryName = store_name.RepositoryDirectoryName;
 pub const RunSummaryStatus = store_service.RunSummaryStatus;
 pub const RunSummary = store_service.RunSummary;
 pub const DiagnosticKind = store_service.DiagnosticKind;
@@ -56,6 +59,7 @@ pub const cleanupTrash = store_service.cleanupTrash;
 
 test {
     _ = @import("review_store/path.zig");
+    _ = @import("review_store/name.zig");
     _ = @import("review_store/capability.zig");
     _ = @import("review_store/registry.zig");
     _ = @import("review_store/run.zig");

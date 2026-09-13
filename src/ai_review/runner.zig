@@ -40,9 +40,9 @@ pub const FailureCode = union(enum) {
     final_answer_too_large: diagnostic.Limit,
     invalid_provider_result: diagnostic.InvalidResultStage,
     invalid_candidates,
-    store_prepare_failed,
+    store_prepare_failed: diagnostic.StoreCause,
     artifact_failed,
-    publish_failed,
+    publish_failed: diagnostic.StoreCause,
     exact_reconciliation_failed,
     internal_error: ?diagnostic.InternalStage,
 };
@@ -324,10 +324,10 @@ pub fn publishReady(allocator: std.mem.Allocator, io: std.Io, ready: ReadyToPubl
         &owned.publication.store,
         repository,
         owned.publication.repository_path,
-    ) catch return failedTerminal(.store_prepare_failed, cleanup_warning);
+    ) catch return failedTerminal(.{ .store_prepare_failed = .io_failed }, cleanup_warning);
     const binding = switch (prepared) {
         .success => |value| value,
-        .failure => return failedTerminal(.store_prepare_failed, cleanup_warning),
+        .failure => |failure| return failedTerminal(.{ .store_prepare_failed = storeCause(failure) }, cleanup_warning),
     };
     const created_at = currentUtcSecond(io) orelse return failedTerminal(.artifact_failed, cleanup_warning);
     const provenance = owned.provenance.committedProducer();
@@ -447,8 +447,28 @@ fn failedTerminal(code: FailureCode, cleanup_warning: ?CleanupWarning) Terminal 
     return makeTerminal(.{ .failed = code }, cleanup_warning);
 }
 
-fn publicationFailureTerminal(_: store_service.PublicationFailure, cleanup_warning: ?CleanupWarning) Terminal {
-    return failedTerminal(.publish_failed, cleanup_warning);
+fn publicationFailureTerminal(failure: store_service.PublicationFailure, cleanup_warning: ?CleanupWarning) Terminal {
+    return failedTerminal(.{ .publish_failed = storeCause(failure) }, cleanup_warning);
+}
+
+fn storeCause(failure: store_service.PublicationFailure) diagnostic.StoreCause {
+    return switch (failure) {
+        .invalid_artifact => .invalid_artifact,
+        .target_unavailable => .target_unavailable,
+        .store_unavailable => .store_unavailable,
+        .unsupported_platform => .unsupported_platform,
+        .unsupported_filesystem => .unsupported_filesystem,
+        .duplicate_review_id => .duplicate_review_id,
+        .store_invalid => .store_invalid,
+        .repository_invalid => .repository_invalid,
+        .main_worktree_unavailable => .main_worktree_unavailable,
+        .repository_name_invalid => .repository_name_invalid,
+        .repository_namespace_collision => .repository_namespace_collision,
+        .git_failed => .git_failed,
+        .io_failed => .io_failed,
+        .binding_mismatch => .binding_mismatch,
+        .concurrent_conflict => .concurrent_conflict,
+    };
 }
 
 fn reconciliationFailureTerminal(_: store_service.ReadFailure, cleanup_warning: ?CleanupWarning) Terminal {
@@ -490,10 +510,10 @@ test "ReviewPipeline terminal taxonomy keeps prepublication and exact-ID uncerta
     try std.testing.expect(uncertain.outcome.outcome_unknown.eql(id));
 }
 
-test "ReviewPipeline maps typed publication failures without inventing OS detail" {
-    for ([_]store_service.PublicationFailure{ .store_unavailable, .target_unavailable, .io_failed }) |failure| {
+test "ReviewPipeline maps typed Store failures without inventing OS detail" {
+    for ([_]store_service.PublicationFailure{ .store_unavailable, .target_unavailable, .io_failed, .main_worktree_unavailable, .repository_name_invalid, .repository_namespace_collision }) |failure| {
         const terminal = publicationFailureTerminal(failure, .private_root_residue);
-        try std.testing.expectEqual(FailureCode.publish_failed, terminal.outcome.failed);
+        try std.testing.expectEqual(storeCause(failure), terminal.outcome.failed.publish_failed);
         try std.testing.expectEqual(CleanupWarning.private_root_residue, terminal.cleanup_warning.?);
     }
     for ([_]store_service.ReadFailure{ .expected_mismatch, .artifact_changed, .store_unavailable }) |failure| {
@@ -635,7 +655,7 @@ test "publishReady rejects a nonrepository before preparing an ID" {
     };
     const terminal = publishReady(allocator, io, ready);
     try std.testing.expect(terminal.outcome == .failed);
-    try std.testing.expectEqual(FailureCode.store_prepare_failed, terminal.outcome.failed);
+    try std.testing.expectEqual(diagnostic.StoreCause.repository_invalid, terminal.outcome.failed.store_prepare_failed);
     try std.testing.expectEqual(CleanupWarning.private_root_residue, terminal.cleanup_warning.?);
 }
 

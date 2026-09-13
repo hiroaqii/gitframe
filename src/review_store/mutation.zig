@@ -337,24 +337,21 @@ fn openLockedRun(
 
     var current_registry = try registry.read(allocator, io, root.directory);
     defer current_registry.deinit();
-    switch (current_registry) {
-        .registry => |*parsed| {
-            var found = false;
-            for (parsed.bindings) |candidate| {
+    const repository_binding = switch (current_registry) {
+        .registry => |*parsed| blk: {
+            for (parsed.bindings) |*candidate| {
                 if (candidate.review_repository_id.eql(binding.review_repository_id)) {
-                    found = true;
-                    break;
+                    break :blk candidate;
                 }
             }
-            if (!found) return .{ .failure = .binding_changed };
+            return .{ .failure = .binding_changed };
         },
         .missing => return .{ .failure = .binding_changed },
         .invalid => return .{ .failure = .run_invalid },
         .unavailable => return .{ .failure = .io_failed },
-    }
+    };
 
-    const repository_text = binding.review_repository_id.canonical();
-    var namespace = root.directory.openDirectory(&repository_text) catch |err|
+    var namespace = root.directory.openDirectory(repository_binding.directory_name) catch |err|
         return .{ .failure = mapBindingOpenError(err) };
     var namespace_owned = true;
     defer if (namespace_owned) namespace.deinit();
@@ -893,8 +890,8 @@ const TestFixture = struct {
         defer locks.close(io);
         const repository_text = repository_id.canonical();
         try locks.createDir(io, &repository_text, .fromMode(0o700));
-        try store.createDir(io, &repository_text, .fromMode(0o700));
-        var namespace = try store.openDir(io, &repository_text, .{});
+        try store.createDir(io, "repository-123e4567", .fromMode(0o700));
+        var namespace = try store.openDir(io, "repository-123e4567", .{});
         errdefer namespace.close(io);
         const review_text = review_id.canonical();
         try namespace.createDir(io, &review_text, .fromMode(0o700));
@@ -933,6 +930,8 @@ const TestFixture = struct {
         const diagnostic = try registry.diagnosticPath("/test/repository");
         const registry_bytes = try registry.writeCanonicalAlloc(allocator, &.{.{
             .review_repository_id = repository_id,
+            .repository_display_name = "repository",
+            .directory_name = "repository-123e4567",
             .locator = .{ .device = 7, .inode = 11 },
             .canonical_path = diagnostic,
             .last_seen_path = diagnostic,
@@ -982,8 +981,7 @@ const TestFixture = struct {
     fn reopen(self: *const TestFixture, allocator: std.mem.Allocator, io: std.Io) !run_artifacts.LoadResult {
         var root = try capability.StoreRootCapability.openCanonical(self.store_root);
         defer root.deinit();
-        const repository_text = self.binding.review_repository_id.canonical();
-        var namespace = try root.directory.openDirectory(&repository_text);
+        var namespace = try root.directory.openDirectory("repository-123e4567");
         defer namespace.deinit();
         return reopenRun(allocator, io, namespace, self.binding);
     }
@@ -998,8 +996,7 @@ const TestFixture = struct {
         kind: store_path.NamespaceTempKind,
         exception: []const u8,
     ) !void {
-        const repository_text = self.binding.review_repository_id.canonical();
-        var iterable = try self.store.openDir(io, &repository_text, .{ .iterate = true });
+        var iterable = try self.store.openDir(io, "repository-123e4567", .{ .iterate = true });
         defer iterable.close(io);
         var iterator = iterable.iterate();
         while (try iterator.next(io)) |entry| {

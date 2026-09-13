@@ -9,6 +9,7 @@ const committed = @import("../../committed_review.zig");
 const git_command = @import("../../git/command.zig");
 const git_review = @import("../../git/committed_review.zig");
 const job = @import("../../ai_review/job.zig");
+const diagnostic = @import("../../ai_review/diagnostic.zig");
 const codex = @import("../../ai_review/adapters/codex/adapter.zig");
 const pipeline = @import("../../ai_review/runner.zig");
 const root_capability = @import("../../repo/root_capability.zig");
@@ -1037,7 +1038,8 @@ test "AI review pipeline classifies pre-provider validation and Store failures" 
         };
         reviewed = .{ .terminal = .{ .outcome = .canceled } };
         const terminal = pipeline.publishReady(allocator, io, ready);
-        try std.testing.expectEqual(pipeline.FailureCode.store_prepare_failed, terminal.outcome.failed);
+        try std.testing.expect(terminal.outcome.failed == .store_prepare_failed);
+        try std.testing.expectEqual(diagnostic.StoreCause.store_invalid, terminal.outcome.failed.store_prepare_failed);
     }
 }
 
@@ -1083,9 +1085,10 @@ test "AI review diagnostics retain exact job identity through messages and F2" {
         .{ .outcome = .{ .failed = .{ .invalid_provider_result = .answer } }, .expected = "The answer was not accepted." },
         .{ .outcome = .{ .failed = .provider_failed }, .expected = "provider I/O" },
         .{ .outcome = .{ .failed = .invalid_candidates }, .expected = "Stage: Candidate validation" },
-        .{ .outcome = .{ .failed = .store_prepare_failed }, .expected = "Stage: Store preparation" },
+        .{ .outcome = .{ .failed = .{ .store_prepare_failed = .repository_name_invalid } }, .expected = "Cause: repository name invalid", .additional = "valid UTF-8 main-worktree directory name" },
+        .{ .outcome = .{ .failed = .{ .store_prepare_failed = .repository_namespace_collision } }, .expected = "Cause: repository namespace collision", .additional = "do not overwrite it" },
         .{ .outcome = .{ .failed = .artifact_failed }, .expected = "Stage: Artifact creation" },
-        .{ .outcome = .{ .failed = .publish_failed }, .expected = "The final save state could not be confirmed.", .forbidden = "The review was not saved." },
+        .{ .outcome = .{ .failed = .{ .publish_failed = .io_failed } }, .expected = "The final save state could not be confirmed.", .additional = "Cause: review store I/O failed", .forbidden = "The review was not saved." },
         .{ .outcome = .{ .failed = .exact_reconciliation_failed }, .expected = "could not be verified against the expected metadata", .forbidden = "did not match" },
         .{ .outcome = .{ .failed = .{ .internal_error = .before_provider } }, .expected = "Check available memory and runtime resources" },
         .{ .outcome = .{ .failed = .{ .internal_error = null } }, .expected = "Stage: Unknown" },

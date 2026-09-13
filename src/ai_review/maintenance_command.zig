@@ -674,8 +674,7 @@ test "review run maintenance prune command uses one disposable Store authority" 
     var locks = try store.openDir(io, ".locks", .{});
     defer locks.close(io);
     locks.createDir(io, &repository_name, .fromMode(0o700)) catch |err| if (err != error.PathAlreadyExists) return err;
-    store.createDir(io, &repository_name, .fromMode(0o700)) catch |err| if (err != error.PathAlreadyExists) return err;
-    var namespace = try store.openDir(io, &repository_name, .{});
+    var namespace = try store.openDir(io, prepared.repository_directory_name.slice(), .{});
     defer namespace.close(io);
 
     const oid = try review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");

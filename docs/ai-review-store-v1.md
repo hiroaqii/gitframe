@@ -7,7 +7,7 @@ This document describes the side-effect-free read boundary, its read-only `AI Re
 Three identities remain separate:
 
 - `CommittedReviewTarget` is portable Git authority: object format, source kind, base OID, head OID, and diff-base OID.
-- `ReviewRepositoryId` is a machine-local UUIDv4 Store namespace issued by a later explicit prepare operation.
+- `ReviewRepositoryId` is the machine-local UUIDv4 identity issued by an explicit prepare operation. Its complete value remains authority even though only its first eight canonical characters appear in the repository directory name.
 - repository and Store paths are startup/routing inputs or diagnostic data. A path never substitutes for an opened descriptor or registry binding.
 
 Read operations re-open authority component-by-component with `O_NOFOLLOW`, validate the opened object, and use descriptor-relative children. Directory order, mtime, display labels, and a prior scan are never authority.
@@ -35,7 +35,7 @@ The resolver performs no filesystem call. It rejects `/`, relative paths, `~`, e
 ```text
 <store-root>/                                  0700
   registry.json                               0600, link count 1
-  <review-repository-id>/                     0700
+  <repository-display-name>-<repository-id-first-8>/  0700
     .tmp-publish-<review-id>-<32 lower hex>/  0700 inert staging evidence
     .tmp-draft-<review-id>-<32 lower hex>      0600, link count 1
     .tmp-result-<review-id>-<32 lower hex>     0600, link count 1
@@ -60,7 +60,9 @@ A name becomes inert orphan evidence only after its expected file/directory meta
 
 `registry.json` is at most 1 MiB and 4096 bindings. Its bytes must equal the compact canonical encoding with fixed field order and a final LF. Device and inode are canonical unsigned decimal strings. Diagnostic paths are canonical absolute raw POSIX paths represented as printable UTF-8 or canonical padded RFC 4648 base64.
 
-Bindings are sorted by `(device, inode)`. A duplicate locator, duplicate `ReviewRepositoryId`, unknown/duplicate field, unsupported schema, malformed path, unsorted entry, or noncanonical byte spelling invalidates the complete registry. Read-only lookup never issues an ID and never updates `last_seen_path`.
+Each binding also requires `repository_display_name` and `directory_name`. The display name is UTF-8, contains no slash or ASCII control, is neither empty nor `.`/`..`, has no trailing `-`, and is at most 246 bytes. The directory name must be exactly `<repository_display_name>-<first 8 characters of the canonical ReviewRepositoryId>` and is at most 255 bytes.
+
+Bindings are sorted by `(device, inode)`. A duplicate locator, duplicate `ReviewRepositoryId`, duplicate directory name, unknown/duplicate/missing field, unsupported schema, malformed path/name, unsorted entry, or noncanonical byte spelling invalidates the complete registry. Schema version remains `1`; an earlier field set is simply invalid and is not identified, read compatibly, migrated, renamed, repaired, or removed. Read-only lookup never issues an ID and never updates `last_seen_path`.
 
 ## Installed prepare helper
 
@@ -72,13 +74,15 @@ Bindings are sorted by `(device, inode)`. A duplicate locator, duplicate `Review
 
 The repository field uses the same canonical unpadded base64url/raw absolute POSIX path decoder as `review-projection`. Empty, relative, NUL-containing, padded, malformed, and over-4096-byte paths fail before Store mutation.
 
-Prepare opens the repository and its physical Git common directory, resolves config and Store root independently of a running TUI, admits a supported local filesystem, and takes the exclusive `.locks/registry.lock`. Under that lock it freshly reads the complete registry. An existing physical locator retains its repository ID and may update only `last_seen_path`; a new locator receives one CSPRNG UUIDv4 binding. Every successful request receives a fresh CSPRNG `ReviewId`:
+Prepare opens the repository and its physical Git common directory, resolves config and Store root independently of a running TUI, admits a supported local filesystem, and takes the exclusive `.locks/registry.lock`. For a new physical locator only, it runs exactly `git --no-optional-locks worktree list --porcelain -z`, requires the first record to be non-bare, and strictly admits that record's finite canonical absolute path by no-follow descriptor traversal before using its final basename. A missing, non-directory, symlink-traversing, noncanonical, or oversized main-worktree path fails before Store creation. It preserves UTF-8 bytes and case, removes only trailing `-` characters, then applies the registry display-name limits above. There is no fallback, replacement, truncation, inferred path, or retry.
+
+Under the registry lock, prepare freshly reads the complete registry. An existing physical locator retains its full repository ID and both saved names without rerunning main-worktree discovery; only `last_seen_path` may change. A new locator receives one CSPRNG UUIDv4 binding and one exact repository directory name. Every successful request receives a fresh CSPRNG `ReviewId`:
 
 ```json
 {"status":"ok","schema_version":1,"review_repository_id":"<uuid-v4>","review_id":"<uuid-v4>"}
 ```
 
-Concurrent first prepare requests converge on the winner's binding. Registry replacement is exact canonical bytes through an exclusive owner-only temporary file, file sync, atomic replacement, and Store-root sync. Existing invalid/unreadable registry authority is never treated as empty. Prepare creates no repository namespace or Run directory; an abandoned producer leaves only its binding and unused Review ID.
+Concurrent first prepare requests converge on the winner's binding. For a new binding, prepare atomically creates the exact repository directory without replacement and syncs it before registry replacement. A destination collision returns `repository_namespace_collision`; it never regenerates or extends the UUID suffix. Registry replacement uses exact canonical bytes through an exclusive owner-only temporary file, file sync, atomic replacement, Store-root sync, and lock-held strict read-back. A proven pre-commit failure removes only the operation-owned, metadata-identical empty directory. Committed, unreadable, replaced, or nonempty state is retained without repair. Existing invalid/unreadable registry authority is never treated as empty. Prepare creates no Run directory; an abandoned producer leaves the persisted empty repository namespace, binding, and unused Review ID.
 
 ## Installed immutable publication helper
 
@@ -91,11 +95,11 @@ Concurrent first prepare requests converge on the winner's binding. Registry rep
 
 The manifest is capped at 256 KiB and findings at 16 MiB. Truncation, extra bytes, overflow, invalid sizes, and a second document fail before Store mutation. Publication strictly parses both artifacts, checks caller/artifact IDs, validates the manifest against the exact findings-byte digest and decoded FindingSet, and preserves both caller byte sequences without canonical rewriting.
 
-Before taking the per-repository `publish.lock`, the helper freshly opens the repository, resolves the physical locator and active Store root, validates the registry mapping to the expected repository ID, and checks all three exact target OIDs as local commit objects with no fetch, replacement, or ref resolution. Under the lock it revalidates Store identity/binding and rejects any existing final review name without comparing or replacing content.
+Before taking the per-repository `publish.lock`, the helper freshly opens the repository, resolves the physical locator and active Store root, validates the registry mapping to the expected repository ID and saved actual repository directory name, and checks all three exact target OIDs as local commit objects with no fetch, replacement, or ref resolution. Under the full-ID lock it revalidates Store identity/binding, opens the saved actual directory, and rejects any existing final review name without comparing or replacing content.
 
 Publication writes only one `.tmp-publish-<review-id>-<128-bit-lower-hex>` owner-only directory in the bound namespace. It exclusively creates and syncs exact `manifest.json` and `findings.json`, syncs the staging directory and namespace, atomically renames without replacement to `<review-id>`, and syncs the namespace again. Before rename, every failure exposes no canonical Run. Cleanup unlinks only the two expected files and then the exact operation-owned empty staging directory; it never recursively deletes or touches another temporary/final entry. A failure after the no-replace rename may leave the complete byte-valid Run visible and a retry returns `duplicate_review_id`.
 
-Both helpers emit one canonical JSON terminal plus LF/EOF. Exit groups are: `0` success; `64` request/schema/artifact errors; `66` unavailable target objects; `69` unavailable/unsupported Store platform or filesystem; `73` duplicate review ID; `74` invalid Store/repository, Git, or I/O failure; `75` binding/concurrent conflict; and `70` allocation or unclassified internal failure. Stderr text and Store paths are never machine authority.
+Both helpers emit one canonical JSON terminal plus LF/EOF. Repository preparation preserves the stable codes `main_worktree_unavailable`, `repository_name_invalid`, and `repository_namespace_collision`; hosted Compare jobs carry the same bounded causes through the existing footer and F2 details. Exit groups are: `0` success; `64` request/schema/artifact errors; `65` invalid repository name; `66` unavailable target objects; `69` unavailable/unsupported Store platform or filesystem; `73` duplicate review ID or repository namespace collision; `74` invalid Store/repository, unavailable main worktree, Git, or I/O failure; `75` binding/concurrent conflict; and `70` allocation or unclassified internal failure. Stderr text, raw names, and Store paths are never machine authority.
 
 ## Run admission and result precedence
 
@@ -117,7 +121,7 @@ An explicit scan performs:
 6. one bounded Git availability batch for all valid targets;
 7. full deterministic sort.
 
-Missing Store/registry/binding is unbound. A missing bound namespace is bound-empty. Invalid-only history is distinct: it returns zero rows with bounded skipped diagnostics.
+Missing Store/registry/binding is unbound. A present binding with a missing or invalid saved namespace is ordinary invalid Store state; it is never recreated or renamed. An existing empty saved namespace is bound-empty. Invalid-only history is distinct: it returns zero rows with bounded skipped diagnostics.
 
 Every namespace entry counts toward 1024 entries and 256 KiB of names. At most 512 canonical Run candidates and 256 MiB of aggregate artifact bytes are admitted. Limit overflow discards all partial rows; no filesystem prefix is presented as history. At most eight sanitized single-line diagnostics of 256 display bytes are retained.
 
@@ -152,8 +156,9 @@ is one complete snapshot: expected revision (`0` means absent), optional
 summary, every finding disposition, and every anchored note. Existing notes are
 therefore retained only when the caller includes them in the next snapshot.
 
-Under the per-Run lock, the writer freshly validates registry binding and the
-complete Run. A valid result returns `already_completed` before draft
+Under the per-Run lock, the writer freshly validates registry binding, opens
+the binding's saved actual repository directory, and validates the complete
+Run. A valid result returns `already_completed` before draft
 inspection, including when a retained draft is missing or invalid. Without a
 result, the actual draft revision must exactly equal the request. GitFrame
 assigns revision `1` or the checked next revision, validates the constructed

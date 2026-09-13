@@ -76,7 +76,7 @@ fn deleteLocked(
     var opened = try openExpected(context, request.store);
     defer opened.deinit();
     try validateBinding(allocator, io, opened.root.directory, request.store);
-    var namespace = try opened.root.directory.openDirectory(&repository_name);
+    var namespace = try opened.root.directory.openDirectory(request.store.repository_directory_name.slice());
     defer namespace.deinit();
     var selected = try namespace.openDirectory(&review_name);
     defer selected.deinit();
@@ -179,7 +179,7 @@ fn cleanupWith(
         return err;
     };
     defer repository_trash.deinit();
-    var namespace = try fresh.root.directory.openDirectory(&repository_name);
+    var namespace = try fresh.root.directory.openDirectory(expected.repository_directory_name.slice());
     defer namespace.deinit();
 
     // Inventory before mutation: fixed grammar bounds both count and name bytes.
@@ -273,7 +273,12 @@ fn validateBinding(allocator: std.mem.Allocator, io: std.Io, root: capability.Di
     };
     defer parsed.deinit();
     const found = parsed.lookup(expected.repository_locator) orelse return error.BindingChanged;
-    if (!found.eql(expected.review_repository_id)) return error.BindingChanged;
+    if (!found.review_repository_id.eql(expected.review_repository_id) or
+        !std.mem.eql(u8, found.repository_display_name, expected.repository_display_name.slice()) or
+        !std.mem.eql(u8, found.directory_name, expected.repository_directory_name.slice()))
+    {
+        return error.BindingChanged;
+    }
 }
 
 fn validateLocation(
@@ -288,8 +293,7 @@ fn validateLocation(
     var fresh = try openExpected(context, expected);
     defer fresh.deinit();
     try validateBinding(allocator, io, fresh.root.directory, expected);
-    const repository_name = expected.review_repository_id.canonical();
-    const namespace_now = try fresh.root.directory.admitChild(&repository_name, .directory);
+    const namespace_now = try fresh.root.directory.admitChild(expected.repository_directory_name.slice(), .directory);
     const run_now = try namespace.admitChild(review_name, .directory);
     if (!namespace_now.sameObject(namespace.metadata) or !run_now.sameObject(selected.metadata)) return error.Conflict;
 }
@@ -562,7 +566,7 @@ const TestFixture = struct {
         var context = try core.Context.initConfigured(allocator, path);
         errdefer context.deinit(allocator);
         const locator: review.GitCommonDirectoryLocator = .{ .device = 7, .inode = 11 };
-        const prepared = (try core.prepareBinding(allocator, io, &context, .{ .locator = locator, .repository_path = "/test/repository" })).success;
+        const prepared = (try core.prepareBinding(allocator, io, &context, .{ .locator = locator, .repository_path = "/test/repository", .repository_name = "repository" })).success;
         const oid = try review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
         const target: review.CommittedReviewTarget = .{ .object_format = .sha1, .source_kind = .branch_range, .base_oid = oid, .head_oid = oid, .diff_base_oid = oid };
         const findings: review.FindingSet = .{ .schema_version = 1, .review_id = prepared.review_id, .created_at = "2026-09-10T00:00:00Z", .target = target, .producer = .{ .name = "test" }, .findings = &.{} };
@@ -576,7 +580,7 @@ const TestFixture = struct {
         var opened = context.openExisting().opened;
         defer opened.deinit();
         return .{ .context = context, .store = try parent.openDir(io, "store", .{}), .request = .{
-            .store = .{ .root_device = opened.snapshot.device, .root_inode = opened.snapshot.inode, .repository_locator = locator, .review_repository_id = prepared.review_repository_id },
+            .store = .{ .root_device = opened.snapshot.device, .root_inode = opened.snapshot.inode, .repository_locator = locator, .review_repository_id = prepared.review_repository_id, .repository_display_name = prepared.repository_display_name, .repository_directory_name = prepared.repository_directory_name },
             .review_id = prepared.review_id,
             .artifacts = .{ .manifest_digest = review.Sha256Digest.hash(manifest_bytes), .findings_digest = manifest.findings_digest, .draft_state = .absent, .draft_digest = null, .result_digest = null },
             .allow_unfinished = true,
@@ -612,7 +616,7 @@ const TestFixture = struct {
     }
 
     fn openRun(self: *const TestFixture) !std.Io.Dir {
-        var namespace = try self.store.openDir(std.testing.io, &self.request.store.review_repository_id.canonical(), .{});
+        var namespace = try self.store.openDir(std.testing.io, self.request.store.repository_directory_name.slice(), .{});
         defer namespace.close(std.testing.io);
         return namespace.openDir(std.testing.io, &self.request.review_id.canonical(), .{});
     }

@@ -1142,12 +1142,9 @@ test "AI Reviews initial page is stable and Run selection is explicit" {
         .missing,
     );
     state.picker.scan_result = .{ .history = .{
-        .snapshot = .{
-            .root_device = 1,
-            .root_inode = 2,
-            .repository_locator = .{ .device = 3, .inode = 4 },
-            .review_repository_id = try committed_review.ReviewRepositoryId.parse("323e4567-e89b-42d3-a456-426614174000"),
-        },
+        .snapshot = testStoreSnapshot(
+            try committed_review.ReviewRepositoryId.parse("323e4567-e89b-42d3-a456-426614174000"),
+        ),
         .rows = rows,
         .diagnostics = try std.testing.allocator.alloc(review_store.Diagnostic, 0),
         .skipped_count = 0,
@@ -1276,4 +1273,16 @@ test "AI Reviews initial page is stable and Run selection is explicit" {
     try std.testing.expect(std.mem.indexOf(u8, loading.text, "aaaaaaa") != null);
     try std.testing.expect(std.mem.indexOf(u8, loading.text, " → ") != null);
     try std.testing.expect(std.mem.indexOf(u8, loading.text, "bbbbbbb") != null);
+}
+
+fn testStoreSnapshot(repository_id: committed_review.ReviewRepositoryId) review_store.StoreSnapshot {
+    const display = review_store.RepositoryDisplayName.fromStored("repository") catch unreachable;
+    return .{
+        .root_device = 1,
+        .root_inode = 2,
+        .repository_locator = .{ .device = 3, .inode = 4 },
+        .review_repository_id = repository_id,
+        .repository_display_name = display,
+        .repository_directory_name = review_store.RepositoryDirectoryName.format(&display, repository_id),
+    };
 }

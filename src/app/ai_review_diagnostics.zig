@@ -43,9 +43,9 @@ pub fn cause(phase: job.Phase) ?[]const u8 {
         },
         .invalid_provider_result => |stage| if (stage == .input) "invalid review input" else "invalid answer",
         .invalid_candidates => "invalid candidates",
-        .store_prepare_failed => "save setup failed",
+        .store_prepare_failed => |store_cause| storeCauseLabel(store_cause),
         .artifact_failed => "artifact creation failed",
-        .publish_failed => "save operation failed",
+        .publish_failed => |store_cause| storeCauseLabel(store_cause),
         .exact_reconciliation_failed => "save verification failed",
         .internal_error => "internal error",
     };
@@ -179,9 +179,19 @@ fn formatFailure(writer: *std.Io.Writer, failure: pipeline.FailureCode) void {
             "Stage: Answer decoding\nThe answer was not accepted.\nNext: Check Codex CLI output and compatibility.\n") catch unreachable,
         .provider_failed => writer.writeAll("Stage: Provider execution\nNext: Check provider I/O and process availability.\n") catch unreachable,
         .invalid_candidates => writer.writeAll("Stage: Candidate validation\nThe answer was not accepted.\nNext: Reload the fixed target and check provider output.\n") catch unreachable,
-        .store_prepare_failed => writer.writeAll("Stage: Store preparation\nNo review was saved.\nNext: Check the configured Store destination and permissions.\n") catch unreachable,
+        .store_prepare_failed => |store_cause| formatStoreFailure(
+            writer,
+            "Store preparation",
+            "No review was saved.",
+            store_cause,
+        ),
         .artifact_failed => writer.writeAll("Stage: Artifact creation\nThe answer was not published.\nNext: Reload the fixed target and check repository data.\n") catch unreachable,
-        .publish_failed => writer.writeAll("Stage: Store publication\nThe final save state could not be confirmed.\nNext: Reload AI Reviews and inspect the Store before starting another review.\n") catch unreachable,
+        .publish_failed => |store_cause| formatStoreFailure(
+            writer,
+            "Store publication",
+            "The final save state could not be confirmed.",
+            store_cause,
+        ),
         .exact_reconciliation_failed => writer.writeAll("Stage: Save verification\nThe review result could not be verified against the expected metadata.\nNext: Reload AI Reviews and inspect the Store.\n") catch unreachable,
         .internal_error => |stage| {
             writer.print("Stage: {s}\nNext: Check available memory and runtime resources.\n", .{
@@ -189,6 +199,51 @@ fn formatFailure(writer: *std.Io.Writer, failure: pipeline.FailureCode) void {
             }) catch unreachable;
         },
     }
+}
+
+fn storeCauseLabel(value: diagnostic.StoreCause) []const u8 {
+    return switch (value) {
+        .invalid_artifact => "invalid review artifacts",
+        .target_unavailable => "target unavailable",
+        .store_unavailable => "review store unavailable",
+        .unsupported_platform => "review store platform unsupported",
+        .unsupported_filesystem => "review store filesystem unsupported",
+        .duplicate_review_id => "duplicate review ID",
+        .store_invalid => "review store invalid",
+        .repository_invalid => "repository invalid",
+        .main_worktree_unavailable => "main worktree unavailable",
+        .repository_name_invalid => "repository name invalid",
+        .repository_namespace_collision => "repository namespace collision",
+        .git_failed => "Git verification failed",
+        .io_failed => "review store I/O failed",
+        .binding_mismatch => "repository binding mismatch",
+        .concurrent_conflict => "review store changed concurrently",
+    };
+}
+
+fn formatStoreFailure(
+    writer: *std.Io.Writer,
+    stage: []const u8,
+    outcome: []const u8,
+    store_cause: diagnostic.StoreCause,
+) void {
+    writer.print("Stage: {s}\nCause: {s}\n{s}\nNext: {s}\n", .{
+        stage,
+        storeCauseLabel(store_cause),
+        outcome,
+        switch (store_cause) {
+            .main_worktree_unavailable => "Check Git worktree metadata and the main worktree.",
+            .repository_name_invalid => "Use a valid UTF-8 main-worktree directory name within the Store component limit.",
+            .repository_namespace_collision => "Inspect the conflicting Store namespace and registry; do not overwrite it.",
+            .unsupported_platform, .unsupported_filesystem => "Use a supported local Review Store platform and filesystem.",
+            .repository_invalid, .git_failed, .target_unavailable => "Reload the repository and fixed review target.",
+            .invalid_artifact => "Reload the fixed target and verify the generated review artifacts.",
+            .duplicate_review_id => "Reload AI Reviews and inspect this review ID before starting another review.",
+            .binding_mismatch, .concurrent_conflict => "Reload AI Reviews and verify the repository binding before retrying.",
+            .store_invalid => "Inspect the configured Review Store without modifying unknown entries.",
+            .store_unavailable, .io_failed => "Check the configured Store destination and permissions.",
+        },
+    }) catch unreachable;
 }
 
 fn formatStartFailure(writer: *std.Io.Writer, failure: job.StartFailure) void {

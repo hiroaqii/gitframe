@@ -63,6 +63,23 @@ pub const Unavailable = enum { private_environment, executable_missing, executab
 pub const Incompatible = enum { environment, process_control, unexpected_event, model_mismatch };
 pub const InvalidResultStage = enum { input, answer };
 pub const InternalStage = enum { before_provider };
+pub const StoreCause = enum {
+    invalid_artifact,
+    target_unavailable,
+    store_unavailable,
+    unsupported_platform,
+    unsupported_filesystem,
+    duplicate_review_id,
+    store_invalid,
+    repository_invalid,
+    main_worktree_unavailable,
+    repository_name_invalid,
+    repository_namespace_collision,
+    git_failed,
+    io_failed,
+    binding_mismatch,
+    concurrent_conflict,
+};
 pub const Exit = struct {
     classification: enum { authentication_response, cli_response, other },
     term: std.process.Child.Term,

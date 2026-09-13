@@ -37,7 +37,7 @@ pub fn publish(
     return service.publish(allocator, io, environment_map, request);
 }
 
-test "review run publication prepare creates one durable binding and no Run namespace" {
+test "review run publication prepare creates one durable binding and named repository namespace" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -104,7 +104,11 @@ test "review run publication prepare creates one durable binding and no Run name
     };
     try std.testing.expectEqual(@as(usize, 1), value.bindings.len);
     try std.testing.expect(value.bindings[0].review_repository_id.eql(first_success.review_repository_id));
+    try std.testing.expectEqualStrings(first_success.repository_display_name.slice(), value.bindings[0].repository_display_name);
+    try std.testing.expectEqualStrings(first_success.repository_directory_name.slice(), value.bindings[0].directory_name);
     try std.testing.expectEqualSlices(u8, repository_path, value.bindings[0].canonical_path.bytes);
+    var named_namespace = try root.directory.openDirectory(first_success.repository_directory_name.slice());
+    named_namespace.deinit();
     const repository_id_text = first_success.review_repository_id.canonical();
     if (root.directory.openDirectory(&repository_id_text)) |unexpected| {
         var owned = unexpected;
@@ -354,8 +358,7 @@ test "review run publication preserves exact bytes rejects duplicates and reopen
     defer allocator.free(store_root);
     var root = try capability.StoreRootCapability.openCanonical(store_root);
     defer root.deinit();
-    const repository_id_text = identities.review_repository_id.canonical();
-    var namespace = try root.directory.openDirectory(&repository_id_text);
+    var namespace = try root.directory.openDirectory(identities.repository_directory_name.slice());
     defer namespace.deinit();
     const review_id_text = identities.review_id.canonical();
     var run_dir = try namespace.openDirectory(&review_id_text);

@@ -4,6 +4,7 @@ const std = @import("std");
 const committed_review = @import("../committed_review.zig");
 const strict = @import("../committed_review/strict_json.zig");
 const capability = @import("capability.zig");
+const store_name = @import("name.zig");
 const store_path = @import("path.zig");
 
 pub const max_registry_bytes: usize = 1024 * 1024;
@@ -28,6 +29,8 @@ pub fn diagnosticPath(bytes: []const u8) strict.ParseError!DiagnosticPath {
 
 pub const Binding = struct {
     review_repository_id: committed_review.ReviewRepositoryId,
+    repository_display_name: []const u8,
+    directory_name: []const u8,
     locator: committed_review.GitCommonDirectoryLocator,
     canonical_path: DiagnosticPath,
     last_seen_path: DiagnosticPath,
@@ -45,9 +48,9 @@ pub const ParsedRegistry = struct {
     pub fn lookup(
         self: *const ParsedRegistry,
         locator: committed_review.GitCommonDirectoryLocator,
-    ) ?committed_review.ReviewRepositoryId {
-        for (self.bindings) |binding| {
-            if (binding.locator.eql(locator)) return binding.review_repository_id;
+    ) ?*const Binding {
+        for (self.bindings) |*binding| {
+            if (binding.locator.eql(locator)) return binding;
         }
         return null;
     }
@@ -136,8 +139,13 @@ pub fn writeCanonicalAlloc(
     for (bindings, 0..) |binding, index| {
         const repository_id = binding.review_repository_id.canonical();
         _ = committed_review.ReviewRepositoryId.parse(&repository_id) catch return error.InvalidValue;
+        const display = store_name.RepositoryDisplayName.fromStored(binding.repository_display_name) catch
+            return error.InvalidValue;
+        _ = store_name.RepositoryDirectoryName.fromStored(binding.directory_name, &display, binding.review_repository_id) catch
+            return error.InvalidValue;
         for (bindings[0..index]) |prior| {
-            if (prior.review_repository_id.eql(binding.review_repository_id)) return error.InvalidValue;
+            if (prior.review_repository_id.eql(binding.review_repository_id) or
+                std.mem.eql(u8, prior.directory_name, binding.directory_name)) return error.InvalidValue;
         }
         if (index != 0) {
             const prior = bindings[index - 1].locator;
@@ -161,6 +169,8 @@ pub fn writeCanonicalAlloc(
         stringify.beginObject() catch return error.ArtifactTooLarge;
         const repository_id = binding.review_repository_id.canonical();
         try jsonField(&stringify, "review_repository_id", &repository_id);
+        try jsonField(&stringify, "repository_display_name", binding.repository_display_name);
+        try jsonField(&stringify, "directory_name", binding.directory_name);
         var device_buffer: [20]u8 = undefined;
         const device = std.fmt.bufPrint(&device_buffer, "{d}", .{binding.locator.device}) catch
             return error.InvalidValue;
@@ -237,6 +247,8 @@ fn parseBindings(parser: *strict.Parser, allocator: std.mem.Allocator) strict.Pa
 fn parseBindingBody(parser: *strict.Parser, allocator: std.mem.Allocator) strict.ParseError!Binding {
     var seen: u32 = 0;
     var repository_id: ?committed_review.ReviewRepositoryId = null;
+    var repository_display_name: ?[]const u8 = null;
+    var directory_name: ?[]const u8 = null;
     var device: ?u64 = null;
     var inode: ?u64 = null;
     var canonical_path: ?DiagnosticPath = null;
@@ -246,25 +258,37 @@ fn parseBindingBody(parser: *strict.Parser, allocator: std.mem.Allocator) strict
             try strict.markSeen(&seen, 0);
             repository_id = committed_review.ReviewRepositoryId.parse(try parser.string()) catch
                 return error.InvalidValue;
-        } else if (std.mem.eql(u8, key, "device")) {
+        } else if (std.mem.eql(u8, key, "repository_display_name")) {
             try strict.markSeen(&seen, 1);
+            repository_display_name = try parser.string();
+        } else if (std.mem.eql(u8, key, "directory_name")) {
+            try strict.markSeen(&seen, 2);
+            directory_name = try parser.string();
+        } else if (std.mem.eql(u8, key, "device")) {
+            try strict.markSeen(&seen, 3);
             device = try parseDecimal(try parser.string());
         } else if (std.mem.eql(u8, key, "inode")) {
-            try strict.markSeen(&seen, 2);
+            try strict.markSeen(&seen, 4);
             inode = try parseDecimal(try parser.string());
         } else if (std.mem.eql(u8, key, "canonical_path")) {
-            try strict.markSeen(&seen, 3);
+            try strict.markSeen(&seen, 5);
             canonical_path = try parsePath(parser, allocator);
         } else if (std.mem.eql(u8, key, "last_seen_path")) {
-            try strict.markSeen(&seen, 4);
+            try strict.markSeen(&seen, 6);
             last_seen_path = try parsePath(parser, allocator);
         } else {
             return error.UnknownField;
         }
     }
-    try strict.requireFields(seen, 0b1_1111);
+    try strict.requireFields(seen, 0b111_1111);
+    const display = store_name.RepositoryDisplayName.fromStored(repository_display_name.?) catch
+        return error.InvalidValue;
+    _ = store_name.RepositoryDirectoryName.fromStored(directory_name.?, &display, repository_id.?) catch
+        return error.InvalidValue;
     return .{
         .review_repository_id = repository_id.?,
+        .repository_display_name = repository_display_name.?,
+        .directory_name = directory_name.?,
         .locator = .{ .device = device.?, .inode = inode.? },
         .canonical_path = canonical_path.?,
         .last_seen_path = last_seen_path.?,
@@ -340,13 +364,14 @@ fn parseDecimal(value: []const u8) strict.ParseError!u64 {
 test "review history backend registry is strict sorted and locator authoritative" {
     const bytes =
         "{\"schema_version\":1,\"bindings\":[" ++
-        "{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/repo/a\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/moved/a\"}}," ++
-        "{\"review_repository_id\":\"223e4567-e89b-42d3-a456-426614174000\",\"device\":\"7\",\"inode\":\"12\",\"canonical_path\":{\"encoding\":\"base64\",\"value\":\"L3JlcG8v/w==\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/repo/b\"}}]}\n";
+        "{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"Repo-A\",\"directory_name\":\"Repo-A-123e4567\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/repo/a\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/moved/a\"}}," ++
+        "{\"review_repository_id\":\"223e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"Repo-B\",\"directory_name\":\"Repo-B-223e4567\",\"device\":\"7\",\"inode\":\"12\",\"canonical_path\":{\"encoding\":\"base64\",\"value\":\"L3JlcG8v/w==\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/repo/b\"}}]}\n";
     var parsed = try parseStrict(std.testing.allocator, bytes);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.bindings.len);
-    const id = parsed.lookup(.{ .device = 7, .inode = 12 }).?;
-    try std.testing.expect(id.eql(try committed_review.ReviewRepositoryId.parse("223e4567-e89b-42d3-a456-426614174000")));
+    const binding = parsed.lookup(.{ .device = 7, .inode = 12 }).?;
+    try std.testing.expect(binding.review_repository_id.eql(try committed_review.ReviewRepositoryId.parse("223e4567-e89b-42d3-a456-426614174000")));
+    try std.testing.expectEqualStrings("Repo-B-223e4567", binding.directory_name);
     try std.testing.expectEqualSlices(u8, "/repo/\xff", parsed.bindings[1].canonical_path.bytes);
     try std.testing.expect(parsed.lookup(.{ .device = 8, .inode = 12 }) == null);
     const unsorted = [_]Binding{ parsed.bindings[1], parsed.bindings[0] };
@@ -356,8 +381,24 @@ test "review history backend registry is strict sorted and locator authoritative
 test "review history backend registry rejects duplicate authority and noncanonical scalar wire" {
     const duplicate =
         "{\"schema_version\":1,\"bindings\":[" ++
-        "{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"device\":\"07\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/repo\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/repo\"}}]}";
+        "{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"repo\",\"directory_name\":\"repo-123e4567\",\"device\":\"07\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/repo\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/repo\"}}]}";
     try std.testing.expectError(error.InvalidValue, parseStrict(std.testing.allocator, duplicate));
+
+    const old_field_set =
+        "{\"schema_version\":1,\"bindings\":[" ++
+        "{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/repo\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/repo\"}}]}";
+    try std.testing.expectError(error.MissingField, parseStrict(std.testing.allocator, old_field_set));
+
+    const mismatched_directory =
+        "{\"schema_version\":1,\"bindings\":[" ++
+        "{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"repo\",\"directory_name\":\"repo-deadbeef\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/repo\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/repo\"}}]}";
+    try std.testing.expectError(error.InvalidValue, parseStrict(std.testing.allocator, mismatched_directory));
+
+    const duplicate_directory =
+        "{\"schema_version\":1,\"bindings\":[" ++
+        "{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"repo\",\"directory_name\":\"repo-123e4567\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/repo/a\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/repo/a\"}}," ++
+        "{\"review_repository_id\":\"123e4567-e89b-42d3-b456-426614174001\",\"repository_display_name\":\"repo\",\"directory_name\":\"repo-123e4567\",\"device\":\"7\",\"inode\":\"12\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/repo/b\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/repo/b\"}}]}\n";
+    try std.testing.expectError(error.InvalidValue, parseStrict(std.testing.allocator, duplicate_directory));
 
     const unknown = "{\"schema_version\":1,\"bindings\":[],\"extra\":true}";
     try std.testing.expectError(error.UnknownField, parseStrict(std.testing.allocator, unknown));

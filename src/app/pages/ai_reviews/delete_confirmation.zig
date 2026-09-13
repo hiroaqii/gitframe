@@ -420,10 +420,14 @@ fn testRow() !review_store.RunSummary {
 }
 
 fn testStoreSnapshot() review_store.StoreSnapshot {
+    const repository_id = committed_review.ReviewRepositoryId.parse("223e4567-e89b-42d3-a456-426614174000") catch unreachable;
+    const display = review_store.RepositoryDisplayName.fromStored("repository") catch unreachable;
     return .{
         .root_device = 1,
         .root_inode = 2,
         .repository_locator = .{ .device = 3, .inode = 4 },
-        .review_repository_id = committed_review.ReviewRepositoryId.parse("223e4567-e89b-42d3-a456-426614174000") catch unreachable,
+        .review_repository_id = repository_id,
+        .repository_display_name = display,
+        .repository_directory_name = review_store.RepositoryDirectoryName.format(&display, repository_id),
     };
 }

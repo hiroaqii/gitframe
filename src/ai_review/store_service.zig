@@ -14,6 +14,7 @@ const root_capability = @import("../repo/root_capability.zig");
 const catalog_store = @import("../review_store/catalog.zig");
 const core = @import("../review_store/core.zig");
 const mutation_store = @import("../review_store/mutation.zig");
+const store_name = @import("../review_store/name.zig");
 const store_path = @import("../review_store/path.zig");
 const run = @import("../review_store/run.zig");
 
@@ -858,8 +859,29 @@ pub fn readExactResult(
     } };
 }
 
-pub const PublicationFailure = enum { invalid_artifact, target_unavailable, store_unavailable, unsupported_platform, unsupported_filesystem, duplicate_review_id, store_invalid, repository_invalid, git_failed, io_failed, binding_mismatch, concurrent_conflict };
-pub const PrepareSuccess = struct { review_repository_id: committed_review.ReviewRepositoryId, review_id: committed_review.ReviewId };
+pub const PublicationFailure = enum {
+    invalid_artifact,
+    target_unavailable,
+    store_unavailable,
+    unsupported_platform,
+    unsupported_filesystem,
+    duplicate_review_id,
+    store_invalid,
+    repository_invalid,
+    main_worktree_unavailable,
+    repository_name_invalid,
+    repository_namespace_collision,
+    git_failed,
+    io_failed,
+    binding_mismatch,
+    concurrent_conflict,
+};
+pub const PrepareSuccess = struct {
+    review_repository_id: committed_review.ReviewRepositoryId,
+    review_id: committed_review.ReviewId,
+    repository_display_name: store_name.RepositoryDisplayName,
+    repository_directory_name: store_name.RepositoryDirectoryName,
+};
 pub const PrepareResult = union(enum) { success: PrepareSuccess, failure: PublicationFailure };
 pub const PublishRequest = struct { repository_path: []const u8, review_repository_id: committed_review.ReviewRepositoryId, review_id: committed_review.ReviewId, manifest_bytes: []const u8, findings_bytes: []const u8 };
 pub const PublishResult = union(enum) { success, failure: PublicationFailure };
@@ -1191,9 +1213,9 @@ fn maintenancePublicationFailure(failure: PublicationFailure) MaintenanceFailure
     return switch (failure) {
         .store_unavailable => .store_unavailable,
         .unsupported_platform, .unsupported_filesystem => .unsupported,
-        .repository_invalid, .binding_mismatch => .binding_changed,
+        .repository_invalid, .main_worktree_unavailable, .repository_name_invalid, .binding_mismatch => .binding_changed,
         .store_invalid, .invalid_artifact => .run_invalid,
-        .duplicate_review_id, .concurrent_conflict => .conflict,
+        .duplicate_review_id, .repository_namespace_collision, .concurrent_conflict => .conflict,
         .target_unavailable, .git_failed, .io_failed => .io_failed,
     };
 }
@@ -1248,23 +1270,41 @@ pub fn prepareWithRepository(
         .locator => |value| value,
         .failure => |failure| return .{ .failure = failure },
     };
-    return prepareLocated(allocator, io, configured_store, locator, repository_path);
+    return prepareLocated(allocator, io, configured_store, repository.git(), locator, repository_path);
 }
 
 fn prepareLocated(
     allocator: std.mem.Allocator,
     io: std.Io,
     configured_store: *const ConfiguredStore,
+    repository: git_command.DirectoryContext,
     locator: committed_review.GitCommonDirectoryLocator,
     repository_path: []const u8,
 ) std.mem.Allocator.Error!PrepareResult {
+    const probe = try core.probeBinding(allocator, io, configured_store.context(), locator);
+    var main_worktree: repository_locator.MainWorktreeResult = .unavailable;
+    defer main_worktree.deinit(allocator);
+    const repository_name: ?[]const u8 = switch (probe) {
+        .bound => null,
+        .unbound => blk: {
+            main_worktree = try repository_locator.mainWorktreeBasename(allocator, io, repository);
+            break :blk switch (main_worktree) {
+                .basename => |value| value,
+                .unavailable => return .{ .failure = .main_worktree_unavailable },
+            };
+        },
+        .failure => |failure| return .{ .failure = mapPrepareCoreFailure(failure) },
+    };
     return switch (try core.prepareBinding(allocator, io, configured_store.context(), .{
         .locator = locator,
         .repository_path = repository_path,
+        .repository_name = repository_name,
     })) {
         .success => |value| .{ .success = .{
             .review_repository_id = value.review_repository_id,
             .review_id = value.review_id,
+            .repository_display_name = value.repository_display_name,
+            .repository_directory_name = value.repository_directory_name,
         } },
         .failure => |failure| .{ .failure = mapPrepareCoreFailure(failure) },
     };
@@ -1287,7 +1327,7 @@ pub fn prepare(
         .store => |*value| value,
         .failure => return .{ .failure = .store_invalid },
     };
-    return prepareLocated(allocator, io, configured_store, repository.locator, repository_path);
+    return prepareLocated(allocator, io, configured_store, repository.git(), repository.locator, repository_path);
 }
 
 /// Publish through the existing Store core using retained physical authority.
@@ -1612,6 +1652,8 @@ fn mapPublicationToReadFailure(failure: PublicationFailure) ReadFailure {
         .unsupported_filesystem => .unsupported_filesystem,
         .store_invalid => .store_invalid,
         .repository_invalid => .repository_invalid,
+        .main_worktree_unavailable, .repository_name_invalid => .repository_invalid,
+        .repository_namespace_collision => .concurrent_conflict,
         .git_failed => .git_failed,
         .io_failed => .io_failed,
         .binding_mismatch => .binding_invalid,
@@ -1629,6 +1671,8 @@ fn mapPrepareCoreFailure(failure: core.PrepareBindingFailure) PublicationFailure
         .unsupported_filesystem => .unsupported_filesystem,
         .store_invalid => .store_invalid,
         .repository_invalid => .repository_invalid,
+        .repository_name_invalid => .repository_name_invalid,
+        .repository_namespace_collision => .repository_namespace_collision,
         .io_failed => .io_failed,
         .concurrent_conflict => .concurrent_conflict,
     };
@@ -2126,6 +2170,123 @@ fn directoryInventory(
     return result.toOwnedSlice(allocator);
 }
 
+test "review store preparation distinguishes unavailable main worktree and invalid repository name" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "store-bare", .fromMode(0o700));
+    try tmp.dir.createDir(io, "store-invalid", .fromMode(0o700));
+    allocator.free(try runTestGit(io, tmp.dir, &.{ "git", "init", "--bare", "Bare.git" }));
+    try tmp.dir.createDir(io, "---", .default_dir);
+    var invalid_repo = try tmp.dir.openDir(io, "---", .{});
+    defer invalid_repo.close(io);
+    allocator.free(try runTestGit(io, invalid_repo, &.{ "git", "init", "--initial-branch=main" }));
+
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    inline for (.{
+        .{ "Bare.git", "store-bare", PublicationFailure.main_worktree_unavailable },
+        .{ "---", "store-invalid", PublicationFailure.repository_name_invalid },
+    }) |case| {
+        const repository_path = try tmp.dir.realPathFileAlloc(io, case[0], allocator);
+        defer allocator.free(repository_path);
+        const store_path_text = try tmp.dir.realPathFileAlloc(io, case[1], allocator);
+        defer allocator.free(store_path_text);
+        var root = try root_capability.RootCapability.openCanonical(repository_path);
+        defer root.deinit();
+        var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
+        defer configured.deinit(allocator);
+        const result = try prepareWithRepository(
+            allocator,
+            io,
+            &configured,
+            .{ .capability = &root, .environment = &environment },
+            repository_path,
+        );
+        try std.testing.expectEqual(case[2], result.failure);
+        if (case[2] == .main_worktree_unavailable) {
+            var store = try tmp.dir.openDir(io, case[1], .{ .iterate = true });
+            defer store.close(io);
+            var iterator = store.iterate();
+            try std.testing.expect(try iterator.next(io) == null);
+        }
+    }
+}
+
+test "review store preparation never reruns main-worktree discovery for an existing binding" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "Bound-Repo", .default_dir);
+    try tmp.dir.createDir(io, "store", .fromMode(0o700));
+    try tmp.dir.createDir(io, "bin", .default_dir);
+    var repo = try tmp.dir.openDir(io, "Bound-Repo", .{});
+    defer repo.close(io);
+    allocator.free(try runTestGit(io, repo, &.{ "git", "init", "--initial-branch=main" }));
+    const repository_path = try tmp.dir.realPathFileAlloc(io, "Bound-Repo", allocator);
+    defer allocator.free(repository_path);
+    const common_path = try std.fs.path.join(allocator, &.{ repository_path, ".git" });
+    defer allocator.free(common_path);
+    const store_path_text = try tmp.dir.realPathFileAlloc(io, "store", allocator);
+    defer allocator.free(store_path_text);
+    var root = try root_capability.RootCapability.openCanonical(repository_path);
+    defer root.deinit();
+    var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
+    defer configured.deinit(allocator);
+    var normal_environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer normal_environment.deinit();
+    const first_result = try prepareWithRepository(
+        allocator,
+        io,
+        &configured,
+        .{ .capability = &root, .environment = &normal_environment },
+        repository_path,
+    );
+    const first = switch (first_result) {
+        .success => |value| value,
+        .failure => return error.ExpectedPrepareSuccess,
+    };
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nif [ \"$1\" = \"--no-optional-locks\" ] && [ \"$2\" = \"rev-parse\" ]; then\n  printf '%s\\n' \"{s}\"\n  exit 0\nfi\nif [ \"$1\" = \"--no-optional-locks\" ] && [ \"$2\" = \"worktree\" ]; then\n  exit 71\nfi\nexit 70\n",
+        .{common_path},
+    );
+    defer allocator.free(script);
+    var bin = try tmp.dir.openDir(io, "bin", .{});
+    defer bin.close(io);
+    try bin.writeFile(io, .{
+        .sub_path = "git",
+        .data = script,
+        .flags = .{ .permissions = .fromMode(0o700) },
+    });
+    const bin_path = try tmp.dir.realPathFileAlloc(io, "bin", allocator);
+    defer allocator.free(bin_path);
+    var parent_environment = std.process.Environ.Map.init(allocator);
+    defer parent_environment.deinit();
+    try parent_environment.put("PATH", bin_path);
+    var worktree_failing_environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment);
+    defer worktree_failing_environment.deinit();
+    const second_result = try prepareWithRepository(
+        allocator,
+        io,
+        &configured,
+        .{ .capability = &root, .environment = &worktree_failing_environment },
+        repository_path,
+    );
+    const second = switch (second_result) {
+        .success => |value| value,
+        .failure => return error.MainWorktreeDiscoveryWasRepeated,
+    };
+    try std.testing.expect(first.review_repository_id.eql(second.review_repository_id));
+    try std.testing.expect(first.repository_display_name.eql(&second.repository_display_name));
+    try std.testing.expect(first.repository_directory_name.eql(&second.repository_directory_name));
+}
+
 test "review store deletion service preserves Git and sibling Runs without target objects" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2154,15 +2315,14 @@ test "review store deletion service preserves Git and sibling Runs without targe
     defer allocator.free(store_path_text);
     var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
     defer configured.deinit(allocator);
-    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = locator, .repository_path = repo_path })).success;
+    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = locator, .repository_path = repo_path, .repository_name = "repo" })).success;
     var store = try tmp.dir.openDir(io, "store", .{});
     defer store.close(io);
     const repository_text = prepared.review_repository_id.canonical();
     var locks = try store.openDir(io, ".locks", .{});
     defer locks.close(io);
     try locks.createDir(io, &repository_text, .fromMode(0o700));
-    try store.createDir(io, &repository_text, .fromMode(0o700));
-    var namespace = try store.openDir(io, &repository_text, .{});
+    var namespace = try store.openDir(io, prepared.repository_directory_name.slice(), .{});
     defer namespace.close(io);
     // These object IDs have never existed in this Git repository.
     const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
@@ -2170,9 +2330,8 @@ test "review store deletion service preserves Git and sibling Runs without targe
     const sibling = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
     try seedTestRun(allocator, io, namespace, prepared.review_repository_id, prepared.review_id, target, "2026-08-20T08:00:00Z", .completed_invalid_draft);
     try seedTestRun(allocator, io, namespace, prepared.review_repository_id, sibling, target, "2026-08-20T08:00:00Z", .draft);
-    const other = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = .{ .device = 7, .inode = 11 }, .repository_path = "/test/other" })).success;
-    try store.createDir(io, &other.review_repository_id.canonical(), .fromMode(0o700));
-    var other_namespace = try store.openDir(io, &other.review_repository_id.canonical(), .{});
+    const other = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = .{ .device = 7, .inode = 11 }, .repository_path = "/test/other", .repository_name = "other" })).success;
+    var other_namespace = try store.openDir(io, other.repository_directory_name.slice(), .{});
     defer other_namespace.close(io);
     try seedTestRun(allocator, io, other_namespace, other.review_repository_id, prepared.review_id, target, "2026-08-20T08:00:00Z", .completed);
     var scanned = try catalog_store.scan(allocator, io, configured.context(), locator);
@@ -2247,15 +2406,14 @@ test "review store maintenance prune scan and sequential delete use a disposable
     defer allocator.free(store_path_text);
     var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
     defer configured.deinit(allocator);
-    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = locator, .repository_path = repo_path })).success;
+    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = locator, .repository_path = repo_path, .repository_name = "repo" })).success;
     var store = try tmp.dir.openDir(io, "store", .{});
     defer store.close(io);
     const repository_text = prepared.review_repository_id.canonical();
     var locks = try store.openDir(io, ".locks", .{});
     defer locks.close(io);
     try locks.createDir(io, &repository_text, .fromMode(0o700));
-    try store.createDir(io, &repository_text, .fromMode(0o700));
-    var namespace = try store.openDir(io, &repository_text, .{});
+    var namespace = try store.openDir(io, prepared.repository_directory_name.slice(), .{});
     defer namespace.close(io);
 
     const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
@@ -2274,9 +2432,8 @@ test "review store maintenance prune scan and sequential delete use a disposable
     try seedTestRun(allocator, io, namespace, prepared.review_repository_id, oldest_id, target, "2026-08-20T04:00:00Z", .completed);
     try seedTestRun(allocator, io, namespace, prepared.review_repository_id, draft_id, target, "2026-08-20T03:00:00Z", .draft);
 
-    const other = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = .{ .device = 17, .inode = 19 }, .repository_path = "/test/prune-other" })).success;
-    try store.createDir(io, &other.review_repository_id.canonical(), .fromMode(0o700));
-    var other_namespace = try store.openDir(io, &other.review_repository_id.canonical(), .{});
+    const other = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = .{ .device = 17, .inode = 19 }, .repository_path = "/test/prune-other", .repository_name = "prune-other" })).success;
+    var other_namespace = try store.openDir(io, other.repository_directory_name.slice(), .{});
     defer other_namespace.close(io);
     try seedTestRun(allocator, io, other_namespace, other.review_repository_id, older_id, target, "2026-08-20T01:00:00Z", .completed);
 
@@ -2502,11 +2659,11 @@ test "Finding disposition exact reload keeps AI Review Store selection identity 
     defer store.close(io);
     const repository_id = try committed_review.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
     const repository_text = repository_id.canonical();
-    const registry_bytes = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"bindings\":[{{\"review_repository_id\":\"{s}\",\"device\":\"{d}\",\"inode\":\"{d}\",\"canonical_path\":{{\"encoding\":\"utf8\",\"value\":\"{s}\"}},\"last_seen_path\":{{\"encoding\":\"utf8\",\"value\":\"{s}\"}}}}]}}\n", .{ &repository_text, locator.device, locator.inode, repo_path, repo_path });
+    const registry_bytes = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"bindings\":[{{\"review_repository_id\":\"{s}\",\"repository_display_name\":\"repo\",\"directory_name\":\"repo-123e4567\",\"device\":\"{d}\",\"inode\":\"{d}\",\"canonical_path\":{{\"encoding\":\"utf8\",\"value\":\"{s}\"}},\"last_seen_path\":{{\"encoding\":\"utf8\",\"value\":\"{s}\"}}}}]}}\n", .{ &repository_text, locator.device, locator.inode, repo_path, repo_path });
     defer allocator.free(registry_bytes);
     try writePrivate(io, store, "registry.json", registry_bytes);
-    try store.createDir(io, &repository_text, .fromMode(0o700));
-    var namespace = try store.openDir(io, &repository_text, .{});
+    try store.createDir(io, "repo-123e4567", .fromMode(0o700));
+    var namespace = try store.openDir(io, "repo-123e4567", .{});
     defer namespace.close(io);
 
     const valid_id = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
@@ -2834,7 +2991,7 @@ test "Finding disposition exact reload keeps AI Review Store selection identity 
     try seedTestRun(allocator, io, namespace, repository_id, mismatched_id, mismatched_target, "2026-08-20T05:00:00Z", .completed_invalid_draft);
     var mismatch_store = try capability.StoreRootCapability.openCanonical(store_path_text);
     defer mismatch_store.deinit();
-    var mismatch_namespace = try mismatch_store.directory.openDirectory(&repository_text);
+    var mismatch_namespace = try mismatch_store.directory.openDirectory(history.snapshot.repository_directory_name.slice());
     defer mismatch_namespace.deinit();
     var mismatch_budget: run.ArtifactBudget = .{};
     var mismatch_loaded = try run.loadValidated(

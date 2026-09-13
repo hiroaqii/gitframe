@@ -2808,12 +2808,12 @@ test "human review result session App bridge tracks every accepted draft and res
             .result_digest = null,
         },
     };
-    try app.pages.ai_reviews.delete_confirmation.begin(allocator, .{
-        .root_device = 1,
-        .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
-        .review_repository_id = repository_id,
-    }, &delete_row, null);
+    try app.pages.ai_reviews.delete_confirmation.begin(
+        allocator,
+        humanReviewTestStoreSnapshot(repository_id),
+        &delete_row,
+        null,
+    );
     try app.human_review_sessions.currentSession().?.editSummary(allocator, "blocked");
     try std.testing.expect((try app.saveHumanReviewSession(&ctx)) == .rejected);
     try app.update(.{ .switch_page = .config }, &ctx);
@@ -3354,6 +3354,20 @@ fn humanReviewTestBinding(suffix: u8) !review_store.ReviewRunBinding {
     };
 }
 
+fn humanReviewTestStoreSnapshot(
+    repository_id: committed_review.ReviewRepositoryId,
+) review_store.StoreSnapshot {
+    const display = review_store.RepositoryDisplayName.fromStored("repository") catch unreachable;
+    return .{
+        .root_device = 1,
+        .root_inode = 2,
+        .repository_locator = .{ .device = 3, .inode = 4 },
+        .review_repository_id = repository_id,
+        .repository_display_name = display,
+        .repository_directory_name = review_store.RepositoryDirectoryName.format(&display, repository_id),
+    };
+}
+
 fn humanReviewTestFindings(binding: review_store.ReviewRunBinding) committed_review.FindingSet {
     return .{
         .schema_version = committed_review.limits.schema_version,
@@ -3540,8 +3554,8 @@ const HumanReviewStoreFixture = struct {
         defer locks.close(io);
         const repository_text = repository_id.canonical();
         try locks.createDir(io, &repository_text, .fromMode(0o700));
-        try store.createDir(io, &repository_text, .fromMode(0o700));
-        var namespace = try store.openDir(io, &repository_text, .{});
+        try store.createDir(io, "repository-123e4567", .fromMode(0o700));
+        var namespace = try store.openDir(io, "repository-123e4567", .{});
         defer namespace.close(io);
         const review_text = review_id.canonical();
         try namespace.createDir(io, &review_text, .fromMode(0o700));
@@ -3553,7 +3567,7 @@ const HumanReviewStoreFixture = struct {
             io,
             store,
             "registry.json",
-            "{\"schema_version\":1,\"bindings\":[{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/test/repository\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/test/repository\"}}]}\n",
+            "{\"schema_version\":1,\"bindings\":[{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"repository\",\"directory_name\":\"repository-123e4567\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/test/repository\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/test/repository\"}}]}\n",
         );
         return .{
             .store_root = try parent.realPathFileAlloc(io, name, allocator),

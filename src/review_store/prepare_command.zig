@@ -210,6 +210,9 @@ fn failureTerminal(failure: store_service.PublicationFailure) Failure {
         .unsupported_filesystem => .{ .exit_code = 69, .code = "unsupported_filesystem", .message = "Review Store filesystem is unsupported" },
         .store_invalid => .{ .exit_code = 74, .code = "store_invalid", .message = "Review Store authority is invalid" },
         .repository_invalid => .{ .exit_code = 74, .code = "repository_invalid", .message = "repository path is invalid" },
+        .main_worktree_unavailable => .{ .exit_code = 74, .code = "main_worktree_unavailable", .message = "main worktree name could not be resolved" },
+        .repository_name_invalid => .{ .exit_code = 65, .code = "repository_name_invalid", .message = "repository name is invalid" },
+        .repository_namespace_collision => .{ .exit_code = 73, .code = "repository_namespace_collision", .message = "repository namespace already exists" },
         .git_failed => .{ .exit_code = 74, .code = "git_failed", .message = "repository identity could not be resolved" },
         .io_failed => .{ .exit_code = 74, .code = "io_failed", .message = "Review Store prepare failed" },
         .concurrent_conflict => .{ .exit_code = 75, .code = "concurrent_conflict", .message = "Review Store authority changed concurrently" },
@@ -311,4 +314,23 @@ test "review run publication prepare request shares the lossless repository path
     defer invalid_arguments.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 64), invalid_arguments.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, invalid_arguments.bytes, "\"code\":\"invalid_arguments\"") != null);
+}
+
+test "review store prepare exposes stable schema-1 repository naming codes" {
+    const cases = [_]struct {
+        failure: store_service.PublicationFailure,
+        code: []const u8,
+    }{
+        .{ .failure = .main_worktree_unavailable, .code = "main_worktree_unavailable" },
+        .{ .failure = .repository_name_invalid, .code = "repository_name_invalid" },
+        .{ .failure = .repository_namespace_collision, .code = "repository_namespace_collision" },
+    };
+    for (cases) |case| {
+        var output = try errorOutputAlloc(std.testing.allocator, failureTerminal(case.failure));
+        defer output.deinit(std.testing.allocator);
+        try std.testing.expect(std.mem.startsWith(u8, output.bytes, "{\"status\":\"error\",\"schema_version\":1,"));
+        var needle_buffer: [96]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buffer, "\"code\":\"{s}\"", .{case.code});
+        try std.testing.expect(std.mem.indexOf(u8, output.bytes, needle) != null);
+    }
 }

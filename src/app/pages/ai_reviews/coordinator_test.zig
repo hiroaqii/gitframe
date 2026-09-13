@@ -84,6 +84,21 @@ const TestApp = struct {
     }
 };
 
+fn testStoreSnapshot(repository_id: committed_review.ReviewRepositoryId) review_store.StoreSnapshot {
+    const repository_display_name = review_store.RepositoryDisplayName.fromStored("repository") catch unreachable;
+    return .{
+        .root_device = 1,
+        .root_inode = 2,
+        .repository_locator = .{ .device = 3, .inode = 4 },
+        .review_repository_id = repository_id,
+        .repository_display_name = repository_display_name,
+        .repository_directory_name = review_store.RepositoryDirectoryName.format(
+            &repository_display_name,
+            repository_id,
+        ),
+    };
+}
+
 test "AI Reviews reload remains task-free until a Run is selected" {
     var app: TestApp = .{};
     defer app.pages.ai_reviews.deinit(std.testing.allocator);
@@ -121,12 +136,7 @@ test "AI Reviews deletion confirmation owns the focused Run and renders an unfin
     rows[0].status = .draft;
     rows[0].producer_model = try allocator.dupe(u8, "gpt-test");
     app.pages.ai_reviews.picker.scan_result = .{ .history = .{
-        .snapshot = .{
-            .root_device = 1,
-            .root_inode = 2,
-            .repository_locator = .{ .device = 3, .inode = 4 },
-            .review_repository_id = repository_id,
-        },
+        .snapshot = testStoreSnapshot(repository_id),
         .rows = rows,
         .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
         .skipped_count = 0,
@@ -206,12 +216,7 @@ test "AI Reviews deletion admission honors session and Store operation owners" {
         .head_oid = reviewAppTestOid('b'),
         .diff_base_oid = reviewAppTestOid('a'),
     };
-    const snapshot: review_store.StoreSnapshot = .{
-        .root_device = 1,
-        .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
-        .review_repository_id = repository_id,
-    };
+    const snapshot = testStoreSnapshot(repository_id);
     var bundle = try reviewHistoryPinnedBundle(allocator, snapshot, repository_id, review_id, target, false);
     defer bundle.deinit(allocator);
     const binding: review_store.ReviewRunBinding = .{
@@ -303,12 +308,7 @@ test "AI Reviews clean close releases the pinned owner before deletion admission
         .head_oid = reviewAppTestOid('b'),
         .diff_base_oid = reviewAppTestOid('a'),
     };
-    const snapshot: review_store.StoreSnapshot = .{
-        .root_device = 1,
-        .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
-        .review_repository_id = repository_id,
-    };
+    const snapshot = testStoreSnapshot(repository_id);
     var bundle = try reviewHistoryPinnedBundle(allocator, snapshot, repository_id, review_id, target, false);
     var app: TestApp = .{};
     defer app.operations.deinit(allocator);
@@ -404,12 +404,7 @@ test "AI Reviews deletion failure retains the list while success reloads toward 
     rows[0] = try reviewHistoryRow(allocator, first_id, .available);
     rows[1] = try reviewHistoryRow(allocator, second_id, .available);
     app.pages.ai_reviews.picker.scan_result = .{ .history = .{
-        .snapshot = .{
-            .root_device = 1,
-            .root_inode = 2,
-            .repository_locator = .{ .device = 3, .inode = 4 },
-            .review_repository_id = repository_id,
-        },
+        .snapshot = testStoreSnapshot(repository_id),
         .rows = rows,
         .diagnostics = try allocator.alloc(review_store.Diagnostic, 0),
         .skipped_count = 0,
@@ -809,12 +804,7 @@ test "AI Reviews inline Finding owner and fold mode file lifecycle use the accep
         .head_oid = reviewAppTestOid('b'),
         .diff_base_oid = reviewAppTestOid('a'),
     };
-    const snapshot: review_store.StoreSnapshot = .{
-        .root_device = 1,
-        .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
-        .review_repository_id = repository_id,
-    };
+    const snapshot = testStoreSnapshot(repository_id);
     var bundle = try reviewHistoryPinnedBundle(allocator, snapshot, repository_id, review_id, target, true);
     try std.testing.expectEqual(@as(usize, 1), bundle.selection.finding_projection.summary.mapped);
 
@@ -929,12 +919,7 @@ test "AI Reviews shared display-mode and terminal resize prepare Finding cards b
         .head_oid = reviewAppTestOid('b'),
         .diff_base_oid = reviewAppTestOid('a'),
     };
-    const snapshot: review_store.StoreSnapshot = .{
-        .root_device = 1,
-        .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
-        .review_repository_id = repository_id,
-    };
+    const snapshot = testStoreSnapshot(repository_id);
     var bundle = try reviewHistoryPinnedBundle(allocator, snapshot, repository_id, review_id, target, true);
     bundle.selection.finding_projection.entries[0].outcome = .{ .mapped = .{
         .file_ordinal = 0,
@@ -2018,12 +2003,7 @@ const FindingNavigationHarness = struct {
             .head_oid = reviewAppTestOid('b'),
             .diff_base_oid = reviewAppTestOid('a'),
         };
-        const snapshot: review_store.StoreSnapshot = .{
-            .root_device = 1,
-            .root_inode = 2,
-            .repository_locator = .{ .device = 3, .inode = 4 },
-            .review_repository_id = repository_id,
-        };
+        const snapshot = testStoreSnapshot(repository_id);
         var bundle = try findingNavigationPinnedBundle(allocator, snapshot, repository_id, review_id, target, rename);
         errdefer bundle.deinit(allocator);
         var loaded_bundle = try app_load.buildLoadedBundle(

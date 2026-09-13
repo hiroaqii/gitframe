@@ -3828,9 +3828,11 @@ test "AI review failure footer and details expose causes at normal and narrow si
         .{ .failure = .{ .timed_out = .{ .stage = .before_provider, .owner = .caller, .budget = .fromSeconds(2) } }, .cause = "timed out" },
         .{ .failure = .{ .timed_out = null }, .cause = "timed out" },
         .{ .failure = .invalid_candidates, .cause = "invalid candidates" },
-        .{ .failure = .store_prepare_failed, .cause = "save setup failed" },
+        .{ .failure = .{ .store_prepare_failed = .main_worktree_unavailable }, .cause = "main worktree unavailable", .evidence = "Check Git worktree metadata" },
+        .{ .failure = .{ .store_prepare_failed = .repository_name_invalid }, .cause = "repository name invalid", .evidence = "valid UTF-8 main-worktree directory name" },
+        .{ .failure = .{ .store_prepare_failed = .repository_namespace_collision }, .cause = "repository namespace collision", .evidence = "do not overwrite it" },
         .{ .failure = .artifact_failed, .cause = "artifact creation failed" },
-        .{ .failure = .publish_failed, .cause = "save operation failed" },
+        .{ .failure = .{ .publish_failed = .io_failed }, .cause = "review store I/O failed" },
         .{ .failure = .exact_reconciliation_failed, .cause = "save verification failed" },
         .{ .failure = .{ .internal_error = .before_provider }, .cause = "internal error" },
     };
