@@ -124,8 +124,8 @@ parser admits only the complete v1 array and order emitted by the writer, so a
 plan cannot silently weaken a bound.
 
 The v1 planning entries cover the 16 MiB projection and projection-frame cap,
-1,024 files, 8,192 hunks, 256 units/model turns, 64 KiB unit fragment, 16 KiB
-line, 256 KiB unit, 32 MiB complete input output, committed-guidance limits,
+1,024 files, 8,192 hunks, 256 units, the 64 KiB whole-hunk packing target,
+16 KiB line, 256 KiB unit, 32 MiB complete input output, committed-guidance limits,
 32 findings per unit/4,096 total, semantic text limits, and candidate batch
 limits. The canonical fixture is [`plan.json`](../testdata/ai-review-producer-v1/protocol/plan.json).
 
@@ -135,7 +135,7 @@ its 256 KiB unique-content aggregate, and one exact source record per key. A
 repeated key in any unit must carry the same blob OID, content digest, and exact
 content bytes.
 
-## Review unit and locations
+## Review unit and derived locations
 
 `ReviewUnit` fields are:
 
@@ -150,7 +150,6 @@ display_path
 file_status
 metadata_lines
 hunks
-locations
 before_guidance / after_guidance
 coverage_spans
 ```
@@ -171,11 +170,12 @@ Successive hunk spans are strictly source-ordered and non-overlapping on both
 sides. A zero-count range is the boundary after its start coordinate (zero is
 before line one), and no later line on a side may follow `line_ending=none`.
 
-Locations are ordered as all before locations then all after locations. IDs
-are contiguous `b0001...b9999` and `a0001...a9999`; each repeats the raw path,
-side, and positive committed line owned by the helper. Every location is
-referenced exactly once by the ordered hunk lines. This makes an opaque ID
-useful to the AI without giving it authority to choose a path or line.
+Location IDs are opaque and restart at one for each unit and side. They are
+contiguous `b0001...b9999` and `a0001...a9999` in ordered hunk lines. The
+protocol derives each location's side, borrowed raw unit path, and positive
+committed line from that one traversal; no duplicate location table is sent
+on the wire. This keeps an opaque ID useful to the AI without giving it
+authority to choose a path or line.
 
 Each guidance item carries exact head/blob object IDs, raw `AGENTS.md` path,
 content digest, and unchanged bounded UTF-8 content. Before and after chains
@@ -193,13 +193,15 @@ is complemented by the complete-plan limit owned by `review-input`. The
 including repeated occurrences, because it bounds the actual unit input.
 
 Coverage spans are sorted non-overlapping half-open offsets into the exact
-projection payload. Their summed bytes are nonzero and at most 64 KiB. They
-are diagnostic coverage authority, not AI-selected location authority. The
-canonical complete example is [`unit.json`](../testdata/ai-review-producer-v1/protocol/unit.json).
+projection payload, and their summed bytes are nonzero. The 64 KiB value is a
+whole-hunk packing target: a hunk is never split, so one indivisible hunk may
+exceed the target while the 256 KiB canonical-unit cap remains hard. Coverage
+is diagnostic authority, not AI-selected location authority. The canonical
+complete example is [`unit.json`](../testdata/ai-review-producer-v1/protocol/unit.json).
 
 The 256 KiB canonical-unit cap is checked independently of collection identity
 ceilings. Some theoretical maximum-cardinality arrays (for example 8,192
-hunks or 9,999 locations on one side) necessarily reach the wire cap first;
+hunks or 9,999 location IDs on one side) necessarily reach the wire cap first;
 their exact cardinality closes as `ArtifactTooLarge`, while cardinality plus
 one closes as `LimitExceeded`. No writer truncates an array to fit.
 
@@ -340,8 +342,10 @@ inventory. Every successful parse proves one adjacent span partition of the
 complete patch, and every rejected variant produces no plan or unit.
 
 One unit contains one file and consecutive whole hunks. Packing is in patch
-order and stops at the 64 KiB raw-fragment, 9,999-location-per-side, or 19,998
-line boundary; a single hunk that cannot fit is `review_unit_too_large`.
+order around the 64 KiB target: after a non-empty unit, a next hunk that would
+exceed the target starts a new unit. The first indivisible hunk may exceed the
+target; only the unchanged 9,999-location-per-side, 19,998-line, and final
+256 KiB canonical-unit hard bounds can reject it.
 Metadata may repeat as model context, but the unit coverage spans form one
 gapless, non-overlapping partition of the exact patch. Unit IDs and all
 before/after location IDs are assigned only by the helper.
@@ -371,7 +375,7 @@ summary and each ordered canonical unit while every `plan_digest` field is the
 all-zero SHA-256 value. The canonical component documents retain their final
 LF in this preimage. The resulting digest is then inserted into the summary
 and every unit. This avoids circular authority while binding the target, both
-input digests, paths, guidance, locations, coverage, unit order, and complete
+input digests, paths, guidance, hunk location IDs, coverage, unit order, and complete
 v1 limit set.
 
 Success is one compact canonical JSON line with fields `schema_version`,

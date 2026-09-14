@@ -19,7 +19,6 @@ pub const Error = std.mem.Allocator.Error || error{
     UnsupportedContent,
     MetadataOnly,
     LimitExceeded,
-    ReviewUnitTooLarge,
     ReviewLineTooLarge,
 };
 
@@ -367,10 +366,6 @@ const Parser = struct {
         if (self.hunk) |*hunk| {
             if (!hunk.complete() or hunk.lines.items.len == 0) return error.InvalidPatch;
             if (end <= hunk.start) return error.InvalidPatch;
-            if (end - hunk.start > limits.max_unit_raw_fragment_bytes) {
-                limits.record(self.violation, "unit_raw_fragment_bytes", end - hunk.start, limits.max_unit_raw_fragment_bytes);
-                return error.ReviewUnitTooLarge;
-            }
             try self.file.?.hunks.append(self.allocator, .{
                 .old_start = hunk.old_start,
                 .old_count = hunk.old_count,
@@ -396,10 +391,6 @@ const Parser = struct {
             const display_source = file.new_path orelse file.old_path orelse return error.InvalidPatch;
             const metadata_end = file.first_hunk_start.?;
             if (metadata_end <= file.start) return error.InvalidPatch;
-            if (metadata_end - file.start > limits.max_unit_raw_fragment_bytes) {
-                limits.record(self.violation, "unit_raw_fragment_bytes", metadata_end - file.start, limits.max_unit_raw_fragment_bytes);
-                return error.ReviewUnitTooLarge;
-            }
             try self.files.append(self.allocator, .{
                 .old_path = file.old_path,
                 .new_path = file.new_path,
@@ -1276,11 +1267,11 @@ test "AI review input patch planner rejects contradictory incomplete and noncano
     }
 }
 
-test "AI review input patch planner rejects oversized whole hunk and cross-hunk overlap" {
+test "AI review input patch planner admits over-target whole hunks and rejects cross-hunk overlap" {
     var oversized: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer oversized.deinit();
     try oversized.writer.writeAll(
-        "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,5 +1,5 @@\n",
+        "diff --git a/a b/a\nindex 1111111..2222222 100644\n--- a/a\n+++ b/a\n@@ -1,5 +1,5 @@\n",
     );
     const content = [_]u8{'x'} ** limits.max_diff_line_bytes;
     for (0..5) |_| {
@@ -1294,9 +1285,9 @@ test "AI review input patch planner rejects oversized whole hunk and cross-hunk 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var violation: ?limits.Violation = null;
-    try std.testing.expectError(error.ReviewUnitTooLarge, parseWithLimit(arena.allocator(), .sha1, oversized.written(), &violation));
-    try std.testing.expectEqualStrings("unit_raw_fragment_bytes", violation.?.resource);
-    try std.testing.expect(violation.?.observed > violation.?.allowed);
+    const oversized_plan = try parseWithLimit(arena.allocator(), .sha1, oversized.written(), &violation);
+    try std.testing.expect(oversized_plan.files[0].hunks[0].coverage.len() > limits.unit_raw_fragment_target_bytes);
+    try std.testing.expect(violation == null);
     var long_line: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer long_line.deinit();
     try long_line.writer.writeAll("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-");
@@ -1312,7 +1303,7 @@ test "AI review input patch planner rejects oversized whole hunk and cross-hunk 
         "@@ -3 +3 @@\n-old\n+new\n@@ -3 +4 @@\n-old\n+new\n"));
 }
 
-test "AI review input patch planner fixes changed-file hunk and raw-fragment exact plus-one limits" {
+test "AI review input patch planner fixes changed-file hunk limits and packing-target boundary" {
     var many_files: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer many_files.deinit();
     var exact_files_end: usize = 0;
@@ -1355,19 +1346,17 @@ test "AI review input patch planner fixes changed-file hunk and raw-fragment exa
     try std.testing.expectEqual(limits.max_hunks + 1, violation.?.observed);
     try std.testing.expectEqual(limits.max_hunks, violation.?.allowed);
 
-    const exact_fragment = try testPatchWithHunkSize(std.testing.allocator, limits.max_unit_raw_fragment_bytes);
+    const exact_fragment = try testPatchWithHunkSize(std.testing.allocator, limits.unit_raw_fragment_target_bytes);
     defer std.testing.allocator.free(exact_fragment);
     var exact_fragment_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer exact_fragment_arena.deinit();
     const exact_fragment_plan = try parse(exact_fragment_arena.allocator(), .sha1, exact_fragment);
-    try std.testing.expectEqual(limits.max_unit_raw_fragment_bytes, exact_fragment_plan.files[0].hunks[0].coverage.len());
-    const plus_fragment = try testPatchWithHunkSize(std.testing.allocator, limits.max_unit_raw_fragment_bytes + 1);
+    try std.testing.expectEqual(limits.unit_raw_fragment_target_bytes, exact_fragment_plan.files[0].hunks[0].coverage.len());
+    const plus_fragment = try testPatchWithHunkSize(std.testing.allocator, limits.unit_raw_fragment_target_bytes + 1);
     defer std.testing.allocator.free(plus_fragment);
     var plus_fragment_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer plus_fragment_arena.deinit();
-    violation = null;
-    try std.testing.expectError(error.ReviewUnitTooLarge, parseWithLimit(plus_fragment_arena.allocator(), .sha1, plus_fragment, &violation));
-    try std.testing.expectEqualStrings("unit_raw_fragment_bytes", violation.?.resource);
-    try std.testing.expectEqual(limits.max_unit_raw_fragment_bytes + 1, violation.?.observed);
-    try std.testing.expectEqual(limits.max_unit_raw_fragment_bytes, violation.?.allowed);
+    const plus_fragment_plan = try parseWithLimit(plus_fragment_arena.allocator(), .sha1, plus_fragment, &violation);
+    try std.testing.expectEqual(limits.unit_raw_fragment_target_bytes + 1, plus_fragment_plan.files[0].hunks[0].coverage.len());
+    try std.testing.expect(violation == null);
 }

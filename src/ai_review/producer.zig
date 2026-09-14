@@ -303,10 +303,12 @@ fn resolveCandidate(
     unit: *const protocol.ReviewUnit,
     candidate: protocol.FindingCandidate,
 ) BuildError!ResolvedCandidate {
-    const start = findLocation(unit, candidate.start_location) orelse
+    const start_occurrence = protocol.findReviewLocation(unit, candidate.start_location) catch
         return error.InvalidCandidateLocation;
-    const end = findLocation(unit, candidate.end_location) orelse
+    const start = (start_occurrence orelse return error.InvalidCandidateLocation).location;
+    const end_occurrence = protocol.findReviewLocation(unit, candidate.end_location) catch
         return error.InvalidCandidateLocation;
+    const end = (end_occurrence orelse return error.InvalidCandidateLocation).location;
     if (start.side != end.side or
         !std.mem.eql(u8, start.path_bytes, end.path_bytes) or
         end.line < start.line)
@@ -323,13 +325,16 @@ fn resolveCandidate(
     for (0..count) |offset| {
         const ordinal = @as(u16, candidate.start_location.ordinal) + @as(u16, @intCast(offset));
         const location_id: protocol.LocationId = .{ .side = start.side, .ordinal = ordinal };
-        const location = findLocation(unit, location_id) orelse return error.InvalidCandidateLocation;
+        const occurrence = protocol.findReviewLocation(unit, location_id) catch
+            return error.InvalidCandidateLocation;
+        const resolved = occurrence orelse return error.InvalidCandidateLocation;
+        const location = resolved.location;
         if (location.line != @as(u64, start.line) + offset or
             !std.mem.eql(u8, start.path_bytes, location.path_bytes))
         {
             return error.InvalidCandidateLocation;
         }
-        const line = findDiffLine(unit, location_id) orelse return error.InvalidCandidateLocation;
+        const line = resolved.diff_line;
         hasher.update(line.text);
         hasher.update(switch (line.line_ending) {
             .lf => "\n",
@@ -356,24 +361,6 @@ fn resolveCandidate(
         .body = candidate.body,
         .suggestion = candidate.suggestion,
     };
-}
-
-fn findLocation(unit: *const protocol.ReviewUnit, id: protocol.LocationId) ?protocol.ReviewLocation {
-    for (unit.locations) |location| if (location.location_id.eql(id)) return location;
-    return null;
-}
-
-fn findDiffLine(unit: *const protocol.ReviewUnit, id: protocol.LocationId) ?protocol.DiffLine {
-    for (unit.hunks) |hunk| {
-        for (hunk.lines) |line| {
-            const actual = switch (id.side) {
-                .before => line.before_location,
-                .after => line.after_location,
-            };
-            if (actual) |location_id| if (location_id.eql(id)) return line;
-        }
-    }
-    return null;
 }
 
 fn resolvedLessThan(_: void, left: ResolvedCandidate, right: ResolvedCandidate) bool {
@@ -822,27 +809,12 @@ test "AI review producer domain orders findings by unsigned raw path across unit
     var summary = fixture.summary.value;
     summary.unit_count = 2;
 
-    var z_locations = [_]protocol.ReviewLocation{
-        fixture.unit.value.locations[0],
-        fixture.unit.value.locations[1],
-        fixture.unit.value.locations[2],
-        fixture.unit.value.locations[3],
-    };
-    for (&z_locations) |*location| location.path_bytes = "z.zig";
     var z_unit = fixture.unit.value;
     z_unit.unit_count = 2;
     z_unit.old_path_bytes = "z.zig";
     z_unit.new_path_bytes = "z.zig";
     z_unit.display_path = "z.zig";
-    z_unit.locations = &z_locations;
 
-    var a_locations = [_]protocol.ReviewLocation{
-        fixture.unit.value.locations[0],
-        fixture.unit.value.locations[1],
-        fixture.unit.value.locations[2],
-        fixture.unit.value.locations[3],
-    };
-    for (&a_locations) |*location| location.path_bytes = "a.zig";
     var a_unit = fixture.unit.value;
     a_unit.unit_id = .{ .ordinal = 2 };
     a_unit.ordinal = 2;
@@ -850,7 +822,6 @@ test "AI review producer domain orders findings by unsigned raw path across unit
     a_unit.old_path_bytes = "a.zig";
     a_unit.new_path_bytes = "a.zig";
     a_unit.display_path = "a.zig";
-    a_unit.locations = &a_locations;
 
     var units = [_]protocol.ReviewUnit{ z_unit, a_unit };
     try bindTestPlan(allocator, &summary, &units);
@@ -869,7 +840,7 @@ test "AI review producer domain orders findings by unsigned raw path across unit
     try std.testing.expectEqualStrings("z.zig", parsed.value.findings[1].anchor.path_bytes);
 }
 
-test "AI review producer domain rejects missing and noncontiguous shown locations" {
+test "AI review producer domain rejects missing noncontiguous and reused derived location IDs" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
     defer fixture.deinit();
@@ -912,15 +883,8 @@ test "AI review producer domain rejects missing and noncontiguous shown location
         .{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .lines = &first_lines },
         .{ .old_start = 3, .old_count = 1, .new_start = 3, .new_count = 1, .lines = &third_lines },
     };
-    const locations = [_]protocol.ReviewLocation{
-        .{ .location_id = .{ .side = .before, .ordinal = 1 }, .path_bytes = "src/main.zig", .side = .before, .line = 1 },
-        .{ .location_id = .{ .side = .before, .ordinal = 2 }, .path_bytes = "src/main.zig", .side = .before, .line = 3 },
-        .{ .location_id = .{ .side = .after, .ordinal = 1 }, .path_bytes = "src/main.zig", .side = .after, .line = 1 },
-        .{ .location_id = .{ .side = .after, .ordinal = 2 }, .path_bytes = "src/main.zig", .side = .after, .line = 3 },
-    };
     var gapped_unit = fixture.unit.value;
     gapped_unit.hunks = &hunks;
-    gapped_unit.locations = &locations;
     var summary = fixture.summary.value;
     var gapped_units = [_]protocol.ReviewUnit{gapped_unit};
     try bindTestPlan(allocator, &summary, &gapped_units);
@@ -937,6 +901,27 @@ test "AI review producer domain rejects missing and noncontiguous shown location
         buildAlloc(
             allocator,
             try testInput(&fixture, &summary, &gapped_units, &span_payloads),
+            verifier.port(),
+        ),
+    );
+
+    var reused_lines = [_]protocol.DiffLine{
+        fixture.unit.value.hunks[0].lines[0],
+        fixture.unit.value.hunks[0].lines[1],
+        fixture.unit.value.hunks[0].lines[2],
+    };
+    reused_lines[2].after_location = .{ .side = .after, .ordinal = 1 };
+    var reused_hunks = [_]protocol.ReviewHunk{fixture.unit.value.hunks[0]};
+    reused_hunks[0].lines = &reused_lines;
+    var reused_unit = fixture.unit.value;
+    reused_unit.hunks = &reused_hunks;
+    const reused_units = [_]protocol.ReviewUnit{reused_unit};
+    const valid_payloads = [_]protocol.FindingCandidatePayload{fixture.candidate.value};
+    try std.testing.expectError(
+        error.InvalidInput,
+        buildAlloc(
+            allocator,
+            try testInput(&fixture, &fixture.summary.value, &reused_units, &valid_payloads),
             verifier.port(),
         ),
     );
@@ -965,15 +950,8 @@ test "AI review producer domain rejects candidate side and unit path mismatches"
         ),
     );
 
-    var locations = [_]protocol.ReviewLocation{
-        fixture.unit.value.locations[0],
-        fixture.unit.value.locations[1],
-        fixture.unit.value.locations[2],
-        fixture.unit.value.locations[3],
-    };
-    locations[3].path_bytes = "other.zig";
     var invalid_unit = fixture.unit.value;
-    invalid_unit.locations = &locations;
+    invalid_unit.new_path_bytes = "other.zig";
     const invalid_units = [_]protocol.ReviewUnit{invalid_unit};
     const valid_payloads = [_]protocol.FindingCandidatePayload{fixture.candidate.value};
     try std.testing.expectError(

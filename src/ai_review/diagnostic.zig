@@ -17,7 +17,6 @@ pub const Resource = enum {
     plan_summary_bytes,
     review_units,
     unit_bytes,
-    unit_raw_fragment_bytes,
     locations_per_side,
     lines_per_unit,
     coverage_spans_per_unit,
@@ -153,12 +152,12 @@ test "AI review diagnostic owns limit names and preserves unknown observations" 
     // Explicit current producer names; keep this list in sync with producers,
     // including helper arguments in projection_frame, input_command and patch_plan.
     const byte_names = [_][]const u8{
-        "context_bytes",            "provider_input_bytes",     "projection_frame_bytes",  "projection_bytes",
-        "input_header_bytes",       "review_input_frame_bytes", "plan_summary_bytes",      "unit_bytes",
-        "unit_raw_fragment_bytes",  "guidance_per_unit_bytes",  "input_output_bytes",      "guidance_file_bytes",
-        "guidance_aggregate_bytes", "diff_line_bytes",          "raw_path_bytes",          "hunk_section_bytes",
-        "metadata_line_bytes",      "display_path_bytes",       "projection_header_bytes", "stdout_bytes",
-        "stderr_bytes",             "final_answer_bytes",
+        "context_bytes",           "provider_input_bytes",     "projection_frame_bytes", "projection_bytes",
+        "input_header_bytes",      "review_input_frame_bytes", "plan_summary_bytes",     "unit_bytes",
+        "guidance_per_unit_bytes", "input_output_bytes",       "guidance_file_bytes",    "guidance_aggregate_bytes",
+        "diff_line_bytes",         "raw_path_bytes",           "hunk_section_bytes",     "metadata_line_bytes",
+        "display_path_bytes",      "projection_header_bytes",  "stdout_bytes",           "stderr_bytes",
+        "final_answer_bytes",
     };
     const count_names = [_][]const u8{
         "review_units",            "locations_per_side",  "lines_per_unit", "coverage_spans_per_unit",

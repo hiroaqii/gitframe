@@ -120,7 +120,6 @@ pub fn executeAlloc(
         var validation_limit: ?limits.Violation = null;
         _ = patch_plan.parseWithLimit(validation_arena.allocator(), frame.target.object_format, frame.patch_bytes, &validation_limit) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            error.ReviewUnitTooLarge => errorOutput(allocator, unitTooLargeFailure(validation_limit.?)),
             error.ReviewLineTooLarge => errorOutput(allocator, lineTooLargeFailure(validation_limit.?)),
             error.LimitExceeded => errorOutput(allocator, limitFailure(validation_limit.?)),
             error.UnsupportedBinary, error.UnsupportedFileType, error.UnsupportedContent, error.MetadataOnly, error.UnsupportedCombinedDiff => errorOutput(allocator, .{
@@ -251,7 +250,6 @@ pub fn planAlloc(
     const owned_patch = try arena.dupe(u8, patch_bytes);
     const parsed_patch = patch_plan.parseWithLimit(arena, target.object_format, owned_patch, violation) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.ReviewUnitTooLarge => error.ReviewUnitTooLarge,
         error.ReviewLineTooLarge => error.ReviewLineTooLarge,
         error.LimitExceeded => error.LimitExceeded,
         error.UnsupportedBinary, error.UnsupportedFileType, error.UnsupportedContent, error.MetadataOnly, error.UnsupportedCombinedDiff => error.UnsupportedProjection,
@@ -362,28 +360,28 @@ fn planChunks(allocator: std.mem.Allocator, plan: patch_plan.Plan, violation: *?
         while (hunk_start < file.hunks.len) {
             const start = if (hunk_start == 0) file.metadata_coverage.start else file.hunks[hunk_start].coverage.start;
             var hunk_end = hunk_start;
-            var old_locations: usize = 0;
-            var new_locations: usize = 0;
+            var old_location_count: usize = 0;
+            var new_location_count: usize = 0;
             var line_count: usize = 0;
             while (hunk_end < file.hunks.len) {
                 const hunk = file.hunks[hunk_end];
                 const raw_size = hunk.coverage.end_exclusive - start;
-                const candidate_old = std.math.add(usize, old_locations, hunk.old_count) catch return error.InvalidPlan;
-                const candidate_new = std.math.add(usize, new_locations, hunk.new_count) catch return error.InvalidPlan;
+                const candidate_old = std.math.add(usize, old_location_count, hunk.old_count) catch return error.InvalidPlan;
+                const candidate_new = std.math.add(usize, new_location_count, hunk.new_count) catch return error.InvalidPlan;
                 const candidate_lines = std.math.add(usize, line_count, hunk.lines.len) catch return error.InvalidPlan;
-                const fits = raw_size <= limits.max_unit_raw_fragment_bytes and
-                    candidate_old <= limits.max_locations_per_side and
+                const fits_hard_limits = candidate_old <= limits.max_locations_per_side and
                     candidate_new <= limits.max_locations_per_side and
                     candidate_lines <= limits.max_lines_per_unit;
-                if (!fits) {
+                if (!fits_hard_limits) {
                     if (hunk_end == hunk_start) {
-                        if (raw_size > limits.max_unit_raw_fragment_bytes) limits.record(violation, "unit_raw_fragment_bytes", raw_size, limits.max_unit_raw_fragment_bytes) else if (candidate_old > limits.max_locations_per_side) limits.record(violation, "locations_per_side", candidate_old, limits.max_locations_per_side) else if (candidate_new > limits.max_locations_per_side) limits.record(violation, "locations_per_side", candidate_new, limits.max_locations_per_side) else limits.record(violation, "lines_per_unit", candidate_lines, limits.max_lines_per_unit);
+                        if (candidate_old > limits.max_locations_per_side) limits.record(violation, "locations_per_side", candidate_old, limits.max_locations_per_side) else if (candidate_new > limits.max_locations_per_side) limits.record(violation, "locations_per_side", candidate_new, limits.max_locations_per_side) else limits.record(violation, "lines_per_unit", candidate_lines, limits.max_lines_per_unit);
                         return error.ReviewUnitTooLarge;
                     }
                     break;
                 }
-                old_locations = candidate_old;
-                new_locations = candidate_new;
+                if (raw_size > limits.unit_raw_fragment_target_bytes and hunk_end != hunk_start) break;
+                old_location_count = candidate_old;
+                new_location_count = candidate_new;
                 line_count = candidate_lines;
                 hunk_end += 1;
             }
@@ -441,12 +439,9 @@ fn buildUnit(
         limits.record(violation, "locations_per_side", @max(before_total, after_total), limits.max_locations_per_side);
         return error.ReviewUnitTooLarge;
     }
-    const locations = try allocator.alloc(protocol.ReviewLocation, before_total + after_total);
     const hunks = try allocator.alloc(protocol.ReviewHunk, source_hunks.len);
     var before_ordinal: u16 = 1;
     var after_ordinal: u16 = 1;
-    var before_index: usize = 0;
-    var after_index: usize = before_total;
     for (source_hunks, 0..) |source_hunk, hunk_index| {
         const lines = try allocator.alloc(protocol.DiffLine, source_hunk.lines.len);
         var old_consumed: u32 = 0;
@@ -455,22 +450,14 @@ fn buildUnit(
             var before_id: ?protocol.LocationId = null;
             var after_id: ?protocol.LocationId = null;
             if (source_line.kind != .added) {
-                const path = file.old_path orelse return error.InvalidPlan;
-                const line = std.math.add(u32, source_hunk.old_start, old_consumed) catch return error.InvalidPlan;
                 const id: protocol.LocationId = .{ .side = .before, .ordinal = before_ordinal };
-                locations[before_index] = .{ .location_id = id, .path_bytes = path, .side = .before, .line = line };
                 before_id = id;
-                before_index += 1;
                 before_ordinal = std.math.add(u16, before_ordinal, 1) catch return error.InvalidPlan;
                 old_consumed = std.math.add(u32, old_consumed, 1) catch return error.InvalidPlan;
             }
             if (source_line.kind != .removed) {
-                const path = file.new_path orelse return error.InvalidPlan;
-                const line = std.math.add(u32, source_hunk.new_start, new_consumed) catch return error.InvalidPlan;
                 const id: protocol.LocationId = .{ .side = .after, .ordinal = after_ordinal };
-                locations[after_index] = .{ .location_id = id, .path_bytes = path, .side = .after, .line = line };
                 after_id = id;
-                after_index += 1;
                 after_ordinal = std.math.add(u16, after_ordinal, 1) catch return error.InvalidPlan;
                 new_consumed = std.math.add(u32, new_consumed, 1) catch return error.InvalidPlan;
             }
@@ -492,7 +479,6 @@ fn buildUnit(
         };
         if (old_consumed != source_hunk.old_count or new_consumed != source_hunk.new_count) return error.InvalidPlan;
     }
-    if (before_index != before_total or after_index != locations.len) return error.InvalidPlan;
     const spans = try allocator.alloc(protocol.CoverageSpan, 1);
     spans[0] = chunk.coverage;
     return .{
@@ -507,7 +493,6 @@ fn buildUnit(
         .file_status = file.status,
         .metadata_lines = file.metadata_lines,
         .hunks = hunks,
-        .locations = locations,
         .before_guidance = guidance.before,
         .after_guidance = guidance.after,
         .coverage_spans = spans,
@@ -779,7 +764,7 @@ test "AI review input materializer emits deterministic complete plan and units" 
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(first.bytes, second.bytes);
     const one_output_digest = identity.Sha256Digest.hash(first.bytes).canonical();
-    try std.testing.expectEqualStrings("sha256:5e3f3fa5582360a5ab8274081be942fbcf726c25b9fc88b81c848f569656d62a", &one_output_digest);
+    try std.testing.expectEqualStrings("sha256:db6f405edca16ba2e804e6f252056de20c0847887e8cdceaa3dc907be42e7095", &one_output_digest);
     try std.testing.expect(std.mem.indexOf(u8, first.bytes, "\"unit_id\":\"unit-0001\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first.bytes, "\"start\":0") != null);
     try std.testing.expectEqual(@as(u8, '\n'), first.bytes[first.bytes.len - 1]);
@@ -797,10 +782,11 @@ test "AI review input materializer emits deterministic complete plan and units" 
     const max_location_parsed = try patch_plan.parse(arena, .sha1, max_location_patch);
     var max_location_output = try buildSuccess(std.testing.allocator, arena, testTarget(), max_location_patch, max_location_parsed, guidance, &violation);
     defer max_location_output.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, max_location_output.bytes, "\"line\":4294967295") != null);
+    try std.testing.expect(std.mem.indexOf(u8, max_location_output.bytes, "\"old_start\":4294967295") != null);
+    try std.testing.expect(std.mem.indexOf(u8, max_location_output.bytes, "\"before_location\":\"b0001\"") != null);
 }
 
-test "AI review input materializer emits canonical many-unit digests order coverage and locations" {
+test "AI review input materializer emits canonical many-unit digests order coverage" {
     const fixture_paths = [_][]const u8{
         "testdata/ai-review-producer-v1/input/valid-modified.patch",
         "testdata/ai-review-producer-v1/input/valid-added.patch",
@@ -838,8 +824,8 @@ test "AI review input materializer emits canonical many-unit digests order cover
     const output_digest = identity.Sha256Digest.hash(output.bytes).canonical();
     try std.testing.expectEqualStrings("sha256:8945cef674c4f2bfba14d33ce7e8b313020762aa53b20f33095e87397a58736a", summary.get("projection_digest").?.string);
     try std.testing.expectEqualStrings("sha256:d1ae83c8db0661d582ce1987c5e8fb7d881b0fa9af10e6e171571b12a22af9a5", summary.get("instruction_set_digest").?.string);
-    try std.testing.expectEqualStrings("sha256:be7c39c56c680969a12bbda3fcba5e359058babcb59e9df34ca9abe4219aa04d", summary.get("plan_digest").?.string);
-    try std.testing.expectEqualStrings("sha256:d66b98ea793beca162d3127047986d7c24136f95890454f24125e4905965ec1a", &output_digest);
+    try std.testing.expectEqualStrings("sha256:792b6558fcb8a1d39ce083dc73ceecd2c78fcad4ed178588bd3c8e1df5709dcd", summary.get("plan_digest").?.string);
+    try std.testing.expectEqualStrings("sha256:b2a7272462b0df1a6ba6efca172482c4621a3018811c5e56ae06126c7c5f966c", &output_digest);
 
     try std.testing.expectEqual(fixture_paths.len, units.len);
     const expected_statuses = [_][]const u8{ "modified", "added", "deleted", "renamed" };
@@ -855,8 +841,10 @@ test "AI review input materializer emits canonical many-unit digests order cover
         try std.testing.expectEqual(@as(i64, @intCast(expected_ends[index])), spans[0].object.get("end_exclusive").?.integer);
         coverage_cursor = expected_ends[index];
 
-        const locations = unit.get("locations").?.array.items;
+        try std.testing.expect(unit.get("locations") == null);
         const hunks = unit.get("hunks").?.array.items;
+        var next_before: u16 = 1;
+        var next_after: u16 = 1;
         for (hunks) |hunk_value| for (hunk_value.object.get("lines").?.array.items) |line_value| {
             const line = line_value.object;
             const kind = line.get("kind").?.string;
@@ -865,13 +853,16 @@ test "AI review input materializer emits canonical many-unit digests order cover
             try std.testing.expect((std.mem.eql(u8, kind, "added") and before == null and after != null) or
                 (std.mem.eql(u8, kind, "removed") and before != null and after == null) or
                 (std.mem.eql(u8, kind, "context") and before != null and after != null));
-            for ([_]?std.json.Value{ before, after }) |reference| if (reference) |location_id| {
-                var found = false;
-                for (locations) |location| {
-                    if (std.mem.eql(u8, location.object.get("location_id").?.string, location_id.string)) found = true;
-                }
-                try std.testing.expect(found);
-            };
+            if (before) |location_id| {
+                const id = try protocol.LocationId.parse(location_id.string);
+                try std.testing.expectEqual(protocol.LocationId{ .side = .before, .ordinal = next_before }, id);
+                next_before += 1;
+            }
+            if (after) |location_id| {
+                const id = try protocol.LocationId.parse(location_id.string);
+                try std.testing.expectEqual(protocol.LocationId{ .side = .after, .ordinal = next_after }, id);
+                next_after += 1;
+            }
         };
     }
     try std.testing.expectEqual(patch_writer.written().len, coverage_cursor);
@@ -892,12 +883,12 @@ test "AI review input materializer reports no-change without issuing a unit" {
     var output = try buildSuccess(std.testing.allocator, arena, testTarget(), "", parsed, guidance, &violation);
     defer output.deinit(std.testing.allocator);
     const zero_output_digest = identity.Sha256Digest.hash(output.bytes).canonical();
-    try std.testing.expectEqualStrings("sha256:62bce7b658f7213ebef832dfa22cd592c1412459daa04741e7a6c645d19963c5", &zero_output_digest);
+    try std.testing.expectEqualStrings("sha256:3d96401ee74066a67578690650a096a0dd99f8dc1b5c57652928b7354d301236", &zero_output_digest);
     try std.testing.expect(std.mem.indexOf(u8, output.bytes, "\"unit_count\":0") != null);
     try std.testing.expect(std.mem.endsWith(u8, output.bytes, "\"units\":[]}\n"));
 }
 
-test "AI review input chunk planner splits only whole hunks and closes the unit-count boundary" {
+test "AI review input chunk planner packs only whole hunks around its raw-fragment target" {
     const line = [_]patch_plan.Line{.{ .kind = .context, .text = "x", .line_ending = .lf }};
     const hunks = [_]patch_plan.Hunk{
         .{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = null, .lines = &line, .coverage = .{ .start = 10, .end_exclusive = 40_000 } },
@@ -921,6 +912,34 @@ test "AI review input chunk planner splits only whole hunks and closes the unit-
     try std.testing.expectEqual(@as(u32, 40_000), chunks[0].coverage.end_exclusive);
     try std.testing.expectEqual(@as(u32, 40_000), chunks[1].coverage.start);
     try std.testing.expectEqual(@as(u32, 80_000), chunks[1].coverage.end_exclusive);
+
+    const over_target_hunk = [_]patch_plan.Hunk{.{
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 1,
+        .section = null,
+        .lines = &line,
+        .coverage = .{ .start = 1, .end_exclusive = limits.unit_raw_fragment_target_bytes + 1 },
+    }};
+    const over_target_file: patch_plan.File = .{
+        .old_path = "a",
+        .new_path = "a",
+        .display_path = "a",
+        .status = .modified,
+        .metadata_lines = &.{"diff --git a/a b/a"},
+        .metadata_coverage = .{ .start = 0, .end_exclusive = 1 },
+        .hunks = &over_target_hunk,
+    };
+    violation = null;
+    const over_target_chunks = try planChunks(arena_owner.allocator(), .{
+        .files = &.{over_target_file},
+        .patch_size = limits.unit_raw_fragment_target_bytes + 1,
+        .hunk_count = 1,
+    }, &violation);
+    try std.testing.expectEqual(@as(usize, 1), over_target_chunks.len);
+    try std.testing.expectEqual(@as(u32, limits.unit_raw_fragment_target_bytes + 1), over_target_chunks[0].coverage.end_exclusive);
+    try std.testing.expect(violation == null);
 
     const files = try arena_owner.allocator().alloc(patch_plan.File, limits.max_review_units + 1);
     const one_hunk = try arena_owner.allocator().alloc(patch_plan.Hunk, limits.max_review_units + 1);
@@ -1092,14 +1111,39 @@ test "AI review input command reports exact process terminals for owner boundary
     output = try executeAlloc(std.testing.allocator, std.testing.io, null, &.{}, hunks_request);
     try expectLimitTerminal(output, "review_input_limit_exceeded", generic_message, "hunks", limits.max_hunks + 1, limits.max_hunks);
     output.deinit(std.testing.allocator);
+}
 
-    const raw_fragment = try testPatchWithRawHunkSize(std.testing.allocator, limits.max_unit_raw_fragment_bytes + 1);
-    defer std.testing.allocator.free(raw_fragment);
-    const fragment_request = try reviewInputRequestAlloc(std.testing.allocator, "/tmp/repo", &target, raw_fragment);
-    defer std.testing.allocator.free(fragment_request);
-    output = try executeAlloc(std.testing.allocator, std.testing.io, null, &.{}, fragment_request);
-    try expectLimitTerminal(output, "review_unit_too_large", "one whole-hunk review unit exceeds a finite v1 limit", "unit_raw_fragment_bytes", limits.max_unit_raw_fragment_bytes + 1, limits.max_unit_raw_fragment_bytes);
-    output.deinit(std.testing.allocator);
+test "AI review input command accepts an indivisible over-target hunk without a raw-fragment terminal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try runTestGit(io, tmp.dir, &.{ "git", "init", "--initial-branch=main" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "seed\n" });
+    try runTestGit(io, tmp.dir, &.{ "git", "add", "a" });
+    try runTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "head" });
+    const head_text = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD" });
+    defer std.testing.allocator.free(head_text);
+    const oid = try target_mod.ObjectId.parse(.sha1, std.mem.trimEnd(u8, head_text, "\n"));
+    const target: target_mod.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = oid,
+        .head_oid = oid,
+        .diff_base_oid = oid,
+    };
+    const repository = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repository);
+    const patch_bytes = try testPatchWithRawHunkSize(std.testing.allocator, limits.unit_raw_fragment_target_bytes + 1);
+    defer std.testing.allocator.free(patch_bytes);
+    const request = try reviewInputRequestAlloc(std.testing.allocator, repository, &target, patch_bytes);
+    defer std.testing.allocator.free(request);
+    var output = try executeAlloc(std.testing.allocator, io, null, &.{}, request);
+    defer output.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), output.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, output.bytes, "\"unit_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.bytes, "{\"name\":\"unit_raw_fragment_target_bytes\",\"value\":65536}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.bytes, "unit_raw_fragment_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.bytes, "review_unit_too_large") == null);
 }
 
 test "AI review input command admits the exact no-change frame without mutation" {
@@ -1418,12 +1462,23 @@ test "AI review input command admits actual review-projection modify add delete 
             coverage_cursor = spans[0].object.get("end_exclusive").?.integer;
             if (std.mem.eql(u8, unit.get("file_status").?.string, "renamed")) {
                 saw_renamed = true;
-                const locations = unit.get("locations").?.array.items;
-                try std.testing.expectEqual(@as(usize, 6), locations.len);
-                for (locations, 0..) |location, index| {
-                    try std.testing.expectEqual(@as(i64, @intCast(index % 3 + 1)), location.object.get("line").?.integer);
-                    try std.testing.expectEqualStrings(if (index < 3) "before" else "after", location.object.get("side").?.string);
-                }
+                try std.testing.expect(unit.get("locations") == null);
+                const hunks = unit.get("hunks").?.array.items;
+                var next_before: u16 = 1;
+                var next_after: u16 = 1;
+                for (hunks) |hunk_value| for (hunk_value.object.get("lines").?.array.items) |line_value| {
+                    const line = line_value.object;
+                    if (line.get("before_location")) |value| {
+                        try std.testing.expectEqual(protocol.LocationId{ .side = .before, .ordinal = next_before }, try protocol.LocationId.parse(value.string));
+                        next_before += 1;
+                    }
+                    if (line.get("after_location")) |value| {
+                        try std.testing.expectEqual(protocol.LocationId{ .side = .after, .ordinal = next_after }, try protocol.LocationId.parse(value.string));
+                        next_after += 1;
+                    }
+                };
+                try std.testing.expectEqual(@as(u16, 4), next_before);
+                try std.testing.expectEqual(@as(u16, 4), next_after);
             }
         }
         try std.testing.expect(saw_renamed);

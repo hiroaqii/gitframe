@@ -19,8 +19,7 @@ pub const max_input_header_bytes: usize = 16 * 1024;
 pub const max_changed_files: usize = 1024;
 pub const max_hunks: usize = 8192;
 pub const max_review_units: usize = 256;
-pub const max_model_turns: usize = 256;
-pub const max_unit_raw_fragment_bytes: usize = 64 * 1024;
+pub const unit_raw_fragment_target_bytes: usize = 64 * 1024;
 pub const max_diff_line_bytes: usize = 16 * 1024;
 pub const max_metadata_lines_per_unit: usize = 8192;
 pub const max_lines_per_unit: usize = 19_998;
@@ -83,14 +82,13 @@ pub const review_plan_limits = [_]PlanLimit{
     .{ .name = "hunks", .value = max_hunks },
     .{ .name = "input_header_bytes", .value = max_input_header_bytes },
     .{ .name = "input_output_bytes", .value = max_review_input_output_bytes },
-    .{ .name = "model_turns", .value = max_model_turns },
     .{ .name = "projection_bytes", .value = max_projection_bytes },
     .{ .name = "projection_frame_bytes", .value = max_projection_frame_bytes },
     .{ .name = "review_units", .value = max_review_units },
     .{ .name = "suggestion_bytes", .value = max_suggestion_bytes },
     .{ .name = "title_bytes", .value = max_title_bytes },
     .{ .name = "unit_bytes", .value = max_unit_bytes },
-    .{ .name = "unit_raw_fragment_bytes", .value = max_unit_raw_fragment_bytes },
+    .{ .name = "unit_raw_fragment_target_bytes", .value = unit_raw_fragment_target_bytes },
 };
 
 test "AI review protocol planning limit names are canonical and unique" {

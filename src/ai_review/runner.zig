@@ -737,7 +737,7 @@ test "publishReady creates exact zero and nonzero publications and rejects a bad
             const location = if (case == .invalid_anchor)
                 try protocol.LocationId.parse("a9999")
             else
-                plan.units[0].locations[0].location_id;
+                (try protocol.findReviewLocation(&plan.units[0], try protocol.LocationId.parse("a0001"))).?.location.location_id;
             const findings = try candidate_arena.allocator().alloc(protocol.FindingCandidate, 1);
             findings[0] = .{
                 .start_location = location,

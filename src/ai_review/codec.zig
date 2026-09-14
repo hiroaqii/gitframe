@@ -1,7 +1,6 @@
 //! Strict complete-input parsers and canonical writers for AI review v1.
 
 const std = @import("std");
-const anchor = @import("../committed_review/anchor.zig");
 const artifact = @import("../committed_review/artifact.zig");
 const identity = @import("../committed_review/identity.zig");
 const target_mod = @import("../committed_review/target.zig");
@@ -473,7 +472,6 @@ fn parseReviewUnitValue(parser: *Parser) ParseError!protocol.ReviewUnit {
     var file_status: ?protocol.FileStatus = null;
     var metadata_lines: ?[]const []const u8 = null;
     var hunks: ?[]const protocol.ReviewHunk = null;
-    var locations: ?[]const protocol.ReviewLocation = null;
     var before_guidance: ?[]const protocol.Guidance = null;
     var after_guidance: ?[]const protocol.Guidance = null;
     var coverage_spans: ?[]const protocol.CoverageSpan = null;
@@ -511,25 +509,21 @@ fn parseReviewUnitValue(parser: *Parser) ParseError!protocol.ReviewUnit {
         } else if (std.mem.eql(u8, key, "hunks")) {
             try markSeen(&seen, 10);
             hunks = try parseHunks(parser);
-        } else if (std.mem.eql(u8, key, "locations")) {
-            try markSeen(&seen, 11);
-            locations = try parseLocations(parser);
         } else if (std.mem.eql(u8, key, "before_guidance")) {
-            try markSeen(&seen, 12);
+            try markSeen(&seen, 11);
             before_guidance = try parseGuidance(parser);
         } else if (std.mem.eql(u8, key, "after_guidance")) {
-            try markSeen(&seen, 13);
+            try markSeen(&seen, 12);
             after_guidance = try parseGuidance(parser);
         } else if (std.mem.eql(u8, key, "coverage_spans")) {
-            try markSeen(&seen, 14);
+            try markSeen(&seen, 13);
             coverage_spans = try parseCoverageSpans(parser);
         } else return error.UnknownField;
     }
     const required = (@as(u32, 1) << 0) | (@as(u32, 1) << 1) | (@as(u32, 1) << 2) |
         (@as(u32, 1) << 3) | (@as(u32, 1) << 4) | (@as(u32, 1) << 7) |
         (@as(u32, 1) << 8) | (@as(u32, 1) << 9) | (@as(u32, 1) << 10) |
-        (@as(u32, 1) << 11) | (@as(u32, 1) << 12) | (@as(u32, 1) << 13) |
-        (@as(u32, 1) << 14);
+        (@as(u32, 1) << 11) | (@as(u32, 1) << 12) | (@as(u32, 1) << 13);
     try requireFields(seen, required);
     const value: protocol.ReviewUnit = .{
         .schema_version = schema_version.?,
@@ -543,7 +537,6 @@ fn parseReviewUnitValue(parser: *Parser) ParseError!protocol.ReviewUnit {
         .file_status = file_status.?,
         .metadata_lines = metadata_lines.?,
         .hunks = hunks.?,
-        .locations = locations.?,
         .before_guidance = before_guidance.?,
         .after_guidance = after_guidance.?,
         .coverage_spans = coverage_spans.?,
@@ -644,42 +637,6 @@ fn parseDiffLines(parser: *Parser) ParseError![]const protocol.DiffLine {
             .line_ending = line_ending.?,
             .before_location = before_location,
             .after_location = after_location,
-        });
-    }
-    return try list.toOwnedSlice();
-}
-
-fn parseLocations(parser: *Parser) ParseError![]const protocol.ReviewLocation {
-    try parser.beginArray();
-    var list = std.array_list.Managed(protocol.ReviewLocation).init(parser.allocator);
-    while (try parser.nextArrayObject()) {
-        if (list.items.len == limits.max_lines_per_unit) return error.LimitExceeded;
-        var seen: u32 = 0;
-        var location_id: ?protocol.LocationId = null;
-        var path_bytes: ?[]const u8 = null;
-        var side: ?anchor.AnchorSide = null;
-        var line: ?u32 = null;
-        while (try parser.nextObjectKey()) |key| {
-            if (std.mem.eql(u8, key, "location_id")) {
-                try markSeen(&seen, 0);
-                location_id = protocol.LocationId.parse(try parser.string()) catch return error.InvalidValue;
-            } else if (std.mem.eql(u8, key, "path_bytes_b64")) {
-                try markSeen(&seen, 1);
-                path_bytes = try decodeRawPath(parser.allocator, try parser.string());
-            } else if (std.mem.eql(u8, key, "side")) {
-                try markSeen(&seen, 2);
-                side = try parseSide(try parser.string());
-            } else if (std.mem.eql(u8, key, "line")) {
-                try markSeen(&seen, 3);
-                line = try parser.unsigned(u32);
-            } else return error.UnknownField;
-        }
-        try requireFields(seen, 0b1111);
-        try list.append(.{
-            .location_id = location_id.?,
-            .path_bytes = path_bytes.?,
-            .side = side.?,
-            .line = line.?,
         });
     }
     return try list.toOwnedSlice();
@@ -851,35 +808,6 @@ fn validateLocationId(value: protocol.LocationId) ParseError!void {
     if (value.ordinal == 0 or value.ordinal > limits.max_locations_per_side) return error.InvalidValue;
 }
 
-const SourcePosition = struct {
-    line: u64,
-    after_line: bool,
-};
-
-const SourceSpan = struct {
-    first: SourcePosition,
-    last: SourcePosition,
-};
-
-/// Unified-diff zero-count ranges identify the boundary after `start` (with
-/// zero meaning the boundary before line one). Non-empty ranges identify the
-/// committed lines themselves. This gives both forms one strict source order.
-fn sourceSpan(start: u32, count: u32) SourceSpan {
-    if (count == 0) {
-        const position: SourcePosition = .{ .line = start, .after_line = true };
-        return .{ .first = position, .last = position };
-    }
-    return .{
-        .first = .{ .line = start, .after_line = false },
-        .last = .{ .line = @as(u64, start) + count - 1, .after_line = false },
-    };
-}
-
-fn sourcePositionBefore(left: SourcePosition, right: SourcePosition) bool {
-    if (left.line != right.line) return left.line < right.line;
-    return !left.after_line and right.after_line;
-}
-
 fn validateReviewUnit(value: *const protocol.ReviewUnit) ParseError!void {
     try validateSchema(value.schema_version);
     if (value.ordinal == 0 or value.ordinal > limits.max_review_units or
@@ -898,96 +826,17 @@ fn validateReviewUnit(value: *const protocol.ReviewUnit) ParseError!void {
     if (value.hunks.len == 0) return error.MissingField;
     if (value.hunks.len > limits.max_hunks) return error.LimitExceeded;
 
-    const before_count = try validateLocations(value);
-    var next_before: u16 = 1;
-    var next_after: u16 = 1;
-    var total_lines: usize = 0;
-    var previous_old_end: ?SourcePosition = null;
-    var previous_new_end: ?SourcePosition = null;
-    var old_ended_without_lf = false;
-    var new_ended_without_lf = false;
     for (value.hunks) |hunk| {
-        if ((hunk.old_count > 0 and hunk.old_start == 0) or
-            (hunk.new_count > 0 and hunk.new_start == 0) or hunk.lines.len == 0)
-        {
-            return error.InvalidValue;
-        }
-        const old_span = sourceSpan(hunk.old_start, hunk.old_count);
-        const new_span = sourceSpan(hunk.new_start, hunk.new_count);
-        if (previous_old_end) |previous| {
-            if (!sourcePositionBefore(previous, old_span.first)) return error.InvalidValue;
-        }
-        if (previous_new_end) |previous| {
-            if (!sourcePositionBefore(previous, new_span.first)) return error.InvalidValue;
-        }
-        previous_old_end = old_span.last;
-        previous_new_end = new_span.last;
         if (hunk.section) |section| try validateDiffText(section, limits.max_hunk_section_bytes);
-        total_lines = std.math.add(usize, total_lines, hunk.lines.len) catch return error.LimitExceeded;
-        if (total_lines > limits.max_lines_per_unit) return error.LimitExceeded;
-
-        var old_line: u64 = hunk.old_start;
-        var new_line: u64 = hunk.new_start;
-        var old_used: u64 = 0;
-        var new_used: u64 = 0;
         for (hunk.lines) |line| {
             try validateDiffText(line.text, limits.max_diff_line_bytes);
-            const consumes_old = line.kind != .added;
-            const consumes_new = line.kind != .removed;
-            if ((consumes_old and old_ended_without_lf) or (consumes_new and new_ended_without_lf)) {
-                return error.InvalidValue;
-            }
-            switch (line.kind) {
-                .context => {
-                    const before_id = line.before_location orelse return error.MissingField;
-                    const after_id = line.after_location orelse return error.MissingField;
-                    if (before_id.side != .before or before_id.ordinal != next_before or
-                        after_id.side != .after or after_id.ordinal != next_after)
-                    {
-                        return error.InvalidValue;
-                    }
-                    try validateLocationReference(value, before_count, before_id, old_line);
-                    try validateLocationReference(value, before_count, after_id, new_line);
-                    next_before = std.math.add(u16, next_before, 1) catch return error.LimitExceeded;
-                    next_after = std.math.add(u16, next_after, 1) catch return error.LimitExceeded;
-                    old_line += 1;
-                    new_line += 1;
-                    old_used += 1;
-                    new_used += 1;
-                },
-                .removed => {
-                    const before_id = line.before_location orelse return error.MissingField;
-                    if (line.after_location != null or before_id.side != .before or before_id.ordinal != next_before) {
-                        return error.InvalidValue;
-                    }
-                    try validateLocationReference(value, before_count, before_id, old_line);
-                    next_before = std.math.add(u16, next_before, 1) catch return error.LimitExceeded;
-                    old_line += 1;
-                    old_used += 1;
-                },
-                .added => {
-                    const after_id = line.after_location orelse return error.MissingField;
-                    if (line.before_location != null or after_id.side != .after or after_id.ordinal != next_after) {
-                        return error.InvalidValue;
-                    }
-                    try validateLocationReference(value, before_count, after_id, new_line);
-                    next_after = std.math.add(u16, next_after, 1) catch return error.LimitExceeded;
-                    new_line += 1;
-                    new_used += 1;
-                },
-            }
-            if (line.line_ending == .none) {
-                if (consumes_old) old_ended_without_lf = true;
-                if (consumes_new) new_ended_without_lf = true;
-            }
         }
-        if (old_used != hunk.old_count or new_used != hunk.new_count) return error.InvalidValue;
     }
-    if (@as(usize, next_before - 1) != before_count or
-        @as(usize, next_after - 1) != value.locations.len - before_count)
-    {
-        return error.InvalidValue;
-    }
+    var locations = protocol.ReviewLocationIterator.init(value);
+    while (locations.next() catch |err| return switch (err) {
+        error.InvalidMapping => error.InvalidValue,
+        error.LimitExceeded => error.LimitExceeded,
+    }) |_| {}
 
     try validateGuidance(
         value.before_guidance,
@@ -996,56 +845,6 @@ fn validateReviewUnit(value: *const protocol.ReviewUnit) ParseError!void {
         value.new_path_bytes,
     );
     try validateCoverage(value.coverage_spans);
-}
-
-fn validateLocations(value: *const protocol.ReviewUnit) ParseError!usize {
-    if (value.locations.len == 0 or value.locations.len > limits.max_lines_per_unit) return error.LimitExceeded;
-    var before_count: usize = 0;
-    var saw_after = false;
-    var expected_before: u16 = 1;
-    var expected_after: u16 = 1;
-    for (value.locations) |location| {
-        if (location.line == 0 or location.location_id.side != location.side) return error.InvalidValue;
-        const expected_path = switch (location.side) {
-            .before => value.old_path_bytes orelse return error.InvalidValue,
-            .after => value.new_path_bytes orelse return error.InvalidValue,
-        };
-        if (!std.mem.eql(u8, expected_path, location.path_bytes)) return error.InvalidValue;
-        switch (location.side) {
-            .before => {
-                if (saw_after or location.location_id.ordinal != expected_before) return error.InvalidValue;
-                expected_before = std.math.add(u16, expected_before, 1) catch return error.LimitExceeded;
-                before_count += 1;
-            },
-            .after => {
-                saw_after = true;
-                if (location.location_id.ordinal != expected_after) return error.InvalidValue;
-                expected_after = std.math.add(u16, expected_after, 1) catch return error.LimitExceeded;
-            },
-        }
-    }
-    if (before_count > limits.max_locations_per_side or
-        value.locations.len - before_count > limits.max_locations_per_side)
-    {
-        return error.LimitExceeded;
-    }
-    return before_count;
-}
-
-fn validateLocationReference(
-    value: *const protocol.ReviewUnit,
-    before_count: usize,
-    id: protocol.LocationId,
-    expected_line: u64,
-) ParseError!void {
-    if (expected_line == 0 or expected_line > std.math.maxInt(u32)) return error.InvalidValue;
-    const index = switch (id.side) {
-        .before => @as(usize, id.ordinal - 1),
-        .after => before_count + @as(usize, id.ordinal - 1),
-    };
-    if (index >= value.locations.len) return error.InvalidValue;
-    const location = value.locations[index];
-    if (!location.location_id.eql(id) or location.line != expected_line) return error.InvalidValue;
 }
 
 fn validateGuidance(
@@ -1154,15 +953,12 @@ fn validateCoverage(spans: []const protocol.CoverageSpan) ParseError!void {
     if (spans.len == 0) return error.MissingField;
     if (spans.len > limits.max_coverage_spans_per_unit) return error.LimitExceeded;
     var previous_end: u32 = 0;
-    var total: usize = 0;
     for (spans, 0..) |span, index| {
         if (span.start >= span.end_exclusive or span.end_exclusive > limits.max_projection_bytes or
             (index > 0 and span.start < previous_end))
         {
             return error.InvalidValue;
         }
-        total = std.math.add(usize, total, span.end_exclusive - span.start) catch return error.LimitExceeded;
-        if (total > limits.max_unit_raw_fragment_bytes) return error.LimitExceeded;
         previous_end = span.end_exclusive;
     }
 }
@@ -1258,12 +1054,6 @@ fn decodeRawPath(allocator: std.mem.Allocator, encoded: []const u8) ParseError![
 fn parseObjectFormat(text: []const u8) ParseError!target_mod.ObjectFormat {
     if (std.mem.eql(u8, text, "sha1")) return .sha1;
     if (std.mem.eql(u8, text, "sha256")) return .sha256;
-    return error.InvalidValue;
-}
-
-fn parseSide(text: []const u8) ParseError!anchor.AnchorSide {
-    if (std.mem.eql(u8, text, "before")) return .before;
-    if (std.mem.eql(u8, text, "after")) return .after;
     return error.InvalidValue;
 }
 
@@ -1455,8 +1245,6 @@ fn writeReviewUnit(
     try stringify.endArray();
     try stringify.objectField("hunks");
     try writeHunks(stringify, value.hunks);
-    try stringify.objectField("locations");
-    try writeLocations(stringify, allocator, value.locations);
     try stringify.objectField("before_guidance");
     try writeGuidance(stringify, allocator, value.before_guidance);
     try stringify.objectField("after_guidance");
@@ -1494,23 +1282,6 @@ fn writeHunks(stringify: *std.json.Stringify, hunks: []const protocol.ReviewHunk
             try stringify.endObject();
         }
         try stringify.endArray();
-        try stringify.endObject();
-    }
-    try stringify.endArray();
-}
-
-fn writeLocations(
-    stringify: *std.json.Stringify,
-    allocator: std.mem.Allocator,
-    locations: []const protocol.ReviewLocation,
-) WriteError!void {
-    try stringify.beginArray();
-    for (locations) |location| {
-        try stringify.beginObject();
-        try fieldLocationId(stringify, "location_id", location.location_id);
-        try fieldRawPath(stringify, allocator, "path_bytes_b64", location.path_bytes);
-        try fieldString(stringify, "side", sideName(location.side));
-        try fieldUnsigned(stringify, "line", location.line);
         try stringify.endObject();
     }
     try stringify.endArray();
@@ -1607,13 +1378,6 @@ fn lineEndingName(value: protocol.LineEnding) []const u8 {
     };
 }
 
-fn sideName(value: anchor.AnchorSide) []const u8 {
-    return switch (value) {
-        .before => "before",
-        .after => "after",
-    };
-}
-
 fn severityName(value: artifact.Severity) []const u8 {
     return switch (value) {
         .info => "info",
@@ -1652,12 +1416,6 @@ const fixture_hunks = [_]protocol.ReviewHunk{.{
     .section = "fn main()",
     .lines = &fixture_lines,
 }};
-const fixture_locations = [_]protocol.ReviewLocation{
-    .{ .location_id = .{ .side = .before, .ordinal = 1 }, .path_bytes = fixture_path, .side = .before, .line = 1 },
-    .{ .location_id = .{ .side = .before, .ordinal = 2 }, .path_bytes = fixture_path, .side = .before, .line = 2 },
-    .{ .location_id = .{ .side = .after, .ordinal = 1 }, .path_bytes = fixture_path, .side = .after, .line = 1 },
-    .{ .location_id = .{ .side = .after, .ordinal = 2 }, .path_bytes = fixture_path, .side = .after, .line = 2 },
-};
 const fixture_coverage = [_]protocol.CoverageSpan{.{ .start = 0, .end_exclusive = 128 }};
 const fixture_metadata = [_][]const u8{"index 0000000..1111111 100644"};
 const fixture_findings = [_]protocol.FindingCandidate{.{
@@ -1704,7 +1462,6 @@ fn testUnit() protocol.ReviewUnit {
         .file_status = .modified,
         .metadata_lines = &fixture_metadata,
         .hunks = &fixture_hunks,
-        .locations = &fixture_locations,
         .before_guidance = &.{},
         .after_guidance = &.{},
         .coverage_spans = &fixture_coverage,
@@ -1839,8 +1596,25 @@ test "AI review protocol canonical plan unit and candidate fixtures round trip" 
     try std.testing.expectEqualStrings(unit_fixture, unit_bytes);
     var parsed_unit = try protocol.ReviewUnit.parseStrict(allocator, unit_fixture);
     defer parsed_unit.deinit();
-    try std.testing.expectEqual(@as(usize, 4), parsed_unit.value.locations.len);
+    try std.testing.expect(std.mem.indexOf(u8, unit_bytes, "\"locations\"") == null);
+    const derived = (try protocol.findReviewLocation(
+        &parsed_unit.value,
+        .{ .side = .after, .ordinal = 2 },
+    )).?;
+    try std.testing.expectEqualStrings(fixture_path, derived.location.path_bytes);
+    try std.testing.expectEqual(@as(u32, 2), derived.location.line);
+    try std.testing.expectEqualStrings("new();", derived.diff_line.text);
     try std.testing.expectEqual(protocol.LineEnding.crlf, parsed_unit.value.hunks[0].lines[2].line_ending);
+
+    const guidance_field = std.mem.indexOf(u8, unit_fixture, "\"before_guidance\"") orelse
+        return error.MissingFixtureNeedle;
+    const old_table = try std.mem.concat(allocator, u8, &.{
+        unit_fixture[0..guidance_field],
+        "\"locations\":[],",
+        unit_fixture[guidance_field..],
+    });
+    defer allocator.free(old_table);
+    try std.testing.expectError(error.UnknownField, protocol.ReviewUnit.parseStrict(allocator, old_table));
 
     const payload: protocol.FindingCandidatePayload = .{ .findings = &fixture_findings };
     const payload_bytes = try payload.writeCanonical(allocator);
@@ -2059,22 +1833,14 @@ test "AI review protocol public scalar and feasible collection bounds are exact"
         .new_count = 1,
         .lines = &added_line,
     }};
-    var added_location = [_]protocol.ReviewLocation{.{
-        .location_id = .{ .side = .after, .ordinal = 1 },
-        .path_bytes = raw_path[0..limits.max_raw_path_bytes],
-        .side = .after,
-        .line = 1,
-    }};
     unit = testUnit();
     unit.old_path_bytes = null;
     unit.new_path_bytes = raw_path[0..limits.max_raw_path_bytes];
     unit.file_status = .added;
     unit.metadata_lines = &.{};
     unit.hunks = &added_hunk;
-    unit.locations = &added_location;
     _ = try expectUnitRoundTrip(allocator, &unit);
     unit.new_path_bytes = raw_path;
-    added_location[0].path_bytes = raw_path;
     try std.testing.expectError(error.LimitExceeded, unit.writeCanonical(allocator));
 
     const guidance_content = try allocator.alloc(u8, limits.max_guidance_file_bytes + 1);
@@ -2133,12 +1899,9 @@ test "AI review protocol public scalar and feasible collection bounds are exact"
     @memcpy(exact_depth_path_buffer[exact_depth_path_length .. exact_depth_path_length + "file.zig".len], "file.zig");
     exact_depth_path_length += "file.zig".len;
     const exact_depth_path = exact_depth_path_buffer[0..exact_depth_path_length];
-    var deep_locations = fixture_locations;
-    for (&deep_locations) |*location| location.path_bytes = exact_depth_path;
     unit = testUnit();
     unit.old_path_bytes = exact_depth_path;
     unit.new_path_bytes = exact_depth_path;
-    unit.locations = &deep_locations;
     unit.before_guidance = guidance_items[0..limits.max_guidance_path_depth];
     unit.after_guidance = guidance_items[0..limits.max_guidance_path_depth];
     _ = try expectUnitRoundTrip(allocator, &unit);
@@ -2179,18 +1942,10 @@ test "AI review protocol public scalar and feasible collection bounds are exact"
     @memcpy(alternate_depth_path_buffer[alternate_depth_path_length .. alternate_depth_path_length + "file.zig".len], "file.zig");
     alternate_depth_path_length += "file.zig".len;
     const alternate_depth_path = alternate_depth_path_buffer[0..alternate_depth_path_length];
-    var union_locations = fixture_locations;
-    for (&union_locations) |*location| {
-        location.path_bytes = switch (location.side) {
-            .before => exact_depth_path,
-            .after => alternate_depth_path,
-        };
-    }
     unit = testUnit();
     unit.old_path_bytes = exact_depth_path;
     unit.new_path_bytes = alternate_depth_path;
     unit.file_status = .renamed;
-    unit.locations = &union_locations;
     // The two distinct chains share only root: 32 + 33 - 1 is the exact 64
     // unique-source limit, while 33 + 33 - 1 is 65 and must fail.
     unit.before_guidance = guidance_items[0..limits.max_guidance_path_depth];
@@ -2209,11 +1964,9 @@ test "AI review protocol public scalar and feasible collection bounds are exact"
     @memcpy(plus_one_depth_path_buffer[plus_one_depth_path_length .. plus_one_depth_path_length + "file.zig".len], "file.zig");
     plus_one_depth_path_length += "file.zig".len;
     const plus_one_depth_path = plus_one_depth_path_buffer[0..plus_one_depth_path_length];
-    for (&deep_locations) |*location| location.path_bytes = plus_one_depth_path;
     unit.old_path_bytes = plus_one_depth_path;
     unit.new_path_bytes = plus_one_depth_path;
     unit.file_status = .modified;
-    unit.locations = &deep_locations;
     unit.before_guidance = &.{};
     unit.after_guidance = &.{};
     try std.testing.expectError(error.LimitExceeded, unit.writeCanonical(allocator));
@@ -2305,8 +2058,6 @@ test "AI review protocol layered collection caps fail at their owning boundary" 
         defer allocator.free(lines);
         const hunks = try allocator.alloc(protocol.ReviewHunk, limits.max_hunks + 1);
         defer allocator.free(hunks);
-        const locations = try allocator.alloc(protocol.ReviewLocation, limits.max_hunks * 2);
-        defer allocator.free(locations);
         for (lines, 0..) |*line, index| {
             const ordinal: u16 = @intCast(index + 1);
             line.* = .{
@@ -2323,68 +2074,43 @@ test "AI review protocol layered collection caps fail at their owning boundary" 
                 .new_count = 1,
                 .lines = lines[index .. index + 1],
             };
-            if (index < limits.max_hunks) {
-                locations[index] = .{
-                    .location_id = .{ .side = .before, .ordinal = ordinal },
-                    .path_bytes = path,
-                    .side = .before,
-                    .line = @intCast(index + 1),
-                };
-                locations[limits.max_hunks + index] = .{
-                    .location_id = .{ .side = .after, .ordinal = ordinal },
-                    .path_bytes = path,
-                    .side = .after,
-                    .line = @intCast(index + 1),
-                };
-            }
         }
         var unit = testUnit();
         unit.old_path_bytes = path;
         unit.new_path_bytes = path;
         unit.hunks = hunks[0..limits.max_hunks];
-        unit.locations = locations;
         try std.testing.expectError(error.ArtifactTooLarge, unit.writeCanonical(allocator));
         unit.hunks = hunks;
         try std.testing.expectError(error.LimitExceeded, unit.writeCanonical(allocator));
     }
 
     {
-        const locations = try allocator.alloc(protocol.ReviewLocation, limits.max_locations_per_side + 1);
-        defer allocator.free(locations);
-        const lines = try allocator.alloc(protocol.DiffLine, limits.max_locations_per_side);
+        const lines = try allocator.alloc(protocol.DiffLine, limits.max_locations_per_side + 1);
         defer allocator.free(lines);
-        for (locations, 0..) |*location, index| {
-            const ordinal: u16 = @intCast(index + 1);
-            location.* = .{
-                .location_id = .{ .side = .after, .ordinal = ordinal },
-                .path_bytes = path,
-                .side = .after,
-                .line = @intCast(index + 1),
+        for (lines, 0..) |*line, index| {
+            const ordinal: u16 = @intCast(@min(index + 1, limits.max_locations_per_side));
+            line.* = .{
+                .kind = .added,
+                .text = "x",
+                .line_ending = .lf,
+                .after_location = .{ .side = .after, .ordinal = ordinal },
             };
-            if (index < lines.len) {
-                lines[index] = .{
-                    .kind = .added,
-                    .text = "x",
-                    .line_ending = .lf,
-                    .after_location = .{ .side = .after, .ordinal = ordinal },
-                };
-            }
         }
-        const hunk = [_]protocol.ReviewHunk{.{
+        var hunk = [_]protocol.ReviewHunk{.{
             .old_start = 0,
             .old_count = 0,
             .new_start = 1,
             .new_count = limits.max_locations_per_side,
-            .lines = lines,
+            .lines = lines[0..limits.max_locations_per_side],
         }};
         var unit = testUnit();
         unit.old_path_bytes = null;
         unit.new_path_bytes = path;
         unit.file_status = .added;
         unit.hunks = &hunk;
-        unit.locations = locations[0..limits.max_locations_per_side];
         try std.testing.expectError(error.ArtifactTooLarge, unit.writeCanonical(allocator));
-        unit.locations = locations;
+        hunk[0].new_count += 1;
+        hunk[0].lines = lines;
         try std.testing.expectError(error.LimitExceeded, unit.writeCanonical(allocator));
     }
 
@@ -2392,8 +2118,6 @@ test "AI review protocol layered collection caps fail at their owning boundary" 
         try std.testing.expectEqual(limits.max_locations_per_side * 2, limits.max_lines_per_unit);
         const lines = try allocator.alloc(protocol.DiffLine, limits.max_lines_per_unit + 1);
         defer allocator.free(lines);
-        const locations = try allocator.alloc(protocol.ReviewLocation, limits.max_lines_per_unit);
-        defer allocator.free(locations);
         for (0..limits.max_locations_per_side) |index| {
             const ordinal: u16 = @intCast(index + 1);
             lines[index] = .{
@@ -2408,18 +2132,6 @@ test "AI review protocol layered collection caps fail at their owning boundary" 
                 .line_ending = .lf,
                 .after_location = .{ .side = .after, .ordinal = ordinal },
             };
-            locations[index] = .{
-                .location_id = .{ .side = .before, .ordinal = ordinal },
-                .path_bytes = path,
-                .side = .before,
-                .line = @intCast(index + 1),
-            };
-            locations[limits.max_locations_per_side + index] = .{
-                .location_id = .{ .side = .after, .ordinal = ordinal },
-                .path_bytes = path,
-                .side = .after,
-                .line = @intCast(index + 1),
-            };
         }
         const exact_hunk = [_]protocol.ReviewHunk{.{
             .old_start = 1,
@@ -2432,7 +2144,6 @@ test "AI review protocol layered collection caps fail at their owning boundary" 
         unit.old_path_bytes = path;
         unit.new_path_bytes = path;
         unit.hunks = &exact_hunk;
-        unit.locations = locations;
         try std.testing.expectError(error.ArtifactTooLarge, unit.writeCanonical(allocator));
 
         const oversized_hunk = [_]protocol.ReviewHunk{.{
@@ -2629,18 +2340,11 @@ test "AI review protocol guidance digest binds exact content bytes" {
         .new_count = 1,
         .lines = &added_lines,
     }};
-    const added_locations = [_]protocol.ReviewLocation{.{
-        .location_id = .{ .side = .after, .ordinal = 1 },
-        .path_bytes = fixture_path,
-        .side = .after,
-        .line = 1,
-    }};
     var added_unit = testUnit();
     added_unit.old_path_bytes = null;
     added_unit.file_status = .added;
     added_unit.metadata_lines = &.{};
     added_unit.hunks = &added_hunks;
-    added_unit.locations = &added_locations;
     _ = try expectUnitRoundTrip(allocator, &added_unit);
     added_unit.before_guidance = &.{root_guidance};
     try std.testing.expectError(error.InvalidValue, added_unit.writeCanonical(allocator));
@@ -2658,18 +2362,11 @@ test "AI review protocol guidance digest binds exact content bytes" {
         .new_count = 0,
         .lines = &deleted_lines,
     }};
-    const deleted_locations = [_]protocol.ReviewLocation{.{
-        .location_id = .{ .side = .before, .ordinal = 1 },
-        .path_bytes = fixture_path,
-        .side = .before,
-        .line = 1,
-    }};
     var deleted_unit = testUnit();
     deleted_unit.new_path_bytes = null;
     deleted_unit.file_status = .deleted;
     deleted_unit.metadata_lines = &.{};
     deleted_unit.hunks = &deleted_hunks;
-    deleted_unit.locations = &deleted_locations;
     _ = try expectUnitRoundTrip(allocator, &deleted_unit);
     deleted_unit.after_guidance = &.{root_guidance};
     try std.testing.expectError(error.InvalidValue, deleted_unit.writeCanonical(allocator));
@@ -2698,16 +2395,16 @@ test "AI review protocol hunk spans are strictly source ordered" {
         .{ .old_start = 10, .old_count = 1, .new_start = 10, .new_count = 1, .lines = lines[0..1] },
         .{ .old_start = 20, .old_count = 1, .new_start = 20, .new_count = 1, .lines = lines[1..2] },
     };
-    var locations = [_]protocol.ReviewLocation{
-        .{ .location_id = .{ .side = .before, .ordinal = 1 }, .path_bytes = path, .side = .before, .line = 10 },
-        .{ .location_id = .{ .side = .before, .ordinal = 2 }, .path_bytes = path, .side = .before, .line = 20 },
-        .{ .location_id = .{ .side = .after, .ordinal = 1 }, .path_bytes = path, .side = .after, .line = 10 },
-        .{ .location_id = .{ .side = .after, .ordinal = 2 }, .path_bytes = path, .side = .after, .line = 20 },
-    };
     var unit = testUnit();
     unit.hunks = &hunks;
-    unit.locations = &locations;
     try std.testing.expect((try expectUnitRoundTrip(allocator, &unit)) <= limits.max_unit_bytes);
+
+    const second_after = (try protocol.findReviewLocation(
+        &unit,
+        .{ .side = .after, .ordinal = 2 },
+    )).?;
+    try std.testing.expectEqualStrings(path, second_after.location.path_bytes);
+    try std.testing.expectEqual(@as(u32, 20), second_after.location.line);
 
     const canonical = try unit.writeCanonical(allocator);
     defer allocator.free(canonical);
@@ -2715,23 +2412,14 @@ test "AI review protocol hunk spans are strictly source ordered" {
     canonical[second_hunk + "\"old_start\":".len] = '1';
     const second_new = std.mem.indexOfPos(u8, canonical, second_hunk, "\"new_start\":20") orelse return error.MissingFixtureNeedle;
     canonical[second_new + "\"new_start\":".len] = '1';
-    var search_index = second_new;
-    while (std.mem.indexOfPos(u8, canonical, search_index, "\"line\":20")) |line_index| {
-        canonical[line_index + "\"line\":".len] = '1';
-        search_index = line_index + "\"line\":20".len;
-    }
     try std.testing.expectError(error.InvalidValue, protocol.ReviewUnit.parseStrict(allocator, canonical));
 
     hunks[1].old_start = 10;
     hunks[1].new_start = 10;
-    locations[1].line = 10;
-    locations[3].line = 10;
     try std.testing.expectError(error.InvalidValue, unit.writeCanonical(allocator));
 
     hunks[0] = .{ .old_start = 10, .old_count = 2, .new_start = 10, .new_count = 2, .lines = &lines };
     hunks[1] = .{ .old_start = 11, .old_count = 1, .new_start = 11, .new_count = 1, .lines = lines[1..2] };
-    locations[1].line = 11;
-    locations[3].line = 11;
     try std.testing.expectError(error.InvalidValue, unit.writeCanonical(allocator));
 
     const added_lines = [_]protocol.DiffLine{
@@ -2742,13 +2430,8 @@ test "AI review protocol hunk spans are strictly source ordered" {
         .{ .old_start = 1, .old_count = 0, .new_start = 2, .new_count = 1, .lines = added_lines[0..1] },
         .{ .old_start = 3, .old_count = 0, .new_start = 5, .new_count = 1, .lines = added_lines[1..2] },
     };
-    const added_locations = [_]protocol.ReviewLocation{
-        .{ .location_id = .{ .side = .after, .ordinal = 1 }, .path_bytes = path, .side = .after, .line = 2 },
-        .{ .location_id = .{ .side = .after, .ordinal = 2 }, .path_bytes = path, .side = .after, .line = 5 },
-    };
     unit = testUnit();
     unit.hunks = &added_hunks;
-    unit.locations = &added_locations;
     try std.testing.expect((try expectUnitRoundTrip(allocator, &unit)) <= limits.max_unit_bytes);
 
     var continued_after_none = added_lines;
@@ -2772,25 +2455,18 @@ test "AI review protocol hunk spans are strictly source ordered" {
         .{ .old_start = 2, .old_count = 1, .new_start = 1, .new_count = 0, .lines = removed_lines[0..1] },
         .{ .old_start = 5, .old_count = 1, .new_start = 4, .new_count = 0, .lines = removed_lines[1..2] },
     };
-    const removed_locations = [_]protocol.ReviewLocation{
-        .{ .location_id = .{ .side = .before, .ordinal = 1 }, .path_bytes = path, .side = .before, .line = 2 },
-        .{ .location_id = .{ .side = .before, .ordinal = 2 }, .path_bytes = path, .side = .before, .line = 5 },
-    };
     unit = testUnit();
     unit.hunks = &removed_hunks;
-    unit.locations = &removed_locations;
     try std.testing.expect((try expectUnitRoundTrip(allocator, &unit)) <= limits.max_unit_bytes);
 }
 
-test "AI review protocol unit mapping and raw coverage fail closed" {
+test "AI review protocol unit mapping and projection coverage fail closed" {
     const allocator = std.testing.allocator;
     var unit = testUnit();
     var coverage = fixture_coverage;
-    coverage[0].end_exclusive = limits.max_unit_raw_fragment_bytes;
+    coverage[0].end_exclusive = limits.unit_raw_fragment_target_bytes + 1;
     unit.coverage_spans = &coverage;
     _ = try expectUnitRoundTrip(allocator, &unit);
-    coverage[0].end_exclusive += 1;
-    try std.testing.expectError(error.LimitExceeded, unit.writeCanonical(allocator));
 
     coverage[0] = .{
         .start = limits.max_projection_bytes - 1,
@@ -2810,9 +2486,11 @@ test "AI review protocol unit mapping and raw coverage fail closed" {
     try std.testing.expectError(error.InvalidValue, unit.writeCanonical(allocator));
 
     unit = testUnit();
-    var locations = fixture_locations;
-    locations[3].line = 3;
-    unit.locations = &locations;
+    var gapped_lines = fixture_lines;
+    gapped_lines[2].after_location.?.ordinal = 3;
+    var gapped_hunks = fixture_hunks;
+    gapped_hunks[0].lines = &gapped_lines;
+    unit.hunks = &gapped_hunks;
     try std.testing.expectError(error.InvalidValue, unit.writeCanonical(allocator));
 
     unit = testUnit();

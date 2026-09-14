@@ -142,7 +142,6 @@ pub const ReviewUnit = struct {
     file_status: FileStatus,
     metadata_lines: []const []const u8,
     hunks: []const ReviewHunk,
-    locations: []const ReviewLocation,
     before_guidance: []const Guidance,
     after_guidance: []const Guidance,
     coverage_spans: []const CoverageSpan,
@@ -155,6 +154,201 @@ pub const ReviewUnit = struct {
         return @import("codec.zig").writeReviewUnitAlloc(allocator, self);
     }
 };
+
+/// One derived location and the exact diff line that owns its opaque ID. All
+/// slices borrow storage from the Review Unit passed to the iterator.
+pub const ReviewLocationOccurrence = struct {
+    location: ReviewLocation,
+    diff_line: *const DiffLine,
+};
+
+pub const ReviewLocationError = error{ InvalidMapping, LimitExceeded };
+
+const SourcePosition = struct {
+    line: u64,
+    after_line: bool,
+};
+
+const SourceSpan = struct {
+    first: SourcePosition,
+    last: SourcePosition,
+};
+
+fn sourceSpan(start: u32, count: u32) SourceSpan {
+    if (count == 0) {
+        const position: SourcePosition = .{ .line = start, .after_line = true };
+        return .{ .first = position, .last = position };
+    }
+    return .{
+        .first = .{ .line = start, .after_line = false },
+        .last = .{ .line = @as(u64, start) + count - 1, .after_line = false },
+    };
+}
+
+fn sourcePositionBefore(left: SourcePosition, right: SourcePosition) bool {
+    if (left.line != right.line) return left.line < right.line;
+    return !left.after_line and right.after_line;
+}
+
+/// The sole unit-local mapping from ordered hunk lines and opaque IDs to
+/// committed coordinates. Each Review Unit restarts both side ordinals at 1.
+pub const ReviewLocationIterator = struct {
+    unit: *const ReviewUnit,
+    hunk_index: usize = 0,
+    line_index: usize = 0,
+    hunk_initialized: bool = false,
+    old_line: u64 = 0,
+    new_line: u64 = 0,
+    old_used: u64 = 0,
+    new_used: u64 = 0,
+    next_before: usize = 1,
+    next_after: usize = 1,
+    total_lines: usize = 0,
+    previous_old_end: ?SourcePosition = null,
+    previous_new_end: ?SourcePosition = null,
+    old_ended_without_lf: bool = false,
+    new_ended_without_lf: bool = false,
+    pending_after: ?ReviewLocationOccurrence = null,
+
+    pub fn init(unit: *const ReviewUnit) ReviewLocationIterator {
+        return .{ .unit = unit };
+    }
+
+    pub fn next(self: *ReviewLocationIterator) ReviewLocationError!?ReviewLocationOccurrence {
+        if (self.pending_after) |occurrence| {
+            self.pending_after = null;
+            return occurrence;
+        }
+
+        while (self.hunk_index < self.unit.hunks.len) {
+            const hunk = &self.unit.hunks[self.hunk_index];
+            if (!self.hunk_initialized) try self.beginHunk(hunk);
+            if (self.line_index == hunk.lines.len) {
+                if (self.old_used != hunk.old_count or self.new_used != hunk.new_count) {
+                    return error.InvalidMapping;
+                }
+                self.hunk_index += 1;
+                self.line_index = 0;
+                self.hunk_initialized = false;
+                continue;
+            }
+
+            const line = &hunk.lines[self.line_index];
+            self.line_index += 1;
+            const consumes_old = line.kind != .added;
+            const consumes_new = line.kind != .removed;
+            if ((consumes_old and self.old_ended_without_lf) or
+                (consumes_new and self.new_ended_without_lf))
+            {
+                return error.InvalidMapping;
+            }
+
+            const occurrence = switch (line.kind) {
+                .context => context: {
+                    const before = try self.derive(line, line.before_location, .before, self.old_line);
+                    const after = try self.derive(line, line.after_location, .after, self.new_line);
+                    self.pending_after = after;
+                    break :context before;
+                },
+                .removed => removed: {
+                    if (line.after_location != null) return error.InvalidMapping;
+                    break :removed try self.derive(line, line.before_location, .before, self.old_line);
+                },
+                .added => added: {
+                    if (line.before_location != null) return error.InvalidMapping;
+                    break :added try self.derive(line, line.after_location, .after, self.new_line);
+                },
+            };
+
+            if (consumes_old) {
+                self.old_line += 1;
+                self.old_used += 1;
+            }
+            if (consumes_new) {
+                self.new_line += 1;
+                self.new_used += 1;
+            }
+            if (line.line_ending == .none) {
+                if (consumes_old) self.old_ended_without_lf = true;
+                if (consumes_new) self.new_ended_without_lf = true;
+            }
+            return occurrence;
+        }
+        return null;
+    }
+
+    fn beginHunk(self: *ReviewLocationIterator, hunk: *const ReviewHunk) ReviewLocationError!void {
+        if ((hunk.old_count > 0 and hunk.old_start == 0) or
+            (hunk.new_count > 0 and hunk.new_start == 0) or hunk.lines.len == 0)
+        {
+            return error.InvalidMapping;
+        }
+        const old_span = sourceSpan(hunk.old_start, hunk.old_count);
+        const new_span = sourceSpan(hunk.new_start, hunk.new_count);
+        if (self.previous_old_end) |previous| {
+            if (!sourcePositionBefore(previous, old_span.first)) return error.InvalidMapping;
+        }
+        if (self.previous_new_end) |previous| {
+            if (!sourcePositionBefore(previous, new_span.first)) return error.InvalidMapping;
+        }
+        self.previous_old_end = old_span.last;
+        self.previous_new_end = new_span.last;
+        self.total_lines = std.math.add(usize, self.total_lines, hunk.lines.len) catch
+            return error.LimitExceeded;
+        if (self.total_lines > limits.max_lines_per_unit) return error.LimitExceeded;
+        self.old_line = hunk.old_start;
+        self.new_line = hunk.new_start;
+        self.old_used = 0;
+        self.new_used = 0;
+        self.hunk_initialized = true;
+    }
+
+    fn derive(
+        self: *ReviewLocationIterator,
+        diff_line: *const DiffLine,
+        optional_id: ?LocationId,
+        side: anchor.AnchorSide,
+        committed_line: u64,
+    ) ReviewLocationError!ReviewLocationOccurrence {
+        const id = optional_id orelse return error.InvalidMapping;
+        const expected = switch (side) {
+            .before => &self.next_before,
+            .after => &self.next_after,
+        };
+        if (expected.* > limits.max_locations_per_side) return error.LimitExceeded;
+        if (id.side != side or id.ordinal != expected.*) return error.InvalidMapping;
+        const path = switch (side) {
+            .before => self.unit.old_path_bytes,
+            .after => self.unit.new_path_bytes,
+        } orelse return error.InvalidMapping;
+        if (committed_line == 0 or committed_line > std.math.maxInt(u32)) return error.InvalidMapping;
+        expected.* += 1;
+        return .{
+            .location = .{
+                .location_id = id,
+                .path_bytes = path,
+                .side = side,
+                .line = @intCast(committed_line),
+            },
+            .diff_line = diff_line,
+        };
+    }
+};
+
+/// Resolve one opaque ID while also validating the complete unit-local mapping.
+pub fn findReviewLocation(
+    unit: *const ReviewUnit,
+    id: LocationId,
+) ReviewLocationError!?ReviewLocationOccurrence {
+    var iterator = ReviewLocationIterator.init(unit);
+    var found: ?ReviewLocationOccurrence = null;
+    while (try iterator.next()) |occurrence| {
+        if (!occurrence.location.location_id.eql(id)) continue;
+        if (found != null) return error.InvalidMapping;
+        found = occurrence;
+    }
+    return found;
+}
 
 /// The complete and only AI-authored finding value.
 pub const FindingCandidate = struct {
