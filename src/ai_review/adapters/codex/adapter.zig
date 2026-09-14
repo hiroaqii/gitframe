@@ -1213,7 +1213,8 @@ test "Codex one and two MiB prompt boundaries include instruction context escapi
     const storage = try allocator.alloc(u8, 16 * 1024 * 1024);
     defer allocator.free(storage);
     for ([_]usize{ 1024 * 1024, 2 * 1024 * 1024 }) |limit| {
-        const limits: execution.Limits = .{ .max_input_bytes = limit };
+        const limits: execution.Limits = if (limit == 2 * 1024 * 1024) .{} else .{ .max_input_bytes = limit };
+        try std.testing.expectEqual(limit, limits.max_input_bytes);
         const count: usize = if (limit == 1024 * 1024) 9 else 18;
         var units: [18]protocol.ReviewUnit = @splat(parsed.value);
         for (units[0..count], 0..) |*unit, index| {

@@ -234,7 +234,7 @@ codex_executable = "/absolute/path/to/codex"
 codex_model = "optional-runner-model"
 
 # Common execution limits; all four may be omitted.
-max_input_bytes = 1048576
+max_input_bytes = 2097152
 max_final_output_bytes = 262144
 max_stream_output_bytes = 8388608
 timeout_seconds = 1800
@@ -268,7 +268,7 @@ combinations with the key and reason. There is no zero/unlimited value.
 
 | Key | Default | Meaning and supported range |
 | --- | --- | --- |
-| `max_input_bytes` | 1048576 (1 MiB) | Entire generated prompt: instruction, context, serialized Review Units, and JSON escaping. `1..maxInt(usize)/2`. |
+| `max_input_bytes` | 2097152 (2 MiB) | Entire generated prompt: instruction, context, serialized Review Units, and JSON escaping. `1..maxInt(usize)/2`. |
 | `max_final_output_bytes` | 262144 (256 KiB) | Decoded final answer for one complete provider call, including its multi-unit envelope. `1..262144`. |
 | `max_stream_output_bytes` | 8388608 (8 MiB) | All stdout wire bytes, including intermediate JSONL events and escaping. `1..maxInt(usize)/2`, and at least `max_final_output_bytes`. |
 | `timeout_seconds` | 1800 (30 minutes) | Shared execution budget, `1..4294967295` seconds. |

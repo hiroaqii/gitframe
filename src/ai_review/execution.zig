@@ -27,7 +27,7 @@ pub const Reason = enum {
 pub const InvalidSetting = struct { key: Key, reason: Reason };
 
 pub const Limits = struct {
-    max_input_bytes: usize = 1024 * 1024,
+    max_input_bytes: usize = 2 * 1024 * 1024,
     max_final_output_bytes: usize = final_answer_ceiling,
     max_stream_output_bytes: usize = 8 * 1024 * 1024,
     timeout_seconds: u32 = 1800,
@@ -53,7 +53,7 @@ pub const Limits = struct {
 test "AI review execution limits have common defaults and finite ranges" {
     const defaults: Limits = .{};
     try std.testing.expect(defaults.validate() == null);
-    try std.testing.expectEqual(@as(usize, 1048576), defaults.max_input_bytes);
+    try std.testing.expectEqual(@as(usize, 2097152), defaults.max_input_bytes);
     try std.testing.expectEqual(@as(usize, 262144), defaults.max_final_output_bytes);
     try std.testing.expectEqual(@as(usize, 8388608), defaults.max_stream_output_bytes);
     try std.testing.expectEqualDeep(std.Io.Duration.fromSeconds(1800), defaults.timeout());

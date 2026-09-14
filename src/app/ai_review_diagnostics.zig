@@ -106,6 +106,26 @@ fn formatLimit(writer: *std.Io.Writer, maybe_limit: ?diagnostic.Limit) void {
     writer.print("\nObserved{s}: {d} {s}\n", .{ if (limit.observation == .at_least) " at least" else "", limit.observed, unit }) catch unreachable;
 }
 
+fn formatInputLimitDetail(writer: *std.Io.Writer, maybe_limit: ?diagnostic.Limit) void {
+    const limit = maybe_limit orelse {
+        writer.writeAll("Exact limit evidence is unavailable.\n") catch unreachable;
+        return;
+    };
+    writer.writeAll(switch (limit.resource) {
+        .provider_input_bytes => "Config: [ai_review].max_input_bytes controls generated prompt bytes.\n" ++
+            "Provider/model context limits are separate from this product budget.\n",
+        .context_bytes => "Constraint: This is the fixed Compare Context limit.\n" ++
+            "Next: Manually reduce the explicitly supplied Compare Context.\n" ++
+            "Config: [ai_review].max_input_bytes does not change this bound.\n",
+        .unit_bytes => "Constraint: This is the fixed canonical Review Unit protocol cap.\n" ++
+            "Increasing [ai_review].max_input_bytes or reducing Compare Context cannot repair this Unit.\n",
+        .guidance_per_unit_bytes => "Constraint: This is the separate repository guidance cap for one Review Unit.\n" ++
+            "Compare Context is unrelated to this bound.\n",
+        .unknown => "Exact limit evidence is unavailable.\n",
+        else => "Constraint: The current protocol cannot represent this target under this fixed resource.\n",
+    }) catch unreachable;
+}
+
 fn formatFailure(writer: *std.Io.Writer, failure: pipeline.FailureCode) void {
     switch (failure) {
         .repository_unavailable => writer.writeAll("Stage: Before Codex starts\nNext: Reload the repository and review target.\n") catch unreachable,
@@ -115,10 +135,7 @@ fn formatFailure(writer: *std.Io.Writer, failure: pipeline.FailureCode) void {
         .input_too_large => |limit| {
             writer.writeAll("Stage: Before Codex starts\n") catch unreachable;
             formatLimit(writer, limit);
-            writer.writeAll("Next: Reduce the review range or Context.\n") catch unreachable;
-            if (limit) |value| if (value.resource == .provider_input_bytes) {
-                writer.writeAll("Config: [ai_review].max_input_bytes (generated prompt bytes). Provider limits still apply.\n") catch unreachable;
-            };
+            formatInputLimitDetail(writer, limit);
         },
         .stream_too_large, .final_answer_too_large => |limit| {
             writer.print("Stage: {s}\n", .{if (failure == .stream_too_large) "Provider execution" else "Answer decoding"}) catch unreachable;

@@ -403,7 +403,8 @@ test "AI review configured input limit reaches retained F2 through actual App su
     const detail = @import("../ai_review_diagnostics.zig").format(&buffer, record);
     try std.testing.expect(std.mem.indexOf(u8, detail, "Limit: 512 bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "[ai_review].max_input_bytes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "Provider limits still apply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Provider/model context limits are separate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Reduce the review range or Context") == null);
     try std.testing.expect(try fixture.storeEmpty());
 }
 
@@ -891,6 +892,12 @@ test "AI review input diagnostic survives task delivery page changes and exact d
     try std.testing.expectEqualStrings("repo", record.display.repository.slice());
     try std.testing.expect(std.mem.endsWith(u8, record.display.base.slice(), "…"));
     try std.testing.expect(record.scope.eql(&fixture.scope()));
+    var detail_buffer: [2048]u8 = undefined;
+    const retained_detail = @import("../ai_review_diagnostics.zig").format(&detail_buffer, record);
+    try std.testing.expect(std.mem.indexOf(u8, retained_detail, "fixed Compare Context limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retained_detail, "Manually reduce the explicitly supplied Compare Context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retained_detail, "[ai_review].max_input_bytes does not change this bound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retained_detail, "Reduce the review range") == null);
     try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.f2 } }).?, &tc.ctx);
     try std.testing.expect(app.overlay.kind.ai_review_details.key.eql(key));
     try std.testing.expect(record.unread);

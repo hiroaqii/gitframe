@@ -3726,7 +3726,7 @@ const help_all_sections = [_]HelpSection{
     .{ .title = "Mouse", .items = &help_mouse_items },
 };
 
-test "AI review input footer and scrolled details remain readable at normal and narrow widths" {
+test "AI review input footer and resource-aware details remain readable at normal and narrow widths" {
     const committed = @import("../committed_review.zig");
     const diagnostic = @import("../ai_review/diagnostic.zig");
     const base = try committed.ObjectId.parse(.sha256, "1" ** 64);
@@ -3783,14 +3783,43 @@ test "AI review input footer and scrolled details remain readable at normal and 
         try std.testing.expect(std.mem.indexOf(u8, last, "2222222222222222") != null);
     }
     var buffer: [2048]u8 = undefined;
+    const provider_input = ai_review_diagnostics.format(&buffer, &record);
+    try std.testing.expect(std.mem.indexOf(u8, provider_input, "[ai_review].max_input_bytes controls generated prompt bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_input, "Provider/model context limits are separate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_input, "Reduce the review range or Context") == null);
+    record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .context_bytes, .allowed = 16384, .observed = 16385, .observation = .exact };
+    const context = ai_review_diagnostics.format(&buffer, &record);
+    try std.testing.expect(std.mem.indexOf(u8, context, "fixed Compare Context limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "Manually reduce the explicitly supplied Compare Context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "[ai_review].max_input_bytes does not change this bound") != null);
+    record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .unit_bytes, .allowed = 262144, .observed = 262145, .observation = .at_least };
+    const unit = ai_review_diagnostics.format(&buffer, &record);
+    try std.testing.expect(std.mem.indexOf(u8, unit, "fixed canonical Review Unit protocol cap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit, "Increasing [ai_review].max_input_bytes or reducing Compare Context cannot repair this Unit") != null);
+    record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .guidance_per_unit_bytes, .allowed = 98304, .observed = 98305, .observation = .at_least };
+    const guidance = ai_review_diagnostics.format(&buffer, &record);
+    try std.testing.expect(std.mem.indexOf(u8, guidance, "separate repository guidance cap for one Review Unit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guidance, "Compare Context is unrelated to this bound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guidance, "[ai_review].max_input_bytes") == null);
     record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .review_units, .allowed = 256, .observed = 257, .observation = .at_least };
     const counted = ai_review_diagnostics.format(&buffer, &record);
     try std.testing.expect(std.mem.indexOf(u8, counted, "Limit: 256 count") != null);
     try std.testing.expect(std.mem.indexOf(u8, counted, "KiB") == null);
+    try std.testing.expect(std.mem.indexOf(u8, counted, "current protocol cannot represent this target under this fixed resource") != null);
+    try std.testing.expect(std.mem.indexOf(u8, counted, "[ai_review].max_input_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, counted, "Compare Context") == null);
     record.phase.terminal.pipeline.outcome.failed.input_too_large.?.resource = .unknown;
-    try std.testing.expect(std.mem.indexOf(u8, ai_review_diagnostics.format(&buffer, &record), "unit unknown") != null);
+    const unknown = ai_review_diagnostics.format(&buffer, &record);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "unit unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "Exact limit evidence is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "[ai_review].max_input_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "Compare Context") == null);
     record.phase.terminal.pipeline.outcome.failed.input_too_large = null;
-    try std.testing.expect(std.mem.indexOf(u8, ai_review_diagnostics.format(&buffer, &record), "Limit / observation: unknown") != null);
+    const unavailable = ai_review_diagnostics.format(&buffer, &record);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "Limit / observation: unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "Exact limit evidence is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "[ai_review].max_input_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "Compare Context") == null);
 }
 
 test "AI review failure footer and details expose causes at normal and narrow sizes" {
@@ -3815,9 +3844,9 @@ test "AI review failure footer and details expose causes at normal and narrow si
         .{ .failure = .projection_failed, .cause = "projection failed" },
         .{ .failure = .input_failed, .cause = "input generation failed" },
         .{ .failure = .{ .input_too_large = .{ .resource = .provider_input_bytes, .allowed = 512, .observed = 1024, .observation = .exact } }, .cause = "input too large", .config_key = "max_input_bytes", .evidence = "Limit: 512 bytes\nObserved: 1024 bytes" },
-        .{ .failure = .{ .input_too_large = .{ .resource = .context_bytes, .allowed = 16384, .observed = 16385, .observation = .exact } }, .cause = "input too large" },
-        .{ .failure = .{ .input_too_large = .{ .resource = .diff_line_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } }, .cause = "input too large" },
-        .{ .failure = .{ .input_too_large = null }, .cause = "input too large" },
+        .{ .failure = .{ .input_too_large = .{ .resource = .context_bytes, .allowed = 16384, .observed = 16385, .observation = .exact } }, .cause = "input too large", .config_key = "max_input_bytes", .evidence = "Manually reduce the explicitly supplied Compare Context" },
+        .{ .failure = .{ .input_too_large = .{ .resource = .diff_line_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } }, .cause = "input too large", .evidence = "current protocol cannot represent this target under this fixed resource" },
+        .{ .failure = .{ .input_too_large = null }, .cause = "input too large", .evidence = "Exact limit evidence is unavailable" },
         .{ .failure = .{ .stream_too_large = .{ .resource = .stdout_bytes, .allowed = 4096, .observed = 4097, .observation = .at_least } }, .cause = "stdout too large", .config_key = "max_stream_output_bytes", .evidence = "Limit: 4096 bytes (4 KiB)\nObserved at least: 4097 bytes" },
         .{ .failure = .{ .stream_too_large = .{ .resource = .stderr_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } }, .cause = "stderr too large" },
         .{ .failure = .{ .final_answer_too_large = .{ .resource = .final_answer_bytes, .allowed = 256, .observed = 257, .observation = .exact } }, .cause = "answer too large", .config_key = "max_final_output_bytes", .evidence = "Limit: 256 bytes\nObserved: 257 bytes" },
