@@ -3,6 +3,8 @@
 const std = @import("std");
 const review = @import("../committed_review.zig");
 const durable = @import("../fs/durable.zig");
+const git_command = @import("../git/command.zig");
+const repository_locator = @import("../git/repository_locator.zig");
 const capability = @import("capability.zig");
 const core = @import("core.zig");
 const catalog = @import("catalog.zig");
@@ -42,13 +44,25 @@ const TrashName = [69]u8;
 const LocationTrashName = [74]u8;
 const max_trash_entries = 512;
 
-pub fn deleteRun(
+fn deleteRun(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const core.Context,
     request: DeleteRequest,
 ) std.mem.Allocator.Error!DeleteResult {
-    return deleteWith(allocator, io, context, request, .{});
+    return deleteWith(allocator, io, context, request, .{}, null);
+}
+
+pub const deleteRunForTest = deleteRun;
+
+pub fn deleteRunBound(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const core.Context,
+    authority: repository_locator.OperationAuthority,
+    request: DeleteRequest,
+) std.mem.Allocator.Error!DeleteResult {
+    return deleteWith(allocator, io, context, request, .{}, authority);
 }
 
 fn deleteWith(
@@ -57,8 +71,9 @@ fn deleteWith(
     context: *const core.Context,
     request: DeleteRequest,
     observer: durable.Observer,
+    authority: ?repository_locator.OperationAuthority,
 ) std.mem.Allocator.Error!DeleteResult {
-    const cleanup = deleteLocked(allocator, io, context, request, observer) catch |err| {
+    const cleanup = deleteLocked(allocator, io, context, request, observer, authority) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = classify(err) };
     };
@@ -71,6 +86,7 @@ fn deleteLocked(
     context: *const core.Context,
     request: DeleteRequest,
     observer: durable.Observer,
+    authority: ?repository_locator.OperationAuthority,
 ) !Cleanup {
     const repository_name = request.store.review_repository_id.canonical();
     const review_name = request.review_id.canonical();
@@ -144,6 +160,7 @@ fn deleteLocked(
     _ = try std.fmt.bufPrint(&location_trash_name, ".run-{s}-{s}", .{ review_name, nonce_text });
 
     try validateLocation(allocator, io, context, request.store, namespace, selected, expected_location);
+    try validateRepositoryBoundary(allocator, io, context, authority, request.store, namespace);
     // From completed rename onward, failures can only describe cleanup pending.
     try validateTrash(opened.root.directory, trash, repository_trash, &repository_name);
     const moved = switch (capability.movePreserving(io, namespace, actual_name, repository_trash, &name, observer)) {
@@ -190,13 +207,26 @@ fn deleteLocked(
 }
 
 /// No automatic caller. Only the currently bound repository's private trash.
-pub fn cleanupTrash(
+fn cleanupTrash(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const core.Context,
     expected: catalog.StoreSnapshot,
 ) std.mem.Allocator.Error!CleanupResult {
-    return cleanupWith(allocator, io, context, expected, .{}) catch |err| {
+    return cleanupWith(allocator, io, context, expected, .{}, null) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = classify(err) };
+    };
+}
+
+pub fn cleanupTrashBound(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const core.Context,
+    authority: repository_locator.OperationAuthority,
+    expected: catalog.StoreSnapshot,
+) std.mem.Allocator.Error!CleanupResult {
+    return cleanupWith(allocator, io, context, expected, .{}, authority) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = classify(err) };
     };
@@ -208,6 +238,7 @@ fn cleanupWith(
     context: *const core.Context,
     expected: catalog.StoreSnapshot,
     observer: durable.Observer,
+    authority: ?repository_locator.OperationAuthority,
 ) !CleanupResult {
     var opened = try openExpected(context, expected);
     defer opened.deinit();
@@ -223,12 +254,18 @@ fn cleanupWith(
     defer fresh.deinit();
     try validateBinding(allocator, io, fresh.root.directory, expected);
     var trash = fresh.root.directory.openDirectory(".trash") catch |err| {
-        if (err == error.FileNotFound) return .{ .cleaned = 0 };
+        if (err == error.FileNotFound) {
+            try validateRepositoryBoundary(allocator, io, context, authority, expected, null);
+            return .{ .cleaned = 0 };
+        }
         return err;
     };
     defer trash.deinit();
     var repository_trash = trash.openDirectory(&repository_name) catch |err| {
-        if (err == error.FileNotFound) return .{ .cleaned = 0 };
+        if (err == error.FileNotFound) {
+            try validateRepositoryBoundary(allocator, io, context, authority, expected, null);
+            return .{ .cleaned = 0 };
+        }
         return err;
     };
     defer repository_trash.deinit();
@@ -259,10 +296,12 @@ fn cleanupWith(
     }
     try completed(capability.syncDirectory(io, namespace, observer));
     try completed(capability.syncDirectory(io, repository_trash, observer));
+    try validateRepositoryBoundary(allocator, io, context, authority, expected, namespace);
     var cleaned: usize = 0;
     const orphan_locations = countOrphanLocations(names[0..count], location_names[0..location_count]);
     const total = count + orphan_locations;
     for (names[0..count]) |*name| {
+        try validateRepositoryBoundary(allocator, io, context, authority, expected, namespace);
         cleanupTrashRun(
             allocator,
             io,
@@ -281,6 +320,7 @@ fn cleanupWith(
     }
     for (location_names[0..location_count]) |*location_name| {
         if (containsTrashRun(names[0..count], location_name[5..])) continue;
+        try validateRepositoryBoundary(allocator, io, context, authority, expected, namespace);
         var run_name: TrashName = undefined;
         @memcpy(&run_name, location_name[5..]);
         cleanupLocationOnly(
@@ -300,6 +340,37 @@ fn cleanupWith(
         cleaned += 1;
     }
     return .{ .cleaned = cleaned };
+}
+
+fn validateRepositoryBoundary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const core.Context,
+    authority: ?repository_locator.OperationAuthority,
+    expected: catalog.StoreSnapshot,
+    namespace: ?capability.DirectoryCapability,
+) !void {
+    const repository = authority orelse return;
+    repository.revalidate(allocator, io) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.BindingChanged;
+    };
+    switch (try core.probeBinding(allocator, io, context, repository.located)) {
+        .bound => {},
+        .unbound, .failure => return error.BindingChanged,
+    }
+    if (!repository.instanceId().?.eql(expected.repository_instance_id))
+        return error.BindingChanged;
+    var fresh = try openExpected(context, expected);
+    defer fresh.deinit();
+    try validateBinding(allocator, io, fresh.root.directory, expected);
+    if (namespace) |expected_namespace| {
+        const namespace_now = fresh.root.directory.admitChild(
+            expected.repository_directory_name.slice(),
+            .directory,
+        ) catch return error.BindingChanged;
+        if (!namespace_now.sameObject(expected_namespace.metadata)) return error.BindingChanged;
+    }
 }
 
 fn validTrashName(name: []const u8) bool {
@@ -579,13 +650,17 @@ fn validateBinding(allocator: std.mem.Allocator, io: std.Io, root: capability.Di
         return if (err == error.OutOfMemory) err else error.InvalidRun;
     };
     defer parsed.deinit();
-    const found = parsed.lookup(expected.repository_locator) orelse return error.BindingChanged;
+    const found = parsed.lookup(expected.repository_instance_id) orelse return error.BindingChanged;
     if (!found.review_repository_id.eql(expected.review_repository_id) or
         !std.mem.eql(u8, found.repository_display_name, expected.repository_display_name.slice()) or
         !std.mem.eql(u8, found.directory_name, expected.repository_directory_name.slice()))
     {
         return error.BindingChanged;
     }
+    const namespace = root.admitChild(expected.repository_directory_name.slice(), .directory) catch
+        return error.BindingChanged;
+    if (namespace.device != expected.namespace_device or namespace.inode != expected.namespace_inode)
+        return error.BindingChanged;
 }
 
 fn validateLocation(
@@ -667,7 +742,7 @@ test "review store deletion protects unfinished stale and locked Runs" {
     request.store.root_inode +%= 1;
     try std.testing.expectEqual(Failure.binding_changed, (try deleteRun(allocator, io, &fixture.context, request)).failure);
     request = fixture.request;
-    request.store.repository_locator.inode +%= 1;
+    request.store.repository_instance_id.bytes[0] +%= 1;
     try std.testing.expectEqual(Failure.binding_changed, (try deleteRun(allocator, io, &fixture.context, request)).failure);
     request = fixture.request;
     request.review_id = try review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
@@ -675,7 +750,7 @@ test "review store deletion protects unfinished stale and locked Runs" {
     request.review_id.bytes = [_]u8{0} ** 16;
     try std.testing.expectEqual(Failure.run_invalid, (try deleteRun(allocator, io, &fixture.context, request)).failure);
     var permission: TestFault = .{ .operation = .rename_preserve, .edge = .before, .failure = error.AccessDenied };
-    const denied = try deleteWith(allocator, io, &fixture.context, fixture.request, .{ .context = &permission, .observe_fn = TestFault.observe });
+    const denied = try deleteWith(allocator, io, &fixture.context, fixture.request, .{ .context = &permission, .observe_fn = TestFault.observe }, null);
     try std.testing.expectEqual(Failure.permission_denied, denied.failure);
 
     var root = fixture.context.openExisting().opened;
@@ -763,7 +838,7 @@ test "review store deletion fault boundaries preserve rename durability before u
         defer fixture.deinit();
         var fault = case;
         try fixture.complete();
-        const result = try deleteWith(allocator, io, &fixture.context, fixture.request, .{ .context = &fault, .observe_fn = TestFault.observe });
+        const result = try deleteWith(allocator, io, &fixture.context, fixture.request, .{ .context = &fault, .observe_fn = TestFault.observe }, null);
         try std.testing.expect(fault.fired);
         if (!fault.renamed) {
             try std.testing.expectEqual(Failure.io_failed, result.failure);
@@ -805,6 +880,7 @@ test "review store deletion cleanup refuses foreign names and unsafe residue" {
             &orphan_fixture.context,
             orphan_fixture.request,
             .{ .context = &move_fault, .observe_fn = TestFault.observe },
+            null,
         );
         var namespace = try orphan_fixture.store.openDir(
             io,
@@ -832,14 +908,14 @@ test "review store deletion cleanup refuses foreign names and unsafe residue" {
     var fixture = try TestFixture.init(tmp.dir);
     defer fixture.deinit();
     var fault: TestFault = .{ .operation = .rename_preserve, .edge = .after };
-    _ = try deleteWith(allocator, io, &fixture.context, fixture.request, .{ .context = &fault, .observe_fn = TestFault.observe });
+    _ = try deleteWith(allocator, io, &fixture.context, fixture.request, .{ .context = &fault, .observe_fn = TestFault.observe }, null);
     var trash = try fixture.openTrash();
     defer trash.close(io);
     try trash.createDir(io, "foreign", .fromMode(0o700));
     try std.testing.expectEqual(Failure.run_invalid, (try cleanupTrash(allocator, io, &fixture.context, fixture.request.store)).failure);
     try trash.deleteDir(io, "foreign");
     var barrier: TestFault = .{ .operation = .sync_directory, .edge = .before };
-    try std.testing.expectError(error.InjectedDeletionFault, cleanupWith(allocator, io, &fixture.context, fixture.request.store, .{ .context = &barrier, .observe_fn = TestFault.observe }));
+    try std.testing.expectError(error.InjectedDeletionFault, cleanupWith(allocator, io, &fixture.context, fixture.request.store, .{ .context = &barrier, .observe_fn = TestFault.observe }, null));
     try std.testing.expectEqual(@as(usize, 0), barrier.unlinks);
     var iterator = trash.iterate();
     const name = try allocator.dupe(u8, (try iterator.next(io)).?.name);
@@ -883,6 +959,166 @@ test "review store deletion distinguishes missing and replaced Store roots" {
     original.close(io);
 }
 
+test "review store delete and cleanup reject marker replacement before canonical mutation" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try TestFixture.init(tmp.dir);
+    defer fixture.deinit();
+    try tmp.dir.createDir(io, "repository", .fromMode(0o700));
+    var repository = try tmp.dir.openDir(io, "repository", .{});
+    defer repository.close(io);
+    const initialized = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "init", "--initial-branch=main" },
+        .cwd = .{ .dir = repository },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(initialized.stdout);
+    defer allocator.free(initialized.stderr);
+    if (initialized.term != .exited or initialized.term.exited != 0) return error.GitCommandFailed;
+    const repository_path = try tmp.dir.realPathFileAlloc(io, "repository", allocator);
+    defer allocator.free(repository_path);
+    var root = try @import("../repo/root_capability.zig").RootCapability.openCanonical(repository_path);
+    defer root.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    var located_result = try repository_locator.locate(allocator, io, .{ .cwd = root.dir(), .environment = &environment });
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
+        .failure => return error.ExpectedRepositoryLocator,
+    };
+    const instance_id = try located.ensureIdentity(allocator, io, .{});
+    const diagnostic = try registry.diagnosticPath(located.canonical_path);
+    const registry_bytes = try registry.writeCanonicalAlloc(allocator, &.{.{
+        .repository_instance_id = instance_id,
+        .review_repository_id = fixture.request.store.review_repository_id,
+        .repository_display_name = fixture.request.store.repository_display_name.slice(),
+        .directory_name = fixture.request.store.repository_directory_name.slice(),
+        .last_seen_path = diagnostic,
+    }});
+    defer allocator.free(registry_bytes);
+    try fixture.store.writeFile(io, .{
+        .sub_path = "registry.json",
+        .data = registry_bytes,
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
+    fixture.request.store.repository_instance_id = instance_id;
+    const authority: repository_locator.OperationAuthority = .{
+        .located = located,
+        .context = .{ .cwd = root.dir(), .environment = &environment },
+    };
+
+    var delete_drift: MarkerBoundaryDrift = .{ .io = io, .repository = repository };
+    const rejected = try deleteWith(allocator, io, &fixture.context, fixture.request, delete_drift.observer(), authority);
+    try std.testing.expectEqual(Failure.binding_changed, rejected.failure);
+    try std.testing.expect(delete_drift.fired);
+    var still_present = try fixture.openRun();
+    still_present.close(io);
+    try restoreMarker(io, repository, instance_id);
+    const deleted = try deleteWith(allocator, io, &fixture.context, fixture.request, .{}, authority);
+    try std.testing.expectEqual(Cleanup.complete, deleted.deleted);
+
+    var cleanup_drift: MarkerBoundaryDrift = .{ .io = io, .repository = repository };
+    try std.testing.expectError(
+        error.BindingChanged,
+        cleanupWith(allocator, io, &fixture.context, fixture.request.store, cleanup_drift.observer(), authority),
+    );
+    try std.testing.expect(cleanup_drift.fired);
+
+    try restoreMarker(io, repository, instance_id);
+    const copied = try std.process.run(allocator, io, .{
+        .argv = &.{ "cp", "-a", "repository", "lease-copy" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(copied.stdout);
+    defer allocator.free(copied.stderr);
+    if (copied.term != .exited or copied.term.exited != 0) return error.CopyFailed;
+    const copy_path = try tmp.dir.realPathFileAlloc(io, "lease-copy/.git", allocator);
+    defer allocator.free(copy_path);
+    const lease_path = try registry.diagnosticPath(copy_path);
+    const lease_registry = try registry.writeCanonicalAlloc(allocator, &.{.{
+        .repository_instance_id = instance_id,
+        .review_repository_id = fixture.request.store.review_repository_id,
+        .repository_display_name = fixture.request.store.repository_display_name.slice(),
+        .directory_name = fixture.request.store.repository_directory_name.slice(),
+        .last_seen_path = lease_path,
+    }});
+    defer allocator.free(lease_registry);
+    var lease_drift: RegistryLeaseBoundaryDrift = .{
+        .io = io,
+        .store = fixture.store,
+        .registry_bytes = lease_registry,
+    };
+    try std.testing.expectError(
+        error.BindingChanged,
+        cleanupWith(allocator, io, &fixture.context, fixture.request.store, lease_drift.observer(), authority),
+    );
+    try std.testing.expect(lease_drift.fired);
+}
+
+const MarkerBoundaryDrift = struct {
+    io: std.Io,
+    repository: std.Io.Dir,
+    fired: bool = false,
+
+    fn observe(context: ?*anyopaque, step: durable.Step) !void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.fired or step.operation != .sync_directory or step.edge != .after) return;
+        self.fired = true;
+        try self.repository.deleteFile(self.io, ".git/gitframe/repository-id-v1");
+        try self.repository.writeFile(self.io, .{
+            .sub_path = ".git/gitframe/repository-id-v1",
+            .data = "923e4567-e89b-42d3-a456-426614174010\n",
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+    }
+
+    fn observer(self: *@This()) durable.Observer {
+        return .{ .context = self, .observe_fn = observe };
+    }
+};
+
+const RegistryLeaseBoundaryDrift = struct {
+    io: std.Io,
+    store: std.Io.Dir,
+    registry_bytes: []const u8,
+    fired: bool = false,
+
+    fn observe(context: ?*anyopaque, step: durable.Step) !void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.fired or step.operation != .sync_directory or step.edge != .after) return;
+        self.fired = true;
+        try self.store.writeFile(self.io, .{
+            .sub_path = "registry.json",
+            .data = self.registry_bytes,
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+    }
+
+    fn observer(self: *@This()) durable.Observer {
+        return .{ .context = self, .observe_fn = observe };
+    }
+};
+
+fn restoreMarker(io: std.Io, repository: std.Io.Dir, instance_id: review.RepositoryInstanceId) !void {
+    try repository.deleteFile(io, ".git/gitframe/repository-id-v1");
+    const canonical = instance_id.canonical();
+    var bytes: [37]u8 = undefined;
+    @memcpy(bytes[0..36], &canonical);
+    bytes[36] = '\n';
+    try repository.writeFile(io, .{
+        .sub_path = ".git/gitframe/repository-id-v1",
+        .data = &bytes,
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
+}
+
 const TestFault = struct {
     operation: durable.Operation,
     edge: durable.Edge,
@@ -920,29 +1156,46 @@ const TestFixture = struct {
         defer allocator.free(path);
         var context = try core.Context.initConfigured(allocator, path);
         errdefer context.deinit(allocator);
-        const locator: review.GitCommonDirectoryLocator = .{ .device = 7, .inode = 11 };
-        const prepared = (try core.prepareBinding(allocator, io, &context, .{ .locator = locator, .repository_path = "/test/repository", .repository_name = "repository" })).success;
+        var store = try parent.openDir(io, "store", .{});
+        errdefer store.close(io);
+        const repository_instance_id = try review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010");
+        const review_repository_id = try review.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
+        const review_id = try review.ReviewId.parse("323e4567-e89b-42d3-a456-426614174000");
+        const repository_display_name = try @import("name.zig").RepositoryDisplayName.fromStored("repository");
+        const repository_directory_name = @import("name.zig").RepositoryDirectoryName.format(&repository_display_name, review_repository_id);
+        const diagnostic = try registry.diagnosticPath("/test/repository");
+        const registry_bytes = try registry.writeCanonicalAlloc(allocator, &.{.{
+            .repository_instance_id = repository_instance_id,
+            .review_repository_id = review_repository_id,
+            .repository_display_name = repository_display_name.slice(),
+            .directory_name = repository_directory_name.slice(),
+            .last_seen_path = diagnostic,
+        }});
+        defer allocator.free(registry_bytes);
+        try store.writeFile(io, .{ .sub_path = "registry.json", .data = registry_bytes, .flags = .{ .permissions = .fromMode(0o600) } });
+        try store.createDir(io, ".locks", .fromMode(0o700));
+        try store.createDir(io, repository_directory_name.slice(), .fromMode(0o700));
         const oid = try review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
         const target: review.CommittedReviewTarget = .{ .object_format = .sha1, .source_kind = .branch_range, .base_oid = oid, .head_oid = oid, .diff_base_oid = oid };
-        const findings: review.FindingSet = .{ .schema_version = 1, .review_id = prepared.review_id, .created_at = "2026-09-10T00:00:00Z", .target = target, .producer = .{ .name = "test" }, .findings = &.{} };
+        const findings: review.FindingSet = .{ .schema_version = 1, .review_id = review_id, .created_at = "2026-09-10T00:00:00Z", .target = target, .producer = .{ .name = "test" }, .findings = &.{} };
         const findings_bytes = try findings.writeCanonical(allocator);
         defer allocator.free(findings_bytes);
-        const manifest: review.ReviewRunManifest = .{ .schema_version = 1, .review_id = prepared.review_id, .review_repository_id = prepared.review_repository_id, .target = target, .created_at = findings.created_at, .display = null, .finding_count = 0, .producer = findings.producer, .findings_digest = review.Sha256Digest.hash(findings_bytes) };
+        const manifest: review.ReviewRunManifest = .{ .schema_version = 1, .review_id = review_id, .review_repository_id = review_repository_id, .target = target, .created_at = findings.created_at, .display = null, .finding_count = 0, .producer = findings.producer, .findings_digest = review.Sha256Digest.hash(findings_bytes) };
         const manifest_bytes = try manifest.writeCanonical(allocator);
         defer allocator.free(manifest_bytes);
-        const published = try core.publish(allocator, io, &context, .{ .locator = locator, .review_repository_id = prepared.review_repository_id, .review_id = prepared.review_id, .manifest_bytes = manifest_bytes, .findings_bytes = findings_bytes });
+        const published = try core.publishForTest(allocator, io, &context, .{ .repository_instance_id = repository_instance_id, .review_repository_id = review_repository_id, .review_id = review_id, .manifest_bytes = manifest_bytes, .findings_bytes = findings_bytes });
         try std.testing.expectEqual(core.PublishResult.success, published);
         var opened = context.openExisting().opened;
         defer opened.deinit();
-        var namespace = try opened.root.directory.openDirectory(prepared.repository_directory_name.slice());
+        var namespace = try opened.root.directory.openDirectory(repository_directory_name.slice());
         defer namespace.deinit();
         var budget: run.ArtifactBudget = .{};
         var loaded = try run.loadValidated(
             allocator,
             io,
             namespace,
-            prepared.review_repository_id,
-            prepared.review_id,
+            review_repository_id,
+            review_id,
             &budget,
         );
         defer loaded.deinit(allocator);
@@ -950,9 +1203,9 @@ const TestFixture = struct {
             .loaded => |*value| run.ArtifactSnapshot.fromLoaded(value),
             .invalid => return error.InvalidRun,
         };
-        return .{ .context = context, .store = try parent.openDir(io, "store", .{}), .request = .{
-            .store = .{ .root_device = opened.snapshot.device, .root_inode = opened.snapshot.inode, .repository_locator = locator, .review_repository_id = prepared.review_repository_id, .repository_display_name = prepared.repository_display_name, .repository_directory_name = prepared.repository_directory_name },
-            .review_id = prepared.review_id,
+        return .{ .context = context, .store = store, .request = .{
+            .store = .{ .root_device = opened.snapshot.device, .root_inode = opened.snapshot.inode, .namespace_device = namespace.metadata.device, .namespace_inode = namespace.metadata.inode, .repository_instance_id = repository_instance_id, .review_repository_id = review_repository_id, .repository_display_name = repository_display_name, .repository_directory_name = repository_directory_name },
+            .review_id = review_id,
             .artifacts = artifacts,
             .allow_unfinished = true,
         } };

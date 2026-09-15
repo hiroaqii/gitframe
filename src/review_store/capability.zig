@@ -452,7 +452,9 @@ fn expectClosedProductionConsumers(allocator: std.mem.Allocator, io: std.Io) !vo
         } else if (marker) return ownershipFailure("unknown-consumer", path);
 
         const imports_neutral = std.mem.indexOf(u8, prefix, "fs/capability.zig\")") != null;
-        if (imports_neutral and !std.mem.eql(u8, path, direct_consumers[0])) return ownershipFailure("unknown-neutral-importer", path);
+        if (imports_neutral and
+            !std.mem.eql(u8, path, direct_consumers[0]) and
+            !std.mem.eql(u8, path, "src/git/repository_locator.zig")) return ownershipFailure("unknown-neutral-importer", path);
         const imports_durable = std.mem.indexOf(u8, prefix, "fs/durable.zig\")") != null;
         if (imports_durable != durableOwner(path)) return ownershipFailure("durable-import-owner-mismatch", path);
         const facade_only = std.mem.indexOf(u8, prefix, "review_store.zig\")") != null and consumerIndex(path) == null;
@@ -511,8 +513,8 @@ fn expectProductionLineCeilings(allocator: std.mem.Allocator, io: std.Io) !void 
         "src/fs/capability.zig",
         "src/fs/durable.zig",
     };
-    const core_ceiling: usize = 3250;
-    const complete_ceiling: usize = 5150;
+    const core_ceiling: usize = 3668;
+    const complete_ceiling: usize = 5538;
     var core: usize = 0;
     var complete = core;
     for (neutral_owner_paths) |path| {
@@ -564,6 +566,7 @@ fn hasForbiddenStoreAccess(source: []const u8, allow_facade_neutral: bool) bool 
 
 fn durableOwner(path: []const u8) bool {
     return std.mem.eql(u8, path, "src/review_store/capability.zig") or
+        std.mem.eql(u8, path, "src/git/repository_locator.zig") or
         std.mem.eql(u8, path, "src/review_store/core.zig") or
         std.mem.eql(u8, path, "src/review_store/maintenance.zig") or
         std.mem.eql(u8, path, "src/review_store/mutation.zig");

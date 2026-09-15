@@ -1,8 +1,8 @@
 //! Store-only bounded catalog scan and exact Review Run admission.
 //!
 //! This module knows no repository capability, Git command, diff, App, Review
-//! page, or provider authority. Callers supply an already-derived physical
-//! repository locator and compose Git object checks outside this boundary.
+//! page, or provider authority. Callers supply an already-read durable
+//! repository instance ID and compose repository checks outside this boundary.
 
 const std = @import("std");
 const committed_review = @import("../committed_review.zig");
@@ -38,13 +38,26 @@ const CandidateName = struct {
 pub const StoreSnapshot = struct {
     root_device: u64,
     root_inode: u64,
-    repository_locator: committed_review.GitCommonDirectoryLocator,
+    namespace_device: u64,
+    namespace_inode: u64,
+    repository_instance_id: committed_review.RepositoryInstanceId,
     review_repository_id: committed_review.ReviewRepositoryId,
     repository_display_name: store_name.RepositoryDisplayName,
     repository_directory_name: store_name.RepositoryDirectoryName,
 
     pub fn root(self: StoreSnapshot) core.RootSnapshot {
         return .{ .device = self.root_device, .inode = self.root_inode };
+    }
+
+    pub fn eql(self: StoreSnapshot, other: StoreSnapshot) bool {
+        return self.root_device == other.root_device and
+            self.root_inode == other.root_inode and
+            self.namespace_device == other.namespace_device and
+            self.namespace_inode == other.namespace_inode and
+            self.repository_instance_id.eql(other.repository_instance_id) and
+            self.review_repository_id.eql(other.review_repository_id) and
+            self.repository_display_name.eql(&other.repository_display_name) and
+            self.repository_directory_name.eql(&other.repository_directory_name);
     }
 };
 
@@ -153,7 +166,7 @@ pub fn scan(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const core.Context,
-    locator: committed_review.GitCommonDirectoryLocator,
+    instance_id: committed_review.RepositoryInstanceId,
 ) std.mem.Allocator.Error!ScanResult {
     var opened = switch (context.openExisting()) {
         .opened => |value| value,
@@ -174,9 +187,9 @@ pub fn scan(
             .io_failed => .io_failed,
         } },
     };
-    const binding = parsed_registry.lookup(locator) orelse return .unbound;
+    const binding = parsed_registry.lookup(instance_id) orelse return .unbound;
     const repository_id = binding.review_repository_id;
-    const snapshot = snapshotFrom(opened.snapshot, binding) catch
+    var snapshot = snapshotFrom(opened.snapshot, binding) catch
         return .{ .failure = .registry_invalid };
     var namespace = opened.root.directory.openDirectory(snapshot.repository_directory_name.slice()) catch |err| {
         return .{ .failure = if (err == error.FileNotFound)
@@ -185,6 +198,8 @@ pub fn scan(
             classifyAccess(err, ScanFailure.namespace_invalid) };
     };
     defer namespace.deinit();
+    snapshot.namespace_device = namespace.metadata.device;
+    snapshot.namespace_inode = namespace.metadata.inode;
 
     var candidates: std.ArrayList(CandidateName) = .empty;
     defer candidates.deinit(allocator);
@@ -358,13 +373,57 @@ pub const ReadResult = union(enum) {
     }
 };
 
+/// Re-read the exact Store root, binding, saved names, and namespace object.
+pub fn validateSnapshot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const core.Context,
+    expected: StoreSnapshot,
+) std.mem.Allocator.Error!?ReadFailure {
+    var opened = switch (context.openExisting()) {
+        .opened => |value| value,
+        .missing => return .root_changed,
+        .unavailable => return .store_unavailable,
+        .failure => |failure| return mapReadOpenFailure(failure),
+    };
+    defer opened.deinit();
+    if (!opened.snapshot.eql(expected.root())) return .root_changed;
+    var registry_result = try registry.read(allocator, io, opened.root.directory);
+    defer registry_result.deinit();
+    const parsed = switch (registry_result) {
+        .missing => return .binding_changed,
+        .registry => |*value| value,
+        .invalid => return .registry_invalid,
+        .unavailable => |reason| return switch (reason) {
+            .permission_denied => .permission_denied,
+            .io_failed => .io_failed,
+        },
+    };
+    const found = parsed.lookup(expected.repository_instance_id) orelse return .binding_changed;
+    const snapshot = snapshotFrom(opened.snapshot, found) catch return .registry_invalid;
+    if (!snapshot.review_repository_id.eql(expected.review_repository_id) or
+        !snapshot.repository_display_name.eql(&expected.repository_display_name) or
+        !snapshot.repository_directory_name.eql(&expected.repository_directory_name))
+    {
+        return .binding_changed;
+    }
+    const namespace = opened.root.directory.admitChild(
+        expected.repository_directory_name.slice(),
+        .directory,
+    ) catch return .binding_changed;
+    return if (namespace.device == expected.namespace_device and namespace.inode == expected.namespace_inode)
+        null
+    else
+        .binding_changed;
+}
+
 /// Admit only the named Run. This function never enumerates the repository
 /// namespace and never substitutes another ID, order, timestamp, or mtime.
 pub fn readExact(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const core.Context,
-    locator: committed_review.GitCommonDirectoryLocator,
+    instance_id: committed_review.RepositoryInstanceId,
     review_id: committed_review.ReviewId,
     expected_store: ?StoreSnapshot,
     expected_artifacts: ?run.ArtifactSnapshot,
@@ -373,7 +432,7 @@ pub fn readExact(
         allocator,
         io,
         context,
-        locator,
+        instance_id,
         review_id,
         expected_store,
         expected_artifacts,
@@ -390,14 +449,14 @@ fn readExactWithHook(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const core.Context,
-    locator: committed_review.GitCommonDirectoryLocator,
+    instance_id: committed_review.RepositoryInstanceId,
     review_id: committed_review.ReviewId,
     expected_store: ?StoreSnapshot,
     expected_artifacts: ?run.ArtifactSnapshot,
     hook: ?ReadHook,
 ) std.mem.Allocator.Error!ReadResult {
     if (expected_store) |expected| {
-        if (!expected.repository_locator.eql(locator)) return .{ .failure = .binding_changed };
+        if (!expected.repository_instance_id.eql(instance_id)) return .{ .failure = .binding_changed };
     }
 
     var opened = switch (context.openExisting()) {
@@ -423,7 +482,7 @@ fn readExactWithHook(
             .io_failed => .io_failed,
         } },
     };
-    const binding = parsed_registry.lookup(locator) orelse
+    const binding = parsed_registry.lookup(instance_id) orelse
         return if (expected_store == null) .absent else .{ .failure = .binding_changed };
     const repository_id = binding.review_repository_id;
     if (expected_store) |expected| {
@@ -431,7 +490,7 @@ fn readExactWithHook(
             return .{ .failure = .binding_changed };
         }
     }
-    const snapshot = snapshotFrom(opened.snapshot, binding) catch
+    var snapshot = snapshotFrom(opened.snapshot, binding) catch
         return .{ .failure = .registry_invalid };
     if (expected_store) |expected| {
         if (!snapshot.repository_display_name.eql(&expected.repository_display_name) or
@@ -448,6 +507,15 @@ fn readExactWithHook(
             classifyAccess(err, ReadFailure.namespace_invalid) };
     };
     defer namespace.deinit();
+    snapshot.namespace_device = namespace.metadata.device;
+    snapshot.namespace_inode = namespace.metadata.inode;
+    if (expected_store) |expected| {
+        if (snapshot.namespace_device != expected.namespace_device or
+            snapshot.namespace_inode != expected.namespace_inode)
+        {
+            return .{ .failure = .binding_changed };
+        }
+    }
     var budget: run.ArtifactBudget = .{};
     const location_result = try run.readLocation(
         allocator,
@@ -494,10 +562,11 @@ fn readExactWithHook(
         io,
         context,
         opened.snapshot,
-        locator,
+        instance_id,
         repository_id,
         snapshot.repository_display_name,
         snapshot.repository_directory_name,
+        namespace.metadata,
     )) |failure| return .{ .failure = failure };
 
     const artifacts = loaded.*;
@@ -516,10 +585,11 @@ fn bindingChangedAfterAdmission(
     io: std.Io,
     context: *const core.Context,
     expected_root: core.RootSnapshot,
-    locator: committed_review.GitCommonDirectoryLocator,
+    instance_id: committed_review.RepositoryInstanceId,
     repository_id: committed_review.ReviewRepositoryId,
     repository_display_name: store_name.RepositoryDisplayName,
     repository_directory_name: store_name.RepositoryDirectoryName,
+    expected_namespace: capability.Metadata,
 ) std.mem.Allocator.Error!?ReadFailure {
     var current = switch (context.openExisting()) {
         .opened => |value| value,
@@ -531,9 +601,9 @@ fn bindingChangedAfterAdmission(
     if (!current.snapshot.eql(expected_root)) return .concurrent_conflict;
     var registry_result = try registry.read(allocator, io, current.root.directory);
     defer registry_result.deinit();
-    return switch (registry_result) {
+    const binding_failure: ?ReadFailure = switch (registry_result) {
         .missing => .concurrent_conflict,
-        .registry => |*parsed| if (parsed.lookup(locator)) |found| blk: {
+        .registry => |*parsed| if (parsed.lookup(instance_id)) |found| blk: {
             if (!found.review_repository_id.eql(repository_id)) break :blk .concurrent_conflict;
             const display = store_name.RepositoryDisplayName.fromStored(found.repository_display_name) catch
                 break :blk .registry_invalid;
@@ -553,6 +623,12 @@ fn bindingChangedAfterAdmission(
             .io_failed => .io_failed,
         },
     };
+    if (binding_failure) |failure| return failure;
+    const namespace = current.root.directory.admitChild(
+        repository_directory_name.slice(),
+        .directory,
+    ) catch return .concurrent_conflict;
+    return if (namespace.sameObject(expected_namespace)) null else .concurrent_conflict;
 }
 
 fn artifactsChangedAfterAdmission(
@@ -633,7 +709,9 @@ fn snapshotFrom(
     return .{
         .root_device = root.device,
         .root_inode = root.inode,
-        .repository_locator = binding.locator,
+        .namespace_device = 0,
+        .namespace_inode = 0,
+        .repository_instance_id = binding.repository_instance_id,
         .review_repository_id = binding.review_repository_id,
         .repository_display_name = display,
         .repository_directory_name = directory,
@@ -763,7 +841,7 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
     defer store.close(io);
     const store_root = try tmp.dir.realPathFileAlloc(io, "store", allocator);
     defer allocator.free(store_root);
-    const locator: committed_review.GitCommonDirectoryLocator = .{ .device = 7, .inode = 11 };
+    const locator = try committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010");
     const repository_id = try committed_review.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
     const repository_display_name = "repository";
     const repository_directory_name = "repository-123e4567";
@@ -772,8 +850,7 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
         .review_repository_id = repository_id,
         .repository_display_name = repository_display_name,
         .directory_name = repository_directory_name,
-        .locator = locator,
-        .canonical_path = diagnostic_path,
+        .repository_instance_id = locator,
         .last_seen_path = diagnostic_path,
     }};
     const registry_bytes = try registry.writeCanonicalAlloc(allocator, &bindings);
@@ -832,7 +909,7 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
         .exact => |*value| value,
         else => return error.ExpectedExactReviewRun,
     };
-    var overflow_draft = try core.saveDraft(allocator, io, &context, .{
+    var overflow_draft = try core.saveDraftForTest(allocator, io, &context, .{
         .binding = .{
             .review_repository_id = repository_id,
             .review_id = overflow_lifecycle_id,
@@ -860,7 +937,7 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
         committed_review.ReviewRunState.draft,
         drafted_exact.exact.artifacts.state,
     );
-    const deleted = try core.deleteRun(allocator, io, &context, .{
+    const deleted = try core.deleteRunForTest(allocator, io, &context, .{
         .store = drafted_exact.exact.snapshot,
         .review_id = overflow_lifecycle_id,
         .artifacts = drafted_exact.exact.artifact_snapshot,
@@ -894,6 +971,8 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
     try std.testing.expect(exact.artifact_snapshot.result_digest != null);
     const expected_store = exact.snapshot;
     const expected_artifacts = exact.artifact_snapshot;
+    var expected_namespace = try exact.root.root.directory.openDirectory(expected_store.repository_directory_name.slice());
+    defer expected_namespace.deinit();
 
     var pinned = try readExact(
         allocator,
@@ -956,7 +1035,7 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
         allocator,
         io,
         &context,
-        .{ .device = locator.device, .inode = locator.inode + 1 },
+        try committed_review.RepositoryInstanceId.parse("223e4567-e89b-42d3-a456-426614174010"),
         result_id,
         null,
         null,
@@ -999,6 +1078,7 @@ test "review store exact read is direct bounded and preserves lifecycle preceden
             repository_id,
             expected_store.repository_display_name,
             expected_store.repository_directory_name,
+            expected_namespace.metadata,
         )).?);
     }
     const result_directory_name = try testRunDirectoryName(result_id);
@@ -1129,7 +1209,7 @@ fn expectPostAdmissionConflict(replacement: PostAdmissionReplacement) !void {
     const store_root = try tmp.dir.realPathFileAlloc(io, "store", allocator);
     defer allocator.free(store_root);
 
-    const locator: committed_review.GitCommonDirectoryLocator = .{ .device = 7, .inode = 11 };
+    const locator = try committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010");
     const repository_id = try committed_review.ReviewRepositoryId.parse(
         "123e4567-e89b-42d3-a456-426614174000",
     );
@@ -1141,8 +1221,7 @@ fn expectPostAdmissionConflict(replacement: PostAdmissionReplacement) !void {
         .review_repository_id = repository_id,
         .repository_display_name = "repository",
         .directory_name = "repository-123e4567",
-        .locator = locator,
-        .canonical_path = diagnostic_path,
+        .repository_instance_id = locator,
         .last_seen_path = diagnostic_path,
     }};
     const registry_bytes = try registry.writeCanonicalAlloc(allocator, &bindings);
@@ -1152,8 +1231,7 @@ fn expectPostAdmissionConflict(replacement: PostAdmissionReplacement) !void {
         .review_repository_id = replacement_repository_id,
         .repository_display_name = "repository",
         .directory_name = "repository-223e4567",
-        .locator = locator,
-        .canonical_path = diagnostic_path,
+        .repository_instance_id = locator,
         .last_seen_path = diagnostic_path,
     }};
     const replacement_registry = try registry.writeCanonicalAlloc(

@@ -18,7 +18,8 @@ The following are local, transient, and non-authoritative:
 - hunk boundaries, context lines, and rename projection;
 - ahead counts and display labels;
 - rendered rows, cursor positions, patch positions, and Stream-global rows;
-- physical repository device/inode locators.
+- machine-local repository-instance and Review Store IDs;
+- same-operation physical repository device/inode observations.
 
 GitFrame does not promise byte-identical patch projection between machines, Git versions, or local Git configurations. Patch bytes are still exact within one successful materialization and are transported without normalization.
 

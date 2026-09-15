@@ -228,6 +228,12 @@ pub fn failureTerminal(failure: store_service.ReadFailure) Failure {
         .binding_changed => .{ .exit_code = 75, .code = "binding_changed", .message = "repository binding changed concurrently" },
         .artifact_changed => .{ .exit_code = 75, .code = "artifact_changed", .message = "Review Store artifacts changed concurrently" },
         .concurrent_conflict => .{ .exit_code = 75, .code = "concurrent_conflict", .message = "Review Store read conflicted concurrently" },
+        .identity_missing => .{ .exit_code = 66, .code = "identity_missing", .message = "repository identity marker is missing" },
+        .identity_invalid => .{ .exit_code = 74, .code = "identity_invalid", .message = "repository identity marker is invalid" },
+        .identity_unavailable => .{ .exit_code = 69, .code = "identity_unavailable", .message = "repository identity marker is unavailable" },
+        .identity_conflict => .{ .exit_code = 75, .code = "identity_conflict", .message = "repository identity conflicts with its binding" },
+        .identity_duplicate => .{ .exit_code = 75, .code = "identity_duplicate", .message = "repository identity is live at another path" },
+        .binding_move_required => .{ .exit_code = 75, .code = "binding_move_required", .message = "repository binding requires stateful prepare" },
     };
 }
 

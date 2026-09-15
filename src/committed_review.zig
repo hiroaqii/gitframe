@@ -13,6 +13,7 @@ const repository_binding = @import("committed_review/repository_binding.zig");
 const target = @import("committed_review/target.zig");
 
 pub const ReviewId = identity.ReviewId;
+pub const RepositoryInstanceId = identity.RepositoryInstanceId;
 pub const ReviewRepositoryId = identity.ReviewRepositoryId;
 pub const Sha256Digest = identity.Sha256Digest;
 

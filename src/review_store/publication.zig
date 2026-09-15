@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const committed_review = @import("../committed_review.zig");
+const git_command = @import("../git/command.zig");
+const root_capability = @import("../repo/root_capability.zig");
 const service = @import("../ai_review/store_service.zig");
 
 // Slice-1's lexical cwd inventory remains immutable outside this handoff. Its
@@ -106,7 +108,9 @@ test "review run publication prepare creates one durable binding and named repos
     try std.testing.expect(value.bindings[0].review_repository_id.eql(first_success.review_repository_id));
     try std.testing.expectEqualStrings(first_success.repository_display_name.slice(), value.bindings[0].repository_display_name);
     try std.testing.expectEqualStrings(first_success.repository_directory_name.slice(), value.bindings[0].directory_name);
-    try std.testing.expectEqualSlices(u8, repository_path, value.bindings[0].canonical_path.bytes);
+    const common_directory = try std.fs.path.join(allocator, &.{ repository_path, ".git" });
+    defer allocator.free(common_directory);
+    try std.testing.expectEqualSlices(u8, common_directory, value.bindings[0].last_seen_path.bytes);
     var named_namespace = try root.directory.openDirectory(first_success.repository_directory_name.slice());
     named_namespace.deinit();
     const repository_id_text = first_success.review_repository_id.canonical();
@@ -134,6 +138,153 @@ test "review run publication prepare creates one durable binding and named repos
     );
     defer allocator.free(preserved_invalid);
     try std.testing.expectEqualSlices(u8, invalid_registry, preserved_invalid);
+}
+
+test "repository instance copied P0 P1 P2 lease race has one winner and one duplicate" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "P0", .fromMode(0o700));
+    {
+        var repository = try tmp.dir.openDir(io, "P0", .{});
+        defer repository.close(io);
+        try runTestGit(io, repository, &.{ "git", "init", "--initial-branch=main" });
+        try repository.writeFile(io, .{ .sub_path = "file", .data = "base\n" });
+        try runTestGit(io, repository, &.{ "git", "add", "file" });
+        try runTestGit(io, repository, &.{
+            "git",    "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-m", "base",
+        });
+    }
+    try tmp.dir.createDir(io, "state", .fromMode(0o700));
+    const p0 = try tmp.dir.realPathFileAlloc(io, "P0", allocator);
+    defer allocator.free(p0);
+    const state = try tmp.dir.realPathFileAlloc(io, "state", allocator);
+    defer allocator.free(state);
+    const config = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(config);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("XDG_STATE_HOME", state);
+    try environment.put("XDG_CONFIG_HOME", config);
+    const initial = try prepare(allocator, io, &environment, p0);
+    try std.testing.expect(initial == .success);
+    var p0_repository = try tmp.dir.openDir(io, "P0", .{});
+    defer p0_repository.close(io);
+    const oid_output = try testGitLine(io, p0_repository, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(oid_output);
+    const oid = try committed_review.ObjectId.parse(.sha1, oid_output[0 .. oid_output.len - 1]);
+    const target: committed_review.CommittedReviewTarget = .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = oid,
+        .head_oid = oid,
+        .diff_base_oid = oid,
+    };
+    var artifacts = try TestArtifactPair.init(
+        allocator,
+        initial.success.review_repository_id,
+        initial.success.review_id,
+        target,
+        "2026-09-16T00:00:00Z",
+        null,
+    );
+    defer artifacts.deinit(allocator);
+    try std.testing.expect((try publish(allocator, io, &environment, .{
+        .repository_path = p0,
+        .review_repository_id = initial.success.review_repository_id,
+        .review_id = initial.success.review_id,
+        .manifest_bytes = artifacts.manifest_bytes,
+        .findings_bytes = artifacts.findings_bytes,
+    })) == .success);
+
+    try copyTree(io, tmp.dir, "P0", "P1");
+    try copyTree(io, tmp.dir, "P0", "P2");
+    try tmp.dir.deleteTree(io, "P0");
+    const p1 = try tmp.dir.realPathFileAlloc(io, "P1", allocator);
+    defer allocator.free(p1);
+    const p2 = try tmp.dir.realPathFileAlloc(io, "P2", allocator);
+    defer allocator.free(p2);
+    const store_root = try std.fs.path.join(allocator, &.{ state, "gitframe", "ai-reviews" });
+    defer allocator.free(store_root);
+    var configured = try service.ConfiguredStore.initConfigured(allocator, store_root);
+    defer configured.deinit(allocator);
+    var git_environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer git_environment.deinit();
+    for ([_][]const u8{ p1, p2 }) |path| {
+        var root = try root_capability.RootCapability.openCanonical(path);
+        defer root.deinit();
+        var scanned = try service.scan(allocator, io, &configured, .{ .capability = &root, .environment = &git_environment });
+        defer scanned.deinit(allocator);
+        try std.testing.expectEqual(service.ScanFailure.binding_move_required, scanned.failure);
+    }
+
+    var racers = [_]ConcurrentPrepare{
+        .{ .io = io, .environment = &environment, .repository_path = p1 },
+        .{ .io = io, .environment = &environment, .repository_path = p2 },
+    };
+    const thread1 = try std.Thread.spawn(.{}, ConcurrentPrepare.execute, .{&racers[0]});
+    const thread2 = try std.Thread.spawn(.{}, ConcurrentPrepare.execute, .{&racers[1]});
+    thread1.join();
+    thread2.join();
+    try std.testing.expect(!racers[0].failed and !racers[1].failed);
+    const winner_index: usize = if (racers[0].result == .success) 0 else 1;
+    const loser_index: usize = 1 - winner_index;
+    try std.testing.expect(racers[winner_index].result == .success);
+    try std.testing.expectEqual(Failure.identity_duplicate, racers[loser_index].result.failure);
+
+    for ([_][]const u8{ racers[winner_index].repository_path, racers[loser_index].repository_path }, 0..) |path, index| {
+        var root = try root_capability.RootCapability.openCanonical(path);
+        defer root.deinit();
+        var scanned = try service.scan(allocator, io, &configured, .{ .capability = &root, .environment = &git_environment });
+        defer scanned.deinit(allocator);
+        if (index == 0) {
+            try std.testing.expect(scanned == .history);
+        } else {
+            try std.testing.expectEqual(service.ScanFailure.identity_duplicate, scanned.failure);
+        }
+        var exact = try service.readExactIdentityWithRepository(
+            allocator,
+            io,
+            &configured,
+            .{ .capability = &root, .environment = &git_environment },
+            initial.success.review_id,
+            null,
+        );
+        defer exact.deinit(allocator);
+        if (index == 0)
+            try std.testing.expect(exact == .exact)
+        else
+            try std.testing.expectEqual(service.ReadFailure.identity_duplicate, exact.failure);
+    }
+    var root = try capability.StoreRootCapability.openCanonical(store_root);
+    defer root.deinit();
+    var parsed = try registry.read(allocator, io, root.directory);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.registry.bindings.len);
+    var iterator = root.directory.iterate();
+    var namespaces: usize = 0;
+    while (try iterator.next(root.directory, io)) |entry| {
+        if (!std.mem.eql(u8, entry.name, ".locks") and !std.mem.eql(u8, entry.name, "registry.json")) namespaces += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), namespaces);
+}
+
+fn copyTree(io: std.Io, parent: std.Io.Dir, source: []const u8, destination: []const u8) !void {
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{ "cp", "-a", source, destination },
+        .cwd = .{ .dir = parent },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.CopyFailed,
+        else => return error.CopyFailed,
+    }
 }
 
 const capability = @import("capability.zig");

@@ -563,6 +563,12 @@ fn scanFailureText(failure: review_store.ScanFailure) []const u8 {
         .enumeration_failed => "Could not load AI reviews: scan failed",
         .scan_limit_exceeded => "Could not load AI reviews: scan limit exceeded",
         .git_failed => "Could not load AI reviews: Git read failed",
+        .identity_missing => "Could not load AI reviews: repository identity missing",
+        .identity_invalid => "Could not load AI reviews: repository identity invalid",
+        .identity_unavailable => "Could not load AI reviews: repository identity unavailable",
+        .identity_conflict => "Could not load AI reviews: repository identity conflict",
+        .identity_duplicate => "Could not load AI reviews: repository identity duplicated",
+        .binding_move_required => "Could not load AI reviews: run prepare after moving the repository",
     };
 }
 
@@ -1239,7 +1245,9 @@ fn testStoreSnapshot(repository_id: committed_review.ReviewRepositoryId) review_
     return .{
         .root_device = 1,
         .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
+        .namespace_device = 3,
+        .namespace_inode = 4,
+        .repository_instance_id = committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010") catch unreachable,
         .review_repository_id = repository_id,
         .repository_display_name = display,
         .repository_directory_name = review_store.RepositoryDirectoryName.format(&display, repository_id),

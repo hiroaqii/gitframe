@@ -7,10 +7,11 @@ This document describes the side-effect-free read boundary, its read-only `AI Re
 Three identities remain separate:
 
 - `CommittedReviewTarget` is portable Git authority: object format, source kind, base OID, head OID, and diff-base OID.
-- `ReviewRepositoryId` is the machine-local UUIDv4 identity issued by an explicit prepare operation. Its complete value remains authority even though only its first eight canonical characters appear in the repository directory name.
+- `RepositoryInstanceId` is a local UUIDv4 stored in the repository's shared Git common directory. Linked worktrees share it; an ordinary clone initializes a different value.
+- `ReviewRepositoryId` is the machine-local Store UUIDv4 mapped from `RepositoryInstanceId` by an explicit prepare operation. Its complete value remains authority even though only its first eight canonical characters appear in the repository directory name.
 - repository and Store paths are startup/routing inputs or diagnostic data. A path never substitutes for an opened descriptor or registry binding.
 
-Read operations re-open authority component-by-component with `O_NOFOLLOW`, validate the opened object, and use descriptor-relative children. Directory order, mtime, display labels, and a prior scan are never authority.
+Every operation owns an opened repository-root descriptor, resolves one opened Git common directory, and reads the marker through that descriptor. Its common-directory `(device, inode)` is only same-operation drift evidence and is never persisted or compared with another operation. Read operations re-open Store authority component-by-component with `O_NOFOLLOW`, validate the opened object, and use descriptor-relative children. Directory order, mtime, display labels, paths, and a prior scan are never positive authority.
 
 ## Store-root resolution
 
@@ -31,6 +32,17 @@ Resolution precedence is:
 The resolver performs no filesystem call. It rejects `/`, relative paths, `~`, environment interpolation, NUL, empty/`.`/`..` components, repeated slash, trailing slash, and values over 4095 bytes. Invalid configured input is a fatal `invalid_ai_review_store_root`; it does not fall back. There is no Store-specific environment or invocation override.
 
 ## Read layout
+
+Repository-local identity has one fixed layout:
+
+```text
+<git-common-dir>/gitframe/                  0700
+  repository-id-v1                        0600, link count 1, "<uuid-v4>\n"
+  repository-id-v1.lock                   0600, persistent advisory lock
+  .repository-id-v1.tmp                   0600, fixed retry evidence
+```
+
+Read-only operations never create this directory or any child. Only prepare may initialize it while holding the Store registry lock, followed by the marker lock. It writes and syncs the fixed temporary file, publishes with no-replace rename, syncs the marker directory, and then rereads the winner. Retry adopts a valid temporary or final marker; malformed or unsafe authority fails without replacement.
 
 ```text
 <store-root>/                                  0700
@@ -60,11 +72,13 @@ A name becomes inert orphan evidence only after its expected file/directory meta
 
 ## Registry
 
-`registry.json` is at most 1 MiB and 4096 bindings. Its bytes must equal the compact canonical encoding with fixed field order and a final LF. Device and inode are canonical unsigned decimal strings. Diagnostic paths are canonical absolute raw POSIX paths represented as printable UTF-8 or canonical padded RFC 4648 base64.
+`registry.json` is at most 1 MiB and 4096 bindings. Its bytes must equal the compact canonical encoding with fixed field order and a final LF. Every binding contains, in order, `repository_instance_id`, `review_repository_id`, `repository_display_name`, `directory_name`, and `last_seen_path`. Both IDs are complete canonical lowercase UUIDv4 values. Diagnostic paths are canonical absolute raw POSIX paths represented as printable UTF-8 or canonical padded RFC 4648 base64.
 
 Each binding also requires `repository_display_name` and `directory_name`. The display name is UTF-8, contains no slash or ASCII control, is neither empty nor `.`/`..`, has no trailing `-`, and is at most 246 bytes. The directory name must be exactly `<repository_display_name>-<first 8 characters of the canonical ReviewRepositoryId>` and is at most 255 bytes.
 
-Bindings are sorted by `(device, inode)`. A duplicate locator, duplicate `ReviewRepositoryId`, duplicate directory name, unknown/duplicate/missing field, unsupported schema, malformed path/name, unsorted entry, or noncanonical byte spelling invalidates the complete registry. Schema version remains `1`; an earlier field set is simply invalid and is not identified, read compatibly, migrated, renamed, repaired, or removed. Read-only lookup never issues an ID and never updates `last_seen_path`.
+Bindings are sorted by the complete `RepositoryInstanceId` bytes. A duplicate instance ID, duplicate `ReviewRepositoryId`, duplicate directory name, duplicate `last_seen_path`, unknown/duplicate/missing field, unsupported schema, malformed path/name, unsorted entry, or noncanonical byte spelling invalidates the complete registry. Read-only lookup is only by instance ID, never issues an ID, and never updates `last_seen_path`.
+
+`last_seen_path` is negative lease evidence only. The current opened common directory and its marker remain positive authority. A different path is accepted when it resolves to the same runtime object. An absent saved path requires one explicit prepare to transfer the lease. A live different object carrying the same marker is `identity_duplicate`; unsafe saved-path evidence is `identity_conflict`. A reused path with a missing, malformed, or different marker never inherits the saved binding.
 
 ## Installed prepare helper
 
@@ -76,15 +90,15 @@ Bindings are sorted by `(device, inode)`. A duplicate locator, duplicate `Review
 
 The repository field uses the same canonical unpadded base64url/raw absolute POSIX path decoder as `review-projection`. Empty, relative, NUL-containing, padded, malformed, and over-4096-byte paths fail before Store mutation.
 
-Prepare opens the repository and its physical Git common directory, resolves config and Store root independently of a running TUI, admits a supported local filesystem, and takes the exclusive `.locks/registry.lock`. For a new physical locator only, it runs exactly `git --no-optional-locks worktree list --porcelain -z`, requires the first record to be non-bare, and strictly admits that record's finite canonical absolute path by no-follow descriptor traversal before using its final basename. A missing, non-directory, symlink-traversing, noncanonical, or oversized main-worktree path fails before Store creation. It preserves UTF-8 bytes and case, removes only trailing `-` characters, then applies the registry display-name limits above. There is no fallback, replacement, truncation, inferred path, or retry.
+Prepare opens the repository and its Git common directory, resolves config and Store root independently of a running TUI, admits a supported local filesystem, and takes the exclusive `.locks/registry.lock`. It rereads the marker under that lock and takes the marker lock only when initialization is required. For a new instance ID only, it runs exactly `git --no-optional-locks worktree list --porcelain -z`, requires the first record to be non-bare, and strictly admits that record's finite canonical absolute path by no-follow descriptor traversal before using its final basename. A missing, non-directory, symlink-traversing, noncanonical, or oversized main-worktree path fails before Store creation. It preserves UTF-8 bytes and case, removes only trailing `-` characters, then applies the registry display-name limits above. There is no fallback, replacement, truncation, or inferred path.
 
-Under the registry lock, prepare freshly reads the complete registry. An existing physical locator retains its full repository ID and both saved names without rerunning main-worktree discovery; only `last_seen_path` may change. A new locator receives one CSPRNG UUIDv4 binding and one exact repository directory name. Every successful request receives a fresh CSPRNG `ReviewId`:
+Under the registry lock, prepare freshly reads the complete registry. An existing instance ID retains its full repository ID and both saved names without rerunning main-worktree discovery; an admitted move changes only `last_seen_path`. A new instance ID receives one CSPRNG `ReviewRepositoryId` and one exact repository directory name. Every successful request receives a fresh CSPRNG `ReviewId`:
 
 ```json
 {"status":"ok","schema_version":1,"review_repository_id":"<uuid-v4>","review_id":"<uuid-v4>"}
 ```
 
-Concurrent first prepare requests converge on the winner's binding. For a new binding, prepare atomically creates the exact repository directory without replacement and syncs it before registry replacement. A destination collision returns `repository_namespace_collision`; it never regenerates or extends the UUID suffix. Registry replacement uses exact canonical bytes through an exclusive owner-only temporary file, file sync, atomic replacement, Store-root sync, and lock-held strict read-back. A proven pre-commit failure removes only the operation-owned, metadata-identical empty directory. Committed, unreadable, replaced, or nonempty state is retained without repair. Existing invalid/unreadable registry authority is never treated as empty. Prepare creates no Run directory; an abandoned producer leaves the persisted empty repository namespace, binding, and unused Review ID.
+Concurrent first prepare requests converge on one marker and one binding. Immediately before the first namespace or registry commit, prepare revalidates the repository-root/common-directory descriptors, exact marker ID, Store root, and complete registry under the registry lock. For a new binding, it atomically creates the exact repository directory without replacement and syncs it before registry replacement. A destination collision returns `repository_namespace_collision`; it never regenerates or extends the UUID suffix. Registry replacement uses exact canonical bytes through an exclusive owner-only temporary file, file sync, atomic replacement, Store-root sync, and lock-held strict read-back. A proven pre-commit failure removes only the operation-owned, metadata-identical empty directory. Committed, unreadable, replaced, or nonempty state is retained without repair. Existing invalid/unreadable registry authority is never treated as empty. Prepare creates no Run directory; an abandoned producer leaves the persisted empty repository namespace, binding, and unused Review ID.
 
 ## Installed immutable publication helper
 
@@ -97,7 +111,7 @@ Concurrent first prepare requests converge on the winner's binding. For a new bi
 
 The manifest is capped at 256 KiB and findings at 16 MiB. Truncation, extra bytes, overflow, invalid sizes, and a second document fail before Store mutation. Publication strictly parses both artifacts, checks caller/artifact IDs, validates the manifest against the exact findings-byte digest and decoded FindingSet, and preserves both caller byte sequences without canonical rewriting.
 
-Before taking the per-repository `publish.lock`, the helper freshly opens the repository, resolves the physical locator and active Store root, validates the registry mapping to the expected repository ID and saved actual repository directory name, and checks all three exact target OIDs as local commit objects with no fetch, replacement, or ref resolution. Under the lock it revalidates Store identity/binding and first reads only `.run-<complete-review-id>`. An exact existing Run is a duplicate; a malformed, mismatched, or incomplete location is ordinary invalid Store state. No scan, short-ID lookup, label guess, or repair is used.
+Before taking the per-repository `publish.lock`, the helper freshly opens the repository, resolves its instance marker and active Store root, validates the instance-to-expected-repository-ID mapping and saved actual repository directory name, and checks all three exact target OIDs as local commit objects with no fetch, replacement, or ref resolution. Under the lock it revalidates Store identity/binding and first reads only `.run-<complete-review-id>`. Immediately before installing that location record it reruns common-directory discovery from the retained repository root, requires the same operation-local common-directory object and marker, and rereads the Store binding. An exact existing Run is a duplicate; a malformed, mismatched, or incomplete location is ordinary invalid Store state. No scan, short-ID lookup, label guess, or repair is used.
 
 Only when that location is absent, publication converts the manifest's exact UTC second once to the OS local calendar minute. A saved non-null `display.head_label` is used as-is except that each slash run becomes one `-` and component-edge hyphens are removed. It must then be valid UTF-8, contain no ASCII control, be nonempty and neither `.` nor `..`, and fit 232 bytes. A present-invalid label fails without fallback. Only an absent head label uses `commit-<first 7 head-OID hex>`. The final stored component is `YYYYMMDD-HHMM-<target-label>-<first 8 review-ID hex>` and is never recomputed after publication.
 
@@ -117,7 +131,7 @@ If `result.json` exists, it must be valid; an invalid result never falls back to
 
 An explicit scan performs:
 
-1. fresh physical Git common-directory locator discovery;
+1. fresh Git common-directory discovery and strict `RepositoryInstanceId` marker read;
 2. read-only Store-root open;
 3. strict registry lookup without get-or-create;
 4. repository namespace open;
@@ -142,7 +156,7 @@ git --no-replace-objects --no-lazy-fetch --no-optional-locks \
 
 Only an ordered `<oid> commit` or `<oid> missing` record is accepted. Wrong count/order/OID/type, overflow, object-format drift, nonzero/signal, or process failure discards the whole batch. It never fetches, resolves a ref, consults replacements, or mutates checkout/index.
 
-Selection treats scan rows as provisional. It owns a duplicated repository capability, controlled environment, Store-root path, fresh Store descriptor, parsed artifacts, and projection bytes. Before returning it revalidates physical repository locator, Store root device/inode, registry binding, namespace, exact Run artifacts, and object availability, then materializes the existing checkout-independent exact committed projection once. Any drift or missing object returns a typed failure without substituting a scan snapshot, current ref, or similar revision.
+Selection treats scan rows as provisional. It owns a duplicated repository capability, controlled environment, one operation-local common-directory descriptor/marker, Store-root path, fresh Store descriptor, parsed artifacts, and projection bytes. Before returning it rediscovers the common directory from that retained root, requires the same runtime object and marker ID, and revalidates Store root, registry binding, namespace, exact Run artifacts, and object availability. It then returns the existing checkout-independent exact committed projection. Any drift or missing object discards the partial result and returns a typed failure without substituting a scan snapshot, current ref, or similar revision. A later independent operation accepts a changed runtime device number when the marker ID and lease still identify the same repository instance.
 
 ## AI Reviews page Run picker
 
@@ -168,6 +182,8 @@ inspection, including when a retained draft is missing or invalid. Without a
 result, the actual draft revision must exactly equal the request. GitFrame
 assigns revision `1` or the checked next revision, validates the constructed
 artifact, and never auto-merges or overwrites a conflicting snapshot.
+
+Each queued mutation owns the duplicated repository-root descriptor and a sanitized snapshot of the admission-time environment. The worker resolves the instance marker from that captured repository; switching the App's active repository cannot retarget accepted work. Immediately before renaming `review_state.json` or `result.json`, the writer rediscovers and revalidates the same common-directory object and marker, reopens the Store root, and rereads the exact instance-to-repository binding and Run location.
 
 Draft bytes are exclusively created as one shared-grammar
 `.tmp-draft-<review-id>-<token>` namespace sibling with mode `0600`. The write
@@ -204,9 +220,11 @@ pending draft; in-flight input is immutable. A result waits behind the accepted
 draft revision and is never coalesced.
 
 Task completion is matched by operation ID and full Run binding, not the
-current page. The App clones request bytes before admission, so conflict,
-failure, page switch, and repository switch cannot discard or mutate the
-caller's dirty editor state. A matching selected AI Review Run receives its bounded
+current page. Before admission the App duplicates the current repository-root
+descriptor, sanitizes and owns the ambient environment snapshot, clones the
+configured Store, and clones request bytes. Conflict, failure, page switch, and
+repository switch therefore cannot redirect accepted work or discard or mutate
+the caller's dirty editor state. A matching selected AI Review Run receives its bounded
 completion notification; every mismatched, stale, or runtime-undelivered
 payload is still deinitialized exactly once.
 

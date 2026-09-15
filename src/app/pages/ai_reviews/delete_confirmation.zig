@@ -425,7 +425,9 @@ fn testStoreSnapshot() review_store.StoreSnapshot {
     return .{
         .root_device = 1,
         .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
+        .namespace_device = 3,
+        .namespace_inode = 4,
+        .repository_instance_id = committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010") catch unreachable,
         .review_repository_id = repository_id,
         .repository_display_name = display,
         .repository_directory_name = review_store.RepositoryDirectoryName.format(&display, repository_id),

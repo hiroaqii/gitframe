@@ -6,6 +6,8 @@
 const std = @import("std");
 const committed_review = @import("../committed_review.zig");
 const durable = @import("../fs/durable.zig");
+const git_command = @import("../git/command.zig");
+const repository_locator = @import("../git/repository_locator.zig");
 const capability = @import("capability.zig");
 const mutation = @import("mutation.zig");
 const maintenance = @import("maintenance.zig");
@@ -161,11 +163,17 @@ pub const PrepareBindingFailure = enum {
     repository_namespace_collision,
     io_failed,
     concurrent_conflict,
+    identity_missing,
+    identity_invalid,
+    identity_unavailable,
+    identity_conflict,
+    identity_duplicate,
+    binding_move_required,
 };
 
 pub const PrepareBindingRequest = struct {
-    locator: committed_review.GitCommonDirectoryLocator,
-    repository_path: []const u8,
+    repository: *repository_locator.LocatedRepository,
+    repository_context: git_command.DirectoryContext,
     repository_name: ?[]const u8 = null,
 };
 
@@ -193,7 +201,7 @@ pub fn probeBinding(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const Context,
-    locator: committed_review.GitCommonDirectoryLocator,
+    located: *const repository_locator.LocatedRepository,
 ) std.mem.Allocator.Error!BindingProbeResult {
     var opened = switch (context.openExisting()) {
         .opened => |value| value,
@@ -210,10 +218,50 @@ pub fn probeBinding(
     var current = try registry.read(allocator, io, opened.root.directory);
     defer current.deinit();
     return switch (current) {
-        .missing => .unbound,
-        .registry => |*parsed| if (parsed.lookup(locator) == null) .unbound else .bound,
+        .missing => switch (located.marker) {
+            .missing => .unbound,
+            .present => .unbound,
+            .invalid => .{ .failure = .identity_invalid },
+            .unavailable => .{ .failure = .identity_unavailable },
+        },
+        .registry => |*parsed| probeParsedBinding(allocator, io, parsed, located),
         .invalid => .{ .failure = .store_invalid },
         .unavailable => .{ .failure = .store_unavailable },
+    };
+}
+
+fn probeParsedBinding(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parsed: *const registry.ParsedRegistry,
+    located: *const repository_locator.LocatedRepository,
+) BindingProbeResult {
+    const instance_id = switch (located.marker) {
+        .present => |value| value,
+        .missing => return if (parsed.lookupPath(located.canonical_path) != null)
+            .{ .failure = .identity_missing }
+        else
+            .unbound,
+        .invalid => return .{ .failure = .identity_invalid },
+        .unavailable => return .{ .failure = .identity_unavailable },
+    };
+    if (parsed.lookupPath(located.canonical_path)) |path_binding| {
+        if (!path_binding.repository_instance_id.eql(instance_id))
+            return .{ .failure = .identity_conflict };
+    }
+    const binding = parsed.lookup(instance_id) orelse return .unbound;
+    return switch (repository_locator.admitPathLease(
+        allocator,
+        io,
+        located,
+        binding.last_seen_path.bytes,
+        binding.repository_instance_id,
+        false,
+    )) {
+        .accepted => .bound,
+        .move_required, .transfer => .{ .failure = .binding_move_required },
+        .duplicate => .{ .failure = .identity_duplicate },
+        .conflict => .{ .failure = .identity_conflict },
     };
 }
 
@@ -225,15 +273,25 @@ pub fn prepareBinding(
     context: *const Context,
     request: PrepareBindingRequest,
 ) std.mem.Allocator.Error!PrepareBindingResult {
-    return prepareBindingWithObserver(allocator, io, context, request, .{});
+    return prepareBindingWithHooks(allocator, io, context, request, .{}, null);
 }
 
-fn prepareBindingWithObserver(
+const PrepareCommitHook = struct {
+    context: *anyopaque,
+    before_registry_commit: *const fn (*anyopaque) void,
+
+    fn fire(self: PrepareCommitHook) void {
+        self.before_registry_commit(self.context);
+    }
+};
+
+fn prepareBindingWithHooks(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const Context,
     request: PrepareBindingRequest,
     observer: durable.Observer,
+    commit_hook: ?PrepareCommitHook,
 ) std.mem.Allocator.Error!PrepareBindingResult {
     const configured = context.configuredPath() orelse
         return .{ .failure = .store_unavailable };
@@ -252,76 +310,91 @@ fn prepareBindingWithObserver(
 
     var current = try registry.read(allocator, io, root.directory);
     defer current.deinit();
-    const existing = switch (current) {
+    request.repository.refreshMarker(allocator, io);
+    switch (request.repository.marker) {
+        .missing => {
+            switch (current) {
+                .registry => |*parsed| if (parsed.lookupPath(request.repository.canonical_path) != null)
+                    return .{ .failure = .identity_missing },
+                .invalid => return .{ .failure = .store_invalid },
+                .unavailable => return .{ .failure = .store_unavailable },
+                .missing => {},
+            }
+            _ = request.repository.ensureIdentity(allocator, io, observer) catch |err|
+                return .{ .failure = mapIdentityFailure(err) };
+            current.deinit();
+            current = try registry.read(allocator, io, root.directory);
+        },
+        .invalid => return .{ .failure = .identity_invalid },
+        .unavailable => return .{ .failure = .identity_unavailable },
+        .present => {},
+    }
+    const instance_id = request.repository.instanceId() orelse
+        return .{ .failure = .identity_missing };
+    const existing: ?*const registry.ParsedRegistry = switch (current) {
         .missing => null,
         .registry => |*value| value,
         .invalid => return .{ .failure = .store_invalid },
         .unavailable => return .{ .failure = .store_unavailable },
     };
+    if (existing) |parsed| if (parsed.lookupPath(request.repository.canonical_path)) |path_binding| {
+        if (!path_binding.repository_instance_id.eql(instance_id))
+            return .{ .failure = .identity_conflict };
+    };
 
-    const diagnostic_path = registry.diagnosticPath(request.repository_path) catch
+    const diagnostic_path = registry.diagnosticPath(request.repository.canonical_path) catch
         return .{ .failure = .repository_invalid };
     var repository_id: committed_review.ReviewRepositoryId = undefined;
     var repository_display_name: store_name.RepositoryDisplayName = undefined;
     var repository_directory_name: store_name.RepositoryDirectoryName = undefined;
     var replacement_needed = false;
     var created_namespace: ?capability.DirectoryCapability = null;
+    var expected_namespace: ?capability.Metadata = null;
     defer if (created_namespace) |*directory| directory.deinit();
-    var bindings_owner: ?[]registry.Binding = null;
-    defer if (bindings_owner) |owned| allocator.free(owned);
-    var bindings: []registry.Binding = undefined;
-    if (existing) |parsed| {
-        const adding_binding = parsed.lookup(request.locator) == null;
-        if (adding_binding and parsed.bindings.len == registry.max_bindings) {
-            return .{ .failure = .store_invalid };
-        }
-        bindings = try allocator.alloc(
-            registry.Binding,
-            parsed.bindings.len + @intFromBool(adding_binding),
+    const found = if (existing) |parsed| parsed.lookup(instance_id) else null;
+    const existing_count = if (existing) |parsed| parsed.bindings.len else 0;
+    const is_new_binding = found == null;
+    if (is_new_binding and existing_count == registry.max_bindings)
+        return .{ .failure = .store_invalid };
+    const bindings = try allocator.alloc(registry.Binding, existing_count + @intFromBool(is_new_binding));
+    defer allocator.free(bindings);
+    if (existing) |parsed| @memcpy(bindings[0..existing_count], parsed.bindings);
+
+    if (found) |binding_found| {
+        const lease = repository_locator.admitPathLease(
+            allocator,
+            io,
+            request.repository,
+            binding_found.last_seen_path.bytes,
+            binding_found.repository_instance_id,
+            true,
         );
-        bindings_owner = bindings;
-        @memcpy(bindings[0..parsed.bindings.len], parsed.bindings);
-        if (parsed.lookup(request.locator)) |found| {
-            repository_id = found.review_repository_id;
-            repository_display_name = store_name.RepositoryDisplayName.fromStored(found.repository_display_name) catch
-                return .{ .failure = .store_invalid };
-            repository_directory_name = store_name.RepositoryDirectoryName.fromStored(
-                found.directory_name,
-                &repository_display_name,
-                repository_id,
-            ) catch return .{ .failure = .store_invalid };
-            var namespace = root.directory.openDirectory(repository_directory_name.slice()) catch
-                return .{ .failure = .store_invalid };
-            namespace.deinit();
-            for (bindings[0..parsed.bindings.len]) |*binding| {
-                if (!binding.locator.eql(request.locator)) continue;
-                if (!std.mem.eql(u8, binding.last_seen_path.bytes, request.repository_path)) {
+        switch (lease) {
+            .accepted => {},
+            .transfer => replacement_needed = true,
+            .move_required => unreachable,
+            .duplicate => return .{ .failure = .identity_duplicate },
+            .conflict => return .{ .failure = .identity_conflict },
+        }
+        repository_id = binding_found.review_repository_id;
+        repository_display_name = store_name.RepositoryDisplayName.fromStored(binding_found.repository_display_name) catch
+            return .{ .failure = .store_invalid };
+        repository_directory_name = store_name.RepositoryDirectoryName.fromStored(
+            binding_found.directory_name,
+            &repository_display_name,
+            repository_id,
+        ) catch return .{ .failure = .store_invalid };
+        var namespace = root.directory.openDirectory(repository_directory_name.slice()) catch
+            return .{ .failure = .store_invalid };
+        expected_namespace = namespace.metadata;
+        namespace.deinit();
+        if (lease == .transfer) {
+            for (bindings) |*binding| {
+                if (binding.repository_instance_id.eql(instance_id)) {
                     binding.last_seen_path = diagnostic_path;
-                    replacement_needed = true;
-                }
-                break;
-            }
-        } else {
-            repository_display_name = store_name.RepositoryDisplayName.fromMainWorktreeBasename(
-                request.repository_name orelse return .{ .failure = .repository_name_invalid },
-            ) catch return .{ .failure = .repository_name_invalid };
-            repository_id = generateRepositoryId(io) catch return .{ .failure = .io_failed };
-            repository_directory_name = store_name.RepositoryDirectoryName.format(&repository_display_name, repository_id);
-            for (parsed.bindings) |binding| {
-                if (std.mem.eql(u8, binding.directory_name, repository_directory_name.slice())) {
-                    return .{ .failure = .repository_namespace_collision };
+                    break;
                 }
             }
-            bindings[bindings.len - 1] = .{
-                .review_repository_id = repository_id,
-                .repository_display_name = repository_display_name.slice(),
-                .directory_name = repository_directory_name.slice(),
-                .locator = request.locator,
-                .canonical_path = diagnostic_path,
-                .last_seen_path = diagnostic_path,
-            };
-            std.mem.sort(registry.Binding, bindings, {}, bindingLessThan);
-            replacement_needed = true;
         }
     } else {
         repository_display_name = store_name.RepositoryDisplayName.fromMainWorktreeBasename(
@@ -329,16 +402,20 @@ fn prepareBindingWithObserver(
         ) catch return .{ .failure = .repository_name_invalid };
         repository_id = generateRepositoryId(io) catch return .{ .failure = .io_failed };
         repository_directory_name = store_name.RepositoryDirectoryName.format(&repository_display_name, repository_id);
-        bindings = try allocator.alloc(registry.Binding, 1);
-        bindings_owner = bindings;
-        bindings[0] = .{
+        if (existing) |parsed| {
+            for (parsed.bindings) |binding| {
+                if (std.mem.eql(u8, binding.directory_name, repository_directory_name.slice()))
+                    return .{ .failure = .repository_namespace_collision };
+            }
+        }
+        bindings[existing_count] = .{
+            .repository_instance_id = instance_id,
             .review_repository_id = repository_id,
             .repository_display_name = repository_display_name.slice(),
             .directory_name = repository_directory_name.slice(),
-            .locator = request.locator,
-            .canonical_path = diagnostic_path,
             .last_seen_path = diagnostic_path,
         };
+        std.mem.sort(registry.Binding, bindings, {}, bindingLessThan);
         replacement_needed = true;
     }
 
@@ -357,7 +434,16 @@ fn prepareBindingWithObserver(
         };
         defer allocator.free(bytes);
 
-        const is_new_binding = existing == null or existing.?.lookup(request.locator) == null;
+        request.repository.revalidate(allocator, io, request.repository_context) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failure = mapIdentityFailure(err) };
+        };
+        if (!contextRootMatches(context, root.directory.metadata) or
+            !(try registryMatches(allocator, io, root.directory, previous_bytes)))
+        {
+            return .{ .failure = .concurrent_conflict };
+        }
+
         if (is_new_binding) {
             const created = switch (capability.createDirectory(
                 io,
@@ -371,6 +457,7 @@ fn prepareBindingWithObserver(
             const namespace = root.directory.openDirectory(repository_directory_name.slice()) catch
                 return .{ .failure = .concurrent_conflict };
             created_namespace = namespace;
+            expected_namespace = namespace.metadata;
             if (created.after_error) |err| {
                 cleanupOwnedEmptyNamespace(io, root.directory, repository_directory_name.slice(), namespace.metadata);
                 return .{ .failure = mapPrepareMutationError(err) };
@@ -387,7 +474,17 @@ fn prepareBindingWithObserver(
             }
         }
 
-        const replacement = atomicReplaceRegistry(io, root.directory, bytes, observer);
+        const replacement = atomicReplaceRegistry(io, root.directory, bytes, .{
+            .allocator = allocator,
+            .context = context,
+            .repository = request.repository,
+            .repository_context = request.repository_context,
+            .expected_root = root.directory.metadata,
+            .expected_registry = previous_bytes,
+            .namespace_name = repository_directory_name.slice(),
+            .expected_namespace = expected_namespace.?,
+            .hook = commit_hook,
+        }, observer);
         const readback = registryReadback(allocator, io, root.directory, bytes, previous_bytes) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .failure = .concurrent_conflict };
@@ -395,7 +492,7 @@ fn prepareBindingWithObserver(
         switch (readback) {
             .candidate => switch (replacement) {
                 .committed => |after_error| if (after_error) |err| return .{ .failure = mapPrepareMutationError(err) },
-                .not_committed => |err| return .{ .failure = mapPrepareMutationError(err) },
+                .not_committed => |err| return .{ .failure = try mapPrepareReplacementError(err) },
             },
             .previous => {
                 if (created_namespace) |namespace| cleanupOwnedEmptyNamespace(
@@ -405,15 +502,38 @@ fn prepareBindingWithObserver(
                     namespace.metadata,
                 );
                 return .{ .failure = switch (replacement) {
-                    .not_committed => |err| if (err == error.ConcurrentStagingConflict)
-                        .concurrent_conflict
-                    else
-                        mapPrepareMutationError(err),
+                    .not_committed => |err| try mapPrepareReplacementError(err),
                     .committed => .concurrent_conflict,
                 } };
             },
             .ambiguous => return .{ .failure = .concurrent_conflict },
         }
+    } else {
+        const expected_registry = registry.writeCanonicalAlloc(allocator, existing.?.bindings) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failure = .store_invalid };
+        };
+        defer allocator.free(expected_registry);
+        (PrepareCommitBoundary{
+            .allocator = allocator,
+            .context = context,
+            .repository = request.repository,
+            .repository_context = request.repository_context,
+            .expected_root = root.directory.metadata,
+            .expected_registry = expected_registry,
+            .namespace_name = repository_directory_name.slice(),
+            .expected_namespace = expected_namespace.?,
+            .hook = commit_hook,
+        }).validate(io, root.directory) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failure = if (err == error.identity_missing or
+                err == error.identity_invalid or
+                err == error.identity_unavailable or
+                err == error.identity_conflict)
+                mapIdentityFailure(err)
+            else
+                .concurrent_conflict };
+        };
     }
 
     const review_id = generateReviewId(io) catch return .{ .failure = .io_failed };
@@ -423,6 +543,37 @@ fn prepareBindingWithObserver(
         .repository_display_name = repository_display_name,
         .repository_directory_name = repository_directory_name,
     } };
+}
+
+fn contextRootMatches(context: *const Context, expected: capability.Metadata) bool {
+    var current = switch (context.openExisting()) {
+        .opened => |value| value,
+        else => return false,
+    };
+    defer current.deinit();
+    return current.root.directory.metadata.sameObject(expected);
+}
+
+fn registryMatches(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: capability.DirectoryCapability,
+    expected: ?[]const u8,
+) std.mem.Allocator.Error!bool {
+    var current = try registry.read(allocator, io, root);
+    defer current.deinit();
+    return switch (current) {
+        .missing => expected == null,
+        .registry => |*parsed| if (expected) |bytes| blk: {
+            const canonical = registry.writeCanonicalAlloc(allocator, parsed.bindings) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => break :blk false,
+            };
+            defer allocator.free(canonical);
+            break :blk std.mem.eql(u8, canonical, bytes);
+        } else false,
+        .invalid, .unavailable => false,
+    };
 }
 
 pub const PublishFailure = enum {
@@ -441,7 +592,7 @@ pub const PublishFailure = enum {
 };
 
 pub const PublishRequest = struct {
-    locator: committed_review.GitCommonDirectoryLocator,
+    repository_instance_id: committed_review.RepositoryInstanceId,
     review_repository_id: committed_review.ReviewRepositoryId,
     review_id: committed_review.ReviewId,
     manifest_bytes: []const u8,
@@ -453,12 +604,43 @@ pub const PublishResult = union(enum) {
     failure: PublishFailure,
 };
 
+const PublishBoundary = struct {
+    context: *const Context,
+    authority: repository_locator.OperationAuthority,
+    root: RootSnapshot,
+    directory_name: store_name.RepositoryDirectoryName,
+};
+
 /// Publish one already-validated immutable Run under an exact existing
-/// locator binding. This may create only the bound namespace and named Run.
+/// repository-instance binding. This may create only the bound namespace and named Run.
 pub fn publish(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const Context,
+    authority: repository_locator.OperationAuthority,
+    request: PublishRequest,
+) std.mem.Allocator.Error!PublishResult {
+    const instance_id = authority.instanceId() orelse return .{ .failure = .binding_mismatch };
+    if (!instance_id.eql(request.repository_instance_id)) return .{ .failure = .binding_mismatch };
+    return publishWithBoundary(allocator, io, context, authority, request);
+}
+
+/// Test-only entrypoint for Store publication fault fixtures that have no Git
+/// process boundary. Product callers must use `publish`.
+pub fn publishForTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const Context,
+    request: PublishRequest,
+) std.mem.Allocator.Error!PublishResult {
+    return publishWithBoundary(allocator, io, context, null, request);
+}
+
+fn publishWithBoundary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const Context,
+    authority: ?repository_locator.OperationAuthority,
     request: PublishRequest,
 ) std.mem.Allocator.Error!PublishResult {
     var manifest = committed_review.ReviewRunManifest.parseStrict(
@@ -497,7 +679,7 @@ pub fn publish(
         allocator,
         io,
         opened.root.directory,
-        request.locator,
+        request.repository_instance_id,
         request.review_repository_id,
         &initial_directory_name,
     )) |failure| return .{ .failure = failure };
@@ -531,7 +713,7 @@ pub fn publish(
         allocator,
         io,
         fresh.root.directory,
-        request.locator,
+        request.repository_instance_id,
         request.review_repository_id,
         &repository_directory_name,
     )) |failure| return .{ .failure = failure };
@@ -568,6 +750,12 @@ pub fn publish(
         namespace,
         request,
         run_directory_name,
+        if (authority) |value| .{
+            .context = context,
+            .authority = value,
+            .root = fresh.snapshot,
+            .directory_name = repository_directory_name,
+        } else null,
         .{},
     );
 }
@@ -578,9 +766,10 @@ fn publishReconciledIntoNamespace(
     namespace: capability.DirectoryCapability,
     request: PublishRequest,
     run_directory_name: store_name.RunDirectoryName,
+    boundary: ?PublishBoundary,
     observer: durable.Observer,
 ) std.mem.Allocator.Error!PublishResult {
-    publishIntoNamespace(allocator, io, namespace, request, run_directory_name, observer) catch |err| {
+    publishIntoNamespace(allocator, io, namespace, request, run_directory_name, boundary, observer) catch |err| {
         if (try publishedRequestMatches(
             allocator,
             io,
@@ -641,6 +830,17 @@ pub fn saveDraft(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const Context,
+    authority: repository_locator.OperationAuthority,
+    request: DraftRequest,
+) std.mem.Allocator.Error!DraftResult {
+    const configured = context.configuredPath() orelse return .{ .failure = .io_failed };
+    return mutation.saveDraftBound(allocator, io, configured, authority, request);
+}
+
+pub fn saveDraftForTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const Context,
     request: DraftRequest,
 ) std.mem.Allocator.Error!DraftResult {
     const configured = context.configuredPath() orelse return .{ .failure = .io_failed };
@@ -648,6 +848,17 @@ pub fn saveDraft(
 }
 
 pub fn createResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const Context,
+    authority: repository_locator.OperationAuthority,
+    request: ResultRequest,
+) std.mem.Allocator.Error!ResultResult {
+    const configured = context.configuredPath() orelse return .{ .failure = .io_failed };
+    return mutation.createResultBound(allocator, io, configured, authority, request);
+}
+
+pub fn createResultForTest(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: *const Context,
@@ -661,8 +872,9 @@ pub const DeleteRequest = maintenance.DeleteRequest;
 pub const DeleteResult = maintenance.DeleteResult;
 pub const MaintenanceFailure = maintenance.Failure;
 pub const CleanupResult = maintenance.CleanupResult;
-pub const deleteRun = maintenance.deleteRun;
-pub const cleanupTrash = maintenance.cleanupTrash;
+pub const deleteRun = maintenance.deleteRunBound;
+pub const cleanupTrash = maintenance.cleanupTrashBound;
+pub const deleteRunForTest = maintenance.deleteRunForTest;
 
 pub const HeldLock = struct {
     file: @FieldType(durable.FileAcquisition, "file"),
@@ -719,10 +931,36 @@ const RegistryReplaceOutcome = union(enum) {
 
 const RegistryReadback = enum { candidate, previous, ambiguous };
 
+const PrepareCommitBoundary = struct {
+    allocator: std.mem.Allocator,
+    context: *const Context,
+    repository: *const repository_locator.LocatedRepository,
+    repository_context: git_command.DirectoryContext,
+    expected_root: capability.Metadata,
+    expected_registry: ?[]const u8,
+    namespace_name: []const u8,
+    expected_namespace: capability.Metadata,
+    hook: ?PrepareCommitHook,
+
+    fn validate(self: PrepareCommitBoundary, io: std.Io, root: capability.DirectoryCapability) !void {
+        if (self.hook) |hook| hook.fire();
+        try self.repository.revalidate(self.allocator, io, self.repository_context);
+        if (!contextRootMatches(self.context, self.expected_root) or
+            !(try registryMatches(self.allocator, io, root, self.expected_registry)))
+        {
+            return error.ConcurrentStagingConflict;
+        }
+        const namespace = root.admitChild(self.namespace_name, .directory) catch
+            return error.ConcurrentStagingConflict;
+        if (!namespace.sameObject(self.expected_namespace)) return error.ConcurrentStagingConflict;
+    }
+};
+
 fn atomicReplaceRegistry(
     io: std.Io,
     root: capability.DirectoryCapability,
     bytes: []const u8,
+    boundary: PrepareCommitBoundary,
     observer: durable.Observer,
 ) RegistryReplaceOutcome {
     var name_buffer: [46]u8 = undefined;
@@ -758,6 +996,7 @@ fn atomicReplaceRegistry(
         .not_completed => |err| return .{ .not_committed = err },
         .completed => |result| if (result.after_error) |err| return .{ .not_committed = err },
     }
+    boundary.validate(io, root) catch |err| return .{ .not_committed = err };
     switch (capability.moveReplacing(io, root, name, root, "registry.json", observer)) {
         .not_completed => |err| return .{ .not_committed = err },
         .completed => |result| {
@@ -866,6 +1105,7 @@ fn publishIntoNamespace(
     namespace: capability.DirectoryCapability,
     request: PublishRequest,
     run_directory_name: store_name.RunDirectoryName,
+    boundary: ?PublishBoundary,
     observer: durable.Observer,
 ) !void {
     const location_record: run_store.LocationRecord = .{
@@ -936,6 +1176,7 @@ fn publishIntoNamespace(
     try completedVoid(capability.syncDirectory(io, namespace, observer));
 
     const location_name = store_path.RunLocationName.format(request.review_id);
+    if (boundary) |value| try validatePublishBoundary(allocator, io, namespace, request, value);
     switch (capability.movePreserving(
         io,
         namespace,
@@ -997,6 +1238,42 @@ fn publishIntoNamespace(
         },
     }
     try completedVoid(capability.syncDirectory(io, namespace, observer));
+}
+
+fn validatePublishBoundary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    namespace: capability.DirectoryCapability,
+    request: PublishRequest,
+    boundary: PublishBoundary,
+) !void {
+    boundary.authority.revalidate(allocator, io) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.BindingChanged;
+    };
+    switch (try probeBinding(allocator, io, boundary.context, boundary.authority.located)) {
+        .bound => {},
+        .unbound, .failure => return error.BindingChanged,
+    }
+    var fresh = switch (boundary.context.openExisting()) {
+        .opened => |value| value,
+        else => return error.BindingChanged,
+    };
+    defer fresh.deinit();
+    if (!fresh.snapshot.eql(boundary.root)) return error.BindingChanged;
+    var directory_name: store_name.RepositoryDirectoryName = undefined;
+    if (try publishBindingFailure(
+        allocator,
+        io,
+        fresh.root.directory,
+        request.repository_instance_id,
+        request.review_repository_id,
+        &directory_name,
+    ) != null) return error.BindingChanged;
+    if (!directory_name.eql(&boundary.directory_name)) return error.BindingChanged;
+    const namespace_now = fresh.root.directory.admitChild(directory_name.slice(), .directory) catch
+        return error.BindingChanged;
+    if (!namespace_now.sameObject(namespace.metadata)) return error.BindingChanged;
 }
 
 fn cleanupOwnedLocation(
@@ -1061,14 +1338,14 @@ fn publishBindingFailure(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: capability.DirectoryCapability,
-    locator: committed_review.GitCommonDirectoryLocator,
+    instance_id: committed_review.RepositoryInstanceId,
     expected: committed_review.ReviewRepositoryId,
     directory_name: *store_name.RepositoryDirectoryName,
 ) std.mem.Allocator.Error!?PublishFailure {
     var current = try registry.read(allocator, io, root);
     defer current.deinit();
     return switch (current) {
-        .registry => |*parsed| if (parsed.lookup(locator)) |actual| blk: {
+        .registry => |*parsed| if (parsed.lookup(instance_id)) |actual| blk: {
             if (!actual.review_repository_id.eql(expected)) break :blk .binding_mismatch;
             const display = store_name.RepositoryDisplayName.fromStored(actual.repository_display_name) catch
                 break :blk .store_invalid;
@@ -1109,8 +1386,17 @@ fn generateReviewId(io: std.Io) !committed_review.ReviewId {
 }
 
 fn bindingLessThan(_: void, left: registry.Binding, right: registry.Binding) bool {
-    return left.locator.device < right.locator.device or
-        (left.locator.device == right.locator.device and left.locator.inode < right.locator.inode);
+    return std.mem.order(u8, &left.repository_instance_id.bytes, &right.repository_instance_id.bytes) == .lt;
+}
+
+fn mapIdentityFailure(err: anyerror) PrepareBindingFailure {
+    return switch (err) {
+        error.identity_missing => .identity_missing,
+        error.identity_invalid => .identity_invalid,
+        error.identity_unavailable => .identity_unavailable,
+        error.identity_conflict => .identity_conflict,
+        else => .identity_unavailable,
+    };
 }
 
 fn formatTokenName(buffer: []u8, prefix: []const u8, token: [16]u8) ![]const u8 {
@@ -1145,6 +1431,19 @@ fn mapPrepareMutationError(err: anyerror) PrepareBindingFailure {
     return .io_failed;
 }
 
+fn mapPrepareReplacementError(err: anyerror) std.mem.Allocator.Error!PrepareBindingFailure {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    return switch (err) {
+        error.identity_missing,
+        error.identity_invalid,
+        error.identity_unavailable,
+        error.identity_conflict,
+        => mapIdentityFailure(err),
+        error.ConcurrentStagingConflict => .concurrent_conflict,
+        else => mapPrepareMutationError(err),
+    };
+}
+
 fn mapRepositoryNamespaceCreateError(err: anyerror) PrepareBindingFailure {
     return if (err == error.PathAlreadyExists)
         .repository_namespace_collision
@@ -1162,6 +1461,7 @@ fn mapPublishOpenFailure(failure: OpenFailure) PublishFailure {
 }
 
 fn mapPublishMutationError(err: anyerror) PublishFailure {
+    if (err == error.BindingChanged) return .binding_mismatch;
     if (err == error.UnsupportedPlatform or err == error.OperationUnsupported) return .unsupported_platform;
     if (err == error.UnsupportedFilesystem) return .unsupported_filesystem;
     if (isUnavailableError(err)) return .store_unavailable;
@@ -1251,6 +1551,65 @@ test "review store core preserves lossless open taxonomy and publication compati
     }
 }
 
+const TestRepository = struct {
+    allocator: std.mem.Allocator,
+    root: @import("../repo/root_capability.zig").RootCapability,
+    environment: git_command.LocalGitEnvironment,
+    located: repository_locator.LocatedRepository,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, parent: std.Io.Dir, name: []const u8) !TestRepository {
+        try parent.createDir(io, name, .fromMode(0o700));
+        var directory = try parent.openDir(io, name, .{});
+        defer directory.close(io);
+        const result = try std.process.run(allocator, io, .{
+            .argv = &.{ "git", "init", "--initial-branch=main" },
+            .cwd = .{ .dir = directory },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code != 0) return error.GitCommandFailed,
+            else => return error.GitCommandFailed,
+        }
+        return open(allocator, io, parent, name);
+    }
+
+    fn open(allocator: std.mem.Allocator, io: std.Io, parent: std.Io.Dir, name: []const u8) !TestRepository {
+        const path = try parent.realPathFileAlloc(io, name, allocator);
+        defer allocator.free(path);
+        var root = try @import("../repo/root_capability.zig").RootCapability.openCanonical(path);
+        errdefer root.deinit();
+        var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+        errdefer environment.deinit();
+        const located_result = try repository_locator.locate(allocator, io, .{
+            .cwd = root.dir(),
+            .environment = &environment,
+        });
+        const located = switch (located_result) {
+            .located => |value| value,
+            .failure => return error.RepositoryLocateFailed,
+        };
+        return .{ .allocator = allocator, .root = root, .environment = environment, .located = located };
+    }
+
+    fn git(self: *const TestRepository) git_command.DirectoryContext {
+        return .{ .cwd = self.root.dir(), .environment = &self.environment };
+    }
+
+    fn initialize(self: *TestRepository, io: std.Io) !void {
+        _ = try self.located.ensureIdentity(self.allocator, io, .{});
+    }
+
+    fn deinit(self: *TestRepository) void {
+        self.located.deinit(self.allocator);
+        self.environment.deinit();
+        self.root.deinit();
+        self.* = undefined;
+    }
+};
+
 test "review store core context is configuration-only cloneable and missing-root tolerant" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1273,9 +1632,11 @@ test "review store core context is configuration-only cloneable and missing-root
     try std.testing.expect(opened == .missing);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(io, "not-created-by-context", .{}));
 
+    var repository = try TestRepository.init(allocator, io, tmp.dir, "repository");
+    defer repository.deinit();
     const prepared = try prepareBinding(allocator, io, &context, .{
-        .locator = .{ .device = 7, .inode = 11 },
-        .repository_path = "/physical/repository",
+        .repository = &repository.located,
+        .repository_context = repository.git(),
         .repository_name = "repository",
     });
     try std.testing.expect(prepared == .success);
@@ -1302,11 +1663,12 @@ test "review store binding persists the actual repository namespace and never re
     defer allocator.free(store_path_text);
     var context = try Context.initConfigured(allocator, store_path_text);
     defer context.deinit(allocator);
-    const locator: committed_review.GitCommonDirectoryLocator = .{ .device = 7, .inode = 11 };
+    var repository = try TestRepository.init(allocator, io, tmp.dir, "Main-Repo---");
+    defer repository.deinit();
 
     const first_result = try prepareBinding(allocator, io, &context, .{
-        .locator = locator,
-        .repository_path = "/physical/Main-Repo---",
+        .repository = &repository.located,
+        .repository_context = repository.git(),
         .repository_name = "Main-Repo---",
     });
     const first = switch (first_result) {
@@ -1314,6 +1676,13 @@ test "review store binding persists the actual repository namespace and never re
         .failure => return error.ExpectedPrepareSuccess,
     };
     try std.testing.expectEqualStrings("Main-Repo", first.repository_display_name.slice());
+    const first_runtime_locator = repository.located.locator;
+    repository.located.locator.device +%= 1;
+    try std.testing.expectEqual(
+        BindingProbeResult.bound,
+        try probeBinding(allocator, io, &context, &repository.located),
+    );
+    repository.located.locator = first_runtime_locator;
     const repository_text = first.review_repository_id.canonical();
     var expected_directory_buffer: [255]u8 = undefined;
     const expected_directory = try std.fmt.bufPrint(
@@ -1336,9 +1705,12 @@ test "review store binding persists the actual repository namespace and never re
         return error.UnexpectedUuidNamespace;
     } else |err| try std.testing.expectEqual(error.FileNotFound, err);
 
+    repository.deinit();
+    try tmp.dir.rename("Main-Repo---", tmp.dir, "Renamed-Checkout", io);
+    repository = try TestRepository.open(allocator, io, tmp.dir, "Renamed-Checkout");
     const second_result = try prepareBinding(allocator, io, &context, .{
-        .locator = locator,
-        .repository_path = "/physical/Renamed-Checkout",
+        .repository = &repository.located,
+        .repository_context = repository.git(),
         .repository_name = null,
     });
     const second = switch (second_result) {
@@ -1353,19 +1725,19 @@ test "review store binding persists the actual repository namespace and never re
     var parsed = try registry.read(allocator, io, opened.root.directory);
     defer parsed.deinit();
     const saved = switch (parsed) {
-        .registry => |*value| value.lookup(locator) orelse return error.ExpectedRepositoryBinding,
+        .registry => |*value| value.lookup(repository.located.instanceId().?) orelse return error.ExpectedRepositoryBinding,
         else => return error.ExpectedRepositoryBinding,
     };
     try std.testing.expectEqualStrings("Main-Repo", saved.repository_display_name);
     try std.testing.expectEqualStrings(expected_directory, saved.directory_name);
-    try std.testing.expectEqualStrings("/physical/Renamed-Checkout", saved.last_seen_path.bytes);
+    try std.testing.expectEqualStrings(repository.located.canonical_path, saved.last_seen_path.bytes);
 
     var raw_store = try tmp.dir.openDir(io, "store", .{});
     defer raw_store.close(io);
     try raw_store.deleteDir(io, expected_directory);
     const missing_namespace = try prepareBinding(allocator, io, &context, .{
-        .locator = locator,
-        .repository_path = "/physical/Renamed-Again",
+        .repository = &repository.located,
+        .repository_context = repository.git(),
         .repository_name = "Must-Not-Replace-Saved-Name",
     });
     try std.testing.expectEqual(PrepareBindingFailure.store_invalid, missing_namespace.failure);
@@ -1408,12 +1780,15 @@ test "review store repository binding fault edges preserve exactly the proven re
         defer allocator.free(store_path_text);
         var context = try Context.initConfigured(allocator, store_path_text);
         defer context.deinit(allocator);
+        var repository = try TestRepository.init(allocator, io, tmp.dir, "repository");
+        defer repository.deinit();
+        try repository.initialize(io);
         var fault: TestStepObserver = .{ .selected = case.step, .occurrence = case.occurrence };
-        const result = try prepareBindingWithObserver(allocator, io, &context, .{
-            .locator = .{ .device = 7, .inode = 11 },
-            .repository_path = "/physical/repository",
+        const result = try prepareBindingWithHooks(allocator, io, &context, .{
+            .repository = &repository.located,
+            .repository_context = repository.git(),
             .repository_name = "repository",
-        }, fault.observer());
+        }, fault.observer(), null);
         try std.testing.expectEqual(PrepareBindingFailure.io_failed, result.failure);
         try std.testing.expect(fault.seen > case.occurrence);
 
@@ -1445,6 +1820,135 @@ test "review store repository binding fault edges preserve exactly the proven re
     }
 }
 
+test "review store prepare revalidates marker and common directory at registry commit boundary" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]PrepareDriftMode{ .marker_deleted, .marker_corrupt, .marker_replaced, .common_directory_replaced }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDir(io, "store", .fromMode(0o700));
+        const store_path_text = try tmp.dir.realPathFileAlloc(io, "store", allocator);
+        defer allocator.free(store_path_text);
+        var context = try Context.initConfigured(allocator, store_path_text);
+        defer context.deinit(allocator);
+        var repository = try TestRepository.init(allocator, io, tmp.dir, "repository");
+        defer repository.deinit();
+        try repository.initialize(io);
+        if (mode == .common_directory_replaced) {
+            var replacement = try TestRepository.init(allocator, io, tmp.dir, "replacement");
+            replacement.deinit();
+        }
+        var drift: PrepareDrift = .{ .io = io, .parent = tmp.dir, .mode = mode };
+        const result = try prepareBindingWithHooks(allocator, io, &context, .{
+            .repository = &repository.located,
+            .repository_context = repository.git(),
+            .repository_name = "repository",
+        }, .{}, drift.hook());
+        try std.testing.expect(result == .failure);
+        try std.testing.expect(drift.fired and drift.failure == null);
+
+        var raw_store = try tmp.dir.openDir(io, "store", .{ .iterate = true });
+        defer raw_store.close(io);
+        try std.testing.expectError(error.FileNotFound, raw_store.access(io, "registry.json", .{}));
+        var iterator = raw_store.iterate();
+        while (try iterator.next(io)) |entry| {
+            try std.testing.expect(std.mem.eql(u8, entry.name, ".locks"));
+        }
+    }
+
+    for ([_]ExistingPrepareDriftMode{ .store_root, .binding_lease, .namespace }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDir(io, "store", .fromMode(0o700));
+        const store_path_text = try tmp.dir.realPathFileAlloc(io, "store", allocator);
+        defer allocator.free(store_path_text);
+        var context = try Context.initConfigured(allocator, store_path_text);
+        defer context.deinit(allocator);
+        var repository = try TestRepository.init(allocator, io, tmp.dir, "repository");
+        defer repository.deinit();
+        const prepared = try prepareBinding(allocator, io, &context, .{
+            .repository = &repository.located,
+            .repository_context = repository.git(),
+            .repository_name = "repository",
+        });
+        const namespace_name = prepared.success.repository_directory_name;
+        var store = try tmp.dir.openDir(io, "store", .{});
+        defer store.close(io);
+        var drift: ExistingPrepareDrift = .{
+            .allocator = allocator,
+            .io = io,
+            .parent = tmp.dir,
+            .store = store,
+            .namespace_name = namespace_name,
+            .mode = mode,
+        };
+        const result = try prepareBindingWithHooks(allocator, io, &context, .{
+            .repository = &repository.located,
+            .repository_context = repository.git(),
+        }, .{}, drift.hook());
+        try std.testing.expect(result == .failure);
+        try std.testing.expect(drift.fired and drift.failure == null);
+    }
+}
+
+test "review run publication rejects marker replacement before location rename" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "store", .fromMode(0o700));
+    const store_path_text = try tmp.dir.realPathFileAlloc(io, "store", allocator);
+    defer allocator.free(store_path_text);
+    var context = try Context.initConfigured(allocator, store_path_text);
+    defer context.deinit(allocator);
+    var repository = try TestRepository.init(allocator, io, tmp.dir, "repository");
+    defer repository.deinit();
+    const prepared_result = try prepareBinding(allocator, io, &context, .{
+        .repository = &repository.located,
+        .repository_context = repository.git(),
+        .repository_name = "repository",
+    });
+    const prepared = switch (prepared_result) {
+        .success => |value| value,
+        .failure => return error.ExpectedPrepareSuccess,
+    };
+    const review_id = testReviewId(701);
+    var artifacts = try TestPublishArtifacts.init(allocator, prepared.review_repository_id, review_id);
+    defer artifacts.deinit(allocator);
+
+    var repository_directory = try tmp.dir.openDir(io, "repository", .{});
+    defer repository_directory.close(io);
+    try repository_directory.deleteFile(io, ".git/gitframe/repository-id-v1");
+    try repository_directory.writeFile(io, .{
+        .sub_path = ".git/gitframe/repository-id-v1",
+        .data = "923e4567-e89b-42d3-a456-426614174010\n",
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
+
+    const result = try publish(allocator, io, &context, .{
+        .located = &repository.located,
+        .context = repository.git(),
+    }, .{
+        .repository_instance_id = repository.located.instanceId().?,
+        .review_repository_id = prepared.review_repository_id,
+        .review_id = review_id,
+        .manifest_bytes = artifacts.manifest,
+        .findings_bytes = artifacts.findings,
+    });
+    try std.testing.expectEqual(PublishFailure.binding_mismatch, result.failure);
+
+    var opened = context.openExisting().opened;
+    defer opened.deinit();
+    var namespace = try opened.root.directory.openDirectory(prepared.repository_directory_name.slice());
+    defer namespace.deinit();
+    const location_name = store_path.RunLocationName.format(review_id);
+    try std.testing.expectError(error.FileNotFound, namespace.admitChild(location_name.slice(), .regular_file));
+    var iterator = namespace.iterate();
+    try std.testing.expect((try iterator.next(namespace, io)) == null);
+}
+
 test "review store repository binding never deletes nonempty or ambiguous namespace residue" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1459,12 +1963,15 @@ test "review store repository binding never deletes nonempty or ambiguous namesp
         defer raw_store.close(io);
         var context = try Context.initConfigured(allocator, store_path_text);
         defer context.deinit(allocator);
+        var repository = try TestRepository.init(allocator, io, tmp.dir, "repository");
+        defer repository.deinit();
+        try repository.initialize(io);
         var fault: BindingResidueFault = .{ .io = io, .store = raw_store, .mode = mode };
-        const result = try prepareBindingWithObserver(allocator, io, &context, .{
-            .locator = .{ .device = 7, .inode = 11 },
-            .repository_path = "/physical/repository",
+        const result = try prepareBindingWithHooks(allocator, io, &context, .{
+            .repository = &repository.located,
+            .repository_context = repository.git(),
             .repository_name = "repository",
-        }, fault.observer());
+        }, fault.observer(), null);
         try std.testing.expect(result == .failure);
         try std.testing.expect(fault.fired);
 
@@ -1545,7 +2052,7 @@ test "review run publication fault boundaries expose all-or-nothing final direct
         id_bytes[8] = 0x80;
         const review_id: committed_review.ReviewId = .{ .bytes = id_bytes };
         const request: PublishRequest = .{
-            .locator = .{ .device = 0, .inode = 0 },
+            .repository_instance_id = try committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010"),
             .review_repository_id = repository_id,
             .review_id = review_id,
             .manifest_bytes = "manifest-exact\n",
@@ -1562,7 +2069,7 @@ test "review run publication fault boundaries expose all-or-nothing final direct
         var fault: TestStepObserver = .{ .selected = case.step, .occurrence = case.occurrence };
         try std.testing.expectError(
             error.InjectedPublicationFault,
-            publishIntoNamespace(allocator, io, namespace, request, run_directory_name, fault.observer()),
+            publishIntoNamespace(allocator, io, namespace, request, run_directory_name, null, fault.observer()),
         );
         if (namespace.openDirectory(run_directory_name.slice())) |final| {
             var owned = final;
@@ -1638,7 +2145,7 @@ test "review run publication fault boundaries expose all-or-nothing final direct
     var boundary_artifacts = try TestPublishArtifacts.init(allocator, repository_id, boundary_review_id);
     defer boundary_artifacts.deinit(allocator);
     const boundary_request: PublishRequest = .{
-        .locator = .{ .device = 0, .inode = 0 },
+        .repository_instance_id = try committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010"),
         .review_repository_id = repository_id,
         .review_id = boundary_review_id,
         .manifest_bytes = boundary_artifacts.manifest,
@@ -1657,6 +2164,7 @@ test "review run publication fault boundaries expose all-or-nothing final direct
             boundary_namespace,
             boundary_request,
             boundary_run_name,
+            null,
             post_publish_fault.observer(),
         ),
     );
@@ -1770,6 +2278,117 @@ const TestStepObserver = struct {
 };
 
 const BindingResidueMode = enum { nonempty, ambiguous_registry };
+
+const PrepareDriftMode = enum { marker_deleted, marker_corrupt, marker_replaced, common_directory_replaced };
+
+const PrepareDrift = struct {
+    io: std.Io,
+    parent: std.Io.Dir,
+    mode: PrepareDriftMode,
+    fired: bool = false,
+    failure: ?anyerror = null,
+
+    fn before(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.apply() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn apply(self: *@This()) !void {
+        self.fired = true;
+        var repository = try self.parent.openDir(self.io, "repository", .{});
+        defer repository.close(self.io);
+        switch (self.mode) {
+            .marker_deleted => try repository.deleteFile(self.io, ".git/gitframe/repository-id-v1"),
+            .marker_corrupt, .marker_replaced => {
+                try repository.deleteFile(self.io, ".git/gitframe/repository-id-v1");
+                try repository.writeFile(self.io, .{
+                    .sub_path = ".git/gitframe/repository-id-v1",
+                    .data = if (self.mode == .marker_corrupt)
+                        "not-a-canonical-uuid-v4-marker-value\n"
+                    else
+                        "923e4567-e89b-42d3-a456-426614174010\n",
+                    .flags = .{ .permissions = .fromMode(0o600) },
+                });
+            },
+            .common_directory_replaced => {
+                try repository.rename(".git", repository, ".git-old", self.io);
+                var replacement = try self.parent.openDir(self.io, "replacement", .{});
+                defer replacement.close(self.io);
+                try replacement.rename(".git", repository, ".git", self.io);
+            },
+        }
+    }
+
+    fn hook(self: *@This()) PrepareCommitHook {
+        return .{ .context = self, .before_registry_commit = before };
+    }
+};
+
+const ExistingPrepareDriftMode = enum { store_root, binding_lease, namespace };
+
+const ExistingPrepareDrift = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent: std.Io.Dir,
+    store: std.Io.Dir,
+    namespace_name: store_name.RepositoryDirectoryName,
+    mode: ExistingPrepareDriftMode,
+    fired: bool = false,
+    failure: ?anyerror = null,
+
+    fn before(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.apply() catch |err| {
+            self.failure = err;
+            return;
+        };
+        self.fired = true;
+    }
+
+    fn apply(self: *@This()) !void {
+        switch (self.mode) {
+            .store_root => {
+                try self.parent.rename("store", self.parent, ".admitted-store", self.io);
+                try self.parent.createDir(self.io, "store", .fromMode(0o700));
+            },
+            .binding_lease => {
+                const bytes = try self.store.readFileAlloc(
+                    self.io,
+                    "registry.json",
+                    self.allocator,
+                    .limited(registry.max_registry_bytes),
+                );
+                defer self.allocator.free(bytes);
+                var parsed = try registry.parseStrict(self.allocator, bytes);
+                defer parsed.deinit();
+                var binding = parsed.bindings[0];
+                binding.last_seen_path = try registry.diagnosticPath("/definitely/absent/repository");
+                const replacement = try registry.writeCanonicalAlloc(self.allocator, &.{binding});
+                defer self.allocator.free(replacement);
+                try self.store.writeFile(self.io, .{
+                    .sub_path = "registry.json",
+                    .data = replacement,
+                    .flags = .{ .permissions = .fromMode(0o600) },
+                });
+            },
+            .namespace => {
+                try self.store.rename(
+                    self.namespace_name.slice(),
+                    self.store,
+                    ".admitted-namespace",
+                    self.io,
+                );
+                try self.store.createDir(self.io, self.namespace_name.slice(), .fromMode(0o700));
+            },
+        }
+    }
+
+    fn hook(self: *@This()) PrepareCommitHook {
+        return .{ .context = self, .before_registry_commit = before };
+    }
+};
 
 const BindingResidueFault = struct {
     io: std.Io,

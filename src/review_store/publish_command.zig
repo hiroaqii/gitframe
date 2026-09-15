@@ -264,6 +264,12 @@ fn failureTerminal(failure: store_service.PublicationFailure) Failure {
         .io_failed => .{ .exit_code = 74, .code = "io_failed", .message = "immutable Run publication failed" },
         .binding_mismatch => .{ .exit_code = 75, .code = "binding_mismatch", .message = "repository binding does not match" },
         .concurrent_conflict => .{ .exit_code = 75, .code = "concurrent_conflict", .message = "Review Store authority changed concurrently" },
+        .identity_missing => .{ .exit_code = 66, .code = "identity_missing", .message = "repository identity marker is missing" },
+        .identity_invalid => .{ .exit_code = 74, .code = "identity_invalid", .message = "repository identity marker is invalid" },
+        .identity_unavailable => .{ .exit_code = 69, .code = "identity_unavailable", .message = "repository identity marker is unavailable" },
+        .identity_conflict => .{ .exit_code = 75, .code = "identity_conflict", .message = "repository identity conflicts with its binding" },
+        .identity_duplicate => .{ .exit_code = 75, .code = "identity_duplicate", .message = "repository identity is live at another path" },
+        .binding_move_required => .{ .exit_code = 75, .code = "binding_move_required", .message = "repository binding requires stateful prepare" },
     };
 }
 

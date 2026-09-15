@@ -89,7 +89,9 @@ fn testStoreSnapshot(repository_id: committed_review.ReviewRepositoryId) review_
     return .{
         .root_device = 1,
         .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
+        .namespace_device = 3,
+        .namespace_inode = 4,
+        .repository_instance_id = committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010") catch unreachable,
         .review_repository_id = repository_id,
         .repository_display_name = repository_display_name,
         .repository_directory_name = review_store.RepositoryDirectoryName.format(
@@ -276,7 +278,11 @@ test "AI Reviews deletion admission honors session and Store operation owners" {
     try std.testing.expectEqualStrings("Close the active or recovery session before deleting this Run", app.pages.ai_reviews.status.text());
 
     app.sessions.deinit();
-    const admission = try app.operations.enqueueDraft(allocator, &app.store.?, .{
+    const repository_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repository_path);
+    var repository = try repo_root_capability.RootCapability.openCanonical(repository_path);
+    defer repository.deinit();
+    const admission = try app.operations.enqueueDraft(allocator, &app.store.?, &repository, null, .{
         .binding = binding,
         .expected_revision = 0,
         .summary = "pending",
@@ -2330,6 +2336,10 @@ test "Finding disposition controller edits once, retries draft saves, and direct
     harness.page_state = .{};
     app.human_review_sessions = harness.sessions;
     harness.sessions = .{};
+    const app_repository_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(app_repository_path);
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(app_repository_path);
+    defer app.repo_session.repo_state.root.?.deinit();
     var app_owns_harness_state = true;
     defer {
         app.review_store_operations.deinit(allocator);

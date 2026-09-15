@@ -373,6 +373,8 @@ pub const App = struct {
         const admission = try self.review_store_operations.enqueueDraft(
             ctx.allocator(),
             store,
+            self.repoSessionView().activeCapability(),
+            self.env_map,
             request,
         );
         self.pumpReviewStoreOperations(ctx);
@@ -391,6 +393,8 @@ pub const App = struct {
         const admission = try self.review_store_operations.enqueueResult(
             ctx.allocator(),
             store,
+            self.repoSessionView().activeCapability(),
+            self.env_map,
             request,
         );
         self.pumpReviewStoreOperations(ctx);
@@ -1084,6 +1088,8 @@ pub const App = struct {
         return self.review_store_operations.enqueueDraftChecked(
             allocator,
             store,
+            self.repoSessionView().activeCapability(),
+            self.env_map,
             prepared.request(),
             prepared.token,
         ) catch |err| {
@@ -1102,6 +1108,8 @@ pub const App = struct {
         return self.review_store_operations.enqueueResultChecked(
             allocator,
             store,
+            self.repoSessionView().activeCapability(),
+            self.env_map,
             prepared.request(),
             prepared.token,
         ) catch |err| {
@@ -2498,6 +2506,12 @@ test "command line keeps input across resize and cancels on focus or page transi
     try std.testing.expect(app.commandLineView() == null);
 }
 
+fn installReviewStoreRepositoryForTest(app: *App, allocator: std.mem.Allocator) !void {
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    app.repo_session.repo_state.root = try @import("repo/root_capability.zig").RootCapability.openCanonical(path);
+}
+
 test "review state persistence App quit drains accepted mutation and reopens after failure" {
     const allocator = std.testing.allocator;
     const committed = @import("committed_review.zig");
@@ -2520,6 +2534,8 @@ test "review state persistence App quit drains accepted mutation and reopens aft
         .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
         .allocator = allocator,
     };
+    try installReviewStoreRepositoryForTest(&app, allocator);
+    defer app.repo_session.repo_state.root.?.deinit();
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
@@ -2624,6 +2640,8 @@ test "human review result session App bridge tracks every accepted draft and res
         .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
         .allocator = allocator,
     };
+    try installReviewStoreRepositoryForTest(&app, allocator);
+    defer app.repo_session.repo_state.root.?.deinit();
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
@@ -2781,6 +2799,8 @@ test "Finding disposition App bridge immediately admits the existing draft save"
         .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
         .allocator = allocator,
     };
+    try installReviewStoreRepositoryForTest(&app, allocator);
+    defer app.repo_session.repo_state.root.?.deinit();
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
@@ -2816,6 +2836,8 @@ test "human review result session App admission faults preserve exact prepared i
         .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
         .allocator = allocator,
     };
+    try installReviewStoreRepositoryForTest(&app, allocator);
+    defer app.repo_session.repo_state.root.?.deinit();
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
@@ -3079,6 +3101,8 @@ test "human review result session App bridge keeps detached failure on original 
         .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
         .allocator = allocator,
     };
+    try installReviewStoreRepositoryForTest(&app, allocator);
+    defer app.repo_session.repo_state.root.?.deinit();
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
@@ -3145,6 +3169,8 @@ test "human review result session App mismatch cancels quit and requires exact r
         .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
         .allocator = allocator,
     };
+    try installReviewStoreRepositoryForTest(&app, allocator);
+    defer app.repo_session.repo_state.root.?.deinit();
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
@@ -3212,7 +3238,9 @@ fn humanReviewTestStoreSnapshot(
     return .{
         .root_device = 1,
         .root_inode = 2,
-        .repository_locator = .{ .device = 3, .inode = 4 },
+        .namespace_device = 3,
+        .namespace_inode = 4,
+        .repository_instance_id = committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010") catch unreachable,
         .review_repository_id = repository_id,
         .repository_display_name = display,
         .repository_directory_name = review_store.RepositoryDirectoryName.format(&display, repository_id),
@@ -3240,20 +3268,9 @@ test "human review result session App and Store keep an in-flight revert on one 
     var fixture = try HumanReviewStoreFixture.init(allocator, io, tmp.dir, "store");
     defer fixture.deinit(allocator);
 
-    var seed_store = try review_store.ConfiguredStore.initConfigured(allocator, fixture.store_root);
-    var seeded = try review_store.saveDraft(allocator, io, &seed_store, .{
-        .binding = fixture.binding,
-        .expected_revision = 0,
-        .summary = "A",
-        .finding_dispositions = &.{},
-        .anchored_notes = &.{},
-    });
-    seed_store.deinit(allocator);
-    defer seeded.deinit(allocator);
-    try std.testing.expect(seeded == .committed);
     var loaded = try committed_review.ReviewDraftState.parseStrict(
         allocator,
-        seeded.committed.canonical_bytes,
+        fixture.draft_bytes,
     );
     defer loaded.deinit();
 
@@ -3264,6 +3281,8 @@ test "human review result session App and Store keep an in-flight revert on one 
         ),
         .allocator = allocator,
     };
+    app.repo_session.repo_state.root = try fixture.repository_root.duplicate();
+    defer app.repo_session.repo_state.root.?.deinit();
     defer app.configured_review_store.?.deinit(allocator);
     defer app.review_store_operations.deinit(allocator);
     defer app.human_review_sessions.deinit();
@@ -3341,12 +3360,103 @@ test "human review result session App and Store keep an in-flight revert on one 
         session.completedSnapshot().?.summary.?,
     );
     try std.testing.expect(!app.review_store_operations.hasWork());
+
+    try tmp.dir.createDir(io, "switch-case", .fromMode(0o700));
+    var switch_parent = try tmp.dir.openDir(io, "switch-case", .{});
+    defer switch_parent.close(io);
+    var switch_fixture = try HumanReviewStoreFixture.init(allocator, io, switch_parent, "store");
+    defer switch_fixture.deinit(allocator);
+    var switch_app: App = .{
+        .configured_review_store = try review_store.ConfiguredStore.initConfigured(
+            allocator,
+            switch_fixture.store_root,
+        ),
+        .allocator = allocator,
+    };
+    switch_app.repo_session.repo_state.root = try switch_fixture.repository_root.duplicate();
+    defer switch_app.repo_session.repo_state.root.?.deinit();
+    defer switch_app.configured_review_store.?.deinit(allocator);
+    defer switch_app.review_store_operations.deinit(allocator);
+    const accepted = try switch_app.review_store_operations.enqueueDraft(
+        allocator,
+        &switch_app.configured_review_store.?,
+        &switch_app.repo_session.repo_state.root.?,
+        null,
+        .{
+            .binding = switch_fixture.binding,
+            .expected_revision = 1,
+            .summary = "captured original",
+            .finding_dispositions = &.{},
+            .anchored_notes = &.{},
+        },
+    );
+    try std.testing.expect(accepted == .accepted);
+    try switch_parent.createDir(io, "other", .fromMode(0o700));
+    var other = try switch_parent.openDir(io, "other", .{});
+    defer other.close(io);
+    const initialized = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "init", "--initial-branch=main" },
+        .cwd = .{ .dir = other },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(initialized.stdout);
+    defer allocator.free(initialized.stderr);
+    if (initialized.term != .exited or initialized.term.exited != 0) return error.GitCommandFailed;
+    const other_path = try switch_parent.realPathFileAlloc(io, "other", allocator);
+    defer allocator.free(other_path);
+    switch_app.repo_session.repo_state.root.?.deinit();
+    switch_app.repo_session.repo_state.root = try @import("repo/root_capability.zig").RootCapability.openCanonical(other_path);
+    var switch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    defer switch_ctx.runtimeClearPendingEffectCopies();
+    try std.testing.expectEqual(@as(usize, 1), try switch_app.review_store_operations.pump(&switch_ctx));
+    const captured_tasks = switch_ctx.takePendingTasksWith();
+    var captured_message = captured_tasks[0].run(captured_tasks[0].ctx, allocator, io);
+    var captured_finished = captured_message.review_store_operation_finished;
+    captured_message = undefined;
+    try std.testing.expect(captured_finished.result.draft == .committed);
+    const captured_outcome = switch_app.review_store_operations.finish(allocator, &captured_finished, false);
+    try std.testing.expect(captured_outcome.accepted);
+
+    _ = try switch_app.review_store_operations.enqueueDraft(
+        allocator,
+        &switch_app.configured_review_store.?,
+        &switch_fixture.repository_root,
+        null,
+        .{
+            .binding = switch_fixture.binding,
+            .expected_revision = 2,
+            .summary = "must fail on marker drift",
+            .finding_dispositions = &.{},
+            .anchored_notes = &.{},
+        },
+    );
+    var original = try switch_parent.openDir(io, "repository", .{});
+    defer original.close(io);
+    try original.deleteFile(io, ".git/gitframe/repository-id-v1");
+    try original.writeFile(io, .{
+        .sub_path = ".git/gitframe/repository-id-v1",
+        .data = "923e4567-e89b-42d3-a456-426614174010\n",
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
+    try std.testing.expectEqual(@as(usize, 1), try switch_app.review_store_operations.pump(&switch_ctx));
+    const drift_tasks = switch_ctx.takePendingTasksWith();
+    var drift_message = drift_tasks[0].run(drift_tasks[0].ctx, allocator, io);
+    var drift_finished = drift_message.review_store_operation_finished;
+    drift_message = undefined;
+    try std.testing.expectEqual(review_store.PersistenceFailure.binding_changed, drift_finished.result.draft.failure);
+    const drift_outcome = switch_app.review_store_operations.finish(allocator, &drift_finished, false);
+    try std.testing.expect(drift_outcome.accepted);
+    try std.testing.expectEqual(review_store.PersistenceFailure.binding_changed, drift_outcome.failure.?);
+    try std.testing.expect(!switch_app.review_store_operations.hasWork());
 }
 
 const HumanReviewStoreFixture = struct {
     store_root: [:0]u8,
+    repository_root: @import("repo/root_capability.zig").RootCapability,
     binding: review_store.ReviewRunBinding,
     findings: committed_review.FindingSet,
+    draft_bytes: []u8,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -3396,6 +3506,46 @@ const HumanReviewStoreFixture = struct {
         };
         const manifest_bytes = try manifest.writeCanonical(allocator);
         defer allocator.free(manifest_bytes);
+        const draft: committed_review.ReviewDraftState = .{
+            .schema_version = committed_review.limits.schema_version,
+            .review_id = review_id,
+            .target = review_target,
+            .findings_digest = findings_digest,
+            .revision = 1,
+            .summary = "A",
+            .finding_dispositions = &.{},
+            .anchored_notes = &.{},
+        };
+        const draft_bytes = try draft.writeCanonical(allocator);
+        errdefer allocator.free(draft_bytes);
+
+        try parent.createDir(io, "repository", .fromMode(0o700));
+        var repository = try parent.openDir(io, "repository", .{});
+        defer repository.close(io);
+        const initialized = try std.process.run(allocator, io, .{
+            .argv = &.{ "git", "init", "--initial-branch=main" },
+            .cwd = .{ .dir = repository },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        });
+        defer allocator.free(initialized.stdout);
+        defer allocator.free(initialized.stderr);
+        switch (initialized.term) {
+            .exited => |code| if (code != 0) return error.GitCommandFailed,
+            else => return error.GitCommandFailed,
+        }
+        try repository.createDir(io, ".git/gitframe", .fromMode(0o700));
+        try repository.writeFile(io, .{
+            .sub_path = ".git/gitframe/repository-id-v1",
+            .data = "123e4567-e89b-42d3-a456-426614174010\n",
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+        const repository_path = try parent.realPathFileAlloc(io, "repository", allocator);
+        defer allocator.free(repository_path);
+        const common_path = try repository.realPathFileAlloc(io, ".git", allocator);
+        defer allocator.free(common_path);
+        var repository_root = try @import("repo/root_capability.zig").RootCapability.openCanonical(repository_path);
+        errdefer repository_root.deinit();
 
         try parent.createDir(io, name, .fromMode(0o700));
         var store = try parent.openDir(io, name, .{});
@@ -3414,20 +3564,23 @@ const HumanReviewStoreFixture = struct {
         defer run.close(io);
         try writeHumanReviewFixtureFile(io, run, "manifest.json", manifest_bytes);
         try writeHumanReviewFixtureFile(io, run, "findings.json", findings_bytes);
+        try writeHumanReviewFixtureFile(io, run, "review_state.json", draft_bytes);
         try writeHumanReviewFixtureFile(
             io,
             namespace,
             ".run-223e4567-e89b-42d3-a456-426614174000",
             "{\"schema_version\":1,\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"review_id\":\"223e4567-e89b-42d3-a456-426614174000\",\"directory_name\":\"20260828-0000-test-223e4567\"}\n",
         );
-        try writeHumanReviewFixtureFile(
-            io,
-            store,
-            "registry.json",
-            "{\"schema_version\":1,\"bindings\":[{\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"repository\",\"directory_name\":\"repository-123e4567\",\"device\":\"7\",\"inode\":\"11\",\"canonical_path\":{\"encoding\":\"utf8\",\"value\":\"/test/repository\"},\"last_seen_path\":{\"encoding\":\"utf8\",\"value\":\"/test/repository\"}}]}\n",
+        const registry_bytes = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schema_version\":1,\"bindings\":[{{\"repository_instance_id\":\"123e4567-e89b-42d3-a456-426614174010\",\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"repository\",\"directory_name\":\"repository-123e4567\",\"last_seen_path\":{{\"encoding\":\"utf8\",\"value\":\"{s}\"}}}}]}}\n",
+            .{common_path},
         );
+        defer allocator.free(registry_bytes);
+        try writeHumanReviewFixtureFile(io, store, "registry.json", registry_bytes);
         return .{
             .store_root = try parent.realPathFileAlloc(io, name, allocator),
+            .repository_root = repository_root,
             .binding = .{
                 .review_repository_id = repository_id,
                 .review_id = review_id,
@@ -3435,10 +3588,13 @@ const HumanReviewStoreFixture = struct {
                 .findings_digest = findings_digest,
             },
             .findings = findings,
+            .draft_bytes = draft_bytes,
         };
     }
 
     fn deinit(self: *HumanReviewStoreFixture, allocator: std.mem.Allocator) void {
+        self.repository_root.deinit();
+        allocator.free(self.draft_bytes);
         allocator.free(self.store_root);
         self.* = undefined;
     }

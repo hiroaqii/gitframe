@@ -7,6 +7,8 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const committed_review = @import("../committed_review.zig");
+const git_command = @import("../git/command.zig");
+const root_capability = @import("../repo/root_capability.zig");
 const review_store = @import("../review_store.zig");
 const app_message = @import("message.zig");
 const human_review_session = @import("human_review_session.zig");
@@ -81,6 +83,8 @@ const Payload = union(enum) {
 const OwnedOperation = struct {
     operation_id: app_message.ReviewStoreOperationId,
     store: review_store.ConfiguredStore,
+    repository: root_capability.RootCapability,
+    environment: git_command.LocalGitEnvironment,
     binding: review_store.ReviewRunBinding,
     payload: Payload,
 
@@ -88,8 +92,14 @@ const OwnedOperation = struct {
         allocator: std.mem.Allocator,
         operation_id: app_message.ReviewStoreOperationId,
         store: *const review_store.ConfiguredStore,
+        repository: *const root_capability.RootCapability,
+        environment: ?*const std.process.Environ.Map,
         request: review_store.DraftSaveRequest,
     ) !OwnedOperation {
+        var owned_repository = try repository.duplicate();
+        errdefer owned_repository.deinit();
+        var owned_environment = try git_command.LocalGitEnvironment.initFromParent(allocator, environment);
+        errdefer owned_environment.deinit();
         var owned_store = try store.clone(allocator);
         errdefer owned_store.deinit(allocator);
         const snapshot: committed_review.ReviewDraftState = .{
@@ -107,6 +117,8 @@ const OwnedOperation = struct {
         return .{
             .operation_id = operation_id,
             .store = owned_store,
+            .repository = owned_repository,
+            .environment = owned_environment,
             .binding = request.binding,
             .payload = .{ .draft = .{
                 .expected_revision = request.expected_revision,
@@ -119,11 +131,21 @@ const OwnedOperation = struct {
         allocator: std.mem.Allocator,
         operation_id: app_message.ReviewStoreOperationId,
         store: *const review_store.ConfiguredStore,
+        repository: *const root_capability.RootCapability,
+        environment: ?*const std.process.Environ.Map,
         request: review_store.ReviewResultCreateRequest,
     ) !OwnedOperation {
+        var owned_repository = try repository.duplicate();
+        errdefer owned_repository.deinit();
+        var owned_environment = try git_command.LocalGitEnvironment.initFromParent(allocator, environment);
+        errdefer owned_environment.deinit();
+        var owned_store = try store.clone(allocator);
+        errdefer owned_store.deinit(allocator);
         return .{
             .operation_id = operation_id,
-            .store = try store.clone(allocator),
+            .store = owned_store,
+            .repository = owned_repository,
+            .environment = owned_environment,
             .binding = request.binding,
             .payload = .{ .result = .{
                 .expected_revision = request.expected_revision,
@@ -133,11 +155,13 @@ const OwnedOperation = struct {
     }
 
     fn deinit(self: *OwnedOperation, allocator: std.mem.Allocator) void {
-        self.store.deinit(allocator);
         switch (self.payload) {
             .draft => |payload| allocator.free(payload.canonical_request),
             .result => {},
         }
+        self.store.deinit(allocator);
+        self.environment.deinit();
+        self.repository.deinit();
         self.* = undefined;
     }
 
@@ -208,16 +232,20 @@ pub const Owner = struct {
         self: *Owner,
         allocator: std.mem.Allocator,
         store: *const review_store.ConfiguredStore,
+        repository: ?*const root_capability.RootCapability,
+        environment: ?*const std.process.Environ.Map,
         request: review_store.DraftSaveRequest,
     ) !Admission {
         const token = self.queueToken(request.binding);
-        return self.enqueueDraftChecked(allocator, store, request, token);
+        return self.enqueueDraftChecked(allocator, store, repository, environment, request, token);
     }
 
     pub fn enqueueDraftChecked(
         self: *Owner,
         allocator: std.mem.Allocator,
         store: *const review_store.ConfiguredStore,
+        repository: ?*const root_capability.RootCapability,
+        environment: ?*const std.process.Environ.Map,
         request: review_store.DraftSaveRequest,
         token: human_review_session.QueueToken,
     ) !Admission {
@@ -228,8 +256,9 @@ pub const Owner = struct {
             .rejected => |reason| return .{ .rejected = reason },
         };
         _ = first_plan;
+        const admitted_repository = repository orelse return .{ .rejected = .store_unavailable };
 
-        var operation = try OwnedOperation.initDraft(allocator, 0, store, request);
+        var operation = try OwnedOperation.initDraft(allocator, 0, store, admitted_repository, environment, request);
         var operation_owned = true;
         defer if (operation_owned) operation.deinit(allocator);
 
@@ -273,16 +302,20 @@ pub const Owner = struct {
         self: *Owner,
         allocator: std.mem.Allocator,
         store: *const review_store.ConfiguredStore,
+        repository: ?*const root_capability.RootCapability,
+        environment: ?*const std.process.Environ.Map,
         request: review_store.ReviewResultCreateRequest,
     ) !Admission {
         const token = self.queueToken(request.binding);
-        return self.enqueueResultChecked(allocator, store, request, token);
+        return self.enqueueResultChecked(allocator, store, repository, environment, request, token);
     }
 
     pub fn enqueueResultChecked(
         self: *Owner,
         allocator: std.mem.Allocator,
         store: *const review_store.ConfiguredStore,
+        repository: ?*const root_capability.RootCapability,
+        environment: ?*const std.process.Environ.Map,
         request: review_store.ReviewResultCreateRequest,
         token: human_review_session.QueueToken,
     ) !Admission {
@@ -293,8 +326,9 @@ pub const Owner = struct {
             .rejected => |reason| return .{ .rejected = reason },
         };
         _ = first_plan;
+        const admitted_repository = repository orelse return .{ .rejected = .store_unavailable };
 
-        var operation = try OwnedOperation.initResult(allocator, 0, store, request);
+        var operation = try OwnedOperation.initResult(allocator, 0, store, admitted_repository, environment, request);
         var operation_owned = true;
         defer if (operation_owned) operation.deinit(allocator);
 
@@ -730,6 +764,9 @@ const Task = struct {
                     ) catch break :blk .{ .draft = .{ .failure = .run_invalid } };
                     defer parsed.deinit();
                     const result: review_store.DraftSaveResult = review_store.saveDraft(allocator, io, &self.operation.store, .{
+                        .capability = &self.operation.repository,
+                        .environment = &self.operation.environment,
+                    }, .{
                         .binding = self.operation.binding,
                         .expected_revision = payload.expected_revision,
                         .summary = parsed.value.summary,
@@ -740,6 +777,9 @@ const Task = struct {
                 },
                 .result => |payload| blk: {
                     const result: review_store.ReviewResultCreateResult = review_store.createResult(allocator, io, &self.operation.store, .{
+                        .capability = &self.operation.repository,
+                        .environment = &self.operation.environment,
+                    }, .{
                         .binding = self.operation.binding,
                         .expected_revision = payload.expected_revision,
                         .decision = payload.decision,
@@ -780,25 +820,42 @@ fn failureResult(
     };
 }
 
+fn openTestRepository(allocator: std.mem.Allocator) !root_capability.RootCapability {
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    return root_capability.RootCapability.openCanonical(path);
+}
+
 test "review state persistence operation owner coalesces drafts serializes result and drains quit" {
     const allocator = std.testing.allocator;
+    var repository = try openTestRepository(allocator);
+    defer repository.deinit();
     var store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused");
     defer store.deinit(allocator);
+    var parent_environment = std.process.Environ.Map.init(allocator);
+    defer parent_environment.deinit();
+    try parent_environment.put("HOME", "/captured-home");
+    try parent_environment.put("GIT_DIR", "/must-not-survive");
     var owner: Owner = .{};
     defer owner.deinit(allocator);
     const binding = try testBinding(0);
-    const first = try owner.enqueueDraft(allocator, &store, testDraft(binding, 0, "first"));
+    const first = try owner.enqueueDraft(allocator, &store, &repository, &parent_environment, testDraft(binding, 0, "first"));
     const first_id = first.accepted.operation_id;
-    const newer = try owner.enqueueDraft(allocator, &store, testDraft(binding, 0, "newer"));
+    const captured = &owner.slots[0].pending_draft.?;
+    try std.testing.expect(captured.repository.identity.eql(repository.identity));
+    try std.testing.expect(captured.repository.handle != repository.handle);
+    try std.testing.expectEqualStrings("/captured-home", captured.environment.borrow().get("HOME").?);
+    try std.testing.expect(captured.environment.borrow().get("GIT_DIR") == null);
+    const newer = try owner.enqueueDraft(allocator, &store, &repository, null, testDraft(binding, 0, "newer"));
     try std.testing.expectEqual(first_id, newer.accepted.superseded_operation_id.?);
     const draft_id = newer.accepted.operation_id;
-    const terminal = try owner.enqueueResult(allocator, &store, .{
+    const terminal = try owner.enqueueResult(allocator, &store, &repository, null, .{
         .binding = binding,
         .expected_revision = 1,
         .decision = .approved,
     });
     const result_id = terminal.accepted.operation_id;
-    const duplicate = try owner.enqueueResult(allocator, &store, .{
+    const duplicate = try owner.enqueueResult(allocator, &store, &repository, null, .{
         .binding = binding,
         .expected_revision = 1,
         .decision = .canceled,
@@ -850,12 +907,14 @@ test "review state persistence operation owner coalesces drafts serializes resul
 
 test "review Store operation owner reports a nominal Run despite immutable binding drift" {
     const allocator = std.testing.allocator;
+    var repository = try openTestRepository(allocator);
+    defer repository.deinit();
     var store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused");
     defer store.deinit(allocator);
     var owner: Owner = .{};
     defer owner.deinit(allocator);
     const binding = try testBinding(42);
-    _ = try owner.enqueueDraft(allocator, &store, testDraft(binding, 0, "pending"));
+    _ = try owner.enqueueDraft(allocator, &store, &repository, null, testDraft(binding, 0, "pending"));
     try std.testing.expect(owner.holdsRun(binding.review_repository_id, binding.review_id));
 
     var drifted = binding;
@@ -872,6 +931,8 @@ test "review Store operation owner reports a nominal Run despite immutable bindi
 
 test "review state persistence operation owner cancels failed drain and enforces finite Run cap" {
     const allocator = std.testing.allocator;
+    var repository = try openTestRepository(allocator);
+    defer repository.deinit();
     var store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused");
     defer store.deinit(allocator);
     const binding = try testBinding(0);
@@ -880,11 +941,11 @@ test "review state persistence operation owner cancels failed drain and enforces
     // observable terminal, releases its clone, and leaves the Run retryable.
     var recovery: Owner = .{};
     defer recovery.deinit(allocator);
-    const active = try recovery.enqueueDraft(allocator, &store, testDraft(binding, 0, "active"));
+    const active = try recovery.enqueueDraft(allocator, &store, &repository, null, testDraft(binding, 0, "active"));
     var recovery_ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     try std.testing.expectEqual(@as(usize, 1), try recovery.pump(&recovery_ctx));
-    const pending_draft = try recovery.enqueueDraft(allocator, &store, testDraft(binding, 1, "pending"));
-    const pending_result = try recovery.enqueueResult(allocator, &store, .{
+    const pending_draft = try recovery.enqueueDraft(allocator, &store, &repository, null, testDraft(binding, 1, "pending"));
+    const pending_result = try recovery.enqueueResult(allocator, &store, &repository, null, .{
         .binding = binding,
         .expected_revision = 2,
         .decision = .approved,
@@ -918,7 +979,7 @@ test "review state persistence operation owner cancels failed drain and enforces
     try std.testing.expect(!recovery.hasWork());
     try std.testing.expect(recovery.admissionsOpen());
 
-    const retry = try recovery.enqueueDraft(allocator, &store, testDraft(binding, 0, "retry"));
+    const retry = try recovery.enqueueDraft(allocator, &store, &repository, null, testDraft(binding, 0, "retry"));
     try std.testing.expectEqual(@as(usize, 1), try recovery.pump(&recovery_ctx));
     const retry_tasks = recovery_ctx.takePendingTasksWith();
     var retry_abandoned = retry_tasks[0].failed(retry_tasks[0].ctx, .runtime_abandoned, allocator);
@@ -933,11 +994,11 @@ test "review state persistence operation owner cancels failed drain and enforces
     // and permits the user's next quit to complete without a blocked slot.
     var owner: Owner = .{};
     defer owner.deinit(allocator);
-    const draining_active = try owner.enqueueDraft(allocator, &store, testDraft(binding, 0, "active"));
+    const draining_active = try owner.enqueueDraft(allocator, &store, &repository, null, testDraft(binding, 0, "active"));
     var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     try std.testing.expectEqual(@as(usize, 1), try owner.pump(&ctx));
-    _ = try owner.enqueueDraft(allocator, &store, testDraft(binding, 1, "pending"));
-    _ = try owner.enqueueResult(allocator, &store, .{
+    _ = try owner.enqueueDraft(allocator, &store, &repository, null, testDraft(binding, 1, "pending"));
+    _ = try owner.enqueueResult(allocator, &store, &repository, null, .{
         .binding = binding,
         .expected_revision = 2,
         .decision = .needs_changes,
@@ -957,8 +1018,8 @@ test "review state persistence operation owner cancels failed drain and enforces
 
     var parallel: Owner = .{};
     defer parallel.deinit(allocator);
-    _ = try parallel.enqueueDraft(allocator, &store, testDraft(try testBinding(100), 0, "one"));
-    _ = try parallel.enqueueDraft(allocator, &store, testDraft(try testBinding(101), 0, "two"));
+    _ = try parallel.enqueueDraft(allocator, &store, &repository, null, testDraft(try testBinding(100), 0, "one"));
+    _ = try parallel.enqueueDraft(allocator, &store, &repository, null, testDraft(try testBinding(101), 0, "two"));
     var parallel_ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     try std.testing.expectEqual(@as(usize, 2), try parallel.pump(&parallel_ctx));
     const parallel_tasks = parallel_ctx.takePendingTasksWith();
@@ -976,12 +1037,14 @@ test "review state persistence operation owner cancels failed drain and enforces
     defer capacity_owner.deinit(allocator);
     for (0..max_active_runs) |index| {
         const unique = try testBinding(@intCast(index + 1));
-        const admission = try capacity_owner.enqueueDraft(allocator, &store, testDraft(unique, 0, "queued"));
+        const admission = try capacity_owner.enqueueDraft(allocator, &store, &repository, null, testDraft(unique, 0, "queued"));
         try std.testing.expect(admission == .accepted);
     }
     const overflow = try capacity_owner.enqueueDraft(
         allocator,
         &store,
+        &repository,
+        null,
         testDraft(try testBinding(250), 0, "overflow"),
     );
     try std.testing.expectEqual(Rejection.capacity, overflow.rejected);
@@ -989,6 +1052,8 @@ test "review state persistence operation owner cancels failed drain and enforces
 
 test "review state persistence checked tokens reject drift and pre-pump retirement is finite" {
     const allocator = std.testing.allocator;
+    var repository = try openTestRepository(allocator);
+    defer repository.deinit();
     var store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused");
     defer store.deinit(allocator);
     var owner: Owner = .{};
@@ -999,6 +1064,8 @@ test "review state persistence checked tokens reject drift and pre-pump retireme
     const active_admission = try owner.enqueueDraftChecked(
         allocator,
         &store,
+        &repository,
+        null,
         testDraft(binding, 0, "active"),
         empty,
     );
@@ -1006,6 +1073,8 @@ test "review state persistence checked tokens reject drift and pre-pump retireme
     const stale = try owner.enqueueDraftChecked(
         allocator,
         &store,
+        &repository,
+        null,
         testDraft(binding, 0, "must not mutate"),
         empty,
     );
@@ -1021,6 +1090,8 @@ test "review state persistence checked tokens reject drift and pre-pump retireme
     const pending_draft = try owner.enqueueDraftChecked(
         allocator,
         &store,
+        &repository,
+        null,
         testDraft(binding, 1, "pending"),
         active_token,
     );
@@ -1028,6 +1099,8 @@ test "review state persistence checked tokens reject drift and pre-pump retireme
     const pending_result = try owner.enqueueResultChecked(
         allocator,
         &store,
+        &repository,
+        null,
         .{ .binding = binding, .expected_revision = 2, .decision = .approved },
         with_draft,
     );

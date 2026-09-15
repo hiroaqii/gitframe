@@ -8,6 +8,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const committed_review = @import("../committed_review.zig");
 const durable = @import("../fs/durable.zig");
+const git_command = @import("../git/command.zig");
+const repository_locator = @import("../git/repository_locator.zig");
 const capability = @import("capability.zig");
 const registry = @import("registry.zig");
 const run_artifacts = @import("run.zig");
@@ -137,17 +139,38 @@ pub fn saveDraft(allocator: std.mem.Allocator, io: std.Io, resolved_store: *cons
 
 /// Internal semantic-core entrypoint after configuration has been resolved.
 pub fn saveDraftAt(allocator: std.mem.Allocator, io: std.Io, store_root: []const u8, request: DraftRequest) std.mem.Allocator.Error!DraftResult {
-    return saveDraftWith(allocator, io, store_root, request, .{});
+    return saveDraftWith(allocator, io, store_root, null, request, .{});
 }
 
-fn saveDraftWith(allocator: std.mem.Allocator, io: std.Io, store_root: []const u8, request: DraftRequest, observer: durable.Observer) std.mem.Allocator.Error!DraftResult {
+pub fn saveDraftBound(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_root: []const u8,
+    authority: repository_locator.OperationAuthority,
+    request: DraftRequest,
+) std.mem.Allocator.Error!DraftResult {
+    return saveDraftWith(allocator, io, store_root, authority, request, .{});
+}
+
+fn saveDraftWith(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_root: []const u8,
+    authority: ?repository_locator.OperationAuthority,
+    request: DraftRequest,
+    observer: durable.Observer,
+) std.mem.Allocator.Error!DraftResult {
+    const instance_id = if (authority) |value|
+        value.instanceId() orelse return .{ .failure = .binding_changed }
+    else
+        null;
     var lock = switch (acquireRunLock(io, store_root, request.binding)) {
         .lock => |value| value,
         .failure => |failure| return .{ .failure = failure },
     };
     defer lock.deinit();
 
-    var opened = try openLockedRun(allocator, io, store_root, request.binding, lock.root_metadata);
+    var opened = try openLockedRun(allocator, io, store_root, instance_id, request.binding, lock.root_metadata);
     var run = switch (opened) {
         .opened => |*value| value,
         .failure => |failure| return .{ .failure = failure },
@@ -180,16 +203,23 @@ fn saveDraftWith(allocator: std.mem.Allocator, io: std.Io, store_root: []const u
     writeMutationFile(
         allocator,
         io,
+        run.root.directory.metadata,
         run.namespace,
         run.run,
         run.loaded.run_location,
+        store_root,
+        authority,
+        request.binding,
         request.binding.review_id,
         .draft,
         "review_state.json",
         bytes,
         .replace,
         observer,
-    ) catch |err| return .{ .failure = mapMutationError(err) };
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = mapMutationError(err) };
+    };
     bytes_owned = false;
     return .{ .committed = .{ .revision = next_revision, .canonical_bytes = bytes } };
 }
@@ -206,17 +236,39 @@ pub fn createResult(allocator: std.mem.Allocator, io: std.Io, resolved_store: *c
 
 /// Internal semantic-core entrypoint after configuration has been resolved.
 pub fn createResultAt(allocator: std.mem.Allocator, io: std.Io, store_root: []const u8, request: ResultRequest) std.mem.Allocator.Error!ResultResult {
-    return createResultWith(allocator, io, store_root, request, .{}, .{});
+    return createResultWith(allocator, io, store_root, null, request, .{}, .{});
 }
 
-fn createResultWith(allocator: std.mem.Allocator, io: std.Io, store_root: []const u8, request: ResultRequest, clock: Clock, observer: durable.Observer) std.mem.Allocator.Error!ResultResult {
+pub fn createResultBound(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_root: []const u8,
+    authority: repository_locator.OperationAuthority,
+    request: ResultRequest,
+) std.mem.Allocator.Error!ResultResult {
+    return createResultWith(allocator, io, store_root, authority, request, .{}, .{});
+}
+
+fn createResultWith(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_root: []const u8,
+    authority: ?repository_locator.OperationAuthority,
+    request: ResultRequest,
+    clock: Clock,
+    observer: durable.Observer,
+) std.mem.Allocator.Error!ResultResult {
+    const instance_id = if (authority) |value|
+        value.instanceId() orelse return .{ .failure = .binding_changed }
+    else
+        null;
     var lock = switch (acquireRunLock(io, store_root, request.binding)) {
         .lock => |value| value,
         .failure => |failure| return .{ .failure = failure },
     };
     defer lock.deinit();
 
-    var opened = try openLockedRun(allocator, io, store_root, request.binding, lock.root_metadata);
+    var opened = try openLockedRun(allocator, io, store_root, instance_id, request.binding, lock.root_metadata);
     var run = switch (opened) {
         .opened => |*value| value,
         .failure => |failure| return .{ .failure = failure },
@@ -257,9 +309,13 @@ fn createResultWith(allocator: std.mem.Allocator, io: std.Io, store_root: []cons
     writeMutationFile(
         allocator,
         io,
+        run.root.directory.metadata,
         run.namespace,
         run.run,
         run.loaded.run_location,
+        store_root,
+        authority,
+        request.binding,
         request.binding.review_id,
         .result,
         "result.json",
@@ -267,6 +323,7 @@ fn createResultWith(allocator: std.mem.Allocator, io: std.Io, store_root: []cons
         .no_replace,
         observer,
     ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.PathAlreadyExists) {
             var reconciliation = try reopenRun(allocator, io, run.namespace, request.binding);
             defer reconciliation.deinit(allocator);
@@ -329,6 +386,7 @@ fn openLockedRun(
     allocator: std.mem.Allocator,
     io: std.Io,
     store_root: []const u8,
+    repository_instance_id: ?committed_review.RepositoryInstanceId,
     binding: RunBinding,
     expected_root: capability.Metadata,
 ) std.mem.Allocator.Error!OpenResult {
@@ -344,6 +402,13 @@ fn openLockedRun(
     defer current_registry.deinit();
     const repository_binding = switch (current_registry) {
         .registry => |*parsed| blk: {
+            if (repository_instance_id) |instance_id| {
+                const found = parsed.lookup(instance_id) orelse
+                    return .{ .failure = .binding_changed };
+                if (!found.review_repository_id.eql(binding.review_repository_id))
+                    return .{ .failure = .binding_changed };
+                break :blk found;
+            }
             for (parsed.bindings) |*candidate| {
                 if (candidate.review_repository_id.eql(binding.review_repository_id)) {
                     break :blk candidate;
@@ -436,9 +501,13 @@ const RenameMode = enum { replace, no_replace };
 fn writeMutationFile(
     allocator: std.mem.Allocator,
     io: std.Io,
+    expected_root: capability.Metadata,
     namespace: capability.DirectoryCapability,
     run: capability.DirectoryCapability,
     expected_location: run_artifacts.RunLocationSnapshot,
+    store_root: []const u8,
+    authority: ?repository_locator.OperationAuthority,
+    binding: RunBinding,
     review_id: committed_review.ReviewId,
     kind: store_path.NamespaceTempKind,
     final_name: []const u8,
@@ -476,7 +545,21 @@ fn writeMutationFile(
     try completedVoid(durable.writeAll(io, file, bytes, observer));
     try completedVoid(durable.syncFile(io, file, observer));
     try completedVoid(capability.syncDirectory(io, namespace, observer));
-    try validateRunLocation(allocator, io, namespace, expected_location);
+    if (authority) |repository| {
+        try validateMutationBoundary(
+            allocator,
+            io,
+            store_root,
+            repository,
+            binding,
+            expected_root,
+            namespace,
+            run,
+            expected_location,
+        );
+    } else {
+        try validateRunLocation(allocator, io, namespace, expected_location);
+    }
     const moved = switch (rename_mode) {
         .replace => capability.moveReplacing(io, namespace, temp_name, run, final_name, observer),
         .no_replace => capability.movePreserving(io, namespace, temp_name, run, final_name, observer),
@@ -491,6 +574,54 @@ fn writeMutationFile(
     try completedVoid(capability.syncDirectory(io, run, observer));
     try completedVoid(capability.syncDirectory(io, namespace, observer));
     try validateRunLocation(allocator, io, namespace, expected_location);
+}
+
+fn validateMutationBoundary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_root: []const u8,
+    repository: repository_locator.OperationAuthority,
+    binding: RunBinding,
+    expected_root: capability.Metadata,
+    namespace: capability.DirectoryCapability,
+    selected_run: capability.DirectoryCapability,
+    expected_location: run_artifacts.RunLocationSnapshot,
+) !void {
+    repository.revalidate(allocator, io) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.BindingChanged;
+    };
+    const instance_id = repository.instanceId() orelse return error.BindingChanged;
+    var root = capability.StoreRootCapability.openCanonical(store_root) catch |err| {
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.BindingChanged;
+    };
+    defer root.deinit();
+    if (!root.directory.metadata.sameObject(expected_root)) return error.BindingChanged;
+    var current = try registry.read(allocator, io, root.directory);
+    defer current.deinit();
+    const repository_binding = switch (current) {
+        .registry => |*parsed| parsed.lookup(instance_id) orelse return error.BindingChanged,
+        .missing, .invalid, .unavailable => return error.BindingChanged,
+    };
+    if (repository_locator.admitPathLease(
+        allocator,
+        io,
+        repository.located,
+        repository_binding.last_seen_path.bytes,
+        repository_binding.repository_instance_id,
+        false,
+    ) != .accepted) return error.BindingChanged;
+    if (!repository_binding.review_repository_id.eql(binding.review_repository_id))
+        return error.BindingChanged;
+    const namespace_now = root.directory.admitChild(repository_binding.directory_name, .directory) catch
+        return error.BindingChanged;
+    if (!namespace_now.sameObject(namespace.metadata)) return error.BindingChanged;
+    try validateRunLocation(allocator, io, namespace, expected_location);
+    const run_now = namespace.admitChild(
+        expected_location.location.record.directory_name.slice(),
+        .directory,
+    ) catch return error.BindingChanged;
+    if (!run_now.sameObject(selected_run.metadata)) return error.BindingChanged;
 }
 
 fn validateRunLocation(
@@ -573,6 +704,7 @@ fn mapBindingOpenError(err: anyerror) Failure {
 
 fn mapMutationError(err: anyerror) Failure {
     if (err == error.Conflict) return .conflict;
+    if (err == error.BindingChanged) return .binding_changed;
     if (err == error.UnsupportedPlatform or
         err == error.UnsupportedFilesystem or
         err == error.OperationUnsupported) return .unsupported;
@@ -609,6 +741,7 @@ test "review state persistence draft CAS and trusted-clock result round trip" {
         allocator,
         io,
         fixture.store_root,
+        null,
         fixture.resultRequest(0, .approved),
         fake_clock,
         .{},
@@ -635,6 +768,7 @@ test "review state persistence draft CAS and trusted-clock result round trip" {
         allocator,
         io,
         fixture.store_root,
+        null,
         fixture.resultRequest(1, .approved),
         fake_clock,
         .{},
@@ -646,6 +780,7 @@ test "review state persistence draft CAS and trusted-clock result round trip" {
         allocator,
         io,
         fixture.store_root,
+        null,
         fixture.resultRequest(2, .approved),
         .{ .sample_fn = &missingClock },
         .{},
@@ -657,6 +792,7 @@ test "review state persistence draft CAS and trusted-clock result round trip" {
         allocator,
         io,
         fixture.store_root,
+        null,
         fixture.resultRequest(2, .approved),
         fake_clock,
         .{},
@@ -702,6 +838,7 @@ test "review state persistence fault boundaries leave old or new byte-complete a
             allocator,
             io,
             fixture.store_root,
+            null,
             fixture.draftRequest(0, "faulted"),
             injected.observer(),
         );
@@ -735,6 +872,7 @@ test "review state persistence fault boundaries leave old or new byte-complete a
             allocator,
             io,
             fixture.store_root,
+            null,
             fixture.resultRequest(1, .approved),
             .{ .context = &clock_value, .sample_fn = &fixedClock },
             injected.observer(),
@@ -803,6 +941,7 @@ test "review state persistence result no-replace reconciles winner and preserves
         allocator,
         io,
         fixture.store_root,
+        null,
         fixture.resultRequest(1, .needs_changes),
         .{ .context = &clock_value, .sample_fn = &fixedClock },
         .{ .context = &race, .observe_fn = &ResultRace.observe },
@@ -836,6 +975,7 @@ test "review state persistence result no-replace reconciles winner and preserves
         allocator,
         io,
         invalid_fixture.store_root,
+        null,
         invalid_fixture.resultRequest(1, .approved),
         .{ .context = &invalid_clock, .sample_fn = &fixedClock },
         .{ .context = &invalid_race, .observe_fn = &ResultRace.observe },
@@ -992,11 +1132,10 @@ const TestFixture = struct {
         errdefer allocator.free(path);
         const diagnostic = try registry.diagnosticPath("/test/repository");
         const registry_bytes = try registry.writeCanonicalAlloc(allocator, &.{.{
+            .repository_instance_id = try committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010"),
             .review_repository_id = repository_id,
             .repository_display_name = "repository",
             .directory_name = "repository-123e4567",
-            .locator = .{ .device = 7, .inode = 11 },
-            .canonical_path = diagnostic,
             .last_seen_path = diagnostic,
         }});
         defer allocator.free(registry_bytes);
@@ -1059,7 +1198,7 @@ const TestFixture = struct {
         kind: store_path.NamespaceTempKind,
         exception: []const u8,
     ) !void {
-        var iterable = try self.store.openDir(io, "repository-123e4567", .{ .iterate = true });
+        var iterable = try self.namespace.openDir(io, ".", .{ .iterate = true });
         defer iterable.close(io);
         var iterator = iterable.iterate();
         while (try iterator.next(io)) |entry| {
@@ -1067,6 +1206,286 @@ const TestFixture = struct {
             if (temp.kind == kind and temp.review_id.eql(self.binding.review_id) and
                 !std.mem.eql(u8, entry.name, exception)) return error.UnexpectedOwnedTemp;
         }
+    }
+
+    fn bindRepository(
+        self: *const TestFixture,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        instance_id: committed_review.RepositoryInstanceId,
+        common_path: []const u8,
+    ) !void {
+        const diagnostic = try registry.diagnosticPath(common_path);
+        const bytes = try registry.writeCanonicalAlloc(allocator, &.{.{
+            .repository_instance_id = instance_id,
+            .review_repository_id = self.binding.review_repository_id,
+            .repository_display_name = "repository",
+            .directory_name = "repository-123e4567",
+            .last_seen_path = diagnostic,
+        }});
+        defer allocator.free(bytes);
+        try writePrivate(io, self.store, "registry.json", bytes);
+    }
+};
+
+const MarkerReplacementObserver = struct {
+    io: std.Io,
+    repository: std.Io.Dir,
+    fired: bool = false,
+
+    fn observe(context: ?*anyopaque, step: durable.Step) !void {
+        const self: *MarkerReplacementObserver = @ptrCast(@alignCast(context.?));
+        if (self.fired or step.operation != .sync_directory or step.edge != .after) return;
+        self.fired = true;
+        try self.repository.deleteFile(self.io, ".git/gitframe/repository-id-v1");
+        try self.repository.writeFile(self.io, .{
+            .sub_path = ".git/gitframe/repository-id-v1",
+            .data = "923e4567-e89b-42d3-a456-426614174010\n",
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+    }
+};
+
+const StoreRootReplacementObserver = struct {
+    io: std.Io,
+    parent: std.Io.Dir,
+    fixture: *TestFixture,
+    store_name: []const u8,
+    parked_name: []const u8,
+    fired: bool = false,
+
+    fn observe(context: ?*anyopaque, step: durable.Step) !void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.fired or step.operation != .sync_directory or step.edge != .after) return;
+        self.fired = true;
+        try self.parent.rename(self.store_name, self.parent, self.parked_name, self.io);
+        try self.parent.createDir(self.io, self.store_name, .fromMode(0o700));
+        var replacement = try self.parent.openDir(self.io, self.store_name, .{});
+        errdefer replacement.close(self.io);
+        try replacement.createDir(self.io, ".locks", .fromMode(0o700));
+        var locks = try replacement.openDir(self.io, ".locks", .{});
+        defer locks.close(self.io);
+        const lock_directory = self.fixture.binding.review_repository_id.canonical();
+        try locks.createDir(self.io, &lock_directory, .fromMode(0o700));
+        try self.fixture.store.rename("registry.json", replacement, "registry.json", self.io);
+        try self.fixture.store.rename("repository-123e4567", replacement, "repository-123e4567", self.io);
+        self.fixture.store.close(self.io);
+        self.fixture.store = replacement;
+    }
+
+    fn observer(self: *@This()) durable.Observer {
+        return .{ .context = self, .observe_fn = observe };
+    }
+};
+
+test "review state mutation rejects authority replacement before canonical rename" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try TestFixture.init(allocator, io, tmp.dir, "store");
+    defer fixture.deinit(allocator);
+
+    try tmp.dir.createDir(io, "repository", .fromMode(0o700));
+    var repository = try tmp.dir.openDir(io, "repository", .{});
+    defer repository.close(io);
+    const initialized = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "init", "--initial-branch=main" },
+        .cwd = .{ .dir = repository },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(initialized.stdout);
+    defer allocator.free(initialized.stderr);
+    switch (initialized.term) {
+        .exited => |code| if (code != 0) return error.GitCommandFailed,
+        else => return error.GitCommandFailed,
+    }
+    const repository_path = try tmp.dir.realPathFileAlloc(io, "repository", allocator);
+    defer allocator.free(repository_path);
+    var root = try @import("../repo/root_capability.zig").RootCapability.openCanonical(repository_path);
+    defer root.deinit();
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    var located_result = try repository_locator.locate(allocator, io, .{
+        .cwd = root.dir(),
+        .environment = &environment,
+    });
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
+        .failure => return error.ExpectedRepositoryLocator,
+    };
+    const instance_id = try located.ensureIdentity(allocator, io, .{});
+    try fixture.bindRepository(allocator, io, instance_id, located.canonical_path);
+
+    var replacement: MarkerReplacementObserver = .{ .io = io, .repository = repository };
+    var saved = try saveDraftWith(
+        allocator,
+        io,
+        fixture.store_root,
+        .{ .located = located, .context = .{ .cwd = root.dir(), .environment = &environment } },
+        fixture.draftRequest(0, "must not commit"),
+        .{ .context = &replacement, .observe_fn = MarkerReplacementObserver.observe },
+    );
+    defer saved.deinit(allocator);
+    try std.testing.expect(replacement.fired);
+    try std.testing.expectEqual(Failure.binding_changed, saved.failure);
+    try std.testing.expectError(error.FileNotFound, fixture.run.access(io, "review_state.json", .{}));
+    try fixture.expectNoOwnTemp(io, .draft);
+
+    try restoreTestMarker(io, repository, instance_id);
+    var draft = try saveDraftWith(
+        allocator,
+        io,
+        fixture.store_root,
+        .{ .located = located, .context = .{ .cwd = root.dir(), .environment = &environment } },
+        fixture.draftRequest(0, "draft before result boundary"),
+        .{},
+    );
+    defer draft.deinit(allocator);
+    try std.testing.expect(draft == .committed);
+    var result_replacement: MarkerReplacementObserver = .{ .io = io, .repository = repository };
+    var completed = try createResultWith(
+        allocator,
+        io,
+        fixture.store_root,
+        .{ .located = located, .context = .{ .cwd = root.dir(), .environment = &environment } },
+        fixture.resultRequest(1, .approved),
+        .{},
+        .{ .context = &result_replacement, .observe_fn = MarkerReplacementObserver.observe },
+    );
+    defer completed.deinit(allocator);
+    try std.testing.expect(result_replacement.fired);
+    try std.testing.expectEqual(Failure.binding_changed, completed.failure);
+    try std.testing.expectError(error.FileNotFound, fixture.run.access(io, "result.json", .{}));
+    try fixture.expectNoOwnTemp(io, .result);
+
+    try restoreTestMarker(io, repository, instance_id);
+    const copied = try std.process.run(allocator, io, .{
+        .argv = &.{ "cp", "-a", "repository", "lease-copy" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(copied.stdout);
+    defer allocator.free(copied.stderr);
+    if (copied.term != .exited or copied.term.exited != 0) return error.CopyFailed;
+    const copy_path = try tmp.dir.realPathFileAlloc(io, "lease-copy/.git", allocator);
+    defer allocator.free(copy_path);
+    const lease_path = try registry.diagnosticPath(copy_path);
+    const lease_registry = try registry.writeCanonicalAlloc(allocator, &.{.{
+        .repository_instance_id = instance_id,
+        .review_repository_id = fixture.binding.review_repository_id,
+        .repository_display_name = "repository",
+        .directory_name = "repository-123e4567",
+        .last_seen_path = lease_path,
+    }});
+    defer allocator.free(lease_registry);
+    const old_draft = try fixture.run.readFileAlloc(io, "review_state.json", allocator, .limited(1024 * 1024));
+    defer allocator.free(old_draft);
+    var lease_drift: RegistryLeaseReplacementObserver = .{
+        .io = io,
+        .store = fixture.store,
+        .registry_bytes = lease_registry,
+    };
+    var lease_rejected = try saveDraftWith(
+        allocator,
+        io,
+        fixture.store_root,
+        .{ .located = located, .context = .{ .cwd = root.dir(), .environment = &environment } },
+        fixture.draftRequest(1, "must not replace"),
+        lease_drift.observer(),
+    );
+    defer lease_rejected.deinit(allocator);
+    try std.testing.expect(lease_drift.fired);
+    try std.testing.expectEqual(Failure.binding_changed, lease_rejected.failure);
+    const current_draft = try fixture.run.readFileAlloc(io, "review_state.json", allocator, .limited(1024 * 1024));
+    defer allocator.free(current_draft);
+    try std.testing.expectEqualSlices(u8, old_draft, current_draft);
+    try fixture.expectNoOwnTemp(io, .draft);
+    try fixture.bindRepository(allocator, io, instance_id, located.canonical_path);
+
+    var draft_root_replacement: StoreRootReplacementObserver = .{
+        .io = io,
+        .parent = tmp.dir,
+        .fixture = &fixture,
+        .store_name = "store",
+        .parked_name = "store-before-draft-root-replacement",
+    };
+    var root_rejected_draft = try saveDraftWith(
+        allocator,
+        io,
+        fixture.store_root,
+        .{ .located = located, .context = .{ .cwd = root.dir(), .environment = &environment } },
+        fixture.draftRequest(1, "must not cross Store roots"),
+        draft_root_replacement.observer(),
+    );
+    defer root_rejected_draft.deinit(allocator);
+    try std.testing.expect(draft_root_replacement.fired);
+    try std.testing.expectEqual(Failure.binding_changed, root_rejected_draft.failure);
+    const draft_after_root_replacement = try fixture.run.readFileAlloc(io, "review_state.json", allocator, .limited(1024 * 1024));
+    defer allocator.free(draft_after_root_replacement);
+    try std.testing.expectEqualSlices(u8, old_draft, draft_after_root_replacement);
+    try fixture.expectNoOwnTemp(io, .draft);
+
+    var result_root_replacement: StoreRootReplacementObserver = .{
+        .io = io,
+        .parent = tmp.dir,
+        .fixture = &fixture,
+        .store_name = "store",
+        .parked_name = "store-before-result-root-replacement",
+    };
+    var clock_value = try committed_review.strict_json.timestampToUnixSeconds("2026-08-22T00:00:00Z");
+    var root_rejected_result = try createResultWith(
+        allocator,
+        io,
+        fixture.store_root,
+        .{ .located = located, .context = .{ .cwd = root.dir(), .environment = &environment } },
+        fixture.resultRequest(1, .needs_changes),
+        .{ .context = &clock_value, .sample_fn = &fixedClock },
+        result_root_replacement.observer(),
+    );
+    defer root_rejected_result.deinit(allocator);
+    try std.testing.expect(result_root_replacement.fired);
+    try std.testing.expectEqual(Failure.binding_changed, root_rejected_result.failure);
+    try std.testing.expectError(error.FileNotFound, fixture.run.access(io, "result.json", .{}));
+    try fixture.expectNoOwnTemp(io, .result);
+}
+
+fn restoreTestMarker(io: std.Io, repository: std.Io.Dir, instance_id: committed_review.RepositoryInstanceId) !void {
+    try repository.deleteFile(io, ".git/gitframe/repository-id-v1");
+    const canonical = instance_id.canonical();
+    var bytes: [37]u8 = undefined;
+    @memcpy(bytes[0..36], &canonical);
+    bytes[36] = '\n';
+    try repository.writeFile(io, .{
+        .sub_path = ".git/gitframe/repository-id-v1",
+        .data = &bytes,
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
+}
+
+const RegistryLeaseReplacementObserver = struct {
+    io: std.Io,
+    store: std.Io.Dir,
+    registry_bytes: []const u8,
+    fired: bool = false,
+
+    fn observe(context: ?*anyopaque, step: durable.Step) !void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.fired or step.operation != .sync_directory or step.edge != .after) return;
+        self.fired = true;
+        try self.store.writeFile(self.io, .{
+            .sub_path = "registry.json",
+            .data = self.registry_bytes,
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+    }
+
+    fn observer(self: *@This()) durable.Observer {
+        return .{ .context = self, .observe_fn = observe };
     }
 };
 

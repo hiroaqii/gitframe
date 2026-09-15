@@ -64,6 +64,29 @@ pub const File = struct {
     pub fn unlock(self: File, io: std.Io) void {
         self.ioFile().unlock(io);
     }
+    pub fn readRegularAlloc(
+        self: File,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        admission: Admission,
+        maximum: usize,
+    ) ![]u8 {
+        const before = self.metadata;
+        if (before.size == 0 or before.size > maximum) return error.FileSizeOutOfBounds;
+        var buffer: [4096]u8 = undefined;
+        var reader = self.ioFile().reader(io, &buffer);
+        const read_limit: std.Io.Limit = if (before.size == std.math.maxInt(u64))
+            .unlimited
+        else
+            .limited64(before.size + 1);
+        const bytes = try reader.interface.allocRemaining(allocator, read_limit);
+        errdefer allocator.free(bytes);
+        if (bytes.len != before.size) return error.FileChangedWhileReading;
+        const after = try metadataForHandle(self.descriptor);
+        try admitMetadata(after, admission);
+        if (!before.sameObject(after) or before.size != after.size) return error.FileChangedWhileReading;
+        return bytes;
+    }
     fn ioFile(self: File) std.Io.File {
         return .{ .handle = self.descriptor.handle, .flags = .{ .nonblocking = true } };
     }
@@ -113,21 +136,7 @@ pub const Directory = struct {
     ) ![]u8 {
         var file = try self.openRegularFileExisting(name, admission);
         defer file.deinit();
-        const before = file.metadata;
-        if (before.size == 0 or before.size > maximum) return error.FileSizeOutOfBounds;
-        var buffer: [4096]u8 = undefined;
-        var reader = file.ioFile().reader(io, &buffer);
-        const read_limit: std.Io.Limit = if (before.size == std.math.maxInt(u64))
-            .unlimited
-        else
-            .limited64(before.size + 1);
-        const bytes = try reader.interface.allocRemaining(allocator, read_limit);
-        errdefer allocator.free(bytes);
-        if (bytes.len != before.size) return error.FileChangedWhileReading;
-        const after = try metadataForHandle(file.descriptor);
-        try admitMetadata(after, admission);
-        if (!before.sameObject(after) or before.size != after.size) return error.FileChangedWhileReading;
-        return bytes;
+        return file.readRegularAlloc(allocator, io, admission, maximum);
     }
     pub fn iterate(_: Directory) Iterator {
         return .{};

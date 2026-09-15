@@ -1,7 +1,7 @@
 //! Nominal run/repository identities and exact-byte SHA-256 digests.
 //!
-//! Review and repository IDs intentionally remain distinct Zig types even
-//! though both use canonical UUIDv4 bytes.
+//! Review, repository-instance, and Store repository IDs intentionally remain
+//! distinct Zig types even though all use canonical UUIDv4 bytes.
 
 const std = @import("std");
 
@@ -35,6 +35,31 @@ pub const ReviewId = struct {
 
     /// Compare the complete 128-bit nominal identity.
     pub fn eql(self: ReviewId, other: ReviewId) bool {
+        return std.mem.eql(u8, &self.bytes, &other.bytes);
+    }
+};
+
+/// Durable identity carried by one Git common directory.
+pub const RepositoryInstanceId = struct {
+    bytes: [16]u8,
+
+    pub fn parse(text: []const u8) IdentityError!RepositoryInstanceId {
+        return .{ .bytes = try parseUuidV4(text) };
+    }
+
+    pub fn generate(random: std.Random) RepositoryInstanceId {
+        var value: RepositoryInstanceId = undefined;
+        random.bytes(&value.bytes);
+        value.bytes[6] = (value.bytes[6] & 0x0f) | 0x40;
+        value.bytes[8] = (value.bytes[8] & 0x3f) | 0x80;
+        return value;
+    }
+
+    pub fn canonical(self: RepositoryInstanceId) [36]u8 {
+        return formatUuid(self.bytes);
+    }
+
+    pub fn eql(self: RepositoryInstanceId, other: RepositoryInstanceId) bool {
         return std.mem.eql(u8, &self.bytes, &other.bytes);
     }
 };
@@ -158,10 +183,13 @@ fn hexLower(value: u8) u8 {
 test "review and repository IDs enforce distinct canonical UUIDv4 domains" {
     const text = "123e4567-e89b-42d3-a456-426614174000";
     const review = try ReviewId.parse(text);
+    const instance = try RepositoryInstanceId.parse(text);
     const repository = try ReviewRepositoryId.parse(text);
     const review_text = review.canonical();
+    const instance_text = instance.canonical();
     const repository_text = repository.canonical();
     try std.testing.expectEqualStrings(text, &review_text);
+    try std.testing.expectEqualStrings(text, &instance_text);
     try std.testing.expectEqualStrings(text, &repository_text);
     try std.testing.expectError(error.InvalidUuid, ReviewId.parse("123E4567-e89b-42d3-a456-426614174000"));
     try std.testing.expectError(error.InvalidUuid, ReviewId.parse("123e4567-e89b-12d3-a456-426614174000"));
@@ -171,9 +199,12 @@ test "review and repository IDs enforce distinct canonical UUIDv4 domains" {
 test "UUID generators set version and variant without coalescing domains" {
     var prng = std.Random.DefaultPrng.init(7);
     const review = ReviewId.generate(prng.random());
+    const instance = RepositoryInstanceId.generate(prng.random());
     const repository = ReviewRepositoryId.generate(prng.random());
     try std.testing.expect((review.bytes[6] >> 4) == 4);
     try std.testing.expect((review.bytes[8] & 0xc0) == 0x80);
+    try std.testing.expect((instance.bytes[6] >> 4) == 4);
+    try std.testing.expect((instance.bytes[8] & 0xc0) == 0x80);
     try std.testing.expect((repository.bytes[6] >> 4) == 4);
     try std.testing.expect((repository.bytes[8] & 0xc0) == 0x80);
 }

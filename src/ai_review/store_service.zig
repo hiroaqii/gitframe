@@ -40,6 +40,15 @@ pub const max_enumerated_name_bytes = catalog_store.max_enumerated_name_bytes;
 pub const max_diagnostics = catalog_store.max_diagnostics;
 pub const max_diagnostic_bytes = catalog_store.max_diagnostic_bytes;
 
+const BoundaryHook = struct {
+    context: *anyopaque,
+    before_final_check: *const fn (*anyopaque) void,
+
+    fn fire(self: BoundaryHook) void {
+        self.before_final_check(self.context);
+    }
+};
+
 /// Owned configuration-only Store address. Construction performs no Store IO,
 /// and no path, descriptor, registry, or root accessor is public.
 pub const ConfiguredStore = struct {
@@ -219,6 +228,12 @@ pub const ScanFailure = enum {
     enumeration_failed,
     scan_limit_exceeded,
     git_failed,
+    identity_missing,
+    identity_invalid,
+    identity_unavailable,
+    identity_conflict,
+    identity_duplicate,
+    binding_move_required,
 };
 
 pub const ScanResult = union(enum) {
@@ -244,16 +259,38 @@ pub fn scan(
     store: *const ConfiguredStore,
     repository: RepositoryContext,
 ) std.mem.Allocator.Error!ScanResult {
-    const located = try repository_locator.locate(allocator, io, repository.git());
-    const locator = switch (located) {
-        .locator => |value| value,
+    return scanWithHook(allocator, io, store, repository, null);
+}
+
+fn scanWithHook(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    hook: ?BoundaryHook,
+) std.mem.Allocator.Error!ScanResult {
+    var located_result = try repository_locator.locate(allocator, io, repository.git());
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
         .failure => return .{ .failure = .repository_invalid },
     };
-    var scanned = try catalog_store.scan(allocator, io, store.context(), locator);
+    const instance_id = located.instanceId() orelse
+        return .{ .failure = markerScanFailure(located.marker) };
+    switch (try core.probeBinding(allocator, io, store.context(), located)) {
+        .bound => {},
+        .unbound => return .unbound,
+        .failure => |failure| return .{ .failure = mapProbeScanFailure(failure) },
+    }
+    var scanned = try catalog_store.scan(allocator, io, store.context(), instance_id);
     defer scanned.deinit(allocator);
     const catalog_value = switch (scanned) {
         .unbound => return .unbound,
-        .bound_empty => |value| return .{ .bound_empty = .{ .snapshot = value.snapshot } },
+        .bound_empty => |value| {
+            if (try finalScanFailure(allocator, io, store, repository, located, &scanned, hook)) |failure|
+                return .{ .failure = failure };
+            return .{ .bound_empty = .{ .snapshot = value.snapshot } };
+        },
         .failure => |failure| return .{ .failure = mapCatalogScanFailure(failure) },
         .catalog => |*value| value,
     };
@@ -287,6 +324,8 @@ pub fn scan(
     for (catalog_value.diagnostics) |diagnostic| {
         try appendDiagnostic(allocator, &diagnostics, diagnostic.kind, diagnostic.text);
     }
+    if (try finalScanFailure(allocator, io, store, repository, located, &scanned, hook)) |failure|
+        return .{ .failure = failure };
     const owned_rows = try rows.toOwnedSlice(allocator);
     errdefer {
         for (owned_rows) |*row| row.deinit(allocator);
@@ -304,6 +343,66 @@ pub fn scan(
         .skipped_count = catalog_value.skipped_count,
         .orphan_count = catalog_value.orphan_count,
     } };
+}
+
+fn finalScanFailure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    located: *const repository_locator.LocatedRepository,
+    expected: *const catalog_store.ScanResult,
+    hook: ?BoundaryHook,
+) std.mem.Allocator.Error!?ScanFailure {
+    if (hook) |value| value.fire();
+    located.revalidate(allocator, io, repository.git()) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return markerErrorScanFailure(err);
+    };
+    switch (try core.probeBinding(allocator, io, store.context(), located)) {
+        .bound => {},
+        .unbound => return .identity_conflict,
+        .failure => |failure| return mapProbeScanFailure(failure),
+    }
+    const instance_id = located.instanceId() orelse return .identity_missing;
+    var current = try catalog_store.scan(allocator, io, store.context(), instance_id);
+    defer current.deinit(allocator);
+    return switch (current) {
+        .failure => |failure| mapCatalogScanFailure(failure),
+        .unbound => .identity_conflict,
+        .bound_empty, .catalog => if (catalogScansEqual(expected, &current)) null else .identity_conflict,
+    };
+}
+
+fn catalogScansEqual(expected: *const catalog_store.ScanResult, actual: *const catalog_store.ScanResult) bool {
+    return switch (expected.*) {
+        .bound_empty => |left| switch (actual.*) {
+            .bound_empty => |right| left.snapshot.eql(right.snapshot),
+            else => false,
+        },
+        .catalog => |left| switch (actual.*) {
+            .catalog => |right| catalogValuesEqual(&left, &right),
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn catalogValuesEqual(left: *const catalog_store.Catalog, right: *const catalog_store.Catalog) bool {
+    if (!left.snapshot.eql(right.snapshot) or
+        left.rows.len != right.rows.len or
+        left.diagnostics.len != right.diagnostics.len or
+        left.skipped_count != right.skipped_count or
+        left.orphan_count != right.orphan_count) return false;
+    for (left.rows, right.rows) |left_row, right_row| {
+        if (!left_row.review_id.eql(right_row.review_id) or
+            !left_row.artifact_snapshot.eql(right_row.artifact_snapshot)) return false;
+    }
+    for (left.diagnostics, right.diagnostics) |left_diagnostic, right_diagnostic| {
+        if (left_diagnostic.kind != right_diagnostic.kind or
+            !std.mem.eql(u8, left_diagnostic.text, right_diagnostic.text)) return false;
+    }
+    return true;
 }
 
 pub const SelectionFailure = enum {
@@ -364,6 +463,7 @@ pub fn selectExact(
         review_id,
         expected_artifacts,
         .strict,
+        null,
     );
 }
 
@@ -387,6 +487,7 @@ pub fn selectExactReload(
         review_id,
         expected_artifacts,
         .immutable,
+        null,
     );
 }
 
@@ -401,6 +502,7 @@ fn selectExactWithArtifactPolicy(
     review_id: committed_review.ReviewId,
     expected_artifacts: ArtifactSnapshot,
     artifact_policy: SelectionArtifactPolicy,
+    hook: ?BoundaryHook,
 ) std.mem.Allocator.Error!SelectionResult {
     var owned_repository = repository.capability.duplicate() catch
         return .{ .failure = .repository_unavailable };
@@ -418,18 +520,20 @@ fn selectExactWithArtifactPolicy(
         .environment = &owned_environment,
     };
 
-    const located = try repository_locator.locate(allocator, io, owned_context.git());
-    const locator = switch (located) {
-        .locator => |value| value,
+    var located_result = try repository_locator.locate(allocator, io, owned_context.git());
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
         .failure => return .{ .failure = .repository_unavailable },
     };
-    if (!locator.eql(expected.repository_locator)) return .{ .failure = .binding_drift };
+    const instance_id = located.instanceId() orelse return .{ .failure = .binding_drift };
+    if (!instance_id.eql(expected.repository_instance_id)) return .{ .failure = .binding_drift };
 
     var exact_result = try catalog_store.readExact(
         allocator,
         io,
         configured_store.context(),
-        locator,
+        instance_id,
         review_id,
         expected,
         if (artifact_policy == .strict) expected_artifacts else null,
@@ -495,6 +599,26 @@ fn selectExactWithArtifactPolicy(
     };
     errdefer finding_index.deinit(allocator);
 
+    if (hook) |value| value.fire();
+    located.revalidate(allocator, io, owned_context.git()) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        finding_index.deinit(allocator);
+        return .{ .failure = .binding_drift };
+    };
+    if (try exactStoreFailure(
+        allocator,
+        io,
+        configured_store.context(),
+        located,
+        instance_id,
+        review_id,
+        &exact.snapshot,
+        exact.artifact_snapshot,
+    )) |failure| {
+        finding_index.deinit(allocator);
+        return .{ .failure = mapExactSelectionFailure(failure) };
+    }
+
     const artifacts = exact.artifacts;
     const projection = source.projection;
     source.endpoints.deinit(allocator);
@@ -519,6 +643,37 @@ fn immutableArtifactIdentityEql(actual: ArtifactSnapshot, expected: ArtifactSnap
                 false
         else
             expected.run_location == null;
+}
+
+fn exactStoreFailure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *const core.Context,
+    located: *const repository_locator.LocatedRepository,
+    instance_id: committed_review.RepositoryInstanceId,
+    review_id: committed_review.ReviewId,
+    expected_store: *const StoreSnapshot,
+    expected_artifacts: ArtifactSnapshot,
+) std.mem.Allocator.Error!?catalog_store.ReadFailure {
+    var current = try catalog_store.readExact(
+        allocator,
+        io,
+        context,
+        instance_id,
+        review_id,
+        expected_store.*,
+        expected_artifacts,
+    );
+    defer current.deinit(allocator);
+    switch (current) {
+        .exact => {},
+        .absent => return .concurrent_conflict,
+        .failure => |failure| return failure,
+    }
+    switch (try core.probeBinding(allocator, io, context, located)) {
+        .bound => return null,
+        .unbound, .failure => return .binding_changed,
+    }
 }
 
 pub const ExpectedPublicationIdentity = struct {
@@ -583,6 +738,12 @@ pub const ReadFailure = enum {
     binding_changed,
     artifact_changed,
     concurrent_conflict,
+    identity_missing,
+    identity_invalid,
+    identity_unavailable,
+    identity_conflict,
+    identity_duplicate,
+    binding_move_required,
 };
 
 pub const ReadResult = union(enum) {
@@ -669,7 +830,7 @@ fn admitExactRun(
     return admitExactRunLocated(allocator, io, configured_store, .{
         .capability = &repository.root,
         .environment = &repository.environment,
-    }, repository.locator, review_id, expected);
+    }, &repository.located, review_id, expected);
 }
 
 fn admitExactRunLocated(
@@ -677,15 +838,44 @@ fn admitExactRunLocated(
     io: std.Io,
     configured_store: *const ConfiguredStore,
     repository: RepositoryContext,
-    locator: committed_review.GitCommonDirectoryLocator,
+    located: *repository_locator.LocatedRepository,
     review_id: committed_review.ReviewId,
     expected: ?ExpectedPublicationIdentity,
 ) std.mem.Allocator.Error!AdmittedExactRun {
+    return admitExactRunLocatedWithHook(
+        allocator,
+        io,
+        configured_store,
+        repository,
+        located,
+        review_id,
+        expected,
+        null,
+    );
+}
+
+fn admitExactRunLocatedWithHook(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    located: *repository_locator.LocatedRepository,
+    review_id: committed_review.ReviewId,
+    expected: ?ExpectedPublicationIdentity,
+    hook: ?BoundaryHook,
+) std.mem.Allocator.Error!AdmittedExactRun {
+    const instance_id = located.instanceId() orelse
+        return .{ .failure = markerReadFailure(located.marker) };
+    switch (try core.probeBinding(allocator, io, configured_store.context(), located)) {
+        .bound => {},
+        .unbound => return .{ .failure = .review_not_found },
+        .failure => |failure| return .{ .failure = probeReadFailure(failure) },
+    }
     var exact_result = try catalog_store.readExact(
         allocator,
         io,
         configured_store.context(),
-        locator,
+        instance_id,
         review_id,
         null,
         null,
@@ -719,6 +909,21 @@ fn admitExactRunLocated(
             return .{ .failure = .expected_mismatch };
         }
     }
+    if (hook) |value| value.fire();
+    located.revalidate(allocator, io, repository.git()) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = markerErrorReadFailure(err) };
+    };
+    if (try exactStoreFailure(
+        allocator,
+        io,
+        configured_store.context(),
+        located,
+        instance_id,
+        review_id,
+        &exact.snapshot,
+        exact.artifact_snapshot,
+    )) |failure| return .{ .failure = mapExactIdentityFailure(failure) };
     const owned = exact.*;
     exact_result = .absent;
     return .{ .exact = owned };
@@ -733,9 +938,10 @@ pub fn readExactIdentityWithRepository(
     review_id: committed_review.ReviewId,
     expected: ?ExpectedPublicationIdentity,
 ) std.mem.Allocator.Error!ReadResult {
-    const located = try locateForPublication(allocator, io, repository);
-    const locator = switch (located) {
-        .locator => |value| value,
+    var located_result = try locateForPublication(allocator, io, repository);
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
         .failure => |failure| return .{ .failure = mapPublicationToReadFailure(failure) },
     };
     var admitted = try admitExactRunLocated(
@@ -743,7 +949,7 @@ pub fn readExactIdentityWithRepository(
         io,
         configured_store,
         repository,
-        locator,
+        located,
         review_id,
         expected,
     );
@@ -885,6 +1091,12 @@ pub const PublicationFailure = enum {
     io_failed,
     binding_mismatch,
     concurrent_conflict,
+    identity_missing,
+    identity_invalid,
+    identity_unavailable,
+    identity_conflict,
+    identity_duplicate,
+    binding_move_required,
 };
 pub const PrepareSuccess = struct {
     review_repository_id: committed_review.ReviewRepositoryId,
@@ -977,20 +1189,49 @@ pub fn scanMaintenanceFromPath(
         .store => |*value| value,
         .failure => |failure| return .{ .failure = maintenanceConfigFailure(failure) },
     };
-    return scanMaintenanceLocated(allocator, io, configured, repository.locator);
+    return scanMaintenanceLocated(
+        allocator,
+        io,
+        configured,
+        .{ .capability = &repository.root, .environment = &repository.environment },
+        &repository.located,
+    );
 }
 
 fn scanMaintenanceLocated(
     allocator: std.mem.Allocator,
     io: std.Io,
     configured: *const ConfiguredStore,
-    locator: committed_review.GitCommonDirectoryLocator,
+    repository: RepositoryContext,
+    located: *repository_locator.LocatedRepository,
 ) std.mem.Allocator.Error!MaintenanceScanResult {
-    var scanned = try catalog_store.scan(allocator, io, configured.context(), locator);
+    return scanMaintenanceLocatedWithHook(allocator, io, configured, repository, located, null);
+}
+
+fn scanMaintenanceLocatedWithHook(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured: *const ConfiguredStore,
+    repository: RepositoryContext,
+    located: *repository_locator.LocatedRepository,
+    hook: ?BoundaryHook,
+) std.mem.Allocator.Error!MaintenanceScanResult {
+    const instance_id = located.instanceId() orelse
+        return .{ .failure = .binding_changed };
+    switch (try core.probeBinding(allocator, io, configured.context(), located)) {
+        .bound => {},
+        .unbound => return .unbound,
+        .failure => return .{ .failure = .binding_changed },
+    }
+    var scanned = try catalog_store.scan(allocator, io, configured.context(), instance_id);
     defer scanned.deinit(allocator);
     const source = switch (scanned) {
         .unbound => return .unbound,
-        .bound_empty => |value| return .{ .bound_empty = value.snapshot },
+        .bound_empty => |value| {
+            if (try maintenanceFinalScanFailure(allocator, io, configured, repository, located, &scanned, hook)) |failure|
+                return .{ .failure = failure };
+            return .{ .bound_empty = value.snapshot };
+        },
         .failure => |failure| return .{ .failure = maintenanceScanFailure(failure) },
         .catalog => |*value| value,
     };
@@ -1009,6 +1250,9 @@ fn scanMaintenanceLocated(
     defer deinitDiagnostics(allocator, &diagnostics);
     for (source.diagnostics) |diagnostic|
         try appendDiagnostic(allocator, &diagnostics, diagnostic.kind, diagnostic.text);
+
+    if (try maintenanceFinalScanFailure(allocator, io, configured, repository, located, &scanned, hook)) |failure|
+        return .{ .failure = failure };
 
     const owned_rows = try rows.toOwnedSlice(allocator);
     errdefer {
@@ -1037,9 +1281,21 @@ pub fn deleteRun(
     repository: RepositoryContext,
     request: DeleteRequest,
 ) std.mem.Allocator.Error!DeleteResult {
-    if (try maintenanceBindingFailure(allocator, io, repository, request.store)) |failure|
+    var located_result = try repository_locator.locate(allocator, io, repository.git());
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
+        .failure => return .{ .failure = .binding_changed },
+    };
+    const instance_id = located.instanceId() orelse return .{ .failure = .binding_changed };
+    if (!instance_id.eql(request.store.repository_instance_id))
+        return .{ .failure = .binding_changed };
+    if (try maintenanceFinalBindingFailure(allocator, io, configured_store, repository, located, request.store)) |failure|
         return .{ .failure = failure };
-    return core.deleteRun(allocator, io, configured_store.context(), request);
+    return core.deleteRun(allocator, io, configured_store.context(), .{
+        .located = located,
+        .context = repository.git(),
+    }, request);
 }
 
 pub fn cleanupTrash(
@@ -1049,9 +1305,21 @@ pub fn cleanupTrash(
     repository: RepositoryContext,
     expected: StoreSnapshot,
 ) std.mem.Allocator.Error!CleanupResult {
-    if (try maintenanceBindingFailure(allocator, io, repository, expected)) |failure|
+    var located_result = try repository_locator.locate(allocator, io, repository.git());
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
+        .failure => return .{ .failure = .binding_changed },
+    };
+    const instance_id = located.instanceId() orelse return .{ .failure = .binding_changed };
+    if (!instance_id.eql(expected.repository_instance_id))
+        return .{ .failure = .binding_changed };
+    if (try maintenanceFinalBindingFailure(allocator, io, configured_store, repository, located, expected)) |failure|
         return .{ .failure = failure };
-    return core.cleanupTrash(allocator, io, configured_store.context(), expected);
+    return core.cleanupTrash(allocator, io, configured_store.context(), .{
+        .located = located,
+        .context = repository.git(),
+    }, expected);
 }
 
 /// Owned display facts and freshness assertions, never a retained Store handle.
@@ -1098,17 +1366,63 @@ pub fn previewDelete(
         .store => |*value| value,
         .failure => |failure| return .{ .failure = maintenanceConfigFailure(failure) },
     };
-    return previewDeleteLocated(allocator, io, configured, repository.locator, review_id);
+    return previewDeleteLocated(
+        allocator,
+        io,
+        configured,
+        .{ .capability = &repository.root, .environment = &repository.environment },
+        &repository.located,
+        review_id,
+    );
 }
 
-fn previewDeleteLocated(allocator: std.mem.Allocator, io: std.Io, configured: *const ConfiguredStore, locator: committed_review.GitCommonDirectoryLocator, review_id: committed_review.ReviewId) std.mem.Allocator.Error!DeletePreviewResult {
-    var read = try catalog_store.readExact(allocator, io, configured.context(), locator, review_id, null, null);
+fn previewDeleteLocated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured: *const ConfiguredStore,
+    repository: RepositoryContext,
+    located: *repository_locator.LocatedRepository,
+    review_id: committed_review.ReviewId,
+) std.mem.Allocator.Error!DeletePreviewResult {
+    return previewDeleteLocatedWithHook(allocator, io, configured, repository, located, review_id, null);
+}
+
+fn previewDeleteLocatedWithHook(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured: *const ConfiguredStore,
+    repository: RepositoryContext,
+    located: *repository_locator.LocatedRepository,
+    review_id: committed_review.ReviewId,
+    hook: ?BoundaryHook,
+) std.mem.Allocator.Error!DeletePreviewResult {
+    const instance_id = located.instanceId() orelse return .{ .failure = .binding_changed };
+    switch (try core.probeBinding(allocator, io, configured.context(), located)) {
+        .bound => {},
+        .unbound, .failure => return .{ .failure = .binding_changed },
+    }
+    var read = try catalog_store.readExact(allocator, io, configured.context(), instance_id, review_id, null, null);
     defer read.deinit(allocator);
     const exact = switch (read) {
         .exact => |*value| value,
         .absent => return .{ .failure = .not_found },
         .failure => |failure| return .{ .failure = maintenanceReadFailure(failure) },
     };
+    if (hook) |value| value.fire();
+    located.revalidate(allocator, io, repository.git()) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = .binding_changed };
+    };
+    if (try exactStoreFailure(
+        allocator,
+        io,
+        configured.context(),
+        located,
+        instance_id,
+        review_id,
+        &exact.snapshot,
+        exact.artifact_snapshot,
+    )) |failure| return .{ .failure = maintenanceReadFailure(failure) };
     const identity = try identityFromExact(allocator, exact, review_id);
     return .{ .preview = .{
         .store = exact.snapshot,
@@ -1149,7 +1463,8 @@ pub fn cleanupFromPath(allocator: std.mem.Allocator, io: std.Io, environment: ?*
         .store => |*value| value,
         .failure => |failure| return .{ .failure = maintenanceConfigFailure(failure) },
     };
-    var scanned = try catalog_store.scan(allocator, io, configured.context(), repository.locator);
+    const instance_id = repository.located.instanceId() orelse return .{ .failure = .binding_changed };
+    var scanned = try catalog_store.scan(allocator, io, configured.context(), instance_id);
     defer scanned.deinit(allocator);
     const snapshot = switch (scanned) {
         .unbound => return .{ .failure = .not_found },
@@ -1227,28 +1542,77 @@ fn maintenancePublicationFailure(failure: PublicationFailure) MaintenanceFailure
         .store_invalid, .invalid_artifact, .target_label_invalid => .run_invalid,
         .duplicate_review_id, .repository_namespace_collision, .run_name_collision, .concurrent_conflict => .conflict,
         .target_unavailable, .local_time_unavailable, .git_failed, .io_failed => .io_failed,
+        .identity_missing,
+        .identity_invalid,
+        .identity_unavailable,
+        .identity_conflict,
+        .identity_duplicate,
+        .binding_move_required,
+        => .binding_changed,
     };
 }
 
-fn maintenanceBindingFailure(
+fn maintenanceFinalBindingFailure(
     allocator: std.mem.Allocator,
     io: std.Io,
+    configured_store: *const ConfiguredStore,
     repository: RepositoryContext,
+    located: *const repository_locator.LocatedRepository,
     expected: StoreSnapshot,
 ) std.mem.Allocator.Error!?MaintenanceFailure {
-    return switch (try repository_locator.locate(allocator, io, repository.git())) {
-        .locator => |locator| if (locator.eql(expected.repository_locator)) null else .binding_changed,
-        .failure => |failure| switch (failure) {
-            .unsupported_platform => .unsupported,
-            .git_command_failed => .io_failed,
-            else => .binding_changed,
-        },
+    located.revalidate(allocator, io, repository.git()) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .binding_changed;
+    };
+    switch (try core.probeBinding(allocator, io, configured_store.context(), located)) {
+        .bound => {},
+        .unbound, .failure => return .binding_changed,
+    }
+    return if (try catalog_store.validateSnapshot(allocator, io, configured_store.context(), expected)) |failure|
+        maintenanceReadFailure(failure)
+    else
+        null;
+}
+
+fn maintenanceFinalScanFailure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
+    located: *const repository_locator.LocatedRepository,
+    expected: *const catalog_store.ScanResult,
+    hook: ?BoundaryHook,
+) std.mem.Allocator.Error!?MaintenanceFailure {
+    if (hook) |value| value.fire();
+    located.revalidate(allocator, io, repository.git()) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .binding_changed;
+    };
+    switch (try core.probeBinding(allocator, io, configured_store.context(), located)) {
+        .bound => {},
+        .unbound, .failure => return .binding_changed,
+    }
+    const instance_id = located.instanceId() orelse return .binding_changed;
+    var current = try catalog_store.scan(allocator, io, configured_store.context(), instance_id);
+    defer current.deinit(allocator);
+    return switch (current) {
+        .failure => |failure| maintenanceScanFailure(failure),
+        .unbound => .binding_changed,
+        .bound_empty, .catalog => if (catalogScansEqual(expected, &current)) null else .binding_changed,
     };
 }
 
 const LocatePublicationResult = union(enum) {
-    locator: committed_review.GitCommonDirectoryLocator,
+    located: repository_locator.LocatedRepository,
     failure: PublicationFailure,
+
+    fn deinit(self: *LocatePublicationResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .located => |*value| value.deinit(allocator),
+            .failure => {},
+        }
+        self.* = .{ .failure = .repository_invalid };
+    }
 };
 
 fn locateForPublication(
@@ -1257,7 +1621,7 @@ fn locateForPublication(
     repository: RepositoryContext,
 ) std.mem.Allocator.Error!LocatePublicationResult {
     return switch (try repository_locator.locate(allocator, io, repository.git())) {
-        .locator => |locator| .{ .locator = locator },
+        .located => |located| .{ .located = located },
         .failure => |failure| .{ .failure = switch (failure) {
             .unsupported_platform => .unsupported_platform,
             .git_command_failed => .git_failed,
@@ -1275,12 +1639,14 @@ pub fn prepareWithRepository(
     repository: RepositoryContext,
     repository_path: []const u8,
 ) std.mem.Allocator.Error!PrepareResult {
-    const located = try locateForPublication(allocator, io, repository);
-    const locator = switch (located) {
-        .locator => |value| value,
+    _ = repository_path;
+    var located_result = try locateForPublication(allocator, io, repository);
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
         .failure => |failure| return .{ .failure = failure },
     };
-    return prepareLocated(allocator, io, configured_store, repository.git(), locator, repository_path);
+    return prepareLocated(allocator, io, configured_store, repository.git(), located);
 }
 
 fn prepareLocated(
@@ -1288,10 +1654,9 @@ fn prepareLocated(
     io: std.Io,
     configured_store: *const ConfiguredStore,
     repository: git_command.DirectoryContext,
-    locator: committed_review.GitCommonDirectoryLocator,
-    repository_path: []const u8,
+    located: *repository_locator.LocatedRepository,
 ) std.mem.Allocator.Error!PrepareResult {
-    const probe = try core.probeBinding(allocator, io, configured_store.context(), locator);
+    const probe = try core.probeBinding(allocator, io, configured_store.context(), located);
     var main_worktree: repository_locator.MainWorktreeResult = .unavailable;
     defer main_worktree.deinit(allocator);
     const repository_name: ?[]const u8 = switch (probe) {
@@ -1303,11 +1668,14 @@ fn prepareLocated(
                 .unavailable => return .{ .failure = .main_worktree_unavailable },
             };
         },
-        .failure => |failure| return .{ .failure = mapPrepareCoreFailure(failure) },
+        .failure => |failure| if (failure == .binding_move_required)
+            null
+        else
+            return .{ .failure = mapPrepareCoreFailure(failure) },
     };
     return switch (try core.prepareBinding(allocator, io, configured_store.context(), .{
-        .locator = locator,
-        .repository_path = repository_path,
+        .repository = located,
+        .repository_context = repository,
         .repository_name = repository_name,
     })) {
         .success => |value| .{ .success = .{
@@ -1337,7 +1705,7 @@ pub fn prepare(
         .store => |*value| value,
         .failure => return .{ .failure = .store_invalid },
     };
-    return prepareLocated(allocator, io, configured_store, repository.git(), repository.locator, repository_path);
+    return prepareLocated(allocator, io, configured_store, repository.git(), &repository.located);
 }
 
 /// Publish through the existing Store core using retained physical authority.
@@ -1348,12 +1716,13 @@ pub fn publishWithRepository(
     repository: RepositoryContext,
     request: PublishRequest,
 ) std.mem.Allocator.Error!PublishResult {
-    const located = try locateForPublication(allocator, io, repository);
-    const locator = switch (located) {
-        .locator => |value| value,
+    var located_result = try locateForPublication(allocator, io, repository);
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
         .failure => |failure| return .{ .failure = failure },
     };
-    return publishLocated(allocator, io, configured_store, repository, locator, request);
+    return publishLocated(allocator, io, configured_store, repository, located, request);
 }
 
 pub fn publish(
@@ -1376,7 +1745,7 @@ pub fn publish(
     return publishLocated(allocator, io, configured_store, .{
         .capability = &repository.root,
         .environment = &repository.environment,
-    }, repository.locator, request);
+    }, &repository.located, request);
 }
 
 fn publishLocated(
@@ -1384,9 +1753,16 @@ fn publishLocated(
     io: std.Io,
     configured_store: *const ConfiguredStore,
     repository: RepositoryContext,
-    locator: committed_review.GitCommonDirectoryLocator,
+    located: *repository_locator.LocatedRepository,
     request: PublishRequest,
 ) std.mem.Allocator.Error!PublishResult {
+    const instance_id = located.instanceId() orelse
+        return .{ .failure = markerPublicationFailure(located.marker) };
+    switch (try core.probeBinding(allocator, io, configured_store.context(), located)) {
+        .bound => {},
+        .unbound => return .{ .failure = .binding_mismatch },
+        .failure => |failure| return .{ .failure = mapPrepareCoreFailure(failure) },
+    }
     var manifest = committed_review.ReviewRunManifest.parseStrict(allocator, request.manifest_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failure = .invalid_artifact },
@@ -1417,7 +1793,10 @@ fn publishLocated(
     }
 
     return switch (try core.publish(allocator, io, configured_store.context(), .{
-        .locator = locator,
+        .located = located,
+        .context = repository.git(),
+    }, .{
+        .repository_instance_id = instance_id,
         .review_repository_id = request.review_repository_id,
         .review_id = request.review_id,
         .manifest_bytes = request.manifest_bytes,
@@ -1432,26 +1811,56 @@ pub fn saveDraft(
     allocator: std.mem.Allocator,
     io: std.Io,
     configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
     request: DraftSaveRequest,
 ) std.mem.Allocator.Error!DraftSaveResult {
-    return core.saveDraft(allocator, io, configured_store.context(), request);
+    var located_result = try repository_locator.locate(allocator, io, repository.git());
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
+        .failure => return .{ .failure = .binding_changed },
+    };
+    switch (try core.probeBinding(allocator, io, configured_store.context(), located)) {
+        .bound => {},
+        .unbound, .failure => return .{ .failure = .binding_changed },
+    }
+    return core.saveDraft(allocator, io, configured_store.context(), .{
+        .located = located,
+        .context = repository.git(),
+    }, request);
 }
 
 pub fn createResult(
     allocator: std.mem.Allocator,
     io: std.Io,
     configured_store: *const ConfiguredStore,
+    repository: RepositoryContext,
     request: ReviewResultCreateRequest,
 ) std.mem.Allocator.Error!ReviewResultCreateResult {
-    return core.createResult(allocator, io, configured_store.context(), request);
+    var located_result = try repository_locator.locate(allocator, io, repository.git());
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
+        .failure => return .{ .failure = .binding_changed },
+    };
+    switch (try core.probeBinding(allocator, io, configured_store.context(), located)) {
+        .bound => {},
+        .unbound, .failure => return .{ .failure = .binding_changed },
+    }
+    return core.createResult(allocator, io, configured_store.context(), .{
+        .located = located,
+        .context = repository.git(),
+    }, request);
 }
 
 const OwnedRepository = struct {
+    allocator: std.mem.Allocator,
     root: root_capability.RootCapability,
     environment: git_command.LocalGitEnvironment,
-    locator: committed_review.GitCommonDirectoryLocator,
+    located: repository_locator.LocatedRepository,
 
     fn deinit(self: *OwnedRepository) void {
+        self.located.deinit(self.allocator);
         self.environment.deinit();
         self.root.deinit();
         self.* = undefined;
@@ -1484,10 +1893,11 @@ fn openRepository(
         .environment = &environment,
     });
     return switch (located) {
-        .locator => |locator| .{ .context = .{
+        .located => |value| .{ .context = .{
+            .allocator = allocator,
             .root = root,
             .environment = environment,
-            .locator = locator,
+            .located = value,
         } },
         .failure => |failure| blk: {
             environment.deinit();
@@ -1561,6 +1971,89 @@ fn mapCatalogScanFailure(failure: catalog_store.ScanFailure) ScanFailure {
         .namespace_invalid => .namespace_invalid,
         .enumeration_failed => .enumeration_failed,
         .scan_limit_exceeded => .scan_limit_exceeded,
+    };
+}
+
+fn markerPublicationFailure(state: repository_locator.MarkerState) PublicationFailure {
+    return switch (state) {
+        .present => .identity_conflict,
+        .missing => .identity_missing,
+        .invalid => .identity_invalid,
+        .unavailable => .identity_unavailable,
+    };
+}
+
+fn markerScanFailure(state: repository_locator.MarkerState) ScanFailure {
+    return switch (state) {
+        .present => .identity_conflict,
+        .missing => .identity_missing,
+        .invalid => .identity_invalid,
+        .unavailable => .identity_unavailable,
+    };
+}
+
+fn markerErrorScanFailure(err: anyerror) ScanFailure {
+    return switch (err) {
+        error.identity_missing => .identity_missing,
+        error.identity_invalid => .identity_invalid,
+        error.identity_unavailable => .identity_unavailable,
+        error.identity_conflict => .identity_conflict,
+        else => .identity_unavailable,
+    };
+}
+
+fn mapProbeScanFailure(failure: core.PrepareBindingFailure) ScanFailure {
+    return switch (failure) {
+        .identity_missing => .identity_missing,
+        .identity_invalid => .identity_invalid,
+        .identity_unavailable => .identity_unavailable,
+        .identity_conflict => .identity_conflict,
+        .identity_duplicate => .identity_duplicate,
+        .binding_move_required => .binding_move_required,
+        .store_unavailable => .store_unavailable,
+        .unsupported_platform => .unsupported_platform,
+        .unsupported_filesystem => .unsupported_filesystem,
+        .store_invalid => .registry_invalid,
+        .repository_invalid, .repository_name_invalid => .repository_invalid,
+        .repository_namespace_collision, .concurrent_conflict => .store_invalid,
+        .io_failed => .store_unavailable,
+    };
+}
+
+fn markerReadFailure(state: repository_locator.MarkerState) ReadFailure {
+    return switch (state) {
+        .present => .identity_conflict,
+        .missing => .identity_missing,
+        .invalid => .identity_invalid,
+        .unavailable => .identity_unavailable,
+    };
+}
+
+fn markerErrorReadFailure(err: anyerror) ReadFailure {
+    return switch (err) {
+        error.identity_missing => .identity_missing,
+        error.identity_invalid => .identity_invalid,
+        error.identity_unavailable => .identity_unavailable,
+        error.identity_conflict => .identity_conflict,
+        else => .identity_unavailable,
+    };
+}
+
+fn probeReadFailure(failure: core.PrepareBindingFailure) ReadFailure {
+    return switch (failure) {
+        .identity_missing => .identity_missing,
+        .identity_invalid => .identity_invalid,
+        .identity_unavailable => .identity_unavailable,
+        .identity_conflict => .identity_conflict,
+        .identity_duplicate => .identity_duplicate,
+        .binding_move_required => .binding_move_required,
+        .store_unavailable => .store_unavailable,
+        .unsupported_platform => .unsupported_platform,
+        .unsupported_filesystem => .unsupported_filesystem,
+        .store_invalid => .store_invalid,
+        .repository_invalid, .repository_name_invalid => .repository_invalid,
+        .repository_namespace_collision, .concurrent_conflict => .concurrent_conflict,
+        .io_failed => .io_failed,
     };
 }
 
@@ -1674,6 +2167,12 @@ fn mapPublicationToReadFailure(failure: PublicationFailure) ReadFailure {
         .run_name_collision => .concurrent_conflict,
         .target_unavailable => .target_unavailable,
         .duplicate_review_id => .io_failed,
+        .identity_missing => .identity_missing,
+        .identity_invalid => .identity_invalid,
+        .identity_unavailable => .identity_unavailable,
+        .identity_conflict => .identity_conflict,
+        .identity_duplicate => .identity_duplicate,
+        .binding_move_required => .binding_move_required,
     };
 }
 
@@ -1688,6 +2187,12 @@ fn mapPrepareCoreFailure(failure: core.PrepareBindingFailure) PublicationFailure
         .repository_namespace_collision => .repository_namespace_collision,
         .io_failed => .io_failed,
         .concurrent_conflict => .concurrent_conflict,
+        .identity_missing => .identity_missing,
+        .identity_invalid => .identity_invalid,
+        .identity_unavailable => .identity_unavailable,
+        .identity_conflict => .identity_conflict,
+        .identity_duplicate => .identity_duplicate,
+        .binding_move_required => .binding_move_required,
     };
 }
 
@@ -2301,6 +2806,33 @@ test "review store preparation never reruns main-worktree discovery for an exist
     try std.testing.expect(first.review_repository_id.eql(second.review_repository_id));
     try std.testing.expect(first.repository_display_name.eql(&second.repository_display_name));
     try std.testing.expect(first.repository_directory_name.eql(&second.repository_directory_name));
+
+    root.deinit();
+    try tmp.dir.rename("Bound-Repo", tmp.dir, "Renamed-Repo", io);
+    const renamed_path = try tmp.dir.realPathFileAlloc(io, "Renamed-Repo", allocator);
+    defer allocator.free(renamed_path);
+    root = try root_capability.RootCapability.openCanonical(renamed_path);
+    var before_transfer = try scan(
+        allocator,
+        io,
+        &configured,
+        .{ .capability = &root, .environment = &normal_environment },
+    );
+    defer before_transfer.deinit(allocator);
+    try std.testing.expectEqual(ScanFailure.binding_move_required, before_transfer.failure);
+    const transferred_result = try prepareWithRepository(
+        allocator,
+        io,
+        &configured,
+        .{ .capability = &root, .environment = &normal_environment },
+        renamed_path,
+    );
+    const transferred = switch (transferred_result) {
+        .success => |value| value,
+        .failure => return error.ExpectedLeaseTransfer,
+    };
+    try std.testing.expect(first.review_repository_id.eql(transferred.review_repository_id));
+    try std.testing.expect(first.repository_directory_name.eql(&transferred.repository_directory_name));
 }
 
 test "review store deletion service preserves Git and sibling Runs without target objects" {
@@ -2325,13 +2857,23 @@ test "review store deletion service preserves Git and sibling Runs without targe
     var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
     defer environment.deinit();
     const repository: RepositoryContext = .{ .capability = &repo_capability, .environment = &environment };
-    const locator = (try repository_locator.locate(allocator, io, repository.git())).locator;
+    var located_result = try repository_locator.locate(allocator, io, repository.git());
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
+        .failure => return error.ExpectedRepositoryLocator,
+    };
     try tmp.dir.createDir(io, "store", .fromMode(0o700));
     const store_path_text = try tmp.dir.realPathFileAlloc(io, "store", allocator);
     defer allocator.free(store_path_text);
     var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
     defer configured.deinit(allocator);
-    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = locator, .repository_path = repo_path, .repository_name = "repo" })).success;
+    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{
+        .repository = located,
+        .repository_context = repository.git(),
+        .repository_name = "repo",
+    })).success;
+    const instance_id = located.instanceId().?;
     var store = try tmp.dir.openDir(io, "store", .{});
     defer store.close(io);
     const repository_text = prepared.review_repository_id.canonical();
@@ -2346,18 +2888,21 @@ test "review store deletion service preserves Git and sibling Runs without targe
     const sibling = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
     try seedTestRun(allocator, io, namespace, prepared.review_repository_id, prepared.review_id, target, "2026-08-20T08:00:00Z", .completed_invalid_draft);
     try seedTestRun(allocator, io, namespace, prepared.review_repository_id, sibling, target, "2026-08-20T08:00:00Z", .draft);
-    const other = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = .{ .device = 7, .inode = 11 }, .repository_path = "/test/other", .repository_name = "other" })).success;
-    var other_namespace = try store.openDir(io, other.repository_directory_name.slice(), .{});
+    const other_repository_id = try committed_review.ReviewRepositoryId.parse("323e4567-e89b-42d3-a456-426614174000");
+    const other_display = try store_name.RepositoryDisplayName.fromStored("other");
+    const other_directory_name = store_name.RepositoryDirectoryName.format(&other_display, other_repository_id);
+    try store.createDir(io, other_directory_name.slice(), .fromMode(0o700));
+    var other_namespace = try store.openDir(io, other_directory_name.slice(), .{});
     defer other_namespace.close(io);
-    try seedTestRun(allocator, io, other_namespace, other.review_repository_id, prepared.review_id, target, "2026-08-20T08:00:00Z", .completed);
-    var scanned = try catalog_store.scan(allocator, io, configured.context(), locator);
+    try seedTestRun(allocator, io, other_namespace, other_repository_id, prepared.review_id, target, "2026-08-20T08:00:00Z", .completed);
+    var scanned = try catalog_store.scan(allocator, io, configured.context(), instance_id);
     defer scanned.deinit(allocator);
     const catalog = &scanned.catalog;
     const artifacts: ArtifactSnapshot = found: {
         for (catalog.rows) |row| if (row.review_id.eql(prepared.review_id)) break :found row.artifact_snapshot;
         return error.MissingFixtureRun;
     };
-    var preview_result = try previewDeleteLocated(allocator, io, &configured, locator, prepared.review_id);
+    var preview_result = try previewDeleteLocated(allocator, io, &configured, repository, located, prepared.review_id);
     defer preview_result.deinit(allocator);
     const preview = &preview_result.preview;
     try std.testing.expect(preview.exact.review_id.eql(prepared.review_id));
@@ -2365,14 +2910,14 @@ test "review store deletion service preserves Git and sibling Runs without targe
     try std.testing.expectEqual(RunSummaryStatus.approved, preview.status);
     try std.testing.expectEqual(run.DraftSnapshotState.invalid, preview.exact.artifacts.draft_state);
     try std.testing.expect(preview.exact.artifacts.eql(artifacts));
-    var draft_preview = try previewDeleteLocated(allocator, io, &configured, locator, sibling);
+    var draft_preview = try previewDeleteLocated(allocator, io, &configured, repository, located, sibling);
     defer draft_preview.deinit(allocator);
     try std.testing.expectEqual(RunSummaryStatus.draft, draft_preview.preview.status);
     const state_context: ReadStateContext = .{ .repository = repo, .repository_path = repo_path, .store_path = store_path_text };
     var before = try captureReadOnlyState(allocator, io, state_context);
     defer before.deinit(allocator);
     var mismatched = catalog.snapshot;
-    mismatched.repository_locator.inode +%= 1;
+    mismatched.repository_instance_id.bytes[0] +%= 1;
     try std.testing.expectEqual(MaintenanceFailure.binding_changed, (try deleteRun(allocator, io, &configured, repository, .{ .store = mismatched, .review_id = prepared.review_id, .artifacts = artifacts })).failure);
     const deleted = try deleteRun(allocator, io, &configured, repository, .{ .store = catalog.snapshot, .review_id = prepared.review_id, .artifacts = artifacts });
     try std.testing.expectEqualDeep(DeleteResult{ .deleted = .complete }, deleted);
@@ -2380,17 +2925,17 @@ test "review store deletion service preserves Git and sibling Runs without targe
     defer after.deinit(allocator);
     inline for (.{ "head", "branch", "index", "local_config", "worktree" }) |field|
         try std.testing.expectEqualStrings(@field(before, field), @field(after, field));
-    var remaining = try catalog_store.scan(allocator, io, configured.context(), locator);
+    var remaining = try catalog_store.scan(allocator, io, configured.context(), instance_id);
     defer remaining.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), remaining.catalog.rows.len);
     try std.testing.expect(remaining.catalog.rows[0].review_id.eql(sibling));
     const other_run_name = try testRunDirectoryName(prepared.review_id);
     var other_run = try other_namespace.openDir(io, other_run_name.slice(), .{});
     other_run.close(io);
-    var absent = try catalog_store.readExact(allocator, io, configured.context(), locator, prepared.review_id, null, null);
+    var absent = try catalog_store.readExact(allocator, io, configured.context(), instance_id, prepared.review_id, null, null);
     defer absent.deinit(allocator);
     try std.testing.expect(absent == .absent);
-    var missing_preview = try previewDeleteLocated(allocator, io, &configured, locator, prepared.review_id);
+    var missing_preview = try previewDeleteLocated(allocator, io, &configured, repository, located, prepared.review_id);
     defer missing_preview.deinit(allocator);
     try std.testing.expectEqual(MaintenanceFailure.not_found, missing_preview.failure);
     try std.testing.expectEqual(@as(usize, 0), (try cleanupTrash(allocator, io, &configured, repository, catalog.snapshot)).cleaned);
@@ -2416,14 +2961,23 @@ test "review store maintenance prune scan and sequential delete use a disposable
     var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
     defer environment.deinit();
     const repository: RepositoryContext = .{ .capability = &repo_capability, .environment = &environment };
-    const locator = (try repository_locator.locate(allocator, io, repository.git())).locator;
+    var located_result = try repository_locator.locate(allocator, io, repository.git());
+    defer located_result.deinit(allocator);
+    const located = switch (located_result) {
+        .located => |*value| value,
+        .failure => return error.ExpectedRepositoryLocator,
+    };
 
     try tmp.dir.createDir(io, "store", .fromMode(0o700));
     const store_path_text = try tmp.dir.realPathFileAlloc(io, "store", allocator);
     defer allocator.free(store_path_text);
     var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
     defer configured.deinit(allocator);
-    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = locator, .repository_path = repo_path, .repository_name = "repo" })).success;
+    const prepared = (try core.prepareBinding(allocator, io, configured.context(), .{
+        .repository = located,
+        .repository_context = repository.git(),
+        .repository_name = "repo",
+    })).success;
     var store = try tmp.dir.openDir(io, "store", .{});
     defer store.close(io);
     const repository_text = prepared.review_repository_id.canonical();
@@ -2449,12 +3003,15 @@ test "review store maintenance prune scan and sequential delete use a disposable
     try seedTestRun(allocator, io, namespace, prepared.review_repository_id, oldest_id, target, "2026-08-20T04:00:00Z", .completed);
     try seedTestRun(allocator, io, namespace, prepared.review_repository_id, draft_id, target, "2026-08-20T03:00:00Z", .draft);
 
-    const other = (try core.prepareBinding(allocator, io, configured.context(), .{ .locator = .{ .device = 17, .inode = 19 }, .repository_path = "/test/prune-other", .repository_name = "prune-other" })).success;
-    var other_namespace = try store.openDir(io, other.repository_directory_name.slice(), .{});
+    const other_repository_id = try committed_review.ReviewRepositoryId.parse("823e4567-e89b-42d3-a456-426614174000");
+    const other_display = try store_name.RepositoryDisplayName.fromStored("prune-other");
+    const other_directory_name = store_name.RepositoryDirectoryName.format(&other_display, other_repository_id);
+    try store.createDir(io, other_directory_name.slice(), .fromMode(0o700));
+    var other_namespace = try store.openDir(io, other_directory_name.slice(), .{});
     defer other_namespace.close(io);
-    try seedTestRun(allocator, io, other_namespace, other.review_repository_id, older_id, target, "2026-08-20T01:00:00Z", .completed);
+    try seedTestRun(allocator, io, other_namespace, other_repository_id, older_id, target, "2026-08-20T01:00:00Z", .completed);
 
-    var first_scan = try scanMaintenanceLocated(allocator, io, &configured, locator);
+    var first_scan = try scanMaintenanceLocated(allocator, io, &configured, repository, located);
     defer first_scan.deinit(allocator);
     const first = &first_scan.catalog;
     try std.testing.expectEqual(@as(usize, 7), first.rows.len);
@@ -2477,7 +3034,7 @@ test "review store maintenance prune scan and sequential delete use a disposable
         defer retained_draft.close(io);
         try retained_draft.setTimestampsNow(io);
     }
-    var second_scan = try scanMaintenanceLocated(allocator, io, &configured, locator);
+    var second_scan = try scanMaintenanceLocated(allocator, io, &configured, repository, located);
     defer second_scan.deinit(allocator);
     const second = &second_scan.catalog;
     try std.testing.expectEqual(first.rows.len, second.rows.len);
@@ -2492,7 +3049,7 @@ test "review store maintenance prune scan and sequential delete use a disposable
         });
         try std.testing.expect(deleted == .deleted);
     }
-    var remaining_scan = try scanMaintenanceLocated(allocator, io, &configured, locator);
+    var remaining_scan = try scanMaintenanceLocated(allocator, io, &configured, repository, located);
     defer remaining_scan.deinit(allocator);
     const remaining = &remaining_scan.catalog;
     try std.testing.expectEqual(@as(usize, 4), remaining.rows.len);
@@ -2640,6 +3197,212 @@ fn testSummary(history: *const History, review_id: committed_review.ReviewId) !*
     return error.ExpectedReviewSummary;
 }
 
+const FinalReadCase = enum { scan, exact, selection, delete_preview, maintenance_scan };
+const FinalStoreDrift = enum { root, registry, namespace, lease };
+const FinalRepositoryDrift = enum { marker, common_directory };
+
+const FinalReadFixture = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured: *const ConfiguredStore,
+    repository: RepositoryContext,
+    located: *repository_locator.LocatedRepository,
+    store: StoreSnapshot,
+    review_id: committed_review.ReviewId,
+    artifacts: ArtifactSnapshot,
+
+    fn expectFailure(
+        self: @This(),
+        read: FinalReadCase,
+        hook: BoundaryHook,
+        scan_failure: ScanFailure,
+        exact_failure: ReadFailure,
+        selection_failure: SelectionFailure,
+    ) !void {
+        switch (read) {
+            .scan => {
+                var result = try scanWithHook(self.allocator, self.io, self.configured, self.repository, hook);
+                defer result.deinit(self.allocator);
+                try std.testing.expectEqual(scan_failure, result.failure);
+            },
+            .exact => {
+                var result = try admitExactRunLocatedWithHook(
+                    self.allocator,
+                    self.io,
+                    self.configured,
+                    self.repository,
+                    self.located,
+                    self.review_id,
+                    null,
+                    hook,
+                );
+                defer result.deinit(self.allocator);
+                try std.testing.expectEqual(exact_failure, result.failure);
+            },
+            .selection => {
+                var result = try selectExactWithArtifactPolicy(
+                    self.allocator,
+                    self.io,
+                    self.configured,
+                    self.repository,
+                    self.store,
+                    self.review_id,
+                    self.artifacts,
+                    .strict,
+                    hook,
+                );
+                defer result.deinit(self.allocator);
+                try std.testing.expectEqual(selection_failure, result.failure);
+            },
+            .delete_preview => {
+                var result = try previewDeleteLocatedWithHook(
+                    self.allocator,
+                    self.io,
+                    self.configured,
+                    self.repository,
+                    self.located,
+                    self.review_id,
+                    hook,
+                );
+                defer result.deinit(self.allocator);
+                try std.testing.expectEqual(MaintenanceFailure.binding_changed, result.failure);
+            },
+            .maintenance_scan => {
+                var result = try scanMaintenanceLocatedWithHook(
+                    self.allocator,
+                    self.io,
+                    self.configured,
+                    self.repository,
+                    self.located,
+                    hook,
+                );
+                defer result.deinit(self.allocator);
+                try std.testing.expectEqual(MaintenanceFailure.binding_changed, result.failure);
+            },
+        }
+    }
+};
+
+const StoreBoundarySwap = struct {
+    io: std.Io,
+    parent: std.Io.Dir,
+    store: std.Io.Dir,
+    name: []const u8,
+    replacement_registry: []const u8,
+    mode: FinalStoreDrift,
+    fired: bool = false,
+    failure: ?anyerror = null,
+
+    fn before(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.swap() catch |err| {
+            self.failure = err;
+            return;
+        };
+        self.fired = true;
+    }
+
+    fn swap(self: *@This()) !void {
+        switch (self.mode) {
+            .root => {
+                try self.parent.rename("store", self.parent, ".admitted-store", self.io);
+                try self.parent.createDir(self.io, "store", .fromMode(0o700));
+            },
+            .registry, .lease => {
+                try self.store.rename("registry.json", self.store, ".admitted-registry", self.io);
+                try self.store.writeFile(self.io, .{
+                    .sub_path = "registry.json",
+                    .data = self.replacement_registry,
+                    .flags = .{ .permissions = .fromMode(0o600) },
+                });
+            },
+            .namespace => {
+                try self.store.rename(self.name, self.store, ".admitted-namespace", self.io);
+                try self.store.createDir(self.io, self.name, .fromMode(0o700));
+            },
+        }
+    }
+
+    fn hook(self: *@This()) BoundaryHook {
+        return .{ .context = self, .before_final_check = before };
+    }
+
+    fn restore(self: *@This()) !void {
+        switch (self.mode) {
+            .root => {
+                try self.parent.deleteDir(self.io, "store");
+                try self.parent.rename(".admitted-store", self.parent, "store", self.io);
+            },
+            .registry, .lease => {
+                try self.store.deleteFile(self.io, "registry.json");
+                try self.store.rename(".admitted-registry", self.store, "registry.json", self.io);
+            },
+            .namespace => {
+                try self.store.deleteDir(self.io, self.name);
+                try self.store.rename(".admitted-namespace", self.store, self.name, self.io);
+            },
+        }
+    }
+};
+
+const RepositoryBoundarySwap = struct {
+    io: std.Io,
+    repository: std.Io.Dir,
+    replacement: std.Io.Dir,
+    original: committed_review.RepositoryInstanceId,
+    mode: FinalRepositoryDrift,
+    fired: bool = false,
+    failure: ?anyerror = null,
+
+    fn before(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.swap() catch |err| {
+            self.failure = err;
+            return;
+        };
+        self.fired = true;
+    }
+
+    fn replaceMarker(self: *@This(), bytes: []const u8) !void {
+        try self.repository.deleteFile(self.io, ".git/gitframe/repository-id-v1");
+        try self.repository.writeFile(self.io, .{
+            .sub_path = ".git/gitframe/repository-id-v1",
+            .data = bytes,
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+    }
+
+    fn swap(self: *@This()) !void {
+        switch (self.mode) {
+            .marker => try self.replaceMarker("923e4567-e89b-42d3-a456-426614174010\n"),
+            .common_directory => {
+                try self.repository.rename(".git", self.repository, ".admitted-git", self.io);
+                try self.replacement.rename(".git", self.repository, ".git", self.io);
+            },
+        }
+    }
+
+    fn hook(self: *@This()) BoundaryHook {
+        return .{ .context = self, .before_final_check = before };
+    }
+
+    fn restore(self: *@This()) !void {
+        switch (self.mode) {
+            .marker => {
+                const canonical = self.original.canonical();
+                var bytes: [37]u8 = undefined;
+                @memcpy(bytes[0..36], &canonical);
+                bytes[36] = '\n';
+                try self.replaceMarker(&bytes);
+            },
+            .common_directory => {
+                try self.repository.rename(".git", self.replacement, ".git", self.io);
+                try self.repository.rename(".admitted-git", self.repository, ".git", self.io);
+            },
+        }
+    }
+};
+
 test "Finding disposition exact reload keeps AI Review Store selection identity and no-scan behavior" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -2683,18 +3446,27 @@ test "Finding disposition exact reload keeps AI Review Store selection identity 
     var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
     defer environment.deinit();
     const repository: RepositoryContext = .{ .capability = &repo_capability, .environment = &environment };
-    const locator_result = try repository_locator.locate(allocator, io, repository.git());
-    const locator = switch (locator_result) {
-        .locator => |value| value,
+    var locator_result = try repository_locator.locate(allocator, io, repository.git());
+    defer locator_result.deinit(allocator);
+    const located = switch (locator_result) {
+        .located => |*value| value,
         .failure => return error.ExpectedRepositoryLocator,
     };
+    const instance_id = try located.ensureIdentity(allocator, io, .{});
 
     try tmp.dir.createDir(io, "store", .fromMode(0o700));
     var store = try tmp.dir.openDir(io, "store", .{});
     defer store.close(io);
     const repository_id = try committed_review.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
     const repository_text = repository_id.canonical();
-    const registry_bytes = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"bindings\":[{{\"review_repository_id\":\"{s}\",\"repository_display_name\":\"repo\",\"directory_name\":\"repo-123e4567\",\"device\":\"{d}\",\"inode\":\"{d}\",\"canonical_path\":{{\"encoding\":\"utf8\",\"value\":\"{s}\"}},\"last_seen_path\":{{\"encoding\":\"utf8\",\"value\":\"{s}\"}}}}]}}\n", .{ &repository_text, locator.device, locator.inode, repo_path, repo_path });
+    const diagnostic = try @import("../review_store/registry.zig").diagnosticPath(located.canonical_path);
+    const registry_bytes = try @import("../review_store/registry.zig").writeCanonicalAlloc(allocator, &.{.{
+        .repository_instance_id = instance_id,
+        .review_repository_id = repository_id,
+        .repository_display_name = "repo",
+        .directory_name = "repo-123e4567",
+        .last_seen_path = diagnostic,
+    }});
     defer allocator.free(registry_bytes);
     try writePrivate(io, store, "registry.json", registry_bytes);
     try store.createDir(io, "repo-123e4567", .fromMode(0o700));
@@ -2779,6 +3551,208 @@ test "Finding disposition exact reload keeps AI Review Store selection identity 
     try std.testing.expect(selected_value.finding_projection.identity.review_id.eql(valid_id));
     try std.testing.expectEqual(@as(usize, 1), selected_value.finding_projection.files.len);
     try std.testing.expectEqual(@as(usize, 0), selected_value.finding_projection.entries.len);
+
+    var configured = try ConfiguredStore.initConfigured(allocator, store_path_text);
+    defer configured.deinit(allocator);
+    var runtime_before = located.locator;
+    runtime_before.device = 56;
+    var runtime_after = runtime_before;
+    runtime_after.device = 30;
+    try repository_locator.testing.validateRuntime(runtime_before, instance_id, runtime_before, .{ .present = instance_id });
+    try repository_locator.testing.validateRuntime(runtime_after, instance_id, runtime_after, .{ .present = instance_id });
+    try std.testing.expectError(
+        error.identity_conflict,
+        repository_locator.testing.validateRuntime(runtime_before, instance_id, runtime_after, .{ .present = instance_id }),
+    );
+
+    try tmp.dir.createDir(io, "device-store", .fromMode(0o700));
+    const device_store_path = try tmp.dir.realPathFileAlloc(io, "device-store", allocator);
+    defer allocator.free(device_store_path);
+    var device_store = try ConfiguredStore.initConfigured(allocator, device_store_path);
+    defer device_store.deinit(allocator);
+    var before_result = try repository_locator.locate(allocator, io, repository.git());
+    defer before_result.deinit(allocator);
+    const before = switch (before_result) {
+        .located => |*value| value,
+        .failure => return error.ExpectedRepositoryLocator,
+    };
+    before.locator = runtime_before;
+    before.testing_runtime = runtime_before;
+    const prepared_before = try prepareLocated(allocator, io, &device_store, repository.git(), before);
+    const device_binding = switch (prepared_before) {
+        .success => |value| value,
+        .failure => return error.ExpectedPrepareSuccess,
+    };
+    const producer: committed_review.Producer = .{ .name = "device-seam", .model = "fixture" };
+    const finding_set: committed_review.FindingSet = .{
+        .schema_version = 1,
+        .review_id = device_binding.review_id,
+        .created_at = "2026-08-20T12:00:00Z",
+        .timing = .{ .duration_ms = 1 },
+        .target = target,
+        .producer = producer,
+        .findings = &.{},
+    };
+    const device_findings = try finding_set.writeCanonical(allocator);
+    defer allocator.free(device_findings);
+    const device_manifest_value: committed_review.ReviewRunManifest = .{
+        .schema_version = 1,
+        .review_id = device_binding.review_id,
+        .review_repository_id = device_binding.review_repository_id,
+        .target = target,
+        .created_at = "2026-08-20T12:00:00Z",
+        .display = .{ .base_label = "main~1", .head_label = "main" },
+        .finding_count = 0,
+        .producer = producer,
+        .findings_digest = committed_review.Sha256Digest.hash(device_findings),
+    };
+    const device_manifest = try device_manifest_value.writeCanonical(allocator);
+    defer allocator.free(device_manifest);
+    const device_published = try publishLocated(allocator, io, &device_store, repository, before, .{
+        .repository_path = repo_path,
+        .review_repository_id = device_binding.review_repository_id,
+        .review_id = device_binding.review_id,
+        .manifest_bytes = device_manifest,
+        .findings_bytes = device_findings,
+    });
+    try std.testing.expect(device_published == .success);
+    var scanned_before = try catalog_store.scan(allocator, io, device_store.context(), instance_id);
+    defer scanned_before.deinit(allocator);
+    const device_history_before = switch (scanned_before) {
+        .catalog => |*value| value,
+        else => return error.ExpectedReviewHistory,
+    };
+    try std.testing.expectEqual(@as(usize, 1), device_history_before.rows.len);
+    try std.testing.expect(device_history_before.rows[0].review_id.eql(device_binding.review_id));
+
+    var after_result = try repository_locator.locate(allocator, io, repository.git());
+    defer after_result.deinit(allocator);
+    const after = switch (after_result) {
+        .located => |*value| value,
+        .failure => return error.ExpectedRepositoryLocator,
+    };
+    after.locator = runtime_after;
+    after.testing_runtime = runtime_after;
+    try std.testing.expect(after.instanceId().?.eql(instance_id));
+    try std.testing.expectEqual(core.BindingProbeResult.bound, try core.probeBinding(allocator, io, device_store.context(), after));
+    var scanned_after = try catalog_store.scan(allocator, io, device_store.context(), instance_id);
+    defer scanned_after.deinit(allocator);
+    const device_history_after = switch (scanned_after) {
+        .catalog => |*value| value,
+        else => return error.ExpectedReviewHistory,
+    };
+    try std.testing.expect(device_history_after.snapshot.eql(device_history_before.snapshot));
+    try std.testing.expectEqual(@as(usize, 1), device_history_after.rows.len);
+    try std.testing.expect(device_history_after.rows[0].artifact_snapshot.eql(device_history_before.rows[0].artifact_snapshot));
+    const prepared_after = try prepareLocated(allocator, io, &device_store, repository.git(), after);
+    try std.testing.expect(prepared_after.success.review_repository_id.eql(device_binding.review_repository_id));
+    try std.testing.expect(prepared_after.success.repository_directory_name.eql(&device_binding.repository_directory_name));
+    var device_root = try capability.StoreRootCapability.openCanonical(device_store_path);
+    defer device_root.deinit();
+    var device_registry = try @import("../review_store/registry.zig").read(allocator, io, device_root.directory);
+    defer device_registry.deinit();
+    try std.testing.expectEqual(@as(usize, 1), device_registry.registry.bindings.len);
+    var device_entries = device_root.directory.iterate();
+    var device_namespaces: usize = 0;
+    while (try device_entries.next(device_root.directory, io)) |entry| {
+        if (!std.mem.eql(u8, entry.name, ".locks") and !std.mem.eql(u8, entry.name, "registry.json"))
+            device_namespaces += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), device_namespaces);
+
+    const replacement_id = try committed_review.ReviewRepositoryId.parse("e23e4567-e89b-42d3-a456-426614174000");
+    const replacement_display = try store_name.RepositoryDisplayName.fromStored("replacement");
+    const replacement_name = store_name.RepositoryDirectoryName.format(&replacement_display, replacement_id);
+    const replacement_registry = try @import("../review_store/registry.zig").writeCanonicalAlloc(allocator, &.{.{
+        .repository_instance_id = instance_id,
+        .review_repository_id = replacement_id,
+        .repository_display_name = replacement_display.slice(),
+        .directory_name = replacement_name.slice(),
+        .last_seen_path = diagnostic,
+    }});
+    defer allocator.free(replacement_registry);
+    output = try runTestGit(io, tmp.dir, &.{ "cp", "-a", "repo", "lease-copy" });
+    allocator.free(output);
+    const lease_copy_path = try tmp.dir.realPathFileAlloc(io, "lease-copy/.git", allocator);
+    defer allocator.free(lease_copy_path);
+    const lease_diagnostic = try @import("../review_store/registry.zig").diagnosticPath(lease_copy_path);
+    const lease_registry = try @import("../review_store/registry.zig").writeCanonicalAlloc(allocator, &.{.{
+        .repository_instance_id = instance_id,
+        .review_repository_id = repository_id,
+        .repository_display_name = "repo",
+        .directory_name = "repo-123e4567",
+        .last_seen_path = lease_diagnostic,
+    }});
+    defer allocator.free(lease_registry);
+    const scenarios = [_]struct { read: FinalReadCase, drift: FinalStoreDrift }{
+        .{ .read = .scan, .drift = .root },
+        .{ .read = .exact, .drift = .registry },
+        .{ .read = .exact, .drift = .namespace },
+        .{ .read = .selection, .drift = .root },
+        .{ .read = .delete_preview, .drift = .registry },
+        .{ .read = .maintenance_scan, .drift = .namespace },
+        .{ .read = .scan, .drift = .lease },
+        .{ .read = .exact, .drift = .lease },
+        .{ .read = .selection, .drift = .lease },
+        .{ .read = .delete_preview, .drift = .lease },
+        .{ .read = .maintenance_scan, .drift = .lease },
+    };
+    const final_reads: FinalReadFixture = .{
+        .allocator = allocator,
+        .io = io,
+        .configured = &configured,
+        .repository = repository,
+        .located = located,
+        .store = history.snapshot,
+        .review_id = valid_id,
+        .artifacts = valid_row.artifact_snapshot,
+    };
+    for (scenarios) |scenario| {
+        var drift: StoreBoundarySwap = .{
+            .io = io,
+            .parent = tmp.dir,
+            .store = store,
+            .name = history.snapshot.repository_directory_name.slice(),
+            .replacement_registry = if (scenario.drift == .lease) lease_registry else replacement_registry,
+            .mode = scenario.drift,
+        };
+        const hook = drift.hook();
+        try final_reads.expectFailure(
+            scenario.read,
+            hook,
+            if (scenario.drift == .lease) .identity_duplicate else .identity_conflict,
+            .binding_changed,
+            if (scenario.drift == .root) .root_drift else .binding_drift,
+        );
+        try std.testing.expect(drift.fired and drift.failure == null);
+        try drift.restore();
+    }
+    try tmp.dir.createDir(io, "read-replacement", .fromMode(0o700));
+    var read_replacement = try tmp.dir.openDir(io, "read-replacement", .{});
+    defer read_replacement.close(io);
+    output = try runTestGit(io, read_replacement, &.{ "git", "init", "--initial-branch=main" });
+    allocator.free(output);
+    for ([_]FinalRepositoryDrift{ .marker, .common_directory }) |mode| {
+        for ([_]FinalReadCase{ .scan, .exact, .selection, .delete_preview, .maintenance_scan }) |read| {
+            var drift: RepositoryBoundarySwap = .{
+                .io = io,
+                .repository = repo,
+                .replacement = read_replacement,
+                .original = instance_id,
+                .mode = mode,
+            };
+            const hook = drift.hook();
+            try final_reads.expectFailure(
+                read,
+                hook,
+                .identity_conflict,
+                .identity_conflict,
+                .binding_drift,
+            );
+            try std.testing.expect(drift.fired and drift.failure == null);
+            try drift.restore();
+        }
+    }
 
     try tmp.dir.createDir(io, "not-repository", .default_dir);
     var not_repository_directory = try tmp.dir.openDir(io, "not-repository", .{});
@@ -3259,7 +4233,9 @@ test "Finding disposition exact reload keeps AI Review Store selection identity 
 
     // The public semantic context owns the same mutation use cases without
     // exposing a Store path or capability to App consumers.
-    try store.createDir(io, ".locks", .fromMode(0o700));
+    store.createDir(io, ".locks", .fromMode(0o700)) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
     var locks = try store.openDir(io, ".locks", .{});
     defer locks.close(io);
     try locks.createDir(io, &repository_text, .fromMode(0o700));
@@ -3271,7 +4247,7 @@ test "Finding disposition exact reload keeps AI Review Store selection identity 
         .target = exact_identity.identity.target,
         .findings_digest = exact_identity.identity.findings_sha256,
     };
-    var saved = try saveDraft(allocator, io, &configured_store, .{
+    var saved = try saveDraft(allocator, io, &configured_store, repository, .{
         .binding = mutation_binding,
         .expected_revision = 0,
         .summary = "semantic context",
@@ -3281,7 +4257,7 @@ test "Finding disposition exact reload keeps AI Review Store selection identity 
     defer saved.deinit(allocator);
     try std.testing.expect(saved == .committed);
     try std.testing.expectEqual(@as(u64, 1), saved.committed.revision);
-    var completed = try createResult(allocator, io, &configured_store, .{
+    var completed = try createResult(allocator, io, &configured_store, repository, .{
         .binding = mutation_binding,
         .expected_revision = 1,
         .decision = .approved,

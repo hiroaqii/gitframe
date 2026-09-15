@@ -1,5 +1,5 @@
-//! Read-only boundary from a machine-local physical Git repository locator to
-//! an already-issued durable `ReviewRepositoryId`.
+//! Read-only boundary from a durable repository instance to an already-issued
+//! machine-local `ReviewRepositoryId`.
 //!
 //! This module defines no registry path, storage, locking, or ID issuance.
 
@@ -8,6 +8,7 @@ const identity = @import("identity.zig");
 
 /// Nominal durable Store namespace returned only by a successful lookup.
 pub const ReviewRepositoryId = identity.ReviewRepositoryId;
+pub const RepositoryInstanceId = identity.RepositoryInstanceId;
 
 /// Machine-local identity copied from the opened Git common-directory
 /// descriptor. It is neither portable nor serialized and owns no path or fd.
@@ -41,12 +42,12 @@ pub const RepositoryBindingRegistry = struct {
     /// Read-only implementation contract; returning malformed bound bytes is
     /// converted to `registry_invalid` by the outer interface.
     pub const VTable = struct {
-        resolve: *const fn (context: *anyopaque, locator: GitCommonDirectoryLocator) RepositoryBindingResult,
+        resolve: *const fn (context: *anyopaque, instance_id: RepositoryInstanceId) RepositoryBindingResult,
     };
 
     /// Look up an already-issued nominal repository ID and fail closed.
-    pub fn resolve(self: RepositoryBindingRegistry, locator: GitCommonDirectoryLocator) RepositoryBindingResult {
-        const result = self.vtable.resolve(self.context, locator);
+    pub fn resolve(self: RepositoryBindingRegistry, instance_id: RepositoryInstanceId) RepositoryBindingResult {
+        const result = self.vtable.resolve(self.context, instance_id);
         return switch (result) {
             .bound => |repository_id| validateRepositoryId(repository_id),
             .unbound => .unbound,
@@ -62,9 +63,9 @@ fn validateRepositoryId(repository_id: ReviewRepositoryId) RepositoryBindingResu
     return .{ .bound = repository_id };
 }
 
-test "repository binding registry resolves seeded physical locators and fails closed" {
+test "repository binding registry resolves repository instances and fails closed" {
     const Mapping = struct {
-        locator: GitCommonDirectoryLocator,
+        instance_id: RepositoryInstanceId,
         repository_id: ReviewRepositoryId,
     };
     const FakeRegistry = struct {
@@ -75,11 +76,11 @@ test "repository binding registry resolves seeded physical locators and fails cl
             return @ptrCast(@alignCast(context));
         }
 
-        fn resolve(context: *anyopaque, locator: GitCommonDirectoryLocator) RepositoryBindingResult {
+        fn resolve(context: *anyopaque, instance_id: RepositoryInstanceId) RepositoryBindingResult {
             const self = from(context);
             if (self.forced_terminal) |terminal| return terminal;
             for (self.mappings) |mapping| {
-                if (mapping.locator.eql(locator)) return .{ .bound = mapping.repository_id };
+                if (mapping.instance_id.eql(instance_id)) return .{ .bound = mapping.repository_id };
             }
             return .unbound;
         }
@@ -91,31 +92,31 @@ test "repository binding registry resolves seeded physical locators and fails cl
         }
     };
 
-    const first_locator: GitCommonDirectoryLocator = .{ .device = 7, .inode = 11 };
-    const second_locator: GitCommonDirectoryLocator = .{ .device = 7, .inode = 12 };
-    const unknown_locator: GitCommonDirectoryLocator = .{ .device = 8, .inode = 11 };
+    const first_instance = try RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010");
+    const second_instance = try RepositoryInstanceId.parse("223e4567-e89b-42d3-a456-426614174010");
+    const unknown_instance = try RepositoryInstanceId.parse("323e4567-e89b-42d3-a456-426614174010");
     const first_id = try ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
     const second_id = try ReviewRepositoryId.parse("223e4567-e89b-42d3-a456-426614174000");
     const mappings = [_]Mapping{
-        .{ .locator = first_locator, .repository_id = first_id },
-        .{ .locator = second_locator, .repository_id = second_id },
+        .{ .instance_id = first_instance, .repository_id = first_id },
+        .{ .instance_id = second_instance, .repository_id = second_id },
     };
     var registry = FakeRegistry{ .mappings = &mappings };
     const binding = registry.interface();
 
-    try std.testing.expect(binding.resolve(first_locator).bound.eql(first_id));
-    try std.testing.expect(binding.resolve(second_locator).bound.eql(second_id));
-    try std.testing.expect(binding.resolve(unknown_locator) == .unbound);
+    try std.testing.expect(binding.resolve(first_instance).bound.eql(first_id));
+    try std.testing.expect(binding.resolve(second_instance).bound.eql(second_id));
+    try std.testing.expect(binding.resolve(unknown_instance) == .unbound);
 
     var invalid = FakeRegistry{ .mappings = &mappings, .forced_terminal = .registry_invalid };
-    try std.testing.expect(invalid.interface().resolve(first_locator) == .registry_invalid);
+    try std.testing.expect(invalid.interface().resolve(first_instance) == .registry_invalid);
     var malformed = FakeRegistry{
         .mappings = &mappings,
         .forced_terminal = .{ .bound = .{ .bytes = [_]u8{0} ** 16 } },
     };
-    try std.testing.expect(malformed.interface().resolve(first_locator) == .registry_invalid);
+    try std.testing.expect(malformed.interface().resolve(first_instance) == .registry_invalid);
     var unavailable = FakeRegistry{ .mappings = &mappings, .forced_terminal = .registry_unavailable };
-    try std.testing.expect(unavailable.interface().resolve(first_locator) == .registry_unavailable);
+    try std.testing.expect(unavailable.interface().resolve(first_instance) == .registry_unavailable);
 }
 
 test "physical locator stores only device and inode" {
