@@ -125,7 +125,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         const msg = ai_reviews_input.pasteToMsg(context.ai_reviews, text) orelse return null;
         return .{ .ai_reviews = msg };
     }
-    if (context.active_page == .compare and context.compare.ai_review_modal_open) {
+    if (context.active_page == .compare and context.compare.ai_review_handoff_open) {
         const msg = compare_input.pasteToMsg(context.compare, text) orelse return null;
         return .{ .compare = msg };
     }
@@ -166,6 +166,10 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         const msg = ai_reviews_input.keyToMsg(context.ai_reviews, key) orelse return null;
         return .{ .ai_reviews = msg };
     }
+    if (context.active_page == .compare and context.compare.ai_review_handoff_open) {
+        const msg = compare_input.keyToMsg(context.compare, key) orelse return null;
+        return .{ .compare = msg };
+    }
     if (context.remote_action_cancelable and key.matches(chasen.Key.escape, .{}))
         return app_message.Msg.cancel_remote_action;
     if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
@@ -178,7 +182,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     }
     if (context.active_page == .compare and
         (context.compare.common.search_mode or context.compare.common.file_search_mode or
-            context.compare.base_picker_open or context.compare.ai_review_modal_open))
+            context.compare.base_picker_open))
     {
         const msg = compare_input.keyToMsg(context.compare, key) orelse return null;
         return .{ .compare = msg };
@@ -1328,20 +1332,36 @@ test "remote cancel Escape takes priority while a background action is active" {
     );
 }
 
-test "Escape dismisses only an uncovered AI review terminal" {
+test "AI Review Handoff owns root input before hosted and remote backgrounds" {
     const escape: chasen.Key = .{ .codepoint = chasen.Key.escape };
     try std.testing.expectEqual(
         app_message.Msg.dismiss_ai_review_status,
         keyToMsg(.{ .ai_review_terminal_visible = true }, escape).?,
     );
     try expectMsg(
-        .{ .compare = .close_ai_review },
+        .{ .compare = .close_ai_review_handoff },
         keyToMsg(.{
             .active_page = .compare,
-            .compare = .{ .ai_review_modal_open = true },
+            .compare = .{ .ai_review_handoff_open = true },
             .ai_review_terminal_visible = true,
+            .remote_action_cancelable = true,
         }, escape).?,
     );
+    const modal_over_background: KeyContext = .{
+        .active_page = .compare,
+        .compare = .{ .ai_review_handoff_open = true },
+        .ai_review_terminal_visible = true,
+        .remote_action_cancelable = true,
+    };
+    try expectMsg(
+        .{ .compare = .copy_ai_review_handoff },
+        keyToMsg(modal_over_background, .{ .codepoint = 'y' }).?,
+    );
+    try expectMsg(
+        .{ .compare = .close_ai_review_handoff },
+        keyToMsg(modal_over_background, .{ .codepoint = 'q' }).?,
+    );
+    try std.testing.expect(keyToMsg(modal_over_background, .{ .codepoint = '1' }) == null);
     try std.testing.expectEqual(
         app_message.Msg.cancel_remote_action,
         keyToMsg(.{ .remote_action_cancelable = true, .ai_review_terminal_visible = true }, escape).?,
@@ -1432,10 +1452,10 @@ test "AI review details own keys and paste while opening respects existing owner
     const normal: KeyContext = .{ .ai_review_terminal_visible = true };
     try std.testing.expectEqual(.open, keyToMsg(normal, f2).?.ai_review_details);
     const blockers = [_]KeyContext{
-        .{ .command_line_active = true },                                           .{ .help_mode = true },                   .{ .repo_picker_mode = true },
-        .{ .commit_panel_mode = true },                                             .{ .discard_confirmation_mode = true },   .{ .push_error_mode = true },
-        .{ .active_selection_gesture = true },                                      .{ .changes = .{ .search_mode = true } }, .{ .active_page = .compare, .compare = .{ .base_picker_open = true } },
-        .{ .active_page = .compare, .compare = .{ .ai_review_modal_open = true } },
+        .{ .command_line_active = true },                                             .{ .help_mode = true },                   .{ .repo_picker_mode = true },
+        .{ .commit_panel_mode = true },                                               .{ .discard_confirmation_mode = true },   .{ .push_error_mode = true },
+        .{ .active_selection_gesture = true },                                        .{ .changes = .{ .search_mode = true } }, .{ .active_page = .compare, .compare = .{ .base_picker_open = true } },
+        .{ .active_page = .compare, .compare = .{ .ai_review_handoff_open = true } },
     };
     for (blockers) |blocked| {
         var context = blocked;

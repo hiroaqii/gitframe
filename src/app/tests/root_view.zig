@@ -10,6 +10,8 @@ const app_test_support = @import("../test_support.zig");
 const changes_navigation = @import("../pages/changes/navigation.zig");
 const changes_reload = @import("../pages/changes/reload.zig");
 const changes_authority = @import("../diff_surface/authority.zig");
+const compare_handoff = @import("../pages/compare/ai_review_handoff.zig");
+const compare_view = @import("../pages/compare/view.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_render = @import("../../diff/render.zig");
 const diff_selection = @import("../../diff/selection.zig");
@@ -161,6 +163,61 @@ fn openAmendConfirmation(app: *App, allocator: std.mem.Allocator, repo_root: []c
     };
     parts = .{ .subject = &.{}, .body = null };
     app.overlay.openAmendCommit();
+}
+
+test "AI Review Handoff root shell uses rendered overlay geometry for End and resize clamp" {
+    const allocator = std.testing.allocator;
+    const committed = @import("../../committed_review.zig");
+    const base = try committed.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const head = try committed.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const narrow: chasen.Size = .{ .width = 40, .height = 12 };
+    const wide: chasen.Size = .{ .width = 80, .height = 24 };
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .compare,
+        .terminal_size = narrow,
+    };
+    defer app.pages.compare.deinit(allocator);
+    app.pages.compare.beginAiReviewHandoff(allocator, .{
+        .executable_path = "/opt/gitframe/bin/gitframe",
+        .repository_path = "/long-repository-path" ** 40,
+        .target = .{
+            .object_format = .sha1,
+            .source_kind = .branch_range,
+            .base_oid = base,
+            .head_oid = head,
+            .diff_base_oid = base,
+        },
+    });
+    const prompt = app.pages.compare.ai_review_handoff.ready().?.snapshot.canonical_prompt;
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+
+    const narrow_prompt_size = compare_view.aiReviewHandoffPromptSize(app_shell_layout.contentSize(narrow));
+    try std.testing.expectEqual(compare_handoff.PromptSize{ .width = 34, .height = 4 }, narrow_prompt_size);
+    try app.update(.{ .compare = .{ .scroll_ai_review_handoff = .end } }, &tc.ctx);
+    try std.testing.expectEqual(
+        compare_handoff.promptMaxOffset(prompt, narrow_prompt_size),
+        app.pages.compare.ai_review_handoff.ready().?.viewport.top_visual_row,
+    );
+    var narrow_surface: chasen.testing.TestSurface = undefined;
+    try narrow_surface.init(narrow.width, narrow.height);
+    defer narrow_surface.deinit();
+    try app.view(&narrow_surface.surface);
+    try app_test_support.expectSnapshotContains(&narrow_surface, "Head OID:");
+
+    try app.update(.{ .terminal_resized = wide }, &tc.ctx);
+    const wide_prompt_size = compare_view.aiReviewHandoffPromptSize(app_shell_layout.contentSize(wide));
+    try std.testing.expectEqual(compare_handoff.PromptSize{ .width = 74, .height = 16 }, wide_prompt_size);
+    try std.testing.expectEqual(
+        compare_handoff.promptMaxOffset(prompt, wide_prompt_size),
+        app.pages.compare.ai_review_handoff.ready().?.viewport.top_visual_row,
+    );
+    var wide_surface: chasen.testing.TestSurface = undefined;
+    try wide_surface.init(wide.width, wide.height);
+    defer wide_surface.deinit();
+    try app.view(&wide_surface.surface);
+    try app_test_support.expectSnapshotContains(&wide_surface, "Head OID:");
 }
 
 test "amend confirmation chrome follows amend role override" {

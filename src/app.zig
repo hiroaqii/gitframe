@@ -19,7 +19,6 @@ const shell_input = @import("app/shell_input.zig");
 const app_shell_layout = @import("app/shell_layout.zig");
 const compare_page = @import("app/pages/compare.zig");
 const compare_coordinator = @import("app/pages/compare/coordinator.zig");
-const compare_ai_review_submission = @import("app/pages/compare/ai_review_submission.zig");
 const compare_input = @import("app/pages/compare/input.zig");
 const ai_reviews_page = @import("app/pages/ai_reviews.zig");
 const ai_reviews_coordinator = @import("app/pages/ai_reviews/coordinator.zig");
@@ -145,6 +144,9 @@ pub const App = struct {
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     env_map: ?*std.process.Environ.Map = null,
+    /// Absolute running executable path borrowed from the startup arena.
+    /// Failure to resolve it is represented by `null` in the handoff modal.
+    executable_path: ?[]const u8 = null,
     /// Set immediately before handing terminal ownership to Chasen teardown.
     /// The event loop normally stops at once; retaining the bit also makes the
     /// transition matrix total for direct/future Session API requests.
@@ -216,9 +218,8 @@ pub const App = struct {
         self.human_review_sessions.deinit();
     }
 
-    /// Takes one fully owned, independently rooted review request. The Compare
-    /// submission UI is added by the following slice; this is its sole App
-    /// admission boundary.
+    /// Temporary hosted-runtime admission retained until the deletion slice.
+    /// The Compare UI no longer calls this boundary.
     pub fn enqueueAiReview(
         self: *App,
         ctx: *chasen.Ctx(Msg),
@@ -232,13 +233,6 @@ pub const App = struct {
 
     pub fn cancelAiReview(self: *App, key: ai_review_job.Key) bool {
         return self.ai_review_jobs.cancel(key);
-    }
-
-    fn submitCompareAiReview(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        switch (self.compareAiReviewSubmission().submit(ctx.allocator())) {
-            .accepted => self.pumpAiReviewJobs(ctx),
-            .ignored, .rejected => {},
-        }
     }
 
     /// Prepare, checked-admit, and infallibly track the current session's
@@ -494,19 +488,8 @@ pub const App = struct {
             .layout = .{ .width = body_size.width, .height = body_size.height },
             .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
             .env_map = self.env_map,
-        };
-    }
-
-    fn compareAiReviewSubmission(self: *App) compare_ai_review_submission.Controller {
-        return .{
-            .page = &self.pages.compare,
-            .repo = self.repoSessionView(),
-            .store = if (self.configured_review_store) |*value| value else null,
-            .codex_executable = self.user_config.ai_review.codex_executable,
-            .codex_model = self.user_config.ai_review.codex_model,
-            .limits = self.user_config.ai_review.limits,
-            .env_map = self.env_map,
-            .jobs = &self.ai_review_jobs,
+            .executable_path = self.executable_path,
+            .handoff_overlay_size = self.shellLayout().contentSize(),
         };
     }
 
@@ -714,6 +697,10 @@ pub const App = struct {
                 .ai_reviews_activation_id = self.pages.ai_reviews.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = self.localWorkflowView().commitPanelInstanceId(),
+                .compare_ai_review_handoff = if (self.pages.compare.ai_review_handoff.currentCopyAuthority()) |authority| .{
+                    .modal_instance_id = authority.modal_instance_id,
+                    .copy_generation = authority.copy_generation,
+                } else null,
             },
             .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
@@ -733,6 +720,7 @@ pub const App = struct {
                 .changes = &self.pages.changes.status,
                 .repository = &self.pages.repository.status,
                 .compare = &self.pages.compare.status,
+                .compare_ai_review_handoff = self.pages.compare.ai_review_handoff.statusMessage(),
                 .ai_reviews = &self.pages.ai_reviews.status,
             },
             .redraw = .{ .skip_requested = &self.redraw_plan.skip_requested },
@@ -828,6 +816,7 @@ pub const App = struct {
                 }
                 self.pages.repository.cancelMouseOwner();
                 self.terminal_size = size;
+                self.compareCoordinator().clampAiReviewHandoffViewport();
                 self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
                     self.changesNavigation().clearMouseDiffSelection();
@@ -1532,7 +1521,6 @@ pub const App = struct {
                 .selection_generation = effect.selection_generation,
             });
         }
-        if (outcome.takeAiReviewStart()) self.submitCompareAiReview(ctx);
         return auto_scroll;
     }
 
@@ -1903,8 +1891,6 @@ pub const App = struct {
                 .root_identity = repo_view.activeIdentity(),
                 .layout = .{ .width = body_size.width, .height = body_size.height },
                 .keymap = self.keymap,
-                .codex_configured = self.user_config.ai_review.codex_executable != null,
-                .codex_model = self.user_config.ai_review.codex_model,
             },
             .ai_reviews = .{
                 .page = &self.pages.ai_reviews,
@@ -2059,7 +2045,7 @@ pub const App = struct {
                     .base_picker_open = self.pages.compare.base_picker.open,
                     .base_picker_query_mode = self.pages.compare.base_picker.input_mode == .query,
                     .base_picker_query_len = self.pages.compare.base_picker.query.len,
-                    .ai_review_modal_open = self.pages.compare.ai_review_modal.open,
+                    .ai_review_handoff_open = self.pages.compare.ai_review_handoff.open,
                 },
                 .selection_owner = &self.pages.compare.diff.selection_owner,
                 .loaded = compare_navigation_view.view().activeLoadedDiffConst(),

@@ -5,12 +5,18 @@ const chasen = @import("chasen");
 const app_load = @import("../../load.zig");
 const app_message = @import("../../message.zig");
 const repo_session = @import("../../repo_session.zig");
+const committed_review = @import("../../../committed_review.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
+const diff_basis = @import("../../diff_basis.zig");
+const effect_origin = @import("../../effect_origin.zig");
 const compare_page = @import("../compare.zig");
 const compare_input = @import("input.zig");
+const compare_view = @import("view.zig");
 const committed_diff_navigation = @import("../committed_diff/navigation.zig");
 const committed_diff_coordinator = @import("../committed_diff/coordinator.zig");
+const root_capability = @import("../../../repo/root_capability.zig");
+const repo_discovery = @import("../../../repo/discovery.zig");
 
 const CompareLoadTask = app_load.CompareLoadTask(app_message.Msg);
 const BranchListTask = app_load.CompareBranchListLoadTask(app_message.Msg);
@@ -20,7 +26,6 @@ pub const ClipboardEffect = committed_diff_coordinator.ClipboardEffect;
 pub const UpdateOutcome = struct {
     clipboard: ?ClipboardEffect = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
-    start_ai_review: bool = false,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -32,12 +37,6 @@ pub const UpdateOutcome = struct {
         self.clipboard = null;
         return effect;
     }
-
-    pub fn takeAiReviewStart(self: *UpdateOutcome) bool {
-        const requested = self.start_ai_review;
-        self.start_ai_review = false;
-        return requested;
-    }
 };
 
 pub const Controller = struct {
@@ -46,6 +45,8 @@ pub const Controller = struct {
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
     env_map: ?*std.process.Environ.Map,
+    executable_path: ?[]const u8 = null,
+    handoff_overlay_size: chasen.Size = .{ .width = 0, .height = 0 },
 
     pub fn navigation(self: Controller) committed_diff_navigation.Controller {
         return .{
@@ -94,14 +95,13 @@ pub const Controller = struct {
             .base_picker_previous => self.page_state.base_picker.moveSelection(-1),
             .base_picker_next => self.page_state.base_picker.moveSelection(1),
             .choose_base => if (try self.page_state.chooseBasePickerTarget(ctx.allocator())) try self.refresh(ctx),
-            .open_ai_review => self.page_state.beginAiReviewModal(),
-            .close_ai_review => self.page_state.closeAiReviewModal(),
-            .submit_ai_review => return .{ .start_ai_review = true },
-            .ai_review_context_insert => |codepoint| self.page_state.ai_review_modal.insert(codepoint),
-            .ai_review_context_paste => |text| self.page_state.ai_review_modal.paste(text),
-            .ai_review_context_backspace => self.page_state.ai_review_modal.backspace(),
-            .ai_review_context_move_left => self.page_state.ai_review_modal.moveLeft(),
-            .ai_review_context_move_right => self.page_state.ai_review_modal.moveRight(),
+            .open_ai_review_handoff => self.openAiReviewHandoff(ctx.allocator()),
+            .close_ai_review_handoff => self.page_state.closeAiReviewHandoff(ctx.allocator()),
+            .copy_ai_review_handoff => return self.copyAiReviewHandoff(),
+            .scroll_ai_review_handoff => |action| self.page_state.ai_review_handoff.scroll(
+                action,
+                compare_view.aiReviewHandoffPromptSize(self.handoff_overlay_size),
+            ),
         }
         return .{};
     }
@@ -230,6 +230,12 @@ pub const Controller = struct {
         self.page_state.base_picker.prepareModalRedraw(io);
     }
 
+    pub fn clampAiReviewHandoffViewport(self: Controller) void {
+        self.page_state.ai_review_handoff.clampViewport(
+            compare_view.aiReviewHandoffPromptSize(self.handoff_overlay_size),
+        );
+    }
+
     fn startBasePicker(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         const request = self.page_state.beginBasePicker(ctx.allocator()) orelse return;
         const capability = self.repo.activeCapability() orelse {
@@ -258,15 +264,194 @@ pub const Controller = struct {
     }
 
     fn commonCoordinator(self: Controller) committed_diff_coordinator.Controller {
-        const identity = self.page_state.activation.currentIdentity();
         return .{
             .navigation = self.navigation(),
-            .effect_origin = .{
-                .page_id = .compare,
-                .repo_epoch = if (identity) |value| value.repo_epoch else self.repo.epoch(),
-                .activation_id = if (identity) |value| value.activation_id else self.page_state.activation.next_activation_id,
-            },
+            .effect_origin = self.pageOrigin(),
             .branch_unavailable_message = "branch switching is not available in Compare",
         };
     }
+
+    fn openAiReviewHandoff(self: Controller, allocator: std.mem.Allocator) void {
+        const repository_path = self.validRepositoryPath();
+        const target = if (repository_path != null) self.acceptedTarget() else null;
+        self.page_state.beginAiReviewHandoff(allocator, .{
+            .executable_path = self.executable_path,
+            .repository_path = repository_path,
+            .target = target,
+        });
+    }
+
+    fn copyAiReviewHandoff(self: Controller) UpdateOutcome {
+        const copy = self.page_state.ai_review_handoff.beginCopy() orelse return .{};
+        return .{ .clipboard = .{
+            .origin = .{ .compare_ai_review_handoff = .{
+                .page = self.pageOrigin(),
+                .modal_instance_id = copy.modal_instance_id,
+                .copy_generation = copy.copy_generation,
+            } },
+            .label = "AI review handoff prompt",
+            .text = copy.prompt,
+        } };
+    }
+
+    fn validRepositoryPath(self: Controller) ?[]const u8 {
+        const repository_path = self.repo.activeRoot() orelse return null;
+        const identity = self.repo.activeIdentity() orelse return null;
+        const capability = self.repo.activeCapability() orelse return null;
+        if (!capability.identity.eql(identity) or !root_capability.pathMatches(repository_path, identity)) return null;
+        return repository_path;
+    }
+
+    fn acceptedTarget(self: Controller) ?@import("../../../committed_review.zig").CommittedReviewTarget {
+        const identity = self.repo.activeIdentity() orelse return null;
+        const accepted_repository = self.page_state.diff.accepted_repository_identity orelse return null;
+        if (!accepted_repository.matches(self.repo.epoch(), identity) or !self.page_state.hasAcceptedDisplay()) return null;
+        const basis = self.page_state.basis orelse return null;
+        const selected_base = self.page_state.base_target orelse return null;
+        if (selected_base.kind != basis.base.kind or
+            !std.mem.eql(u8, selected_base.full_ref, basis.base.full_ref)) return null;
+        basis.target.validate() catch return null;
+        return basis.target;
+    }
+
+    fn pageOrigin(self: Controller) effect_origin.PageOrigin {
+        const identity = self.page_state.activation.currentIdentity();
+        return .{
+            .page_id = .compare,
+            .repo_epoch = if (identity) |value| value.repo_epoch else self.repo.epoch(),
+            .activation_id = if (identity) |value| value.activation_id else self.page_state.activation.next_activation_id,
+        };
+    }
 };
+
+fn handoffTestTarget() committed_review.CommittedReviewTarget {
+    const base = committed_review.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111") catch unreachable;
+    const head = committed_review.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222") catch unreachable;
+    return .{
+        .object_format = .sha1,
+        .source_kind = .branch_range,
+        .base_oid = base,
+        .head_oid = head,
+        .diff_base_oid = base,
+    };
+}
+
+fn handoffTestDiscovery(allocator: std.mem.Allocator, repository_path: []const u8) !repo_discovery.DiscoveryResult {
+    const label = try allocator.dupe(u8, "repo");
+    errdefer allocator.free(label);
+    const display_path = try allocator.dupe(u8, repository_path);
+    errdefer allocator.free(display_path);
+    return .{ .single_repo = .{
+        .label = label,
+        .display_path = display_path,
+        .canonical_root = try allocator.dupe(u8, repository_path),
+    } };
+}
+
+fn handoffTestBasis(allocator: std.mem.Allocator, target: committed_review.CommittedReviewTarget) !diff_basis.BranchDiffBasis {
+    const full_ref = try allocator.dupe(u8, "refs/heads/main");
+    errdefer allocator.free(full_ref);
+    const display_name = try allocator.dupe(u8, "main");
+    errdefer allocator.free(display_name);
+    return .{
+        .base = .{
+            .full_ref = full_ref,
+            .display_name = display_name,
+            .kind = .local,
+        },
+        .head_display = try allocator.dupe(u8, "feature"),
+        .target = target,
+        .ahead_count = 1,
+    };
+}
+
+fn handoffTestBaseTarget(allocator: std.mem.Allocator) !diff_basis.BaseTarget {
+    const full_ref = try allocator.dupe(u8, "refs/heads/main");
+    errdefer allocator.free(full_ref);
+    return .{
+        .full_ref = full_ref,
+        .display_name = try allocator.dupe(u8, "main"),
+        .kind = .local,
+    };
+}
+
+test "AI Review Handoff coordinator admits one exact accepted target and rejects stale or absent targets" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(repository_path);
+
+    var session: repo_session.State = .{};
+    defer session.deinit(allocator);
+    session.repo_epoch = 7;
+    session.repo_state.discovery = try handoffTestDiscovery(allocator, repository_path);
+    session.repo_state.root = try root_capability.RootCapability.openCanonical(repository_path);
+
+    const target = handoffTestTarget();
+    var page_state: compare_page.ComparePageState = .{};
+    defer page_state.deinit(allocator);
+    _ = page_state.activate(session.repo_epoch);
+    page_state.diff.load.state = .{ .empty = .no_changes };
+    page_state.diff.accepted_repository_identity = .{
+        .repo_epoch = session.repo_epoch,
+        .root_identity = session.repo_state.root.?.identity,
+    };
+    page_state.basis = try handoffTestBasis(allocator, target);
+    page_state.base_target = try handoffTestBaseTarget(allocator);
+
+    const controller: Controller = .{
+        .page_state = &page_state,
+        .repo = session.view(),
+        .layout = .{ .width = 120, .height = 32 },
+        .env_map = null,
+        .executable_path = "/opt/gitframe/bin/gitframe",
+        .handoff_overlay_size = .{ .width = 120, .height = 32 },
+    };
+    var test_context: chasen.testing.TestCtx(app_message.Msg) = .{};
+    defer test_context.resetTransient();
+
+    var opened = try controller.update(&test_context.ctx, .open_ai_review_handoff);
+    opened.deinit(allocator);
+    const ready = page_state.ai_review_handoff.ready().?;
+    try std.testing.expect(ready.snapshot.target.eql(&target));
+    const expected_prompt = try allocator.dupe(u8, ready.snapshot.canonical_prompt);
+    defer allocator.free(expected_prompt);
+
+    page_state.basis.?.target.head_oid = target.base_oid;
+    var copied = try controller.update(&test_context.ctx, .copy_ai_review_handoff);
+    const effect = copied.clipboard.?;
+    try std.testing.expectEqualStrings(expected_prompt, effect.text);
+    try std.testing.expect(effect.text.ptr == page_state.ai_review_handoff.ready().?.snapshot.canonical_prompt.ptr);
+    switch (effect.origin) {
+        .compare_ai_review_handoff => |origin| {
+            try std.testing.expectEqual(page_state.ai_review_handoff.instance_id, origin.modal_instance_id);
+            try std.testing.expectEqual(@as(u64, 1), origin.copy_generation);
+        },
+        else => return error.ExpectedHandoffClipboardOrigin,
+    }
+    copied.deinit(allocator);
+
+    page_state.diff.accepted_repository_identity.?.repo_epoch += 1;
+    var stale = try controller.update(&test_context.ctx, .open_ai_review_handoff);
+    stale.deinit(allocator);
+    try std.testing.expectEqual(
+        @import("ai_review_handoff.zig").UnavailableReason.comparison_unavailable_or_stale,
+        page_state.ai_review_handoff.unavailableReason().?,
+    );
+    try std.testing.expect(page_state.ai_review_handoff.ready() == null);
+
+    page_state.diff.accepted_repository_identity.?.repo_epoch = session.repo_epoch;
+    const owned_basis = page_state.basis.?;
+    page_state.basis = null;
+    var absent = try controller.update(&test_context.ctx, .open_ai_review_handoff);
+    absent.deinit(allocator);
+    try std.testing.expectEqual(
+        @import("ai_review_handoff.zig").UnavailableReason.comparison_unavailable_or_stale,
+        page_state.ai_review_handoff.unavailableReason().?,
+    );
+    page_state.basis = owned_basis;
+}

@@ -59,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
 
     const palette = gitframe.theme.Palette.fromConfig(user_config.theme);
     const effective_keymap = gitframe.keymap.Effective.fromConfig(user_config.keymap);
+    const executable_path = std.process.executablePathAlloc(init.io, arena) catch null;
 
     if (config.stats_summary) {
         var summary: StatsSummary = .{};
@@ -88,6 +89,7 @@ pub fn main(init: std.process.Init) !void {
             },
             .keymap = effective_keymap,
             .theme = palette,
+            .executable_path = executable_path,
         });
         try printStatsSummary(init.io, summary);
         return;
@@ -117,6 +119,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .keymap = effective_keymap,
         .theme = palette,
+        .executable_path = executable_path,
     });
 }
 

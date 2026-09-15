@@ -204,7 +204,7 @@ pub const View = struct {
 
         if ((self.active_page == .changes and (self.changes.key.search_mode or self.changes.key.file_search_mode)) or
             (self.active_page == .compare and (self.compare.key.common.search_mode or self.compare.key.common.file_search_mode or
-                self.compare.key.base_picker_open or self.compare.key.ai_review_modal_open)) or
+                self.compare.key.base_picker_open or self.compare.key.ai_review_handoff_open)) or
             (self.active_page == .ai_reviews and (self.ai_reviews.key.common.search_mode or self.ai_reviews.key.common.file_search_mode or
                 self.ai_reviews.key.picker_open)) or
             (self.active_page == .repository and (self.repository.key.source_search_mode or self.repository.key.file_search_mode)) or

@@ -106,6 +106,7 @@ pub const DiagnosticPorts = struct {
     changes: *app_state.StatusMessage,
     repository: *app_state.StatusMessage,
     compare: *app_state.StatusMessage,
+    compare_ai_review_handoff: ?*app_state.StatusMessage = null,
     ai_reviews: *app_state.StatusMessage,
 };
 
@@ -352,7 +353,7 @@ pub const Controller = struct {
                         .origin = origin,
                         .generation = generation,
                     },
-                    .shell_surface => {},
+                    .shell_surface, .compare_ai_review_handoff => {},
                 };
             },
             .unsupported_runtime => self.setEffectStatus(pending.origin, "clipboard copy unavailable: {s}", .{pending.label}),
@@ -377,6 +378,8 @@ pub const Controller = struct {
                 .config => self.diagnostics.shell.set(fmt, args),
             },
             .shell_surface => self.diagnostics.shell.set(fmt, args),
+            .compare_ai_review_handoff => if (self.diagnostics.compare_ai_review_handoff) |status|
+                status.set(fmt, args),
         }
     }
 };

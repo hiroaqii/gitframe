@@ -214,8 +214,8 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.active_page == .compare and app.compare.page.base_picker.open) {
         try compare_view.viewBasePicker(app.compare, surface);
     }
-    if (app.active_page == .compare and app.compare.page.ai_review_modal.open) {
-        try compare_view.viewAiReviewModal(app.compare, surface);
+    if (app.active_page == .compare and app.compare.page.ai_review_handoff.open) {
+        try compare_view.viewAiReviewHandoff(app.compare, surface);
     }
     if (app.active_page == .ai_reviews and app.ai_reviews.page.picker.isPickerVisible()) {
         try ai_reviews_view.viewPicker(app.ai_reviews, surface);
@@ -556,7 +556,7 @@ const FooterProjection = struct {
 /// drift away from the mouse hit target.
 pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     if (app.command_line != null) return null;
-    if (app.active_page == .compare and app.compare.page.ai_review_modal.open) return null;
+    if (app.active_page == .compare and app.compare.page.ai_review_handoff.open) return null;
     if (app.active_page == .ai_reviews and
         (app.ai_reviews.page.picker.isPickerVisible() or app.ai_reviews.page.human_review_decision.isOpen())) return null;
     if (width == 0 or app.active_page == .config) return null;
@@ -2016,8 +2016,8 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         .compare => {
             const footer = app.compare.footer();
             if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open or
-                app.compare.page.ai_review_modal.open) return result;
-            appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'a' }, "a", "AI review", .ai_review_select);
+                app.compare.page.ai_review_handoff.open) return result;
+            appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'a' }, "a", "AI handoff", .ai_review_select);
             appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "base", .compare_base);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);

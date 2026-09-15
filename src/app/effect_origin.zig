@@ -25,9 +25,21 @@ pub const ShellSurfaceOrigin = struct {
     instance_id: u64,
 };
 
+pub const CompareAiReviewHandoffOrigin = struct {
+    page: PageOrigin,
+    modal_instance_id: u64,
+    copy_generation: u64,
+};
+
+pub const CompareAiReviewHandoffAuthority = struct {
+    modal_instance_id: u64,
+    copy_generation: u64,
+};
+
 pub const Origin = union(enum) {
     page: PageOrigin,
     shell_surface: ShellSurfaceOrigin,
+    compare_ai_review_handoff: CompareAiReviewHandoffOrigin,
 };
 
 pub const Liveness = enum {
@@ -47,21 +59,12 @@ pub const Snapshot = struct {
     ai_reviews_activation_id: u64,
     push_error_instance_id: ?u64,
     commit_panel_instance_id: ?u64,
+    compare_ai_review_handoff: ?CompareAiReviewHandoffAuthority = null,
 };
 
 pub fn classify(origin: Origin, current: Snapshot) Liveness {
     return switch (origin) {
-        .page => |captured| blk: {
-            const activation_matches = switch (captured.page_id) {
-                .changes => captured.activation_id == current.changes_activation_id,
-                .repository => captured.activation_id == current.repository_activation_id,
-                .compare => captured.activation_id == current.compare_activation_id,
-                .ai_reviews => captured.activation_id == current.ai_reviews_activation_id,
-                .config => true,
-            };
-            if (captured.repo_epoch != current.repo_epoch or !activation_matches) break :blk .stale;
-            break :blk if (captured.page_id == current.active_page) .live_active else .live_inactive;
-        },
+        .page => |captured| classifyPage(captured, current),
         .shell_surface => |captured| blk: {
             const current_instance = switch (captured.surface) {
                 .push_error => current.push_error_instance_id,
@@ -70,7 +73,27 @@ pub fn classify(origin: Origin, current: Snapshot) Liveness {
             if (current_instance == null or current_instance.? != captured.instance_id) break :blk .stale;
             break :blk .live_active;
         },
+        .compare_ai_review_handoff => |captured| blk: {
+            const page_liveness = classifyPage(captured.page, current);
+            if (page_liveness == .stale) break :blk .stale;
+            const authority = current.compare_ai_review_handoff orelse break :blk .stale;
+            if (authority.modal_instance_id != captured.modal_instance_id or
+                authority.copy_generation != captured.copy_generation) break :blk .stale;
+            break :blk page_liveness;
+        },
     };
+}
+
+fn classifyPage(captured: PageOrigin, current: Snapshot) Liveness {
+    const activation_matches = switch (captured.page_id) {
+        .changes => captured.activation_id == current.changes_activation_id,
+        .repository => captured.activation_id == current.repository_activation_id,
+        .compare => captured.activation_id == current.compare_activation_id,
+        .ai_reviews => captured.activation_id == current.ai_reviews_activation_id,
+        .config => true,
+    };
+    if (captured.repo_epoch != current.repo_epoch or !activation_matches) return .stale;
+    return if (captured.page_id == current.active_page) .live_active else .live_inactive;
 }
 
 test "repository selection inactive page accepts same-instance clipboard completion" {
@@ -140,4 +163,34 @@ test "reopened shell surface rejects prior clipboard completion" {
         Liveness.stale,
         classify(.{ .shell_surface = .{ .surface = .commit_panel, .instance_id = 18 } }, missing),
     );
+}
+
+test "AI Review Handoff origin requires exact modal instance and latest copy generation" {
+    const current: Snapshot = .{
+        .active_page = .compare,
+        .repo_epoch = 4,
+        .changes_activation_id = 9,
+        .repository_activation_id = 5,
+        .compare_activation_id = 6,
+        .ai_reviews_activation_id = 7,
+        .push_error_instance_id = null,
+        .commit_panel_instance_id = null,
+        .compare_ai_review_handoff = .{ .modal_instance_id = 12, .copy_generation = 3 },
+    };
+    const exact: Origin = .{ .compare_ai_review_handoff = .{
+        .page = .{ .page_id = .compare, .repo_epoch = 4, .activation_id = 6 },
+        .modal_instance_id = 12,
+        .copy_generation = 3,
+    } };
+    try @import("std").testing.expectEqual(Liveness.live_active, classify(exact, current));
+
+    var old_instance = exact;
+    old_instance.compare_ai_review_handoff.modal_instance_id = 11;
+    try @import("std").testing.expectEqual(Liveness.stale, classify(old_instance, current));
+    var old_copy = exact;
+    old_copy.compare_ai_review_handoff.copy_generation = 2;
+    try @import("std").testing.expectEqual(Liveness.stale, classify(old_copy, current));
+    var closed = current;
+    closed.compare_ai_review_handoff = null;
+    try @import("std").testing.expectEqual(Liveness.stale, classify(exact, closed));
 }
