@@ -88,7 +88,6 @@ pub const View = struct {
     repo_picker_mode: bool,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode,
     remote_action_cancelable: bool = false,
-    ai_review_terminal_visible: bool = false,
     command_line_active: bool = false,
     repository_command_available: bool = false,
     keymap: keymap.Effective,
@@ -119,12 +118,9 @@ pub const View = struct {
             .amend_confirmation_mode = self.overlay.isAmendCommit(),
             .push_confirmation_mode = self.overlay.isPushBranch(),
             .pull_confirmation_mode = self.overlay.isPullBranch(),
-            .ai_review_quit_confirmation_mode = self.overlay.isQuitAiReviews(),
             .branch_switch_mode = self.overlay.isSwitchBranch(),
             .push_error_mode = self.overlay.isPushError(),
             .remote_action_cancelable = self.remote_action_cancelable,
-            .ai_review_terminal_visible = self.ai_review_terminal_visible,
-            .ai_review_details_open = self.overlay.isAiReviewDetails(),
             .active_selection_gesture = if (self.activeDiffSelectionOwner()) |selection| selection.active() else self.active_page == .repository and self.repository.page_state.activeMouseOwner(),
             .command_line_active = self.command_line_active,
             .repository_command_available = self.repository_command_available,
@@ -133,11 +129,6 @@ pub const View = struct {
     }
 
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
-        if (self.overlay.isAiReviewDetails()) return if (mouse.type == .press) switch (mouse.button) {
-            .wheel_up => .{ .ai_review_details = .up },
-            .wheel_down => .{ .ai_review_details = .down },
-            else => null,
-        } else null;
         if (self.command_line_active) return null;
         if (self.active_page == .ai_reviews and self.ai_reviews.key.human_review.open) return null;
         if (self.activeDiffSelectionOwner()) |selection| {
@@ -552,23 +543,6 @@ test "human review result modal blocks mouse routing while Repository Help scrol
         .mods = .{},
         .type = .press,
     } }) == null);
-    overlay.kind = .{ .ai_review_details = .{ .key = .{ .id = 1, .generation = 2 } } };
-    try std.testing.expectEqual(.down, modal_view.handleEvent(.{ .mouse = .{
-        .col = 2,
-        .row = 2,
-        .button = .wheel_down,
-        .mods = .{},
-        .type = .press,
-    } }).?.ai_review_details);
-    inline for (.{ .press, .drag, .release }) |event_type| {
-        try std.testing.expect(modal_view.handleEvent(.{ .mouse = .{
-            .col = 2,
-            .row = 2,
-            .button = .left,
-            .mods = .{},
-            .type = event_type,
-        } }) == null);
-    }
 }
 
 test "Finding pointer shell preserves the AI Reviews body point and button once" {

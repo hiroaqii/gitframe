@@ -113,7 +113,6 @@ pub fn executeAlloc(
 
     // Preserve the command adapter's established validation order: malformed
     // projection bytes are rejected before the repository path is consulted.
-    // The hosted path calls `planAlloc` directly and parses only once.
     {
         var validation_arena = std.heap.ArenaAllocator.init(allocator);
         defer validation_arena.deinit();

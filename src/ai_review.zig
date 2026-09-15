@@ -10,11 +10,6 @@ pub const store_service = @import("ai_review/store_service.zig");
 pub const store_read_command = @import("ai_review/store_read_command.zig");
 pub const maintenance_command = @import("ai_review/maintenance_command.zig");
 pub const result_read_command = @import("ai_review/result_read_command.zig");
-pub const codex_adapter = @import("ai_review/adapters/codex/adapter.zig");
-pub const codex_environment = @import("ai_review/adapters/codex/environment.zig");
-pub const runner = @import("ai_review/runner.zig");
-pub const job = @import("ai_review/job.zig");
-pub const job_owner = @import("ai_review/job_owner.zig");
 
 pub const ReviewPlanSummary = protocol.ReviewPlanSummary;
 pub const ReviewUnit = protocol.ReviewUnit;
@@ -38,9 +33,4 @@ test {
     _ = store_read_command;
     _ = result_read_command;
     _ = maintenance_command;
-    _ = codex_adapter;
-    _ = codex_environment;
-    _ = runner;
-    _ = job;
-    _ = job_owner;
 }

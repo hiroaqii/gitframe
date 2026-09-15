@@ -16,8 +16,6 @@ pub const OverlayKind = union(enum) {
     pull_branch,
     switch_branch,
     push_error,
-    quit_ai_reviews,
-    ai_review_details: @import("ai_review_diagnostics.zig").Selection,
 };
 
 pub const OverlayMouseMode = enum {
@@ -40,10 +38,6 @@ pub const OverlayState = struct {
     /// Async results captured by an older surface must not present in a newer
     /// popup merely because both have the same overlay kind.
     push_error_instance_id: u64 = 0,
-
-    pub fn isAiReviewDetails(self: OverlayState) bool {
-        return self.kind == .ai_review_details;
-    }
 
     pub fn isHelp(self: OverlayState) bool {
         return self.kind == .help;
@@ -73,17 +67,12 @@ pub const OverlayState = struct {
         return self.kind == .push_error;
     }
 
-    pub fn isQuitAiReviews(self: OverlayState) bool {
-        return self.kind == .quit_ai_reviews;
-    }
-
     pub fn mouseMode(self: OverlayState) OverlayMouseMode {
         return switch (self.kind) {
             .none => .passthrough,
             .help => .scroll_help,
             .push_error => .scroll_push_error,
-            .ai_review_details => .block,
-            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch, .quit_ai_reviews => .block,
+            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch => .block,
         };
     }
 
@@ -128,11 +117,6 @@ pub const OverlayState = struct {
         self.kind = .push_error;
         self.owner_page = .changes;
         self.push_error_scroll = 0;
-    }
-
-    pub fn openQuitAiReviews(self: *OverlayState, owner_page: page.Id) void {
-        self.kind = .quit_ai_reviews;
-        self.owner_page = owner_page;
     }
 
     pub fn close(self: *OverlayState) void {

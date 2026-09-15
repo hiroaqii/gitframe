@@ -46,10 +46,6 @@ const workflow_remote = @import("app/workflow/remote.zig");
 const shell_effects = @import("app/shell_effects.zig");
 const human_review_session_mod = @import("app/human_review_session.zig");
 const review_store_operations_mod = @import("app/review_store_operations.zig");
-const ai_review_jobs_mod = @import("app/ai_review_jobs.zig");
-const ai_review_job = @import("ai_review/job.zig");
-const ai_review_job_owner = @import("ai_review/job_owner.zig");
-const ai_review_pipeline = @import("ai_review/runner.zig");
 const context = @import("context.zig");
 const config_mod = @import("config.zig");
 const diff_surface = @import("app/diff_surface.zig");
@@ -165,13 +161,9 @@ pub const App = struct {
     shell_effects_state: shell_effects.State = .{},
     human_review_sessions: human_review_session_mod.Owner = .{},
     review_store_operations: review_store_operations_mod.Owner = .{},
-    ai_review_jobs: ai_review_job_owner.Owner = .{},
     /// Retains the user's quit intent after Store drain success until the
     /// existing Git action lifecycle is also terminal.
     quit_after_store_drain: bool = false,
-    /// Retains confirmed quit intent until AI work is terminal and downstream
-    /// quit handling either accepts the intent or requests teardown.
-    quit_after_ai_review_jobs: bool = false,
     drag_auto_scroll: drag_auto_scroll.State = .{},
     command_session: CommandSession = .inactive,
 
@@ -214,25 +206,7 @@ pub const App = struct {
         self.remote_workflow.deinit(deinit_ctx.allocator);
         self.shell_effects_state.deinit(deinit_ctx.allocator);
         self.review_store_operations.deinit(deinit_ctx.allocator);
-        self.ai_review_jobs.deinit();
         self.human_review_sessions.deinit();
-    }
-
-    /// Temporary hosted-runtime admission retained until the deletion slice.
-    /// The Compare UI no longer calls this boundary.
-    pub fn enqueueAiReview(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-        scope: ai_review_job.Scope,
-        request: ai_review_pipeline.Request,
-    ) ai_review_job_owner.Admission {
-        const admission = self.ai_review_jobs.enqueue(scope, request);
-        self.pumpAiReviewJobs(ctx);
-        return admission;
-    }
-
-    pub fn cancelAiReview(self: *App, key: ai_review_job.Key) bool {
-        return self.ai_review_jobs.cancel(key);
     }
 
     /// Prepare, checked-admit, and infallibly track the current session's
@@ -516,7 +490,7 @@ pub const App = struct {
                 .help = self.overlay.isHelp(),
                 .commit_input = self.localWorkflowView().commitPanelOpen(),
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
-                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isQuitAiReviews() or self.overlay.isAiReviewDetails() or
+                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or
                     self.pages.ai_reviews.delete_confirmation.isOpen(),
                 .branch_switch = self.overlay.isSwitchBranch(),
                 .push_error = self.overlay.isPushError(),
@@ -887,7 +861,6 @@ pub const App = struct {
                     self.redraw_plan.requestSkip();
                 }
             },
-            .ai_review_job => |message| self.finishAiReviewJob(ctx, message),
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
             .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
             .ai_reviews => |ai_reviews_msg| _ = try self.updateAiReviews(ctx, ai_reviews_msg),
@@ -1014,10 +987,6 @@ pub const App = struct {
             },
             .git_action_spinner_tick => if (self.actionLifecycle().tick(ctx)) self.redraw_plan.requestSkip(),
             .cancel_remote_action => _ = self.remoteWorkflow().cancelActiveRemote(false),
-            .ai_review_details => |action| self.updateAiReviewDetails(action),
-            .dismiss_ai_review_status => _ = self.ai_review_jobs.dismissSelectedTerminal(),
-            .confirm_ai_review_quit => self.confirmAiReviewQuit(ctx),
-            .cancel_ai_review_quit => if (self.overlay.isQuitAiReviews()) self.overlay.close(),
             .quit => {
                 self.drag_auto_scroll.clear();
                 self.requestQuit(ctx);
@@ -1030,7 +999,6 @@ pub const App = struct {
         try self.changesRead().maybeStartQueuedRevalidation(ctx);
         try self.repositoryCoordinator().startPending(ctx);
         self.reconcileCommandLine();
-        self.clampAiReviewDetails();
         const revalidation_queued_before_projection = self.changesRead().hasQueuedFullRevalidation();
         if (self.active_page == .changes) try self.changesRead().ensureProjection(ctx);
         // Boundary inert retention queues its repair revalidation inside
@@ -1045,8 +1013,6 @@ pub const App = struct {
         }
         self.actionLifecycle().reconcileSpinner(ctx);
         self.pumpReviewStoreOperations(ctx);
-        self.pumpAiReviewJobs(ctx);
-        self.resumeQuitAfterAiReviewJobs(ctx);
         self.resumeQuitAfterStoreDrain(ctx);
         if (!self.redraw_plan.resolvesToSkip() and self.active_page == .ai_reviews) {
             self.aiReviewsCoordinator().ensureFindingPresentationCache();
@@ -1071,23 +1037,13 @@ pub const App = struct {
             self.setStatus("finish current git action before quitting", .{});
             return;
         }
-        if (self.ai_review_jobs.requestQuit() == .confirmation_required) {
-            if (self.quit_after_ai_review_jobs) {
-                self.setStatus("finishing AI review before quitting", .{});
-            } else {
-                self.overlay.openQuitAiReviews(self.active_page);
-            }
-            return;
-        }
         switch (self.review_store_operations.requestQuit()) {
             .ready => {
-                self.quit_after_ai_review_jobs = false;
                 self.quit_after_store_drain = false;
                 self.teardown_requested = true;
                 ctx.quit();
             },
             .draining => {
-                self.quit_after_ai_review_jobs = false;
                 self.quit_after_store_drain = true;
                 // Store scans/selections are read generations, not accepted
                 // mutations. Invalidate them while retaining the selected
@@ -1116,30 +1072,6 @@ pub const App = struct {
             }
             self.setStatus("could not start AI review save", .{});
         };
-    }
-
-    fn pumpAiReviewJobs(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        _ = ai_review_jobs_mod.pump(Msg, &self.ai_review_jobs, ctx);
-    }
-
-    fn finishAiReviewJob(self: *App, ctx: *chasen.Ctx(Msg), message: ai_review_jobs_mod.Msg) void {
-        _ = ai_review_jobs_mod.update(Msg, &self.ai_review_jobs, message, ctx);
-    }
-
-    fn resumeQuitAfterAiReviewJobs(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        if (!self.quit_after_ai_review_jobs or !self.ai_review_jobs.quitReady()) return;
-        self.requestQuit(ctx);
-    }
-
-    fn confirmAiReviewQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        if (!self.overlay.isQuitAiReviews()) return;
-        self.overlay.close();
-        self.quit_after_ai_review_jobs = true;
-        if (self.ai_review_jobs.confirmQuit()) {
-            self.requestQuit(ctx);
-            return;
-        }
-        self.setStatus("finishing AI review before quitting", .{});
     }
 
     fn enqueuePreparedHumanReviewDraft(
@@ -1618,7 +1550,6 @@ pub const App = struct {
                 },
                 .history_selection => |result| {
                     const outcome = try self.aiReviewsCoordinator().finishHistorySelection(ctx, result);
-                    if (outcome.loaded) self.acknowledgeSelectedAiReviewRun();
                     if (outcome.redraw == .skip) {
                         self.redraw_plan.requestSkip();
                     }
@@ -1636,12 +1567,6 @@ pub const App = struct {
                 .repo_discovery => |result| try self.finishChangesRepoDiscovery(ctx, result),
             },
         }
-    }
-
-    fn acknowledgeSelectedAiReviewRun(self: *App) void {
-        const selected = self.pages.ai_reviews.selectedRunConst() orelse return;
-        const repository = self.repoSessionView().activeIdentity() orelse return;
-        _ = self.ai_review_jobs.acknowledgeRun(repository, selected.binding().review_id);
     }
 
     fn finishActionResult(self: *App, ctx: *chasen.Ctx(Msg), finished: ActionFinishedMsg) !void {
@@ -1916,8 +1841,6 @@ pub const App = struct {
             .action = self.actionLifecycleView(),
             .remote_cancelable = remote.canCancel(self.actionLifecycleView().acceptedPending()),
             .remote_canceling = remote.canceling(),
-            .ai_review_status = self.aiReviewStatusView(),
-            .ai_review_detail = if (self.overlay.isAiReviewDetails()) self.ai_review_jobs.find(self.overlay.kind.ai_review_details.key) else null,
             .status = &self.status,
             .page_status = self.activePageStatus(),
             .command_line = self.commandLineView(),
@@ -2093,70 +2016,12 @@ pub const App = struct {
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
             .remote_action_cancelable = self.remoteWorkflowView().canCancel(self.actionLifecycleView().acceptedPending()),
-            .ai_review_terminal_visible = self.aiReviewTerminalVisible(),
             .command_line_active = self.commandLineView() != null,
             .repository_command_available = self.repositoryCommandAvailable(),
             .keymap = self.keymap,
             .overlay = &self.overlay,
             .layout = layout,
             .footer_status_target = app_view.footerStatusTarget(self.shellViewContext(), layout.footer.width),
-        };
-    }
-
-    fn aiReviewTerminalVisible(self: *const App) bool {
-        if (self.status.text().len > 0 or self.actionLifecycleView().spinnerPresentation() != null) return false;
-        const selected = self.ai_review_jobs.selected() orelse return false;
-        return selected.unread and selected.phase == .terminal;
-    }
-
-    fn updateAiReviewDetails(self: *App, action: @import("app/ai_review_diagnostics.zig").Action) void {
-        if (action == .open) {
-            if (self.overlay.kind != .none or !self.aiReviewTerminalVisible()) return;
-            const record = self.ai_review_jobs.selected() orelse return;
-            self.overlay.kind = .{ .ai_review_details = .{ .key = record.key } };
-            self.overlay.owner_page = self.active_page;
-            return;
-        }
-        if (!self.overlay.isAiReviewDetails()) return;
-        if (action == .close) {
-            self.overlay.close();
-            return;
-        }
-        const selection = &self.overlay.kind.ai_review_details;
-        const record = self.ai_review_jobs.find(selection.key) orelse {
-            self.overlay.close();
-            return;
-        };
-        const viewport = app_view.aiReviewDetailViewport(self.shellLayout().contentSize(), record);
-        selection.scroll = switch (action) {
-            .up => selection.scroll -| 1,
-            .down => selection.scroll +| 1,
-            .page_up => selection.scroll -| @max(viewport.rows, 1),
-            .page_down => selection.scroll +| @max(viewport.rows, 1),
-            .home => 0,
-            .end => viewport.max_scroll,
-            .open, .close => unreachable,
-        };
-        selection.scroll = @min(selection.scroll, viewport.max_scroll);
-    }
-
-    fn clampAiReviewDetails(self: *App) void {
-        if (!self.overlay.isAiReviewDetails()) return;
-        const selection = &self.overlay.kind.ai_review_details;
-        const record = self.ai_review_jobs.find(selection.key) orelse {
-            self.overlay.close();
-            return;
-        };
-        selection.scroll = @min(selection.scroll, app_view.aiReviewDetailViewport(self.shellLayout().contentSize(), record).max_scroll);
-    }
-
-    fn aiReviewStatusView(self: *const App) ?app_view.AiReviewStatus {
-        const record = self.ai_review_jobs.selected() orelse return null;
-        return .{
-            .key = record.key,
-            .scope = record.scope,
-            .phase = record.phase,
-            .repository_basename = record.display.repository.slice(),
         };
     }
 

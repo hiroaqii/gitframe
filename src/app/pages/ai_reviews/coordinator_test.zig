@@ -18,9 +18,6 @@ const diff_view_model = @import("../../../diff/view_model.zig");
 const file_tree = @import("../../../file_tree.zig");
 const finding_card = @import("../../../ai_review/finding_card.zig");
 const finding_projection = @import("../../../ai_review/finding_projection.zig");
-const ai_review_job = @import("../../../ai_review/job.zig");
-const ai_review_pipeline = @import("../../../ai_review/runner.zig");
-const codex_adapter = @import("../../../ai_review/adapters/codex/adapter.zig");
 const git_review = @import("../../../git/committed_review.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
 const git_refs = @import("../../../git/refs.zig");
@@ -1358,7 +1355,6 @@ fn expectDirectRefreshCompletionOrder(
     defer app.pages.ai_reviews.deinit(allocator);
     defer app.configured_review_store.?.deinit(allocator);
     defer app.repo_session.deinit(allocator);
-    defer app.ai_review_jobs.deinit();
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     var unrelated_root = try repo_root_capability.RootCapability.openCanonical(roots.b);
     defer unrelated_root.deinit();
@@ -1395,35 +1391,6 @@ fn expectDirectRefreshCompletionOrder(
     const generation = task.generation;
     const store_identity = task.store.identity();
     AiReviewSelectionTask.destroy(task, allocator);
-
-    const unrelated_review_id = try committed_review.ReviewId.parse("a23e4567-e89b-42d3-a456-426614174000");
-    const matching = try seedPublishedAiReviewTerminal(
-        &app,
-        allocator,
-        &app.repo_session.repo_state.root.?,
-        roots.a,
-        target,
-        review_id,
-    );
-    const unrelated_review = try seedPublishedAiReviewTerminal(
-        &app,
-        allocator,
-        &app.repo_session.repo_state.root.?,
-        roots.a,
-        target,
-        unrelated_review_id,
-    );
-    const unrelated_repository = try seedPublishedAiReviewTerminal(
-        &app,
-        allocator,
-        &unrelated_root,
-        roots.b,
-        target,
-        review_id,
-    );
-    try std.testing.expectEqual(@as(usize, 3), app.ai_review_jobs.retained_count);
-    try std.testing.expect(app.ai_review_jobs.selected().?.key.eql(matching));
-    try std.testing.expect(app.ai_review_jobs.find(matching).?.unread);
 
     try app.update(.{ .switch_page = .config }, &ctx);
     try std.testing.expectEqual(page.Id.config, app.active_page);
@@ -1511,17 +1478,6 @@ fn expectDirectRefreshCompletionOrder(
         .failed_static, .empty, .stale_identity, .stale_generation, .stale_store, .stale_repository => try std.testing.expect(app.pages.ai_reviews.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr == original_manifest_ptr),
     }
 
-    if (result_kind == .loaded) {
-        try std.testing.expectEqual(@as(usize, 2), app.ai_review_jobs.retained_count);
-        try std.testing.expect(app.ai_review_jobs.find(matching) == null);
-    } else {
-        try std.testing.expectEqual(@as(usize, 3), app.ai_review_jobs.retained_count);
-        try std.testing.expect(app.ai_review_jobs.find(matching).?.unread);
-        try std.testing.expect(app.ai_review_jobs.selected().?.key.eql(matching));
-    }
-    try std.testing.expect(app.ai_review_jobs.find(unrelated_review).?.unread);
-    try std.testing.expect(app.ai_review_jobs.find(unrelated_repository).?.unread);
-
     var duplicate: app_load.AiReviewSelectionFinished = .{
         .identity = identity,
         .generation = generation,
@@ -1541,18 +1497,6 @@ fn expectDirectRefreshCompletionOrder(
         .stale_store => duplicate.store_identity.digest[0] ^= 0xff,
         else => {},
     }
-    const replacement_matching = if (result_kind == .loaded)
-        try seedPublishedAiReviewTerminal(
-            &app,
-            allocator,
-            &app.repo_session.repo_state.root.?,
-            roots.a,
-            target,
-            review_id,
-        )
-    else
-        null;
-    const retained_count_before_duplicate = app.ai_review_jobs.retained_count;
     const retained_manifest_ptr = app.pages.ai_reviews.selectedRunConst().?.selection.artifacts.manifest_bytes.ptr;
     ctx.resetRedrawSuppressed();
     try app.update(.{ .load_finished = .{ .ai_reviews = .{ .history_selection = duplicate } } }, &ctx);
@@ -1562,46 +1506,7 @@ fn expectDirectRefreshCompletionOrder(
     if (result_kind == .selection_failed) {
         try std.testing.expectEqualStrings("Could not load AI review: artifacts changed", app.pages.ai_reviews.status.text());
     }
-    try std.testing.expectEqual(retained_count_before_duplicate, app.ai_review_jobs.retained_count);
-    if (replacement_matching) |key| try std.testing.expect(app.ai_review_jobs.find(key).?.unread);
-    try std.testing.expect(app.ai_review_jobs.find(unrelated_review).?.unread);
-    try std.testing.expect(app.ai_review_jobs.find(unrelated_repository).?.unread);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-}
-
-fn seedPublishedAiReviewTerminal(
-    app: *app_root.App,
-    allocator: std.mem.Allocator,
-    root: *const repo_root_capability.RootCapability,
-    repository_path: []const u8,
-    target: committed_review.CommittedReviewTarget,
-    review_id: committed_review.ReviewId,
-) !ai_review_job.Key {
-    const store = if (app.configured_review_store) |*value| value else return error.ExpectedConfiguredStore;
-    const request = try ai_review_pipeline.Request.init(
-        allocator,
-        root.*,
-        null,
-        store,
-        repository_path,
-        target,
-        null,
-        .{ .codex = try codex_adapter.Request.init(allocator, "/bin/false", null) },
-        "",
-        .{},
-    );
-    const key = switch (app.ai_review_jobs.enqueue(.{ .repository = root.identity, .target = target }, request)) {
-        .accepted => |value| value,
-        .rejected => return error.ExpectedAiReviewAdmission,
-    };
-    var started = app.ai_review_jobs.takeNextReview() orelse return error.ExpectedAiReviewStart;
-    defer started.request.deinit();
-    try std.testing.expect(started.key.eql(key));
-    if (!app.ai_review_jobs.finishReview(key, .{ .outcome = .{ .published = .{
-        .review_id = review_id,
-        .finding_count = 0,
-    } } })) return error.ExpectedAiReviewTerminal;
-    return key;
 }
 
 fn directRefreshBundle(

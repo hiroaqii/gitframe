@@ -103,7 +103,7 @@ Only when that location is absent, publication converts the manifest's exact UTC
 
 Publication writes one `.tmp-publish-...` directory containing the exact immutable artifacts and one same-token `.tmp-location-...` regular file containing strict canonical schema-1 JSON: full repository ID, full review ID, and the actual directory component. After both are synced, it atomically installs `.run-<complete-review-id>` without replacement, syncs the namespace, then atomically installs the Run directory under its readable name and syncs again. A final-name collision returns `run_name_collision`; it never regenerates the UUID, retries, extends the suffix, or chooses another name. Before the Run rename, cleanup may remove only the operation-owned byte- and metadata-identical locator and staging entries. Once the Run rename commits, both entries are retained; a following durability error is reconciled by the full-ID locator and exact artifact bytes, without republishing.
 
-Both helpers emit one canonical JSON terminal plus LF/EOF. Repository preparation preserves `main_worktree_unavailable`, `repository_name_invalid`, and `repository_namespace_collision`; publication preserves `target_label_invalid`, `local_time_unavailable`, and `run_name_collision`. Hosted Compare jobs carry the same bounded causes through the existing footer and F2 details. Exit groups are: `0` success; `64` request/schema/artifact errors; `65` invalid repository or target label; `66` unavailable target objects; `69` unavailable/unsupported Store platform or filesystem; `73` duplicate review ID or repository/Run name collision; `74` invalid Store/repository, unavailable main worktree/local time, Git, or I/O failure; `75` binding/concurrent conflict; and `70` allocation or unclassified internal failure. Stderr text, raw names, and Store paths are never machine authority.
+Both helpers emit one canonical JSON terminal plus LF/EOF. Repository preparation preserves `main_worktree_unavailable`, `repository_name_invalid`, and `repository_namespace_collision`; publication preserves `target_label_invalid`, `local_time_unavailable`, and `run_name_collision`. Exit groups are: `0` success; `64` request/schema/artifact errors; `65` invalid repository or target label; `66` unavailable target objects; `69` unavailable/unsupported Store platform or filesystem; `73` duplicate review ID or repository/Run name collision; `74` invalid Store/repository, unavailable main worktree/local time, Git, or I/O failure; `75` binding/concurrent conflict; and `70` allocation or unclassified internal failure. Stderr text, raw names, and Store paths are never machine authority.
 
 ## Run admission and result precedence
 
@@ -223,81 +223,41 @@ admitted during the responsive drain before teardown. Any Store failure cancels
 quit, reopens admission, reports the typed terminal, and leaves caller-owned
 dirty state available for explicit reload/reconciliation.
 
-## Starting a hosted review from Compare
+## Hosted runtime removal and config upgrade
 
-The `Compare` page can submit its currently accepted committed branch range to
-the Codex CLI. Configure an absolute executable path; the model is optional:
+GitFrame no longer starts an AI provider or publishes a Review Run from the
+`Compare` page. Pressing `a` opens a provider-neutral handoff containing the
+running GitFrame executable, repository, and exact committed base/head OIDs.
+`y` copies that same immutable prompt through the existing terminal clipboard
+path. Provider, installed-Skill, login, network, and Store readiness are not
+detected or launched by the TUI.
+
+`[ai_review]` now accepts only the optional Store root:
 
 ```toml
 [ai_review]
-codex_executable = "/absolute/path/to/codex"
-codex_model = "optional-runner-model"
-
-# Common execution limits; all four may be omitted.
-max_input_bytes = 2097152
-max_final_output_bytes = 262144
-max_stream_output_bytes = 8388608
-timeout_seconds = 1800
+store_root = "/absolute/canonical/path"
 ```
 
-GitFrame uses the CLI's existing authentication context and does not select,
-inspect, or store whether that context uses a subscription or API billing. If
-`codex_model` is absent, the runner default is used.
+Existing configuration files must remove all six former hosted-runtime keys:
 
-Press `a` on `Compare` to inspect the exact base and head OIDs, optionally enter
-up to 16 KiB of review context, and press Enter to start. Submission revalidates
-the accepted repository and target; a configuration, stale-target, or queue
-failure remains in the modal without starting work. An accepted job runs in the
-background and appears in the existing one-line footer as `queued`, `reviewing`,
-`publishing`, or a terminal outcome. Esc dismisses only the currently visible
-unread terminal. Selecting the exact published Run on `AI Reviews` acknowledges
-that job without affecting another Run.
+```text
+codex_executable
+codex_model
+max_input_bytes
+max_final_output_bytes
+max_stream_output_bytes
+timeout_seconds
+```
 
-The hosted path publishes through the same Store domain as external producers,
-but it does not invoke the installed `gitframe-ai-review` Skill or `review.py`.
-Runs created externally remain available on `AI Reviews`; they do not have an
-in-memory GitFrame job status.
+Each removed name is an ordinary unknown key. GitFrame provides no alias,
+migration, automatic rewrite, fallback, or replacement provider setting.
+Remove the keys manually before starting the updated executable.
 
-### Common execution limits
-
-These are provider-neutral limits under `[ai_review]`, not Codex/model overrides.
-Missing files, omitted keys, partial settings, and the existing Store/executable/model
-settings retain their defaults. Values are decimal integers; startup rejects
-non-integers, negative/zero values, overflow, duplicate keys, and unsupported
-combinations with the key and reason. There is no zero/unlimited value.
-
-| Key | Default | Meaning and supported range |
-| --- | --- | --- |
-| `max_input_bytes` | 2097152 (2 MiB) | Entire generated prompt: instruction, context, serialized Review Units, and JSON escaping. `1..maxInt(usize)/2`. |
-| `max_final_output_bytes` | 262144 (256 KiB) | Decoded final answer for one complete provider call, including its multi-unit envelope. `1..262144`. |
-| `max_stream_output_bytes` | 8388608 (8 MiB) | All stdout wire bytes, including intermediate JSONL events and escaping. `1..maxInt(usize)/2`, and at least `max_final_output_bytes`. |
-| `timeout_seconds` | 1800 (30 minutes) | Shared execution budget, `1..4294967295` seconds. |
-
-Exactly the configured byte limit is accepted; exceeding it fails the whole
-operation. No truncated prompt or partial answer becomes a successful review.
-The machine-sized byte ceiling leaves room for bounded-reader arithmetic and
-the `N+1` overflow observation. It does not reserve that much memory.
-`stream >= final` does not guarantee that JSONL overhead/escaping will fit.
-
-Configuration is loaded at startup; each accepted Compare request copies all
-four values. Queued/running requests and retained diagnostics keep that snapshot.
-Changes require a restart and affect only new requests; there is no hot reload.
-The timeout starts immediately before the version probe and uses the same
-absolute deadline through the main provider process. Queue wait, Git/input
-preparation, prompt/private-environment creation, answer decoding/validation,
-and Store publication are excluded. An earlier caller deadline still wins.
-The probe also retains its separate, non-terminal 5-second local cap.
-
-These limits do not replace provider/model service limits or protocol/Store
-validation. Context remains 16 KiB, stderr remains 64 KiB, per-unit candidate
-payloads remain 256 KiB, and the candidate aggregate remains 16 MiB. The 256 KiB
-whole-answer ceiling is a separate GitFrame runtime/product limit, not a claim
-that the per-unit protocol ceiling applies to a multi-unit answer.
-
-Existing F2 details show the failed job's allowed/observed bytes or timeout
-budget and point to the applicable common key. Protocol/context/stderr limits
-and caller-owned deadlines do not suggest an unrelated setting. Raising an
-input setting does not guarantee acceptance by a model or provider.
+External agents continue to use the installed `gitframe-ai-review` Skill and
+the explicit review target/projection/input/producer/Store helpers. Existing
+Runs remain readable on `AI Reviews`, where draft/result persistence and human
+decisions keep their existing ownership and semantics.
 
 ## Resource ownership and current non-goals
 

@@ -30,8 +30,6 @@ const ai_reviews_page = if (builtin.is_test) @import("pages/ai_reviews.zig") els
 const repository_page = if (builtin.is_test) @import("pages/repository.zig") else struct {};
 const repository_source = if (builtin.is_test) @import("../repository/source.zig") else struct {};
 const content_fingerprint = if (builtin.is_test) @import("../content_fingerprint.zig") else struct {};
-const ai_review_job = @import("../ai_review/job.zig");
-const ai_review_diagnostics = @import("ai_review_diagnostics.zig");
 
 /// Rendering-only helpers for App.
 ///
@@ -84,13 +82,6 @@ const PageBarMetadata = struct {
     remote_actions: ?PageBarRemoteActions = null,
 };
 
-pub const AiReviewStatus = struct {
-    key: ai_review_job.Key,
-    scope: ai_review_job.Scope,
-    phase: ai_review_job.Phase,
-    repository_basename: ?[]const u8 = null,
-};
-
 pub const Context = struct {
     changes: changes_view.Context,
     compare: compare_view.Context,
@@ -104,8 +95,6 @@ pub const Context = struct {
     action: action_lifecycle.View,
     remote_cancelable: bool = false,
     remote_canceling: bool = false,
-    ai_review_status: ?AiReviewStatus = null,
-    ai_review_detail: ?*const ai_review_job.Record = null,
     /// Shell notifications temporarily win over the active page diagnostic.
     status: *const app_state.StatusMessage,
     page_status: ?*const app_state.StatusMessage = null,
@@ -204,12 +193,6 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     }
     if (app.overlay.isPushError() and app.overlay.visibleOn(app.active_page)) {
         try viewPushError(app, surface);
-    }
-    if (app.overlay.isAiReviewDetails() and app.overlay.visibleOn(app.active_page)) {
-        if (app.ai_review_detail) |record| try viewAiReviewDetails(app, surface, record);
-    }
-    if (app.overlay.isQuitAiReviews() and app.overlay.visibleOn(app.active_page)) {
-        try viewAiReviewQuitConfirmation(app, surface);
     }
     if (app.active_page == .compare and app.compare.page.base_picker.open) {
         try compare_view.viewBasePicker(app.compare, surface);
@@ -561,7 +544,6 @@ pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
         (app.ai_reviews.page.picker.isPickerVisible() or app.ai_reviews.page.human_review_decision.isOpen())) return null;
     if (width == 0 or app.active_page == .config) return null;
     if (app.action.spinnerPresentation() != null) return null;
-    if (app.status.text().len == 0 and app.ai_review_status != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
 
     var terminal_buffer: [32]u8 = undefined;
@@ -573,8 +555,7 @@ pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     const hints = footerHints(app, &key_buffers);
     var finding_buffer: [128]u8 = undefined;
     const finding_text = findingFooterText(app, finding_buffer[0..]);
-    var ai_status_buffer: [256]u8 = undefined;
-    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, null, &ai_status_buffer);
+    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, null);
     const status_segment = projection.status_segment orelse return null;
     const range = projection.segments.renderedRange(status_segment, projection.left_limit) orelse return null;
     return .{
@@ -601,8 +582,7 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
     const spinner_text = gitActionSpinnerText(app, surface.frameAllocator());
     var finding_buffer: [128]u8 = undefined;
     const finding_text = findingFooterText(app, finding_buffer[0..]);
-    var ai_status_buffer: [256]u8 = undefined;
-    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, spinner_text, &ai_status_buffer);
+    const projection = projectFooter(app, width, &hints, terminal_text, finding_text, spinner_text);
 
     var left_area = surface.child(.{
         .col = 0,
@@ -649,7 +629,6 @@ fn projectFooter(
     terminal_text: []const u8,
     finding_text: ?[]const u8,
     spinner_text: ?[]const u8,
-    ai_status_buffer: []u8,
 ) FooterProjection {
     const hint_options = footerKeyHintOptions(app.theme);
     const essential_hint_width = hints.widthForPriority(.repository_switch, hint_options);
@@ -657,10 +636,6 @@ fn projectFooter(
         0
     else
         essential_hint_width +| 1;
-    const ai_status_text = if (app.ai_review_status) |status|
-        formatAiReviewStatus(ai_status_buffer, status, width -| essential_reserve -| 1)
-    else
-        null;
     var footer_segments = FooterSegments{};
     footer_segments.append(.{
         .text = terminal_text,
@@ -732,11 +707,6 @@ fn projectFooter(
                 .style = app.theme.style(.prompt),
             });
         }
-    } else if (ai_status_text) |text| {
-        footer_segments.append(.{
-            .text = text,
-            .style = app.theme.style(.prompt),
-        });
     } else if (app.page_status) |page_status| {
         if (page_status.text().len > 0 and footer_segments.len < footer_segments.items.len) {
             status_segment = footer_segments.len;
@@ -773,129 +743,8 @@ fn projectFooter(
 
 fn findingFooterText(app: Context, buffer: []u8) ?[]const u8 {
     if (app.active_page != .ai_reviews) return null;
-    if (app.ai_review_status != null) return null;
     const summary = app.ai_reviews.footer().finding_summary orelse return null;
     return formatFindingFooterSummary(buffer, summary, app.terminal_size.width >= 96);
-}
-
-fn formatAiReviewStatus(buffer: []u8, status: AiReviewStatus, max_width: u16) ?[]const u8 {
-    var id_buffer: [7]u8 = undefined;
-    const id = formatBase36(&id_buffer, status.key.id);
-    var identity_text: [43]u8 = undefined;
-    const canonical_identity = std.fmt.bufPrint(&identity_text, "{d}:{d}", .{
-        status.scope.repository.device,
-        status.scope.repository.inode,
-    }) catch return null;
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(canonical_identity, &digest, .{});
-    var root_hash: [8]u8 = undefined;
-    const hex = "0123456789abcdef";
-    for (digest[0..4], 0..) |byte, index| {
-        root_hash[index * 2] = hex[byte >> 4];
-        root_hash[index * 2 + 1] = hex[byte & 0x0f];
-    }
-    const base = status.scope.target.base_oid.short();
-    const head = status.scope.target.head_oid.short();
-    const state = aiReviewState(status.phase);
-
-    if (status.phase == .terminal) {
-        var cause_buffer: [96]u8 = undefined;
-        const summary = ai_review_diagnostics.cause(status.phase);
-        const cause = if (summary) |value| std.fmt.bufPrint(&cause_buffer, "failed: {s}", .{value}) catch return null else state.long;
-        const basename = status.repository_basename orelse "";
-        const clipped = chasen.text.clipToWidthWithMarker(basename, 24, "…");
-        const full = std.fmt.bufPrint(buffer, "AI {s} {s}{s}#{s}:{s}…{s} {s}  F2 details", .{
-            id, clipped.prefix, clipped.marker, root_hash, base, head, cause,
-        }) catch return null;
-        if (chasen.text.displayWidth(full) <= max_width) return full;
-        const target = std.fmt.bufPrint(buffer, "AI {s} #{s}:{s}…{s} {s}  F2 details", .{ id, root_hash, base, head, cause }) catch return null;
-        if (chasen.text.displayWidth(target) <= max_width) return target;
-        const repository = std.fmt.bufPrint(buffer, "AI {s} #{s} {s}  F2 details", .{ id, root_hash, cause }) catch return null;
-        if (chasen.text.displayWidth(repository) <= max_width) return repository;
-        const compact = std.fmt.bufPrint(buffer, "AI {s} {s}  F2 details", .{ id, cause }) catch return null;
-        if (chasen.text.displayWidth(compact) <= max_width) return compact;
-        const short = std.fmt.bufPrint(buffer, "AI {s} {s} F2", .{
-            id, summary orelse state.long,
-        }) catch return null;
-        return short;
-    }
-
-    if (status.repository_basename) |basename| {
-        if (validRepositoryBasename(basename)) {
-            const clipped = chasen.text.clipToWidthWithMarker(basename, 24, "…");
-            const full = std.fmt.bufPrint(buffer, "AI {s} {s}{s}#{s}:{s}…{s} {s}", .{
-                id,
-                clipped.prefix,
-                clipped.marker,
-                root_hash,
-                base,
-                head,
-                state.long,
-            }) catch null;
-            if (full) |text| if (chasen.text.displayWidth(text) <= max_width) return text;
-        }
-    }
-
-    const without_basename = std.fmt.bufPrint(buffer, "AI {s} #{s}:{s}…{s} {s}", .{
-        id,
-        root_hash,
-        base,
-        head,
-        state.long,
-    }) catch return null;
-    if (chasen.text.displayWidth(without_basename) <= max_width) return without_basename;
-    return std.fmt.bufPrint(buffer, "AI {s} #{s}:{s}…{s} {c}", .{
-        id,
-        root_hash,
-        base,
-        head,
-        state.short,
-    }) catch null;
-}
-
-const AiReviewState = struct {
-    long: []const u8,
-    short: u8,
-};
-
-fn aiReviewState(phase: ai_review_job.Phase) AiReviewState {
-    return switch (phase) {
-        .queued => .{ .long = "queued", .short = 'q' },
-        .reviewing => .{ .long = "reviewing", .short = 'r' },
-        .publishing => .{ .long = "publishing", .short = 'p' },
-        .terminal => |terminal| switch (terminal) {
-            .start_failed => .{ .long = "failed", .short = 'f' },
-            .pipeline => |value| switch (value.outcome) {
-                .published => .{ .long = "published", .short = 'o' },
-                .no_changes => .{ .long = "no-changes", .short = 'n' },
-                .failed => .{ .long = "failed", .short = 'f' },
-                .canceled => .{ .long = "canceled", .short = 'c' },
-                .outcome_unknown => .{ .long = "outcome-unknown", .short = 'u' },
-            },
-        },
-    };
-}
-
-fn formatBase36(buffer: *[7]u8, value: ai_review_job.Id) []const u8 {
-    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    var remaining = value;
-    var index: usize = buffer.len;
-    while (remaining > 0) {
-        index -= 1;
-        buffer[index] = digits[remaining % 36];
-        remaining /= 36;
-    }
-    if (index == buffer.len) {
-        index -= 1;
-        buffer[index] = '0';
-    }
-    return buffer[index..];
-}
-
-fn validRepositoryBasename(value: []const u8) bool {
-    if (value.len == 0 or !std.unicode.utf8ValidateSlice(value)) return false;
-    for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
-    return true;
 }
 
 fn formatFindingFooterSummary(
@@ -1504,28 +1353,6 @@ fn viewAmendConfirmation(app: Context, surface: *chasen.Surface) !void {
     }
 }
 
-fn viewAiReviewQuitConfirmation(app: Context, surface: *chasen.Surface) !void {
-    const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, confirmation_dialog_width),
-        .dialog_height = @min(surface.size().height, confirmation_dialog_height),
-        .title = "Cancel AI reviews and quit?",
-        .backdrop = false,
-        .border = .rounded,
-        .title_style = app.theme.boldStyle(.danger),
-        .border_style = app.theme.style(.danger),
-    };
-    const frame = ui.Modal.frame(surface, opts) orelse return;
-    fillModalDialog(frame);
-    frame.view();
-    var content = frame.contentSurface();
-    const size = content.size();
-    const start_row: u16 = if (size.height > 3) (size.height - 3) / 2 else 0;
-    try drawCenteredText(&content, start_row, "Queued reviews will be canceled; active work will finish cleanup.", app.theme.style(.danger));
-    if (start_row + 2 < size.height) {
-        try drawCenteredText(&content, start_row + 2, "Enter: cancel reviews + quit    Esc/q: stay", app.theme.style(.danger));
-    }
-}
-
 fn viewPushConfirmation(app: Context, surface: *chasen.Surface) !void {
     const confirmation = app.push_confirmation orelse return;
     const opts: ui.Modal.ViewOptions = .{
@@ -1705,36 +1532,6 @@ fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
     const half = visible / 2;
     const max_start = len - visible;
     return @min(selected -| half, max_start);
-}
-
-fn aiReviewDetailOptions(size: chasen.Size) ui.Modal.ViewOptions {
-    return .{ .dialog_width = @min(size.width, 90), .dialog_height = @min(size.height, 32), .title = "AI review details", .backdrop = false, .border = .rounded };
-}
-
-pub fn aiReviewDetailViewport(size: chasen.Size, record: *const ai_review_job.Record) struct { rows: usize, max_scroll: usize } {
-    const content = modalContentSizeForRect(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, aiReviewDetailOptions(size));
-    const rows = content.height -| 2;
-    var buffer: [2048]u8 = undefined;
-    const text = ai_review_diagnostics.format(&buffer, record);
-    return .{ .rows = rows, .max_scroll = if (content.width == 0) 0 else paragraphMaxScroll(text, content.width, rows) };
-}
-
-fn viewAiReviewDetails(app: Context, surface: *chasen.Surface, record: *const ai_review_job.Record) !void {
-    var opts = aiReviewDetailOptions(surface.size());
-    opts.title_style = app.theme.boldStyle(.danger);
-    opts.border_style = app.theme.style(.danger);
-    const frame = ui.Modal.frame(surface, opts) orelse return;
-    fillModalDialog(frame);
-    frame.view();
-    var content = frame.contentSurface();
-    const size = content.size();
-    var buffer: [2048]u8 = undefined;
-    // Wrapped drawing borrows glyphs until frame completion.
-    const text = try content.copyText(ai_review_diagnostics.format(&buffer, record));
-    var body = content.child(.{ .col = 0, .row = 0, .width = size.width, .height = size.height -| 2 });
-    _ = drawWrappedTextScrolled(&body, text, app.overlay.kind.ai_review_details.scroll, .{});
-    if (size.height > 0)
-        try draw.copyClippedTextAt(&content, 0, size.height - 1, "j/k: scroll  Esc/q/F2: close", app.theme.style(.muted));
 }
 
 fn viewPushError(app: Context, surface: *chasen.Surface) !void {
@@ -2370,119 +2167,6 @@ test "Finding discovery footer formats responsive counts before transient status
     defer std.testing.allocator.free(snapshot);
     try std.testing.expectEqual(@as(?usize, 1), std.mem.indexOf(u8, snapshot, compact));
     try std.testing.expectEqual(@as(?usize, 14), std.mem.indexOf(u8, snapshot, "ready"));
-}
-
-test "AI review footer preserves mandatory identity at 56 80 and 120 columns" {
-    const committed = @import("../committed_review.zig");
-    const base = try committed.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
-    const head = try committed.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
-    const status: AiReviewStatus = .{
-        .key = .{ .id = std.math.maxInt(ai_review_job.Id), .generation = 1 },
-        .scope = .{
-            .repository = .{ .device = 12, .inode = 34 },
-            .target = .{
-                .object_format = .sha1,
-                .source_kind = .branch_range,
-                .base_oid = base,
-                .head_oid = head,
-                .diff_base_oid = base,
-            },
-        },
-        .phase = .reviewing,
-        .repository_basename = "repository-with-a-long-name",
-    };
-
-    for ([_]u16{ 38, 62, 102 }) |width| {
-        var buffer: [256]u8 = undefined;
-        const text = formatAiReviewStatus(&buffer, status, width) orelse return error.ExpectedAiReviewStatus;
-        try std.testing.expect(chasen.text.displayWidth(text) <= width);
-        try std.testing.expect(std.mem.indexOf(u8, text, "AI 1z141z3") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "#a5c8d54c:1111111…2222222") != null);
-    }
-
-    var harness: ShellViewTestHarness = .{};
-    _ = harness.compare.activation.activate(0, .pending, .unavailable, .unavailable);
-    for ([_]u16{ 56, 80, 120 }) |width| {
-        harness.terminal_size.width = width;
-        var context = harness.context();
-        context.active_page = .compare;
-        context.page_status = &harness.compare.status;
-        context.ai_review_status = status;
-        var terminal: chasen.testing.TestSurface = undefined;
-        try terminal.init(width, 1);
-        defer terminal.deinit();
-        viewFooter(context, &terminal.surface);
-        const snapshot = try terminal.snapshot(std.testing.allocator);
-        defer std.testing.allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "AI 1z141z3") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "#a5c8d54c:1111111…2222222") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "R: switch repo") != null);
-    }
-
-    harness.terminal_size.width = 80;
-    harness.status.set("shell status owns the footer", .{});
-    var covered = harness.context();
-    covered.active_page = .compare;
-    covered.page_status = &harness.compare.status;
-    covered.ai_review_status = status;
-    var shell_surface: chasen.testing.TestSurface = undefined;
-    try shell_surface.init(80, 1);
-    defer shell_surface.deinit();
-    viewFooter(covered, &shell_surface.surface);
-    const shell_snapshot = try shell_surface.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(shell_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, shell_snapshot, "shell status owns") != null);
-    try std.testing.expect(std.mem.indexOf(u8, shell_snapshot, "AI 1z141z3") == null);
-
-    harness.status.clear();
-    action_lifecycle.testing.installAccepted(&harness.action_runtime, .{ .generation = 1, .kind = .push });
-    action_lifecycle.testing.setSpinner(&harness.action_runtime, 1, false);
-    var spinner_surface: chasen.testing.TestSurface = undefined;
-    try spinner_surface.init(80, 1);
-    defer spinner_surface.deinit();
-    viewFooter(covered, &spinner_surface.surface);
-    const spinner_snapshot = try spinner_surface.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(spinner_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, spinner_snapshot, "push") != null);
-    try std.testing.expect(std.mem.indexOf(u8, spinner_snapshot, "AI 1z141z3") == null);
-    action_lifecycle.testing.clear(&harness.action_runtime);
-
-    var restored_surface: chasen.testing.TestSurface = undefined;
-    try restored_surface.init(80, 1);
-    defer restored_surface.deinit();
-    viewFooter(covered, &restored_surface.surface);
-    const restored_snapshot = try restored_surface.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(restored_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, restored_snapshot, "AI 1z141z3") != null);
-
-    var finding_buffer: [128]u8 = undefined;
-    var ai_reviews_context = harness.context();
-    ai_reviews_context.active_page = .ai_reviews;
-    ai_reviews_context.ai_review_status = status;
-    try std.testing.expect(findingFooterText(ai_reviews_context, finding_buffer[0..]) == null);
-
-    var narrow_buffer: [256]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "AI 1z141z3 #a5c8d54c:1111111…2222222 r",
-        formatAiReviewStatus(&narrow_buffer, status, 38).?,
-    );
-    var medium_buffer: [256]u8 = undefined;
-    const medium = formatAiReviewStatus(&medium_buffer, status, 62).?;
-    try std.testing.expect(std.mem.indexOf(u8, medium, "repository-with-a-long-name") == null);
-    try std.testing.expect(std.mem.endsWith(u8, medium, " reviewing"));
-    var wide_buffer: [256]u8 = undefined;
-    const wide = formatAiReviewStatus(&wide_buffer, status, 102).?;
-    try std.testing.expect(std.mem.indexOf(u8, wide, "repository-with-a-long") != null);
-    try std.testing.expect(std.mem.endsWith(u8, wide, " reviewing"));
-}
-
-test "AI review footer uses the decided state codes" {
-    try std.testing.expectEqual(@as(u8, 'q'), aiReviewState(.queued).short);
-    try std.testing.expectEqual(@as(u8, 'r'), aiReviewState(.reviewing).short);
-    try std.testing.expectEqual(@as(u8, 'p'), aiReviewState(.publishing).short);
-    try std.testing.expectEqual(@as(u8, 'n'), aiReviewState(.{ .terminal = .{ .pipeline = .{ .outcome = .no_changes } } }).short);
-    try std.testing.expectEqual(@as(u8, 'f'), aiReviewState(.{ .terminal = .{ .start_failed = .review_task_start_failed } }).short);
-    try std.testing.expectEqual(@as(u8, 'c'), aiReviewState(.{ .terminal = .{ .pipeline = .{ .outcome = .canceled } } }).short);
 }
 
 test "footer status target matches clipped rendered cells and retains full text" {
@@ -3725,225 +3409,3 @@ const help_all_sections = [_]HelpSection{
     .{ .title = "Changes diff", .items = &help_changes_diff_items },
     .{ .title = "Mouse", .items = &help_mouse_items },
 };
-
-test "AI review input footer and resource-aware details remain readable at normal and narrow widths" {
-    const committed = @import("../committed_review.zig");
-    const diagnostic = @import("../ai_review/diagnostic.zig");
-    const base = try committed.ObjectId.parse(.sha256, "1" ** 64);
-    const head = try committed.ObjectId.parse(.sha256, "2" ** 64);
-    var record: ai_review_job.Record = .{
-        .key = .{ .id = 4294967295, .generation = 9 },
-        .sequence = 1,
-        .request = null,
-        .scope = .{ .repository = .{ .device = 12, .inode = 34 }, .target = .{
-            .object_format = .sha256,
-            .source_kind = .branch_range,
-            .base_oid = base,
-            .head_oid = head,
-            .diff_base_oid = base,
-        } },
-        .display = .{ .repository = diagnostic.Label.init("長いrepo" ** 30), .base = diagnostic.Label.init("base枝" ** 30), .head = diagnostic.Label.init("head枝" ** 30) },
-        .phase = .{ .terminal = .{ .pipeline = .{ .outcome = .{ .failed = .{ .input_too_large = .{
-            .resource = .provider_input_bytes,
-            .allowed = 131072,
-            .observed = 145678,
-            .observation = .at_least,
-        } } } } } },
-    };
-    var harness: ShellViewTestHarness = .{};
-    for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 80, .height = 24 }, .{ .width = 56, .height = 16 } }) |size| {
-        harness.terminal_size = size;
-        var context = harness.context();
-        context.ai_review_status = .{ .key = record.key, .scope = record.scope, .phase = record.phase, .repository_basename = record.display.repository.slice() };
-        var footer: chasen.testing.TestSurface = undefined;
-        try footer.init(size.width, 1);
-        defer footer.deinit();
-        viewFooter(context, &footer.surface);
-        const snapshot = try footer.snapshot(std.testing.allocator);
-        defer std.testing.allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "input too large") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "F2") != null);
-        harness.overlay.kind = .{ .ai_review_details = .{ .key = record.key } };
-        harness.overlay.owner_page = .changes;
-        var detail: chasen.testing.TestSurface = undefined;
-        try detail.init(size.width, size.height);
-        defer detail.deinit();
-        try viewAiReviewDetails(context, &detail.surface, &record);
-        const first = try detail.snapshot(std.testing.allocator);
-        defer std.testing.allocator.free(first);
-        try std.testing.expect(std.mem.indexOf(u8, first, "Failed: input too large") != null);
-        try std.testing.expect(std.mem.indexOf(u8, first, "Before Codex starts") != null);
-        try std.testing.expect(std.mem.indexOf(u8, first, "131072 bytes (128 KiB)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, first, "Observed at least: 145678 bytes") != null);
-        harness.overlay.kind.ai_review_details.scroll = aiReviewDetailViewport(size, &record).max_scroll;
-        try viewAiReviewDetails(context, &detail.surface, &record);
-        const last = try detail.snapshot(std.testing.allocator);
-        defer std.testing.allocator.free(last);
-        try std.testing.expect(std.mem.indexOf(u8, last, "Head:") != null);
-        try std.testing.expect(std.mem.indexOf(u8, last, "2222222222222222") != null);
-    }
-    var buffer: [2048]u8 = undefined;
-    const provider_input = ai_review_diagnostics.format(&buffer, &record);
-    try std.testing.expect(std.mem.indexOf(u8, provider_input, "[ai_review].max_input_bytes controls generated prompt bytes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, provider_input, "Provider/model context limits are separate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, provider_input, "Reduce the review range or Context") == null);
-    record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .context_bytes, .allowed = 16384, .observed = 16385, .observation = .exact };
-    const context = ai_review_diagnostics.format(&buffer, &record);
-    try std.testing.expect(std.mem.indexOf(u8, context, "fixed Compare Context limit") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context, "Manually reduce the explicitly supplied Compare Context") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context, "[ai_review].max_input_bytes does not change this bound") != null);
-    record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .unit_bytes, .allowed = 262144, .observed = 262145, .observation = .at_least };
-    const unit = ai_review_diagnostics.format(&buffer, &record);
-    try std.testing.expect(std.mem.indexOf(u8, unit, "fixed canonical Review Unit protocol cap") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unit, "Increasing [ai_review].max_input_bytes or reducing Compare Context cannot repair this Unit") != null);
-    record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .guidance_per_unit_bytes, .allowed = 98304, .observed = 98305, .observation = .at_least };
-    const guidance = ai_review_diagnostics.format(&buffer, &record);
-    try std.testing.expect(std.mem.indexOf(u8, guidance, "separate repository guidance cap for one Review Unit") != null);
-    try std.testing.expect(std.mem.indexOf(u8, guidance, "Compare Context is unrelated to this bound") != null);
-    try std.testing.expect(std.mem.indexOf(u8, guidance, "[ai_review].max_input_bytes") == null);
-    record.phase.terminal.pipeline.outcome.failed.input_too_large = .{ .resource = .review_units, .allowed = 256, .observed = 257, .observation = .at_least };
-    const counted = ai_review_diagnostics.format(&buffer, &record);
-    try std.testing.expect(std.mem.indexOf(u8, counted, "Limit: 256 count") != null);
-    try std.testing.expect(std.mem.indexOf(u8, counted, "KiB") == null);
-    try std.testing.expect(std.mem.indexOf(u8, counted, "current protocol cannot represent this target under this fixed resource") != null);
-    try std.testing.expect(std.mem.indexOf(u8, counted, "[ai_review].max_input_bytes") == null);
-    try std.testing.expect(std.mem.indexOf(u8, counted, "Compare Context") == null);
-    record.phase.terminal.pipeline.outcome.failed.input_too_large.?.resource = .unknown;
-    const unknown = ai_review_diagnostics.format(&buffer, &record);
-    try std.testing.expect(std.mem.indexOf(u8, unknown, "unit unknown") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unknown, "Exact limit evidence is unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unknown, "[ai_review].max_input_bytes") == null);
-    try std.testing.expect(std.mem.indexOf(u8, unknown, "Compare Context") == null);
-    record.phase.terminal.pipeline.outcome.failed.input_too_large = null;
-    const unavailable = ai_review_diagnostics.format(&buffer, &record);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "Limit / observation: unknown") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "Exact limit evidence is unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "[ai_review].max_input_bytes") == null);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "Compare Context") == null);
-}
-
-test "AI review failure footer and details expose causes at normal and narrow sizes" {
-    const committed = @import("../committed_review.zig");
-    const pipeline = @import("../ai_review/runner.zig");
-    const oid = try committed.ObjectId.parse(.sha1, "1234567890123456789012345678901234567890");
-    var record: ai_review_job.Record = .{
-        .key = .{ .id = 1, .generation = 2 },
-        .sequence = 1,
-        .request = null,
-        .scope = .{ .repository = .{ .device = 12, .inode = 34 }, .target = .{
-            .object_format = .sha1,
-            .source_kind = .branch_range,
-            .base_oid = oid,
-            .head_oid = oid,
-            .diff_base_oid = oid,
-        } },
-    };
-    const cases = [_]struct { failure: pipeline.FailureCode, cause: []const u8, config_key: ?[]const u8 = null, evidence: ?[]const u8 = null }{
-        .{ .failure = .repository_unavailable, .cause = "repository unavailable" },
-        .{ .failure = .target_unavailable, .cause = "target unavailable" },
-        .{ .failure = .projection_failed, .cause = "projection failed" },
-        .{ .failure = .input_failed, .cause = "input generation failed" },
-        .{ .failure = .{ .input_too_large = .{ .resource = .provider_input_bytes, .allowed = 512, .observed = 1024, .observation = .exact } }, .cause = "input too large", .config_key = "max_input_bytes", .evidence = "Limit: 512 bytes\nObserved: 1024 bytes" },
-        .{ .failure = .{ .input_too_large = .{ .resource = .context_bytes, .allowed = 16384, .observed = 16385, .observation = .exact } }, .cause = "input too large", .config_key = "max_input_bytes", .evidence = "Manually reduce the explicitly supplied Compare Context" },
-        .{ .failure = .{ .input_too_large = .{ .resource = .diff_line_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } }, .cause = "input too large", .evidence = "current protocol cannot represent this target under this fixed resource" },
-        .{ .failure = .{ .input_too_large = null }, .cause = "input too large", .evidence = "Exact limit evidence is unavailable" },
-        .{ .failure = .{ .stream_too_large = .{ .resource = .stdout_bytes, .allowed = 4096, .observed = 4097, .observation = .at_least } }, .cause = "stdout too large", .config_key = "max_stream_output_bytes", .evidence = "Limit: 4096 bytes (4 KiB)\nObserved at least: 4097 bytes" },
-        .{ .failure = .{ .stream_too_large = .{ .resource = .stderr_bytes, .allowed = 65536, .observed = 65537, .observation = .at_least } }, .cause = "stderr too large" },
-        .{ .failure = .{ .final_answer_too_large = .{ .resource = .final_answer_bytes, .allowed = 256, .observed = 257, .observation = .exact } }, .cause = "answer too large", .config_key = "max_final_output_bytes", .evidence = "Limit: 256 bytes\nObserved: 257 bytes" },
-        .{ .failure = .{ .provider_exit = .{ .classification = .authentication_response, .term = .{ .exited = 17 } } }, .cause = "auth-related response" },
-        .{ .failure = .{ .invalid_provider_result = .answer }, .cause = "invalid answer" },
-        .{ .failure = .{ .timed_out = .{ .stage = .provider_execution, .owner = .adapter, .budget = .fromSeconds(7) } }, .cause = "timed out", .config_key = "timeout_seconds", .evidence = "Budget at entry: 7s" },
-        .{ .failure = .{ .timed_out = .{ .stage = .version_probe, .owner = .caller, .budget = .fromSeconds(3) } }, .cause = "timed out" },
-        .{ .failure = .{ .timed_out = .{ .stage = .before_provider, .owner = .caller, .budget = .fromSeconds(2) } }, .cause = "timed out" },
-        .{ .failure = .{ .timed_out = null }, .cause = "timed out" },
-        .{ .failure = .invalid_candidates, .cause = "invalid candidates" },
-        .{ .failure = .{ .store_prepare_failed = .main_worktree_unavailable }, .cause = "main worktree unavailable", .evidence = "Check Git worktree metadata" },
-        .{ .failure = .{ .store_prepare_failed = .repository_name_invalid }, .cause = "repository name invalid", .evidence = "valid UTF-8 main-worktree directory name" },
-        .{ .failure = .{ .store_prepare_failed = .repository_namespace_collision }, .cause = "repository namespace collision", .evidence = "do not overwrite it" },
-        .{ .failure = .{ .publish_failed = .target_label_invalid }, .cause = "target label invalid", .evidence = "not replaced or shortened" },
-        .{ .failure = .{ .publish_failed = .local_time_unavailable }, .cause = "local time unavailable", .evidence = "local timezone availability" },
-        .{ .failure = .{ .publish_failed = .run_name_collision }, .cause = "review Run name collision", .evidence = "do not overwrite it or retry" },
-        .{ .failure = .artifact_failed, .cause = "artifact creation failed" },
-        .{ .failure = .{ .publish_failed = .io_failed }, .cause = "review store I/O failed" },
-        .{ .failure = .exact_reconciliation_failed, .cause = "save verification failed" },
-        .{ .failure = .{ .internal_error = .before_provider }, .cause = "internal error" },
-    };
-    var harness: ShellViewTestHarness = .{};
-    for (cases) |case| {
-        record.phase = .{ .terminal = .{ .pipeline = .{ .outcome = .{ .failed = case.failure } } } };
-        var buffer: [2048]u8 = undefined;
-        const formatted = ai_review_diagnostics.format(&buffer, &record);
-        if (case.config_key) |key| {
-            try std.testing.expect(std.mem.indexOf(u8, formatted, "[ai_review].") != null);
-            try std.testing.expect(std.mem.indexOf(u8, formatted, key) != null);
-        } else {
-            try std.testing.expect(std.mem.indexOf(u8, formatted, "[ai_review].") == null);
-        }
-        if (case.evidence) |evidence| try std.testing.expect(std.mem.indexOf(u8, formatted, evidence) != null);
-        if (case.failure == .final_answer_too_large) try std.testing.expect(std.mem.indexOf(u8, formatted, "runtime ceiling 262144 bytes") != null);
-        for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 56, .height = 16 } }) |size| {
-            harness.terminal_size = size;
-            var context = harness.context();
-            context.ai_review_status = .{ .key = record.key, .scope = record.scope, .phase = record.phase };
-            var footer: chasen.testing.TestSurface = undefined;
-            try footer.init(size.width, 1);
-            defer footer.deinit();
-            viewFooter(context, &footer.surface);
-            const text = try footer.snapshot(std.testing.allocator);
-            defer std.testing.allocator.free(text);
-            try std.testing.expect(std.mem.indexOf(u8, text, case.cause) != null);
-            try std.testing.expect(std.mem.indexOf(u8, text, "F2") != null);
-            if (std.mem.indexOf(u8, text, "F2 details")) |index| {
-                const after = index + "F2 details".len;
-                if (after < text.len) try std.testing.expect(text[after] == ' ' or text[after] == '\n');
-            }
-            harness.overlay.kind = .{ .ai_review_details = .{ .key = record.key } };
-            harness.overlay.owner_page = .changes;
-            var detail: chasen.testing.TestSurface = undefined;
-            try detail.init(size.width, size.height);
-            defer detail.deinit();
-            try viewAiReviewDetails(context, &detail.surface, &record);
-            const top = try detail.snapshot(std.testing.allocator);
-            defer std.testing.allocator.free(top);
-            try std.testing.expect(std.mem.indexOf(u8, top, case.cause) != null);
-            const stage_label = if (case.failure == .timed_out and case.failure.timed_out == null) "Stage / duration / deadline owner: unknown" else "Stage:";
-            try std.testing.expect(std.mem.indexOf(u8, top, stage_label) != null);
-            harness.overlay.kind.ai_review_details.scroll = aiReviewDetailViewport(size, &record).max_scroll;
-            try viewAiReviewDetails(context, &detail.surface, &record);
-            const bottom = try detail.snapshot(std.testing.allocator);
-            defer std.testing.allocator.free(bottom);
-            try std.testing.expect(std.mem.indexOf(u8, bottom, oid.slice()) != null);
-        }
-    }
-
-    const uncertain_id = try committed.ReviewId.parse("123e4567-e89b-42d3-a456-426614174000");
-    const terminals = [_]struct { phase: ai_review_job.Phase, footer: []const u8, detail: []const u8 }{
-        .{ .phase = .{ .terminal = .{ .start_failed = .review_task_start_failed } }, .footer = "review start failed", .detail = "Stage: Review task start" },
-        .{ .phase = .{ .terminal = .{ .start_failed = .publication_task_start_failed } }, .footer = "save start failed", .detail = "Stage: Save task start" },
-        .{ .phase = .{ .terminal = .{ .pipeline = .{ .outcome = .{ .outcome_unknown = uncertain_id } } } }, .footer = "outcome-unknown", .detail = "Review ID: 123e4567-e89b-42d3-a456-426614174000" },
-    };
-    for (terminals) |case| {
-        record.phase = case.phase;
-        for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 56, .height = 16 } }) |size| {
-            harness.terminal_size = size;
-            var context = harness.context();
-            context.ai_review_status = .{ .key = record.key, .scope = record.scope, .phase = record.phase };
-            var footer: chasen.testing.TestSurface = undefined;
-            try footer.init(size.width, 1);
-            defer footer.deinit();
-            viewFooter(context, &footer.surface);
-            const footer_text = try footer.snapshot(std.testing.allocator);
-            defer std.testing.allocator.free(footer_text);
-            try std.testing.expect(std.mem.indexOf(u8, footer_text, case.footer) != null);
-            try std.testing.expect(std.mem.indexOf(u8, footer_text, "F2") != null);
-            harness.overlay.kind = .{ .ai_review_details = .{ .key = record.key } };
-            var detail: chasen.testing.TestSurface = undefined;
-            try detail.init(size.width, size.height);
-            defer detail.deinit();
-            try viewAiReviewDetails(context, &detail.surface, &record);
-            const detail_text = try detail.snapshot(std.testing.allocator);
-            defer std.testing.allocator.free(detail_text);
-            try std.testing.expect(std.mem.indexOf(u8, detail_text, case.detail) != null);
-        }
-    }
-}

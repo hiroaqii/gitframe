@@ -1063,8 +1063,8 @@ fn runWithStdinControlledInternal(
     return finishControlledCapture(allocator, &multi_reader, capture_mode, term);
 }
 
-/// Existing capture-only controlled entry. The Codex path uses the separate
-/// controlled-stdin entry above.
+/// Existing capture-only controlled entry. Callers that need bounded stdin use
+/// the separate controlled-stdin entry above.
 pub fn runCapturedControlled(
     allocator: std.mem.Allocator,
     io: std.Io,

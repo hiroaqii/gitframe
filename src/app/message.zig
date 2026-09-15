@@ -19,7 +19,6 @@ const repository_layout = @import("pages/repository/layout.zig");
 const changes_message = @import("pages/changes/message.zig");
 const review_store = @import("../review_store.zig");
 const human_review_session = @import("human_review_session.zig");
-const ai_review_jobs = @import("ai_review_jobs.zig");
 
 pub const LoadFinished = load.ReadFinished;
 
@@ -152,7 +151,6 @@ pub const Msg = union(enum) {
     shell_effect_finished: ShellEffectFinished,
     review_store_operation_finished: ReviewStoreOperationFinished,
     ai_review_delete_finished: ai_review_delete.Finished,
-    ai_review_job: ai_review_jobs.Msg,
     changes: changes_message.Msg,
     compare: compare_input.Msg,
     ai_reviews: ai_reviews_input.Msg,
@@ -222,10 +220,6 @@ pub const Msg = union(enum) {
     focus_lost,
     git_action_spinner_tick,
     cancel_remote_action,
-    dismiss_ai_review_status,
-    ai_review_details: @import("ai_review_diagnostics.zig").Action,
-    confirm_ai_review_quit,
-    cancel_ai_review_quit,
     quit,
 
     pub fn loadFinished(inner: LoadFinished) Msg {
@@ -263,10 +257,6 @@ pub const Msg = union(enum) {
         } } };
     }
 
-    pub fn aiReviewJob(inner: ai_review_jobs.Msg) Msg {
-        return .{ .ai_review_job = inner };
-    }
-
     /// Releases messages that the runtime cannot deliver during shutdown.
     pub fn deinitUndelivered(self: *Msg, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -275,7 +265,6 @@ pub const Msg = union(enum) {
             .push_inspection_finished => |*finished| finished.deinit(allocator),
             .review_store_operation_finished => |*finished| finished.deinit(allocator),
             .ai_review_delete_finished => |*finished| finished.deinit(allocator),
-            .ai_review_job => |*message| message.deinit(),
             .repository => |*repository_msg| repository_msg.deinitUndelivered(allocator),
             else => {},
         }
@@ -296,7 +285,6 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         .shell_effect_finished,
         .review_store_operation_finished,
         .ai_review_delete_finished,
-        .ai_review_job,
         .auto_reload_tick,
         .drag_auto_scroll_tick,
         .focus_lost,

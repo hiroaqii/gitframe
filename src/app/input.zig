@@ -38,12 +38,9 @@ pub const KeyContext = struct {
     amend_confirmation_mode: bool = false,
     push_confirmation_mode: bool = false,
     pull_confirmation_mode: bool = false,
-    ai_review_quit_confirmation_mode: bool = false,
     branch_switch_mode: bool = false,
     push_error_mode: bool = false,
     remote_action_cancelable: bool = false,
-    ai_review_terminal_visible: bool = false,
-    ai_review_details_open: bool = false,
     active_selection_gesture: bool = false,
     command_line_active: bool = false,
     repository_command_available: bool = false,
@@ -98,8 +95,6 @@ const Action = enum {
     cancel_branch_switch,
     close_push_error,
     run_interactive_push,
-    confirm_ai_review_quit,
-    cancel_ai_review_quit,
 };
 
 pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
@@ -115,7 +110,6 @@ pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
 }
 
 fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
-    if (context.ai_review_details_open) return null;
     if (context.command_line_active) return .{ .command_line = if (text.len > 0 and std.unicode.utf8ValidateSlice(text))
         .{ .paste = text }
     else
@@ -150,7 +144,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         return .{ .ai_reviews = msg };
     }
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
-    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.ai_review_quit_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
+    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return .{ .commit_panel_paste = text };
     if (context.active_page == .changes) {
         const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
@@ -160,7 +154,6 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 }
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
-    if (context.ai_review_details_open) return detailsKeyToMsg(key);
     if (context.command_line_active) return .{ .command_line = commandLineKeyToMsg(key) };
     if (context.active_page == .ai_reviews and context.ai_reviews.human_review.open) {
         const msg = ai_reviews_input.keyToMsg(context.ai_reviews, key) orelse return null;
@@ -203,7 +196,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.active_page == .ai_reviews and
         (context.ai_reviews.common.search_mode or context.ai_reviews.common.file_search_mode or
             context.ai_reviews.picker_open or context.ai_reviews.human_review.open or
-            (context.ai_reviews.finding_card_focused and !key.matches(chasen.Key.f2, .{}))))
+            context.ai_reviews.finding_card_focused))
     {
         const msg = ai_reviews_input.keyToMsg(context.ai_reviews, key) orelse return null;
         return .{ .ai_reviews = msg };
@@ -214,13 +207,10 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(key);
     if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(key);
     if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(key);
-    if (context.ai_review_quit_confirmation_mode) return aiReviewQuitConfirmationKeyToMsg(key);
     if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
     if (context.push_error_mode) return pushErrorKeyToMsg(key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
     if (selectionKeyToMsg(context, key)) |msg| return msg;
-    if (context.ai_review_terminal_visible and !context.active_selection_gesture and key.matches(chasen.Key.f2, .{}))
-        return .{ .ai_review_details = .open };
     const routing_key = normalRoutingKey(key);
     if (pageForKey(context.keymap, routing_key)) |target| return .{ .switch_page = target };
     if (context.keymap.spec(.help)) |spec| if (spec.matches(routing_key)) return app_message.Msg.open_help;
@@ -262,22 +252,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
             return .{ .ai_reviews = msg };
         }
     }
-    if (context.ai_review_terminal_visible and routing_key.matches(chasen.Key.escape, .{})) {
-        return .dismiss_ai_review_status;
-    }
     if (routing_key.codepoint == 'q' and !key_input.hasCommandModifier(routing_key)) return app_message.Msg.quit;
-    return null;
-}
-
-fn detailsKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    const DetailsAction = @import("ai_review_diagnostics.zig").Action;
-    const bindings = .{
-        .{ chasen.Key.escape, DetailsAction.close }, .{ chasen.Key.f2, DetailsAction.close },        .{ 'q', DetailsAction.close },
-        .{ chasen.Key.up, DetailsAction.up },        .{ 'k', DetailsAction.up },                     .{ chasen.Key.down, DetailsAction.down },
-        .{ 'j', DetailsAction.down },                .{ chasen.Key.page_up, DetailsAction.page_up }, .{ chasen.Key.page_down, DetailsAction.page_down },
-        .{ chasen.Key.home, DetailsAction.home },    .{ chasen.Key.end, DetailsAction.end },
-    };
-    inline for (bindings) |binding| if (key.matches(binding[0], .{})) return .{ .ai_review_details = binding[1] };
     return null;
 }
 
@@ -397,12 +372,6 @@ fn pushConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
 fn pullConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
     if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_pull);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_pull);
-    return null;
-}
-
-fn aiReviewQuitConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_ai_review_quit);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_ai_review_quit);
     return null;
 }
 
@@ -534,8 +503,6 @@ fn actionToMsg(action: Action) app_message.Msg {
         .cancel_branch_switch => app_message.Msg.cancel_branch_switch,
         .close_push_error => app_message.Msg.close_push_error,
         .run_interactive_push => app_message.Msg.run_interactive_push,
-        .confirm_ai_review_quit => app_message.Msg.confirm_ai_review_quit,
-        .cancel_ai_review_quit => app_message.Msg.cancel_ai_review_quit,
     };
 }
 
@@ -584,15 +551,6 @@ test "human review result modal precedes normal root page and remote-cancel rout
         .{ .ai_reviews = .{ .human_review_decision = .{ .summary_paste = "人の要約" } } },
         pasteToMsg(summary_modal, "人の要約").?,
     );
-}
-
-test "AI review quit confirmation owns keyboard and paste input" {
-    const context: KeyContext = .{ .ai_review_quit_confirmation_mode = true };
-    try std.testing.expectEqual(app_message.Msg.confirm_ai_review_quit, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(app_message.Msg.cancel_ai_review_quit, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(app_message.Msg.cancel_ai_review_quit, keyToMsg(context, .{ .codepoint = 'q' }).?);
-    try std.testing.expect(keyToMsg(context, .{ .codepoint = 'x' }) == null);
-    try std.testing.expect(eventToMsg(context, .{ .paste = "ignored" }) == null);
 }
 
 test "AI Reviews Finding focus admits page keys but retains card commands" {
@@ -1332,25 +1290,19 @@ test "remote cancel Escape takes priority while a background action is active" {
     );
 }
 
-test "AI Review Handoff owns root input before hosted and remote backgrounds" {
+test "AI Review Handoff owns root input before remote backgrounds" {
     const escape: chasen.Key = .{ .codepoint = chasen.Key.escape };
-    try std.testing.expectEqual(
-        app_message.Msg.dismiss_ai_review_status,
-        keyToMsg(.{ .ai_review_terminal_visible = true }, escape).?,
-    );
     try expectMsg(
         .{ .compare = .close_ai_review_handoff },
         keyToMsg(.{
             .active_page = .compare,
             .compare = .{ .ai_review_handoff_open = true },
-            .ai_review_terminal_visible = true,
             .remote_action_cancelable = true,
         }, escape).?,
     );
     const modal_over_background: KeyContext = .{
         .active_page = .compare,
         .compare = .{ .ai_review_handoff_open = true },
-        .ai_review_terminal_visible = true,
         .remote_action_cancelable = true,
     };
     try expectMsg(
@@ -1364,7 +1316,7 @@ test "AI Review Handoff owns root input before hosted and remote backgrounds" {
     try std.testing.expect(keyToMsg(modal_over_background, .{ .codepoint = '1' }) == null);
     try std.testing.expectEqual(
         app_message.Msg.cancel_remote_action,
-        keyToMsg(.{ .remote_action_cancelable = true, .ai_review_terminal_visible = true }, escape).?,
+        keyToMsg(.{ .remote_action_cancelable = true }, escape).?,
     );
 }
 
@@ -1444,29 +1396,4 @@ fn shiftedLowerOnly(lower: u21) chasen.Key {
         .codepoint = lower,
         .mods = .{ .shift = true },
     };
-}
-
-test "AI review details own keys and paste while opening respects existing owners" {
-    const f2: chasen.Key = .{ .codepoint = chasen.Key.f2 };
-    try std.testing.expect(keyToMsg(.{}, f2) == null);
-    const normal: KeyContext = .{ .ai_review_terminal_visible = true };
-    try std.testing.expectEqual(.open, keyToMsg(normal, f2).?.ai_review_details);
-    const blockers = [_]KeyContext{
-        .{ .command_line_active = true },                                             .{ .help_mode = true },                   .{ .repo_picker_mode = true },
-        .{ .commit_panel_mode = true },                                               .{ .discard_confirmation_mode = true },   .{ .push_error_mode = true },
-        .{ .active_selection_gesture = true },                                        .{ .changes = .{ .search_mode = true } }, .{ .active_page = .compare, .compare = .{ .base_picker_open = true } },
-        .{ .active_page = .compare, .compare = .{ .ai_review_handoff_open = true } },
-    };
-    for (blockers) |blocked| {
-        var context = blocked;
-        context.ai_review_terminal_visible = true;
-        if (keyToMsg(context, f2)) |msg| try std.testing.expect(msg != .ai_review_details);
-    }
-    const open: KeyContext = .{ .ai_review_details_open = true, .ai_review_terminal_visible = true };
-    for ([_]u21{ 'q', chasen.Key.escape, chasen.Key.f2 }) |key|
-        try std.testing.expectEqual(.close, keyToMsg(open, .{ .codepoint = key }).?.ai_review_details);
-    try std.testing.expectEqual(.down, keyToMsg(open, .{ .codepoint = 'j' }).?.ai_review_details);
-    try std.testing.expectEqual(.end, keyToMsg(open, .{ .codepoint = chasen.Key.end }).?.ai_review_details);
-    for ([_]u21{ '1', 'R', '/', 'a', ':' }) |key| try std.testing.expect(keyToMsg(open, .{ .codepoint = key }) == null);
-    try std.testing.expect(pasteToMsg(open, "do not route") == null);
 }
