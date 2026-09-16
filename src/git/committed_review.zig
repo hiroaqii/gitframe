@@ -92,6 +92,45 @@ pub const AheadDisplayResult = union(enum) {
     failure: AheadDisplayFailure,
 };
 
+/// In-memory authority for one direct committed diff. It deliberately carries
+/// no ref, merge-base policy, selection intent, or durable review identity.
+pub const CommittedDiffBasis = struct {
+    pub const Before = union(enum) {
+        commit: ObjectId,
+        empty_tree,
+    };
+
+    object_format: ObjectFormat,
+    before: Before,
+    after: ObjectId,
+
+    fn validate(self: CommittedDiffBasis) error{InvalidBasis}!void {
+        if (!self.after.validFor(self.object_format)) return error.InvalidBasis;
+        switch (self.before) {
+            .commit => |oid| if (!oid.validFor(self.object_format)) return error.InvalidBasis,
+            .empty_tree => {},
+        }
+    }
+
+    fn beforeOid(self: CommittedDiffBasis) ObjectId {
+        return switch (self.before) {
+            .commit => |oid| oid,
+            .empty_tree => canonicalEmptyTreeOid(self.object_format),
+        };
+    }
+};
+
+/// Allocator-owned direct patch paired with the exact basis that produced it.
+pub const CommittedDiffMaterialization = struct {
+    basis: CommittedDiffBasis,
+    patch_bytes: []u8,
+
+    pub fn deinit(self: *CommittedDiffMaterialization, allocator: std.mem.Allocator) void {
+        allocator.free(self.patch_bytes);
+        self.* = undefined;
+    }
+};
+
 /// Local, non-authoritative materialization for one exact target.
 pub const CommittedDiffProjection = struct {
     target: CommittedReviewTarget,
@@ -111,6 +150,20 @@ pub const CommittedDiffProjection = struct {
 pub const ProjectionFailure = enum {
     projection_too_large,
     projection_git_command_failed,
+};
+
+/// Complete direct materialization or the existing projection terminal.
+pub const CommittedDiffMaterializationResult = union(enum) {
+    materialization: CommittedDiffMaterialization,
+    failure: ProjectionFailure,
+
+    pub fn deinit(self: *CommittedDiffMaterializationResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .materialization => |*materialization| materialization.deinit(allocator),
+            .failure => {},
+        }
+        self.* = .{ .failure = .projection_git_command_failed };
+    }
 };
 
 /// Complete owned projection or one projection-specific terminal.
@@ -190,9 +243,10 @@ pub const CommittedDiffEndpointSidecar = struct {
     }
 };
 
-/// One-command source for exact Finding projection. The patch shape remains
-/// the established public projection value; the sidecar supplies authority
-/// that patch presentation paths cannot provide.
+/// One-diff-command source for exact Finding projection after shared basis
+/// admission. The patch shape remains the established public projection
+/// value; the sidecar supplies authority that patch presentation paths cannot
+/// provide.
 pub const CommittedFindingProjectionSource = struct {
     projection: CommittedDiffProjection,
     endpoints: CommittedDiffEndpointSidecar,
@@ -540,6 +594,18 @@ pub fn computeAheadDisplay(
     return .{ .count = count };
 }
 
+/// Materialize one direct exact-endpoint committed patch. The repository
+/// format and both endpoint object kinds are admitted before diff capture;
+/// versioned attributes come from `basis.after`.
+pub fn materializeCommittedDiff(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    basis: CommittedDiffBasis,
+) std.mem.Allocator.Error!CommittedDiffMaterializationResult {
+    return materializeCommittedDiffWithGit(allocator, io, context, basis, strict_prefix[0]);
+}
+
 /// Materialize the shared checkout-independent committed patch. Versioned
 /// attributes come from `target.head_oid`; worktree/index content is excluded.
 pub fn materializeCommittedProjection(
@@ -551,8 +617,9 @@ pub fn materializeCommittedProjection(
     return materializeCommittedProjectionWithGit(allocator, io, context, target, strict_prefix[0]);
 }
 
-/// Materialize one patch plus its exact raw endpoint identities with one Git
-/// command. There is no retry or path-derived fallback.
+/// Materialize one patch plus its exact raw endpoint identities with one diff
+/// command after shared basis admission. There is no retry or path-derived
+/// fallback.
 pub fn materializeCommittedFindingProjectionSource(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -672,17 +739,46 @@ fn materializeCommittedProjectionWithGit(
     target: CommittedReviewTarget,
     git_executable: []const u8,
 ) std.mem.Allocator.Error!ProjectionResult {
-    const capture = try captureCommittedDiff(
+    target.validate() catch return .{ .failure = .projection_git_command_failed };
+    const basis: CommittedDiffBasis = .{
+        .object_format = target.object_format,
+        .before = .{ .commit = target.diff_base_oid },
+        .after = target.head_oid,
+    };
+    const materialized = try materializeCommittedDiffWithGit(
         allocator,
         io,
         context,
-        target,
+        basis,
+        git_executable,
+    );
+    return switch (materialized) {
+        .materialization => |value| .{ .projection = .{
+            .target = target,
+            .patch_bytes = value.patch_bytes,
+        } },
+        .failure => |failure| .{ .failure = failure },
+    };
+}
+
+fn materializeCommittedDiffWithGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    basis: CommittedDiffBasis,
+    git_executable: []const u8,
+) std.mem.Allocator.Error!CommittedDiffMaterializationResult {
+    const capture = try captureAdmittedCommittedDiff(
+        allocator,
+        io,
+        context,
+        basis,
         git_executable,
         &.{},
         max_projection_bytes,
     );
     return switch (capture) {
-        .bytes => |bytes| .{ .projection = .{ .target = target, .patch_bytes = bytes } },
+        .bytes => |bytes| .{ .materialization = .{ .basis = basis, .patch_bytes = bytes } },
         .failure => |failure| .{ .failure = failure },
     };
 }
@@ -694,12 +790,18 @@ fn materializeCommittedFindingProjectionSourceWithGit(
     target: CommittedReviewTarget,
     git_executable: []const u8,
 ) std.mem.Allocator.Error!FindingProjectionSourceResult {
+    target.validate() catch return .{ .failure = .projection_git_command_failed };
+    const basis: CommittedDiffBasis = .{
+        .object_format = target.object_format,
+        .before = .{ .commit = target.diff_base_oid },
+        .after = target.head_oid,
+    };
     const combined_limit = std.math.mul(usize, max_projection_bytes, 2) catch unreachable;
-    const capture = try captureCommittedDiff(
+    const capture = try captureAdmittedCommittedDiff(
         allocator,
         io,
         context,
-        target,
+        basis,
         git_executable,
         &.{ "--raw", "-z", "--no-abbrev", "--patch" },
         combined_limit,
@@ -754,17 +856,115 @@ const ProjectionCapture = union(enum) {
     failure: ProjectionFailure,
 };
 
-fn captureCommittedDiff(
+fn canonicalEmptyTreeOid(format: ObjectFormat) ObjectId {
+    const text = switch (format) {
+        .sha1 => "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        .sha256 => "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
+    };
+    return ObjectId.parse(format, text) catch unreachable;
+}
+
+fn admitCommittedDiffBasis(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: git_command.DirectoryContext,
-    target: CommittedReviewTarget,
+    basis: CommittedDiffBasis,
+    git_executable: []const u8,
+) std.mem.Allocator.Error!bool {
+    basis.validate() catch return false;
+    const format_result = try readObjectFormatWithGit(allocator, io, context, git_executable);
+    const repository_format = switch (format_result) {
+        .format => |value| value,
+        .invalid_repository, .unsupported, .failed => return false,
+    };
+    if (repository_format != basis.object_format) return false;
+
+    const before_oid = basis.beforeOid();
+    const stdin = try std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{
+        before_oid.slice(),
+        basis.after.slice(),
+    });
+    defer allocator.free(stdin);
+    const argv = [_][]const u8{
+        git_executable,
+        strict_prefix[1],
+        strict_prefix[2],
+        strict_prefix[3],
+        "cat-file",
+        "--batch-check=%(objectname) %(objecttype)",
+    };
+    const max_record_bytes = ObjectFormat.sha256.oidHexLength() + " missing\n".len;
+    var result = try git_command.runWithStdinBounded(allocator, io, context, .{
+        .argv = &argv,
+        .stdin = stdin,
+        .stdout_limit = .limited(2 * max_record_bytes),
+        .stderr_limit = .limited(stderr_capture_bytes),
+    });
+    defer result.deinit(allocator);
+    const completed = switch (result) {
+        .completed => |value| value,
+        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return false,
+    };
+    if (!termExited(completed.term, 0)) return false;
+    return validCommittedDiffBasisObjectRecords(basis, before_oid, completed.stdout);
+}
+
+fn validCommittedDiffBasisObjectRecords(
+    basis: CommittedDiffBasis,
+    before_oid: ObjectId,
+    stdout: []const u8,
+) bool {
+    var lines = std.mem.splitScalar(u8, stdout, '\n');
+    const expected_oids = [_]*const ObjectId{ &before_oid, &basis.after };
+    const before_kind: []const u8 = switch (basis.before) {
+        .commit => "commit",
+        .empty_tree => "tree",
+    };
+    const expected_kinds = [_][]const u8{ before_kind, "commit" };
+    for (expected_oids, expected_kinds) |oid, kind| {
+        const line = lines.next() orelse return false;
+        if (line.len != oid.slice().len + 1 + kind.len or
+            !std.mem.eql(u8, line[0..oid.slice().len], oid.slice()) or
+            line[oid.slice().len] != ' ' or
+            !std.mem.eql(u8, line[oid.slice().len + 1 ..], kind)) return false;
+    }
+    const terminal = lines.next() orelse return false;
+    return terminal.len == 0 and lines.next() == null;
+}
+
+fn captureAdmittedCommittedDiff(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    basis: CommittedDiffBasis,
     git_executable: []const u8,
     output_options: []const []const u8,
     stdout_limit: usize,
 ) std.mem.Allocator.Error!ProjectionCapture {
-    target.validate() catch return .{ .failure = .projection_git_command_failed };
-    const attr_source = try std.fmt.allocPrint(allocator, "--attr-source={s}", .{target.head_oid.slice()});
+    if (!try admitCommittedDiffBasis(allocator, io, context, basis, git_executable))
+        return .{ .failure = .projection_git_command_failed };
+    return captureCommittedDiff(
+        allocator,
+        io,
+        context,
+        basis,
+        git_executable,
+        output_options,
+        stdout_limit,
+    );
+}
+
+fn captureCommittedDiff(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    basis: CommittedDiffBasis,
+    git_executable: []const u8,
+    output_options: []const []const u8,
+    stdout_limit: usize,
+) std.mem.Allocator.Error!ProjectionCapture {
+    const before_oid = basis.beforeOid();
+    const attr_source = try std.fmt.allocPrint(allocator, "--attr-source={s}", .{basis.after.slice()});
     defer allocator.free(attr_source);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -783,8 +983,8 @@ fn captureCommittedDiff(
         "--no-textconv",
         "--src-prefix=a/",
         "--dst-prefix=b/",
-        target.diff_base_oid.slice(),
-        target.head_oid.slice(),
+        before_oid.slice(),
+        basis.after.slice(),
     });
     var result = try git_command.runCapturedBounded(allocator, io, context, .{
         .argv = argv.items,
@@ -1372,9 +1572,18 @@ fn readObjectFormat(
     io: std.Io,
     context: git_command.DirectoryContext,
 ) std.mem.Allocator.Error!ObjectFormatResult {
+    return readObjectFormatWithGit(allocator, io, context, strict_prefix[0]);
+}
+
+fn readObjectFormatWithGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    git_executable: []const u8,
+) std.mem.Allocator.Error!ObjectFormatResult {
     const argv = [_][]const u8{
-        strict_prefix[0], strict_prefix[1],       strict_prefix[2], strict_prefix[3],
-        "rev-parse",      "--show-object-format",
+        git_executable, strict_prefix[1],       strict_prefix[2], strict_prefix[3],
+        "rev-parse",    "--show-object-format",
     };
     var result = try git_command.runCapturedBounded(allocator, io, context, .{
         .argv = &argv,
@@ -1387,7 +1596,7 @@ fn readObjectFormat(
         .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return .failed,
     };
     if (!termExited(completed.term, 0)) {
-        return if (try strictPrefixSupported(allocator, io, context)) .invalid_repository else .failed;
+        return if (try strictPrefixSupportedWithGit(allocator, io, context, git_executable)) .invalid_repository else .failed;
     }
     const text = singleLfLine(completed.stdout) orelse return .failed;
     if (std.mem.eql(u8, text, "sha1")) return .{ .format = .sha1 };
@@ -1395,13 +1604,14 @@ fn readObjectFormat(
     return .unsupported;
 }
 
-fn strictPrefixSupported(
+fn strictPrefixSupportedWithGit(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: git_command.DirectoryContext,
+    git_executable: []const u8,
 ) std.mem.Allocator.Error!bool {
     const argv = [_][]const u8{
-        strict_prefix[0], strict_prefix[1], strict_prefix[2], strict_prefix[3], "--version",
+        git_executable, strict_prefix[1], strict_prefix[2], strict_prefix[3], "--version",
     };
     var result = try git_command.runCapturedBounded(allocator, io, context, .{
         .argv = &argv,
@@ -2090,7 +2300,7 @@ const RefMovementTestContext = struct {
     }
 };
 
-test "target resolver ends at pinned target and projection and anchor are separate" {
+test "committed diff basis keeps Compare projection byte-identical while target and anchor stay separate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -2122,6 +2332,19 @@ test "target resolver ends at pinned target and projection and anchor are separa
     var projection = try materializeCommittedProjection(std.testing.allocator, io, context, target);
     defer projection.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, projection.projection.patch_bytes, "+feature") != null);
+    var direct = try materializeCommittedDiff(std.testing.allocator, io, context, .{
+        .object_format = target.object_format,
+        .before = .{ .commit = target.diff_base_oid },
+        .after = target.head_oid,
+    });
+    defer direct.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u8,
+        projection.projection.patch_bytes,
+        direct.materialization.patch_bytes,
+    );
+    try std.testing.expect(target.diff_base_oid.eql(&direct.materialization.basis.before.commit));
+    try std.testing.expect(target.head_oid.eql(&direct.materialization.basis.after));
 
     const digest = wire.Sha256Digest.hash("feature\n");
     var anchor = try resolveCodeAnchor(std.testing.allocator, io, context, target, .{
@@ -2661,18 +2884,33 @@ test "projection closes completed nonzero signal and stderr overflow to one gene
     defer std.testing.allocator.free(root_path);
     const log_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "invocations" });
     defer std.testing.allocator.free(log_path);
-    const args_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "argv" });
-    defer std.testing.allocator.free(args_path);
+    const trace_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "trace" });
+    defer std.testing.allocator.free(trace_path);
     const script =
         "#!/bin/sh\n" ++
         "printf x >> \"$FAKE_LOG\"\n" ++
-        "printf '%s\\n' \"$@\" > \"$FAKE_ARGS\"\n" ++
-        "case \"$FAKE_MODE\" in\n" ++
-        "  ok) printf 'binary\\000patch' ;;\n" ++
-        "  nonzero) exit 7 ;;\n" ++
-        "  unsupported_attr_source) printf unsupported >&2; exit 129 ;;\n" ++
-        "  signal) kill -TERM $$ ;;\n" ++
-        "  stderr) i=0; while [ \"$i\" -le 8192 ]; do printf e >&2; i=$((i + 1)); done ;;\n" ++
+        "for arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$FAKE_TRACE\"; done\n" ++
+        "printf '<end>\\n' >> \"$FAKE_TRACE\"\n" ++
+        "case \"$4\" in\n" ++
+        "  rev-parse) printf 'sha1\\n' ;;\n" ++
+        "  cat-file)\n" ++
+        "    IFS= read -r before || exit 10\n" ++
+        "    IFS= read -r after || exit 11\n" ++
+        "    if IFS= read -r extra; then exit 12; fi\n" ++
+        "    case \"$FAKE_MODE\" in\n" ++
+        "      before_tree) printf '%s tree\\n%s commit\\n' \"$before\" \"$after\" ;;\n" ++
+        "      after_missing) printf '%s commit\\n%s missing\\n' \"$before\" \"$after\" ;;\n" ++
+        "      *) printf '%s commit\\n%s commit\\n' \"$before\" \"$after\" ;;\n" ++
+        "    esac ;;\n" ++
+        "  --attr-source=*)\n" ++
+        "    case \"$FAKE_MODE\" in\n" ++
+        "      ok) printf 'binary\\000patch' ;;\n" ++
+        "      nonzero) exit 7 ;;\n" ++
+        "      unsupported_attr_source) printf unsupported >&2; exit 129 ;;\n" ++
+        "      signal) kill -TERM $$ ;;\n" ++
+        "      stderr) i=0; while [ \"$i\" -le 8192 ]; do printf e >&2; i=$((i + 1)); done ;;\n" ++
+        "      *) exit 13 ;;\n" ++
+        "    esac ;;\n" ++
         "  *) exit 9 ;;\n" ++
         "esac\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "git", .data = script });
@@ -2684,7 +2922,7 @@ test "projection closes completed nonzero signal and stderr overflow to one gene
     defer parent.deinit();
     try parent.put("PATH", root_path);
     try parent.put("FAKE_LOG", log_path);
-    try parent.put("FAKE_ARGS", args_path);
+    try parent.put("FAKE_TRACE", trace_path);
     try parent.put("FAKE_MODE", "ok");
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, &parent);
     defer environment.deinit();
@@ -2700,21 +2938,22 @@ test "projection closes completed nonzero signal and stderr overflow to one gene
     var ok = try materializeCommittedProjectionWithGit(std.testing.allocator, io, context, target, git_path);
     defer ok.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, "binary\x00patch", ok.projection.patch_bytes);
-
-    const modes = [_][]const u8{ "nonzero", "unsupported_attr_source", "signal", "stderr" };
-    for (modes) |mode| {
-        try environment.map.put("FAKE_MODE", mode);
-        var result = try materializeCommittedProjectionWithGit(std.testing.allocator, io, context, target, git_path);
-        defer result.deinit(std.testing.allocator);
-        try std.testing.expectEqual(ProjectionFailure.projection_git_command_failed, result.failure);
-    }
-    const invocations = try tmp.dir.readFileAlloc(io, "invocations", std.testing.allocator, .limited(16));
-    defer std.testing.allocator.free(invocations);
-    try std.testing.expectEqualStrings("xxxxx", invocations);
-    const args = try tmp.dir.readFileAlloc(io, "argv", std.testing.allocator, .limited(1024));
-    defer std.testing.allocator.free(args);
+    const trace = try tmp.dir.readFileAlloc(io, "trace", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(trace);
     try std.testing.expectEqualStrings(
         "--no-replace-objects\n" ++
+            "--no-lazy-fetch\n" ++
+            "--no-optional-locks\n" ++
+            "rev-parse\n" ++
+            "--show-object-format\n" ++
+            "<end>\n" ++
+            "--no-replace-objects\n" ++
+            "--no-lazy-fetch\n" ++
+            "--no-optional-locks\n" ++
+            "cat-file\n" ++
+            "--batch-check=%(objectname) %(objecttype)\n" ++
+            "<end>\n" ++
+            "--no-replace-objects\n" ++
             "--no-lazy-fetch\n" ++
             "--no-optional-locks\n" ++
             "--attr-source=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n" ++
@@ -2725,9 +2964,40 @@ test "projection closes completed nonzero signal and stderr overflow to one gene
             "--src-prefix=a/\n" ++
             "--dst-prefix=b/\n" ++
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" ++
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
-        args,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n" ++
+            "<end>\n",
+        trace,
     );
+
+    const modes = [_][]const u8{ "nonzero", "unsupported_attr_source", "signal", "stderr" };
+    for (modes) |mode| {
+        try environment.map.put("FAKE_MODE", mode);
+        var result = try materializeCommittedProjectionWithGit(std.testing.allocator, io, context, target, git_path);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ProjectionFailure.projection_git_command_failed, result.failure);
+    }
+    const invalid_kind_modes = [_][]const u8{ "before_tree", "after_missing" };
+    for (invalid_kind_modes) |mode| {
+        try environment.map.put("FAKE_MODE", mode);
+        var result = try materializeCommittedDiffWithGit(std.testing.allocator, io, context, .{
+            .object_format = .sha1,
+            .before = .{ .commit = target.diff_base_oid },
+            .after = target.head_oid,
+        }, git_path);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ProjectionFailure.projection_git_command_failed, result.failure);
+    }
+    var invalid_basis = try materializeCommittedDiffWithGit(std.testing.allocator, io, context, .{
+        .object_format = .sha1,
+        .before = .{ .commit = testObjectId(.sha256, 'a') },
+        .after = target.head_oid,
+    }, git_path);
+    defer invalid_basis.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ProjectionFailure.projection_git_command_failed, invalid_basis.failure);
+
+    const invocations = try tmp.dir.readFileAlloc(io, "invocations", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(invocations);
+    try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxxxxx", invocations);
 }
 
 test "projection accepts exact sixteen MiB and rejects only the next stdout byte" {
@@ -3295,7 +3565,7 @@ test "resolver pins full abbreviated ref root tag and ancestry endpoints and rej
     try std.testing.expectEqual(TargetResolutionFailure.base_ambiguous, short_oid_collision.failure);
 }
 
-test "resolver supports sha256 repositories and separates no and multiple merge bases" {
+test "committed diff basis supports sha256 root while resolver separates no and multiple merge bases" {
     const io = std.testing.io;
     var sha256_tmp = std.testing.tmpDir(.{});
     defer sha256_tmp.cleanup();
@@ -3313,6 +3583,14 @@ test "resolver supports sha256 repositories and separates no and multiple merge 
     }));
     try std.testing.expectEqual(ObjectFormat.sha256, sha256_target.object_format);
     try std.testing.expectEqual(@as(u8, 64), sha256_target.head_oid.len);
+    var sha256_root = try materializeCommittedDiff(std.testing.allocator, io, sha256_context, .{
+        .object_format = .sha256,
+        .before = .empty_tree,
+        .after = sha256_target.head_oid,
+    });
+    defer sha256_root.deinit(std.testing.allocator);
+    try std.testing.expect(sha256_root.materialization.basis.before == .empty_tree);
+    try std.testing.expect(std.mem.indexOf(u8, sha256_root.materialization.patch_bytes, "+sha256") != null);
 
     var graph_tmp = std.testing.tmpDir(.{});
     defer graph_tmp.cleanup();
