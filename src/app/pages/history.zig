@@ -7,6 +7,8 @@ const app_state = @import("../state.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const catalog = @import("history/catalog.zig");
 const input = @import("history/input.zig");
+const selection = @import("history/selection.zig");
+const git_history = @import("../../git/history.zig");
 
 pub const Msg = input.Msg;
 
@@ -46,6 +48,8 @@ pub const HistoryPageState = struct {
     needs_continuation: bool = false,
     load_state: LoadState = .idle,
     catalog: catalog.State = .{},
+    draft: selection.Draft = .single,
+    render_now_unix: ?i64 = null,
     status: app_state.StatusMessage = .{},
 
     pub fn deinit(self: *HistoryPageState, allocator: std.mem.Allocator) void {
@@ -61,6 +65,8 @@ pub const HistoryPageState = struct {
         self.needs_continuation = false;
         const root = identity orelse {
             self.catalog.clear(allocator);
+            self.draft = .single;
+            self.render_now_unix = null;
             self.repo_epoch = repo_epoch;
             self.root_identity = null;
             self.needs_initial = false;
@@ -69,7 +75,11 @@ pub const HistoryPageState = struct {
         };
         const same_repository = self.repo_epoch == repo_epoch and
             self.root_identity != null and self.root_identity.?.eql(root);
-        if (!same_repository) self.catalog.clear(allocator);
+        if (!same_repository) {
+            self.catalog.clear(allocator);
+            self.draft = .single;
+            self.render_now_unix = null;
+        }
         self.repo_epoch = repo_epoch;
         self.root_identity = root;
         self.needs_initial = true;
@@ -92,6 +102,8 @@ pub const HistoryPageState = struct {
         identity: ?root_capability.Identity,
     ) void {
         self.catalog.clear(allocator);
+        self.draft = .single;
+        self.render_now_unix = null;
         self.pending = null;
         self.repo_epoch = repo_epoch;
         self.root_identity = identity;
@@ -101,6 +113,10 @@ pub const HistoryPageState = struct {
     }
 
     pub fn requestReload(self: *HistoryPageState) void {
+        if (self.draft.isRange()) {
+            self.status.set("Cancel range selection before reloading", .{});
+            return;
+        }
         self.pending = null;
         self.needs_continuation = false;
         if (!self.active or self.root_identity == null) {
@@ -110,6 +126,7 @@ pub const HistoryPageState = struct {
         }
         self.needs_initial = true;
         self.load_state = .loading;
+        self.draft = .single;
     }
 
     pub fn requestContinuation(self: *HistoryPageState) void {
@@ -194,7 +211,11 @@ pub const HistoryPageState = struct {
             },
             .loaded => |*page| {
                 switch (pending.request) {
-                    .initial => try self.catalog.replace(allocator, page),
+                    .initial => {
+                        try self.catalog.replace(allocator, page);
+                        self.draft = .single;
+                        self.render_now_unix = finished.render_now_unix;
+                    },
                     .continuation => try self.catalog.append(allocator, page),
                 }
                 self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
@@ -214,20 +235,41 @@ pub const HistoryPageState = struct {
             .last => self.catalog.last(body_height),
             .load_older => self.requestContinuation(),
             .cancel_load => self.cancelLoad(),
+            .toggle_range => if (self.catalog.moreRowSelected()) {
+                self.status.set("Press Enter to load older commits", .{});
+            } else if (self.catalog.records.items.len > 0) {
+                self.draft.toggleAnchor(self.catalog.cursor);
+            },
+            .cancel_draft => if (!self.draft.clearAnchor()) {
+                self.status.set("No previously selected diff", .{});
+            },
+            .unsupported_search => self.status.set("Commit search is not available in v1", .{}),
             .owned_noop => {},
         }
+    }
+
+    pub fn selectionRequest(self: *const HistoryPageState) git_history.SelectionResolution {
+        const snapshot = if (self.catalog.snapshot) |*value| value else return .{ .unavailable = .empty_catalog };
+        return git_history.resolveSelection(
+            snapshot,
+            self.catalog.records.items,
+            self.draft.anchor(),
+            self.catalog.cursor,
+        );
     }
 
     pub fn inputContext(self: *const HistoryPageState, effective: @import("keymap").Effective) input.Context {
         return .{
             .loading = self.load_state == .loading,
             .more_row_selected = self.catalog.moreRowSelected(),
+            .picker_ready = self.catalog.records.items.len > 0,
             .keymap = effective,
         };
     }
 };
 
-test "History logical cancellation makes an arriving catalog result stale" {
+test "History completion adopts only an admitted initial presentation clock" {
+    const allocator = std.testing.allocator;
     const identity = app_page.RequestIdentity.history(9, 4);
     const root_identity: root_capability.Identity = .{ .device = 7, .inode = 11 };
     var state: HistoryPageState = .{
@@ -243,19 +285,164 @@ test "History logical cancellation makes an arriving catalog result stale" {
             .request = .initial,
         },
     };
-    state.cancelLoad();
-    try std.testing.expectEqual(LoadState.idle, state.load_state);
-    try std.testing.expectEqualStrings("History load canceled", state.status.text());
+    defer state.deinit(allocator);
 
-    var finished: app_load.HistoryCatalogFinished = .{
+    const head = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const root = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    var initial: app_load.HistoryCatalogFinished = .{
         .identity = identity,
         .root_identity = root_identity,
         .generation = 3,
         .request = .initial,
+        .render_now_unix = 100,
+        .result = .{ .loaded = .{
+            .snapshot = .{
+                .object_format = .sha1,
+                .head = head,
+                .display = .{ .branch = try allocator.dupe(u8, "main") },
+            },
+            .records = try allocator.alloc(git_history.Record, 1),
+            .continuation = root,
+        } },
+    };
+    initial.result.loaded.records[0] = try pickerTestRecord(allocator, head, 1, .{ .available = root }, "head");
+    defer initial.deinit(allocator);
+    try std.testing.expectEqual(
+        ApplyOutcome.changed,
+        try state.applyFinished(allocator, identity, root_identity, &initial),
+    );
+    try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
+
+    state.arm(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 4,
+        .request = .{ .continuation = .{ .format = .sha1, .cursor = root } },
+    });
+    var continuation: app_load.HistoryCatalogFinished = .{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 4,
+        .request = .{ .continuation = .{ .format = .sha1, .cursor = root } },
+        .render_now_unix = 200,
+        .result = .{ .loaded = .{ .records = try allocator.alloc(git_history.Record, 1) } },
+    };
+    continuation.result.loaded.records[0] = try pickerTestRecord(allocator, root, 0, .true_root, "root");
+    defer continuation.deinit(allocator);
+    try std.testing.expectEqual(
+        ApplyOutcome.changed,
+        try state.applyFinished(allocator, identity, root_identity, &continuation),
+    );
+    try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
+
+    state.arm(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 5,
+        .request = .initial,
+    });
+    var failed: app_load.HistoryCatalogFinished = .{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 5,
+        .request = .initial,
+        .render_now_unix = 300,
         .result = .{ .failure = .git_command_failed },
     };
-    try std.testing.expectEqual(
-        ApplyOutcome.discarded,
-        try state.applyFinished(std.testing.allocator, identity, root_identity, &finished),
-    );
+    try std.testing.expectEqual(ApplyOutcome.failed, try state.applyFinished(allocator, identity, root_identity, &failed));
+    try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
+
+    state.arm(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 6,
+        .request = .initial,
+    });
+    var stale: app_load.HistoryCatalogFinished = .{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 7,
+        .request = .initial,
+        .render_now_unix = 400,
+        .result = .{ .failure = .git_command_failed },
+    };
+    try std.testing.expectEqual(ApplyOutcome.discarded, try state.applyFinished(allocator, identity, root_identity, &stale));
+    try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
+
+    state.cancelLoad();
+    try std.testing.expectEqual(LoadState.loaded, state.load_state);
+    try std.testing.expectEqualStrings("History load canceled", state.status.text());
+}
+
+test "History picker preserves its anchor across older-page append and resolves one snapshot" {
+    const allocator = std.testing.allocator;
+    const head = try git_history.ObjectId.parse(.sha1, "3333333333333333333333333333333333333333");
+    const middle = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const root = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    var initial: git_history.Page = .{
+        .snapshot = .{
+            .object_format = .sha1,
+            .head = head,
+            .display = .{ .branch = try allocator.dupe(u8, "main") },
+        },
+        .records = try allocator.alloc(git_history.Record, 2),
+        .continuation = root,
+    };
+    initial.records[0] = try pickerTestRecord(allocator, head, 1, .{ .available = middle }, "head");
+    initial.records[1] = try pickerTestRecord(allocator, middle, 1, .{ .available = root }, "middle");
+    defer initial.deinit(allocator);
+
+    var state: HistoryPageState = .{ .active = true, .load_state = .loaded };
+    defer state.deinit(allocator);
+    try state.catalog.replace(allocator, &initial);
+    state.applyInput(.toggle_range, 24);
+    try std.testing.expectEqual(@as(?usize, 0), state.draft.anchor());
+    state.catalog.last(24);
+    try std.testing.expect(state.catalog.moreRowSelected());
+    state.applyInput(.toggle_range, 24);
+    try std.testing.expectEqualStrings("Press Enter to load older commits", state.status.text());
+    try std.testing.expectEqual(@as(?usize, 0), state.draft.anchor());
+
+    var older: git_history.Page = .{ .records = try allocator.alloc(git_history.Record, 1) };
+    older.records[0] = try pickerTestRecord(allocator, root, 0, .true_root, "root");
+    defer older.deinit(allocator);
+    try state.catalog.append(allocator, &older);
+    try std.testing.expectEqual(@as(usize, 2), state.catalog.cursor);
+    try std.testing.expectEqual(selection.Direction.toward_older, state.draft.direction(state.catalog.cursor).?);
+    const request = state.selectionRequest().request;
+    try std.testing.expectEqual(@as(usize, 3), request.intent.commitCount());
+    try std.testing.expect(request.basis.before == .empty_tree);
+
+    state.requestReload();
+    try std.testing.expectEqual(LoadState.loaded, state.load_state);
+    try std.testing.expectEqualStrings("Cancel range selection before reloading", state.status.text());
+    state.applyInput(.cancel_draft, 24);
+    try std.testing.expect(!state.draft.isRange());
+    state.applyInput(.cancel_draft, 24);
+    try std.testing.expectEqualStrings("No previously selected diff", state.status.text());
+    state.applyInput(.unsupported_search, 24);
+    try std.testing.expectEqualStrings("Commit search is not available in v1", state.status.text());
+}
+
+fn pickerTestRecord(
+    allocator: std.mem.Allocator,
+    oid: git_history.ObjectId,
+    parent_count: u16,
+    first_parent: git_history.FirstParent,
+    subject: []const u8,
+) !git_history.Record {
+    const author = try allocator.dupe(u8, "Test");
+    errdefer allocator.free(author);
+    const decorations = try allocator.dupe(u8, "");
+    errdefer allocator.free(decorations);
+    const owned_subject = try allocator.dupe(u8, subject);
+    return .{
+        .oid = oid,
+        .parent_count = parent_count,
+        .first_parent = first_parent,
+        .author = author,
+        .committer_unix = 0,
+        .decorations = decorations,
+        .subject = owned_subject,
+    };
 }

@@ -1,12 +1,14 @@
-//! Pure History catalog input mapping. Selection and diff input are owned by
-//! later slices and deliberately absent here.
+//! Pure History commit-picker input mapping. Actual diff loading and accepted
+//! diff input remain owned by the next slice.
 
 const chasen = @import("chasen");
 const keymap = @import("keymap");
+const key_input = @import("../../key_input.zig");
 
 pub const Context = struct {
     loading: bool = false,
     more_row_selected: bool = false,
+    picker_ready: bool = false,
     keymap: keymap.Effective = .{},
 };
 
@@ -19,6 +21,9 @@ pub const Msg = union(enum) {
     last,
     load_older,
     cancel_load,
+    toggle_range,
+    cancel_draft,
+    unsupported_search,
     owned_noop,
 };
 
@@ -34,6 +39,11 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.home, .{}) or matches(context.keymap, .document_first, key)) return .first;
     if (key.matches(chasen.Key.end, .{}) or matches(context.keymap, .document_last, key)) return .last;
     if (key.matches(chasen.Key.enter, .{}) and context.more_row_selected) return .load_older;
+    if (context.picker_ready and !key_input.hasCommandModifier(key)) {
+        if (key.codepoint == ' ') return .toggle_range;
+        if (key.codepoint == '/') return .unsupported_search;
+    }
+    if (context.picker_ready and key.matches(chasen.Key.escape, .{})) return .cancel_draft;
     return null;
 }
 
@@ -55,4 +65,12 @@ test "History loading owns Escape and keeps editing input inert" {
 test "History Enter is reserved for the visible load-more operation" {
     try @import("std").testing.expect(keyToMsg(.{}, .{ .codepoint = chasen.Key.enter }) == null);
     try @import("std").testing.expectEqual(Msg.load_older, keyToMsg(.{ .more_row_selected = true }, .{ .codepoint = chasen.Key.enter }).?);
+}
+
+test "History picker owns range cancel and unsupported search without wiring diff Enter" {
+    const ready: Context = .{ .picker_ready = true };
+    try @import("std").testing.expectEqual(Msg.toggle_range, keyToMsg(ready, .{ .codepoint = ' ' }).?);
+    try @import("std").testing.expectEqual(Msg.cancel_draft, keyToMsg(ready, .{ .codepoint = chasen.Key.escape }).?);
+    try @import("std").testing.expectEqual(Msg.unsupported_search, keyToMsg(ready, .{ .codepoint = '/' }).?);
+    try @import("std").testing.expect(keyToMsg(ready, .{ .codepoint = chasen.Key.enter }) == null);
 }

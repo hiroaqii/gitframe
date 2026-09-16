@@ -127,6 +127,137 @@ pub const LoadResult = union(enum) {
     }
 };
 
+/// Immutable, in-memory commit-picker intent. Indices are catalog coordinates;
+/// full OIDs remain the endpoint authority.
+pub const SelectionIntent = union(enum) {
+    single: struct {
+        index: usize,
+        oid: ObjectId,
+    },
+    range: struct {
+        anchor_index: usize,
+        cursor_index: usize,
+        newest_index: usize,
+        oldest_index: usize,
+        newest_oid: ObjectId,
+        oldest_oid: ObjectId,
+    },
+
+    pub fn commitCount(self: SelectionIntent) usize {
+        return switch (self) {
+            .single => 1,
+            .range => |value| value.oldest_index - value.newest_index + 1,
+        };
+    }
+};
+
+/// A validated picker request. It is neither an accepted selection nor an
+/// async task: S4 may re-resolve and pin it before starting materialization.
+pub const SelectionRequest = struct {
+    snapshot_head: ObjectId,
+    intent: SelectionIntent,
+    basis: committed_review.CommittedDiffBasis,
+};
+
+pub const SelectionUnavailable = union(enum) {
+    empty_catalog,
+    operation_row,
+    invalid_snapshot,
+    non_contiguous,
+    missing_first_parent: struct {
+        commit_index: usize,
+        oid: ObjectId,
+    },
+};
+
+pub const SelectionResolution = union(enum) {
+    request: SelectionRequest,
+    unavailable: SelectionUnavailable,
+};
+
+/// Resolve a single commit or inclusive first-parent range from one already
+/// admitted catalog snapshot. This performs no Git command, fetch, merge-base
+/// lookup, revision parsing, or fallback.
+pub fn resolveSelection(
+    snapshot: *const Snapshot,
+    records: []const Record,
+    anchor: ?usize,
+    cursor: usize,
+) SelectionResolution {
+    const snapshot_head = snapshot.head orelse return .{ .unavailable = .empty_catalog };
+    if (records.len == 0) return .{ .unavailable = .empty_catalog };
+    if (cursor >= records.len) return .{ .unavailable = .operation_row };
+    const anchor_index = anchor orelse cursor;
+    if (anchor_index >= records.len) return .{ .unavailable = .operation_row };
+    if (!snapshot_head.validFor(snapshot.object_format) or
+        !snapshot_head.eql(&records[0].oid))
+    {
+        return .{ .unavailable = .invalid_snapshot };
+    }
+
+    const newest_index = @min(anchor_index, cursor);
+    const oldest_index = @max(anchor_index, cursor);
+    for (records[newest_index .. oldest_index + 1]) |record| {
+        if (!record.oid.validFor(snapshot.object_format) or
+            !validFirstParentShape(record, snapshot.object_format))
+        {
+            return .{ .unavailable = .invalid_snapshot };
+        }
+    }
+    for (newest_index..oldest_index) |index| {
+        switch (records[index].first_parent) {
+            .available => |parent| {
+                if (!parent.eql(&records[index + 1].oid))
+                    return .{ .unavailable = .non_contiguous };
+            },
+            .missing => |oid| return .{ .unavailable = .{ .missing_first_parent = .{
+                .commit_index = index,
+                .oid = oid,
+            } } },
+            .true_root => return .{ .unavailable = .non_contiguous },
+        }
+    }
+
+    const oldest = &records[oldest_index];
+    const before: committed_review.CommittedDiffBasis.Before = switch (oldest.first_parent) {
+        .available => |oid| .{ .commit = oid },
+        .true_root => .empty_tree,
+        .missing => |oid| return .{ .unavailable = .{ .missing_first_parent = .{
+            .commit_index = oldest_index,
+            .oid = oid,
+        } } },
+    };
+    const newest = &records[newest_index];
+    const intent: SelectionIntent = if (anchor_index == cursor)
+        .{ .single = .{ .index = cursor, .oid = newest.oid } }
+    else
+        .{ .range = .{
+            .anchor_index = anchor_index,
+            .cursor_index = cursor,
+            .newest_index = newest_index,
+            .oldest_index = oldest_index,
+            .newest_oid = newest.oid,
+            .oldest_oid = oldest.oid,
+        } };
+    return .{ .request = .{
+        .snapshot_head = snapshot_head,
+        .intent = intent,
+        .basis = .{
+            .object_format = snapshot.object_format,
+            .before = before,
+            .after = newest.oid,
+        },
+    } };
+}
+
+fn validFirstParentShape(record: Record, format: ObjectFormat) bool {
+    return switch (record.first_parent) {
+        .true_root => record.parent_count == 0,
+        .available => |oid| record.parent_count > 0 and oid.validFor(format),
+        .missing => |oid| record.parent_count > 0 and oid.validFor(format),
+    };
+}
+
 pub fn loadInitial(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -771,4 +902,78 @@ test "History traversal requires raw adjacent parents and typed terminal boundar
     try std.testing.expect(validTraversal(&metadata, &.{ .{ .available = b }, .{ .missing = a } }));
     try std.testing.expect(!validTraversal(&metadata, &.{ .{ .available = a }, .true_root }));
     try std.testing.expect(!validTraversal(&metadata, &.{ .{ .available = b }, .{ .available = a } }));
+}
+
+test "History selection resolver normalizes ranges and distinguishes root from missing parent" {
+    const newest = try ObjectId.parse(.sha1, "dddddddddddddddddddddddddddddddddddddddd");
+    const middle = try ObjectId.parse(.sha1, "cccccccccccccccccccccccccccccccccccccccc");
+    const root = try ObjectId.parse(.sha1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const missing = try ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const snapshot: Snapshot = .{
+        .object_format = .sha1,
+        .head = newest,
+        .display = .detached,
+    };
+    const records = [_]Record{
+        resolverTestRecord(newest, 2, .{ .available = middle }),
+        resolverTestRecord(middle, 1, .{ .available = root }),
+        resolverTestRecord(root, 0, .true_root),
+    };
+
+    const single = resolveSelection(&snapshot, &records, null, 0).request;
+    try std.testing.expect(single.intent == .single);
+    try std.testing.expectEqual(@as(usize, 1), single.intent.commitCount());
+    try std.testing.expect(single.basis.before == .commit);
+    try std.testing.expect(single.basis.before.commit.eql(&middle));
+    try std.testing.expect(single.basis.after.eql(&newest));
+
+    const root_range = resolveSelection(&snapshot, &records, 0, 2).request;
+    try std.testing.expect(root_range.intent == .range);
+    try std.testing.expectEqual(@as(usize, 3), root_range.intent.commitCount());
+    try std.testing.expectEqual(@as(usize, 0), root_range.intent.range.anchor_index);
+    try std.testing.expectEqual(@as(usize, 2), root_range.intent.range.cursor_index);
+    try std.testing.expect(root_range.basis.before == .empty_tree);
+    try std.testing.expect(root_range.basis.after.eql(&newest));
+
+    const reverse = resolveSelection(&snapshot, &records, 2, 0).request;
+    try std.testing.expect(reverse.intent == .range);
+    try std.testing.expectEqual(@as(usize, 0), reverse.intent.range.newest_index);
+    try std.testing.expectEqual(@as(usize, 2), reverse.intent.range.oldest_index);
+    try std.testing.expect(reverse.basis.before == .empty_tree);
+
+    const collapsed = resolveSelection(&snapshot, &records, 1, 1).request;
+    try std.testing.expect(collapsed.intent == .single);
+    try std.testing.expectEqual(@as(usize, 1), collapsed.intent.single.index);
+    try std.testing.expect(collapsed.basis.before.commit.eql(&root));
+
+    var shallow_records = records[0..2].*;
+    shallow_records[1].first_parent = .{ .missing = missing };
+    const unavailable_single = resolveSelection(&snapshot, &shallow_records, null, 1).unavailable;
+    try std.testing.expect(unavailable_single == .missing_first_parent);
+    try std.testing.expect(unavailable_single.missing_first_parent.oid.eql(&missing));
+    const unavailable = resolveSelection(&snapshot, &shallow_records, 0, 1).unavailable;
+    try std.testing.expect(unavailable == .missing_first_parent);
+    try std.testing.expectEqual(@as(usize, 1), unavailable.missing_first_parent.commit_index);
+    try std.testing.expect(unavailable.missing_first_parent.oid.eql(&missing));
+
+    var broken_records = records;
+    broken_records[0].first_parent = .{ .available = root };
+    try std.testing.expect(resolveSelection(&snapshot, &broken_records, 0, 1).unavailable == .non_contiguous);
+    try std.testing.expect(resolveSelection(&snapshot, &records, null, records.len).unavailable == .operation_row);
+
+    var mismatched_snapshot = snapshot;
+    mismatched_snapshot.head = middle;
+    try std.testing.expect(resolveSelection(&mismatched_snapshot, &records, null, 0).unavailable == .invalid_snapshot);
+}
+
+fn resolverTestRecord(oid: ObjectId, parent_count: u16, first_parent: FirstParent) Record {
+    return .{
+        .oid = oid,
+        .parent_count = parent_count,
+        .first_parent = first_parent,
+        .author = @constCast(""),
+        .committer_unix = 0,
+        .decorations = @constCast(""),
+        .subject = @constCast(""),
+    };
 }

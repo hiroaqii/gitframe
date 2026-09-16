@@ -6,6 +6,7 @@ const content_fingerprint = @import("../content_fingerprint.zig");
 const chasen = @import("chasen");
 const auto_reload = @import("auto_reload.zig");
 const actions = @import("actions.zig");
+const branch_commit_time = @import("branch_commit_time.zig");
 const diff_basis = @import("diff_basis.zig");
 const page = @import("page.zig");
 const diff_file = @import("../diff/file.zig");
@@ -225,6 +226,7 @@ pub const HistoryCatalogFinished = struct {
     root_identity: root_capability.Identity,
     generation: u64,
     request: HistoryCatalogRequest,
+    render_now_unix: ?i64 = null,
     result: git_history.LoadResult,
 
     pub fn deinit(self: *HistoryCatalogFinished, allocator: std.mem.Allocator) void {
@@ -1033,12 +1035,16 @@ pub fn HistoryCatalogTask(comptime Msg: type) type {
                     continuation.cursor,
                 ),
             } catch git_history.LoadResult{ .failure = .git_command_failed };
-            return task.finish(allocator, result);
+            const render_now_unix = if (task.request == .initial)
+                branch_commit_time.sampleUnixSeconds(io)
+            else
+                null;
+            return task.finish(allocator, result, render_now_unix);
         }
 
         pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
             const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failure = .git_command_failed });
+            return task.finish(allocator, .{ .failure = .git_command_failed }, null);
         }
 
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
@@ -1047,13 +1053,19 @@ pub fn HistoryCatalogTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_history.LoadResult) Msg {
+        fn finish(
+            task: *@This(),
+            allocator: std.mem.Allocator,
+            result: git_history.LoadResult,
+            render_now_unix: ?i64,
+        ) Msg {
             defer task.destroy(allocator);
             return Msg.loadFinished(.{ .history = .{
                 .identity = task.identity,
                 .root_identity = task.root.identity,
                 .generation = task.generation,
                 .request = task.request,
+                .render_now_unix = render_now_unix,
                 .result = result,
             } });
         }
