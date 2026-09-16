@@ -95,6 +95,10 @@ test {
     _ = @import("app/pages/repository/tasks.zig");
     _ = @import("app/pages/repository/tree_projection.zig");
     _ = @import("app/pages/repository/view.zig");
+    _ = @import("app/pages/history.zig");
+    _ = @import("app/pages/history/catalog.zig");
+    _ = @import("app/pages/history/input.zig");
+    _ = @import("app/pages/history/view.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/push_retry.zig");
     _ = @import("app/repo_picker.zig");
@@ -141,6 +145,7 @@ test {
     _ = @import("git/committed_review.zig");
     _ = @import("git/committed_review/instructions.zig");
     _ = @import("git/compare.zig");
+    _ = @import("git/history.zig");
     _ = @import("git/operations.zig");
     _ = @import("git/read.zig");
     _ = @import("git/repository_locator.zig");

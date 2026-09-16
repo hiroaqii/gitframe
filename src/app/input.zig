@@ -17,12 +17,14 @@ const compare_input = @import("pages/compare/input.zig");
 const ai_reviews_input = @import("pages/ai_reviews/input.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_input = @import("pages/repository/input.zig");
+const history_input = @import("pages/history/input.zig");
 
 /// Minimal snapshot needed to translate a terminal key into an App message.
 /// Keeping this small prevents input mapping from depending on full App state.
 pub const ChangesContext = changes_input.Context;
 pub const CompareContext = compare_input.Context;
 pub const AiReviewsContext = ai_reviews_input.Context;
+pub const HistoryContext = history_input.Context;
 
 pub const KeyContext = struct {
     active_page: page.Id = .changes,
@@ -30,6 +32,7 @@ pub const KeyContext = struct {
     compare: CompareContext = .{},
     ai_reviews: AiReviewsContext = .{},
     repository: repository_input.Context = .{},
+    history: HistoryContext = .{},
     commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode = .list,
@@ -146,6 +149,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return .{ .commit_panel_paste = text };
+    if (context.active_page == .history) return .{ .history = history_input.pasteToMsg(context.history, text) };
     if (context.active_page == .changes) {
         const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
         return translateChangesMsg(changes_msg);
@@ -210,6 +214,12 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
     if (context.push_error_mode) return pushErrorKeyToMsg(key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
+    if (context.active_page == .history and context.history.loading) {
+        const routing_key = normalRoutingKey(key);
+        if (pageForKey(context.keymap, routing_key)) |target| return .{ .switch_page = target };
+        if (routing_key.codepoint == 'q' and !key_input.hasCommandModifier(routing_key)) return app_message.Msg.quit;
+        return .{ .history = history_input.keyToMsg(context.history, routing_key) orelse .owned_noop };
+    }
     if (selectionKeyToMsg(context, key)) |msg| return msg;
     const routing_key = normalRoutingKey(key);
     if (pageForKey(context.keymap, routing_key)) |target| return .{ .switch_page = target };
@@ -241,6 +251,9 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
         if (repository_input.keyToMsg(repository_page.Msg, context.repository, routing_key)) |repository_msg| {
             return .{ .repository = repository_msg };
         }
+    }
+    if (context.active_page == .history) {
+        if (history_input.keyToMsg(context.history, routing_key)) |msg| return .{ .history = msg };
     }
     if (context.active_page == .compare) {
         if (compare_input.keyToMsg(context.compare, routing_key)) |msg| {
@@ -284,6 +297,7 @@ fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
             context.repository,
             key,
         ) orelse return null },
+        .history => null,
         .config => null,
     };
 }
@@ -292,6 +306,7 @@ fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
     const bindings = [_]struct { action: keymap.PublicAction, id: page.Id }{
         .{ .action = .page_changes, .id = .changes },
         .{ .action = .page_repository, .id = .repository },
+        .{ .action = .page_history, .id = .history },
         .{ .action = .page_compare, .id = .compare },
         .{ .action = .page_ai_reviews, .id = .ai_reviews },
         .{ .action = .page_config, .id = .config },
@@ -516,7 +531,7 @@ fn expectMsg(expected: app_message.Msg, actual: app_message.Msg) !void {
 
 test "human review result modal precedes normal root page and remote-cancel routes" {
     try expectMsg(.{ .switch_page = .changes }, keyToMsg(.{}, .{ .codepoint = '1' }).?);
-    try expectMsg(.{ .switch_page = .config }, keyToMsg(.{}, .{ .codepoint = '5' }).?);
+    try expectMsg(.{ .switch_page = .config }, keyToMsg(.{}, .{ .codepoint = '6' }).?);
     try std.testing.expectEqual(changesMsg(.{ .search_insert = '2' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, .{ .codepoint = '2' }).?);
     try expectMsg(.{ .commit_panel_insert = '3' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = '3' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = '2', .mods = .{ .ctrl = true } }));
@@ -561,7 +576,7 @@ test "AI Reviews Finding focus admits page keys but retains card commands" {
             .finding_card_focused = true,
         },
     };
-    try expectMsg(.{ .switch_page = .compare }, keyToMsg(context, .{ .codepoint = '3' }).?);
+    try expectMsg(.{ .switch_page = .compare }, keyToMsg(context, .{ .codepoint = '4' }).?);
     try expectMsg(
         .{ .ai_reviews = .{ .finding_card = .accept } },
         keyToMsg(context, .{ .codepoint = 'a' }).?,
@@ -570,6 +585,19 @@ test "AI Reviews Finding focus admits page keys but retains card commands" {
         .{ .ai_reviews = .{ .finding_card = .retry } },
         keyToMsg(context, .{ .codepoint = 'r' }).?,
     );
+}
+
+test "History catalog loading admits only cancel page transition and quit" {
+    const context: KeyContext = .{
+        .active_page = .history,
+        .history = .{ .loading = true },
+    };
+    try expectMsg(.{ .history = .cancel_load }, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try expectMsg(.{ .switch_page = .compare }, keyToMsg(context, .{ .codepoint = '4' }).?);
+    try expectMsg(.quit, keyToMsg(context, .{ .codepoint = 'q' }).?);
+    try expectMsg(.{ .history = .owned_noop }, keyToMsg(context, .{ .codepoint = 'j' }).?);
+    try expectMsg(.{ .history = .owned_noop }, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
+    try expectMsg(.{ .history = .owned_noop }, pasteToMsg(context, "ignored").?);
 }
 
 test "command line owns key and paste input before every normal route" {

@@ -15,6 +15,7 @@ const ai_review_delete = @import("pages/ai_reviews/delete_confirmation.zig");
 const diff_surface = @import("diff_surface.zig");
 const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const repository_page = @import("pages/repository.zig");
+const history_page = @import("pages/history.zig");
 const repository_layout = @import("pages/repository/layout.zig");
 const changes_message = @import("pages/changes/message.zig");
 const review_store = @import("../review_store.zig");
@@ -155,6 +156,7 @@ pub const Msg = union(enum) {
     compare: compare_input.Msg,
     ai_reviews: ai_reviews_input.Msg,
     repository: repository_page.Msg,
+    history: history_page.Msg,
     command_line: command_line.Msg,
     mouse_selection_drag: MouseSelectionContinuation,
     mouse_selection_release: MouseSelectionContinuation,

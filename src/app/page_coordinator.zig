@@ -17,6 +17,7 @@ const repo_session = @import("repo_session.zig");
 const compare_page = @import("pages/compare.zig");
 const ai_reviews_page = @import("pages/ai_reviews.zig");
 const repository_page = @import("pages/repository.zig");
+const history_page = @import("pages/history.zig");
 const changes_page = @import("pages/changes.zig");
 const changes_content = @import("pages/changes/content.zig");
 const changes_navigation = @import("pages/changes/navigation.zig");
@@ -39,6 +40,7 @@ pub const Intent = enum {
     none,
     changes_revalidation,
     changes_repository_changed,
+    history_refresh,
     compare_refresh,
 };
 
@@ -46,6 +48,7 @@ pub const Controller = struct {
     active_page: *page.Id,
     changes: *changes_page.ChangesPageState,
     repository: *repository_page.RepositoryPageState,
+    history: *history_page.HistoryPageState,
     compare: *compare_page.ComparePageState,
     ai_reviews: *ai_reviews_page.AiReviewsPageState,
     config_page: *page.LazyPlaceholder,
@@ -81,6 +84,10 @@ pub const Controller = struct {
             .compare => blk: {
                 _ = self.compare.activate(self.repo.epoch());
                 break :blk .compare_refresh;
+            },
+            .history => blk: {
+                self.history.activate(allocator, self.repo.epoch(), self.repo.activeIdentity());
+                break :blk .history_refresh;
             },
             .ai_reviews => blk: {
                 self.ai_reviews.releaseFindingPresentationCache(allocator);
@@ -133,6 +140,7 @@ pub const Controller = struct {
 
         if (self.active_page.* == .changes) self.deactivateChangesForPageSwitch(allocator);
         if (self.active_page.* == .repository) self.deactivateRepositoryForPageSwitch();
+        if (self.active_page.* == .history) self.history.deactivate();
         if (self.active_page.* == .compare) self.compare.deactivate();
         if (self.active_page.* == .ai_reviews) {
             self.ai_reviews.deactivate();
@@ -146,6 +154,10 @@ pub const Controller = struct {
             .repository => blk: {
                 self.repository.activate(self.repo.epoch(), self.repo.activeIdentity());
                 break :blk .none;
+            },
+            .history => blk: {
+                self.history.activate(allocator, self.repo.epoch(), self.repo.activeIdentity());
+                break :blk .history_refresh;
             },
             .compare => blk: {
                 _ = self.compare.activate(self.repo.epoch());

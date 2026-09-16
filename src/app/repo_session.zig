@@ -22,6 +22,7 @@ const changes_reload = if (builtin.is_test) @import("pages/changes/reload.zig") 
 const compare_page = @import("pages/compare.zig");
 const ai_reviews_page = @import("pages/ai_reviews.zig");
 const repository_page = @import("pages/repository.zig");
+const history_page = @import("pages/history.zig");
 const discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const repo_state = @import("../repo/state.zig");
@@ -205,6 +206,19 @@ pub const CompareInvalidationPort = struct {
     }
 };
 
+pub const HistoryInvalidationPort = struct {
+    page: *history_page.HistoryPageState,
+
+    fn invalidateBeforeReplacement(
+        self: HistoryInvalidationPort,
+        allocator: std.mem.Allocator,
+        next_epoch: u64,
+        identity: ?root_capability.Identity,
+    ) void {
+        self.page.repositoryChanged(allocator, next_epoch, identity);
+    }
+};
+
 pub const AiReviewsInvalidationPort = struct {
     page: *ai_reviews_page.AiReviewsPageState,
 
@@ -223,6 +237,7 @@ pub const Controller = struct {
     action_pending: bool,
     changes: changes_repository_session.Controller,
     repository: RepositoryInvalidationPort,
+    history: ?HistoryInvalidationPort = null,
     compare: CompareInvalidationPort,
     ai_reviews: AiReviewsInvalidationPort,
     shell: remote_state.RepositoryInvalidationPort,
@@ -312,6 +327,11 @@ pub const Controller = struct {
             const next_epoch = nextEpoch(self.state.repo_epoch);
             self.shell.invalidateBeforeRepositoryReplacement(allocator);
             self.changes.invalidateBeforeReplacement(allocator);
+            if (self.history) |history| history.invalidateBeforeReplacement(
+                allocator,
+                next_epoch,
+                if (prepared.candidate) |root| root.identity else null,
+            );
             self.compare.invalidateBeforeReplacement(allocator);
             self.ai_reviews.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(
@@ -395,6 +415,7 @@ pub const Controller = struct {
             const next_epoch = nextEpoch(self.state.repo_epoch);
             self.shell.invalidateBeforeRepositoryReplacement(allocator);
             self.changes.invalidateBeforeReplacement(allocator);
+            if (self.history) |history| history.invalidateBeforeReplacement(allocator, next_epoch, prepared.candidate.?.identity);
             self.compare.invalidateBeforeReplacement(allocator);
             self.ai_reviews.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(allocator, next_epoch, prepared.candidate.?.identity);

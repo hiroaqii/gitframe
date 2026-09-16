@@ -20,6 +20,7 @@ const file_tree = @import("../file_tree.zig");
 const git_command = @import("../git/command.zig");
 const git_committed_review = @import("../git/committed_review.zig");
 const git_compare = @import("../git/compare.zig");
+const git_history = @import("../git/history.zig");
 const git_read = @import("../git/read.zig");
 const git_refs = @import("../git/refs.zig");
 const git_branch_status = @import("../git/branch_status.zig");
@@ -211,6 +212,27 @@ pub const CompareBranchListFinished = struct {
     }
 };
 
+pub const HistoryCatalogRequest = union(enum) {
+    initial,
+    continuation: struct {
+        format: git_history.ObjectFormat,
+        cursor: git_history.ObjectId,
+    },
+};
+
+pub const HistoryCatalogFinished = struct {
+    identity: page.RequestIdentity,
+    root_identity: root_capability.Identity,
+    generation: u64,
+    request: HistoryCatalogRequest,
+    result: git_history.LoadResult,
+
+    pub fn deinit(self: *HistoryCatalogFinished, allocator: std.mem.Allocator) void {
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const AiReviewScanTaskResult = union(enum) {
     empty,
     scanned: review_store.ScanResult,
@@ -354,6 +376,7 @@ pub const CoordinatorReadFinished = union(enum) {
 /// than adding Repository-shaped tags beside Changes tags in App.Msg.
 pub const ReadFinished = union(enum) {
     changes: ChangesReadFinished,
+    history: HistoryCatalogFinished,
     compare: CompareReadFinished,
     ai_reviews: AiReviewsReadFinished,
     shell: ShellReadFinished,
@@ -957,6 +980,82 @@ pub fn CompareLoadTask(comptime Msg: type) type {
             if (task.target) |*target| target.deinit(allocator);
             task.environment.deinit();
             task.root.deinit();
+        }
+    };
+}
+
+/// Async owner for one exact History catalog page. The duplicated descriptor
+/// and sanitized environment are the only repository authority retained by
+/// the task; the cursor is a full inline OID, never a ref or offset.
+pub fn HistoryCatalogTask(comptime Msg: type) type {
+    return struct {
+        identity: page.RequestIdentity,
+        generation: u64,
+        root: root_capability.RootCapability,
+        request: HistoryCatalogRequest,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn init(
+            identity: page.RequestIdentity,
+            generation: u64,
+            root: *const root_capability.RootCapability,
+            request: HistoryCatalogRequest,
+            env_map: ?*const std.process.Environ.Map,
+            allocator: std.mem.Allocator,
+        ) !@This() {
+            std.debug.assert(identity.origin == .history);
+            var owned_root = try root.duplicate();
+            errdefer owned_root.deinit();
+            var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map);
+            errdefer environment.deinit();
+            return .{
+                .identity = identity,
+                .generation = generation,
+                .root = owned_root,
+                .request = request,
+                .environment = environment,
+            };
+        }
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const context: git_command.DirectoryContext = .{
+                .cwd = task.root.dir(),
+                .environment = &task.environment,
+            };
+            const result: git_history.LoadResult = switch (task.request) {
+                .initial => git_history.loadInitial(allocator, io, context),
+                .continuation => |continuation| git_history.loadContinuation(
+                    allocator,
+                    io,
+                    context,
+                    continuation.format,
+                    continuation.cursor,
+                ),
+            } catch git_history.LoadResult{ .failure = .git_command_failed };
+            return task.finish(allocator, result);
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failure = .git_command_failed });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_history.LoadResult) Msg {
+            defer task.destroy(allocator);
+            return Msg.loadFinished(.{ .history = .{
+                .identity = task.identity,
+                .root_identity = task.root.identity,
+                .generation = task.generation,
+                .request = task.request,
+                .result = result,
+            } });
         }
     };
 }

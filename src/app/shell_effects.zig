@@ -65,6 +65,7 @@ pub const OriginContext = struct {
     snapshot: effect_origin.Snapshot,
     changes_repo_epoch: u64,
     repository_repo_epoch: u64,
+    history_repo_epoch: u64 = 0,
     compare_repo_epoch: u64,
     ai_reviews_repo_epoch: u64,
 
@@ -92,6 +93,14 @@ pub const OriginContext = struct {
         };
     }
 
+    pub fn history(self: OriginContext) effect_origin.PageOrigin {
+        return .{
+            .page_id = .history,
+            .repo_epoch = self.history_repo_epoch,
+            .activation_id = self.snapshot.history_activation_id,
+        };
+    }
+
     pub fn aiReviews(self: OriginContext) effect_origin.PageOrigin {
         return .{
             .page_id = .ai_reviews,
@@ -105,6 +114,7 @@ pub const DiagnosticPorts = struct {
     shell: *app_state.StatusMessage,
     changes: *app_state.StatusMessage,
     repository: *app_state.StatusMessage,
+    history: ?*app_state.StatusMessage = null,
     compare: *app_state.StatusMessage,
     compare_ai_review_handoff: ?*app_state.StatusMessage = null,
     ai_reviews: *app_state.StatusMessage,
@@ -156,6 +166,10 @@ pub const Controller = struct {
 
     pub fn compareOrigin(self: Controller) effect_origin.PageOrigin {
         return self.origins.compare();
+    }
+
+    pub fn historyOrigin(self: Controller) effect_origin.PageOrigin {
+        return self.origins.history();
     }
 
     pub fn aiReviewsOrigin(self: Controller) effect_origin.PageOrigin {
@@ -373,6 +387,7 @@ pub const Controller = struct {
             .page => |captured| switch (captured.page_id) {
                 .changes => self.diagnostics.changes.set(fmt, args),
                 .repository => self.diagnostics.repository.set(fmt, args),
+                .history => if (self.diagnostics.history) |status| status.set(fmt, args) else self.diagnostics.shell.set(fmt, args),
                 .compare => self.diagnostics.compare.set(fmt, args),
                 .ai_reviews => self.diagnostics.ai_reviews.set(fmt, args),
                 .config => self.diagnostics.shell.set(fmt, args),

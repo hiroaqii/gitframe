@@ -1721,7 +1721,7 @@ test "Changes canonical publication page transition retires generic page exits" 
     var roots = try TestRepoPair.init();
     defer roots.deinit();
 
-    for ([_]page.Id{ .compare, .ai_reviews, .config }, 0..) |target, index| {
+    for ([_]page.Id{ .history, .compare, .ai_reviews, .config }, 0..) |target, index| {
         var app = try canonicalPublicationTestApp(allocator, roots.a);
         defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
@@ -2829,9 +2829,10 @@ fn canonicalPageTransitionMessage(
             .codepoint = switch (target) {
                 .changes => '1',
                 .repository => '2',
-                .compare => '3',
-                .ai_reviews => '4',
-                .config => '5',
+                .history => '3',
+                .compare => '4',
+                .ai_reviews => '5',
+                .config => '6',
             },
         } }),
         .page_bar => blk: {

@@ -55,6 +55,7 @@ pub const Snapshot = struct {
     repo_epoch: u64,
     changes_activation_id: u64,
     repository_activation_id: u64,
+    history_activation_id: u64 = 0,
     compare_activation_id: u64,
     ai_reviews_activation_id: u64,
     push_error_instance_id: ?u64,
@@ -88,6 +89,7 @@ fn classifyPage(captured: PageOrigin, current: Snapshot) Liveness {
     const activation_matches = switch (captured.page_id) {
         .changes => captured.activation_id == current.changes_activation_id,
         .repository => captured.activation_id == current.repository_activation_id,
+        .history => captured.activation_id == current.history_activation_id,
         .compare => captured.activation_id == current.compare_activation_id,
         .ai_reviews => captured.activation_id == current.ai_reviews_activation_id,
         .config => true,

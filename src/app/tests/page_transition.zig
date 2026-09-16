@@ -251,7 +251,7 @@ test "keyboard and page bar mouse share the page switch transition" {
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 }
 
-test "page key 3 activates Compare without replacing retained Changes state" {
+test "page key 4 activates Compare without replacing retained Changes state" {
     var app: App = .{
         .config = .{ .source = .stdin },
         .pages = .{ .changes = .{
@@ -262,7 +262,7 @@ test "page key 3 activates Compare without replacing retained Changes state" {
     _ = activateChanges(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
 
-    const message = app.handleEvent(.{ .key_press = .{ .codepoint = '3' } }) orelse
+    const message = app.handleEvent(.{ .key_press = .{ .codepoint = '4' } }) orelse
         return error.ExpectedComparePageSwitch;
     try std.testing.expectEqual(App.Msg{ .switch_page = .compare }, message);
     try app.update(message, &ctx);

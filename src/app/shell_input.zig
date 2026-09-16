@@ -78,12 +78,17 @@ pub const RepositoryContext = struct {
     page_state: *const repository_page.RepositoryPageState,
 };
 
+pub const HistoryContext = struct {
+    key: app_input.HistoryContext = .{},
+};
+
 pub const View = struct {
     active_page: page.Id,
     changes: ChangesContext,
     compare: CompareContext,
     ai_reviews: AiReviewsContext,
     repository: RepositoryContext,
+    history: HistoryContext = .{},
     commit_panel_mode: bool,
     repo_picker_mode: bool,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode,
@@ -110,6 +115,7 @@ pub const View = struct {
             .compare = self.compare.key,
             .ai_reviews = self.ai_reviews.key,
             .repository = self.repository.key,
+            .history = self.history.key,
             .commit_panel_mode = self.commit_panel_mode,
             .repo_picker_mode = self.repo_picker_mode,
             .repo_picker_input_mode = self.repo_picker_input_mode,
@@ -330,7 +336,7 @@ pub const View = struct {
             .changes => .{ .changes = self.changes.selection_owner },
             .compare => .{ .compare = self.compare.selection_owner },
             .ai_reviews => .{ .ai_reviews = self.ai_reviews.selection_owner },
-            .repository, .config => null,
+            .repository, .history, .config => null,
         };
     }
 

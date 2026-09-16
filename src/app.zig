@@ -37,6 +37,8 @@ const changes_view = @import("app/pages/changes/view.zig");
 const repository_page = @import("app/pages/repository.zig");
 const repository_coordinator = @import("app/pages/repository/coordinator.zig");
 const repository_layout = @import("app/pages/repository/layout.zig");
+const history_page = @import("app/pages/history.zig");
+const history_coordinator = @import("app/pages/history/coordinator.zig");
 const repo_session = @import("app/repo_session.zig");
 const app_state = @import("app/state.zig");
 const app_view = @import("app/view.zig");
@@ -74,6 +76,7 @@ comptime {
 const PageStates = struct {
     changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
+    history: history_page.HistoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
     ai_reviews: ai_reviews_page.AiReviewsPageState = .{},
     config: page.LazyPlaceholder = .{},
@@ -198,6 +201,7 @@ pub const App = struct {
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.pages.changes.deinit(deinit_ctx.allocator);
         self.pages.repository.deinit(deinit_ctx.allocator);
+        self.pages.history.deinit(deinit_ctx.allocator);
         self.pages.compare.deinit(deinit_ctx.allocator);
         self.pages.ai_reviews.deinit(deinit_ctx.allocator);
         if (self.configured_review_store) |*store| store.deinit(deinit_ctx.allocator);
@@ -428,6 +432,7 @@ pub const App = struct {
                 self.pages.ai_reviews.delete_confirmation.isOpen(),
             .changes = self.changesRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
+            .history = .{ .page = &self.pages.history },
             .compare = .{ .page = &self.pages.compare },
             .ai_reviews = .{ .page = &self.pages.ai_reviews },
             .shell = self.remote_workflow.repositoryInvalidationPort(&self.overlay),
@@ -437,6 +442,16 @@ pub const App = struct {
     fn repositoryCoordinator(self: *App) repository_coordinator.Controller {
         return .{
             .page_state = &self.pages.repository,
+            .active_page = self.active_page,
+            .repo = self.repoSessionView(),
+            .body_size = self.shellLayout().bodySize(),
+            .env_map = self.env_map,
+        };
+    }
+
+    fn historyCoordinator(self: *App) history_coordinator.Controller {
+        return .{
+            .page_state = &self.pages.history,
             .active_page = self.active_page,
             .repo = self.repoSessionView(),
             .body_size = self.shellLayout().bodySize(),
@@ -483,6 +498,7 @@ pub const App = struct {
             .active_page = &self.active_page,
             .changes = &self.pages.changes,
             .repository = &self.pages.repository,
+            .history = &self.pages.history,
             .compare = &self.pages.compare,
             .ai_reviews = &self.pages.ai_reviews,
             .config_page = &self.pages.config,
@@ -514,6 +530,7 @@ pub const App = struct {
             .none => {},
             .changes_revalidation => try self.changesRead().requestRevalidation(ctx),
             .changes_repository_changed => try self.changesRead().startDiffLoad(ctx, .repo_switch),
+            .history_refresh => try self.historyCoordinator().startPending(ctx),
             .compare_refresh => try self.compareCoordinator().refresh(ctx),
         }
     }
@@ -557,7 +574,7 @@ pub const App = struct {
             .ai_reviews => !self.pages.ai_reviews.diff.search.mode and
                 !self.pages.ai_reviews.diff.file_search.mode and
                 !self.pages.ai_reviews.picker.isPickerVisible(),
-            .repository, .config => false,
+            .repository, .history, .config => false,
         };
         if (!reachable) return 0;
 
@@ -671,6 +688,7 @@ pub const App = struct {
                 .repo_epoch = repo_epoch,
                 .changes_activation_id = self.pages.changes.activation.next_activation_id,
                 .repository_activation_id = self.pages.repository.activation_id,
+                .history_activation_id = self.pages.history.activation_id,
                 .compare_activation_id = self.pages.compare.activation.next_activation_id,
                 .ai_reviews_activation_id = self.pages.ai_reviews.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
@@ -682,6 +700,7 @@ pub const App = struct {
             },
             .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
+            .history_repo_epoch = self.pages.history.repo_epoch,
             .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
             .ai_reviews_repo_epoch = if (ai_reviews_identity) |identity| identity.repo_epoch else repo_epoch,
         };
@@ -697,6 +716,7 @@ pub const App = struct {
                 .shell = &self.status,
                 .changes = &self.pages.changes.status,
                 .repository = &self.pages.repository.status,
+                .history = &self.pages.history.status,
                 .compare = &self.pages.compare.status,
                 .compare_ai_review_handoff = self.pages.compare.ai_review_handoff.statusMessage(),
                 .ai_reviews = &self.pages.ai_reviews.status,
@@ -848,6 +868,7 @@ pub const App = struct {
                     self.pages.repository.restoreSelectionViewportAnchor(anchor, repository_body_size)
                 else
                     self.pages.repository.clampForBodySize(repository_body_size);
+                self.pages.history.catalog.clamp(@import("app/pages/history/catalog.zig").visibleRows(repository_body_size.height));
                 self.overlayScroll().clampHelp();
                 self.overlayScroll().clampPushError();
             },
@@ -869,6 +890,7 @@ pub const App = struct {
             .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
             .ai_reviews => |ai_reviews_msg| _ = try self.updateAiReviews(ctx, ai_reviews_msg),
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
+            .history => |history_msg| self.historyCoordinator().update(history_msg),
             .command_line => |command_msg| self.updateCommandLine(command_msg),
             .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
             .mouse_selection_release => |continuation| try self.updateMouseSelectionRelease(ctx, continuation),
@@ -973,6 +995,7 @@ pub const App = struct {
                     }
                 },
                 .repository => self.repositoryCoordinator().requestReload(),
+                .history => self.historyCoordinator().refresh(),
                 .compare => try self.compareCoordinator().refresh(ctx),
                 .ai_reviews => try self.aiReviewsCoordinator().refresh(ctx),
                 .config => self.status.set("reload is not available on this page yet", .{}),
@@ -984,6 +1007,7 @@ pub const App = struct {
                 switch (self.active_page) {
                     .changes => self.changesNavigation().clearDiffSelection(),
                     .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
+                    .history => {},
                     .compare => self.pages.compare.diff.selection_owner = .none,
                     .ai_reviews => self.pages.ai_reviews.diff.selection_owner = .none,
                     .config => {},
@@ -1002,6 +1026,7 @@ pub const App = struct {
         if (try self.compareCoordinator().applyDeferred(ctx) == .skip) self.redraw_plan.requestSkip();
         try self.changesRead().maybeStartQueuedRevalidation(ctx);
         try self.repositoryCoordinator().startPending(ctx);
+        try self.historyCoordinator().startPending(ctx);
         self.reconcileCommandLine();
         const revalidation_queued_before_projection = self.changesRead().hasQueuedFullRevalidation();
         if (self.active_page == .changes) try self.changesRead().ensureProjection(ctx);
@@ -1538,6 +1563,13 @@ pub const App = struct {
                 .projection => |result| try self.changesRead().finishProjectionLoad(ctx.allocator(), result),
                 .projection_syntax => |result| self.changesRead().finishGeneratedProjectionSyntax(ctx.allocator(), result),
             },
+            .history => |result_value| {
+                var result = result_value;
+                defer result.deinit(ctx.allocator());
+                if (try self.historyCoordinator().finish(ctx.allocator(), &result) == .discarded) {
+                    self.redraw_plan.requestSkip();
+                }
+            },
             .compare => |compare_result| switch (compare_result) {
                 .source => |result| {
                     if (try self.compareCoordinator().finishLoad(ctx, result) == .skip) {
@@ -1802,6 +1834,7 @@ pub const App = struct {
         if (self.active_page == .compare) self.pages.compare.status.clearIfEphemeral();
         if (self.active_page == .ai_reviews) self.pages.ai_reviews.status.clearIfEphemeral();
         if (self.active_page == .repository) self.pages.repository.status.clearIfEphemeral();
+        if (self.active_page == .history) self.pages.history.status.clearIfEphemeral();
     }
 
     pub fn view(self: *const App, surface: *chasen.Surface) !void {
@@ -1840,6 +1873,10 @@ pub const App = struct {
                 .palette = self.theme,
                 .keymap = self.keymap,
                 .repo_root = self.repoSessionView().activeRoot(),
+            },
+            .history = .{
+                .page_state = &self.pages.history,
+                .palette = self.theme,
             },
             .active_page = self.active_page,
             .page_bar_visible = true,
@@ -2020,6 +2057,7 @@ pub const App = struct {
                 .key = self.pages.repository.inputContext(self.keymap),
                 .page_state = &self.pages.repository,
             },
+            .history = .{ .key = self.pages.history.inputContext(self.keymap) },
             .commit_panel_mode = self.localWorkflowView().commitPanelOpen(),
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
@@ -2041,6 +2079,7 @@ pub const App = struct {
         return switch (self.active_page) {
             .changes => &self.pages.changes.status,
             .repository => &self.pages.repository.status,
+            .history => &self.pages.history.status,
             .compare => &self.pages.compare.status,
             .ai_reviews => &self.pages.ai_reviews.status,
             .config => null,
@@ -2051,6 +2090,7 @@ pub const App = struct {
         return switch (self.active_page) {
             .changes => &self.pages.changes.status,
             .repository => &self.pages.repository.status,
+            .history => &self.pages.history.status,
             .compare => &self.pages.compare.status,
             .ai_reviews => &self.pages.ai_reviews.status,
             .config => null,
@@ -2142,6 +2182,7 @@ pub const App = struct {
                 allocator,
                 completion.generation,
             ),
+            .history => {},
             .config => {},
         }
     }
@@ -2190,6 +2231,7 @@ pub const App = struct {
         const origin = switch (self.active_page) {
             .changes => effects.changesOrigin(),
             .repository => effects.repositoryOrigin(),
+            .history => effects.historyOrigin(),
             .compare => effects.compareOrigin(),
             .ai_reviews => effects.aiReviewsOrigin(),
             .config => return,

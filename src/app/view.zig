@@ -16,6 +16,7 @@ const changes_view = @import("pages/changes/view.zig");
 const compare_view = @import("pages/compare/view.zig");
 const ai_reviews_view = @import("pages/ai_reviews/view.zig");
 const repository_view = @import("pages/repository/view.zig");
+const history_view = @import("pages/history/view.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const page_header = @import("page_header.zig");
@@ -87,6 +88,7 @@ pub const Context = struct {
     compare: compare_view.Context,
     ai_reviews: ai_reviews_view.Context,
     repository: repository_view.ViewContext,
+    history: ?history_view.ViewContext = null,
     active_page: page.Id,
     page_bar_visible: bool,
     theme: theme.Palette,
@@ -222,6 +224,7 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
     return switch (app.active_page) {
         .changes => changes_view.view(app.changes, surface),
         .repository => repository_view.view(app.repository, surface),
+        .history => if (app.history) |history| history_view.view(history, surface) else viewPlaceholderPage(app.active_page, app.has_active_repo, app.theme, surface),
         .compare => compare_view.view(app.compare, surface),
         .ai_reviews => ai_reviews_view.view(app.ai_reviews, surface),
         .config => viewPlaceholderPage(app.active_page, app.has_active_repo, app.theme, surface),
@@ -232,6 +235,7 @@ fn activePageHeaderPresentation(app: Context) ?page_header.Presentation {
     return switch (app.active_page) {
         .changes => changes_view.pageHeaderPresentation(app.changes),
         .repository => repository_view.pageHeaderPresentation(app.repository),
+        .history => null,
         .compare => compare_view.pageHeaderPresentation(app.compare),
         .ai_reviews => ai_reviews_view.pageHeaderPresentation(app.ai_reviews),
         .config => null,
@@ -243,7 +247,7 @@ fn activePageHeaderLineStats(app: Context) ?file_tree.Stats {
         .changes => changes_view.pageHeaderLineStats(app.changes),
         .compare => compare_view.pageHeaderLineStats(app.compare),
         .ai_reviews => ai_reviews_view.pageHeaderLineStats(app.ai_reviews),
-        .repository, .config => null,
+        .repository, .history, .config => null,
     };
 }
 
@@ -455,7 +459,7 @@ fn viewPlaceholderPage(id: page.Id, has_repository: bool, palette: theme.Palette
     if (size.width == 0 or size.height == 0) return;
     const row = size.height / 2;
     draw.copyClippedTextAt(surface, 1, row, id.label(), palette.boldStyle(.accent)) catch {};
-    const description = if (!has_repository and (id == .repository or id == .compare or id == .ai_reviews))
+    const description = if (!has_repository and (id == .repository or id == .history or id == .compare or id == .ai_reviews))
         "Repository required"
     else
         id.placeholderDescription();
@@ -1810,6 +1814,18 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
             result.append(ui.key_hint.item("q", "quit"), .quit);
         },
+        .history => {
+            if (app.history) |history| {
+                if (history.page_state.load_state == .loading) {
+                    result.append(ui.key_hint.item("Esc", "cancel"), .primary);
+                } else if (history.page_state.catalog.moreRowSelected()) {
+                    result.append(ui.key_hint.item("Enter", "load older"), .primary);
+                }
+            }
+            appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
+            appendFooterAction(app, &result, key_buffers, .help, "help", .help);
+            result.append(ui.key_hint.item("q", "quit"), .quit);
+        },
         .compare => {
             const footer = app.compare.footer();
             if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open or
@@ -2013,6 +2029,7 @@ fn helpSectionsForPage(help_page: page.Id) []const HelpSection {
     return switch (help_page) {
         .changes => &help_all_sections,
         .repository => &help_repository_sections,
+        .history => &help_history_sections,
         .compare => &help_compare_sections,
         .ai_reviews => &help_ai_reviews_sections,
         .config => &help_placeholder_sections,
@@ -2084,7 +2101,7 @@ fn drawHelpLine(
 fn drawHelpItem(app: Context, surface: *chasen.Surface, row: u16, item: HelpItem) !void {
     if (surface.size().width == 0) return;
     const desired_key_width: u16 = switch (app.active_page) {
-        .changes, .repository, .compare, .ai_reviews => 18,
+        .changes, .repository, .history, .compare, .ai_reviews => 18,
         .config => 12,
     };
     const key_width: u16 = @min(desired_key_width, surface.size().width);
@@ -2836,7 +2853,7 @@ test "page bar shows remote actions only in the clean layout" {
     } } };
     const palette: theme.Palette = .default();
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(96, shell_layout.page_bar_rows);
+    try ts.init(120, shell_layout.page_bar_rows);
     defer ts.deinit();
 
     viewPageBar(.changes, false, .{
@@ -2847,7 +2864,7 @@ test "page bar shows remote actions only in the clean layout" {
     const action_text = "(P: push / U: pull)";
     const action_col = ts.surface.size().width - 1 - chasen.text.displayWidth(action_text);
     try ts.expectCellText(action_col, shell_layout.page_bar_label_row, "(");
-    try ts.expectCellText(95, shell_layout.page_bar_label_row, " ");
+    try ts.expectCellText(119, shell_layout.page_bar_label_row, " ");
     const action = ts.surface.readCell(action_col, shell_layout.page_bar_label_row) orelse return error.ExpectedRemoteActionHint;
     try std.testing.expect(action.style.eql(palette.style(.muted)));
 
@@ -3241,6 +3258,7 @@ const HelpSection = struct {
 const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
+    .{ .key = .{ .action = .page_history }, .description = "History page" },
     .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
     .{ .key = .{ .action = .page_ai_reviews }, .description = "AI Reviews page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
@@ -3263,6 +3281,7 @@ const help_global_items = [_]HelpItem{
 const help_placeholder_items = [_]HelpItem{
     .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
+    .{ .key = .{ .action = .page_history }, .description = "History page" },
     .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
     .{ .key = .{ .action = .page_ai_reviews }, .description = "AI Reviews page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
@@ -3284,6 +3303,19 @@ const help_compare_items = [_]HelpItem{
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
     .{ .key = .{ .text = "y / Y" }, .description = "copy current line / hunk" },
+};
+
+const help_history_items = [_]HelpItem{
+    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move through commits" },
+    .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "move one visible page" },
+    .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last catalog row" },
+    .{ .key = .{ .text = "Enter" }, .description = "load older commits on the operation row" },
+    .{ .key = .{ .action = .reload }, .description = "reload from exact current HEAD" },
+    .{ .key = .{ .text = "Esc" }, .description = "cancel the logical catalog load" },
+};
+
+const help_history_sections = [_]HelpSection{
+    .{ .title = "History", .items = &help_history_items },
 };
 
 const help_ai_reviews_items = [_]HelpItem{
@@ -3310,6 +3342,7 @@ const help_ai_reviews_sections = [_]HelpSection{
 const help_repository_global_items = [_]HelpItem{
     .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
     .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
+    .{ .key = .{ .action = .page_history }, .description = "History page" },
     .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
     .{ .key = .{ .action = .page_ai_reviews }, .description = "AI Reviews page" },
     .{ .key = .{ .action = .page_config }, .description = "Config page" },

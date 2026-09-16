@@ -4,6 +4,7 @@ const chasen = @import("chasen");
 pub const PublicAction = enum {
     page_changes,
     page_repository,
+    page_history,
     page_compare,
     page_ai_reviews,
     page_config,
@@ -241,9 +242,10 @@ fn defaultSpec(action: PublicAction) ?KeySpec {
     return switch (action) {
         .page_changes => .{ .plain_codepoint = '1' },
         .page_repository => .{ .plain_codepoint = '2' },
-        .page_compare => .{ .plain_codepoint = '3' },
-        .page_ai_reviews => .{ .plain_codepoint = '4' },
-        .page_config => .{ .plain_codepoint = '5' },
+        .page_history => .{ .plain_codepoint = '3' },
+        .page_compare => .{ .plain_codepoint = '4' },
+        .page_ai_reviews => .{ .plain_codepoint = '5' },
+        .page_config => .{ .plain_codepoint = '6' },
         .help => .{ .exact = '?' },
         .reload => .{ .plain_codepoint = 'r' },
         .search => .{ .plain_codepoint = '/' },
