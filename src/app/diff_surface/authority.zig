@@ -112,12 +112,14 @@ pub const Member = enum {
 /// identities from being admitted accidentally.
 pub const Owner = enum {
     changes,
+    history,
     compare,
     ai_reviews,
 
     fn identity(self: Owner, repo_epoch: u64, activation_id: u64) page.RequestIdentity {
         return switch (self) {
             .changes => page.RequestIdentity.changes(repo_epoch, activation_id),
+            .history => page.RequestIdentity.history(repo_epoch, activation_id),
             .compare => page.RequestIdentity.compare(repo_epoch, activation_id),
             .ai_reviews => page.RequestIdentity.aiReviews(repo_epoch, activation_id),
         };
@@ -126,6 +128,7 @@ pub const Owner = enum {
     fn matches(self: Owner, origin: page.Id) bool {
         return switch (self) {
             .changes => origin == .changes,
+            .history => origin == .history,
             .compare => origin == .compare,
             .ai_reviews => origin == .ai_reviews,
         };

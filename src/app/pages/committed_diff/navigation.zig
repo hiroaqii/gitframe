@@ -21,6 +21,7 @@ pub const View = struct {
     activation: *const diff_surface.authority.Lifecycle,
     status: *const app_state.StatusMessage,
     current_target: ?committed_review.CommittedReviewTarget,
+    presentation_identity: ?committed_diff.PresentationIdentity = null,
     repo_root: ?[]const u8,
     repo_epoch: u64,
     root_identity: ?root_capability.Identity,
@@ -38,6 +39,7 @@ pub const View = struct {
                 .source = self.source,
                 .layout = self.layout,
                 .current_target = self.current_target,
+                .presentation_identity = self.presentation_identity,
                 .live_drag_deferred_source = self.live_drag_deferred_source,
             }),
             .repo_root = self.repo_root,
@@ -96,6 +98,7 @@ pub const Controller = struct {
     activation: *diff_surface.authority.Lifecycle,
     status: *app_state.StatusMessage,
     current_target: ?committed_review.CommittedReviewTarget,
+    presentation_identity: ?committed_diff.PresentationIdentity = null,
     repo_root: ?[]const u8,
     repo_epoch: u64,
     root_identity: ?root_capability.Identity,
@@ -114,6 +117,7 @@ pub const Controller = struct {
                 .source = self.source,
                 .layout = self.layout,
                 .current_target = self.current_target,
+                .presentation_identity = self.presentation_identity,
                 .live_drag_deferred_source = self.live_drag_deferred_source,
             }),
             .repo_root = self.repo_root,
@@ -131,6 +135,7 @@ pub const Controller = struct {
             .activation = self.activation,
             .status = self.status,
             .current_target = self.current_target,
+            .presentation_identity = self.presentation_identity,
             .repo_root = self.repo_root,
             .repo_epoch = self.repo_epoch,
             .root_identity = self.root_identity,
@@ -162,7 +167,11 @@ pub const Controller = struct {
 
         fn installRetainedSelection(ctx: *anyopaque) bool {
             const self: *UpdateAdapter = @ptrCast(@alignCast(ctx));
-            return self.navigation.diff.installPinnedSelectionBasis(self.navigation.current_target);
+            const identity = self.navigation.presentation_identity orelse if (self.navigation.current_target) |target|
+                committed_diff.PresentationIdentity{ .review_target = target }
+            else
+                null;
+            return self.navigation.diff.installPinnedPresentationIdentity(identity);
         }
 
         pub fn applyRetentionTransition(

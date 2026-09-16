@@ -151,7 +151,7 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
             app.active_page,
             sections.body.height == 0 or sections.footer.height == 0,
             .{
-                .presentation = activePageHeaderPresentation(app),
+                .presentation = activePageHeaderPresentation(app, surface.frameAllocator()),
                 .line_stats = activePageHeaderLineStats(app),
                 .remote_actions = activePageHeaderRemoteActions(app),
             },
@@ -231,11 +231,11 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
     };
 }
 
-fn activePageHeaderPresentation(app: Context) ?page_header.Presentation {
+fn activePageHeaderPresentation(app: Context, allocator: std.mem.Allocator) ?page_header.Presentation {
     return switch (app.active_page) {
         .changes => changes_view.pageHeaderPresentation(app.changes),
         .repository => repository_view.pageHeaderPresentation(app.repository),
-        .history => null,
+        .history => if (app.history) |history| history_view.pageHeaderPresentation(history, allocator) else null,
         .compare => compare_view.pageHeaderPresentation(app.compare),
         .ai_reviews => ai_reviews_view.pageHeaderPresentation(app.ai_reviews),
         .config => null,
@@ -247,7 +247,8 @@ fn activePageHeaderLineStats(app: Context) ?file_tree.Stats {
         .changes => changes_view.pageHeaderLineStats(app.changes),
         .compare => compare_view.pageHeaderLineStats(app.compare),
         .ai_reviews => ai_reviews_view.pageHeaderLineStats(app.ai_reviews),
-        .repository, .history, .config => null,
+        .history => if (app.history) |history| history_view.pageHeaderLineStats(history) else null,
+        .repository, .config => null,
     };
 }
 
@@ -671,6 +672,10 @@ fn projectFooter(
         });
     }
     const committed_footer = switch (app.active_page) {
+        .history => if (app.history) |history|
+            if (history.page_state.current_view == .diff) history.footer() else null
+        else
+            null,
         .compare => app.compare.footer(),
         .ai_reviews => app.ai_reviews.footer(),
         else => null,
@@ -1818,6 +1823,10 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             if (app.history) |history| {
                 if (history.page_state.load_state == .loading) {
                     result.append(ui.key_hint.item("Esc", "cancel"), .primary);
+                } else if (history.page_state.current_view == .diff) {
+                    const footer = history.footer();
+                    if (!footer.normal_action_hints_enabled) return result;
+                    appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "commits", .compare_base);
                 } else if (history.page_state.catalog.moreRowSelected()) {
                     result.append(ui.key_hint.item("Enter", "load older"), .primary);
                 }
@@ -2917,7 +2926,7 @@ test "Config page header never borrows another page repository context" {
     var harness: ShellViewTestHarness = .{};
     var context = harness.context();
     context.active_page = .config;
-    try std.testing.expect(activePageHeaderPresentation(context) == null);
+    try std.testing.expect(activePageHeaderPresentation(context, std.testing.allocator) == null);
     try std.testing.expect(activePageHeaderLineStats(context) == null);
 }
 

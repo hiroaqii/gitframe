@@ -11,6 +11,7 @@ pub const interval_ns: u64 = 80 * std.time.ns_per_ms;
 
 pub const Target = enum {
     changes,
+    history,
     compare,
     ai_reviews,
     repository,

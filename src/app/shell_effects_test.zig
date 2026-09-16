@@ -196,13 +196,13 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
         } },
     };
     app.pages.compare.diff.pinned_selection_basis = .{
-        .target = .{
+        .identity = .{ .review_target = .{
             .object_format = .sha1,
             .source_kind = .branch_range,
             .base_oid = .{},
             .head_oid = .{},
             .diff_base_oid = .{},
-        },
+        } },
     };
     const retained_token = app.pages.compare.diff.completed_selection.?.token;
     const retained_pin = app.pages.compare.diff.pinned_selection_basis.?;

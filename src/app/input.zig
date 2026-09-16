@@ -138,6 +138,10 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         const repository_msg = repository_input.pasteToMsg(repository_page.Msg, context.repository, text) orelse return null;
         return .{ .repository = repository_msg };
     }
+    if (context.active_page == .history and (context.history.common.search_mode or context.history.common.file_search_mode)) {
+        const msg = history_input.pasteToMsg(context.history, text) orelse return null;
+        return .{ .history = msg };
+    }
     if (context.active_page == .compare and (context.compare.common.search_mode or context.compare.common.file_search_mode)) {
         const msg = compare_input.pasteToMsg(context.compare, text) orelse return null;
         return .{ .compare = msg };
@@ -149,7 +153,10 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
     if (context.commit_panel_mode) return .{ .commit_panel_paste = text };
-    if (context.active_page == .history) return .{ .history = history_input.pasteToMsg(context.history, text) };
+    if (context.active_page == .history) {
+        const msg = history_input.pasteToMsg(context.history, text) orelse return null;
+        return .{ .history = msg };
+    }
     if (context.active_page == .changes) {
         const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
         return translateChangesMsg(changes_msg);
@@ -176,6 +183,12 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.active_page == .repository and (context.repository.source_search_mode or context.repository.file_search_mode)) {
         const repository_msg = repository_input.keyToMsg(repository_page.Msg, context.repository, key) orelse return null;
         return .{ .repository = repository_msg };
+    }
+    if (context.active_page == .history and
+        (context.history.common.search_mode or context.history.common.file_search_mode))
+    {
+        const msg = history_input.keyToMsg(context.history, key) orelse return null;
+        return .{ .history = msg };
     }
     if (context.active_page == .compare and
         (context.compare.common.search_mode or context.compare.common.file_search_mode or
@@ -297,7 +310,7 @@ fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
             context.repository,
             key,
         ) orelse return null },
-        .history => null,
+        .history => .{ .history = history_input.selectionKeyToMsg(context.history, key) orelse return null },
         .config => null,
     };
 }
@@ -598,6 +611,29 @@ test "History catalog loading admits only cancel page transition and quit" {
     try expectMsg(.{ .history = .owned_noop }, keyToMsg(context, .{ .codepoint = 'j' }).?);
     try expectMsg(.{ .history = .owned_noop }, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
     try expectMsg(.{ .history = .owned_noop }, pasteToMsg(context, "ignored").?);
+}
+
+test "History committed diff text input precedes page shortcuts and picker key stays local" {
+    const searching: KeyContext = .{
+        .active_page = .history,
+        .history = .{
+            .diff_view = true,
+            .common = .{ .search_mode = true },
+        },
+    };
+    try expectMsg(
+        .{ .history = .{ .common = .{ .shared = .{ .search_insert = '4' } } } },
+        keyToMsg(searching, .{ .codepoint = '4' }).?,
+    );
+    try expectMsg(
+        .{ .history = .{ .common = .{ .shared = .{ .search_paste = "needle" } } } },
+        pasteToMsg(searching, "needle").?,
+    );
+
+    var normal = searching;
+    normal.history.common.search_mode = false;
+    try expectMsg(.{ .switch_page = .compare }, keyToMsg(normal, .{ .codepoint = '4' }).?);
+    try expectMsg(.{ .history = .open_picker }, keyToMsg(normal, .{ .codepoint = 'm' }).?);
 }
 
 test "command line owns key and paste input before every normal route" {

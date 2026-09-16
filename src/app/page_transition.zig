@@ -5,6 +5,7 @@ const page = @import("page.zig");
 
 pub const Blocker = enum {
     changes_mouse_selection,
+    history_mouse_selection,
     compare_mouse_selection,
     ai_reviews_mouse_selection,
     repository_mouse_selection,
@@ -12,6 +13,8 @@ pub const Blocker = enum {
     compare_deferred_apply,
     changes_search,
     changes_file_search,
+    history_search,
+    history_file_search,
     compare_search,
     compare_file_search,
     ai_reviews_search,
@@ -34,6 +37,7 @@ pub const Blocker = enum {
     pub fn message(self: Blocker) []const u8 {
         return switch (self) {
             .changes_mouse_selection => "finish mouse selection before switching pages",
+            .history_mouse_selection => "finish History mouse selection before switching pages",
             .compare_mouse_selection => "finish Compare mouse selection before switching pages",
             .ai_reviews_mouse_selection => "finish AI Reviews mouse selection before switching pages",
             .repository_mouse_selection => "finish Repository mouse selection before switching pages",
@@ -41,6 +45,8 @@ pub const Blocker = enum {
             .compare_deferred_apply => "finish deferred Compare update before switching pages",
             .changes_search => "finish search before switching pages",
             .changes_file_search => "finish file search before switching pages",
+            .history_search => "finish History search before switching pages",
+            .history_file_search => "finish History file search before switching pages",
             .compare_search => "finish Compare search before switching pages",
             .compare_file_search => "finish Compare file search before switching pages",
             .ai_reviews_search => "finish AI Reviews search before switching pages",
@@ -65,6 +71,7 @@ pub const Blocker = enum {
 
 pub const Snapshot = struct {
     changes_mouse_selection: bool = false,
+    history_mouse_selection: bool = false,
     compare_mouse_selection: bool = false,
     ai_reviews_mouse_selection: bool = false,
     repository_mouse_selection: bool = false,
@@ -72,6 +79,8 @@ pub const Snapshot = struct {
     compare_deferred_apply: bool = false,
     changes_search: bool = false,
     changes_file_search: bool = false,
+    history_search: bool = false,
+    history_file_search: bool = false,
     compare_search: bool = false,
     compare_file_search: bool = false,
     ai_reviews_search: bool = false,
@@ -114,6 +123,8 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.push_error) return .{ .blocked = .push_error };
     if (snapshot.changes_search) return .{ .blocked = .changes_search };
     if (snapshot.changes_file_search) return .{ .blocked = .changes_file_search };
+    if (snapshot.history_search) return .{ .blocked = .history_search };
+    if (snapshot.history_file_search) return .{ .blocked = .history_file_search };
     if (snapshot.compare_search) return .{ .blocked = .compare_search };
     if (snapshot.compare_file_search) return .{ .blocked = .compare_file_search };
     if (snapshot.ai_reviews_search) return .{ .blocked = .ai_reviews_search };
@@ -121,6 +132,7 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.repository_source_search) return .{ .blocked = .repository_source_search };
     if (snapshot.repository_file_search) return .{ .blocked = .repository_file_search };
     if (snapshot.changes_mouse_selection) return .{ .blocked = .changes_mouse_selection };
+    if (snapshot.history_mouse_selection) return .{ .blocked = .history_mouse_selection };
     if (snapshot.compare_mouse_selection) return .{ .blocked = .compare_mouse_selection };
     if (snapshot.ai_reviews_mouse_selection) return .{ .blocked = .ai_reviews_mouse_selection };
     if (snapshot.repository_mouse_selection) return .{ .blocked = .repository_mouse_selection };
@@ -154,6 +166,7 @@ test "every blocker prevents transitions between independent pages" {
         snapshot: Snapshot,
     }{
         .{ .blocker = .changes_mouse_selection, .snapshot = .{ .changes_mouse_selection = true } },
+        .{ .blocker = .history_mouse_selection, .snapshot = .{ .history_mouse_selection = true } },
         .{ .blocker = .compare_mouse_selection, .snapshot = .{ .compare_mouse_selection = true } },
         .{ .blocker = .ai_reviews_mouse_selection, .snapshot = .{ .ai_reviews_mouse_selection = true } },
         .{ .blocker = .repository_mouse_selection, .snapshot = .{ .repository_mouse_selection = true } },
@@ -161,6 +174,8 @@ test "every blocker prevents transitions between independent pages" {
         .{ .blocker = .compare_deferred_apply, .snapshot = .{ .compare_deferred_apply = true } },
         .{ .blocker = .changes_search, .snapshot = .{ .changes_search = true } },
         .{ .blocker = .changes_file_search, .snapshot = .{ .changes_file_search = true } },
+        .{ .blocker = .history_search, .snapshot = .{ .history_search = true } },
+        .{ .blocker = .history_file_search, .snapshot = .{ .history_file_search = true } },
         .{ .blocker = .compare_search, .snapshot = .{ .compare_search = true } },
         .{ .blocker = .compare_file_search, .snapshot = .{ .compare_file_search = true } },
         .{ .blocker = .ai_reviews_search, .snapshot = .{ .ai_reviews_search = true } },

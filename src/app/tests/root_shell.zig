@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
+const keymap = @import("keymap");
 const app_mod = @import("../../app.zig");
 const app_test_support = @import("../test_support.zig");
 const app_load = @import("../load.zig");
@@ -27,6 +28,7 @@ const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
 const git_status = @import("../../git/status.zig");
+const git_history = @import("../../git/history.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 
 const App = app_mod.App;
@@ -758,6 +760,242 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try std.testing.expectEqual(mouse_anchor.raw_presentation_scroll, expected_mouse_scroll);
     try std.testing.expectEqual(expected_mouse_scroll, app.pages.compare.diff.viewer.diff_scroll);
     try std.testing.expectEqual(@as(usize, 0), app.shell_effects_state.clipboard_copies.count());
+}
+
+test "History accepted diff runs one root interaction and transition sequence" {
+    const allocator = std.testing.allocator;
+    const before = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const after = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const request: git_history.SelectionRequest = .{
+        .snapshot_head = after,
+        .intent = .{ .single = .{ .index = 0, .oid = after } },
+        .basis = .{
+            .object_format = .sha1,
+            .before = .{ .commit = before },
+            .after = after,
+        },
+    };
+    var loaded = app_test_support.loadedDiffOne();
+    loaded.reviewed_files = try allocator.alloc(bool, 1);
+    loaded.reviewed_files[0] = false;
+    var app: App = .{
+        .active_page = .history,
+        .allocator = allocator,
+        .terminal_size = .{ .width = 120, .height = 12 },
+        .pages = .{ .history = .{
+            .repo_epoch = 0,
+            .load_state = .loaded,
+            .current_view = .diff,
+            .diff = .{
+                .load = app_test_support.loadState(loaded),
+                .viewer = .{ .focus = .diff },
+                .accepted_repository_identity = .{ .repo_epoch = 0, .root_identity = null },
+            },
+        } },
+    };
+    switch (app.pages.history.diff.load.state) {
+        .loaded => |*session| session.reviewed_files_owned = true,
+        else => unreachable,
+    }
+    app.pages.history.accepted = .{
+        .request = request,
+        .origin = .detached,
+        .selected_parent_count = 1,
+        .target_subject = try allocator.dupe(u8, "accepted subject"),
+    };
+    defer app.pages.history.deinit(allocator);
+    defer app.shell_effects_state.deinit(allocator);
+    _ = app.pages.history.activation.activate(0, .immutable, .unavailable, .unavailable);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    // Diff text input retains priority over root page shortcuts.
+    app.pages.history.diff.search.mode = true;
+    const search_key = app.handleEvent(.{ .key_press = .{ .codepoint = '4' } }) orelse
+        return error.ExpectedHistorySearchInput;
+    try std.testing.expectEqual(
+        App.Msg{ .history = .{ .common = .{ .shared = .{ .search_insert = '4' } } } },
+        search_key,
+    );
+    try app.update(search_key, &ctx);
+    const search_paste = app.handleEvent(.{ .paste = "needle" }) orelse
+        return error.ExpectedHistorySearchPaste;
+    try app.update(search_paste, &ctx);
+    try std.testing.expectEqualStrings("4needle", app.pages.history.diff.search.input.slice());
+    const cancel_search = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.escape } }) orelse
+        return error.ExpectedHistorySearchCancel;
+    try app.update(cancel_search, &ctx);
+    try std.testing.expect(!app.pages.history.diff.search.mode);
+
+    // History owns and suppresses reviewed actions at its adapter boundary for
+    // both default and configured bindings; the shared state stays untouched.
+    for ([_]chasen.Key{ .{ .codepoint = 'v' }, .{ .codepoint = 'H' } }) |key| {
+        const msg = app.handleEvent(.{ .key_press = key }) orelse return error.ExpectedHistoryOwnedNoop;
+        try std.testing.expectEqual(App.Msg{ .history = .owned_noop }, msg);
+        try app.update(msg, &ctx);
+    }
+    var configured: keymap.Config = .{};
+    configured.set(.mark_reviewed, .{ .plain_codepoint = 'x' });
+    configured.set(.hide_reviewed, .{ .plain_codepoint = 'z' });
+    app.keymap = keymap.Effective.fromConfig(configured);
+    for ([_]chasen.Key{ .{ .codepoint = 'x' }, .{ .codepoint = 'z' } }) |key| {
+        const msg = app.handleEvent(.{ .key_press = key }) orelse return error.ExpectedHistoryOwnedNoop;
+        try std.testing.expectEqual(App.Msg{ .history = .owned_noop }, msg);
+        try app.update(msg, &ctx);
+    }
+    app.keymap = .{};
+    const accepted_loaded = switch (app.pages.history.diff.load.state) {
+        .loaded => |*session| &session.loaded,
+        else => return error.ExpectedLoadedHistory,
+    };
+    try std.testing.expect(!accepted_loaded.reviewed_files[0]);
+    try std.testing.expect(!app.pages.history.diff.review_display.hide_reviewed_files);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.reviewed_store.entries.count());
+
+    // The same accepted surface routes both sidebar and diff pointer regions.
+    const layout = shellLayout(&app);
+    const sidebar_click = app.handleEvent(app_test_support.mouseEventTyped(
+        layout.body.col + 1,
+        layout.body.row + sidebar_header_rows,
+        .left,
+        .press,
+    )) orelse return error.ExpectedHistorySidebarPress;
+    try std.testing.expectEqual(
+        App.Msg{ .history = .{ .common = .{ .shared = .{ .sidebar_click_node = 0 } } } },
+        sidebar_click,
+    );
+    try app.update(sidebar_click, &ctx);
+
+    const sidebar_width = sidebarWidth(layout.content.width, null);
+    const diff_point = diff_surface.MousePoint{
+        .col = sidebar_width + 20,
+        .row = diff_render.body_start_row,
+    };
+    const diff_press = app.handleEvent(app_test_support.mouseEventTyped(
+        layout.body.col + diff_point.col,
+        layout.body.row + diff_point.row,
+        .left,
+        .press,
+    )) orelse return error.ExpectedHistoryDiffPress;
+    try std.testing.expectEqual(
+        App.Msg{ .history = .{ .common = .{ .shared = .{ .mouse_diff_press = diff_point } } } },
+        diff_press,
+    );
+
+    app.pages.history.diff.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .side = .old,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 0 },
+        .anchor_cell = .{ .col = diff_point.col, .row = diff_point.row },
+    } };
+    const last_row = layout.body.height - 1;
+    const drag = app.handleEvent(app_test_support.mouseEventTyped(
+        layout.body.col + diff_point.col,
+        layout.body.row + last_row,
+        .left,
+        .drag,
+    )) orelse return error.ExpectedHistoryDrag;
+    switch (drag) {
+        .mouse_selection_drag => |continuation| switch (continuation.target) {
+            .history => {},
+            else => return error.ExpectedHistoryDrag,
+        },
+        else => return error.ExpectedHistoryDrag,
+    }
+    try app.update(drag, &ctx);
+    const auto_scroll_generation = app.drag_auto_scroll.active.?.generation;
+    try std.testing.expectEqual(auto_scroll_generation, app.drag_auto_scroll.scheduled_generation.?);
+    var ticks: usize = 0;
+    while (app.pages.history.diff.selection_owner.activeDiff().?.focus.hunk_index == 0 and ticks < 32) : (ticks += 1) {
+        try app.update(.{ .drag_auto_scroll_tick = auto_scroll_generation }, &ctx);
+    }
+    try std.testing.expect(ticks >= 1);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.pages.history.diff.selection_owner.activeDiff().?.focus.hunk_index,
+    );
+
+    // The transition snapshot comes from the live History owner, not a hand-
+    // written policy value.
+    try app.update(.{ .switch_page = .config }, &ctx);
+    try std.testing.expectEqual(page.Id.history, app.active_page);
+    try std.testing.expectEqualStrings(
+        "finish History mouse selection before switching pages",
+        app.status.text(),
+    );
+
+    const release = app.handleEvent(app_test_support.mouseEventTyped(
+        layout.body.col + diff_point.col,
+        layout.body.row + last_row,
+        .left,
+        .release,
+    )) orelse return error.ExpectedHistoryRelease;
+    switch (release) {
+        .mouse_selection_release => |continuation| switch (continuation.target) {
+            .history => {},
+            else => return error.ExpectedHistoryRelease,
+        },
+        else => return error.ExpectedHistoryRelease,
+    }
+    try app.update(release, &ctx);
+    try std.testing.expect(app.pages.history.diff.completed_selection != null);
+    try std.testing.expect(app.pages.history.diff.pinned_selection_basis != null);
+
+    const copy = app.handleEvent(.{ .key_press = .{ .codepoint = 'y' } }) orelse
+        return error.ExpectedHistorySelectionCopy;
+    try std.testing.expectEqual(
+        App.Msg{ .history = .{ .common = .{ .shared = .{ .selection_action = .copy } } } },
+        copy,
+    );
+    try app.update(copy, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+        .request_id = ctx._pending_clipboard_copies[0].request_id,
+        .outcome = .sent,
+    } } }, &ctx);
+    try std.testing.expect(app.pages.history.diff.completed_selection == null);
+    try std.testing.expect(app.pages.history.diff.pinned_selection_basis == null);
+
+    app.pages.history.diff.search.mode = true;
+    try app.update(.{ .switch_page = .config }, &ctx);
+    try std.testing.expectEqual(page.Id.history, app.active_page);
+    try std.testing.expectEqualStrings("finish History search before switching pages", app.status.text());
+    app.pages.history.diff.search.mode = false;
+    app.pages.history.diff.file_search.mode = true;
+    try app.update(.{ .switch_page = .config }, &ctx);
+    try std.testing.expectEqual(page.Id.history, app.active_page);
+    try std.testing.expectEqualStrings("finish History file search before switching pages", app.status.text());
+    app.pages.history.diff.file_search.mode = false;
+
+    // Picker/catalog and picker/diff loading are intentionally not transition
+    // blockers. Exercise both pending tags without a state cross-product.
+    const root_identity = @import("../../repo/root_capability.zig").Identity{ .device = 3, .inode = 5 };
+    const catalog_identity = app.pages.history.activation.currentIdentity().?;
+    app.pages.history.current_view = .picker;
+    app.pages.history.load_state = .loading;
+    app.pages.history.pending = .{ .catalog = .{
+        .identity = catalog_identity,
+        .root_identity = root_identity,
+        .generation = 9,
+        .request = .initial,
+    } };
+    try app.update(.{ .switch_page = .config }, &ctx);
+    try std.testing.expectEqual(page.Id.config, app.active_page);
+
+    app.active_page = .history;
+    _ = app.pages.history.activation.activate(0, .immutable, .unavailable, .unavailable);
+    app.pages.history.current_view = .picker;
+    app.pages.history.load_state = .loading;
+    app.pages.history.pending = .{ .diff = .{
+        .identity = app.pages.history.activation.currentIdentity().?,
+        .root_identity = root_identity,
+        .generation = 10,
+        .request = request,
+    } };
+    try app.update(.{ .switch_page = .config }, &ctx);
+    try std.testing.expectEqual(page.Id.config, app.active_page);
 }
 
 test "help overlay opens and closes before normal shortcuts" {

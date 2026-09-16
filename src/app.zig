@@ -450,11 +450,14 @@ pub const App = struct {
     }
 
     fn historyCoordinator(self: *App) history_coordinator.Controller {
+        const body_size = self.shellLayout().bodySize();
         return .{
             .page_state = &self.pages.history,
             .active_page = self.active_page,
             .repo = self.repoSessionView(),
-            .body_size = self.shellLayout().bodySize(),
+            .body_size = body_size,
+            .layout = .{ .width = body_size.width, .height = body_size.height },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.history),
             .env_map = self.env_map,
         };
     }
@@ -574,7 +577,10 @@ pub const App = struct {
             .ai_reviews => !self.pages.ai_reviews.diff.search.mode and
                 !self.pages.ai_reviews.diff.file_search.mode and
                 !self.pages.ai_reviews.picker.isPickerVisible(),
-            .repository, .history, .config => false,
+            .history => self.pages.history.current_view == .diff and
+                !self.pages.history.diff.search.mode and
+                !self.pages.history.diff.file_search.mode,
+            .repository, .config => false,
         };
         if (!reachable) return 0;
 
@@ -680,6 +686,7 @@ pub const App = struct {
     fn shellEffectOrigins(self: *const App) shell_effects.OriginContext {
         const repo_epoch = self.repoSessionView().epoch();
         const changes_identity = self.pages.changes.activation.currentIdentity();
+        const history_identity = self.pages.history.activation.currentIdentity();
         const compare_identity = self.pages.compare.activation.currentIdentity();
         const ai_reviews_identity = self.pages.ai_reviews.activation.currentIdentity();
         return .{
@@ -688,7 +695,7 @@ pub const App = struct {
                 .repo_epoch = repo_epoch,
                 .changes_activation_id = self.pages.changes.activation.next_activation_id,
                 .repository_activation_id = self.pages.repository.activation_id,
-                .history_activation_id = self.pages.history.activation_id,
+                .history_activation_id = self.pages.history.activation.next_activation_id,
                 .compare_activation_id = self.pages.compare.activation.next_activation_id,
                 .ai_reviews_activation_id = self.pages.ai_reviews.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
@@ -700,7 +707,7 @@ pub const App = struct {
             },
             .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
-            .history_repo_epoch = self.pages.history.repo_epoch,
+            .history_repo_epoch = if (history_identity) |identity| identity.repo_epoch else self.pages.history.repo_epoch,
             .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
             .ai_reviews_repo_epoch = if (ai_reviews_identity) |identity| identity.repo_epoch else repo_epoch,
         };
@@ -809,6 +816,9 @@ pub const App = struct {
                 if (self.pages.compare.diff.selection_owner.activeMouseSelection()) {
                     self.pages.compare.diff.selection_owner = .none;
                 }
+                if (self.pages.history.diff.selection_owner.activeMouseSelection()) {
+                    self.pages.history.diff.selection_owner = .none;
+                }
                 if (self.pages.ai_reviews.diff.selection_owner.activeMouseSelection()) {
                     self.pages.ai_reviews.diff.selection_owner = .none;
                 }
@@ -890,7 +900,7 @@ pub const App = struct {
             .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
             .ai_reviews => |ai_reviews_msg| _ = try self.updateAiReviews(ctx, ai_reviews_msg),
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
-            .history => |history_msg| self.historyCoordinator().update(history_msg),
+            .history => |history_msg| _ = try self.updateHistory(ctx, history_msg),
             .command_line => |command_msg| self.updateCommandLine(command_msg),
             .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
             .mouse_selection_release => |continuation| try self.updateMouseSelectionRelease(ctx, continuation),
@@ -951,6 +961,9 @@ pub const App = struct {
                 if (self.active_page == .compare and self.pages.compare.diff.selection_owner.activeMouseSelection()) {
                     self.pages.compare.diff.selection_owner = .none;
                 }
+                if (self.active_page == .history and self.pages.history.diff.selection_owner.activeMouseSelection()) {
+                    self.pages.history.diff.selection_owner = .none;
+                }
                 if (self.active_page == .ai_reviews and self.pages.ai_reviews.diff.selection_owner.activeMouseSelection()) {
                     self.pages.ai_reviews.diff.selection_owner = .none;
                 }
@@ -1007,7 +1020,7 @@ pub const App = struct {
                 switch (self.active_page) {
                     .changes => self.changesNavigation().clearDiffSelection(),
                     .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
-                    .history => {},
+                    .history => self.pages.history.diff.selection_owner = .none,
                     .compare => self.pages.compare.diff.selection_owner = .none,
                     .ai_reviews => self.pages.ai_reviews.diff.selection_owner = .none,
                     .config => {},
@@ -1282,6 +1295,11 @@ pub const App = struct {
                 _ = try self.updateCompare(ctx, .{ .common = .{ .shared = .{ .mouse_diff_drag = point } } });
                 break :blk .compare;
             },
+            .history => |point| blk: {
+                if (self.active_page != .history) break :blk .history;
+                _ = try self.updateHistory(ctx, .{ .common = .{ .shared = .{ .mouse_diff_drag = point } } });
+                break :blk .history;
+            },
             .ai_reviews => |point| blk: {
                 if (self.active_page != .ai_reviews) break :blk .ai_reviews;
                 _ = try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_drag = point } } });
@@ -1315,6 +1333,9 @@ pub const App = struct {
             .compare => |point| {
                 if (self.active_page == .compare) _ = try self.updateCompare(ctx, .{ .common = .{ .shared = .{ .mouse_diff_release = point } } });
             },
+            .history => |point| {
+                if (self.active_page == .history) _ = try self.updateHistory(ctx, .{ .common = .{ .shared = .{ .mouse_diff_release = point } } });
+            },
             .ai_reviews => |point| {
                 if (self.active_page == .ai_reviews) _ = try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_release = point } } });
             },
@@ -1341,6 +1362,7 @@ pub const App = struct {
 
         const outcome: ?drag_auto_scroll.StepOutcome = switch (active.target) {
             .changes => try self.updateChanges(ctx, .{ .mouse_diff_auto_scroll_step = active.intent }),
+            .history => try self.updateHistory(ctx, .{ .common = .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } } }),
             .compare => try self.updateCompare(ctx, .{ .common = .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } } }),
             .ai_reviews => try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } } }),
             .repository => blk: {
@@ -1370,6 +1392,7 @@ pub const App = struct {
     ) ?drag_auto_scroll.Viewport {
         if (self.active_page != switch (target) {
             .changes => page.Id.changes,
+            .history => page.Id.history,
             .compare => page.Id.compare,
             .ai_reviews => page.Id.ai_reviews,
             .repository => page.Id.repository,
@@ -1379,6 +1402,10 @@ pub const App = struct {
             .changes => blk: {
                 var adapter = self.changesNavigation().updateAdapter();
                 break :blk diffAutoScrollViewport(adapter.shared().navigation);
+            },
+            .history => blk: {
+                var adapter = self.historyCoordinator().navigation().updateAdapter();
+                break :blk diffAutoScrollViewport(adapter.bodyController());
             },
             .compare => blk: {
                 var adapter = self.compareCoordinator().navigation().updateAdapter();
@@ -1489,6 +1516,27 @@ pub const App = struct {
         return auto_scroll;
     }
 
+    fn updateHistory(
+        self: *App,
+        ctx: *chasen.Ctx(Msg),
+        msg: history_page.Msg,
+    ) !?drag_auto_scroll.StepOutcome {
+        var outcome = try self.historyCoordinator().update(ctx, msg);
+        defer outcome.deinit(ctx.allocator());
+        const auto_scroll = outcome.auto_scroll;
+        if (outcome.takeClipboard()) |taken| {
+            var effect = taken;
+            defer effect.deinit(ctx.allocator());
+            self.shellEffects().queueClipboard(ctx, .{
+                .origin = effect.origin,
+                .label = effect.label,
+                .text = effect.text,
+                .selection_generation = effect.selection_generation,
+            });
+        }
+        return auto_scroll;
+    }
+
     fn updateAiReviews(
         self: *App,
         ctx: *chasen.Ctx(Msg),
@@ -1563,12 +1611,19 @@ pub const App = struct {
                 .projection => |result| try self.changesRead().finishProjectionLoad(ctx.allocator(), result),
                 .projection_syntax => |result| self.changesRead().finishGeneratedProjectionSyntax(ctx.allocator(), result),
             },
-            .history => |result_value| {
-                var result = result_value;
-                defer result.deinit(ctx.allocator());
-                if (try self.historyCoordinator().finish(ctx.allocator(), &result) == .discarded) {
-                    self.redraw_plan.requestSkip();
-                }
+            .history => |history_result| switch (history_result) {
+                .catalog => |result_value| {
+                    var result = result_value;
+                    defer result.deinit(ctx.allocator());
+                    if (try self.historyCoordinator().finishCatalog(ctx.allocator(), &result) == .discarded)
+                        self.redraw_plan.requestSkip();
+                },
+                .diff => |result_value| {
+                    var result = result_value;
+                    defer result.deinit(ctx.allocator());
+                    if (try self.historyCoordinator().finishDiff(ctx.allocator(), &result) == .discarded)
+                        self.redraw_plan.requestSkip();
+                },
             },
             .compare => |compare_result| switch (compare_result) {
                 .source => |result| {
@@ -1877,6 +1932,11 @@ pub const App = struct {
             .history = .{
                 .page_state = &self.pages.history,
                 .palette = self.theme,
+                .repo_root = repo_view.activeRoot(),
+                .repo_epoch = repo_view.epoch(),
+                .root_identity = repo_view.activeIdentity(),
+                .layout = .{ .width = body_size.width, .height = body_size.height },
+                .keymap = self.keymap,
             },
             .active_page = self.active_page,
             .page_bar_visible = true,
@@ -1966,6 +2026,24 @@ pub const App = struct {
         };
         var compare_body_adapter = compare_navigation_view.resolver();
         const compare_body_view = compare_navigation_view.bodyView(&compare_body_adapter);
+        const history_navigation_view: committed_diff_navigation.View = .{
+            .diff = &self.pages.history.diff,
+            .activation = &self.pages.history.activation,
+            .status = &self.pages.history.status,
+            .current_target = null,
+            .presentation_identity = self.pages.history.currentPresentationIdentity(),
+            .repo_root = repo.activeRoot(),
+            .repo_epoch = repo.epoch(),
+            .root_identity = repo.activeIdentity(),
+            .source = history_page.selection_source,
+            .layout = .{ .width = body_size.width, .height = body_size.height },
+            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.history),
+            .live_drag_deferred_source = false,
+        };
+        var history_body_adapter = history_navigation_view.resolver();
+        const history_body_view = history_navigation_view.bodyView(&history_body_adapter);
+        var history_key = self.pages.history.inputContext(self.keymap);
+        history_key.common.side_by_side = history_navigation_view.view().effectiveDisplayMode() == .side_by_side;
         const ai_reviews_navigation_view: ai_reviews_navigation.View = .{
             .page = &self.pages.ai_reviews,
             .repo_root = repo.activeRoot(),
@@ -2057,7 +2135,17 @@ pub const App = struct {
                 .key = self.pages.repository.inputContext(self.keymap),
                 .page_state = &self.pages.repository,
             },
-            .history = .{ .key = self.pages.history.inputContext(self.keymap) },
+            .history = .{
+                .key = history_key,
+                .selection_owner = &self.pages.history.diff.selection_owner,
+                .loaded = if (self.pages.history.current_view == .diff)
+                    history_body_view.view.activeLoadedDiffConst()
+                else
+                    null,
+                .selected_node = self.pages.history.diff.viewer.selected_node,
+                .sidebar_hidden = self.pages.history.diff.viewer.sidebar_hidden,
+                .sidebar_width = self.pages.history.diff.viewer.sidebar_width,
+            },
             .commit_panel_mode = self.localWorkflowView().commitPanelOpen(),
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
@@ -2182,7 +2270,13 @@ pub const App = struct {
                 allocator,
                 completion.generation,
             ),
-            .history => {},
+            .history => {
+                var adapter = self.historyCoordinator().navigation().updateAdapter();
+                if (adapter.bodyController().clearCompletedSelectionAfterCopy(
+                    allocator,
+                    completion.generation,
+                )) self.pages.history.diff.pinned_selection_basis = null;
+            },
             .config => {},
         }
     }

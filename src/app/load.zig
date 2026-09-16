@@ -235,6 +235,46 @@ pub const HistoryCatalogFinished = struct {
     }
 };
 
+pub const HistoryDiffTaskResult = union(enum) {
+    empty,
+    loaded: CommittedDiffBundle,
+    unavailable: git_committed_review.ProjectionFailure,
+    failed_static: []const u8,
+
+    pub fn deinit(self: *HistoryDiffTaskResult) void {
+        switch (self.*) {
+            .loaded => |*bundle| bundle.deinit(),
+            .empty, .unavailable, .failed_static => {},
+        }
+        self.* = .empty;
+    }
+};
+
+pub const HistoryDiffFinished = struct {
+    identity: page.RequestIdentity,
+    root_identity: root_capability.Identity,
+    generation: u64,
+    request: git_history.SelectionRequest,
+    result: HistoryDiffTaskResult,
+
+    pub fn deinit(self: *HistoryDiffFinished, _: std.mem.Allocator) void {
+        self.result.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const HistoryReadFinished = union(enum) {
+    catalog: HistoryCatalogFinished,
+    diff: HistoryDiffFinished,
+
+    pub fn deinit(self: *HistoryReadFinished, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const AiReviewScanTaskResult = union(enum) {
     empty,
     scanned: review_store.ScanResult,
@@ -378,7 +418,7 @@ pub const CoordinatorReadFinished = union(enum) {
 /// than adding Repository-shaped tags beside Changes tags in App.Msg.
 pub const ReadFinished = union(enum) {
     changes: ChangesReadFinished,
-    history: HistoryCatalogFinished,
+    history: HistoryReadFinished,
     compare: CompareReadFinished,
     ai_reviews: AiReviewsReadFinished,
     shell: ShellReadFinished,
@@ -1060,14 +1100,85 @@ pub fn HistoryCatalogTask(comptime Msg: type) type {
             render_now_unix: ?i64,
         ) Msg {
             defer task.destroy(allocator);
-            return Msg.loadFinished(.{ .history = .{
+            return Msg.loadFinished(.{ .history = .{ .catalog = .{
                 .identity = task.identity,
                 .root_identity = task.root.identity,
                 .generation = task.generation,
                 .request = task.request,
                 .render_now_unix = render_now_unix,
                 .result = result,
-            } });
+            } } });
+        }
+    };
+}
+
+/// Async owner for one immutable History selection. The selection request is
+/// already resolved from one admitted first-parent catalog; the worker owns a
+/// duplicated repository descriptor and materializes only its exact basis.
+pub fn HistoryDiffTask(comptime Msg: type) type {
+    return struct {
+        identity: page.RequestIdentity,
+        generation: u64,
+        root: root_capability.RootCapability,
+        request: git_history.SelectionRequest,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn init(
+            identity: page.RequestIdentity,
+            generation: u64,
+            root: *const root_capability.RootCapability,
+            request: git_history.SelectionRequest,
+            env_map: ?*const std.process.Environ.Map,
+            allocator: std.mem.Allocator,
+        ) !@This() {
+            std.debug.assert(identity.origin == .history);
+            var owned_root = try root.duplicate();
+            errdefer owned_root.deinit();
+            var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map);
+            errdefer environment.deinit();
+            return .{
+                .identity = identity,
+                .generation = generation,
+                .root = owned_root,
+                .request = request,
+                .environment = environment,
+            };
+        }
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const context: git_command.DirectoryContext = .{
+                .cwd = task.root.dir(),
+                .environment = &task.environment,
+            };
+            return task.finish(allocator, runHistoryDiffLoad(
+                allocator,
+                io,
+                context,
+                task.request,
+            ));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: HistoryDiffTaskResult) Msg {
+            defer task.destroy(allocator);
+            return Msg.loadFinished(.{ .history = .{ .diff = .{
+                .identity = task.identity,
+                .root_identity = task.root.identity,
+                .generation = task.generation,
+                .request = task.request,
+                .result = result,
+            } } });
         }
     };
 }
@@ -1774,6 +1885,135 @@ pub fn runCompareBranchListLoad(
         .failed => |message| .{ .failed = message },
         .failed_static => |message| .{ .failed_static = message },
     };
+}
+
+/// Materialize the exact basis from one admitted History selection and parse
+/// it through the shared committed-diff bundle boundary.
+pub fn runHistoryDiffLoad(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    request: git_history.SelectionRequest,
+) HistoryDiffTaskResult {
+    if (!historySelectionRequestConsistent(request)) {
+        return .{ .unavailable = .projection_git_command_failed };
+    }
+
+    var materialized = git_committed_review.materializeCommittedDiff(
+        allocator,
+        io,
+        context,
+        request.basis,
+    ) catch return .{ .failed_static = "History diff could not be materialized: out of memory" };
+    defer materialized.deinit(allocator);
+
+    return switch (materialized) {
+        .failure => |failure| .{ .unavailable = failure },
+        .materialization => |*value| if (value.patch_bytes.len == 0)
+            .{ .loaded = .empty }
+        else
+            .{ .loaded = .{ .loaded = buildLoadedBundleWithIo(
+                allocator,
+                io,
+                value.patch_bytes,
+            ) catch return .{ .failed_static = "History diff could not be parsed" } } },
+    };
+}
+
+fn historySelectionRequestConsistent(request: git_history.SelectionRequest) bool {
+    const format = request.basis.object_format;
+    if (!request.snapshot_head.validFor(format) or !request.basis.after.validFor(format)) return false;
+    const after = switch (request.intent) {
+        .single => |single| blk: {
+            if (!single.oid.validFor(format) or
+                (single.index == 0 and !single.oid.eql(&request.snapshot_head))) return false;
+            break :blk single.oid;
+        },
+        .range => |range| blk: {
+            if (range.newest_index >= range.oldest_index or
+                range.anchor_index < range.newest_index or range.anchor_index > range.oldest_index or
+                range.cursor_index < range.newest_index or range.cursor_index > range.oldest_index or
+                @min(range.anchor_index, range.cursor_index) != range.newest_index or
+                @max(range.anchor_index, range.cursor_index) != range.oldest_index or
+                !range.newest_oid.validFor(format) or !range.oldest_oid.validFor(format) or
+                (range.newest_index == 0 and !range.newest_oid.eql(&request.snapshot_head)))
+            {
+                return false;
+            }
+            break :blk range.newest_oid;
+        },
+    };
+    return after.eql(&request.basis.after);
+}
+
+test "History exact diff load covers normal root merge range and allow-empty from one catalog" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.txt", .data = "root\n" });
+    try runTestGit(io, &.{ "git", "add", "." }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "root" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.txt", .data = "root\nnormal\n" });
+    try runTestGit(io, &.{ "git", "add", "." }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "normal" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "switch", "-c", "side" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "side.txt", .data = "side\n" });
+    try runTestGit(io, &.{ "git", "add", "." }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "side" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "switch", "main" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.txt", .data = "main\n" });
+    try runTestGit(io, &.{ "git", "add", "." }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "main" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "merge", "--no-ff", "-m", "merge", "side" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "empty" }, tmp.dir);
+
+    const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+    var catalog_result = try git_history.loadInitial(allocator, io, context);
+    defer catalog_result.deinit(allocator);
+    const catalog = switch (catalog_result) {
+        .loaded => |*loaded| loaded,
+        .failure => return error.ExpectedHistoryCatalog,
+    };
+    try std.testing.expectEqual(@as(usize, 5), catalog.records.len);
+    try std.testing.expectEqual(@as(u16, 2), catalog.records[1].parent_count);
+
+    const cases = [_]struct {
+        anchor: ?usize,
+        cursor: usize,
+        empty: bool,
+    }{
+        .{ .anchor = null, .cursor = 3, .empty = false }, // normal
+        .{ .anchor = null, .cursor = 4, .empty = false }, // root
+        .{ .anchor = null, .cursor = 1, .empty = false }, // merge parent 1
+        .{ .anchor = 1, .cursor = 3, .empty = false }, // inclusive range
+        .{ .anchor = null, .cursor = 0, .empty = true }, // allow-empty
+    };
+    for (cases) |case| {
+        const request = git_history.resolveSelection(
+            &catalog.snapshot.?,
+            catalog.records,
+            case.anchor,
+            case.cursor,
+        ).request;
+        var result = runHistoryDiffLoad(allocator, io, context, request);
+        defer result.deinit();
+        switch (result) {
+            .loaded => |bundle| switch (bundle) {
+                .empty => try std.testing.expect(case.empty),
+                .loaded => |loaded| {
+                    try std.testing.expect(!case.empty);
+                    try std.testing.expect(loaded.loaded.document.files.len > 0);
+                },
+            },
+            else => return error.ExpectedHistoryDiff,
+        }
+    }
 }
 
 /// Resolve the Branch Review caller policy, then run the target, ahead, and

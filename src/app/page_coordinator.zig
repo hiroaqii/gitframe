@@ -178,6 +178,7 @@ pub const Controller = struct {
         const active = self.active_page.*;
         return .{
             .changes_mouse_selection = active == .changes and self.changes.selection_owner.activeMouseSelection(),
+            .history_mouse_selection = active == .history and self.history.diff.selection_owner.activeMouseSelection(),
             .compare_mouse_selection = active == .compare and self.compare.diff.selection_owner.activeMouseSelection(),
             .ai_reviews_mouse_selection = active == .ai_reviews and self.ai_reviews.diff.selection_owner.activeMouseSelection(),
             .repository_mouse_selection = active == .repository and self.repository.activeMouseSourceRange(),
@@ -185,6 +186,8 @@ pub const Controller = struct {
             .compare_deferred_apply = active == .compare and self.compare.deferred_load_apply != null,
             .changes_search = active == .changes and self.changes.search.mode,
             .changes_file_search = active == .changes and self.changes.file_search.mode,
+            .history_search = active == .history and self.history.diff.search.mode,
+            .history_file_search = active == .history and self.history.diff.file_search.mode,
             .compare_search = active == .compare and self.compare.diff.search.mode,
             .compare_file_search = active == .compare and self.compare.diff.file_search.mode,
             .ai_reviews_search = active == .ai_reviews and self.ai_reviews.diff.search.mode,

@@ -65,6 +65,7 @@ pub const ShellEffectFinished = union(enum) {
 
 pub const MouseSelectionTarget = union(enum) {
     changes: ?changes_message.MousePoint,
+    history: ?diff_surface.MousePoint,
     compare: ?diff_surface.MousePoint,
     ai_reviews: ?diff_surface.MousePoint,
     repository: ?repository_layout.BodyPoint,

@@ -1,8 +1,8 @@
 //! Shared retained state for read-only committed-diff pages.
 //!
-//! Compare and AI Reviews own independent activation, target, request, modal,
-//! and diagnostics. This component owns only the diff interaction state whose
-//! contract is identical for both pages.
+//! History, Compare, and AI Reviews own independent activation, selection or
+//! target, request, modal, and diagnostics. This component owns only the diff
+//! interaction state whose contract is identical for those pages.
 
 const std = @import("std");
 const content_fingerprint = @import("../../content_fingerprint.zig");
@@ -11,6 +11,7 @@ const diff_surface = @import("../diff_surface.zig");
 const load_state = @import("../load_state.zig");
 const app_load = @import("../load.zig");
 const committed_review = @import("../../committed_review.zig");
+const git_committed_review = @import("../../git/committed_review.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
@@ -30,15 +31,41 @@ pub const AcceptedRepositoryIdentity = struct {
     }
 };
 
+/// Page-local presentation identity used only to admit retained selection
+/// actions for the exact committed diff still on screen. This is deliberately
+/// not a durable review target: Compare keeps its review target, while History
+/// pins the already-resolved direct endpoint basis.
+pub const PresentationIdentity = union(enum) {
+    review_target: committed_review.CommittedReviewTarget,
+    diff_basis: git_committed_review.CommittedDiffBasis,
+
+    pub fn eql(self: PresentationIdentity, other: PresentationIdentity) bool {
+        return switch (self) {
+            .review_target => |target| switch (other) {
+                .review_target => |candidate| target.eql(&candidate),
+                .diff_basis => false,
+            },
+            .diff_basis => |basis| switch (other) {
+                .review_target => false,
+                .diff_basis => |candidate| std.meta.eql(basis, candidate),
+            },
+        };
+    }
+};
+
 pub const PinnedSelectionBasis = struct {
-    target: committed_review.CommittedReviewTarget,
+    identity: PresentationIdentity,
 
     pub fn init(target: committed_review.CommittedReviewTarget) PinnedSelectionBasis {
-        return .{ .target = target };
+        return .{ .identity = .{ .review_target = target } };
+    }
+
+    pub fn initIdentity(identity: PresentationIdentity) PinnedSelectionBasis {
+        return .{ .identity = identity };
     }
 
     pub fn eql(self: PinnedSelectionBasis, other: PinnedSelectionBasis) bool {
-        return self.target.eql(&other.target);
+        return self.identity.eql(other.identity);
     }
 };
 
@@ -48,7 +75,15 @@ pub const SurfaceOwner = struct {
     source: diff_source.SourceMode,
     layout: diff_surface.Layout,
     current_target: ?committed_review.CommittedReviewTarget,
+    presentation_identity: ?PresentationIdentity = null,
     live_drag_deferred_source: bool,
+
+    fn currentPresentation(self: SurfaceOwner) ?PresentationIdentity {
+        return self.presentation_identity orelse if (self.current_target) |target|
+            PresentationIdentity{ .review_target = target }
+        else
+            null;
+    }
 };
 
 pub const ReadSurfaceOwner = struct {
@@ -57,7 +92,15 @@ pub const ReadSurfaceOwner = struct {
     source: diff_source.SourceMode,
     layout: diff_surface.Layout,
     current_target: ?committed_review.CommittedReviewTarget,
+    presentation_identity: ?PresentationIdentity = null,
     live_drag_deferred_source: bool,
+
+    fn currentPresentation(self: ReadSurfaceOwner) ?PresentationIdentity {
+        return self.presentation_identity orelse if (self.current_target) |target|
+            PresentationIdentity{ .review_target = target }
+        else
+            null;
+    }
 };
 
 pub const State = struct {
@@ -109,25 +152,55 @@ pub const State = struct {
         self: *const State,
         current_target: ?committed_review.CommittedReviewTarget,
     ) bool {
-        return current_target != null and self.load.state == .loaded;
+        return self.retainedSelectionInstallAvailableWithIdentity(if (current_target) |target|
+            .{ .review_target = target }
+        else
+            null);
+    }
+
+    pub fn retainedSelectionInstallAvailableWithIdentity(
+        self: *const State,
+        current_identity: ?PresentationIdentity,
+    ) bool {
+        return current_identity != null and self.load.state == .loaded;
     }
 
     pub fn retainedSelectionAdmitted(
         self: *const State,
         current_target: ?committed_review.CommittedReviewTarget,
     ) bool {
+        return self.retainedSelectionAdmittedWithIdentity(if (current_target) |target|
+            .{ .review_target = target }
+        else
+            null);
+    }
+
+    pub fn retainedSelectionAdmittedWithIdentity(
+        self: *const State,
+        current_identity: ?PresentationIdentity,
+    ) bool {
         const pinned = self.pinned_selection_basis orelse return false;
-        const current = current_target orelse return false;
-        return pinned.eql(.init(current));
+        const current = current_identity orelse return false;
+        return pinned.eql(.initIdentity(current));
+    }
+
+    pub fn installPinnedPresentationIdentity(
+        self: *State,
+        current_identity: ?PresentationIdentity,
+    ) bool {
+        const identity = current_identity orelse return false;
+        self.pinned_selection_basis = .initIdentity(identity);
+        return true;
     }
 
     pub fn installPinnedSelectionBasis(
         self: *State,
         current_target: ?committed_review.CommittedReviewTarget,
     ) bool {
-        const target = current_target orelse return false;
-        self.pinned_selection_basis = .init(target);
-        return true;
+        return self.installPinnedPresentationIdentity(if (current_target) |target|
+            .{ .review_target = target }
+        else
+            null);
     }
 
     pub fn takeReloadAnchor(self: *State) ?diff_surface.ReloadAnchor {
@@ -175,10 +248,29 @@ pub const State = struct {
         incoming_target: committed_review.CommittedReviewTarget,
         incoming_diff: *const app_load.CommittedDiffBundle,
     ) bool {
+        return self.retainedSelectionTransfersWithIdentity(
+            repo_epoch,
+            root_identity,
+            source,
+            if (current_target) |target| .{ .review_target = target } else null,
+            .{ .review_target = incoming_target },
+            incoming_diff,
+        );
+    }
+
+    pub fn retainedSelectionTransfersWithIdentity(
+        self: *const State,
+        repo_epoch: u64,
+        root_identity: ?root_capability.Identity,
+        source: diff_source.SourceMode,
+        current_identity: ?PresentationIdentity,
+        incoming_identity: PresentationIdentity,
+        incoming_diff: *const app_load.CommittedDiffBundle,
+    ) bool {
         const completed = self.completed_selection orelse return false;
         const pinned = self.pinned_selection_basis orelse return false;
-        const current = current_target orelse return false;
-        if (!pinned.eql(.init(current)) or !pinned.eql(.init(incoming_target))) return false;
+        const current = current_identity orelse return false;
+        if (!pinned.eql(.initIdentity(current)) or !pinned.eql(.initIdentity(incoming_identity))) return false;
         if (completed.token.repo_epoch != repo_epoch or
             !optionalRootIdentityEql(completed.token.root_identity, root_identity) or
             !completed.token.source.eql(diff_surface.selection.SourceBasis.init(source)) or
@@ -209,6 +301,31 @@ pub const State = struct {
         root_identity: ?root_capability.Identity,
         source: diff_source.SourceMode,
         current_target: committed_review.CommittedReviewTarget,
+        pair_changed: bool,
+        transfer_selection: bool,
+        incoming: *app_load.CommittedDiffBundle,
+    ) !void {
+        return self.replaceDiffWithIdentity(
+            allocator,
+            repo_epoch,
+            repo_root,
+            root_identity,
+            source,
+            .{ .review_target = current_target },
+            pair_changed,
+            transfer_selection,
+            incoming,
+        );
+    }
+
+    pub fn replaceDiffWithIdentity(
+        self: *State,
+        allocator: std.mem.Allocator,
+        repo_epoch: u64,
+        repo_root: ?[]const u8,
+        root_identity: ?root_capability.Identity,
+        source: diff_source.SourceMode,
+        current_identity: PresentationIdentity,
         pair_changed: bool,
         transfer_selection: bool,
         incoming: *app_load.CommittedDiffBundle,
@@ -275,7 +392,7 @@ pub const State = struct {
                 .source_session_revision = self.source_session_revision,
                 .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
             };
-            self.pinned_selection_basis = .init(current_target);
+            self.pinned_selection_basis = .initIdentity(current_identity);
         }
         self.accepted_repository_identity = .{
             .repo_epoch = repo_epoch,
@@ -284,6 +401,7 @@ pub const State = struct {
     }
 
     pub fn diffSurface(self: *State, owner: SurfaceOwner) diff_surface.DiffSurface {
+        const presentation = owner.currentPresentation();
         return .{
             .activation = owner.activation,
             .status = owner.status,
@@ -306,14 +424,15 @@ pub const State = struct {
             .reload_anchor = if (self.reload_anchor) |*anchor| anchor else null,
             .live_drag_deferred_source = owner.live_drag_deferred_source,
             .selection_completion_policy = .retain_with_actions,
-            .retained_selection_install_available = self.retainedSelectionInstallAvailable(owner.current_target),
-            .retained_selection_action_admitted = self.retainedSelectionAdmitted(owner.current_target),
+            .retained_selection_install_available = self.retainedSelectionInstallAvailableWithIdentity(presentation),
+            .retained_selection_action_admitted = self.retainedSelectionAdmittedWithIdentity(presentation),
             .source = owner.source,
             .layout = owner.layout,
         };
     }
 
     pub fn readSurface(self: *const State, owner: ReadSurfaceOwner) diff_surface.ReadSurface {
+        const presentation = owner.currentPresentation();
         return .{
             .activation = owner.activation,
             .status = owner.status,
@@ -336,8 +455,8 @@ pub const State = struct {
             .reload_anchor = if (self.reload_anchor) |*anchor| anchor else null,
             .live_drag_deferred_source = owner.live_drag_deferred_source,
             .selection_completion_policy = .retain_with_actions,
-            .retained_selection_install_available = self.retainedSelectionInstallAvailable(owner.current_target),
-            .retained_selection_action_admitted = self.retainedSelectionAdmitted(owner.current_target),
+            .retained_selection_install_available = self.retainedSelectionInstallAvailableWithIdentity(presentation),
+            .retained_selection_action_admitted = self.retainedSelectionAdmittedWithIdentity(presentation),
             .source = owner.source,
             .layout = owner.layout,
         };
@@ -371,4 +490,23 @@ test "committed diff state owns shared navigation without page target authority"
     try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll);
     try std.testing.expect(state.search.mode);
     try std.testing.expect(surface.viewer == &state.viewer);
+}
+
+test "committed diff selection pin admits one exact History basis without changing review targets" {
+    var state: State = .{};
+    const before = try git_committed_review.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const after = try git_committed_review.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const basis: git_committed_review.CommittedDiffBasis = .{
+        .object_format = .sha1,
+        .before = .{ .commit = before },
+        .after = after,
+    };
+    const identity: PresentationIdentity = .{ .diff_basis = basis };
+    try std.testing.expect(state.installPinnedPresentationIdentity(identity));
+    try std.testing.expect(state.retainedSelectionAdmittedWithIdentity(identity));
+
+    var different = basis;
+    different.after = before;
+    try std.testing.expect(!state.retainedSelectionAdmittedWithIdentity(.{ .diff_basis = different }));
+    try std.testing.expect(!state.retainedSelectionAdmitted(null));
 }
