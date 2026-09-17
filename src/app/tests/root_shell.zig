@@ -832,7 +832,6 @@ test "History accepted diff runs one root interaction and transition sequence" {
         .request = request,
         .origin = .detached,
         .selected_parent_count = 1,
-        .target_subject = try allocator.dupe(u8, "accepted subject"),
     };
     var catalog_page: git_history.Page = catalog_page: {
         const records = try allocator.alloc(git_history.Record, 3);

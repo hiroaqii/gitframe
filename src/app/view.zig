@@ -2594,7 +2594,6 @@ test "footer normal-mode hints match the decided page lists" {
             },
             .origin = .{ .branch = try allocator.dupe(u8, "main") },
             .selected_parent_count = 0,
-            .target_subject = try allocator.dupe(u8, "root"),
         },
     };
     history_state.catalog.continuation = accepted_oid;
@@ -3017,6 +3016,32 @@ test "page bar hides remote actions while showing diff totals" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD main ↑0") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "P: push") == null);
+}
+
+test "History page bar keeps compact comparison complete with diff totals at 120 columns" {
+    const palette: theme.Palette = .default();
+    var ts: chasen.testing.TestSurface = undefined;
+    // The outer shell frame consumes two columns from a 120-column terminal.
+    try ts.init(118, shell_layout.page_bar_rows);
+    defer ts.deinit();
+
+    viewPageBar(.history, false, .{
+        .presentation = .{ .comparison = .{
+            .base_display_name = "1 commit 1111111",
+            .head_display_name = "2222222",
+            .freshness = .fresh,
+        } },
+        .line_stats = .{ .added = 39, .removed = 710 },
+    }, palette, &ts.surface);
+
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        snapshot,
+        "BASE 1 commit 1111111  …  HEAD 2222222",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710") != null);
 }
 
 test "page bar shows remote actions only in the clean layout" {

@@ -88,7 +88,7 @@ pub const ViewContext = struct {
 pub fn pageHeaderPresentation(context: ViewContext, allocator: std.mem.Allocator) ?page_header.Presentation {
     const page = context.page_state;
     if (page.current_view != .diff) return null;
-    const accepted = page.accepted orelse return terminal(sourcePending(page), sourceFailed(page));
+    const accepted = if (page.accepted) |*value| value else return terminal(sourcePending(page), sourceFailed(page));
     const repository = page.diff.accepted_repository_identity orelse return terminal(sourcePending(page), sourceFailed(page));
     if (!repository.matches(context.repo_epoch, context.root_identity) or !page.diff.hasAcceptedDiff())
         return terminal(sourcePending(page), sourceFailed(page));
@@ -97,31 +97,13 @@ pub fn pageHeaderPresentation(context: ViewContext, allocator: std.mem.Allocator
         .commit => |oid| oid.short(),
         .empty_tree => "empty tree",
     };
-    const kind = switch (accepted.request.intent) {
-        .single => if (accepted.request.basis.before == .empty_tree)
-            "root"
-        else if (accepted.selected_parent_count > 1)
-            std.fmt.allocPrint(allocator, "merge parent 1/{d}", .{accepted.selected_parent_count}) catch "merge parent 1"
-        else
-            "single",
-        .range => "range",
-    };
     const count = accepted.request.intent.commitCount();
     const base_label = std.fmt.allocPrint(
         allocator,
-        "{s} {d} {s} {s}",
-        .{ kind, count, if (count == 1) "commit" else "commits", before },
-    ) catch before;
-    const origin = switch (accepted.origin) {
-        .branch => |branch| branch,
-        .detached => "detached",
-        .unborn => |branch| branch,
-    };
-    const selected_label = std.fmt.allocPrint(
-        allocator,
-        "{s} @ {s} {s}",
-        .{ accepted.request.basis.after.short(), origin, accepted.target_subject },
-    ) catch accepted.request.basis.after.short();
+        "{d} {s} {s}",
+        .{ count, if (count == 1) "commit" else "commits", before },
+    ) catch return null;
+    const selected_label = accepted.request.basis.after.short();
     const head_label = if (page.acceptedContextChanged()) blk: {
         const current = page.currentHeadContext() orelse break :blk selected_label;
         const current_label = headContextLabel(allocator, current) catch break :blk selected_label;
@@ -936,7 +918,6 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         },
         .origin = .{ .branch = try allocator.dupe(u8, "main") },
         .selected_parent_count = 2,
-        .target_subject = try allocator.dupe(u8, "catalog head"),
     };
     page_state.catalog.snapshot.?.display.deinit(allocator);
     page_state.catalog.snapshot.?.display = .{ .branch = try allocator.dupe(u8, "feature") };
@@ -1002,7 +983,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "Esc: previous diff") != null);
 }
 
-test "History accepted headers keep kind count endpoints subject and origin at representative sizes" {
+test "History accepted header keeps only count endpoints and current HEAD context" {
     const allocator = std.testing.allocator;
     const before = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
     const after = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
@@ -1010,43 +991,33 @@ test "History accepted headers keep kind count endpoints subject and origin at r
     const Kind = enum { normal, root, merge, range };
     const cases = [_]struct {
         kind: Kind,
-        size: chasen.Size,
         detached: bool,
-        subject: []const u8,
         expected_base: []const u8,
         expected_head: []const u8,
     }{
         .{
             .kind = .normal,
-            .size = .{ .width = 80, .height = 24 },
             .detached = false,
-            .subject = "normal subject",
-            .expected_base = "single 1 commit 1111111",
-            .expected_head = "2222222 @ main normal subject",
+            .expected_base = "1 commit 1111111",
+            .expected_head = "2222222",
         },
         .{
             .kind = .root,
-            .size = .{ .width = 80, .height = 24 },
             .detached = false,
-            .subject = "root subject",
-            .expected_base = "root 1 commit empty tree",
-            .expected_head = "2222222 @ main root subject",
+            .expected_base = "1 commit empty tree",
+            .expected_head = "2222222",
         },
         .{
             .kind = .merge,
-            .size = .{ .width = 120, .height = 32 },
             .detached = false,
-            .subject = "merge subject",
-            .expected_base = "merge parent 1/2 1 commit 1111111",
-            .expected_head = "2222222 @ main merge subject",
+            .expected_base = "1 commit 1111111",
+            .expected_head = "2222222",
         },
         .{
             .kind = .range,
-            .size = .{ .width = 120, .height = 32 },
             .detached = true,
-            .subject = "range target subject",
-            .expected_base = "range 3 commits 1111111",
-            .expected_head = "2222222 @ detached range target subject · Current HEAD: topic @ 3333333",
+            .expected_base = "3 commits 1111111",
+            .expected_head = "2222222 · Current HEAD: topic @ 3333333",
         },
     };
 
@@ -1065,7 +1036,7 @@ test "History accepted headers keep kind count endpoints subject and origin at r
         const origin: git_history.HeadDisplay = if (case.detached)
             .detached
         else
-            .{ .branch = try allocator.dupe(u8, "main") };
+            .{ .branch = try allocator.dupe(u8, "selection-origin") };
         var page_state: history_page.HistoryPageState = .{
             .repo_epoch = 7,
             .current_view = .diff,
@@ -1086,7 +1057,6 @@ test "History accepted headers keep kind count endpoints subject and origin at r
                 },
                 .origin = origin,
                 .selected_parent_count = if (case.kind == .merge) 2 else if (case.kind == .root) 0 else 1,
-                .target_subject = try allocator.dupe(u8, case.subject),
             },
             .diff = .{
                 .load = .{ .state = .{ .empty = .no_changes } },
@@ -1106,10 +1076,13 @@ test "History accepted headers keep kind count endpoints subject and origin at r
         try std.testing.expectEqualStrings(case.expected_base, comparison.base_display_name);
         try std.testing.expectEqualStrings(case.expected_head, comparison.head_display_name);
 
-        const line = (try page_header.formatAlloc(arena.allocator(), presentation, case.size.width)).?;
-        try std.testing.expect(chasen.text.displayWidth(line) <= case.size.width);
-        try std.testing.expect(std.mem.indexOf(u8, line, "BASE ") != null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "HEAD ") != null);
+        const line = (try page_header.formatAlloc(arena.allocator(), presentation, 120)).?;
+        const expected_line = try std.fmt.allocPrint(
+            arena.allocator(),
+            "BASE {s}  …  HEAD {s}",
+            .{ case.expected_base, case.expected_head },
+        );
+        try std.testing.expectEqualStrings(expected_line, line);
     }
 }
 

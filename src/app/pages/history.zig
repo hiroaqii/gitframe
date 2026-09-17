@@ -66,7 +66,6 @@ pub const AcceptedSelection = struct {
     request: git_history.SelectionRequest,
     origin: git_history.HeadDisplay,
     selected_parent_count: u16,
-    target_subject: []u8,
     picker_scroll: usize = 0,
 
     pub fn init(
@@ -82,21 +81,17 @@ pub const AcceptedSelection = struct {
         };
         if (selected_index >= records.len or !records[selected_index].oid.eql(&request.basis.after))
             return error.InvalidSelection;
-        var origin = try cloneHeadDisplay(allocator, snapshot.display);
-        errdefer origin.deinit(allocator);
-        const target_subject = try allocator.dupe(u8, records[selected_index].subject);
+        const origin = try cloneHeadDisplay(allocator, snapshot.display);
         return .{
             .request = request,
             .origin = origin,
             .selected_parent_count = records[selected_index].parent_count,
-            .target_subject = target_subject,
             .picker_scroll = picker_scroll,
         };
     }
 
     pub fn deinit(self: *AcceptedSelection, allocator: std.mem.Allocator) void {
         self.origin.deinit(allocator);
-        allocator.free(self.target_subject);
         self.* = undefined;
     }
 
@@ -1249,7 +1244,7 @@ test "History diff completion publishes atomically and failure or cancel preserv
     );
     try std.testing.expectEqual(CurrentView.diff, state.current_view);
     try std.testing.expect(state.accepted.?.request.basis.after.eql(&newest));
-    try std.testing.expectEqualStrings("newest", state.accepted.?.target_subject);
+    try std.testing.expectEqualStrings("main", state.accepted.?.origin.branch);
     try std.testing.expect(state.diff.load.state == .loaded);
 
     state.openPicker(allocator);
@@ -1318,10 +1313,6 @@ test "History diff completion publishes atomically and failure or cancel preserv
     try std.testing.expect(state.returnToAccepted());
     try std.testing.expect(state.accepted.?.request.basis.after.eql(&newest));
 
-    if (state.catalog.snapshot) |*snapshot| {
-        snapshot.display.deinit(allocator);
-        snapshot.display = .detached;
-    }
     state.armDiff(.{
         .identity = identity,
         .root_identity = root_identity,
@@ -1343,7 +1334,7 @@ test "History diff completion publishes atomically and failure or cancel preserv
     );
     try std.testing.expectEqual(CurrentView.diff, state.current_view);
     try std.testing.expect(state.accepted.?.request.basis.after.eql(&newest));
-    try std.testing.expectEqualStrings("newest", state.accepted.?.target_subject);
+    try std.testing.expectEqualStrings("main", state.accepted.?.origin.branch);
     try std.testing.expect(state.diff.load.state == .loaded);
 }
 
@@ -1593,14 +1584,14 @@ test "History picker revalidates accepted context and repository replacement fen
         .diff_scroll = 7,
         .display_mode = .unified,
     };
-    const accepted_subject = state.accepted.?.target_subject.ptr;
+    const accepted_origin = state.accepted.?.origin.branch.ptr;
     const accepted_basis = state.accepted.?.request.basis;
 
     state.deactivate();
     state.activate(allocator, 7, root_identity);
     try std.testing.expectEqual(app_load.HistoryProbeReason.activation, state.nextRequest().?.probe);
     try std.testing.expectEqual(CurrentView.diff, state.current_view);
-    try std.testing.expectEqual(accepted_subject, state.accepted.?.target_subject.ptr);
+    try std.testing.expectEqual(accepted_origin, state.accepted.?.origin.branch.ptr);
     try std.testing.expectEqual(@as(usize, 3), state.diff.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll);
     try std.testing.expect(state.diff.viewer.display_mode == .unified);
