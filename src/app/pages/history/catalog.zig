@@ -131,9 +131,10 @@ pub const State = struct {
     }
 };
 
-/// One header row and one column-label row are outside the scrolling list.
+/// The catalog context occupies row zero; every remaining row belongs to the
+/// scrolling list.
 pub fn visibleRows(body_height: u16) usize {
-    return body_height -| 2;
+    return body_height -| 1;
 }
 
 test "History catalog viewport includes only the load-more operation row" {
@@ -152,11 +153,11 @@ test "History catalog navigation reuses Viewport keep-visible semantics" {
     try std.testing.expect(!state.canMovePrevious());
     try std.testing.expect(state.canMoveNext());
     state.pageDown(5);
-    try std.testing.expectEqual(@as(usize, 3), state.cursor);
+    try std.testing.expectEqual(@as(usize, 4), state.cursor);
     try std.testing.expectEqual(@as(usize, 1), state.scroll);
     state.last(5);
     try std.testing.expectEqual(@as(usize, 9), state.cursor);
-    try std.testing.expectEqual(@as(usize, 7), state.scroll);
+    try std.testing.expectEqual(@as(usize, 6), state.scroll);
     try std.testing.expect(state.canMovePrevious());
     try std.testing.expect(!state.canMoveNext());
     state.continuation = try git_history.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
@@ -169,4 +170,10 @@ test "History catalog navigation reuses Viewport keep-visible semantics" {
     try std.testing.expectEqual(@as(usize, 0), state.scroll);
     state.records = .empty;
     state.continuation = null;
+}
+
+test "History catalog gives the removed column-label row back to the viewport" {
+    try std.testing.expectEqual(@as(usize, 0), visibleRows(0));
+    try std.testing.expectEqual(@as(usize, 0), visibleRows(1));
+    try std.testing.expectEqual(@as(usize, 23), visibleRows(24));
 }

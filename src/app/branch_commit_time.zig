@@ -80,6 +80,11 @@ pub fn formatExactUtc(timestamp: ?i64) ?ExactUtc {
     return result;
 }
 
+pub fn formatDateUtc(timestamp: ?i64) ?[10]u8 {
+    const exact = formatExactUtc(timestamp) orelse return null;
+    return exact.bytes[0..10].*;
+}
+
 fn literalRelative(text: []const u8) Relative {
     var result: Relative = .{};
     @memcpy(result.bytes[0..text.len], text);
@@ -158,4 +163,11 @@ test "exact commit time is deterministic UTC and rejects unrepresentable values"
     try std.testing.expect(formatExactUtc(null) == null);
     try std.testing.expect(formatExactUtc(-1) == null);
     try std.testing.expect(formatExactUtc(maximum_utc_second + 1) == null);
+
+    const epoch_date = formatDateUtc(0).?;
+    try std.testing.expectEqualStrings("1970-01-01", &epoch_date);
+    const last_date = formatDateUtc(maximum_utc_second).?;
+    try std.testing.expectEqualStrings("9999-12-31", &last_date);
+    try std.testing.expect(formatDateUtc(null) == null);
+    try std.testing.expect(formatDateUtc(-1) == null);
 }

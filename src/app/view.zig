@@ -3251,6 +3251,7 @@ test "History help explains every commit picker marker" {
     defer std.testing.allocator.free(snapshot);
 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Markers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit · Date · Author · [Refs] Subject") != null);
     for ([_][]const u8{
         "range anchor",
         "commit included in the selected range",
@@ -3496,6 +3497,7 @@ const help_compare_items = [_]HelpItem{
 };
 
 const help_history_items = [_]HelpItem{
+    .{ .key = .{ .text = "Row" }, .description = "Commit · Date · Author · [Refs] Subject" },
     .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move through commits" },
     .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "move one visible page" },
     .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last catalog row" },

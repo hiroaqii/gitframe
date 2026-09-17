@@ -18,6 +18,35 @@ const root_capability = @import("../../../repo/root_capability.zig");
 const theme = @import("theme");
 
 const row_prefix_width: u16 = 4;
+const commit_width: u16 = 7;
+const date_width: u16 = 10;
+const author_width: u16 = 14;
+const column_gap: u16 = 2;
+
+const FieldLayout = struct {
+    col: u16,
+    width: u16,
+};
+
+const CommitRowLayout = struct {
+    commit: FieldLayout,
+    date: FieldLayout,
+    author: FieldLayout,
+    summary: FieldLayout,
+
+    fn init(viewport_width: u16) CommitRowLayout {
+        const commit_col = row_prefix_width;
+        const date_col = commit_col + commit_width + column_gap;
+        const author_col = date_col + date_width + column_gap;
+        const summary_col = author_col + author_width + column_gap;
+        return .{
+            .commit = .{ .col = commit_col, .width = commit_width },
+            .date = .{ .col = date_col, .width = date_width },
+            .author = .{ .col = author_col, .width = author_width },
+            .summary = .{ .col = summary_col, .width = viewport_width -| summary_col },
+        };
+    }
+};
 
 pub const PickerMarker = struct {
     pub const range_anchor = "A";
@@ -171,62 +200,26 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
     }
 
     const snapshot = &page.catalog.snapshot.?;
-    const head_text = try std.fmt.allocPrint(
-        surface.frameAllocator(),
-        "History  {s}  ·  {d} commit{s}",
-        .{
-            try headContextLabel(surface.frameAllocator(), snapshot),
-            page.catalog.records.items.len,
-            if (page.catalog.records.items.len == 1) "" else "s",
-        },
-    );
-    try drawClipped(surface, 2, 0, head_text, context.palette.boldStyle(.accent));
-
     const previous = if (page.acceptedContextChanged())
         try previousDiffLabel(surface.frameAllocator(), page.accepted.?)
     else
         null;
+    try drawCatalogContext(surface, context.palette, page, snapshot, previous);
 
     if (page.catalog.records.items.len == 0) {
-        if (previous) |label| {
-            if (size.height > 1) try drawClipped(surface, 0, 1, label, context.palette.style(.prompt));
-        }
-        if (size.height > 2) try drawClipped(
+        if (size.height > 1) try drawClipped(
             surface,
             2,
-            2,
+            1,
             if (previous != null) "No commits yet  ·  r: reload  ·  Esc: previous diff" else "No commits yet  ·  r: reload",
             context.palette.style(.muted),
         );
         return;
     }
 
-    if (size.height > 1) {
-        const columns = if (previous) |label|
-            if (page.catalog.capped)
-                try std.fmt.allocPrint(
-                    surface.frameAllocator(),
-                    "History limit reached: 2,000 commits loaded  ·  {s}",
-                    .{label},
-                )
-            else
-                label
-        else if (page.catalog.capped)
-            "History limit reached: 2,000 commits loaded"
-        else blk: {
-            const suffix = if (page.load_state == .loading)
-                "  ·  loading…"
-            else
-                "";
-            const labels = "    commit   subject";
-            break :blk try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}", .{ labels, suffix });
-        };
-        try drawClipped(surface, 0, 1, columns, context.palette.style(.muted));
-    }
-
     const range = page.catalog.visibleRange(size.height);
     for (range.start..range.end) |index| {
-        const row: u16 = @intCast(2 + index - range.start);
+        const row: u16 = @intCast(1 + index - range.start);
         if (row >= size.height) break;
         const focused = index == page.catalog.cursor;
         if (index == page.catalog.records.items.len) {
@@ -253,8 +246,12 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
         });
         try drawClipped(surface, 0, row, markers, if (focused) context.palette.boldStyle(.accent) else context.palette.style(.muted));
         if (range_marker) |marker| try drawClipped(surface, 1, row, marker, context.palette.boldStyle(.accent));
-        const line = try commitRowTextAlloc(surface.frameAllocator(), record, page.render_now_unix, size.width -| row_prefix_width);
-        try drawClipped(surface, row_prefix_width, row, line, if (focused) context.palette.boldStyle(.foreground) else context.palette.style(.foreground));
+        try drawCommitRow(
+            surface,
+            row,
+            record,
+            if (focused) context.palette.boldStyle(.foreground) else context.palette.style(.foreground),
+        );
     }
 }
 
@@ -364,6 +361,87 @@ fn terminal(pending: bool, failed: bool) ?page_header.Presentation {
     return null;
 }
 
+const CatalogPosition = struct {
+    full: []const u8,
+    compact: []const u8,
+};
+
+fn drawCatalogContext(
+    surface: *chasen.Surface,
+    palette: theme.Palette,
+    page: *const history_page.HistoryPageState,
+    snapshot: *const git_history.Snapshot,
+    previous: ?[]const u8,
+) !void {
+    const size = surface.size();
+    if (size.width <= 2 or size.height == 0) return;
+    const allocator = surface.frameAllocator();
+    const base = try catalogHeadContextLabel(allocator, snapshot);
+    var left = base;
+    if (page.catalog.capped) {
+        left = try std.fmt.allocPrint(allocator, "{s} · Limit: 2,000 commits loaded", .{left});
+    } else if (page.load_state == .loading) {
+        left = try std.fmt.allocPrint(allocator, "{s} · Loading…", .{left});
+    }
+    if (previous) |label| {
+        left = try std.fmt.allocPrint(allocator, "{s} · {s}", .{ left, label });
+    }
+
+    const position = try catalogPositionLabel(allocator, page);
+    const content_width: u16 = size.width -| 2;
+    const base_width = chasen.text.displayWidth(base);
+    const full_width = chasen.text.displayWidth(position.full);
+    const compact_width = chasen.text.displayWidth(position.compact);
+    const right = if (base_width +| column_gap +| full_width <= content_width)
+        position.full
+    else if (base_width +| column_gap +| compact_width <= content_width)
+        position.compact
+    else
+        null;
+
+    if (right) |right_text| {
+        const right_width = chasen.text.displayWidth(right_text);
+        const right_col: u16 = size.width - @as(u16, @intCast(right_width));
+        const left_width = right_col -| column_gap -| 2;
+        try drawClippedField(surface, 2, 0, left_width, left, palette.boldStyle(.accent));
+        try drawClipped(surface, right_col, 0, right_text, palette.style(.muted));
+        return;
+    }
+
+    try drawClipped(surface, 2, 0, left, palette.boldStyle(.accent));
+}
+
+fn catalogHeadContextLabel(allocator: std.mem.Allocator, snapshot: *const git_history.Snapshot) ![]const u8 {
+    return switch (snapshot.display) {
+        .branch => |branch| if (snapshot.head) |head|
+            try std.fmt.allocPrint(allocator, "Branch {s} · HEAD {s}", .{ branch, head.short() })
+        else
+            try std.fmt.allocPrint(allocator, "Branch {s} · HEAD unavailable", .{branch}),
+        .detached => if (snapshot.head) |head|
+            try std.fmt.allocPrint(allocator, "Detached HEAD {s}", .{head.short()})
+        else
+            "Detached HEAD unavailable",
+        .unborn => |branch| try std.fmt.allocPrint(allocator, "Branch {s} · Unborn", .{branch}),
+    };
+}
+
+fn catalogPositionLabel(allocator: std.mem.Allocator, page: *const history_page.HistoryPageState) !CatalogPosition {
+    const loaded = page.catalog.records.items.len;
+    if (page.catalog.moreRowSelected()) return .{
+        .full = try std.fmt.allocPrint(allocator, "{d} commits loaded · more available", .{loaded}),
+        .compact = try std.fmt.allocPrint(allocator, "{d} loaded · more", .{loaded}),
+    };
+    if (loaded == 0) return .{
+        .full = "0 commits loaded",
+        .compact = "0 loaded",
+    };
+    const position = @min(page.catalog.cursor, loaded - 1) + 1;
+    return .{
+        .full = try std.fmt.allocPrint(allocator, "Commit {d} of {d} loaded", .{ position, loaded }),
+        .compact = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ position, loaded }),
+    };
+}
+
 fn headContextLabel(allocator: std.mem.Allocator, snapshot: *const git_history.Snapshot) ![]const u8 {
     return switch (snapshot.display) {
         .branch => |branch| if (snapshot.head) |head|
@@ -407,48 +485,70 @@ fn topologyMarker(record: *const git_history.Record) []const u8 {
     };
 }
 
-/// Preserve marker, topology, short OID, and subject. Optional row facts are
-/// removed in the contract order: author, refs, then time.
-fn commitRowTextAlloc(
-    allocator: std.mem.Allocator,
+fn drawCommitRow(
+    surface: *chasen.Surface,
+    row: u16,
     record: *const git_history.Record,
-    now_unix: ?i64,
-    available_width: u16,
-) ![]const u8 {
-    const short_oid = record.oid.short();
-    const relative = branch_commit_time.formatRelative(record.committer_unix, now_unix);
-    const mandatory_width = chasen.text.displayWidth(short_oid) + 2 + chasen.text.displayWidth(record.subject);
-    const time_width = 2 + chasen.text.displayWidth(relative.text());
-    const refs_width = if (record.decorations.len == 0) 0 else 4 + chasen.text.displayWidth(record.decorations);
-    const author_width = if (record.author.len == 0) 0 else chasen.text.displayWidth("  — ") + chasen.text.displayWidth(record.author);
+    style: chasen.TextStyle,
+) !void {
+    const layout = CommitRowLayout.init(surface.size().width);
+    try drawClippedField(surface, layout.commit.col, row, layout.commit.width, record.oid.short(), style);
+    const formatted_date = branch_commit_time.formatDateUtc(record.committer_unix);
+    try drawClippedField(
+        surface,
+        layout.date.col,
+        row,
+        layout.date.width,
+        if (formatted_date) |*value| value[0..] else "—",
+        style,
+    );
+    try drawClippedField(surface, layout.author.col, row, layout.author.width, record.author, style);
+    try drawSummaryFields(surface, row, layout.summary, record, style);
+}
 
-    var show_time = time_width > 0;
-    var show_refs = refs_width > 0;
-    var show_author = author_width > 0;
-    var total = mandatory_width + time_width + refs_width + author_width;
-    if (total > available_width and show_author) {
-        total -|= author_width;
-        show_author = false;
-    }
-    if (total > available_width and show_refs) {
-        total -|= refs_width;
-        show_refs = false;
-    }
-    if (total > available_width and show_time) {
-        show_time = false;
+fn drawSummaryFields(
+    surface: *chasen.Surface,
+    row: u16,
+    field: FieldLayout,
+    record: *const git_history.Record,
+    style: chasen.TextStyle,
+) !void {
+    if (field.width == 0) return;
+    if (record.decorations.len == 0) {
+        try drawClippedField(surface, field.col, row, field.width, record.subject, style);
+        return;
     }
 
-    if (show_author and show_refs) return std.fmt.allocPrint(allocator, "{s}  {s}  {s}  ({s})  — {s}", .{
-        short_oid, record.subject, relative.text(), record.decorations, record.author,
+    const refs = try std.fmt.allocPrint(surface.frameAllocator(), "[{s}]", .{record.decorations});
+    const refs_width = chasen.text.displayWidth(refs);
+    if (refs_width >= field.width) {
+        try drawClippedField(surface, field.col, row, field.width, refs, style);
+        return;
+    }
+
+    try drawClippedField(surface, field.col, row, refs_width, refs, style);
+    const subject_col = field.col +| refs_width +| 1;
+    const subject_width = field.width -| refs_width -| 1;
+    try drawClippedField(surface, subject_col, row, subject_width, record.subject, style);
+}
+
+fn drawClippedField(
+    surface: *chasen.Surface,
+    col: u16,
+    row: u16,
+    width: u16,
+    text: []const u8,
+    style: chasen.TextStyle,
+) !void {
+    const size = surface.size();
+    if (width == 0 or col >= size.width or row >= size.height) return;
+    var field = surface.child(.{
+        .col = col,
+        .row = row,
+        .width = @min(width, size.width - col),
+        .height = 1,
     });
-    if (show_author) return std.fmt.allocPrint(allocator, "{s}  {s}  {s}  — {s}", .{
-        short_oid, record.subject, relative.text(), record.author,
-    });
-    if (show_refs) return std.fmt.allocPrint(allocator, "{s}  {s}  {s}  ({s})", .{
-        short_oid, record.subject, relative.text(), record.decorations,
-    });
-    if (show_time) return std.fmt.allocPrint(allocator, "{s}  {s}  {s}", .{ short_oid, record.subject, relative.text() });
-    return std.fmt.allocPrint(allocator, "{s}  {s}", .{ short_oid, record.subject });
+    try drawClipped(&field, 0, 0, text, style);
 }
 
 fn drawState(surface: *chasen.Surface, palette: theme.Palette, title: []const u8, body: []const u8, hint: []const u8) void {
@@ -486,7 +586,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         .oid = parent,
         .parent_count = 1,
         .first_parent = .{ .available = root },
-        .author = try allocator.dupe(u8, "Grace Hopper"),
+        .author = try allocator.dupe(u8, "Grace 界界e\u{301} Hopper"),
         .committer_unix = 1_710_000_000,
         .decorations = try allocator.dupe(u8, ""),
         .subject = try allocator.dupe(u8, "catalog middle"),
@@ -526,20 +626,25 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         try view(.{ .page_state = &page_state, .palette = .default() }, &rendered.surface);
         const snapshot = try rendered.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "History  main @ 1111111") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Branch main · HEAD 1111111") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit 3 of 3 loaded") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "catalog head") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit   subject") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, " AM 1111111") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "›┃R 3333333") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "root subject") != null);
-        try rendered.expectCellText(2, 0, "H");
-        try rendered.expectCellText(row_prefix_width, 1, "c");
-        try rendered.expectCellText(row_prefix_width, 2, "1");
+        try rendered.expectCellText(2, 0, "B");
+        const layout = CommitRowLayout.init(size.width);
+        try rendered.expectCellText(layout.commit.col, 1, "1");
+        try rendered.expectCellText(layout.date.col, 1, "2");
+        try rendered.expectCellText(layout.author.col, 1, "A");
+        try rendered.expectCellText(layout.summary.col, 1, "[");
 
         const expected_range_style = theme.Palette.default().boldStyle(.accent);
         for ([_]struct { row: u16, marker: []const u8 }{
-            .{ .row = 2, .marker = PickerMarker.range_anchor },
+            .{ .row = 1, .marker = PickerMarker.range_anchor },
+            .{ .row = 2, .marker = PickerMarker.range_selected },
             .{ .row = 3, .marker = PickerMarker.range_selected },
-            .{ .row = 4, .marker = PickerMarker.range_selected },
         }) |expected| {
             const cell = rendered.surface.readCell(1, expected.row) orelse return error.ExpectedRangeMarker;
             try std.testing.expectEqualStrings(expected.marker, cell.char.grapheme);
@@ -549,6 +654,44 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ada Lovelace") != null);
         }
     }
+
+    page_state.catalog.snapshot.?.display.deinit(allocator);
+    page_state.catalog.snapshot.?.display = .detached;
+    const older_oid = try git_history.ObjectId.parse(.sha1, "4444444444444444444444444444444444444444");
+    page_state.catalog.continuation = older_oid;
+    page_state.catalog.cursor = page_state.catalog.records.items.len;
+    var detached_more: chasen.testing.TestSurface = undefined;
+    try detached_more.init(80, 24);
+    defer detached_more.deinit();
+    try view(.{ .page_state = &page_state, .palette = .default() }, &detached_more.surface);
+    const detached_more_snapshot = try detached_more.snapshot(allocator);
+    defer allocator.free(detached_more_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Detached HEAD 1111111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "3 commits loaded · more available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Load 200 older commits…") != null);
+
+    var older_page: git_history.Page = .{ .records = try allocator.alloc(git_history.Record, 1) };
+    older_page.records[0] = .{
+        .oid = older_oid,
+        .parent_count = 0,
+        .first_parent = .true_root,
+        .author = try allocator.dupe(u8, "界界界界界界e\u{301} appended author"),
+        .committer_unix = 0,
+        .decorations = try allocator.dupe(u8, "older-tag-with-a-long-name"),
+        .subject = try allocator.dupe(u8, "appended subject stays in the same column"),
+    };
+    defer older_page.deinit(allocator);
+    try page_state.catalog.append(allocator, &older_page);
+    page_state.catalog.cursor = 3;
+    var appended: chasen.testing.TestSurface = undefined;
+    try appended.init(80, 24);
+    defer appended.deinit();
+    try view(.{ .page_state = &page_state, .palette = .default() }, &appended.surface);
+    const appended_layout = CommitRowLayout.init(80);
+    try appended.expectCellText(appended_layout.commit.col, 4, "4");
+    try appended.expectCellText(appended_layout.date.col, 4, "1");
+    try appended.expectCellText(appended_layout.author.col, 4, "界");
+    try appended.expectCellText(appended_layout.summary.col, 4, "[");
 
     page_state.accepted = .{
         .request = .{
@@ -574,7 +717,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     try view(.{ .page_state = &page_state, .palette = .default() }, &changed.surface);
     const changed_snapshot = try changed.snapshot(allocator);
     defer allocator.free(changed_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "History  feature @ 2222222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "Branch feature · HEAD 2222222") != null);
     try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "Previous diff: main @ 1111111") != null);
 
     page_state.catalog.capped = true;
@@ -584,7 +727,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     try view(.{ .page_state = &page_state, .palette = .default() }, &capped.surface);
     const capped_snapshot = try capped.snapshot(allocator);
     defer allocator.free(capped_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, capped_snapshot, "History limit reached: 2,000 commits loaded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped_snapshot, "Limit: 2,000 commits loaded") != null);
     try std.testing.expect(std.mem.indexOf(u8, capped_snapshot, "Previous diff: main @ 1111111") != null);
 
     var unborn_page: git_history.Page = .{ .snapshot = .{
@@ -602,7 +745,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     try view(.{ .page_state = &page_state, .palette = .default() }, &unborn.surface);
     const unborn_snapshot = try unborn.snapshot(allocator);
     defer allocator.free(unborn_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "History  future (unborn)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "Branch future · Unborn") != null);
     try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "Previous diff: main @ 1111111") != null);
     try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "r: reload  ·  Esc: previous diff") != null);
 
@@ -739,36 +882,48 @@ test "History accepted headers keep kind count endpoints subject and origin at r
     }
 }
 
-test "History row projection drops author refs and time in that order" {
-    const allocator = std.testing.allocator;
+test "History fixed row fields clip ASCII wide and combining metadata without overlap" {
     const oid = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
     const parent = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
     const record: git_history.Record = .{
         .oid = oid,
         .parent_count = 1,
         .first_parent = .{ .available = parent },
-        .author = @constCast("Ada"),
-        .committer_unix = 1_720_000_000,
-        .decorations = @constCast("main"),
-        .subject = @constCast("subject"),
+        .author = @constCast("界界界界界界e\u{301} author suffix"),
+        .committer_unix = 0,
+        .decorations = @constCast("refs-wide-界界界"),
+        .subject = @constCast("a long subject that must remain inside the surface"),
     };
-    const mandatory_width = chasen.text.displayWidth("1111111  subject");
-    const now_unix: i64 = 1_720_086_400;
-    const time_width = chasen.text.displayWidth("  1d ago");
-    const refs_width = chasen.text.displayWidth("  (main)");
+    const unavailable: git_history.Record = .{
+        .oid = parent,
+        .parent_count = 0,
+        .first_parent = .true_root,
+        .author = @constCast("an ASCII author name far beyond fourteen cells"),
+        .committer_unix = -1,
+        .decorations = @constCast(""),
+        .subject = @constCast("subject without refs"),
+    };
 
-    const without_author = try commitRowTextAlloc(allocator, &record, now_unix, @intCast(mandatory_width + time_width + refs_width));
-    defer allocator.free(without_author);
-    try std.testing.expect(std.mem.indexOf(u8, without_author, "1d ago") != null);
-    try std.testing.expect(std.mem.indexOf(u8, without_author, "(main)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, without_author, "Ada") == null);
+    var rendered: chasen.testing.TestSurface = undefined;
+    try rendered.init(80, 2);
+    defer rendered.deinit();
+    try drawCommitRow(&rendered.surface, 0, &record, .{});
+    try drawCommitRow(&rendered.surface, 1, &unavailable, .{});
 
-    const without_refs = try commitRowTextAlloc(allocator, &record, now_unix, @intCast(mandatory_width + time_width));
-    defer allocator.free(without_refs);
-    try std.testing.expect(std.mem.indexOf(u8, without_refs, "1d ago") != null);
-    try std.testing.expect(std.mem.indexOf(u8, without_refs, "(main)") == null);
+    const layout = CommitRowLayout.init(80);
+    try rendered.expectCellText(layout.commit.col, 0, "1");
+    try rendered.expectCellText(layout.date.col, 0, "1");
+    try rendered.expectCellText(layout.author.col, 0, "界");
+    try rendered.expectCellText(layout.summary.col, 0, "[");
+    const refs_width = chasen.text.displayWidth("[refs-wide-界界界]");
+    try rendered.expectCellText(layout.summary.col + refs_width + 1, 0, "a");
+    try rendered.expectCellText(layout.date.col, 1, "—");
+    try rendered.expectCellText(layout.author.col, 1, "a");
+    try rendered.expectCellText(layout.summary.col, 1, "s");
 
-    const mandatory_only = try commitRowTextAlloc(allocator, &record, now_unix, @intCast(mandatory_width));
-    defer allocator.free(mandatory_only);
-    try std.testing.expectEqualStrings("1111111  subject", mandatory_only);
+    const snapshot = try rendered.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "1970-01-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "author suffix") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "subject without refs") != null);
 }
