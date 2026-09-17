@@ -310,6 +310,15 @@ pub const View = struct {
                 else => null,
             };
         }
+        if (self.active_page == .history) {
+            if (self.history.key.loading or !self.history.key.picker_ready) return null;
+            _ = self.bodyMousePoint(mouse) orelse return null;
+            return switch (mouse.button) {
+                .wheel_up => if (self.history.key.picker_can_move_previous) .{ .history = .move_previous } else null,
+                .wheel_down => if (self.history.key.picker_can_move_next) .{ .history = .move_next } else null,
+                else => null,
+            };
+        }
         if (self.active_page == .ai_reviews) {
             const pane = self.committedDiffMousePane(self.ai_reviews, mouse) orelse return null;
             return switch (mouse.button) {
@@ -686,7 +695,7 @@ test "Finding pointer shell preserves the AI Reviews body point and button once"
     );
 }
 
-test "History committed diff routes body mouse and live selection continuation through the shell" {
+test "History routes committed diff and bounded picker wheel through the shell" {
     var overlay: app_state.OverlayState = .{};
     var selection_owner: diff_selection.Owner = .none;
     var repository_state: repository_page.RepositoryPageState = .{};
@@ -794,4 +803,39 @@ test "History committed diff routes body mouse and live selection continuation t
         },
         else => return error.ExpectedHistoryRelease,
     }
+
+    selection_owner = .none;
+    var picker_view = view;
+    picker_view.history.key = .{
+        .picker_ready = true,
+        .picker_can_move_next = true,
+    };
+    picker_view.history.loaded = null;
+    const picker_wheel_up = chasen.Event{ .mouse = .{
+        .col = terminal_col,
+        .row = terminal_row,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    } };
+    const picker_wheel_down = chasen.Event{ .mouse = .{
+        .col = terminal_col,
+        .row = terminal_row,
+        .button = .wheel_down,
+        .mods = .{},
+        .type = .press,
+    } };
+    try std.testing.expect(picker_view.handleEvent(picker_wheel_up) == null);
+    try std.testing.expectEqual(
+        app_message.Msg{ .history = .move_next },
+        picker_view.handleEvent(picker_wheel_down).?,
+    );
+
+    picker_view.history.key.picker_can_move_previous = true;
+    picker_view.history.key.picker_can_move_next = false;
+    try std.testing.expectEqual(
+        app_message.Msg{ .history = .move_previous },
+        picker_view.handleEvent(picker_wheel_up).?,
+    );
+    try std.testing.expect(picker_view.handleEvent(picker_wheel_down) == null);
 }

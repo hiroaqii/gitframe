@@ -545,6 +545,8 @@ pub const HistoryPageState = struct {
             .diff_view = self.current_view == .diff and self.accepted != null,
             .more_row_selected = !self.catalog_hidden and self.catalog.moreRowSelected(),
             .picker_ready = !self.catalog_hidden and self.catalog.records.items.len > 0,
+            .picker_can_move_previous = !self.catalog_hidden and self.catalog.canMovePrevious(),
+            .picker_can_move_next = !self.catalog_hidden and self.catalog.canMoveNext(),
             .return_to_accepted = self.current_view == .picker and self.accepted != null and
                 (self.load_state != .loading or self.catalog_hidden),
             .common = .{

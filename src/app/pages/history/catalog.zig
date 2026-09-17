@@ -35,6 +35,15 @@ pub const State = struct {
         return self.hasMoreRow() and self.cursor == self.records.items.len;
     }
 
+    pub fn canMovePrevious(self: *const State) bool {
+        return self.rowCount() > 0 and self.cursor > 0;
+    }
+
+    pub fn canMoveNext(self: *const State) bool {
+        const count = self.rowCount();
+        return count > 0 and self.cursor < count - 1;
+    }
+
     pub fn replace(self: *State, allocator: std.mem.Allocator, page: *git_history.Page) !void {
         const snapshot = page.takeSnapshot() orelse return error.MissingInitialSnapshot;
         const records = page.takeRecords();
@@ -63,13 +72,12 @@ pub const State = struct {
     }
 
     pub fn movePrevious(self: *State, body_height: u16) void {
-        self.cursor -|= 1;
+        if (self.canMovePrevious()) self.cursor -= 1;
         self.keepCursorVisible(visibleRows(body_height));
     }
 
     pub fn moveNext(self: *State, body_height: u16) void {
-        const count = self.rowCount();
-        if (count > 0) self.cursor = @min(self.cursor +| 1, count - 1);
+        if (self.canMoveNext()) self.cursor += 1;
         self.keepCursorVisible(visibleRows(body_height));
     }
 
@@ -141,14 +149,24 @@ test "History catalog viewport includes only the load-more operation row" {
 test "History catalog navigation reuses Viewport keep-visible semantics" {
     var records: [10]git_history.Record = undefined;
     var state: State = .{ .records = .{ .items = &records, .capacity = records.len } };
+    try std.testing.expect(!state.canMovePrevious());
+    try std.testing.expect(state.canMoveNext());
     state.pageDown(5);
     try std.testing.expectEqual(@as(usize, 3), state.cursor);
     try std.testing.expectEqual(@as(usize, 1), state.scroll);
     state.last(5);
     try std.testing.expectEqual(@as(usize, 9), state.cursor);
     try std.testing.expectEqual(@as(usize, 7), state.scroll);
+    try std.testing.expect(state.canMovePrevious());
+    try std.testing.expect(!state.canMoveNext());
+    state.continuation = try git_history.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    try std.testing.expect(state.canMoveNext());
+    state.moveNext(5);
+    try std.testing.expect(state.moreRowSelected());
+    try std.testing.expect(!state.canMoveNext());
     state.first(5);
     try std.testing.expectEqual(@as(usize, 0), state.cursor);
     try std.testing.expectEqual(@as(usize, 0), state.scroll);
     state.records = .empty;
+    state.continuation = null;
 }
