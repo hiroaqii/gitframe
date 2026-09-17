@@ -73,11 +73,20 @@ pub fn pageHeaderPresentation(context: ViewContext, allocator: std.mem.Allocator
         .detached => "detached",
         .unborn => |branch| branch,
     };
-    const head_label = std.fmt.allocPrint(
+    const selected_label = std.fmt.allocPrint(
         allocator,
         "{s} @ {s} {s}",
         .{ accepted.request.basis.after.short(), origin, accepted.target_subject },
     ) catch accepted.request.basis.after.short();
+    const head_label = if (page.acceptedContextChanged()) blk: {
+        const current = page.currentHeadContext() orelse break :blk selected_label;
+        const current_label = headContextLabel(allocator, current) catch break :blk selected_label;
+        break :blk std.fmt.allocPrint(
+            allocator,
+            "{s} · Current HEAD: {s}",
+            .{ selected_label, current_label },
+        ) catch selected_label;
+    } else selected_label;
     return .{ .comparison = .{
         .base_display_name = base_label,
         .head_display_name = head_label,
@@ -103,12 +112,45 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
     const page = context.page_state;
 
     if (page.load_state == .no_repository) {
-        drawState(surface, context.palette, "History", "Repository required", "R: switch repository");
+        drawState(surface, context.palette, "History", "History requires a repository", "R: switch repository");
+        return;
+    }
+    if (page.catalog_hidden) {
+        const title = if (page.currentHeadContext()) |snapshot|
+            try std.fmt.allocPrint(surface.frameAllocator(), "History  {s}", .{try headContextLabel(surface.frameAllocator(), snapshot)})
+        else
+            "History";
+        const message = if (page.load_state == .failed)
+            page.status.text()
+        else
+            "Loading current commit history…";
+        const previous = if (page.accepted) |accepted|
+            try previousDiffLabel(surface.frameAllocator(), accepted)
+        else
+            null;
+        const hint = if (page.load_state == .failed)
+            if (previous) |label|
+                try std.fmt.allocPrint(surface.frameAllocator(), "{s}  ·  r: retry  ·  Esc: previous diff", .{label})
+            else
+                "r: retry"
+        else if (previous) |label|
+            try std.fmt.allocPrint(surface.frameAllocator(), "{s}  ·  Esc: previous diff", .{label})
+        else
+            "Esc: cancel";
+        drawState(surface, context.palette, title, message, hint);
         return;
     }
     if (page.catalog.snapshot == null) {
         if (page.load_state == .failed) {
-            drawState(surface, context.palette, "History unavailable", page.status.text(), "r: retry");
+            const hint = if (page.accepted) |accepted|
+                try std.fmt.allocPrint(
+                    surface.frameAllocator(),
+                    "{s}  ·  r: retry  ·  Esc: previous diff",
+                    .{try previousDiffLabel(surface.frameAllocator(), accepted)},
+                )
+            else
+                "r: retry";
+            drawState(surface, context.palette, "History unavailable", page.status.text(), hint);
         } else if (page.load_state == .idle) {
             drawState(surface, context.palette, "History", page.status.text(), "r: retry");
         } else {
@@ -118,20 +160,47 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
     }
 
     const snapshot = &page.catalog.snapshot.?;
-    const head_text = switch (snapshot.display) {
-        .branch => |branch| try std.fmt.allocPrint(surface.frameAllocator(), "History  {s}  {s}", .{ branch, snapshot.head.?.short() }),
-        .detached => try std.fmt.allocPrint(surface.frameAllocator(), "History  detached@{s}", .{snapshot.head.?.short()}),
-        .unborn => |branch| try std.fmt.allocPrint(surface.frameAllocator(), "History  {s}  unborn", .{branch}),
-    };
+    const head_text = try std.fmt.allocPrint(
+        surface.frameAllocator(),
+        "History  {s}  ·  {d} commit{s}",
+        .{
+            try headContextLabel(surface.frameAllocator(), snapshot),
+            page.catalog.records.items.len,
+            if (page.catalog.records.items.len == 1) "" else "s",
+        },
+    );
     try drawClipped(surface, 0, 0, head_text, context.palette.boldStyle(.accent));
 
+    const previous = if (page.acceptedContextChanged())
+        try previousDiffLabel(surface.frameAllocator(), page.accepted.?)
+    else
+        null;
+
     if (page.catalog.records.items.len == 0) {
-        if (size.height > 2) try drawClipped(surface, 2, 2, "No commits yet", context.palette.style(.muted));
+        if (previous) |label| {
+            if (size.height > 1) try drawClipped(surface, 0, 1, label, context.palette.style(.prompt));
+        }
+        if (size.height > 2) try drawClipped(
+            surface,
+            2,
+            2,
+            if (previous != null) "No commits yet  ·  r: reload  ·  Esc: previous diff" else "No commits yet  ·  r: reload",
+            context.palette.style(.muted),
+        );
         return;
     }
 
     if (size.height > 1) {
-        const columns = if (page.catalog.capped)
+        const columns = if (previous) |label|
+            if (page.catalog.capped)
+                try std.fmt.allocPrint(
+                    surface.frameAllocator(),
+                    "History limit reached: 2,000 commits loaded  ·  {s}",
+                    .{label},
+                )
+            else
+                label
+        else if (page.catalog.capped)
             "History limit reached: 2,000 commits loaded"
         else blk: {
             const suffix = if (page.load_state == .loading)
@@ -281,6 +350,41 @@ fn terminal(pending: bool, failed: bool) ?page_header.Presentation {
     return null;
 }
 
+fn headContextLabel(allocator: std.mem.Allocator, snapshot: *const git_history.Snapshot) ![]const u8 {
+    return switch (snapshot.display) {
+        .branch => |branch| if (snapshot.head) |head|
+            try std.fmt.allocPrint(allocator, "{s} @ {s}", .{ branch, head.short() })
+        else
+            try std.fmt.allocPrint(allocator, "{s} (unborn)", .{branch}),
+        .detached => if (snapshot.head) |head|
+            try std.fmt.allocPrint(allocator, "detached @ {s}", .{head.short()})
+        else
+            "detached",
+        .unborn => |branch| try std.fmt.allocPrint(allocator, "{s} (unborn)", .{branch}),
+    };
+}
+
+fn previousDiffLabel(allocator: std.mem.Allocator, accepted: history_page.AcceptedSelection) ![]const u8 {
+    const context = switch (accepted.origin) {
+        .branch => |branch| try std.fmt.allocPrint(
+            allocator,
+            "{s} @ {s}",
+            .{ branch, accepted.request.snapshot_head.short() },
+        ),
+        .detached => try std.fmt.allocPrint(
+            allocator,
+            "detached @ {s}",
+            .{accepted.request.snapshot_head.short()},
+        ),
+        .unborn => |branch| try std.fmt.allocPrint(
+            allocator,
+            "{s} @ {s}",
+            .{ branch, accepted.request.snapshot_head.short() },
+        ),
+    };
+    return std.fmt.allocPrint(allocator, "Previous diff: {s}", .{context});
+}
+
 fn topologyMarker(record: *const git_history.Record) []const u8 {
     return switch (record.first_parent) {
         .true_root => "R",
@@ -408,7 +512,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         try view(.{ .page_state = &page_state, .palette = .default() }, &rendered.surface);
         const snapshot = try rendered.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "History  main  1111111") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "History  main @ 1111111") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "catalog head") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, " A M 1111111") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "›│ R 3333333") != null);
@@ -417,6 +521,83 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ada Lovelace") != null);
         }
     }
+
+    page_state.accepted = .{
+        .request = .{
+            .snapshot_head = head,
+            .intent = .{ .single = .{ .index = 0, .oid = head } },
+            .basis = .{
+                .object_format = .sha1,
+                .before = .{ .commit = parent },
+                .after = head,
+            },
+        },
+        .origin = .{ .branch = try allocator.dupe(u8, "main") },
+        .selected_parent_count = 2,
+        .target_subject = try allocator.dupe(u8, "catalog head"),
+    };
+    page_state.catalog.snapshot.?.display.deinit(allocator);
+    page_state.catalog.snapshot.?.display = .{ .branch = try allocator.dupe(u8, "feature") };
+    page_state.catalog.snapshot.?.head = parent;
+
+    var changed: chasen.testing.TestSurface = undefined;
+    try changed.init(120, 32);
+    defer changed.deinit();
+    try view(.{ .page_state = &page_state, .palette = .default() }, &changed.surface);
+    const changed_snapshot = try changed.snapshot(allocator);
+    defer allocator.free(changed_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "History  feature @ 2222222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "Previous diff: main @ 1111111") != null);
+
+    page_state.catalog.capped = true;
+    var capped: chasen.testing.TestSurface = undefined;
+    try capped.init(120, 32);
+    defer capped.deinit();
+    try view(.{ .page_state = &page_state, .palette = .default() }, &capped.surface);
+    const capped_snapshot = try capped.snapshot(allocator);
+    defer allocator.free(capped_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, capped_snapshot, "History limit reached: 2,000 commits loaded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped_snapshot, "Previous diff: main @ 1111111") != null);
+
+    var unborn_page: git_history.Page = .{ .snapshot = .{
+        .object_format = .sha1,
+        .head = null,
+        .display = .{ .unborn = try allocator.dupe(u8, "future") },
+    } };
+    defer unborn_page.deinit(allocator);
+    try page_state.catalog.replace(allocator, &unborn_page);
+    page_state.load_state = .empty;
+
+    var unborn: chasen.testing.TestSurface = undefined;
+    try unborn.init(80, 24);
+    defer unborn.deinit();
+    try view(.{ .page_state = &page_state, .palette = .default() }, &unborn.surface);
+    const unborn_snapshot = try unborn.snapshot(allocator);
+    defer allocator.free(unborn_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "History  future (unborn)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "Previous diff: main @ 1111111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "r: reload  ·  Esc: previous diff") != null);
+
+    page_state.observed_context = .{
+        .object_format = .sha1,
+        .head = parent,
+        .display = .{ .branch = try allocator.dupe(u8, "broken") },
+    };
+    page_state.catalog_hidden = true;
+    page_state.load_state = .failed;
+    page_state.status.set("History load failed: git_command_failed", .{});
+
+    var failed: chasen.testing.TestSurface = undefined;
+    try failed.init(80, 24);
+    defer failed.deinit();
+    try view(.{ .page_state = &page_state, .palette = .default() }, &failed.surface);
+    const failed_snapshot = try failed.snapshot(allocator);
+    defer allocator.free(failed_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "History  broken @ 2222222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "History load failed: git_command_failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "Previous diff: main @ 1111111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "r: retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "Esc: previous diff") != null);
 }
 
 test "History accepted headers keep kind count endpoints subject and origin at representative sizes" {
@@ -463,7 +644,7 @@ test "History accepted headers keep kind count endpoints subject and origin at r
             .detached = true,
             .subject = "range target subject",
             .expected_base = "range 3 commits 1111111",
-            .expected_head = "2222222 @ detached range target subject",
+            .expected_head = "2222222 @ detached range target subject · Current HEAD: topic @ 3333333",
         },
     };
 
@@ -486,6 +667,11 @@ test "History accepted headers keep kind count endpoints subject and origin at r
         var page_state: history_page.HistoryPageState = .{
             .repo_epoch = 7,
             .current_view = .diff,
+            .observed_context = if (case.kind == .range) .{
+                .object_format = .sha1,
+                .head = oldest,
+                .display = .{ .branch = try allocator.dupe(u8, "topic") },
+            } else null,
             .accepted = .{
                 .request = .{
                     .snapshot_head = after,

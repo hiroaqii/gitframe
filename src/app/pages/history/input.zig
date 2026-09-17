@@ -11,6 +11,7 @@ pub const Context = struct {
     diff_view: bool = false,
     more_row_selected: bool = false,
     picker_ready: bool = false,
+    return_to_accepted: bool = false,
     common: committed_diff_input.Context = .{},
     keymap: keymap.Effective = .{},
 };
@@ -49,12 +50,14 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
             !key_input.hasCommandModifier(key) and key.codepoint == 'm') return .open_picker;
         return .{ .common = committed_diff_input.keyToMsg(context.common, key) orelse return null };
     }
-    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return .move_previous;
-    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return .move_next;
-    if (key.matches(chasen.Key.page_up, .{}) or matches(context.keymap, .page_up, key)) return .page_up;
-    if (key.matches(chasen.Key.page_down, .{}) or matches(context.keymap, .page_down, key)) return .page_down;
-    if (key.matches(chasen.Key.home, .{}) or matches(context.keymap, .document_first, key)) return .first;
-    if (key.matches(chasen.Key.end, .{}) or matches(context.keymap, .document_last, key)) return .last;
+    if (context.picker_ready) {
+        if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return .move_previous;
+        if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return .move_next;
+        if (key.matches(chasen.Key.page_up, .{}) or matches(context.keymap, .page_up, key)) return .page_up;
+        if (key.matches(chasen.Key.page_down, .{}) or matches(context.keymap, .page_down, key)) return .page_down;
+        if (key.matches(chasen.Key.home, .{}) or matches(context.keymap, .document_first, key)) return .first;
+        if (key.matches(chasen.Key.end, .{}) or matches(context.keymap, .document_last, key)) return .last;
+    }
     if (key.matches(chasen.Key.enter, .{})) {
         if (context.more_row_selected) return .load_older;
         if (context.picker_ready) return .load_diff;
@@ -63,7 +66,8 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
         if (key.codepoint == ' ') return .toggle_range;
         if (key.codepoint == '/') return .unsupported_search;
     }
-    if (context.picker_ready and key.matches(chasen.Key.escape, .{})) return .cancel_draft;
+    if ((context.picker_ready or context.return_to_accepted) and
+        key.matches(chasen.Key.escape, .{})) return .cancel_draft;
     return null;
 }
 
@@ -100,4 +104,8 @@ test "History picker owns range cancel and unsupported search" {
     try @import("std").testing.expectEqual(Msg.cancel_draft, keyToMsg(ready, .{ .codepoint = chasen.Key.escape }).?);
     try @import("std").testing.expectEqual(Msg.unsupported_search, keyToMsg(ready, .{ .codepoint = '/' }).?);
     try @import("std").testing.expectEqual(Msg.load_diff, keyToMsg(ready, .{ .codepoint = chasen.Key.enter }).?);
+    try @import("std").testing.expectEqual(
+        Msg.cancel_draft,
+        keyToMsg(.{ .return_to_accepted = true }, .{ .codepoint = chasen.Key.escape }).?,
+    );
 }

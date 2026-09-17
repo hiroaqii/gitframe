@@ -41,8 +41,8 @@ pub const Controller = struct {
     mode_toggle_hint_width: u16 = 0,
     env_map: ?*const std.process.Environ.Map,
 
-    pub fn refresh(self: Controller) void {
-        self.page_state.requestReload();
+    pub fn refresh(self: Controller, allocator: std.mem.Allocator) void {
+        self.page_state.requestReload(allocator);
     }
 
     pub fn navigation(self: Controller) committed_diff_navigation.Controller {
@@ -77,7 +77,7 @@ pub const Controller = struct {
                 };
             },
             .load_diff => try self.startDiff(ctx),
-            .open_picker => self.page_state.openPicker(),
+            .open_picker => self.page_state.openPicker(ctx.allocator()),
             else => self.page_state.applyInput(msg, self.body_size.height),
         }
         return .{};

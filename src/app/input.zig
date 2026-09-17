@@ -611,6 +611,16 @@ test "History catalog loading admits only cancel page transition and quit" {
     try expectMsg(.{ .history = .owned_noop }, keyToMsg(context, .{ .codepoint = 'j' }).?);
     try expectMsg(.{ .history = .owned_noop }, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
     try expectMsg(.{ .history = .owned_noop }, pasteToMsg(context, "ignored").?);
+
+    const failed_with_previous: KeyContext = .{
+        .active_page = .history,
+        .history = .{ .return_to_accepted = true },
+    };
+    try expectMsg(.reload, keyToMsg(failed_with_previous, .{ .codepoint = 'r' }).?);
+    try expectMsg(
+        .{ .history = .cancel_draft },
+        keyToMsg(failed_with_previous, .{ .codepoint = chasen.Key.escape }).?,
+    );
 }
 
 test "History committed diff text input precedes page shortcuts and picker key stays local" {

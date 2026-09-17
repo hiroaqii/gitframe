@@ -785,6 +785,10 @@ pub const App = struct {
                 var previous_compare_resolver = previous_compare_view.resolver();
                 const previous_compare_body = previous_compare_view.bodyView(&previous_compare_resolver);
                 const compare_selection_anchor = previous_compare_body.captureSelectionViewportAnchor();
+                const previous_history_view = self.historyCoordinator().navigationView();
+                var previous_history_resolver = previous_history_view.resolver();
+                const previous_history_body = previous_history_view.bodyView(&previous_history_resolver);
+                const history_selection_anchor = previous_history_body.captureSelectionViewportAnchor();
                 const previous_ai_reviews_base_view = self.aiReviewsCoordinator().navigationView();
                 const resize_allocator = self.allocator;
                 var previous_ai_reviews_frame = if (resize_allocator) |allocator|
@@ -803,6 +807,8 @@ pub const App = struct {
                 const previous_mode = self.changesNavigationView().effectiveDisplayMode();
                 const previous_compare_width = previous_compare_body.view.diffPaneWidth();
                 const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
+                const previous_history_width = previous_history_body.view.diffPaneWidth();
+                const previous_history_mode = previous_history_body.view.effectiveDisplayMode();
                 const previous_ai_reviews_width = previous_ai_reviews_body.view.diffPaneWidth();
                 const previous_ai_reviews_display_mode = previous_ai_reviews_body.view.effectiveDisplayMode();
                 var incoming_ai_reviews_preparation = if (resize_allocator) |allocator|
@@ -851,6 +857,20 @@ pub const App = struct {
                 compare_body.updateSearchMatchOffset();
                 compare_body.controller.scrollSearchMatchIntoView();
                 compare_body.clampDiffNavigation();
+                var history_adapter = self.historyCoordinator().navigation().updateAdapter();
+                var history_body = history_adapter.bodyController();
+                history_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_history_width);
+                if (previous_history_mode != history_body.controller.view().effectiveDisplayMode()) {
+                    history_body.controller.clearMouseDiffSelection();
+                    history_body.controller.clearKeyboardSideChoice();
+                    self.pages.history.diff.advanceSelectionLayoutRevision();
+                }
+                if (history_selection_anchor) |anchor| history_body.restoreSelectionViewportAnchor(anchor);
+                history_body.controller.clampSidebarHorizontalScroll();
+                history_body.clampDiffNavigationKeepingHunkVisible();
+                history_body.updateSearchMatchOffset();
+                history_body.controller.scrollSearchMatchIntoView();
+                history_body.clampDiffNavigation();
                 self.aiReviewsCoordinator().reconcileFindingCardVisibility();
                 const current_ai_reviews_view = self.aiReviewsCoordinator().navigationView();
                 var current_ai_reviews_frame = if (incoming_ai_reviews_preparation) |*preparation|
@@ -1008,7 +1028,7 @@ pub const App = struct {
                     }
                 },
                 .repository => self.repositoryCoordinator().requestReload(),
-                .history => self.historyCoordinator().refresh(),
+                .history => self.historyCoordinator().refresh(self.allocator orelse ctx.allocator()),
                 .compare => try self.compareCoordinator().refresh(ctx),
                 .ai_reviews => try self.aiReviewsCoordinator().refresh(ctx),
                 .config => self.status.set("reload is not available on this page yet", .{}),

@@ -65,12 +65,14 @@ pub const AcceptedSelection = struct {
     origin: git_history.HeadDisplay,
     selected_parent_count: u16,
     target_subject: []u8,
+    picker_scroll: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
         request: git_history.SelectionRequest,
         snapshot: *const git_history.Snapshot,
         records: []const git_history.Record,
+        picker_scroll: usize,
     ) !AcceptedSelection {
         const selected_index = switch (request.intent) {
             .single => |single| single.index,
@@ -86,6 +88,7 @@ pub const AcceptedSelection = struct {
             .origin = origin,
             .selected_parent_count = records[selected_index].parent_count,
             .target_subject = target_subject,
+            .picker_scroll = picker_scroll,
         };
     }
 
@@ -108,10 +111,14 @@ pub const HistoryPageState = struct {
     root_identity: ?root_capability.Identity = null,
     generation: u64 = 0,
     pending: ?Pending = null,
+    needs_probe: ?app_load.HistoryProbeReason = null,
     needs_initial: bool = false,
+    initial_policy: app_load.HistoryInitialPolicy = .reset,
     needs_continuation: bool = false,
     load_state: LoadState = .idle,
     catalog: catalog.State = .{},
+    catalog_hidden: bool = false,
+    observed_context: ?git_history.Snapshot = null,
     draft: selection.Draft = .single,
     render_now_unix: ?i64 = null,
     current_view: CurrentView = .picker,
@@ -121,6 +128,7 @@ pub const HistoryPageState = struct {
 
     pub fn deinit(self: *HistoryPageState, allocator: std.mem.Allocator) void {
         self.catalog.deinit(allocator);
+        if (self.observed_context) |*snapshot| snapshot.deinit(allocator);
         if (self.accepted) |*accepted| accepted.deinit(allocator);
         self.diff.deinit(allocator);
         self.* = .{};
@@ -128,9 +136,13 @@ pub const HistoryPageState = struct {
 
     pub fn activate(self: *HistoryPageState, allocator: std.mem.Allocator, repo_epoch: u64, identity: ?root_capability.Identity) void {
         self.pending = null;
+        self.needs_probe = null;
+        self.needs_initial = false;
         self.needs_continuation = false;
         const root = identity orelse {
             self.catalog.clear(allocator);
+            self.clearObservedContext(allocator);
+            self.catalog_hidden = false;
             self.draft = .single;
             self.render_now_unix = null;
             self.clearAccepted(allocator);
@@ -145,6 +157,8 @@ pub const HistoryPageState = struct {
             self.root_identity != null and self.root_identity.?.eql(root);
         if (!same_repository) {
             self.catalog.clear(allocator);
+            self.clearObservedContext(allocator);
+            self.catalog_hidden = false;
             self.draft = .single;
             self.render_now_unix = null;
             self.clearAccepted(allocator);
@@ -157,7 +171,13 @@ pub const HistoryPageState = struct {
             .unavailable,
             .unavailable,
         );
-        self.needs_initial = true;
+        if (same_repository and (self.catalog.snapshot != null or self.accepted != null)) {
+            self.needs_probe = .activation;
+        } else {
+            self.needs_initial = true;
+            self.initial_policy = .reset;
+        }
+        self.catalog_hidden = self.current_view == .picker;
         self.load_state = .loading;
         self.status.clear();
     }
@@ -166,6 +186,7 @@ pub const HistoryPageState = struct {
         self.diff.selection_owner = .none;
         self.activation.deactivate();
         self.pending = null;
+        self.needs_probe = null;
         self.needs_initial = false;
         self.needs_continuation = false;
         if (self.catalog.snapshot != null) self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
@@ -178,11 +199,16 @@ pub const HistoryPageState = struct {
         identity: ?root_capability.Identity,
     ) void {
         self.catalog.clear(allocator);
+        self.clearObservedContext(allocator);
+        self.catalog_hidden = false;
         self.draft = .single;
         self.render_now_unix = null;
         self.clearAccepted(allocator);
         self.activation.deactivate();
         self.pending = null;
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+        self.needs_probe = null;
         self.repo_epoch = repo_epoch;
         self.root_identity = identity;
         self.needs_continuation = false;
@@ -190,36 +216,52 @@ pub const HistoryPageState = struct {
         self.load_state = if (identity == null) .no_repository else .idle;
     }
 
-    pub fn requestReload(self: *HistoryPageState) void {
-        if (self.draft.isRange()) {
+    pub fn requestReload(self: *HistoryPageState, _: std.mem.Allocator) void {
+        if (self.current_view == .picker and !self.catalog_hidden and self.draft.isRange()) {
             self.status.set("Cancel range selection before reloading", .{});
             return;
         }
         self.pending = null;
+        self.needs_probe = null;
+        self.needs_initial = false;
         self.needs_continuation = false;
         if (self.activation.currentIdentity() == null or self.root_identity == null) {
             self.needs_initial = false;
             self.load_state = .no_repository;
             return;
         }
-        self.needs_initial = true;
+        self.needs_probe = .reload;
         self.load_state = .loading;
-        self.draft = .single;
+        self.catalog_hidden = self.current_view == .picker;
+        self.status.clear();
     }
 
     pub fn requestContinuation(self: *HistoryPageState) void {
-        if (self.activation.currentIdentity() == null or self.pending != null or !self.catalog.moreRowSelected()) return;
+        if (self.activation.currentIdentity() == null or self.pending != null or self.catalog_hidden or !self.catalog.moreRowSelected()) return;
         self.needs_continuation = true;
         self.load_state = .loading;
     }
 
     pub fn cancelLoad(self: *HistoryPageState) void {
-        if (self.pending == null and !self.needs_initial and !self.needs_continuation) return;
+        if (self.pending == null and self.needs_probe == null and !self.needs_initial and !self.needs_continuation) {
+            if (self.current_view == .picker and self.catalog_hidden and self.accepted != null) {
+                self.current_view = .diff;
+                self.status.clear();
+            }
+            return;
+        }
+        const return_to_accepted = self.current_view == .picker and self.catalog_hidden and self.accepted != null;
         const was_diff = if (self.pending) |pending| std.meta.activeTag(pending) == .diff else false;
+        const retain_hidden_catalog = self.current_view == .picker and self.catalog_hidden and
+            self.catalog.snapshot != null and !was_diff;
         self.pending = null;
+        self.needs_probe = null;
         self.needs_initial = false;
         self.needs_continuation = false;
-        self.load_state = if (self.catalog.snapshot == null)
+        self.catalog_hidden = retain_hidden_catalog;
+        self.load_state = if (retain_hidden_catalog)
+            .failed
+        else if (self.catalog.snapshot == null)
             .idle
         else if (self.catalog.records.items.len == 0)
             .empty
@@ -233,11 +275,16 @@ pub const HistoryPageState = struct {
         } else {
             self.status.set("History load canceled", .{});
         }
+        if (return_to_accepted) {
+            self.current_view = .diff;
+            self.status.clear();
+        }
     }
 
     pub fn nextRequest(self: *HistoryPageState) ?app_load.HistoryCatalogRequest {
         if (self.activation.currentIdentity() == null or self.pending != null or self.root_identity == null) return null;
-        if (self.needs_initial) return .initial;
+        if (self.needs_probe) |reason| return .{ .probe = reason };
+        if (self.needs_initial) return .{ .initial = self.initial_policy };
         if (self.needs_continuation) {
             const snapshot = self.catalog.snapshot orelse return null;
             const cursor = self.catalog.continuation orelse return null;
@@ -254,6 +301,7 @@ pub const HistoryPageState = struct {
 
     pub fn armCatalog(self: *HistoryPageState, pending: CatalogPending) void {
         self.pending = .{ .catalog = pending };
+        self.needs_probe = null;
         self.needs_initial = false;
         self.needs_continuation = false;
         self.load_state = .loading;
@@ -267,6 +315,7 @@ pub const HistoryPageState = struct {
 
     pub fn rejectPreparation(self: *HistoryPageState) void {
         self.pending = null;
+        self.needs_probe = null;
         self.needs_initial = false;
         self.needs_continuation = false;
         self.load_state = .failed;
@@ -326,21 +375,25 @@ pub const HistoryPageState = struct {
 
         switch (finished.result) {
             .failure => |failure| {
-                self.load_state = .failed;
-                self.status.set("History load failed: {s}", .{@tagName(failure)});
+                if (std.meta.activeTag(pending.request) == .probe and self.current_view == .diff and self.accepted != null) {
+                    self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
+                    self.status.set("History HEAD check failed: {s}", .{@tagName(failure)});
+                } else {
+                    self.load_state = .failed;
+                    self.status.set("History load failed: {s}", .{@tagName(failure)});
+                }
                 return .failed;
             },
             .loaded => |*page| {
                 switch (pending.request) {
-                    .initial => {
-                        try self.catalog.replace(allocator, page);
-                        self.draft = .single;
-                        self.render_now_unix = finished.render_now_unix;
-                    },
+                    .probe => |reason| return self.applyProbe(allocator, reason, page),
+                    .initial => |policy| try self.applyInitial(allocator, policy, page, finished.render_now_unix),
                     .continuation => try self.catalog.append(allocator, page),
                 }
-                self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
-                self.status.clear();
+                if (std.meta.activeTag(pending.request) == .continuation) {
+                    self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
+                    self.status.clear();
+                }
                 return .changed;
             },
         }
@@ -398,6 +451,7 @@ pub const HistoryPageState = struct {
                     pending.request,
                     snapshot,
                     self.catalog.records.items,
+                    self.catalog.scroll,
                 );
                 var accepted_owned = true;
                 defer if (accepted_owned) accepted.deinit(allocator);
@@ -487,10 +541,12 @@ pub const HistoryPageState = struct {
 
     pub fn inputContext(self: *const HistoryPageState, effective: @import("keymap").Effective) input.Context {
         return .{
-            .loading = self.load_state == .loading,
+            .loading = self.current_view == .picker and self.load_state == .loading,
             .diff_view = self.current_view == .diff and self.accepted != null,
-            .more_row_selected = self.catalog.moreRowSelected(),
-            .picker_ready = self.catalog.records.items.len > 0,
+            .more_row_selected = !self.catalog_hidden and self.catalog.moreRowSelected(),
+            .picker_ready = !self.catalog_hidden and self.catalog.records.items.len > 0,
+            .return_to_accepted = self.current_view == .picker and self.accepted != null and
+                (self.load_state != .loading or self.catalog_hidden),
             .common = .{
                 .search_mode = self.diff.search.mode,
                 .file_search_mode = self.diff.file_search.mode,
@@ -510,10 +566,30 @@ pub const HistoryPageState = struct {
         return if (self.accepted) |accepted| accepted.presentationIdentity() else null;
     }
 
-    pub fn openPicker(self: *HistoryPageState) void {
+    pub fn currentHeadContext(self: *const HistoryPageState) ?*const git_history.Snapshot {
+        if (self.observed_context) |*snapshot| return snapshot;
+        if (!self.catalog_hidden) if (self.catalog.snapshot) |*snapshot| return snapshot;
+        return null;
+    }
+
+    pub fn acceptedContextChanged(self: *const HistoryPageState) bool {
+        const accepted = self.accepted orelse return false;
+        const current = self.currentHeadContext() orelse return false;
+        return current.object_format != accepted.request.basis.object_format or
+            !optionalOidEql(current.head, accepted.request.snapshot_head) or
+            !headDisplayEql(current.display, accepted.origin);
+    }
+
+    pub fn openPicker(self: *HistoryPageState, _: std.mem.Allocator) void {
         if (self.accepted == null) return;
         self.diff.selection_owner = .none;
         self.current_view = .picker;
+        self.pending = null;
+        self.needs_probe = .open_picker;
+        self.needs_initial = false;
+        self.needs_continuation = false;
+        self.catalog_hidden = true;
+        self.load_state = .loading;
         self.status.clear();
     }
 
@@ -530,7 +606,199 @@ pub const HistoryPageState = struct {
         self.current_view = .picker;
         self.diff.deinit(allocator);
     }
+
+    fn applyProbe(
+        self: *HistoryPageState,
+        allocator: std.mem.Allocator,
+        reason: app_load.HistoryProbeReason,
+        page: *git_history.Page,
+    ) ApplyOutcome {
+        if (page.records.len != 0 or page.continuation != null) {
+            self.load_state = .failed;
+            self.status.set("History HEAD check returned an invalid result", .{});
+            return .failed;
+        }
+        const incoming = if (page.snapshot) |*snapshot| snapshot else {
+            self.load_state = .failed;
+            self.status.set("History HEAD check returned no context", .{});
+            return .failed;
+        };
+        const current = if (self.catalog.snapshot) |*snapshot| snapshot else null;
+        const unchanged = if (current) |snapshot| snapshotEql(snapshot, incoming) else false;
+
+        if (unchanged and reason != .reload) {
+            self.clearObservedContext(allocator);
+            self.catalog_hidden = false;
+            self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
+            self.status.clear();
+            if (reason == .open_picker and !self.restoreAcceptedDraft()) {
+                self.resetDraft("History changed; draft selection reset");
+            }
+            return .changed;
+        }
+
+        const same_branch_context = if (current) |snapshot| sameBranchContext(snapshot.display, incoming.display) else false;
+        self.clearObservedContext(allocator);
+        self.observed_context = page.takeSnapshot();
+        self.needs_initial = true;
+        self.initial_policy = switch (reason) {
+            .activation => if (same_branch_context and self.current_view == .picker) .preserve_draft else .reset,
+            .open_picker => .restore_accepted,
+            .reload => .reset,
+        };
+        self.catalog_hidden = self.current_view == .picker;
+        self.load_state = .loading;
+        self.status.clear();
+        return .changed;
+    }
+
+    fn applyInitial(
+        self: *HistoryPageState,
+        allocator: std.mem.Allocator,
+        requested_policy: app_load.HistoryInitialPolicy,
+        page: *git_history.Page,
+        render_now_unix: ?i64,
+    ) !void {
+        const incoming = if (page.snapshot) |*snapshot| snapshot else return error.MissingInitialSnapshot;
+        const previous = if (self.catalog.snapshot) |*snapshot| snapshot else null;
+        const policy: app_load.HistoryInitialPolicy = if (previous) |snapshot|
+            if (sameBranchContext(snapshot.display, incoming.display) or snapshotEql(snapshot, incoming)) requested_policy else .reset
+        else
+            .reset;
+        const restore: ?PickerRestore = switch (policy) {
+            .reset => null,
+            .preserve_draft => switch (self.selectionRequest()) {
+                .request => |request| .{ .request = request, .scroll = self.catalog.scroll },
+                .unavailable => null,
+            },
+            .restore_accepted => if (self.accepted) |accepted| .{
+                .request = accepted.request,
+                .scroll = accepted.picker_scroll,
+            } else null,
+        };
+
+        try self.catalog.replace(allocator, page);
+        self.draft = .single;
+        const restored = if (restore) |value| self.restorePicker(value) else false;
+        if (policy != .reset and !restored) {
+            self.resetDraft("History changed; draft selection reset");
+        } else {
+            self.status.clear();
+        }
+        self.clearObservedContext(allocator);
+        self.catalog_hidden = false;
+        self.render_now_unix = render_now_unix;
+        self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
+    }
+
+    fn restoreAcceptedDraft(self: *HistoryPageState) bool {
+        const accepted = self.accepted orelse return false;
+        return self.restorePicker(.{ .request = accepted.request, .scroll = accepted.picker_scroll });
+    }
+
+    fn restorePicker(self: *HistoryPageState, restore: PickerRestore) bool {
+        const positions = mappedSelectionPositions(self.catalog.records.items, restore.request.intent) orelse return false;
+        const snapshot = if (self.catalog.snapshot) |*value| value else return false;
+        const candidate = switch (git_history.resolveSelection(snapshot, self.catalog.records.items, positions.anchor, positions.cursor)) {
+            .request => |request| request,
+            .unavailable => return false,
+        };
+        if (!std.meta.eql(candidate.basis, restore.request.basis)) return false;
+        self.catalog.cursor = positions.cursor;
+        self.catalog.scroll = shiftedScroll(restore.scroll, intentCursor(restore.request.intent), positions.cursor);
+        self.draft = if (positions.anchor) |anchor| .{ .range = anchor } else .single;
+        return true;
+    }
+
+    fn resetDraft(self: *HistoryPageState, message: []const u8) void {
+        self.draft = .single;
+        self.catalog.cursor = 0;
+        self.catalog.scroll = 0;
+        self.status.set("{s}", .{message});
+    }
+
+    fn clearObservedContext(self: *HistoryPageState, allocator: std.mem.Allocator) void {
+        if (self.observed_context) |*snapshot| snapshot.deinit(allocator);
+        self.observed_context = null;
+    }
 };
+
+const PickerRestore = struct {
+    request: git_history.SelectionRequest,
+    scroll: usize,
+};
+
+const PickerPositions = struct {
+    cursor: usize,
+    anchor: ?usize,
+};
+
+fn snapshotEql(a: *const git_history.Snapshot, b: *const git_history.Snapshot) bool {
+    return a.object_format == b.object_format and optionalOidEql(a.head, b.head) and headDisplayEql(a.display, b.display);
+}
+
+fn optionalOidEql(a: ?git_history.ObjectId, b: ?git_history.ObjectId) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(&b.?);
+}
+
+fn headDisplayEql(a: git_history.HeadDisplay, b: git_history.HeadDisplay) bool {
+    return switch (a) {
+        .branch => |branch| switch (b) {
+            .branch => |other| std.mem.eql(u8, branch, other),
+            else => false,
+        },
+        .detached => b == .detached,
+        .unborn => |branch| switch (b) {
+            .unborn => |other| std.mem.eql(u8, branch, other),
+            else => false,
+        },
+    };
+}
+
+fn sameBranchContext(a: git_history.HeadDisplay, b: git_history.HeadDisplay) bool {
+    return switch (a) {
+        .branch => |branch| switch (b) {
+            .branch => |other| std.mem.eql(u8, branch, other),
+            else => false,
+        },
+        .detached, .unborn => false,
+    };
+}
+
+fn mappedSelectionPositions(records: []const git_history.Record, intent: git_history.SelectionIntent) ?PickerPositions {
+    return switch (intent) {
+        .single => |single| .{
+            .cursor = findRecord(records, single.oid) orelse return null,
+            .anchor = null,
+        },
+        .range => |range| blk: {
+            const anchor_oid = if (range.anchor_index == range.newest_index) range.newest_oid else range.oldest_oid;
+            const cursor_oid = if (range.cursor_index == range.newest_index) range.newest_oid else range.oldest_oid;
+            break :blk .{
+                .cursor = findRecord(records, cursor_oid) orelse return null,
+                .anchor = findRecord(records, anchor_oid) orelse return null,
+            };
+        },
+    };
+}
+
+fn findRecord(records: []const git_history.Record, oid: git_history.ObjectId) ?usize {
+    for (records, 0..) |record, index| if (record.oid.eql(&oid)) return index;
+    return null;
+}
+
+fn intentCursor(intent: git_history.SelectionIntent) usize {
+    return switch (intent) {
+        .single => |single| single.index,
+        .range => |range| range.cursor_index,
+    };
+}
+
+fn shiftedScroll(scroll: usize, old_cursor: usize, new_cursor: usize) usize {
+    if (new_cursor >= old_cursor) return scroll +| (new_cursor - old_cursor);
+    return scroll -| (old_cursor - new_cursor);
+}
 
 fn cloneHeadDisplay(allocator: std.mem.Allocator, display: git_history.HeadDisplay) !git_history.HeadDisplay {
     return switch (display) {
@@ -575,7 +843,7 @@ test "History completion adopts only an admitted initial presentation clock" {
         .identity = identity,
         .root_identity = root_identity,
         .generation = 3,
-        .request = .initial,
+        .request = .{ .initial = .reset },
     });
 
     const head = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
@@ -584,7 +852,7 @@ test "History completion adopts only an admitted initial presentation clock" {
         .identity = identity,
         .root_identity = root_identity,
         .generation = 3,
-        .request = .initial,
+        .request = .{ .initial = .reset },
         .render_now_unix = 100,
         .result = .{ .loaded = .{
             .snapshot = .{
@@ -630,13 +898,13 @@ test "History completion adopts only an admitted initial presentation clock" {
         .identity = identity,
         .root_identity = root_identity,
         .generation = 5,
-        .request = .initial,
+        .request = .{ .initial = .reset },
     });
     var failed: app_load.HistoryCatalogFinished = .{
         .identity = identity,
         .root_identity = root_identity,
         .generation = 5,
-        .request = .initial,
+        .request = .{ .initial = .reset },
         .render_now_unix = 300,
         .result = .{ .failure = .git_command_failed },
     };
@@ -647,13 +915,13 @@ test "History completion adopts only an admitted initial presentation clock" {
         .identity = identity,
         .root_identity = root_identity,
         .generation = 6,
-        .request = .initial,
+        .request = .{ .initial = .reset },
     });
     var stale: app_load.HistoryCatalogFinished = .{
         .identity = identity,
         .root_identity = root_identity,
         .generation = 7,
-        .request = .initial,
+        .request = .{ .initial = .reset },
         .render_now_unix = 400,
         .result = .{ .failure = .git_command_failed },
     };
@@ -704,7 +972,7 @@ test "History picker preserves its anchor across older-page append and resolves 
     try std.testing.expectEqual(@as(usize, 3), request.intent.commitCount());
     try std.testing.expect(request.basis.before == .empty_tree);
 
-    state.requestReload();
+    state.requestReload(allocator);
     try std.testing.expectEqual(LoadState.loaded, state.load_state);
     try std.testing.expectEqualStrings("Cancel range selection before reloading", state.status.text());
     state.applyInput(.cancel_draft, 24);
@@ -773,7 +1041,26 @@ test "History diff completion publishes atomically and failure or cancel preserv
     try std.testing.expectEqualStrings("newest", state.accepted.?.target_subject);
     try std.testing.expect(state.diff.load.state == .loaded);
 
-    state.openPicker();
+    state.openPicker(allocator);
+    const picker_probe_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 20,
+        .request = picker_probe_request,
+    });
+    var picker_probe: app_load.HistoryCatalogFinished = .{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 20,
+        .request = picker_probe_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, newest, "main") },
+    };
+    defer picker_probe.deinit(allocator);
+    try std.testing.expectEqual(
+        ApplyOutcome.changed,
+        try state.applyFinished(allocator, identity, root_identity, &picker_probe),
+    );
     state.catalog.cursor = 1;
     const root_request = state.selectionRequest().request;
     state.armDiff(.{
@@ -802,7 +1089,10 @@ test "History diff completion publishes atomically and failure or cancel preserv
         .generation = 3,
         .request = root_request,
     });
+    try std.testing.expect(state.inputContext(.{}).loading);
+    try std.testing.expect(!state.inputContext(.{}).return_to_accepted);
     state.cancelLoad();
+    try std.testing.expectEqual(CurrentView.picker, state.current_view);
     var canceled: app_load.HistoryDiffFinished = .{
         .identity = identity,
         .root_identity = root_identity,
@@ -844,6 +1134,606 @@ test "History diff completion publishes atomically and failure or cancel preserv
     try std.testing.expect(state.accepted.?.request.basis.after.eql(&newest));
     try std.testing.expectEqualStrings("newest", state.accepted.?.target_subject);
     try std.testing.expect(state.diff.load.state == .loaded);
+}
+
+test "History lifecycle reuses one context and preserves a valid draft across HEAD advance" {
+    const allocator = std.testing.allocator;
+    const root_identity: root_capability.Identity = .{ .device = 23, .inode = 29 };
+    const newest = try git_history.ObjectId.parse(.sha1, "dddddddddddddddddddddddddddddddddddddddd");
+    const middle = try git_history.ObjectId.parse(.sha1, "cccccccccccccccccccccccccccccccccccccccc");
+    const root = try git_history.ObjectId.parse(.sha1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const advanced = try git_history.ObjectId.parse(.sha1, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    const replacement = try git_history.ObjectId.parse(.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    var state: HistoryPageState = .{
+        .repo_epoch = 4,
+        .root_identity = root_identity,
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    var original = try pickerPage(allocator, "main", &.{ newest, middle, root });
+    defer original.deinit(allocator);
+    try state.catalog.replace(allocator, &original);
+    state.catalog.cursor = 1;
+    state.catalog.scroll = 0;
+    state.draft = .{ .range = 0 };
+    const retained_subject = state.catalog.records.items[0].subject.ptr;
+    _ = state.activation.activate(4, .unavailable, .unavailable, .unavailable);
+    state.deactivate();
+
+    state.activate(allocator, 4, root_identity);
+    const same_request = state.nextRequest().?;
+    try std.testing.expectEqual(app_load.HistoryProbeReason.activation, same_request.probe);
+    const same_identity = state.activation.currentIdentity().?;
+    state.armCatalog(.{
+        .identity = same_identity,
+        .root_identity = root_identity,
+        .generation = 1,
+        .request = same_request,
+    });
+    var same = app_load.HistoryCatalogFinished{
+        .identity = same_identity,
+        .root_identity = root_identity,
+        .generation = 1,
+        .request = same_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, newest, "main") },
+    };
+    defer same.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, same_identity, root_identity, &same));
+    try std.testing.expect(!state.catalog_hidden);
+    try std.testing.expectEqual(@as(usize, 1), state.catalog.cursor);
+    try std.testing.expectEqual(@as(?usize, 0), state.draft.anchor());
+    try std.testing.expectEqual(retained_subject, state.catalog.records.items[0].subject.ptr);
+
+    state.deactivate();
+    state.activate(allocator, 4, root_identity);
+    const advance_probe_request = state.nextRequest().?;
+    const advance_identity = state.activation.currentIdentity().?;
+    state.armCatalog(.{
+        .identity = advance_identity,
+        .root_identity = root_identity,
+        .generation = 2,
+        .request = advance_probe_request,
+    });
+    var advance_probe = app_load.HistoryCatalogFinished{
+        .identity = advance_identity,
+        .root_identity = root_identity,
+        .generation = 2,
+        .request = advance_probe_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, advanced, "main") },
+    };
+    defer advance_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, advance_identity, root_identity, &advance_probe));
+    const advance_initial_request = state.nextRequest().?;
+    try std.testing.expectEqual(app_load.HistoryInitialPolicy.preserve_draft, advance_initial_request.initial);
+    state.armCatalog(.{
+        .identity = advance_identity,
+        .root_identity = root_identity,
+        .generation = 3,
+        .request = advance_initial_request,
+    });
+    var advance_initial = app_load.HistoryCatalogFinished{
+        .identity = advance_identity,
+        .root_identity = root_identity,
+        .generation = 3,
+        .request = advance_initial_request,
+        .render_now_unix = 200,
+        .result = .{ .loaded = try pickerPage(allocator, "main", &.{ advanced, newest, middle, root }) },
+    };
+    defer advance_initial.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, advance_identity, root_identity, &advance_initial));
+    try std.testing.expectEqual(@as(usize, 2), state.catalog.cursor);
+    try std.testing.expectEqual(@as(?usize, 1), state.draft.anchor());
+    try std.testing.expectEqual(selection.Direction.toward_older, state.draft.direction(state.catalog.cursor).?);
+    try std.testing.expectEqual(@as(usize, 1), state.catalog.scroll);
+    try std.testing.expectEqual(@as(?i64, 200), state.render_now_unix);
+
+    state.deactivate();
+    state.activate(allocator, 4, root_identity);
+    const reset_probe_request = state.nextRequest().?;
+    const reset_identity = state.activation.currentIdentity().?;
+    state.armCatalog(.{
+        .identity = reset_identity,
+        .root_identity = root_identity,
+        .generation = 4,
+        .request = reset_probe_request,
+    });
+    var reset_probe = app_load.HistoryCatalogFinished{
+        .identity = reset_identity,
+        .root_identity = root_identity,
+        .generation = 4,
+        .request = reset_probe_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, replacement, "main") },
+    };
+    defer reset_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, reset_identity, root_identity, &reset_probe));
+    const reset_initial_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = reset_identity,
+        .root_identity = root_identity,
+        .generation = 5,
+        .request = reset_initial_request,
+    });
+    var reset_initial = app_load.HistoryCatalogFinished{
+        .identity = reset_identity,
+        .root_identity = root_identity,
+        .generation = 5,
+        .request = reset_initial_request,
+        .render_now_unix = 300,
+        .result = .{ .loaded = try pickerPage(allocator, "main", &.{replacement}) },
+    };
+    defer reset_initial.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, reset_identity, root_identity, &reset_initial));
+    try std.testing.expectEqual(@as(usize, 0), state.catalog.cursor);
+    try std.testing.expect(state.draft.anchor() == null);
+    try std.testing.expectEqualStrings("History changed; draft selection reset", state.status.text());
+
+    state.requestReload(allocator);
+    const reload_probe_request = state.nextRequest().?;
+    try std.testing.expectEqual(app_load.HistoryProbeReason.reload, reload_probe_request.probe);
+    state.armCatalog(.{
+        .identity = reset_identity,
+        .root_identity = root_identity,
+        .generation = 6,
+        .request = reload_probe_request,
+    });
+    var reload_probe = app_load.HistoryCatalogFinished{
+        .identity = reset_identity,
+        .root_identity = root_identity,
+        .generation = 6,
+        .request = reload_probe_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, replacement, "main") },
+    };
+    defer reload_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, reset_identity, root_identity, &reload_probe));
+    try std.testing.expectEqual(app_load.HistoryInitialPolicy.reset, state.nextRequest().?.initial);
+    const reload_initial_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = reset_identity,
+        .root_identity = root_identity,
+        .generation = 7,
+        .request = reload_initial_request,
+    });
+    var reload_initial = app_load.HistoryCatalogFinished{
+        .identity = reset_identity,
+        .root_identity = root_identity,
+        .generation = 7,
+        .request = reload_initial_request,
+        .result = .{ .loaded = try pickerPage(allocator, "main", &.{replacement}) },
+    };
+    defer reload_initial.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, reset_identity, root_identity, &reload_initial));
+
+    state.deactivate();
+    state.activate(allocator, 4, root_identity);
+    const changed_probe_request = state.nextRequest().?;
+    const changed_identity = state.activation.currentIdentity().?;
+    state.armCatalog(.{
+        .identity = changed_identity,
+        .root_identity = root_identity,
+        .generation = 8,
+        .request = changed_probe_request,
+    });
+    var changed_probe = app_load.HistoryCatalogFinished{
+        .identity = changed_identity,
+        .root_identity = root_identity,
+        .generation = 8,
+        .request = changed_probe_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, advanced, "feature") },
+    };
+    defer changed_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, changed_identity, root_identity, &changed_probe));
+    const changed_initial_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = changed_identity,
+        .root_identity = root_identity,
+        .generation = 9,
+        .request = changed_initial_request,
+    });
+    state.cancelLoad();
+    try std.testing.expect(state.catalog_hidden);
+    try std.testing.expectEqual(LoadState.failed, state.load_state);
+    try std.testing.expect(!state.inputContext(.{}).picker_ready);
+    try std.testing.expect(input.keyToMsg(state.inputContext(.{}), .{ .codepoint = 'j' }) == null);
+    try std.testing.expect(input.keyToMsg(state.inputContext(.{}), .{ .codepoint = 0x0d }) == null);
+    const canceled_context = state.currentHeadContext().?;
+    try std.testing.expect(canceled_context.head.?.eql(&advanced));
+    try std.testing.expect(std.meta.activeTag(canceled_context.display) == .branch);
+    try std.testing.expectEqualStrings("feature", canceled_context.display.branch);
+    state.requestReload(allocator);
+    try std.testing.expectEqual(app_load.HistoryProbeReason.reload, state.nextRequest().?.probe);
+    try std.testing.expect(state.currentHeadContext().?.head.?.eql(&advanced));
+}
+
+test "History picker revalidates accepted context and repository replacement fences old completion" {
+    const allocator = std.testing.allocator;
+    const root_identity: root_capability.Identity = .{ .device = 31, .inode = 37 };
+    const replacement_identity: root_capability.Identity = .{ .device = 41, .inode = 43 };
+    const newest = try git_history.ObjectId.parse(.sha1, "3333333333333333333333333333333333333333");
+    const root = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const feature = try git_history.ObjectId.parse(.sha1, "4444444444444444444444444444444444444444");
+
+    var state: HistoryPageState = .{
+        .repo_epoch = 7,
+        .root_identity = root_identity,
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    var original = try pickerPage(allocator, "main", &.{ newest, root });
+    defer original.deinit(allocator);
+    try state.catalog.replace(allocator, &original);
+    state.catalog.cursor = 1;
+    state.catalog.scroll = 1;
+    state.draft = .{ .range = 0 };
+    _ = state.activation.activate(7, .immutable, .unavailable, .unavailable);
+    const accepted_request = state.selectionRequest().request;
+    try std.testing.expect(std.meta.activeTag(accepted_request.intent) == .range);
+    state.accepted = try AcceptedSelection.init(
+        allocator,
+        accepted_request,
+        &state.catalog.snapshot.?,
+        state.catalog.records.items,
+        state.catalog.scroll,
+    );
+    state.current_view = .diff;
+    state.diff.viewer = .{
+        .selected_node = 3,
+        .focus = .diff,
+        .diff_scroll = 7,
+        .display_mode = .unified,
+    };
+    const accepted_subject = state.accepted.?.target_subject.ptr;
+    const accepted_basis = state.accepted.?.request.basis;
+
+    state.deactivate();
+    state.activate(allocator, 7, root_identity);
+    try std.testing.expectEqual(app_load.HistoryProbeReason.activation, state.nextRequest().?.probe);
+    try std.testing.expectEqual(CurrentView.diff, state.current_view);
+    try std.testing.expectEqual(accepted_subject, state.accepted.?.target_subject.ptr);
+    try std.testing.expectEqual(@as(usize, 3), state.diff.viewer.selected_node);
+    try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll);
+    try std.testing.expect(state.diff.viewer.display_mode == .unified);
+    state.cancelLoad();
+
+    state.openPicker(allocator);
+    const same_request = state.nextRequest().?;
+    const identity = state.activation.currentIdentity().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 1,
+        .request = same_request,
+    });
+    var same = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 1,
+        .request = same_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, newest, "main") },
+    };
+    defer same.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, identity, root_identity, &same));
+    try std.testing.expectEqual(@as(usize, 1), state.catalog.cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.catalog.scroll);
+    try std.testing.expect(state.draft.isRange());
+
+    try std.testing.expect(state.returnToAccepted());
+    state.openPicker(allocator);
+    const range_failure_probe_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 2,
+        .request = range_failure_probe_request,
+    });
+    var range_failure_probe = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 2,
+        .request = range_failure_probe_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, feature, "broken") },
+    };
+    defer range_failure_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, identity, root_identity, &range_failure_probe));
+    const range_failure_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 3,
+        .request = range_failure_request,
+    });
+    var range_failure = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 3,
+        .request = range_failure_request,
+        .result = .{ .failure = .git_command_failed },
+    };
+    defer range_failure.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.failed, try state.applyFinished(allocator, identity, root_identity, &range_failure));
+    try std.testing.expect(state.catalog_hidden);
+    try std.testing.expect(state.draft.isRange());
+    state.requestReload(allocator);
+    const range_retry_request = state.nextRequest().?;
+    try std.testing.expectEqual(app_load.HistoryProbeReason.reload, range_retry_request.probe);
+    const retry_context = state.currentHeadContext().?;
+    try std.testing.expect(retry_context.head.?.eql(&feature));
+    try std.testing.expect(std.meta.activeTag(retry_context.display) == .branch);
+    try std.testing.expectEqualStrings("broken", retry_context.display.branch);
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 4,
+        .request = range_retry_request,
+    });
+    try std.testing.expect(state.inputContext(.{}).loading);
+    try std.testing.expect(state.inputContext(.{}).return_to_accepted);
+    try std.testing.expectEqual(
+        Msg.cancel_load,
+        input.keyToMsg(state.inputContext(.{}), .{ .codepoint = 0x1b }).?,
+    );
+    state.applyInput(.cancel_load, 24);
+    try std.testing.expectEqual(CurrentView.diff, state.current_view);
+    try std.testing.expect(state.catalog_hidden);
+    try std.testing.expect(state.acceptedContextChanged());
+    try std.testing.expect(state.currentHeadContext().?.head.?.eql(&feature));
+    try std.testing.expect(std.meta.eql(accepted_basis, state.accepted.?.request.basis));
+
+    state.openPicker(allocator);
+    const branch_probe_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 5,
+        .request = branch_probe_request,
+    });
+    var branch_probe = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 5,
+        .request = branch_probe_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, feature, "feature") },
+    };
+    defer branch_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, identity, root_identity, &branch_probe));
+    const branch_initial_request = state.nextRequest().?;
+    try std.testing.expectEqual(app_load.HistoryInitialPolicy.restore_accepted, branch_initial_request.initial);
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 6,
+        .request = branch_initial_request,
+    });
+    var branch_initial = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 6,
+        .request = branch_initial_request,
+        .result = .{ .loaded = try pickerPage(allocator, "feature", &.{feature}) },
+    };
+    defer branch_initial.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, identity, root_identity, &branch_initial));
+    try std.testing.expect(state.accepted != null);
+    try std.testing.expect(state.acceptedContextChanged());
+    try std.testing.expectEqual(@as(usize, 0), state.catalog.cursor);
+    try std.testing.expect(state.draft.anchor() == null);
+
+    try std.testing.expectEqual(
+        Msg.cancel_draft,
+        input.keyToMsg(state.inputContext(.{}), .{ .codepoint = 0x1b }).?,
+    );
+    state.applyInput(.cancel_draft, 24);
+    try std.testing.expectEqual(CurrentView.diff, state.current_view);
+    try std.testing.expect(std.meta.eql(accepted_basis, state.accepted.?.request.basis));
+
+    state.openPicker(allocator);
+    const unborn_probe_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 7,
+        .request = unborn_probe_request,
+    });
+    var unborn_probe = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 7,
+        .request = unborn_probe_request,
+        .result = .{ .loaded = try pickerUnbornPage(allocator, "future") },
+    };
+    defer unborn_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, identity, root_identity, &unborn_probe));
+    const unborn_initial_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 8,
+        .request = unborn_initial_request,
+    });
+    var unborn_initial = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 8,
+        .request = unborn_initial_request,
+        .result = .{ .loaded = try pickerUnbornPage(allocator, "future") },
+    };
+    defer unborn_initial.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, identity, root_identity, &unborn_initial));
+    try std.testing.expectEqual(LoadState.empty, state.load_state);
+    try std.testing.expectEqual(@as(usize, 0), state.catalog.records.items.len);
+    try std.testing.expect(std.meta.eql(accepted_basis, state.accepted.?.request.basis));
+    try std.testing.expectEqual(
+        Msg.cancel_draft,
+        input.keyToMsg(state.inputContext(.{}), .{ .codepoint = 0x1b }).?,
+    );
+    state.applyInput(.cancel_draft, 24);
+    try std.testing.expectEqual(CurrentView.diff, state.current_view);
+
+    state.openPicker(allocator);
+    const detached_probe_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 9,
+        .request = detached_probe_request,
+    });
+    var detached_probe = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 9,
+        .request = detached_probe_request,
+        .result = .{ .loaded = .{ .snapshot = .{
+            .object_format = .sha1,
+            .head = feature,
+            .display = .detached,
+        } } },
+    };
+    defer detached_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, identity, root_identity, &detached_probe));
+    try std.testing.expectEqual(app_load.HistoryInitialPolicy.restore_accepted, state.nextRequest().?.initial);
+    state.cancelLoad();
+    try std.testing.expectEqual(CurrentView.diff, state.current_view);
+    try std.testing.expect(state.acceptedContextChanged());
+
+    state.openPicker(allocator);
+    const cancel_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 10,
+        .request = cancel_request,
+    });
+    state.cancelLoad();
+    try std.testing.expectEqual(CurrentView.diff, state.current_view);
+    var canceled = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 10,
+        .request = cancel_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, feature, "feature") },
+    };
+    defer canceled.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, try state.applyFinished(allocator, identity, root_identity, &canceled));
+
+    state.openPicker(allocator);
+    const failed_probe_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 11,
+        .request = failed_probe_request,
+    });
+    var failed_probe = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 11,
+        .request = failed_probe_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, feature, "broken") },
+    };
+    defer failed_probe.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, try state.applyFinished(allocator, identity, root_identity, &failed_probe));
+    const failed_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 12,
+        .request = failed_request,
+    });
+    var failed = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 12,
+        .request = failed_request,
+        .result = .{ .failure = .git_command_failed },
+    };
+    defer failed.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.failed, try state.applyFinished(allocator, identity, root_identity, &failed));
+    try std.testing.expect(state.accepted != null);
+    try std.testing.expect(!state.inputContext(.{}).loading);
+    try std.testing.expect(state.inputContext(.{}).return_to_accepted);
+    try std.testing.expect(std.meta.eql(accepted_basis, state.accepted.?.request.basis));
+    try std.testing.expectEqual(
+        Msg.cancel_draft,
+        input.keyToMsg(state.inputContext(.{}), .{ .codepoint = 0x1b }).?,
+    );
+    state.applyInput(.cancel_draft, 24);
+    try std.testing.expectEqual(CurrentView.diff, state.current_view);
+
+    state.openPicker(allocator);
+    const stale_request = state.nextRequest().?;
+    state.armCatalog(.{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 13,
+        .request = stale_request,
+    });
+    state.repositoryChanged(allocator, 8, replacement_identity);
+    try std.testing.expect(state.accepted == null);
+    try std.testing.expect(state.catalog.snapshot == null);
+    var stale = app_load.HistoryCatalogFinished{
+        .identity = identity,
+        .root_identity = root_identity,
+        .generation = 13,
+        .request = stale_request,
+        .result = .{ .loaded = try pickerProbePage(allocator, feature, "feature") },
+    };
+    defer stale.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, try state.applyFinished(allocator, identity, replacement_identity, &stale));
+}
+
+fn pickerProbePage(
+    allocator: std.mem.Allocator,
+    head: git_history.ObjectId,
+    branch: []const u8,
+) !git_history.Page {
+    return .{ .snapshot = .{
+        .object_format = .sha1,
+        .head = head,
+        .display = .{ .branch = try allocator.dupe(u8, branch) },
+    } };
+}
+
+fn pickerUnbornPage(allocator: std.mem.Allocator, branch: []const u8) !git_history.Page {
+    return .{ .snapshot = .{
+        .object_format = .sha1,
+        .head = null,
+        .display = .{ .unborn = try allocator.dupe(u8, branch) },
+    } };
+}
+
+fn pickerPage(
+    allocator: std.mem.Allocator,
+    branch: []const u8,
+    oids: []const git_history.ObjectId,
+) !git_history.Page {
+    std.debug.assert(oids.len > 0);
+    const records = try allocator.alloc(git_history.Record, oids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (records[0..initialized]) |*record| record.deinit(allocator);
+        allocator.free(records);
+    }
+    for (oids, 0..) |oid, index| {
+        var subject_buffer: [32]u8 = undefined;
+        const subject = try std.fmt.bufPrint(&subject_buffer, "commit {d}", .{index});
+        records[index] = try pickerTestRecord(
+            allocator,
+            oid,
+            if (index + 1 < oids.len) 1 else 0,
+            if (index + 1 < oids.len) .{ .available = oids[index + 1] } else .true_root,
+            subject,
+        );
+        initialized += 1;
+    }
+    const owned_branch = try allocator.dupe(u8, branch);
+    return .{
+        .snapshot = .{
+            .object_format = .sha1,
+            .head = oids[0],
+            .display = .{ .branch = owned_branch },
+        },
+        .records = records,
+    };
 }
 
 fn pickerTestRecord(

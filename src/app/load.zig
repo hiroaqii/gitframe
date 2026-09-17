@@ -213,8 +213,21 @@ pub const CompareBranchListFinished = struct {
     }
 };
 
+pub const HistoryProbeReason = enum {
+    activation,
+    open_picker,
+    reload,
+};
+
+pub const HistoryInitialPolicy = enum {
+    reset,
+    preserve_draft,
+    restore_accepted,
+};
+
 pub const HistoryCatalogRequest = union(enum) {
-    initial,
+    probe: HistoryProbeReason,
+    initial: HistoryInitialPolicy,
     continuation: struct {
         format: git_history.ObjectFormat,
         cursor: git_history.ObjectId,
@@ -1066,6 +1079,7 @@ pub fn HistoryCatalogTask(comptime Msg: type) type {
                 .environment = &task.environment,
             };
             const result: git_history.LoadResult = switch (task.request) {
+                .probe => git_history.probeHead(allocator, io, context),
                 .initial => git_history.loadInitial(allocator, io, context),
                 .continuation => |continuation| git_history.loadContinuation(
                     allocator,
@@ -1075,7 +1089,7 @@ pub fn HistoryCatalogTask(comptime Msg: type) type {
                     continuation.cursor,
                 ),
             } catch git_history.LoadResult{ .failure = .git_command_failed };
-            const render_now_unix = if (task.request == .initial)
+            const render_now_unix = if (std.meta.activeTag(task.request) == .initial)
                 branch_commit_time.sampleUnixSeconds(io)
             else
                 null;

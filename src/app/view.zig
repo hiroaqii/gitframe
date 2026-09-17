@@ -29,6 +29,8 @@ const changes_page = if (builtin.is_test) @import("pages/changes.zig") else stru
 const compare_page = if (builtin.is_test) @import("pages/compare.zig") else struct {};
 const ai_reviews_page = if (builtin.is_test) @import("pages/ai_reviews.zig") else struct {};
 const repository_page = if (builtin.is_test) @import("pages/repository.zig") else struct {};
+const history_page = if (builtin.is_test) @import("pages/history.zig") else struct {};
+const git_history = if (builtin.is_test) @import("../git/history.zig") else struct {};
 const repository_source = if (builtin.is_test) @import("../repository/source.zig") else struct {};
 const content_fingerprint = if (builtin.is_test) @import("../content_fingerprint.zig") else struct {};
 
@@ -1821,14 +1823,25 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         },
         .history => {
             if (app.history) |history| {
-                if (history.page_state.load_state == .loading) {
-                    result.append(ui.key_hint.item("Esc", "cancel"), .primary);
+                const history_input = history.page_state.inputContext(app.keymap);
+                if (history.page_state.current_view == .picker and history_input.loading) {
+                    result.append(
+                        ui.key_hint.item("Esc", if (history_input.return_to_accepted) "previous diff" else "cancel"),
+                        .primary,
+                    );
                 } else if (history.page_state.current_view == .diff) {
                     const footer = history.footer();
                     if (!footer.normal_action_hints_enabled) return result;
                     appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "commits", .compare_base);
-                } else if (history.page_state.catalog.moreRowSelected()) {
+                } else if (history_input.more_row_selected) {
                     result.append(ui.key_hint.item("Enter", "load older"), .primary);
+                } else {
+                    appendFooterAction(app, &result, key_buffers, .reload, "reload", .primary);
+                }
+                if (history.page_state.current_view == .picker and
+                    history_input.return_to_accepted and !history_input.loading)
+                {
+                    result.append(ui.key_hint.item("Esc", "previous diff"), .primary);
                 }
             }
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
@@ -2496,6 +2509,7 @@ fn installRepositorySourceForFooterTest(harness: *ShellViewTestHarness) !void {
 }
 
 test "footer normal-mode hints match the decided page lists" {
+    const allocator = std.testing.allocator;
     var harness: ShellViewTestHarness = .{};
     try installRepositorySourceForFooterTest(&harness);
     defer if (harness.repository.displayed_document) |*displayed| displayed.deinit(std.testing.allocator);
@@ -2514,6 +2528,60 @@ test "footer normal-mode hints match the decided page lists" {
     context.active_page = .repository;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    const accepted_oid = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    var history_state: history_page.HistoryPageState = .{
+        .load_state = .failed,
+        .catalog_hidden = true,
+        .accepted = .{
+            .request = .{
+                .snapshot_head = accepted_oid,
+                .intent = .{ .single = .{ .index = 0, .oid = accepted_oid } },
+                .basis = .{
+                    .object_format = .sha1,
+                    .before = .empty_tree,
+                    .after = accepted_oid,
+                },
+            },
+            .origin = .{ .branch = try allocator.dupe(u8, "main") },
+            .selected_parent_count = 0,
+            .target_subject = try allocator.dupe(u8, "root"),
+        },
+    };
+    history_state.catalog.continuation = accepted_oid;
+    defer history_state.deinit(allocator);
+    context = harness.context();
+    context.active_page = .history;
+    context.history = .{
+        .page_state = &history_state,
+        .palette = .default(),
+    };
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("r", "reload"),
+        ui.key_hint.item("Esc", "previous diff"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    history_state.load_state = .loading;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Esc", "previous diff"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    history_state.catalog_hidden = false;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Esc", "cancel"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
         ui.key_hint.item("q", "quit"),
@@ -3318,13 +3386,17 @@ const help_history_items = [_]HelpItem{
     .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move through commits" },
     .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "move one visible page" },
     .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last catalog row" },
-    .{ .key = .{ .text = "Enter" }, .description = "load older commits on the operation row" },
-    .{ .key = .{ .action = .reload }, .description = "reload from exact current HEAD" },
-    .{ .key = .{ .text = "Esc" }, .description = "cancel the logical catalog load" },
+    .{ .key = .{ .text = "Space" }, .description = "start / clear a contiguous range" },
+    .{ .key = .{ .text = "Enter" }, .description = "open selected diff / load older commits" },
+    .{ .key = .{ .text = "m" }, .description = "choose commits from an accepted diff" },
+    .{ .key = .{ .action = .reload }, .description = "recheck and reload exact current HEAD" },
+    .{ .key = .{ .text = "/" }, .description = "search diff; commit search unavailable" },
+    .{ .key = .{ .text = "Esc" }, .description = "cancel load/range or return to accepted diff" },
 };
 
 const help_history_sections = [_]HelpSection{
     .{ .title = "History", .items = &help_history_items },
+    .{ .title = "Diff", .items = &help_diff_navigation_items },
 };
 
 const help_ai_reviews_items = [_]HelpItem{

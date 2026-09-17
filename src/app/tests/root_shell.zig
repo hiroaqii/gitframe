@@ -52,6 +52,29 @@ fn terminalBodyHeight(terminal_height: u16) u16 {
     return app_shell_layout.bodyHeight(terminal_height);
 }
 
+fn historyRecordForRootTest(
+    allocator: std.mem.Allocator,
+    oid: git_history.ObjectId,
+    parent_count: u16,
+    first_parent: git_history.FirstParent,
+    subject: []const u8,
+) !git_history.Record {
+    const author = try allocator.dupe(u8, "Test");
+    errdefer allocator.free(author);
+    const decorations = try allocator.dupe(u8, "");
+    errdefer allocator.free(decorations);
+    const owned_subject = try allocator.dupe(u8, subject);
+    return .{
+        .oid = oid,
+        .parent_count = parent_count,
+        .first_parent = first_parent,
+        .author = author,
+        .committer_unix = 0,
+        .decorations = decorations,
+        .subject = owned_subject,
+    };
+}
+
 fn footerStatusPress(app: *const App) ?App.Msg {
     const layout = shellLayout(app);
     if (layout.footer.height == 0) return null;
@@ -766,6 +789,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     const allocator = std.testing.allocator;
     const before = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
     const after = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const oldest = try git_history.ObjectId.parse(.sha1, "3333333333333333333333333333333333333333");
     const request: git_history.SelectionRequest = .{
         .snapshot_head = after,
         .intent = .{ .single = .{ .index = 0, .oid = after } },
@@ -775,13 +799,13 @@ test "History accepted diff runs one root interaction and transition sequence" {
             .after = after,
         },
     };
-    var loaded = app_test_support.loadedDiffOne();
-    loaded.reviewed_files = try allocator.alloc(bool, 1);
-    loaded.reviewed_files[0] = false;
+    var loaded = app_test_support.loadedDiffNested();
+    loaded.reviewed_files = try allocator.alloc(bool, 2);
+    @memset(loaded.reviewed_files, false);
     var app: App = .{
         .active_page = .history,
         .allocator = allocator,
-        .terminal_size = .{ .width = 120, .height = 12 },
+        .terminal_size = .{ .width = 120, .height = 32 },
         .pages = .{ .history = .{
             .repo_epoch = 0,
             .load_state = .loaded,
@@ -794,7 +818,14 @@ test "History accepted diff runs one root interaction and transition sequence" {
         } },
     };
     switch (app.pages.history.diff.load.state) {
-        .loaded => |*session| session.reviewed_files_owned = true,
+        .loaded => |*session| {
+            session.reviewed_files_owned = true;
+            session.loaded.collapsed_hunks = try session.arena.allocator().alloc(
+                bool,
+                session.loaded.document.totalHunks(),
+            );
+            @memset(session.loaded.collapsed_hunks, false);
+        },
         else => unreachable,
     }
     app.pages.history.accepted = .{
@@ -803,6 +834,32 @@ test "History accepted diff runs one root interaction and transition sequence" {
         .selected_parent_count = 1,
         .target_subject = try allocator.dupe(u8, "accepted subject"),
     };
+    var catalog_page: git_history.Page = catalog_page: {
+        const records = try allocator.alloc(git_history.Record, 3);
+        var initialized: usize = 0;
+        errdefer {
+            for (records[0..initialized]) |*record| record.deinit(allocator);
+            allocator.free(records);
+        }
+        records[0] = try historyRecordForRootTest(allocator, after, 1, .{ .available = before }, "accepted subject");
+        initialized += 1;
+        records[1] = try historyRecordForRootTest(allocator, before, 1, .{ .available = oldest }, "parent");
+        initialized += 1;
+        records[2] = try historyRecordForRootTest(allocator, oldest, 0, .true_root, "root");
+        break :catalog_page .{
+            .snapshot = .{
+                .object_format = .sha1,
+                .head = after,
+                .display = .detached,
+            },
+            .records = records,
+        };
+    };
+    defer catalog_page.deinit(allocator);
+    try app.pages.history.catalog.replace(allocator, &catalog_page);
+    app.pages.history.catalog.cursor = 2;
+    app.pages.history.catalog.scroll = 1;
+    app.pages.history.draft = .{ .range = 1 };
     defer app.pages.history.deinit(allocator);
     defer app.shell_effects_state.deinit(allocator);
     _ = app.pages.history.activation.activate(0, .immutable, .unavailable, .unavailable);
@@ -853,7 +910,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.reviewed_store.entries.count());
 
     // The same accepted surface routes both sidebar and diff pointer regions.
-    const layout = shellLayout(&app);
+    var layout = shellLayout(&app);
     const sidebar_click = app.handleEvent(app_test_support.mouseEventTyped(
         layout.body.col + 1,
         layout.body.row + sidebar_header_rows,
@@ -865,6 +922,44 @@ test "History accepted diff runs one root interaction and transition sequence" {
         sidebar_click,
     );
     try app.update(sidebar_click, &ctx);
+
+    accepted_loaded.toggleHunkFold(0, 0);
+    app.pages.history.diff.viewer.display_mode = .side_by_side;
+    app.pages.history.diff.viewer.diff_cursor = .{ .hunk_header = 1 };
+    app.pages.history.diff.viewer.diff_scroll = 4;
+    const retained_target = app.pages.history.diff.viewer.selected_target;
+    const retained_node = app.pages.history.diff.viewer.selected_node;
+    try std.testing.expect(file_tree.isCollapsed(&accepted_loaded.collapsed_dirs, "src"));
+    try std.testing.expect(accepted_loaded.isHunkFolded(0, 0));
+
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 24 } }, &ctx);
+    try std.testing.expectEqual(chasen.Size{ .width = 80, .height = 24 }, app.terminal_size);
+    try std.testing.expectEqual(retained_target, app.pages.history.diff.viewer.selected_target);
+    try std.testing.expectEqual(retained_node, app.pages.history.diff.viewer.selected_node);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.pages.history.diff.viewer.display_mode);
+    try std.testing.expect(file_tree.isCollapsed(&accepted_loaded.collapsed_dirs, "src"));
+    try std.testing.expect(accepted_loaded.isHunkFolded(0, 0));
+    try std.testing.expect(std.meta.eql(request, app.pages.history.accepted.?.request));
+    try std.testing.expectEqual(@as(usize, 2), app.pages.history.catalog.cursor);
+    try std.testing.expectEqual(@as(?usize, 1), app.pages.history.draft.anchor());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.history.catalog.scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.viewer.diff_scroll);
+
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try std.testing.expectEqual(chasen.Size{ .width = 120, .height = 32 }, app.terminal_size);
+    try std.testing.expectEqual(retained_target, app.pages.history.diff.viewer.selected_target);
+    try std.testing.expectEqual(retained_node, app.pages.history.diff.viewer.selected_node);
+    try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.pages.history.diff.viewer.display_mode);
+    try std.testing.expect(file_tree.isCollapsed(&accepted_loaded.collapsed_dirs, "src"));
+    try std.testing.expect(accepted_loaded.isHunkFolded(0, 0));
+    try std.testing.expect(std.meta.eql(request, app.pages.history.accepted.?.request));
+    try std.testing.expectEqual(@as(usize, 2), app.pages.history.catalog.cursor);
+    try std.testing.expectEqual(@as(?usize, 1), app.pages.history.draft.anchor());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.history.catalog.scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.viewer.diff_scroll);
+    accepted_loaded.toggleHunkFold(0, 0);
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 12 } }, &ctx);
+    layout = shellLayout(&app);
 
     const sidebar_width = sidebarWidth(layout.content.width, null);
     const diff_point = diff_surface.MousePoint{
@@ -979,7 +1074,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
         .identity = catalog_identity,
         .root_identity = root_identity,
         .generation = 9,
-        .request = .initial,
+        .request = .{ .initial = .reset },
     } };
     try app.update(.{ .switch_page = .config }, &ctx);
     try std.testing.expectEqual(page.Id.config, app.active_page);

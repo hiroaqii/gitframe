@@ -263,27 +263,51 @@ pub fn loadInitial(
     io: std.Io,
     context: git_command.DirectoryContext,
 ) std.mem.Allocator.Error!LoadResult {
-    const format = switch (try readObjectFormat(allocator, io, context)) {
-        .format => |value| value,
+    var probed = try probeHead(allocator, io, context);
+    const snapshot = switch (probed) {
+        .loaded => |*page| page.takeSnapshot() orelse {
+            probed.deinit(allocator);
+            return .{ .failure = .malformed_catalog };
+        },
         .failure => |failure| return .{ .failure = failure },
     };
-
-    var snapshot = switch (try readHeadSnapshot(allocator, io, context, format)) {
-        .snapshot => |value| value,
-        .failure => |failure| return .{ .failure = failure },
-    };
-    errdefer snapshot.deinit(allocator);
+    probed.deinit(allocator);
+    errdefer {
+        var owned = snapshot;
+        owned.deinit(allocator);
+    }
     const head = snapshot.head orelse return .{ .loaded = .{ .snapshot = snapshot } };
 
-    var page = switch (try loadPage(allocator, io, context, format, head)) {
+    var page = switch (try loadPage(allocator, io, context, snapshot.object_format, head)) {
         .loaded => |value| value,
         .failure => |failure| {
-            snapshot.deinit(allocator);
+            var owned = snapshot;
+            owned.deinit(allocator);
             return .{ .failure = failure };
         },
     };
     page.snapshot = snapshot;
     return .{ .loaded = page };
+}
+
+/// Resolve only the exact local HEAD basis used by History lifecycle checks.
+/// This intentionally omits traversal metadata, status, upstream information,
+/// remote reads, and fetches. The returned page owns only its snapshot.
+pub fn probeHead(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+) std.mem.Allocator.Error!LoadResult {
+    const format = switch (try readObjectFormat(allocator, io, context)) {
+        .format => |value| value,
+        .failure => |failure| return .{ .failure = failure },
+    };
+
+    const snapshot = switch (try readHeadSnapshot(allocator, io, context, format)) {
+        .snapshot => |value| value,
+        .failure => |failure| return .{ .failure = failure },
+    };
+    return .{ .loaded = .{ .snapshot = snapshot } };
 }
 
 pub fn loadContinuation(
@@ -798,6 +822,17 @@ test "History exact catalog pages full topology and preserves shallow raw parent
     var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
     defer environment.deinit();
     const source_context: git_command.DirectoryContext = .{ .cwd = source, .environment = &environment };
+    var probe = try probeHead(allocator, io, source_context);
+    defer probe.deinit(allocator);
+    switch (probe) {
+        .loaded => |page| {
+            try std.testing.expectEqual(@as(usize, 0), page.records.len);
+            try std.testing.expect(page.continuation == null);
+            try std.testing.expect(page.snapshot.?.head != null);
+            try std.testing.expectEqualStrings("main", page.snapshot.?.display.branch);
+        },
+        .failure => return error.ExpectedHeadProbe,
+    }
     var initial = try loadInitial(allocator, io, source_context);
     defer initial.deinit(allocator);
     const first_page = switch (initial) {
