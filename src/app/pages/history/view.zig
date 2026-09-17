@@ -17,7 +17,18 @@ const loaded_diff = @import("../../../loaded_diff.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const theme = @import("theme");
 
-const row_prefix_width: u16 = 5;
+const row_prefix_width: u16 = 4;
+
+pub const PickerMarker = struct {
+    pub const range_anchor = "A";
+    pub const range_selected = "┃";
+    pub const merge = "M";
+    pub const root = "R";
+    pub const unavailable_parent = "?";
+};
+
+pub const range_footer_text = "Range: " ++ PickerMarker.range_anchor ++
+    " anchor · " ++ PickerMarker.range_selected ++ " selected";
 
 pub const ViewContext = struct {
     page_state: *const history_page.HistoryPageState,
@@ -169,7 +180,7 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
             if (page.catalog.records.items.len == 1) "" else "s",
         },
     );
-    try drawClipped(surface, 0, 0, head_text, context.palette.boldStyle(.accent));
+    try drawClipped(surface, 2, 0, head_text, context.palette.boldStyle(.accent));
 
     const previous = if (page.acceptedContextChanged())
         try previousDiffLabel(surface.frameAllocator(), page.accepted.?)
@@ -207,10 +218,7 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
                 "  ·  loading…"
             else
                 "";
-            const labels = if (size.width >= 100)
-                "    commit   subject  [A anchor  │ range  M merge  R root  ? unavailable]"
-            else
-                "    commit   subject  [A anchor  │ range  M/R type]";
+            const labels = "    commit   subject";
             break :blk try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}", .{ labels, suffix });
         };
         try drawClipped(surface, 0, 1, columns, context.palette.style(.muted));
@@ -222,23 +230,29 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
         if (row >= size.height) break;
         const focused = index == page.catalog.cursor;
         if (index == page.catalog.records.items.len) {
-            const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s}  … ", .{if (focused) "›" else " "});
+            const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s} … ", .{if (focused) "›" else " "});
             try drawClipped(surface, 0, row, markers, if (focused) context.palette.boldStyle(.accent) else context.palette.style(.prompt));
             const label = if (page.load_state == .loading) "Loading older commits…" else "Load 200 older commits…";
             try drawClipped(surface, row_prefix_width, row, label, if (focused) context.palette.boldStyle(.prompt) else context.palette.style(.prompt));
             continue;
         }
         const record = &page.catalog.records.items[index];
-        const range_marker: []const u8 = if (page.draft.anchor()) |anchor|
-            if (index == anchor) "A" else if (page.draft.contains(page.catalog.cursor, index)) "│" else " "
+        const range_marker: ?[]const u8 = if (page.draft.anchor()) |anchor|
+            if (index == anchor)
+                PickerMarker.range_anchor
+            else if (page.draft.contains(page.catalog.cursor, index))
+                PickerMarker.range_selected
+            else
+                null
         else
-            " ";
-        const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s} {s} ", .{
+            null;
+        const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}{s} ", .{
             if (focused) "›" else " ",
-            range_marker,
+            range_marker orelse " ",
             topologyMarker(record),
         });
         try drawClipped(surface, 0, row, markers, if (focused) context.palette.boldStyle(.accent) else context.palette.style(.muted));
+        if (range_marker) |marker| try drawClipped(surface, 1, row, marker, context.palette.boldStyle(.accent));
         const line = try commitRowTextAlloc(surface.frameAllocator(), record, page.render_now_unix, size.width -| row_prefix_width);
         try drawClipped(surface, row_prefix_width, row, line, if (focused) context.palette.boldStyle(.foreground) else context.palette.style(.foreground));
     }
@@ -387,9 +401,9 @@ fn previousDiffLabel(allocator: std.mem.Allocator, accepted: history_page.Accept
 
 fn topologyMarker(record: *const git_history.Record) []const u8 {
     return switch (record.first_parent) {
-        .true_root => "R",
-        .missing => "?",
-        .available => if (record.parent_count > 1) "M" else " ",
+        .true_root => PickerMarker.root,
+        .missing => PickerMarker.unavailable_parent,
+        .available => if (record.parent_count > 1) PickerMarker.merge else " ",
     };
 }
 
@@ -514,9 +528,23 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "History  main @ 1111111") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "catalog head") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, " A M 1111111") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "›│ R 3333333") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, " AM 1111111") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "›┃R 3333333") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "root subject") != null);
+        try rendered.expectCellText(2, 0, "H");
+        try rendered.expectCellText(row_prefix_width, 1, "c");
+        try rendered.expectCellText(row_prefix_width, 2, "1");
+
+        const expected_range_style = theme.Palette.default().boldStyle(.accent);
+        for ([_]struct { row: u16, marker: []const u8 }{
+            .{ .row = 2, .marker = PickerMarker.range_anchor },
+            .{ .row = 3, .marker = PickerMarker.range_selected },
+            .{ .row = 4, .marker = PickerMarker.range_selected },
+        }) |expected| {
+            const cell = rendered.surface.readCell(1, expected.row) orelse return error.ExpectedRangeMarker;
+            try std.testing.expectEqualStrings(expected.marker, cell.char.grapheme);
+            try std.testing.expect(cell.style.eql(expected_range_style));
+        }
         if (size.width == 120) {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ada Lovelace") != null);
         }

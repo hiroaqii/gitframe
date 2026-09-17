@@ -673,6 +673,17 @@ fn projectFooter(
             .drop_priority = .source,
         });
     }
+    if (app.active_page == .history) {
+        if (app.history) |history| {
+            if (history.page_state.current_view == .picker and history.page_state.draft.isRange()) {
+                footer_segments.append(.{
+                    .text = history_view.range_footer_text,
+                    .style = app.theme.style(.accent),
+                    .drop_priority = .source,
+                });
+            }
+        }
+    }
     const committed_footer = switch (app.active_page) {
         .history => if (app.history) |history|
             if (history.page_state.current_view == .diff) history.footer() else null
@@ -1833,10 +1844,38 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                     const footer = history.footer();
                     if (!footer.normal_action_hints_enabled) return result;
                     appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "commits", .compare_base);
-                } else if (history_input.more_row_selected) {
-                    result.append(ui.key_hint.item("Enter", "load older"), .primary);
                 } else {
-                    appendFooterAction(app, &result, key_buffers, .reload, "reload", .primary);
+                    const range_active = history.page_state.draft.isRange();
+                    if (history_input.picker_ready) {
+                        result.append(
+                            ui.key_hint.item(
+                                "Space",
+                                if (range_active)
+                                    "clear range"
+                                else if (history_input.more_row_selected)
+                                    "select commit for range"
+                                else
+                                    "start range",
+                            ),
+                            .primary,
+                        );
+                    }
+                    if (history_input.more_row_selected) {
+                        result.append(ui.key_hint.item("Enter", "load older"), .primary);
+                    } else if (history_input.picker_ready) {
+                        result.append(
+                            ui.key_hint.item(
+                                "Enter",
+                                if (range_active) "open range diff" else "open diff",
+                            ),
+                            .primary,
+                        );
+                    }
+                    if (!range_active) {
+                        appendFooterAction(app, &result, key_buffers, .reload, "reload", .secondary);
+                    } else if (!history_input.return_to_accepted) {
+                        result.append(ui.key_hint.item("Esc", "cancel range"), .secondary);
+                    }
                 }
                 if (history.page_state.current_view == .picker and
                     history_input.return_to_accepted and !history_input.loading)
@@ -2607,6 +2646,56 @@ test "footer normal-mode hints match the decided page lists" {
     });
 }
 
+test "History picker footer keeps the range action visible and explains an active range" {
+    const allocator = std.testing.allocator;
+    var harness: ShellViewTestHarness = .{};
+    var history_state: history_page.HistoryPageState = .{ .load_state = .loaded };
+    defer history_state.deinit(allocator);
+    var history_records: [1]git_history.Record = undefined;
+    history_state.catalog.records = .{ .items = &history_records, .capacity = history_records.len };
+    defer history_state.catalog.records = .empty;
+
+    var context = harness.context();
+    context.active_page = .history;
+    context.history = .{
+        .page_state = &history_state,
+        .palette = .default(),
+    };
+    var key_buffers: [footer_hint_capacity][16]u8 = undefined;
+
+    var hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Space", "start range"),
+        ui.key_hint.item("Enter", "open diff"),
+        ui.key_hint.item("r", "reload"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    history_state.draft = .{ .range = 0 };
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Space", "clear range"),
+        ui.key_hint.item("Enter", "open range diff"),
+        ui.key_hint.item("Esc", "cancel range"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    for ([_]u16{ 80, 120 }) |width| {
+        var footer: chasen.testing.TestSurface = undefined;
+        try footer.init(width, 1);
+        defer footer.deinit();
+        viewFooter(context, &footer.surface);
+        const snapshot = try footer.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, history_view.range_footer_text) != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space: clear range") != null);
+    }
+}
+
 test "footer normal-mode hints follow state and local key ownership" {
     var harness: ShellViewTestHarness = .{};
     var key_buffers: [footer_hint_capacity][16]u8 = undefined;
@@ -3149,6 +3238,30 @@ test "help popup uses effective document navigation labels and reaches its tail 
     }
 }
 
+test "History help explains every commit picker marker" {
+    var harness: ShellViewTestHarness = .{};
+    var context = harness.context();
+    context.active_page = .history;
+
+    var popup: chasen.testing.TestSurface = undefined;
+    try popup.init(100, 40);
+    defer popup.deinit();
+    try viewHelpPopup(context, &popup.surface);
+    const snapshot = try popup.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Markers") != null);
+    for ([_][]const u8{
+        "range anchor",
+        "commit included in the selected range",
+        "merge commit",
+        "root commit",
+        "first parent unavailable",
+    }) |description| {
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, description) != null);
+    }
+}
+
 test "push error paragraph viewport max scroll follows wrapped line count" {
     const text = "ab\n\nあいz\nabcdef";
     const width: u16 = 4;
@@ -3394,8 +3507,17 @@ const help_history_items = [_]HelpItem{
     .{ .key = .{ .text = "Esc" }, .description = "cancel load/range or return to accepted diff" },
 };
 
+const help_history_marker_items = [_]HelpItem{
+    .{ .key = .{ .text = history_view.PickerMarker.range_anchor }, .description = "range anchor" },
+    .{ .key = .{ .text = history_view.PickerMarker.range_selected }, .description = "commit included in the selected range" },
+    .{ .key = .{ .text = history_view.PickerMarker.merge }, .description = "merge commit" },
+    .{ .key = .{ .text = history_view.PickerMarker.root }, .description = "root commit" },
+    .{ .key = .{ .text = history_view.PickerMarker.unavailable_parent }, .description = "first parent unavailable" },
+};
+
 const help_history_sections = [_]HelpSection{
     .{ .title = "History", .items = &help_history_items },
+    .{ .title = "Markers", .items = &help_history_marker_items },
     .{ .title = "Diff", .items = &help_diff_navigation_items },
 };
 
