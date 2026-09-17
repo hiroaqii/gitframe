@@ -367,7 +367,7 @@ pub const Controller = struct {
                         .origin = origin,
                         .generation = generation,
                     },
-                    .shell_surface, .compare_ai_review_handoff => {},
+                    .shell_surface, .compare_ai_review_handoff, .history_commit_detail => {},
                 };
             },
             .unsupported_runtime => self.setEffectStatus(pending.origin, "clipboard copy unavailable: {s}", .{pending.label}),
@@ -395,6 +395,10 @@ pub const Controller = struct {
             .shell_surface => self.diagnostics.shell.set(fmt, args),
             .compare_ai_review_handoff => if (self.diagnostics.compare_ai_review_handoff) |status|
                 status.set(fmt, args),
+            .history_commit_detail => if (self.diagnostics.history) |status|
+                status.set(fmt, args)
+            else
+                self.diagnostics.shell.set(fmt, args),
         }
     }
 };

@@ -3,9 +3,12 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
-const text_presentation = @import("chasen_ui").text_presentation;
+const ui = @import("chasen_ui");
+const text_presentation = ui.text_presentation;
+const draw = @import("draw");
 const keymap = @import("keymap");
 const branch_commit_time = @import("../../branch_commit_time.zig");
+const app_state = @import("../../state.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const page_header = @import("../../page_header.zig");
 const committed_diff_navigation = @import("../committed_diff/navigation.zig");
@@ -67,6 +70,7 @@ pub const ViewContext = struct {
     root_identity: ?root_capability.Identity = null,
     layout: diff_surface.Layout = .{ .width = 0, .height = 0 },
     keymap: keymap.Effective = .{},
+    shell_status: ?*const app_state.StatusMessage = null,
 
     pub fn footer(self: ViewContext) diff_surface.view.FooterView {
         const navigation = navigationView(self);
@@ -144,6 +148,138 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         return viewDiff(context, surface);
     }
     return viewPicker(context, surface);
+}
+
+pub fn viewCommitDetail(context: ViewContext, surface: *chasen.Surface) !void {
+    const detail = context.page_state.openDetailConst() orelse return;
+    const opts: ui.Modal.ViewOptions = .{
+        .dialog_width = @min(surface.size().width, 100),
+        .dialog_height = @min(surface.size().height, 24),
+        .title = "Commit detail",
+        .backdrop = true,
+        .border = .rounded,
+        .title_style = context.palette.boldStyle(.accent),
+        .border_style = context.palette.style(.accent),
+    };
+    const frame = ui.Modal.frame(surface, opts) orelse return;
+    var dialog = frame.dialogSurface();
+    dialog.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
+    frame.view();
+    var content = frame.contentSurface();
+    const size = content.size();
+    if (size.width == 0 or size.height == 0) return;
+    const body_height = size.height -| 2;
+    if (body_height > 0) {
+        var body = content.child(.{ .col = 0, .row = 0, .width = size.width, .height = body_height });
+        _ = drawWrappedTextScrolled(
+            &body,
+            detail.snapshot.canonical_payload,
+            detail.top_visual_row,
+            chasen.TextStyle{},
+        );
+    }
+
+    if (body_height < size.height) {
+        const total = history_page.detailVisualRowCount(detail.snapshot.canonical_payload, size.width);
+        const end = @min(total, detail.top_visual_row + @as(usize, body_height));
+        const visible_status = if (context.page_state.status.text().len > 0)
+            context.page_state.status.text()
+        else if (context.shell_status) |status|
+            status.text()
+        else
+            "";
+        const indicator = if (visible_status.len > 0)
+            visible_status
+        else if (total > @as(usize, body_height))
+            try std.fmt.allocPrint(content.frameAllocator(), "Rows {d}-{d} of {d}", .{
+                @min(detail.top_visual_row + 1, total),
+                end,
+                total,
+            })
+        else
+            "";
+        const indicator_style = if (std.mem.startsWith(u8, indicator, "clipboard copy sent:"))
+            context.palette.style(.accent)
+        else if (visible_status.len > 0)
+            context.palette.style(.danger)
+        else
+            context.palette.style(.muted);
+        try draw.copyClippedTextAt(&content, 0, body_height, indicator, indicator_style);
+    }
+    if (body_height +| 1 < size.height) {
+        const items = [_]ui.key_hint.Item{
+            ui.key_hint.item("y", "copy"),
+            ui.key_hint.item("j/k PgUp/PgDn Home/End", "scroll"),
+            ui.key_hint.item("i/Esc/q", "close"),
+        };
+        _ = try ui.key_hint.draw(&content, 0, body_height + 1, &items, .{
+            .key_style = context.palette.boldStyle(.accent),
+            .action_style = context.palette.style(.muted),
+        });
+    }
+}
+
+pub fn detailContentSize(size: chasen.Size) history_page.DetailSize {
+    const overlay: chasen.Rect = .{ .col = 0, .row = 0, .width = size.width, .height = size.height };
+    const dialog = ui.Modal.dialogRectFor(overlay, .{
+        .dialog_width = @min(size.width, 100),
+        .dialog_height = @min(size.height, 24),
+    });
+    const content = ui.Modal.contentRectFor(dialog, .{ .top = 1, .right = 1, .bottom = 1, .left = 1 });
+    return .{ .width = content.width, .height = content.height -| 2 };
+}
+
+fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: usize, style: chasen.TextStyle) usize {
+    const size = surface.size();
+    if (size.width == 0 or size.height == 0) return 0;
+    const clamped_scroll = @min(scroll, history_page.detailMaxOffset(text, .{
+        .width = size.width,
+        .height = size.height,
+    }));
+    var logical_row: usize = 0;
+    var drawn_rows: usize = 0;
+    var line_start: usize = 0;
+    var line_end: usize = 0;
+    var line_width: u32 = 0;
+    var iter = chasen.text.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        if (bytes.len == 1 and bytes[0] == '\n') {
+            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style)) return drawn_rows;
+            logical_row += 1;
+            line_start = grapheme.start + grapheme.len;
+            line_end = line_start;
+            line_width = 0;
+            continue;
+        }
+        const grapheme_width = chasen.text.displayWidth(bytes);
+        if (line_width > 0 and line_width + grapheme_width > size.width) {
+            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style)) return drawn_rows;
+            logical_row += 1;
+            line_start = grapheme.start;
+            line_end = grapheme.start;
+            line_width = 0;
+        }
+        line_end = grapheme.start + grapheme.len;
+        line_width += grapheme_width;
+    }
+    _ = drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style);
+    return drawn_rows;
+}
+
+fn drawWrappedLine(
+    surface: *chasen.Surface,
+    line: []const u8,
+    logical_row: usize,
+    scroll: usize,
+    drawn_rows: *usize,
+    style: chasen.TextStyle,
+) bool {
+    if (logical_row < scroll) return false;
+    if (drawn_rows.* >= @as(usize, surface.size().height)) return true;
+    _ = surface.borrowTextAt(0, @intCast(drawn_rows.*), line, style);
+    drawn_rows.* += 1;
+    return drawn_rows.* >= @as(usize, surface.size().height);
 }
 
 fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
@@ -1022,4 +1158,75 @@ test "History fixed row fields clip ASCII wide and combining metadata without ov
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "1970-01-01") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "author suffix") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "subject without refs") != null);
+}
+
+test "History commit detail reaches a 16 KiB ASCII wide combining document and copies it whole" {
+    const allocator = std.testing.allocator;
+    const oid = try git_history.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const tail = "TAIL-猫-e\u{301}";
+    const subject = try allocator.alloc(u8, 16 * 1024);
+    @memset(subject, 's');
+    @memcpy(subject[subject.len - tail.len ..], tail);
+    const author = try allocator.dupe(u8, "Long Author");
+    const committed = try allocator.dupe(u8, "2024-09-01 12:35:23 +00:00");
+    const decorations = try allocator.dupe(u8, "HEAD -> main, tag: wide-猫");
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "Commit: {s}\nAuthor: {s}\nCommitted: {s}\nRefs: {s}\nSubject: {s}",
+        .{ oid.slice(), author, committed, decorations, subject },
+    );
+    var page_state: history_page.HistoryPageState = .{ .detail = .{ .open = .{
+        .snapshot = .{
+            .oid = oid,
+            .author = author,
+            .committed = committed,
+            .decorations = decorations,
+            .subject = subject,
+            .canonical_payload = payload,
+        },
+        .modal_instance_id = 1,
+    } } };
+    defer page_state.deinit(allocator);
+    var shell_status: app_state.StatusMessage = .{};
+    const context: ViewContext = .{
+        .page_state = &page_state,
+        .palette = .default(),
+        .shell_status = &shell_status,
+    };
+
+    const size: chasen.Size = .{ .width = 80, .height = 24 };
+    var rendered: chasen.testing.TestSurface = undefined;
+    try rendered.init(size.width, size.height);
+    defer rendered.deinit();
+    try viewCommitDetail(context, &rendered.surface);
+    const start = try rendered.snapshot(allocator);
+    defer allocator.free(start);
+    try std.testing.expect(std.mem.indexOf(u8, start, "Commit detail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, start, "Commit: 0123456789abcdef") != null);
+    try std.testing.expect(std.mem.indexOf(u8, start, "Rows 1-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, start, "y: copy") != null);
+
+    shell_status.set("close History commit detail before switching pages", .{});
+    try viewCommitDetail(context, &rendered.surface);
+    const blocked = try rendered.snapshot(allocator);
+    defer allocator.free(blocked);
+    try std.testing.expect(std.mem.indexOf(u8, blocked, shell_status.text()) != null);
+    shell_status.clear();
+
+    const content_size = detailContentSize(size);
+    page_state.scrollDetail(.end, content_size);
+    try viewCommitDetail(context, &rendered.surface);
+    const end = try rendered.snapshot(allocator);
+    defer allocator.free(end);
+    try std.testing.expect(std.mem.indexOf(u8, end, "e\u{301}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, end, " of ") != null);
+    const copy = page_state.beginDetailCopy().?;
+    try std.testing.expectEqual(payload.len, copy.payload.len);
+    try std.testing.expectEqualStrings(payload, copy.payload);
+
+    page_state.clampDetailViewport(detailContentSize(.{ .width = 120, .height = 32 }));
+    try std.testing.expectEqual(
+        history_page.detailMaxOffset(payload, detailContentSize(.{ .width = 120, .height = 32 })),
+        page_state.openDetailConst().?.top_visual_row,
+    );
 }

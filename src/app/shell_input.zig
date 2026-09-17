@@ -143,6 +143,27 @@ pub const View = struct {
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
         if (self.command_line_active) return null;
         if (self.active_page == .ai_reviews and self.ai_reviews.key.human_review.open) return null;
+        if (self.active_page == .history and self.history.key.detail_open) {
+            if (mouse.type != .press) return null;
+            switch (mouse.button) {
+                .wheel_up => return .{ .history = .{ .scroll_detail = .row_up } },
+                .wheel_down => return .{ .history = .{ .scroll_detail = .row_down } },
+                .left => if (self.layout.page_bar) |bar| {
+                    if (self.layout.terminalToContent(mouse.col, mouse.row)) |point| {
+                        if (point.row == app_shell_layout.page_bar_label_row) {
+                            const compact = self.layout.body.height == 0 or self.layout.footer.height == 0;
+                            const target = if (compact)
+                                if (point.col >= 1 and point.col < @min(bar.width, self.active_page.label().len + 3)) self.active_page else null
+                            else
+                                page.tabAtColumn(bar.width, point.col);
+                            if (target) |id| return .{ .switch_page = id };
+                        }
+                    }
+                },
+                else => {},
+            }
+            return null;
+        }
         if (self.activeDiffSelectionOwner()) |selection| {
             if (selection.active()) switch (selection) {
                 .changes => switch (mouse.type) {
@@ -838,4 +859,29 @@ test "History routes committed diff and bounded picker wheel through the shell" 
         picker_view.handleEvent(picker_wheel_up).?,
     );
     try std.testing.expect(picker_view.handleEvent(picker_wheel_down) == null);
+
+    var detail_view = picker_view;
+    detail_view.history.key = .{ .detail_open = true };
+    try std.testing.expectEqual(
+        app_message.Msg{ .history = .{ .scroll_detail = .row_down } },
+        detail_view.handleEvent(picker_wheel_down).?,
+    );
+    try std.testing.expect(detail_view.handleEvent(.{ .mouse = .{
+        .col = terminal_col,
+        .row = terminal_row,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } }) == null);
+    const compare_tab = page.tab(.compare);
+    try std.testing.expectEqual(
+        app_message.Msg{ .switch_page = .compare },
+        detail_view.handleEvent(.{ .mouse = .{
+            .col = @intCast(layout.content.col + compare_tab.col),
+            .row = @intCast(layout.content.row + app_shell_layout.page_bar_label_row),
+            .button = .left,
+            .mods = .{},
+            .type = .press,
+        } }).?,
+    );
 }

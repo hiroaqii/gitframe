@@ -459,6 +459,7 @@ pub const App = struct {
             .layout = .{ .width = body_size.width, .height = body_size.height },
             .mode_toggle_hint_width = self.displayModeToggleHintWidth(.history),
             .env_map = self.env_map,
+            .detail_overlay_size = self.shellLayout().contentSize(),
         };
     }
 
@@ -704,6 +705,10 @@ pub const App = struct {
                     .modal_instance_id = authority.modal_instance_id,
                     .copy_generation = authority.copy_generation,
                 } else null,
+                .history_commit_detail = if (self.pages.history.currentDetailCopyAuthority()) |authority| .{
+                    .modal_instance_id = authority.modal_instance_id,
+                    .copy_generation = authority.copy_generation,
+                } else null,
             },
             .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
@@ -831,6 +836,7 @@ pub const App = struct {
                 self.pages.repository.cancelMouseOwner();
                 self.terminal_size = size;
                 self.compareCoordinator().clampAiReviewHandoffViewport();
+                self.historyCoordinator().clampDetailViewport();
                 self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
                     self.changesNavigation().clearMouseDiffSelection();
@@ -1957,6 +1963,7 @@ pub const App = struct {
                 .root_identity = repo_view.activeIdentity(),
                 .layout = .{ .width = body_size.width, .height = body_size.height },
                 .keymap = self.keymap,
+                .shell_status = &self.status,
             },
             .active_page = self.active_page,
             .page_bar_visible = true,
@@ -2660,6 +2667,44 @@ test "command line keeps input across resize and cancels on focus or page transi
     try std.testing.expect(app.commandLineView() != null);
     try app.update(.{ .switch_page = .config }, &tc.ctx);
     try std.testing.expect(app.commandLineView() == null);
+}
+
+test "History commit detail copy is wired through the root shell effect terminal" {
+    const allocator = std.testing.allocator;
+    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .history,
+        .terminal_size = .{ .width = 80, .height = 24 },
+        .pages = .{ .history = .{ .detail = .{ .open = .{
+            .snapshot = .{
+                .oid = oid,
+                .author = try allocator.dupe(u8, "Author"),
+                .committed = try allocator.dupe(u8, "2024-09-01 12:35:23 +00:00"),
+                .decorations = try allocator.dupe(u8, "main"),
+                .subject = try allocator.dupe(u8, "subject"),
+                .canonical_payload = try allocator.dupe(u8, "Commit: 0123456789abcdef0123456789abcdef01234567"),
+            },
+            .modal_instance_id = 2,
+        } } } },
+    };
+    defer app.pages.history.deinit(allocator);
+    defer app.shell_effects_state.deinit(allocator);
+    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    defer tc.resetTransient();
+    defer tc.ctx.runtimeClearPendingEffectCopies();
+
+    try app.update(.{ .history = .copy_detail }, &tc.ctx);
+    try std.testing.expectEqual(@as(usize, 1), app.shellEffectsView().pendingClipboardCount());
+    try std.testing.expectEqual(@as(u64, 1), app.pages.history.currentDetailCopyAuthority().?.copy_generation);
+    const request_id = tc.ctx._pending_clipboard_copies[0].request_id;
+
+    try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+        .request_id = request_id,
+        .outcome = .sent,
+    } } }, &tc.ctx);
+    try std.testing.expectEqual(@as(usize, 0), app.shellEffectsView().pendingClipboardCount());
+    try std.testing.expectEqualStrings("clipboard copy sent: History commit detail", app.pages.history.status.text());
 }
 
 fn installReviewStoreRepositoryForTest(app: *App, allocator: std.mem.Allocator) !void {

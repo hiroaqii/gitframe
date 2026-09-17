@@ -221,6 +221,34 @@ test "page transition blocker leaves page and Changes state unchanged" {
     try std.testing.expect(app.pages.compare.activation.state == .inactive);
 }
 
+test "History commit detail blocks direct page switch without releasing owned state" {
+    const allocator = std.testing.allocator;
+    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    var app: TestApp = .{
+        .allocator = allocator,
+        .active_page = .history,
+        .pages = .{ .history = .{ .detail = .{ .open = .{
+            .snapshot = .{
+                .oid = oid,
+                .author = try allocator.dupe(u8, "Author"),
+                .committed = try allocator.dupe(u8, "2024-09-01 12:35:23 +00:00"),
+                .decorations = try allocator.dupe(u8, "main"),
+                .subject = try allocator.dupe(u8, "subject"),
+                .canonical_payload = try allocator.dupe(u8, "Commit: 0123456789abcdef0123456789abcdef01234567"),
+            },
+            .modal_instance_id = 1,
+        } } } },
+    };
+    defer app.pages.history.deinit(allocator);
+    var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
+
+    try app.update(.{ .switch_page = .compare }, &ctx);
+
+    try std.testing.expectEqual(page.Id.history, app.active_page);
+    try std.testing.expect(app.pages.history.detailOpen());
+    try std.testing.expectEqualStrings("close History commit detail before switching pages", app.status.text());
+}
+
 test "Compare transient owners block transitions while direct AI Run reload does not" {
     const allocator = std.testing.allocator;
     var app: TestApp = .{ .allocator = allocator, .active_page = .compare };

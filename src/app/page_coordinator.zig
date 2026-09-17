@@ -188,6 +188,7 @@ pub const Controller = struct {
             .changes_file_search = active == .changes and self.changes.file_search.mode,
             .history_search = active == .history and self.history.diff.search.mode,
             .history_file_search = active == .history and self.history.diff.file_search.mode,
+            .history_commit_detail = active == .history and self.history.detailOpen(),
             .compare_search = active == .compare and self.compare.diff.search.mode,
             .compare_file_search = active == .compare and self.compare.diff.file_search.mode,
             .ai_reviews_search = active == .ai_reviews and self.ai_reviews.diff.search.mode,

@@ -36,10 +36,22 @@ pub const CompareAiReviewHandoffAuthority = struct {
     copy_generation: u64,
 };
 
+pub const HistoryCommitDetailOrigin = struct {
+    page: PageOrigin,
+    modal_instance_id: u64,
+    copy_generation: u64,
+};
+
+pub const HistoryCommitDetailAuthority = struct {
+    modal_instance_id: u64,
+    copy_generation: u64,
+};
+
 pub const Origin = union(enum) {
     page: PageOrigin,
     shell_surface: ShellSurfaceOrigin,
     compare_ai_review_handoff: CompareAiReviewHandoffOrigin,
+    history_commit_detail: HistoryCommitDetailOrigin,
 };
 
 pub const Liveness = enum {
@@ -61,6 +73,7 @@ pub const Snapshot = struct {
     push_error_instance_id: ?u64,
     commit_panel_instance_id: ?u64,
     compare_ai_review_handoff: ?CompareAiReviewHandoffAuthority = null,
+    history_commit_detail: ?HistoryCommitDetailAuthority = null,
 };
 
 pub fn classify(origin: Origin, current: Snapshot) Liveness {
@@ -78,6 +91,14 @@ pub fn classify(origin: Origin, current: Snapshot) Liveness {
             const page_liveness = classifyPage(captured.page, current);
             if (page_liveness == .stale) break :blk .stale;
             const authority = current.compare_ai_review_handoff orelse break :blk .stale;
+            if (authority.modal_instance_id != captured.modal_instance_id or
+                authority.copy_generation != captured.copy_generation) break :blk .stale;
+            break :blk page_liveness;
+        },
+        .history_commit_detail => |captured| blk: {
+            const page_liveness = classifyPage(captured.page, current);
+            if (page_liveness == .stale) break :blk .stale;
+            const authority = current.history_commit_detail orelse break :blk .stale;
             if (authority.modal_instance_id != captured.modal_instance_id or
                 authority.copy_generation != captured.copy_generation) break :blk .stale;
             break :blk page_liveness;
@@ -194,5 +215,38 @@ test "AI Review Handoff origin requires exact modal instance and latest copy gen
     try @import("std").testing.expectEqual(Liveness.stale, classify(old_copy, current));
     var closed = current;
     closed.compare_ai_review_handoff = null;
+    try @import("std").testing.expectEqual(Liveness.stale, classify(exact, closed));
+}
+
+test "History commit detail origin requires live page exact instance and latest generation" {
+    const current: Snapshot = .{
+        .active_page = .history,
+        .repo_epoch = 8,
+        .changes_activation_id = 1,
+        .repository_activation_id = 2,
+        .history_activation_id = 3,
+        .compare_activation_id = 4,
+        .ai_reviews_activation_id = 5,
+        .push_error_instance_id = null,
+        .commit_panel_instance_id = null,
+        .history_commit_detail = .{ .modal_instance_id = 6, .copy_generation = 7 },
+    };
+    const exact: Origin = .{ .history_commit_detail = .{
+        .page = .{ .page_id = .history, .repo_epoch = 8, .activation_id = 3 },
+        .modal_instance_id = 6,
+        .copy_generation = 7,
+    } };
+    try @import("std").testing.expectEqual(Liveness.live_active, classify(exact, current));
+    var old_generation = exact;
+    old_generation.history_commit_detail.copy_generation = 6;
+    try @import("std").testing.expectEqual(Liveness.stale, classify(old_generation, current));
+    var replaced = current;
+    replaced.history_commit_detail.?.modal_instance_id = 9;
+    try @import("std").testing.expectEqual(Liveness.stale, classify(exact, replaced));
+    var inactive = current;
+    inactive.active_page = .changes;
+    try @import("std").testing.expectEqual(Liveness.live_inactive, classify(exact, inactive));
+    var closed = current;
+    closed.history_commit_detail = null;
     try @import("std").testing.expectEqual(Liveness.stale, classify(exact, closed));
 }

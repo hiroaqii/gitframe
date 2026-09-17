@@ -6,7 +6,17 @@ const keymap = @import("keymap");
 const key_input = @import("../../key_input.zig");
 const committed_diff_input = @import("../committed_diff/input.zig");
 
+pub const DetailScrollAction = enum {
+    row_up,
+    row_down,
+    page_up,
+    page_down,
+    home,
+    end,
+};
+
 pub const Context = struct {
+    detail_open: bool = false,
     loading: bool = false,
     diff_view: bool = false,
     more_row_selected: bool = false,
@@ -32,11 +42,16 @@ pub const Msg = union(enum) {
     unsupported_search,
     load_diff,
     open_picker,
+    open_detail,
+    close_detail,
+    copy_detail,
+    scroll_detail: DetailScrollAction,
     common: committed_diff_input.Msg,
     owned_noop,
 };
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
+    if (context.detail_open) return detailKeyToMsg(key);
     if (context.loading) {
         if (key.matches(chasen.Key.escape, .{})) return .cancel_load;
         return .owned_noop;
@@ -65,6 +80,7 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
         if (context.picker_ready) return .load_diff;
     }
     if (context.picker_ready and !key_input.hasCommandModifier(key)) {
+        if (key.codepoint == 'i') return .open_detail;
         if (key.codepoint == ' ') return .toggle_range;
         if (key.codepoint == '/') return .unsupported_search;
     }
@@ -74,13 +90,29 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
 }
 
 pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
+    if (context.detail_open) return .owned_noop;
     if (!context.diff_view) return .owned_noop;
     return .{ .common = committed_diff_input.pasteToMsg(context.common, text) orelse return null };
 }
 
 pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?Msg {
-    if (!context.diff_view or context.loading) return null;
+    if (context.detail_open or !context.diff_view or context.loading) return null;
     return .{ .common = committed_diff_input.selectionKeyToMsg(context.common, key) orelse return null };
+}
+
+fn detailKeyToMsg(key: chasen.Key) ?Msg {
+    if (key.matches(chasen.Key.escape, .{}) or
+        (!key_input.hasCommandModifier(key) and (key.codepoint == 'i' or key.codepoint == 'q'))) return .close_detail;
+    if (!key_input.hasCommandModifier(key) and key.codepoint == 'y') return .copy_detail;
+    if (key.matches(chasen.Key.up, .{}) or
+        (!key_input.hasCommandModifier(key) and key.codepoint == 'k')) return .{ .scroll_detail = .row_up };
+    if (key.matches(chasen.Key.down, .{}) or
+        (!key_input.hasCommandModifier(key) and key.codepoint == 'j')) return .{ .scroll_detail = .row_down };
+    if (key.matches(chasen.Key.page_up, .{})) return .{ .scroll_detail = .page_up };
+    if (key.matches(chasen.Key.page_down, .{})) return .{ .scroll_detail = .page_down };
+    if (key.matches(chasen.Key.home, .{})) return .{ .scroll_detail = .home };
+    if (key.matches(chasen.Key.end, .{})) return .{ .scroll_detail = .end };
+    return null;
 }
 
 fn matches(effective: keymap.Effective, action: keymap.PublicAction, key: chasen.Key) bool {
@@ -110,4 +142,15 @@ test "History picker owns range cancel and unsupported search" {
         Msg.cancel_draft,
         keyToMsg(.{ .return_to_accepted = true }, .{ .codepoint = chasen.Key.escape }).?,
     );
+}
+
+test "History commit detail owns close copy and scrolling" {
+    const detail: Context = .{ .detail_open = true };
+    try @import("std").testing.expectEqual(Msg.close_detail, keyToMsg(detail, .{ .codepoint = chasen.Key.escape }).?);
+    try @import("std").testing.expectEqual(Msg.close_detail, keyToMsg(detail, .{ .codepoint = 'i' }).?);
+    try @import("std").testing.expectEqual(Msg.close_detail, keyToMsg(detail, .{ .codepoint = 'q' }).?);
+    try @import("std").testing.expectEqual(Msg.copy_detail, keyToMsg(detail, .{ .codepoint = 'y' }).?);
+    try @import("std").testing.expectEqual(Msg{ .scroll_detail = .row_down }, keyToMsg(detail, .{ .codepoint = 'j' }).?);
+    try @import("std").testing.expect(keyToMsg(detail, .{ .codepoint = '1' }) == null);
+    try @import("std").testing.expectEqual(Msg.owned_noop, pasteToMsg(detail, "hidden").?);
 }

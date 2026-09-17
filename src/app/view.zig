@@ -204,6 +204,11 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.active_page == .compare and app.compare.page.ai_review_handoff.open) {
         try compare_view.viewAiReviewHandoff(app.compare, surface);
     }
+    if (app.active_page == .history) {
+        if (app.history) |history| if (history.page_state.detailOpen()) {
+            try history_view.viewCommitDetail(history, surface);
+        };
+    }
     if (app.active_page == .ai_reviews and app.ai_reviews.page.picker.isPickerVisible()) {
         try ai_reviews_view.viewPicker(app.ai_reviews, surface);
     }
@@ -1870,6 +1875,7 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                             ),
                             .primary,
                         );
+                        result.append(ui.key_hint.item("i", "inspect"), .secondary);
                     }
                     if (!range_active) {
                         appendFooterAction(app, &result, key_buffers, .reload, "reload", .secondary);
@@ -2667,6 +2673,7 @@ test "History picker footer keeps the range action visible and explains an activ
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("Space", "start range"),
         ui.key_hint.item("Enter", "open diff"),
+        ui.key_hint.item("i", "inspect"),
         ui.key_hint.item("r", "reload"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2678,6 +2685,7 @@ test "History picker footer keeps the range action visible and explains an activ
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("Space", "clear range"),
         ui.key_hint.item("Enter", "open range diff"),
+        ui.key_hint.item("i", "inspect"),
         ui.key_hint.item("Esc", "cancel range"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -3503,6 +3511,7 @@ const help_history_items = [_]HelpItem{
     .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last catalog row" },
     .{ .key = .{ .text = "Space" }, .description = "start / clear a contiguous range" },
     .{ .key = .{ .text = "Enter" }, .description = "open selected diff / load older commits" },
+    .{ .key = .{ .text = "i" }, .description = "inspect selected commit metadata; y copies it" },
     .{ .key = .{ .text = "m" }, .description = "choose commits from an accepted diff" },
     .{ .key = .{ .action = .reload }, .description = "recheck and reload exact current HEAD" },
     .{ .key = .{ .text = "/" }, .description = "search diff; commit search unavailable" },

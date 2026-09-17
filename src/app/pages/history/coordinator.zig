@@ -10,6 +10,7 @@ const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const effect_origin = @import("../../effect_origin.zig");
 const repo_session = @import("../../repo_session.zig");
 const history_page = @import("../history.zig");
+const history_view = @import("view.zig");
 const committed_diff_coordinator = @import("../committed_diff/coordinator.zig");
 const committed_diff_navigation = @import("../committed_diff/navigation.zig");
 
@@ -40,6 +41,7 @@ pub const Controller = struct {
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
     env_map: ?*const std.process.Environ.Map,
+    detail_overlay_size: chasen.Size = .{ .width = 0, .height = 0 },
 
     pub fn refresh(self: Controller, allocator: std.mem.Allocator) void {
         self.page_state.requestReload(allocator);
@@ -78,6 +80,13 @@ pub const Controller = struct {
             },
             .load_diff => try self.startDiff(ctx),
             .open_picker => self.page_state.openPicker(ctx.allocator()),
+            .open_detail => self.page_state.openDetail(ctx.allocator()),
+            .close_detail => self.page_state.closeDetail(ctx.allocator()),
+            .copy_detail => return self.copyDetail(),
+            .scroll_detail => |action| self.page_state.scrollDetail(
+                action,
+                history_view.detailContentSize(self.detail_overlay_size),
+            ),
             else => self.page_state.applyInput(msg, self.body_size.height),
         }
         return .{};
@@ -160,6 +169,10 @@ pub const Controller = struct {
         };
     }
 
+    pub fn clampDetailViewport(self: Controller) void {
+        self.page_state.clampDetailViewport(history_view.detailContentSize(self.detail_overlay_size));
+    }
+
     fn startDiff(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         if (self.active_page != .history) return;
         const request = self.page_state.beginDiffRequest() orelse return;
@@ -211,6 +224,19 @@ pub const Controller = struct {
             .effect_origin = self.pageOrigin(),
             .branch_unavailable_message = "branch switching is not available in History",
         };
+    }
+
+    fn copyDetail(self: Controller) UpdateOutcome {
+        const copy = self.page_state.beginDetailCopy() orelse return .{};
+        return .{ .clipboard = .{
+            .origin = .{ .history_commit_detail = .{
+                .page = self.pageOrigin(),
+                .modal_instance_id = copy.modal_instance_id,
+                .copy_generation = copy.copy_generation,
+            } },
+            .label = "History commit detail",
+            .text = copy.payload,
+        } };
     }
 
     fn currentIdentity(self: Controller) ?app_page.RequestIdentity {

@@ -15,6 +15,7 @@ pub const Blocker = enum {
     changes_file_search,
     history_search,
     history_file_search,
+    history_commit_detail,
     compare_search,
     compare_file_search,
     ai_reviews_search,
@@ -47,6 +48,7 @@ pub const Blocker = enum {
             .changes_file_search => "finish file search before switching pages",
             .history_search => "finish History search before switching pages",
             .history_file_search => "finish History file search before switching pages",
+            .history_commit_detail => "close History commit detail before switching pages",
             .compare_search => "finish Compare search before switching pages",
             .compare_file_search => "finish Compare file search before switching pages",
             .ai_reviews_search => "finish AI Reviews search before switching pages",
@@ -81,6 +83,7 @@ pub const Snapshot = struct {
     changes_file_search: bool = false,
     history_search: bool = false,
     history_file_search: bool = false,
+    history_commit_detail: bool = false,
     compare_search: bool = false,
     compare_file_search: bool = false,
     ai_reviews_search: bool = false,
@@ -125,6 +128,7 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.changes_file_search) return .{ .blocked = .changes_file_search };
     if (snapshot.history_search) return .{ .blocked = .history_search };
     if (snapshot.history_file_search) return .{ .blocked = .history_file_search };
+    if (snapshot.history_commit_detail) return .{ .blocked = .history_commit_detail };
     if (snapshot.compare_search) return .{ .blocked = .compare_search };
     if (snapshot.compare_file_search) return .{ .blocked = .compare_file_search };
     if (snapshot.ai_reviews_search) return .{ .blocked = .ai_reviews_search };
@@ -176,6 +180,7 @@ test "every blocker prevents transitions between independent pages" {
         .{ .blocker = .changes_file_search, .snapshot = .{ .changes_file_search = true } },
         .{ .blocker = .history_search, .snapshot = .{ .history_search = true } },
         .{ .blocker = .history_file_search, .snapshot = .{ .history_file_search = true } },
+        .{ .blocker = .history_commit_detail, .snapshot = .{ .history_commit_detail = true } },
         .{ .blocker = .compare_search, .snapshot = .{ .compare_search = true } },
         .{ .blocker = .compare_file_search, .snapshot = .{ .compare_file_search = true } },
         .{ .blocker = .ai_reviews_search, .snapshot = .{ .ai_reviews_search = true } },
