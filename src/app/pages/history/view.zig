@@ -222,11 +222,12 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
         const row: u16 = @intCast(1 + index - range.start);
         if (row >= size.height) break;
         const focused = index == page.catalog.cursor;
+        if (focused) fillSelectedRow(surface, row, context.palette.color(.pane_cursor_bg));
         if (index == page.catalog.records.items.len) {
             const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s} … ", .{if (focused) "›" else " "});
-            try drawClipped(surface, 0, row, markers, if (focused) context.palette.boldStyle(.accent) else context.palette.style(.prompt));
+            try drawClipped(surface, 0, row, markers, catalogStyle(context.palette, .prompt, focused));
             const label = if (page.load_state == .loading) "Loading older commits…" else "Load 200 older commits…";
-            try drawClipped(surface, row_prefix_width, row, label, if (focused) context.palette.boldStyle(.prompt) else context.palette.style(.prompt));
+            try drawClipped(surface, row_prefix_width, row, label, catalogStyle(context.palette, .prompt, focused));
             continue;
         }
         const record = &page.catalog.records.items[index];
@@ -244,14 +245,9 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
             range_marker orelse " ",
             topologyMarker(record),
         });
-        try drawClipped(surface, 0, row, markers, if (focused) context.palette.boldStyle(.accent) else context.palette.style(.muted));
-        if (range_marker) |marker| try drawClipped(surface, 1, row, marker, context.palette.boldStyle(.accent));
-        try drawCommitRow(
-            surface,
-            row,
-            record,
-            if (focused) context.palette.boldStyle(.foreground) else context.palette.style(.foreground),
-        );
+        try drawClipped(surface, 0, row, markers, catalogStyle(context.palette, if (focused) .accent else .info, focused));
+        if (range_marker) |marker| try drawClipped(surface, 1, row, marker, rangeMarkerStyle(context.palette, focused));
+        try drawCommitRow(surface, row, record, context.palette, focused);
     }
 }
 
@@ -489,10 +485,18 @@ fn drawCommitRow(
     surface: *chasen.Surface,
     row: u16,
     record: *const git_history.Record,
-    style: chasen.TextStyle,
+    palette: theme.Palette,
+    focused: bool,
 ) !void {
     const layout = CommitRowLayout.init(surface.size().width);
-    try drawClippedField(surface, layout.commit.col, row, layout.commit.width, record.oid.short(), style);
+    try drawClippedField(
+        surface,
+        layout.commit.col,
+        row,
+        layout.commit.width,
+        record.oid.short(),
+        catalogStyle(palette, .accent, focused),
+    );
     const formatted_date = branch_commit_time.formatDateUtc(record.committer_unix);
     try drawClippedField(
         surface,
@@ -500,10 +504,17 @@ fn drawCommitRow(
         row,
         layout.date.width,
         if (formatted_date) |*value| value[0..] else "—",
-        style,
+        catalogStyle(palette, .muted, focused),
     );
-    try drawClippedField(surface, layout.author.col, row, layout.author.width, record.author, style);
-    try drawSummaryFields(surface, row, layout.summary, record, style);
+    try drawClippedField(
+        surface,
+        layout.author.col,
+        row,
+        layout.author.width,
+        record.author,
+        catalogStyle(palette, .info, focused),
+    );
+    try drawSummaryFields(surface, row, layout.summary, record, palette, focused);
 }
 
 fn drawSummaryFields(
@@ -511,25 +522,62 @@ fn drawSummaryFields(
     row: u16,
     field: FieldLayout,
     record: *const git_history.Record,
-    style: chasen.TextStyle,
+    palette: theme.Palette,
+    focused: bool,
 ) !void {
     if (field.width == 0) return;
     if (record.decorations.len == 0) {
-        try drawClippedField(surface, field.col, row, field.width, record.subject, style);
+        try drawClippedField(
+            surface,
+            field.col,
+            row,
+            field.width,
+            record.subject,
+            catalogStyle(palette, .foreground, focused),
+        );
         return;
     }
 
     const refs = try std.fmt.allocPrint(surface.frameAllocator(), "[{s}]", .{record.decorations});
     const refs_width = chasen.text.displayWidth(refs);
     if (refs_width >= field.width) {
-        try drawClippedField(surface, field.col, row, field.width, refs, style);
+        try drawClippedField(surface, field.col, row, field.width, refs, catalogStyle(palette, .prompt, focused));
         return;
     }
 
-    try drawClippedField(surface, field.col, row, refs_width, refs, style);
+    try drawClippedField(surface, field.col, row, refs_width, refs, catalogStyle(palette, .prompt, focused));
     const subject_col = field.col +| refs_width +| 1;
     const subject_width = field.width -| refs_width -| 1;
-    try drawClippedField(surface, subject_col, row, subject_width, record.subject, style);
+    try drawClippedField(
+        surface,
+        subject_col,
+        row,
+        subject_width,
+        record.subject,
+        catalogStyle(palette, .foreground, focused),
+    );
+}
+
+fn catalogStyle(palette: theme.Palette, role: theme.Role, focused: bool) chasen.TextStyle {
+    var style = palette.style(role);
+    if (focused) {
+        style.bold = true;
+        style.bg = palette.color(.pane_cursor_bg);
+    }
+    return style;
+}
+
+fn rangeMarkerStyle(palette: theme.Palette, focused: bool) chasen.TextStyle {
+    var style = catalogStyle(palette, .accent, focused);
+    style.bold = true;
+    return style;
+}
+
+fn fillSelectedRow(surface: *chasen.Surface, row: u16, background: chasen.Color) void {
+    const style = chasen.TextStyle{ .bg = background };
+    for (0..surface.size().width) |col| {
+        _ = surface.borrowTextAt(@intCast(col), row, " ", style);
+    }
 }
 
 fn drawClippedField(
@@ -615,6 +663,13 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     page_state.render_now_unix = 1_720_086_400;
     page_state.draft = .{ .range = 0 };
     page_state.catalog.cursor = 2;
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@intFromEnum(theme.Role.foreground)] = .{ .rgb = .{ 13, 14, 15 } };
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 16, 17, 18 } };
 
     for ([_]chasen.Size{
         .{ .width = 80, .height = 24 },
@@ -623,7 +678,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         var rendered: chasen.testing.TestSurface = undefined;
         try rendered.init(size.width, size.height);
         defer rendered.deinit();
-        try view(.{ .page_state = &page_state, .palette = .default() }, &rendered.surface);
+        try view(.{ .page_state = &page_state, .palette = palette }, &rendered.surface);
         const snapshot = try rendered.snapshot(allocator);
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Branch main · HEAD 1111111") != null);
@@ -640,7 +695,45 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         try rendered.expectCellText(layout.author.col, 1, "A");
         try rendered.expectCellText(layout.summary.col, 1, "[");
 
-        const expected_range_style = theme.Palette.default().boldStyle(.accent);
+        const refs_width = chasen.text.displayWidth("[HEAD -> main]");
+        for ([_]struct { col: u16, role: theme.Role }{
+            .{ .col = layout.commit.col, .role = .accent },
+            .{ .col = layout.date.col, .role = .muted },
+            .{ .col = layout.author.col, .role = .info },
+            .{ .col = layout.summary.col, .role = .prompt },
+            .{ .col = layout.summary.col + refs_width + 1, .role = .foreground },
+        }) |expected| {
+            const cell = rendered.surface.readCell(expected.col, 1) orelse return error.ExpectedHistoryField;
+            try std.testing.expect(cell.style.fg.eql(palette.color(expected.role)));
+            try std.testing.expect(!cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+        }
+
+        const selected_refs_width = chasen.text.displayWidth("[root-tag]");
+        for ([_]struct { col: u16, role: theme.Role }{
+            .{ .col = layout.commit.col, .role = .accent },
+            .{ .col = layout.date.col, .role = .muted },
+            .{ .col = layout.author.col, .role = .info },
+            .{ .col = layout.summary.col, .role = .prompt },
+            .{ .col = layout.summary.col + selected_refs_width + 1, .role = .foreground },
+        }) |expected| {
+            const cell = rendered.surface.readCell(expected.col, 3) orelse return error.ExpectedSelectedHistoryField;
+            try std.testing.expect(cell.style.fg.eql(palette.color(expected.role)));
+            try std.testing.expect(cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+            try std.testing.expect(cell.style.bold);
+        }
+        try std.testing.expect(rendered.surface.readCell(size.width - 1, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+
+        const merge_marker = rendered.surface.readCell(2, 1) orelse return error.ExpectedTopologyMarker;
+        try std.testing.expectEqualStrings(PickerMarker.merge, merge_marker.char.grapheme);
+        try std.testing.expect(merge_marker.style.fg.eql(palette.color(.info)));
+        try std.testing.expect(!merge_marker.style.dim);
+        try std.testing.expect(!merge_marker.style.bg.eql(palette.color(.pane_cursor_bg)));
+        const selected_root_marker = rendered.surface.readCell(2, 3) orelse return error.ExpectedTopologyMarker;
+        try std.testing.expectEqualStrings(PickerMarker.root, selected_root_marker.char.grapheme);
+        try std.testing.expect(selected_root_marker.style.fg.eql(palette.color(.accent)));
+        try std.testing.expect(!selected_root_marker.style.dim);
+        try std.testing.expect(selected_root_marker.style.bg.eql(palette.color(.pane_cursor_bg)));
+
         for ([_]struct { row: u16, marker: []const u8 }{
             .{ .row = 1, .marker = PickerMarker.range_anchor },
             .{ .row = 2, .marker = PickerMarker.range_selected },
@@ -648,7 +741,9 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         }) |expected| {
             const cell = rendered.surface.readCell(1, expected.row) orelse return error.ExpectedRangeMarker;
             try std.testing.expectEqualStrings(expected.marker, cell.char.grapheme);
-            try std.testing.expect(cell.style.eql(expected_range_style));
+            try std.testing.expect(cell.style.fg.eql(palette.color(.accent)));
+            try std.testing.expect(cell.style.bold);
+            try std.testing.expectEqual(expected.row == 3, cell.style.bg.eql(palette.color(.pane_cursor_bg)));
         }
         if (size.width == 120) {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ada Lovelace") != null);
@@ -907,8 +1002,9 @@ test "History fixed row fields clip ASCII wide and combining metadata without ov
     var rendered: chasen.testing.TestSurface = undefined;
     try rendered.init(80, 2);
     defer rendered.deinit();
-    try drawCommitRow(&rendered.surface, 0, &record, .{});
-    try drawCommitRow(&rendered.surface, 1, &unavailable, .{});
+    const palette = theme.Palette.default();
+    try drawCommitRow(&rendered.surface, 0, &record, palette, false);
+    try drawCommitRow(&rendered.surface, 1, &unavailable, palette, false);
 
     const layout = CommitRowLayout.init(80);
     try rendered.expectCellText(layout.commit.col, 0, "1");
