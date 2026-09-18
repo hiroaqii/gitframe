@@ -1180,7 +1180,7 @@ test "repository source header renderer follows adaptive omission regions" {
     );
 
     var medium: chasen.testing.TestSurface = undefined;
-    try medium.init(59, 1);
+    try medium.init(56, 1);
     defer medium.deinit();
     try drawSourceHeader(&medium.surface, presentation, .{}, false, false, .default());
     const medium_snapshot = try medium.snapshot(std.testing.allocator);

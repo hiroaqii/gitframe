@@ -28,6 +28,14 @@ pub const Exact = struct {
     }
 };
 
+pub const Minute = struct {
+    bytes: [23]u8,
+
+    pub fn text(self: *const Minute) []const u8 {
+        return &self.bytes;
+    }
+};
+
 pub fn isDisplayTimestamp(timestamp: i64) bool {
     return timestamp >= 0 and timestamp <= maximum_display_unix_second;
 }
@@ -61,6 +69,13 @@ pub fn formatExact(timestamp: ?i64) ?Exact {
     return formatExactCalendar(calendar);
 }
 
+pub fn formatMinute(timestamp: ?i64) ?Minute {
+    const value = timestamp orelse return null;
+    if (!isDisplayTimestamp(value)) return null;
+    const calendar = fromUnixSeconds(value) orelse return null;
+    return formatMinuteCalendar(calendar);
+}
+
 pub fn formatDate(timestamp: ?i64) ?[10]u8 {
     const exact = formatExact(timestamp) orelse return null;
     return exact.bytes[0..10].*;
@@ -88,6 +103,25 @@ fn formatExactCalendar(calendar: CalendarSecond) ?Exact {
         calendar.hour,
         calendar.minute,
         calendar.second,
+        if (offset < 0) @as(u8, '-') else @as(u8, '+'),
+        offset_magnitude / 60,
+        offset_magnitude % 60,
+    }) catch return null;
+    std.debug.assert(rendered.len == result.bytes.len);
+    return result;
+}
+
+fn formatMinuteCalendar(calendar: CalendarSecond) ?Minute {
+    if (!validCalendar(calendar)) return null;
+    const offset: i32 = calendar.utc_offset_minutes;
+    const offset_magnitude: u32 = @intCast(if (offset < 0) -offset else offset);
+    var result: Minute = undefined;
+    const rendered = std.fmt.bufPrint(&result.bytes, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} {c}{d:0>2}:{d:0>2}", .{
+        calendar.year,
+        calendar.month,
+        calendar.day,
+        calendar.hour,
+        calendar.minute,
         if (offset < 0) @as(u8, '-') else @as(u8, '+'),
         offset_magnitude / 60,
         offset_magnitude % 60,
@@ -152,4 +186,36 @@ test "local timestamp formatting keeps calendar date seconds and signed offset" 
     try std.testing.expect(formatExact(null) == null);
     try std.testing.expect(formatExact(-1) == null);
     try std.testing.expect(formatExact(maximum_display_unix_second + 1) == null);
+}
+
+test "local minute formatting omits seconds and keeps signed offset" {
+    const east = formatMinuteCalendar(.{
+        .year = 2026,
+        .month = 9,
+        .day = 18,
+        .hour = 21,
+        .minute = 30,
+        .second = 45,
+        .utc_offset_minutes = 9 * 60,
+    }).?;
+    try std.testing.expectEqualStrings("2026-09-18 21:30 +09:00", east.text());
+
+    const west = formatMinuteCalendar(.{
+        .year = 2024,
+        .month = 2,
+        .day = 29,
+        .hour = 3,
+        .minute = 4,
+        .second = 59,
+        .utc_offset_minutes = -(3 * 60 + 30),
+    }).?;
+    try std.testing.expectEqualStrings("2024-02-29 03:04 -03:30", west.text());
+
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        const epoch = formatMinute(0) orelse return error.LocalTimeUnavailable;
+        try std.testing.expectEqual(@as(usize, 23), epoch.text().len);
+    }
+    try std.testing.expect(formatMinute(null) == null);
+    try std.testing.expect(formatMinute(-1) == null);
+    try std.testing.expect(formatMinute(maximum_display_unix_second + 1) == null);
 }

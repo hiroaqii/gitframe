@@ -107,7 +107,7 @@ pub fn formatLinePosition(position: LinePosition) LineLabel {
 }
 
 pub const CommitLabel = struct {
-    bytes: [33]u8 = undefined,
+    bytes: [30]u8 = undefined,
     len: u8,
     width: u8,
 
@@ -119,8 +119,8 @@ pub const CommitLabel = struct {
 pub fn formatCommitFact(fact: CommitFact) CommitLabel {
     var result: CommitLabel = .{ .len = 0, .width = 0 };
     switch (fact) {
-        .committed => |seconds| if (local_time.formatExact(seconds)) |exact| {
-            const label = std.fmt.bufPrint(&result.bytes, "commit {s}", .{exact.text()}) catch unreachable;
+        .committed => |seconds| if (local_time.formatMinute(seconds)) |minute| {
+            const label = std.fmt.bufPrint(&result.bytes, "commit {s}", .{minute.text()}) catch unreachable;
             result.len = @intCast(label.len);
             result.width = @intCast(label.len);
         } else {
@@ -306,13 +306,13 @@ test "repository source header Git markers are compact and omit clean state" {
     try std.testing.expectEqualStrings("?", GitState.unavailable.marker());
 }
 
-test "repository source header uses shared local second formatting" {
-    const exact = local_time.formatExact(951_827_640).?;
+test "repository source header uses shared local minute formatting" {
+    const minute = local_time.formatMinute(951_827_640).?;
     const committed = formatCommitFact(.{ .committed = 951_827_640 });
-    var expected_buffer: [33]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buffer, "commit {s}", .{exact.text()});
+    var expected_buffer: [30]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buffer, "commit {s}", .{minute.text()});
     try std.testing.expectEqualStrings(expected, committed.text());
-    try std.testing.expectEqual(@as(u8, 33), committed.width);
+    try std.testing.expectEqual(@as(u8, 30), committed.width);
     const uncommitted = formatCommitFact(.uncommitted);
     try std.testing.expectEqualStrings("uncommitted", uncommitted.text());
     const unavailable = formatCommitFact(.unavailable);
@@ -352,7 +352,7 @@ test "repository source header layout removes metadata in approved priority orde
     try std.testing.expectEqual(@as(u16, 12), wide.path_target.?.width);
     try std.testing.expectEqual(@as(u16, 79), wide.commit.?.region.col + wide.commit.?.region.width);
 
-    const without_line = layout(59, presentation);
+    const without_line = layout(56, presentation);
     try std.testing.expect(without_line.line == null);
     try std.testing.expect(without_line.git != null);
     try std.testing.expect(without_line.commit != null);
