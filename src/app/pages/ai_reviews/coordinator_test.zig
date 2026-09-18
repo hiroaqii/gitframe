@@ -24,6 +24,7 @@ const git_refs = @import("../../../git/refs.zig");
 const repo_discovery = @import("../../../repo/discovery.zig");
 const repo_root_capability = @import("../../../repo/root_capability.zig");
 const committed_review = @import("../../../committed_review.zig");
+const local_time = @import("../../../local_time.zig");
 const review_store = @import("../../../review_store.zig");
 const review_store_capability = @import("../../../review_store/capability.zig");
 const review_store_name = @import("../../../review_store/name.zig");
@@ -157,6 +158,7 @@ test "AI Reviews deletion confirmation owns the focused Run and renders an unfin
     try std.testing.expectEqual(@as(usize, 0), app.pages.ai_reviews.picker.focus);
     try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
 
+    const created_exact = local_time.formatExact(rows[0].created_at_unix).?;
     for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 80, .height = 24 } }) |size| {
         var surface: chasen.testing.TestSurface = undefined;
         try surface.init(size.width, size.height);
@@ -173,6 +175,7 @@ test "AI Reviews deletion confirmation owns the focused Run and renders an unfin
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Delete AI review Run?") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Current: no") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, created_exact.text()) != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "WARNING: This Run is unfinished") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Enter/Esc/n: cancel  y: delete") != null);
     }
@@ -687,6 +690,10 @@ fn expectHumanReviewDecisionSurfaces(
     completed.completed_at = &completed_at;
     completed.snapshot = &long_snapshot;
     page_state.human_review_decision.markFinalizeAccepted();
+    const completed_unix = try committed_review.strict_json.timestampToUnixSeconds(&completed_at);
+    const completed_exact = local_time.formatExact(completed_unix).?;
+    const completed_label = try std.fmt.allocPrint(std.testing.allocator, "Completed at {s}", .{completed_exact.text()});
+    defer std.testing.allocator.free(completed_label);
     for ([_]chasen.Size{
         .{ .width = 80, .height = 24 },
         .{ .width = 56, .height = 16 },
@@ -697,7 +704,7 @@ fn expectHumanReviewDecisionSurfaces(
         repo_epoch,
         root_identity,
         size,
-        &.{ "Human review result", "Completed at 2026-08-27T12:00:00Z", "Run ", "[x] Approved", "Summary (read-only)", "👩‍🚀", "second line remains exact" },
+        &.{ "Human review result", completed_label, "Run ", "[x] Approved", "Summary (read-only)", "👩‍🚀", "second line remains exact" },
         &.{"Completing review..."},
     );
     try page_state.human_review_decision.open(std.testing.allocator, editable);

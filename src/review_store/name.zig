@@ -1,11 +1,8 @@
 //! Bounded, allocation-free names persisted by Review Store schema version 1.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const committed_review = @import("../committed_review.zig");
-const c = @cImport({
-    @cInclude("time.h");
-});
+const local_time = @import("../local_time.zig");
 
 pub const max_repository_display_bytes: usize = 246;
 pub const max_target_label_bytes: usize = 232;
@@ -99,25 +96,17 @@ pub const LocalCalendarMinute = struct {
     minute: u8,
 
     pub fn fromUnixSeconds(unix_seconds: i64) RunNameError!LocalCalendarMinute {
-        if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) {
-            return error.LocalTimeUnavailable;
-        }
-        const seconds = std.math.cast(c.time_t, unix_seconds) orelse
-            return error.LocalTimeUnavailable;
-        var calendar: c.struct_tm = undefined;
-        if (c.localtime_r(&seconds, &calendar) == null) return error.LocalTimeUnavailable;
-        return fromLocalTm(calendar);
+        return fromLocalCalendar(local_time.fromUnixSeconds(unix_seconds) orelse
+            return error.LocalTimeUnavailable);
     }
 
-    fn fromLocalTm(calendar: c.struct_tm) RunNameError!LocalCalendarMinute {
-        const year = std.math.cast(u16, calendar.tm_year + 1900) orelse
-            return error.LocalTimeUnavailable;
+    fn fromLocalCalendar(calendar: local_time.CalendarSecond) RunNameError!LocalCalendarMinute {
         const value: LocalCalendarMinute = .{
-            .year = year,
-            .month = std.math.cast(u8, calendar.tm_mon + 1) orelse return error.LocalTimeUnavailable,
-            .day = std.math.cast(u8, calendar.tm_mday) orelse return error.LocalTimeUnavailable,
-            .hour = std.math.cast(u8, calendar.tm_hour) orelse return error.LocalTimeUnavailable,
-            .minute = std.math.cast(u8, calendar.tm_min) orelse return error.LocalTimeUnavailable,
+            .year = calendar.year,
+            .month = calendar.month,
+            .day = calendar.day,
+            .hour = calendar.hour,
+            .minute = calendar.minute,
         };
         value.validate() catch return error.LocalTimeUnavailable;
         return value;
@@ -359,17 +348,20 @@ test "review run name uses fixed target only when the saved label is absent" {
 }
 
 test "review run name maps the sampled local calendar fields once" {
-    var calendar = std.mem.zeroes(c.struct_tm);
-    calendar.tm_year = 126;
-    calendar.tm_mon = 8;
-    calendar.tm_mday = 13;
-    calendar.tm_hour = 19;
-    calendar.tm_min = 42;
-    const minute = try LocalCalendarMinute.fromLocalTm(calendar);
+    var calendar: local_time.CalendarSecond = .{
+        .year = 2026,
+        .month = 9,
+        .day = 13,
+        .hour = 19,
+        .minute = 42,
+        .second = 17,
+        .utc_offset_minutes = 9 * 60,
+    };
+    const minute = try LocalCalendarMinute.fromLocalCalendar(calendar);
     try std.testing.expectEqualStrings("20260913-1942", &minute.format());
-    calendar.tm_mday = 31;
-    calendar.tm_mon = 1;
-    try std.testing.expectError(error.LocalTimeUnavailable, LocalCalendarMinute.fromLocalTm(calendar));
+    calendar.day = 31;
+    calendar.month = 2;
+    try std.testing.expectError(error.LocalTimeUnavailable, LocalCalendarMinute.fromLocalCalendar(calendar));
 }
 
 test "review run stored component validates calendar label and complete ID suffix relation" {

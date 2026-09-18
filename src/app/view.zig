@@ -7,6 +7,7 @@ const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
 const app_actions = @import("actions.zig");
 const branch_commit_time = @import("branch_commit_time.zig");
+const local_time = @import("../local_time.zig");
 const action_lifecycle = @import("workflow/action_lifecycle.zig");
 const app_state = @import("state.zig");
 const diff_surface_view = @import("diff_surface/view.zig");
@@ -1480,7 +1481,7 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
     const selected = @min(state.selected_index, state.branches.len - 1);
     if (size.height >= 4) {
         const branch = state.branches[selected];
-        const exact = branch_commit_time.formatExactUtc(branch.tip_committer_unix);
+        const exact = local_time.formatExact(branch.tip_committer_unix);
         const detail = if (exact) |value|
             try std.fmt.allocPrint(content.frameAllocator(), "last commit: {s}", .{value.text()})
         else
@@ -3439,11 +3440,10 @@ test "branch switch popup renders relative times and selected exact commit detai
     const known_snapshot = try known.snapshot(allocator);
     defer allocator.free(known_snapshot);
 
-    const detail_index = std.mem.indexOf(
-        u8,
-        known_snapshot,
-        "last commit: 2023-11-14 20:13:20 +00:00",
-    ).?;
+    const exact = local_time.formatExact(now - 2 * 60 * 60).?;
+    const expected_detail = try std.fmt.allocPrint(allocator, "last commit: {s}", .{exact.text()});
+    defer allocator.free(expected_detail);
+    const detail_index = std.mem.indexOf(u8, known_snapshot, expected_detail).?;
     const branch_index = std.mem.indexOf(u8, known_snapshot, "feature/recent").?;
     try std.testing.expect(detail_index < branch_index);
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "2h ago") != null);

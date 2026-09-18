@@ -7,7 +7,7 @@ const ui = @import("chasen_ui");
 const text_presentation = ui.text_presentation;
 const draw = @import("draw");
 const keymap = @import("keymap");
-const branch_commit_time = @import("../../branch_commit_time.zig");
+const local_time = @import("../../../local_time.zig");
 const app_state = @import("../../state.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const page_header = @import("../../page_header.zig");
@@ -615,7 +615,7 @@ fn drawCommitRow(
         record.oid.short(),
         catalogStyle(palette, .accent, focused),
     );
-    const formatted_date = branch_commit_time.formatDateUtc(record.committer_unix);
+    const formatted_date = local_time.formatDate(record.committer_unix);
     try drawClippedField(
         surface,
         layout.date.col,
@@ -1128,7 +1128,8 @@ test "History fixed row fields clip ASCII wide and combining metadata without ov
 
     const snapshot = try rendered.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "1970-01-01") != null);
+    const epoch_date = local_time.formatDate(0).?;
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, &epoch_date) != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "author suffix") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "subject without refs") != null);
 }

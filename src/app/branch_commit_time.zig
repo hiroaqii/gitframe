@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const git_refs = @import("../git/refs.zig");
+const local_time = @import("../local_time.zig");
 
 pub const Relative = struct {
     bytes: [24]u8 = undefined,
@@ -11,16 +12,6 @@ pub const Relative = struct {
         return self.bytes[0..self.len];
     }
 };
-
-pub const ExactUtc = struct {
-    bytes: [26]u8,
-
-    pub fn text(self: *const ExactUtc) []const u8 {
-        return &self.bytes;
-    }
-};
-
-const maximum_utc_second: i64 = 253_402_300_799; // 9999-12-31 23:59:59Z
 
 /// Samples the real clock as a floored Unix second. An unavailable/zero
 /// resolution clock and values outside the page's i64 vocabulary fail closed.
@@ -50,7 +41,7 @@ fn lessThan(_: void, lhs: git_refs.BranchListItem, rhs: git_refs.BranchListItem)
 pub fn formatRelative(timestamp: ?i64, now_unix: ?i64) Relative {
     const value = timestamp orelse return literalRelative("—");
     const now = now_unix orelse return literalRelative("—");
-    if (formatExactUtc(value) == null) return literalRelative("—");
+    if (!local_time.isDisplayTimestamp(value)) return literalRelative("—");
     if (value > now) return literalRelative("future");
 
     const age: i128 = @as(i128, now) - @as(i128, value);
@@ -58,31 +49,6 @@ pub fn formatRelative(timestamp: ?i64, now_unix: ?i64) Relative {
     if (age < 60 * 60) return numericRelative(@divFloor(age, 60), "m ago");
     if (age < 24 * 60 * 60) return numericRelative(@divFloor(age, 60 * 60), "h ago");
     return numericRelative(@divFloor(age, 24 * 60 * 60), "d ago");
-}
-
-pub fn formatExactUtc(timestamp: ?i64) ?ExactUtc {
-    const value = timestamp orelse return null;
-    if (value < 0 or value > maximum_utc_second) return null;
-    const seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(value) };
-    const year_day = seconds.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_seconds = seconds.getDaySeconds();
-    var result: ExactUtc = undefined;
-    const rendered = std.fmt.bufPrint(&result.bytes, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} +00:00", .{
-        year_day.year,
-        month_day.month.numeric(),
-        month_day.day_index + 1,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
-    }) catch unreachable;
-    std.debug.assert(rendered.len == result.bytes.len);
-    return result;
-}
-
-pub fn formatDateUtc(timestamp: ?i64) ?[10]u8 {
-    const exact = formatExactUtc(timestamp) orelse return null;
-    return exact.bytes[0..10].*;
 }
 
 fn literalRelative(text: []const u8) Relative {
@@ -145,7 +111,7 @@ test "relative commit time covers exact boundaries future and unavailable values
         .{ .timestamp = now - 86_400, .current = now, .expected = "1d ago" },
         .{ .timestamp = now + 1, .current = now, .expected = "future" },
         .{ .timestamp = -1, .current = now, .expected = "—" },
-        .{ .timestamp = maximum_utc_second + 1, .current = now, .expected = "—" },
+        .{ .timestamp = local_time.maximum_display_unix_second + 1, .current = now, .expected = "—" },
         .{ .timestamp = null, .current = now, .expected = "—" },
         .{ .timestamp = now, .current = null, .expected = "—" },
     };
@@ -153,21 +119,4 @@ test "relative commit time covers exact boundaries future and unavailable values
         const actual = formatRelative(case.timestamp, case.current);
         try std.testing.expectEqualStrings(case.expected, actual.text());
     }
-}
-
-test "exact commit time is deterministic UTC and rejects unrepresentable values" {
-    const epoch = formatExactUtc(0).?;
-    try std.testing.expectEqualStrings("1970-01-01 00:00:00 +00:00", epoch.text());
-    const last = formatExactUtc(maximum_utc_second).?;
-    try std.testing.expectEqualStrings("9999-12-31 23:59:59 +00:00", last.text());
-    try std.testing.expect(formatExactUtc(null) == null);
-    try std.testing.expect(formatExactUtc(-1) == null);
-    try std.testing.expect(formatExactUtc(maximum_utc_second + 1) == null);
-
-    const epoch_date = formatDateUtc(0).?;
-    try std.testing.expectEqualStrings("1970-01-01", &epoch_date);
-    const last_date = formatDateUtc(maximum_utc_second).?;
-    try std.testing.expectEqualStrings("9999-12-31", &last_date);
-    try std.testing.expect(formatDateUtc(null) == null);
-    try std.testing.expect(formatDateUtc(-1) == null);
 }

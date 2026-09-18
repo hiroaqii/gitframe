@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const manifest = @import("../../../repository/manifest.zig");
+const local_time = @import("../../../local_time.zig");
 
 pub const minimum_path_width: u16 = 8;
 pub const field_gap: u16 = 2;
@@ -105,41 +106,8 @@ pub fn formatLinePosition(position: LinePosition) LineLabel {
     return result;
 }
 
-pub const UtcMinute = struct {
-    bytes: [17]u8,
-
-    pub fn text(self: *const UtcMinute) []const u8 {
-        return &self.bytes;
-    }
-};
-
-const maximum_utc_second: i64 = 253_402_300_799; // 9999-12-31 23:59:59Z
-
-/// Formats an accepted committer Unix timestamp without consulting local
-/// timezone or a clock. Invalid values remain the unavailable presentation.
-pub fn formatUtcMinute(timestamp_seconds: i64) ?UtcMinute {
-    if (timestamp_seconds < 0) return null;
-    const seconds = std.math.cast(u64, timestamp_seconds) orelse return null;
-    if (timestamp_seconds > maximum_utc_second) return null;
-
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = seconds };
-    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_seconds = epoch_seconds.getDaySeconds();
-    var result: UtcMinute = undefined;
-    const rendered = std.fmt.bufPrint(&result.bytes, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}Z", .{
-        year_day.year,
-        month_day.month.numeric(),
-        month_day.day_index + 1,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-    }) catch unreachable;
-    std.debug.assert(rendered.len == result.bytes.len);
-    return result;
-}
-
 pub const CommitLabel = struct {
-    bytes: [24]u8 = undefined,
+    bytes: [33]u8 = undefined,
     len: u8,
     width: u8,
 
@@ -151,8 +119,8 @@ pub const CommitLabel = struct {
 pub fn formatCommitFact(fact: CommitFact) CommitLabel {
     var result: CommitLabel = .{ .len = 0, .width = 0 };
     switch (fact) {
-        .committed => |seconds| if (formatUtcMinute(seconds)) |minute| {
-            const label = std.fmt.bufPrint(&result.bytes, "commit {s}", .{minute.text()}) catch unreachable;
+        .committed => |seconds| if (local_time.formatExact(seconds)) |exact| {
+            const label = std.fmt.bufPrint(&result.bytes, "commit {s}", .{exact.text()}) catch unreachable;
             result.len = @intCast(label.len);
             result.width = @intCast(label.len);
         } else {
@@ -338,31 +306,19 @@ test "repository source header Git labels remain typed aggregate facts" {
     try std.testing.expectEqualStrings("git ?", GitState.unavailable.label());
 }
 
-test "repository source header UTC minute formatting is deterministic and bounded" {
-    const epoch = formatUtcMinute(0).?;
-    try std.testing.expectEqualStrings("1970-01-01 00:00Z", epoch.text());
-
-    const before_minute = formatUtcMinute(59).?;
-    try std.testing.expectEqualStrings("1970-01-01 00:00Z", before_minute.text());
-    const next_minute = formatUtcMinute(60).?;
-    try std.testing.expectEqualStrings("1970-01-01 00:01Z", next_minute.text());
-
-    const leap = formatUtcMinute(951_827_640).?;
-    try std.testing.expectEqualStrings("2000-02-29 12:34Z", leap.text());
-    const upper = formatUtcMinute(maximum_utc_second).?;
-    try std.testing.expectEqualStrings("9999-12-31 23:59Z", upper.text());
-
-    try std.testing.expect(formatUtcMinute(-1) == null);
-    try std.testing.expect(formatUtcMinute(maximum_utc_second + 1) == null);
-
+test "repository source header uses shared local second formatting" {
+    const exact = local_time.formatExact(951_827_640).?;
     const committed = formatCommitFact(.{ .committed = 951_827_640 });
-    try std.testing.expectEqualStrings("commit 2000-02-29 12:34Z", committed.text());
-    try std.testing.expectEqual(@as(u8, 24), committed.width);
+    var expected_buffer: [33]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buffer, "commit {s}", .{exact.text()});
+    try std.testing.expectEqualStrings(expected, committed.text());
+    try std.testing.expectEqual(@as(u8, 33), committed.width);
     const uncommitted = formatCommitFact(.uncommitted);
     try std.testing.expectEqualStrings("uncommitted", uncommitted.text());
     const unavailable = formatCommitFact(.unavailable);
     try std.testing.expectEqualStrings("commit —", unavailable.text());
     try std.testing.expectEqual(@as(u8, 8), unavailable.width);
+    try std.testing.expectEqualStrings("commit —", formatCommitFact(.{ .committed = -1 }).text());
 }
 
 test "repository source header presentation measures escaped raw path" {
@@ -396,7 +352,7 @@ test "repository source header layout removes metadata in approved priority orde
     try std.testing.expectEqual(@as(u16, 12), wide.path_target.?.width);
     try std.testing.expectEqual(@as(u16, 79), wide.commit.?.region.col + wide.commit.?.region.width);
 
-    const without_line = layout(50, presentation);
+    const without_line = layout(59, presentation);
     try std.testing.expect(without_line.line == null);
     try std.testing.expect(without_line.git != null);
     try std.testing.expect(without_line.commit != null);

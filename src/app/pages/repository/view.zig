@@ -1093,7 +1093,8 @@ test "repository source header renders typed metadata focus-stably" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/app/pages/repository.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 42/8713") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit 2000-02-29 12:34Z") != null);
+    const expected_commit = source_header.formatCommitFact(.{ .committed = 951_827_640 });
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, expected_commit.text()) != null);
 
     const points = [_]struct { col: u16, role: theme.Role, bold: bool }{
         .{ .col = expected_layout.path_target.?.col, .role = .accent, .bold = true },
@@ -1176,14 +1177,15 @@ test "repository source header renderer follows adaptive omission regions" {
     );
 
     var medium: chasen.testing.TestSurface = undefined;
-    try medium.init(50, 1);
+    try medium.init(59, 1);
     defer medium.deinit();
     try drawSourceHeader(&medium.surface, presentation, .{}, false, false, .default());
     const medium_snapshot = try medium.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(medium_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "Ln 42/8713") == null);
     try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "modified") != null);
-    try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "commit 2000-") != null);
+    const expected_commit = source_header.formatCommitFact(.{ .committed = 951_827_640 });
+    try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, expected_commit.text()) != null);
 
     var narrow: chasen.testing.TestSurface = undefined;
     try narrow.init(29, 1);

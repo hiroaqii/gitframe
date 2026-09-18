@@ -15,6 +15,7 @@ const file_tree = @import("../../../file_tree.zig");
 const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const commit_time = @import("../../branch_commit_time.zig");
+const local_time = @import("../../../local_time.zig");
 const ai_review_handoff = @import("ai_review_handoff.zig");
 
 pub const Context = struct {
@@ -138,7 +139,7 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     }
     if (show_detail and next_row < footer_row) {
         if (picker.selectedItem()) |item| {
-            const exact = commit_time.formatExactUtc(item.tip_committer_unix);
+            const exact = local_time.formatExact(item.tip_committer_unix);
             const detail = if (exact) |value|
                 try std.fmt.allocPrint(content.frameAllocator(), "last commit: {s}  {s}", .{ value.text(), item.full_ref })
             else

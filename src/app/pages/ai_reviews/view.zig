@@ -7,6 +7,7 @@ const draw = @import("draw");
 const theme = @import("theme");
 const ai_reviews_page = @import("../ai_reviews.zig");
 const commit_time = @import("../../branch_commit_time.zig");
+const local_time = @import("../../../local_time.zig");
 const ai_reviews_navigation = @import("navigation.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const diff_file = @import("../../../diff/file.zig");
@@ -351,11 +352,12 @@ pub fn viewDeleteConfirmation(app: Context, surface: *chasen.Surface) !void {
         row += 1;
     }
     if (row < footer_row) {
+        const created = local_time.formatExact(summary.created_at_unix);
         const facts = try std.fmt.allocPrint(content.frameAllocator(), "Status: {s}  Current: {s}  Findings: {d}  Created: {s}", .{
             ai_reviews_page.runSummaryStatusText(summary.status),
             if (app.page.isCurrentReview(summary.request.review_id)) "yes" else "no",
             summary.finding_count,
-            &summary.created_at,
+            if (created) |*value| value.text() else "—",
         });
         try draw.copyClippedTextAt(&content, 0, row, facts, app.palette.style(.muted));
         row += 1;
@@ -599,10 +601,11 @@ fn humanReviewLifecycleText(
             "Review state requires reload"
         else
             "Completion failed — review and retry",
-        .completed => if (presentation.completed_at) |completed_at|
-            try std.fmt.allocPrint(allocator, "Completed at {s}", .{completed_at.*[0..]})
-        else
-            "Completed",
+        .completed => if (presentation.completed_at) |completed_at| blk: {
+            const exact = formatStoredUtcLocal(completed_at) orelse
+                break :blk "Completed at —";
+            break :blk try std.fmt.allocPrint(allocator, "Completed at {s}", .{exact.text()});
+        } else "Completed",
     };
 }
 
@@ -797,9 +800,21 @@ fn drawAiReviewDetail(
     try draw.copyClippedTextAt(surface, 0, start_row, target, app.palette.style(.muted));
     if (start_row + 1 >= surface.size().height -| 1) return;
     const review_id = item.review_id.canonical();
-    const displayed_review_id: []const u8 = if (surface.size().width >= 73) &review_id else review_id[0..8];
-    const detail = try std.fmt.allocPrint(surface.frameAllocator(), "created {s}  review {s}", .{ &item.created_at, displayed_review_id });
+    const created = local_time.formatExact(item.created_at_unix);
+    const created_text = if (created) |*value| value.text() else "—";
+    const full_id_width = surface.displayWidth("created ") + surface.displayWidth(created_text) +
+        surface.displayWidth("  review ") + surface.displayWidth(&review_id);
+    const displayed_review_id: []const u8 = if (surface.size().width >= full_id_width) &review_id else review_id[0..8];
+    const detail = try std.fmt.allocPrint(surface.frameAllocator(), "created {s}  review {s}", .{
+        created_text,
+        displayed_review_id,
+    });
     try draw.copyClippedTextAt(surface, 0, start_row + 1, detail, app.palette.style(.muted));
+}
+
+fn formatStoredUtcLocal(timestamp: *const [20]u8) ?local_time.Exact {
+    const unix_seconds = committed_review.strict_json.timestampToUnixSeconds(timestamp) catch return null;
+    return local_time.formatExact(unix_seconds);
 }
 
 fn targetPairAlloc(
@@ -1185,6 +1200,8 @@ test "AI Reviews initial page is stable and Run selection is explicit" {
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "@bbbbbbb") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "base@") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "head@") == null);
+        const created_exact = local_time.formatExact(rows[0].created_at_unix).?;
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, created_exact.text()) != null);
 
         const pair_width = size.width - 20;
         for ([_]struct {
@@ -1234,7 +1251,8 @@ test "AI Reviews initial page is stable and Run selection is explicit" {
         } else if (size.width >= 80) {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "gpt-6-test") == null);
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 findings") != null);
-            try std.testing.expect(std.mem.indexOf(u8, snapshot, "123e4567-e89b-42d3-a456-426614174000") != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "review 123e4567") != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "123e4567-e89b-42d3-a456-426614174000") == null);
         } else {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "gpt-6-test") == null);
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "findings") == null);

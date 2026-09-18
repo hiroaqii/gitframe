@@ -3,7 +3,7 @@
 const std = @import("std");
 const ui = @import("chasen_ui");
 const app_load = @import("../load.zig");
-const branch_commit_time = @import("../branch_commit_time.zig");
+const local_time = @import("../../local_time.zig");
 const app_page = @import("../page.zig");
 const app_state = @import("../state.zig");
 const diff_surface = @import("../diff_surface.zig");
@@ -120,7 +120,7 @@ pub const CommitDetailSnapshot = struct {
     fn init(allocator: std.mem.Allocator, record: git_history.Record) !CommitDetailSnapshot {
         const author = try allocator.dupe(u8, record.author);
         errdefer allocator.free(author);
-        const exact = branch_commit_time.formatExactUtc(record.committer_unix);
+        const exact = local_time.formatExact(record.committer_unix);
         const committed = try allocator.dupe(u8, if (exact) |value| value.text() else "—");
         errdefer allocator.free(committed);
         const decorations = try allocator.dupe(u8, record.decorations);
@@ -1975,12 +1975,19 @@ test "History commit detail owns exact payload viewport generations and lifecycl
 
     state.openDetail(allocator);
     const first = state.openDetailConst().?;
-    try std.testing.expectEqualStrings(
+    const exact = local_time.formatExact(state.catalog.records.items[0].committer_unix).?;
+    const expected_payload = try std.fmt.allocPrint(
+        allocator,
         "Commit: 0123456789abcdef0123456789abcdef01234567\n" ++
             "Author: Full Author\n" ++
-            "Committed: 2024-09-01 13:15:23 +00:00\n" ++
+            "Committed: {s}\n" ++
             "Refs: HEAD -> main, tag: v1\n" ++
             "Subject: wide 猫 e\u{301} subject",
+        .{exact.text()},
+    );
+    defer allocator.free(expected_payload);
+    try std.testing.expectEqualStrings(
+        expected_payload,
         first.snapshot.canonical_payload,
     );
     const instance = first.modal_instance_id;
