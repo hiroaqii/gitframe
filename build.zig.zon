@@ -11,8 +11,8 @@
             .path = "../chasen-ui",
         },
         .flow_syntax = .{
-            .url = "git+https://github.com/neurocyte/flow-syntax?ref=zig-0.16#6d1772a8d51729ad0488fc4d556ec7f87168bfdb",
-            .hash = "flow_syntax-0.7.2-X8jOoYiMAQAaepRcrHQMb57tdPzzGt14ydaJbSNuWYTn",
+            .url = "git+https://github.com/neurocyte/flow-syntax?ref=zig-0.16#4a44180376ec28e7bb4ed56c5b6fe24292c74930",
+            .hash = "flow_syntax-0.7.2-X8jOofSXAQBcUBUOAnot6C9tuAVlF0Q4cM1IcUBFJ00p",
             .lazy = true,
         },
     },

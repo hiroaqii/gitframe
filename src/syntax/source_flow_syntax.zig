@@ -137,6 +137,10 @@ const RenderContext = struct {
         scope: []const u8,
         _: u32,
         capture_index: usize,
+        // Keep provider precedence metadata inert until GitFrame can apply it
+        // together with document-relative injection byte ranges.
+        _: i32,
+        _: u32,
         _: *const flow_syntax.Node,
     ) error{Stop}!void {
         const role = token.roleFromScope(scope);

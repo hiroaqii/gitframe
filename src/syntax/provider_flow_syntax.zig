@@ -134,6 +134,12 @@ const RenderContext = struct {
         scope: []const u8,
         _: u32,
         capture_index: usize,
+        // flow-syntax exposes query precedence to consumers. GitFrame keeps
+        // its established role/refinement overlap policy for now; applying
+        // injection precedence before its byte ranges are document-relative
+        // would make misplaced Markdown captures override valid parent ones.
+        _: i32,
+        _: u32,
         _: *const flow_syntax.Node,
     ) error{Stop}!void {
         const role = token.roleFromScope(scope);
