@@ -1,6 +1,7 @@
 const std = @import("std");
 const diff_parser = @import("../diff/parser.zig");
 const flow_syntax = @import("flow_syntax");
+const highlight_policy = @import("highlight_policy.zig");
 const provider = @import("provider.zig");
 const token = @import("token.zig");
 const text_eligibility = @import("../diff/text_eligibility.zig");
@@ -57,6 +58,8 @@ fn highlightHunkSide(
     hunk: diff_parser.Hunk,
     key: HunkSideKey,
 ) !void {
+    if (!highlight_policy.enabledForPath(filePathForSide(file, key.side))) return;
+
     const fragment = try provider.buildFragment(allocator, hunk, key.side);
     defer fragment.deinit(allocator);
     if (fragment.text.len == 0 or fragment.lines.len == 0) return;
@@ -135,9 +138,8 @@ const RenderContext = struct {
         _: u32,
         capture_index: usize,
         // flow-syntax exposes query precedence to consumers. GitFrame keeps
-        // its established role/refinement overlap policy for now; applying
-        // injection precedence before its byte ranges are document-relative
-        // would make misplaced Markdown captures override valid parent ones.
+        // its established role/refinement overlap policy until ranked overlap
+        // resolution is implemented and tested as a separate change.
         _: i32,
         _: u32,
         _: *const flow_syntax.Node,
@@ -230,6 +232,38 @@ test "mixed eligibility skips invalid files without shifting valid span indices"
         .line_index = 2,
         .side = .new,
     }), .member, "name"));
+}
+
+test "flow syntax leaves Markdown diff sides undecorated" {
+    const lines = [_]diff_parser.DiffLine{.{
+        .kind = .added,
+        .text = "const value: usize = 42;",
+        .new_line = 1,
+    }};
+    const files = [_]diff_parser.FileDiff{.{
+        .header = "diff --git a/README.md b/README.md",
+        .old_path = "a/README.md",
+        .new_path = "b/README.md",
+        .metadata = &.{},
+        .hunks = &.{.{
+            .old_start = 1,
+            .old_count = 0,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+            .lines = &lines,
+        }},
+    }};
+    const eligibility = [_]text_eligibility.FileTextEligibility{.selectable_utf8};
+    var spans = try buildDocumentSpans(std.testing.allocator, std.testing.io, .{ .files = &files }, &eligibility);
+    defer spans.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), spans.lineSpans(.{
+        .file_index = 0,
+        .hunk_index = 0,
+        .line_index = 0,
+        .side = .new,
+    }).spans.len);
 }
 
 fn lineHasRoleText(line: []const u8, spans: token.LineSpans, role: token.TokenRole, expected: []const u8) bool {

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const flow_syntax = @import("flow_syntax");
+const highlight_policy = @import("highlight_policy.zig");
 const source_document = @import("../repository/source.zig");
 const source_spans = @import("source.zig");
 const token = @import("token.zig");
@@ -105,6 +106,8 @@ fn collectCandidates(
     document: *const source_document.Document,
     path: []const u8,
 ) !std.ArrayList(source_spans.Candidate) {
+    if (!highlight_policy.enabledForPath(path)) return .empty;
+
     const query_cache = try flow_syntax.QueryCache.create(io, allocator, .{});
     defer query_cache.deinit();
     var syntax = try flow_syntax.create_guess_file_type_static(allocator, document.bytes, path, query_cache);
@@ -137,8 +140,8 @@ const RenderContext = struct {
         scope: []const u8,
         _: u32,
         capture_index: usize,
-        // Keep provider precedence metadata inert until GitFrame can apply it
-        // together with document-relative injection byte ranges.
+        // Ranked overlap resolution is intentionally handled separately from
+        // this provider compatibility update.
         _: i32,
         _: u32,
         _: *const flow_syntax.Node,
@@ -251,6 +254,18 @@ test "flow syntax builds source-shaped spans from one full file instance" {
         try std.testing.expect(roleTextCount(&document, spans, .special_punctuation, "{") > 0);
         try std.testing.expect(roleTextCount(&document, spans, .special_punctuation, "}") > 0);
     }
+}
+
+test "flow syntax leaves Markdown source files undecorated" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "const value: usize = 42;\n");
+    var document = try source_document.Document.initOwned(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    var spans = try buildSourceSpans(allocator, std.testing.io, &document, "README.MD");
+    defer spans.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), spans.line_entries.len);
+    try std.testing.expectEqual(@as(usize, 0), spans.spans.len);
 }
 
 fn roleTextCount(
