@@ -45,12 +45,12 @@ pub const GitState = enum {
     modified,
     unavailable,
 
-    pub fn label(self: GitState) []const u8 {
+    pub fn marker(self: GitState) []const u8 {
         return switch (self) {
-            .clean => "clean",
-            .added => "added",
-            .modified => "modified",
-            .unavailable => "git ?",
+            .clean => "",
+            .added => "A",
+            .modified => "M",
+            .unavailable => "?",
         };
     }
 };
@@ -185,15 +185,16 @@ pub fn layout(width: u16, presentation: Presentation) Layout {
         formatLinePosition(position)
     else
         null;
+    const git_marker = presentation.git_state.marker();
     const commit_label = formatCommitFact(presentation.commit_fact);
 
     var include_line = line_label != null;
-    var include_git = true;
+    var include_git = git_marker.len > 0;
     var include_commit = true;
     while (true) {
         const metadata_width = metadataGroupWidth(
             if (include_line) line_label.?.len else null,
-            if (include_git) presentation.git_state.label().len else null,
+            if (include_git) git_marker.len else null,
             if (include_commit) commit_label.width else null,
         );
         const required = @as(usize, minimum_path_width) +
@@ -217,7 +218,7 @@ pub fn layout(width: u16, presentation: Presentation) Layout {
 
     const metadata_width = metadataGroupWidth(
         if (include_line) line_label.?.len else null,
-        if (include_git) presentation.git_state.label().len else null,
+        if (include_git) git_marker.len else null,
         if (include_commit) commit_label.width else null,
     );
     const metadata_col = content_end - metadata_width;
@@ -254,12 +255,11 @@ pub fn layout(width: u16, presentation: Presentation) Layout {
         if (include_git or include_commit) field_col += field_gap;
     }
     if (include_git) {
-        const label = presentation.git_state.label();
         result.git = .{
-            .region = .{ .col = @intCast(field_col), .width = @intCast(label.len) },
+            .region = .{ .col = @intCast(field_col), .width = @intCast(git_marker.len) },
             .state = presentation.git_state,
         };
-        field_col += label.len;
+        field_col += git_marker.len;
         if (include_commit) field_col += field_gap;
     }
     if (include_commit) {
@@ -299,11 +299,11 @@ test "repository source header line position uses real content coordinates" {
     try std.testing.expectEqualStrings("Ln 42/8713", current.text());
 }
 
-test "repository source header Git labels remain typed aggregate facts" {
-    try std.testing.expectEqualStrings("clean", GitState.clean.label());
-    try std.testing.expectEqualStrings("added", GitState.added.label());
-    try std.testing.expectEqualStrings("modified", GitState.modified.label());
-    try std.testing.expectEqualStrings("git ?", GitState.unavailable.label());
+test "repository source header Git markers are compact and omit clean state" {
+    try std.testing.expectEqualStrings("", GitState.clean.marker());
+    try std.testing.expectEqualStrings("A", GitState.added.marker());
+    try std.testing.expectEqualStrings("M", GitState.modified.marker());
+    try std.testing.expectEqualStrings("?", GitState.unavailable.marker());
 }
 
 test "repository source header uses shared local second formatting" {
@@ -362,17 +362,17 @@ test "repository source header layout removes metadata in approved priority orde
     try std.testing.expect(git_only.git != null);
     try std.testing.expect(git_only.commit == null);
 
-    const path_only = layout(19, presentation);
+    const path_only = layout(12, presentation);
     try std.testing.expect(path_only.line == null);
     try std.testing.expect(path_only.git == null);
     try std.testing.expect(path_only.commit == null);
-    try std.testing.expectEqual(@as(u16, 17), path_only.path_area.width);
+    try std.testing.expectEqual(@as(u16, 10), path_only.path_area.width);
 }
 
 test "repository source header layout preserves path target and tiny bounds" {
     const short = Presentation.init("a", null, .clean, .unavailable);
     const wide = layout(40, short);
-    try std.testing.expect(wide.git != null);
+    try std.testing.expect(wide.git == null);
     try std.testing.expectEqual(@as(u16, 1), wide.path_target.?.width);
     try std.testing.expect(!wide.path_target.?.contains(0));
     try std.testing.expect(!wide.path_target.?.contains(2));

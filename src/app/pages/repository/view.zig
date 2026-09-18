@@ -516,7 +516,7 @@ pub fn drawSourceHeaderWithStatus(
             surface,
             field.region.col,
             source_geometry.source_path_row,
-            field.state.label(),
+            field.state.marker(),
             sourceHeaderGitStyle(field.state, palette),
         ) catch {};
     }
@@ -1038,7 +1038,7 @@ fn sourceHeaderPresentationForTest(path: []const u8) source_header.Presentation 
 test "repository source header renders path above a full fixed separator" {
     const palette: theme.Palette = .default();
     var test_surface: chasen.testing.TestSurface = undefined;
-    try test_surface.init(24, source_geometry.source_body_first_row);
+    try test_surface.init(30, source_geometry.source_body_first_row);
     defer test_surface.deinit();
 
     try drawSourceHeader(&test_surface.surface, sourceHeaderPresentationForTest("src/main.zig"), .{}, false, false, palette);
@@ -1092,9 +1092,11 @@ test "repository source header renders typed metadata focus-stably" {
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/app/pages/repository.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 42/8713") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") == null);
     const expected_commit = source_header.formatCommitFact(.{ .committed = 951_827_640 });
     try std.testing.expect(std.mem.indexOf(u8, snapshot, expected_commit.text()) != null);
+    try active.expectCellText(expected_layout.git.?.region.col, source_geometry.source_path_row, "M");
+    try inactive.expectCellText(expected_layout.git.?.region.col, source_geometry.source_path_row, "M");
 
     const points = [_]struct { col: u16, role: theme.Role, bold: bool }{
         .{ .col = expected_layout.path_target.?.col, .role = .accent, .bold = true },
@@ -1149,7 +1151,6 @@ test "repository source header highlights only the exact path target" {
 test "repository source header preserves semantic Git styles" {
     const palette: theme.Palette = .default();
     const cases = [_]struct { state: source_header.GitState, role: theme.Role }{
-        .{ .state = .clean, .role = .muted },
         .{ .state = .added, .role = .diff_added },
         .{ .state = .modified, .role = .diff_modified },
         .{ .state = .unavailable, .role = .warning },
@@ -1166,6 +1167,8 @@ test "repository source header preserves semantic Git styles" {
         try std.testing.expect(git_cell.style.fg.eql(palette.color(case.role)));
         try std.testing.expect(!git_cell.style.dim);
     }
+    const clean = source_header.Presentation.init("main.zig", null, .clean, .unavailable);
+    try std.testing.expect(source_header.layout(40, clean).git == null);
 }
 
 test "repository source header renderer follows adaptive omission regions" {
@@ -1183,7 +1186,7 @@ test "repository source header renderer follows adaptive omission regions" {
     const medium_snapshot = try medium.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(medium_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "Ln 42/8713") == null);
-    try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "modified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, "modified") == null);
     const expected_commit = source_header.formatCommitFact(.{ .committed = 951_827_640 });
     try std.testing.expect(std.mem.indexOf(u8, medium_snapshot, expected_commit.text()) != null);
 
@@ -1194,7 +1197,7 @@ test "repository source header renderer follows adaptive omission regions" {
     const narrow_snapshot = try narrow.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(narrow_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "Ln 42/8713") == null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "modified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "modified") == null);
     try std.testing.expect(std.mem.indexOf(u8, narrow_snapshot, "2000-") == null);
 }
 
@@ -2720,7 +2723,10 @@ test "repository source header page view keeps filesystem metadata outside commi
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "main.zig") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 2/2") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") == null);
+        const body_layout = repository_layout.bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
+        const header_layout = source_header.layout(body_layout.source_width, state.sourceHeaderPresentation().?);
+        try test_surface.expectCellText(body_layout.source_col + header_layout.git.?.region.col, source_geometry.source_path_row, "M");
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29 12:34Z") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit —") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "second") != null);
@@ -2762,7 +2768,10 @@ test "repository source header page view keeps filesystem metadata outside commi
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 2/2") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit —") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "modified") == null);
+        const body_layout = repository_layout.bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
+        const header_layout = source_header.layout(body_layout.source_width, state.sourceHeaderPresentation().?);
+        try test_surface.expectCellText(body_layout.source_col + header_layout.git.?.region.col, source_geometry.source_path_row, "M");
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "second") != null);
     }
 
@@ -2776,6 +2785,9 @@ test "repository source header page view keeps filesystem metadata outside commi
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "main.zig") != null);
         try test_surface.expectCellText(1, source_geometry.source_path_row, "m");
+        const body_layout = repository_layout.bodyLayout(test_surface.surface.size(), state.viewer.tree_width, state.viewer.tree_hidden);
+        const header_layout = source_header.layout(body_layout.source_width, state.sourceHeaderPresentation().?);
+        try test_surface.expectCellText(body_layout.source_col + header_layout.git.?.region.col, source_geometry.source_path_row, "M");
     }
     _ = state.applyNavigation(allocator, .toggle_tree_visibility, size);
     _ = state.applyNavigation(allocator, .enter_file_search, test_surface.surface.size());
