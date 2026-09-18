@@ -150,13 +150,22 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     try std.testing.expectEqualStrings("topic", app.pages.compare.base_target.?.display_name);
 }
 
-test "repository selection drag routes first and outside release terminates" {
+test "Repository active pointer owner blocks wheel redraw until release" {
+    const allocator = std.testing.allocator;
     var app: App = .{
         .active_page = .repository,
         .terminal_size = .{ .width = 100, .height = 20 },
     };
+    defer app.pages.repository.deinit(allocator);
     app.pages.repository.viewer.tree_width = 42;
     app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        1,
+        .{ .device = 2, .inode = 3 },
+        .{ .location = .{ .path = "incoming.zig" } },
+    );
+    app.pages.repository.acceptIncoming(allocator, &incoming);
     try std.testing.expect(app.pages.repository.activeMouseOwner());
     try std.testing.expect(app.pages.repository.activeMouseSourceRange());
     const shell = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
@@ -195,6 +204,8 @@ test "repository selection drag routes first and outside release terminates" {
         shell.body.row + 2,
         .wheel_down,
     )) == null);
+    try std.testing.expect(app.pages.repository.activeMouseSourceRange());
+    try std.testing.expect(app.pages.repository.incomingIsPending());
 
     const release = app.handleEvent(app_test_support.mouseEventTyped(0, 0, .left, .release)) orelse
         return error.ExpectedRepositoryRelease;
@@ -209,9 +220,30 @@ test "repository selection drag routes first and outside release terminates" {
         },
         else => return error.ExpectedRepositoryRelease,
     }
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     try app.update(release, &ctx);
     try std.testing.expect(!app.pages.repository.activeMouseSourceRange());
+    try std.testing.expect(!app.pages.repository.activeMouseOwner());
+
+    app.pages.repository.selection_owner = .{ .source_header = repositoryHeaderSelectionForTest() };
+    var header_incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        1,
+        .{ .device = 2, .inode = 3 },
+        .{ .location = .{ .path = "header-incoming.zig" } },
+    );
+    app.pages.repository.acceptIncoming(allocator, &header_incoming);
+    try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(
+        shell.body.col + tree_width + 2,
+        shell.body.row + 2,
+        .wheel_up,
+    )) == null);
+    try std.testing.expect(app.pages.repository.activeMouseOwner());
+    try std.testing.expect(app.pages.repository.incomingIsPending());
+
+    const header_release = app.handleEvent(app_test_support.mouseEventTyped(0, 0, .left, .release)) orelse
+        return error.ExpectedRepositoryRelease;
+    try app.update(header_release, &ctx);
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 }
 

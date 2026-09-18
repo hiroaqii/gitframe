@@ -241,6 +241,7 @@ pub const Command = union(enum) {
 
 pub const RepositoryUpdate = struct {
     selected_path_changed: bool = false,
+    wheel_complete_noop: bool = false,
     command: ?Command = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
 
@@ -1640,7 +1641,7 @@ pub const RepositoryPageState = struct {
         self: *RepositoryPageState,
         msg: Msg,
         body_size: chasen.Size,
-    ) void {
+    ) bool {
         const keep = switch (self.selection_owner) {
             .none => true,
             .source_header => switch (msg) {
@@ -1703,7 +1704,11 @@ pub const RepositoryPageState = struct {
                 },
             },
         };
-        if (!keep) self.clearLiveSelectionPreservingViewport(body_size);
+        if (!keep) {
+            self.clearLiveSelectionPreservingViewport(body_size);
+            return true;
+        }
+        return false;
     }
 
     pub fn applyNavigation(
@@ -1714,12 +1719,18 @@ pub const RepositoryPageState = struct {
     ) RepositoryUpdate {
         var result: RepositoryUpdate = .{};
         var file_search_submitted = false;
+        const wheel = switch (msg) {
+            .wheel_up, .wheel_down, .mouse_source_wheel_up, .mouse_source_wheel_down => true,
+            else => false,
+        };
+        const viewer_before: ?repository_model.ViewerState = if (wheel) self.viewer else null;
         // A contextual destination is subordinate to the user's next
         // destination/navigation command. Dismiss it before that command can
         // mutate retained browser state. Pure presentation/cancel commands do
         // not retarget the browser and therefore retain the owner.
+        const incoming_dismissed = wheel and navigationDismissesIncoming(msg) and self.incoming != .none;
         if (navigationDismissesIncoming(msg)) self.dismissIncoming(allocator);
-        self.reconcileLiveSelectionForMessage(msg, body_size);
+        const selection_owner_cleared = self.reconcileLiveSelectionForMessage(msg, body_size);
         const keyboard_search_cursor = if (switch (msg) {
             .submit_source_search, .next_source_match, .previous_source_match => true,
             else => false,
@@ -1905,6 +1916,12 @@ pub const RepositoryPageState = struct {
                 self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
             };
         };
+        if (viewer_before) |before| {
+            result.wheel_complete_noop = !incoming_dismissed and
+                !selection_owner_cleared and
+                !result.selected_path_changed and
+                std.meta.eql(before, self.viewer);
+        }
         return result;
     }
 

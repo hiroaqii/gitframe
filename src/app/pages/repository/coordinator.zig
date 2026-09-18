@@ -111,8 +111,9 @@ pub const Controller = struct {
                 var page_update = self.page_state.applyNavigation(ctx.allocator(), msg, self.body_size);
                 defer page_update.deinit(ctx.allocator());
                 const auto_scroll = page_update.auto_scroll;
-                const command = page_update.takeCommand() orelse return .{ .auto_scroll = auto_scroll };
-                return .{ .auto_scroll = auto_scroll, .clipboard = switch (command) {
+                const redraw: Redraw = if (page_update.wheel_complete_noop) .skip else .default;
+                const command = page_update.takeCommand() orelse return .{ .redraw = redraw, .auto_scroll = auto_scroll };
+                return .{ .redraw = redraw, .auto_scroll = auto_scroll, .clipboard = switch (command) {
                     .copy_source_selection => |copy| .{
                         .origin = .{ .page = self.effectOrigin() },
                         .label = "source selection",
@@ -136,24 +137,25 @@ pub const Controller = struct {
     /// Starts pending members in the established primary/auxiliary order.
     /// Manifest and document failures propagate; bounded auxiliary failures
     /// remain page-local so they cannot fail the primary Repository update.
-    pub fn startPending(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        try self.maybeStartManifest(ctx);
-        self.maybeStartBranch(ctx);
+    pub fn startPending(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !bool {
+        var visible_changed = try self.maybeStartManifest(ctx);
+        visible_changed = self.maybeStartBranch(ctx) or visible_changed;
         self.maybeStartPathHistory(ctx);
-        try self.maybeStartDocument(ctx);
+        visible_changed = try self.maybeStartDocument(ctx) or visible_changed;
         try self.maybeStartSyntax(ctx);
         self.maybeStartChangeMap(ctx);
+        return visible_changed;
     }
 
-    fn maybeStartManifest(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.active_page != .repository or !self.page_state.wantsManifestRequest()) return;
+    fn maybeStartManifest(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !bool {
+        if (self.active_page != .repository or !self.page_state.wantsManifestRequest()) return false;
         const repo_root = self.repo.activeRoot() orelse {
             self.page_state.requestReload(false);
-            return;
+            return true;
         };
         const capability = self.repo.activeCapability() orelse {
             self.page_state.requestReload(false);
-            return;
+            return true;
         };
 
         var request = self.page_state.prepareRequest(ctx.allocator(), repo_root, capability) catch |err| {
@@ -181,13 +183,17 @@ pub const Controller = struct {
             self.page_state.rejectSpawn(generation);
             return err;
         };
+        return true;
     }
 
-    fn maybeStartDocument(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.active_page != .repository or !self.page_state.wantsDocumentRequest()) return;
+    fn maybeStartDocument(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !bool {
+        if (self.active_page != .repository or !self.page_state.wantsDocumentRequest()) return false;
+        const displayed_present = self.page_state.displayed_document != null;
+        const authority_will_change = if (self.page_state.displayed_document) |document| document.authority == .accepted else false;
+        const incoming_will_change = self.page_state.incoming != .none;
         const capability = self.repo.activeCapability() orelse {
             self.page_state.markDocumentCapabilityUnavailable();
-            return;
+            return authority_will_change or incoming_will_change;
         };
         var request = self.page_state.prepareDocumentRequest(ctx.allocator(), capability) catch |err| {
             self.page_state.markDocumentRequestPreparationFailed(err);
@@ -207,29 +213,31 @@ pub const Controller = struct {
             self.page_state.rejectDocumentSpawn(generation);
             return err;
         };
+        return displayed_present or incoming_will_change;
     }
 
-    fn maybeStartBranch(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) void {
-        if (self.active_page != .repository or !self.page_state.wantsBranchRequest()) return;
+    fn maybeStartBranch(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) bool {
+        if (self.active_page != .repository or !self.page_state.wantsBranchRequest()) return false;
+        const freshness_before = self.page_state.branch.freshness;
         const repo_root = self.repo.activeRoot() orelse {
             self.page_state.markBranchRequestPreparationFailed();
-            return;
+            return !std.meta.eql(freshness_before, self.page_state.branch.freshness);
         };
         const capability = self.repo.activeCapability() orelse {
             self.page_state.markBranchRequestPreparationFailed();
-            return;
+            return !std.meta.eql(freshness_before, self.page_state.branch.freshness);
         };
 
         var request = self.page_state.prepareBranchRequest(ctx.allocator(), repo_root, capability) catch {
             self.page_state.markBranchRequestPreparationFailed();
-            return;
+            return !std.meta.eql(freshness_before, self.page_state.branch.freshness);
         };
         var request_consumed = false;
         defer if (!request_consumed) request.deinit(ctx.allocator());
         const generation = request.generation;
         const task = ctx.allocator().create(BranchTask) catch {
             self.page_state.rejectBranchSpawn(generation);
-            return;
+            return !std.meta.eql(freshness_before, self.page_state.branch.freshness);
         };
         task.* = .{ .request = request, .env_map = self.env_map };
         request_consumed = true;
@@ -237,6 +245,7 @@ pub const Controller = struct {
             task.destroy(ctx.allocator());
             self.page_state.rejectBranchSpawn(generation);
         };
+        return !std.meta.eql(freshness_before, self.page_state.branch.freshness);
     }
 
     fn maybeStartPathHistory(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) void {

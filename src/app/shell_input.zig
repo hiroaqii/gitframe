@@ -481,14 +481,16 @@ pub const OverlayScrollController = struct {
     help_page: page.Id,
     push_error_message: ?[]const u8,
 
-    pub fn scrollHelp(self: OverlayScrollController, delta: isize) void {
+    pub fn scrollHelp(self: OverlayScrollController, delta: isize) bool {
+        const previous = self.overlay.help_scroll;
         self.overlay.help_scroll = applySignedScroll(self.overlay.help_scroll, delta);
         self.clampHelp();
+        return previous != self.overlay.help_scroll;
     }
 
     pub fn pageHelp(self: OverlayScrollController, pages: isize) void {
         const rows = @max(@as(usize, app_view.helpVisibleRows(self.content_size, self.help_page)), 1);
-        self.scrollHelp(pageDelta(rows, pages));
+        _ = self.scrollHelp(pageDelta(rows, pages));
     }
 
     pub fn clampHelp(self: OverlayScrollController) void {
@@ -498,9 +500,11 @@ pub const OverlayScrollController = struct {
         );
     }
 
-    pub fn scrollPushError(self: OverlayScrollController, delta: isize) void {
+    pub fn scrollPushError(self: OverlayScrollController, delta: isize) bool {
+        const previous = self.overlay.push_error_scroll;
         self.overlay.push_error_scroll = applySignedScroll(self.overlay.push_error_scroll, delta);
         self.clampPushError();
+        return previous != self.overlay.push_error_scroll;
     }
 
     pub fn pagePushError(self: OverlayScrollController, pages: isize) void {
@@ -508,7 +512,7 @@ pub const OverlayScrollController = struct {
             self.content_size,
             self.push_error_message,
         )), 1);
-        self.scrollPushError(pageDelta(rows, pages));
+        _ = self.scrollPushError(pageDelta(rows, pages));
     }
 
     pub fn clampPushError(self: OverlayScrollController) void {
@@ -550,15 +554,15 @@ test "human review result modal blocks mouse routing while Repository Help scrol
         .push_error_message = null,
     };
 
-    controller.scrollHelp(1);
+    _ = controller.scrollHelp(1);
     try std.testing.expectEqual(@as(usize, 1), overlay.help_scroll);
     controller.pageHelp(1);
     try std.testing.expectEqual(@min(1 + visible_rows, max_scroll), overlay.help_scroll);
-    controller.scrollHelp(std.math.maxInt(isize));
+    _ = controller.scrollHelp(std.math.maxInt(isize));
     try std.testing.expectEqual(max_scroll, overlay.help_scroll);
     controller.pageHelp(-1);
     try std.testing.expectEqual(max_scroll -| visible_rows, overlay.help_scroll);
-    controller.scrollHelp(-std.math.maxInt(isize));
+    _ = controller.scrollHelp(-std.math.maxInt(isize));
     try std.testing.expectEqual(@as(usize, 0), overlay.help_scroll);
 
     overlay.close();

@@ -764,7 +764,9 @@ test "changes repository transition active repository replacement rejects old ow
     try std.testing.expectEqualStrings(roots.b, replacement_task.request.root_path);
     try std.testing.expect(replacement_task.request.root.identity.eql(root_b_identity));
     try std.testing.expectEqual(@as(usize, 0), app.pages.repository.status.text().len);
-    try std.testing.expect(app.redraw_plan.resolvesToSkip());
+    // The stale completion is a skip candidate, but the same root tail arms
+    // the visible replacement manifest lifecycle and therefore needs a frame.
+    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "changes repository transition post-commit manifest start failures stay on Repository" {
@@ -880,6 +882,188 @@ test "wheel redraw error terminal does not suppress the root frame" {
     try std.testing.expectError(error.OutOfMemory, app.update(wheel_down, &failing_ctx));
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expect(!failing_ctx.redrawWasSuppressed());
+}
+
+test "Repository tree wheel redraw preserves meaningful owner path and incoming transitions" {
+    const allocator = std.testing.allocator;
+    var app = try repositoryWheelAppForTest(
+        allocator,
+        "a.zig\x00b.zig\x00",
+        "zero\none\ntwo\nthree\nfour\nfive\n",
+    );
+    defer app.pages.repository.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const wheel_up: App.Msg = .{ .repository = .wheel_up };
+    const wheel_down: App.Msg = .{ .repository = .wheel_down };
+
+    // Ownerless tree input first changes focus/cursor, then becomes a complete
+    // top-edge no-op; the opposite direction remains immediately meaningful.
+    app.pages.repository.viewer.focus = .source;
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_up, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), app.pages.repository.viewer.tree_cursor);
+    try std.testing.expectEqual(@import("../pages/repository/model.zig").Focus.tree, app.pages.repository.viewer.focus);
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_up, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqualStrings("a.zig", app.pages.repository.selected_path.?);
+
+    // This is the lifetime-sensitive sequence: the first wheel clears a
+    // keyboard owner, selects another manifest path, and destroys the old
+    // displayed document. Assertions intentionally read no old borrow.
+    app.pages.repository.viewer.focus = .source;
+    app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(
+        repositoryContentTokenForTest(&app.pages.repository),
+        1,
+    ) };
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(app.pages.repository.selection_owner == .none);
+    try std.testing.expectEqualStrings("b.zig", app.pages.repository.selected_path.?);
+    try std.testing.expect(app.pages.repository.displayed_document == null);
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_up, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqualStrings("a.zig", app.pages.repository.selected_path.?);
+
+    // At the bottom edge, dismissing an incoming destination is itself the
+    // only meaningful first transition; the following event is a true no-op.
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        app.pages.repository.repo_epoch,
+        app.pages.repository.root_identity.?,
+        .{ .location = .{ .path = "incoming.zig" } },
+    );
+    app.pages.repository.acceptIncoming(allocator, &incoming);
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(app.pages.repository.incoming == .none);
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_up, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+
+    // A provisional edge skip cannot hide a Repository tail diagnostic.
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    app.pages.repository.needs_revalidation = true;
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(repository_page.LoadState.no_repository, app.pages.repository.load_state);
+    app.pages.repository.status.clear();
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+}
+
+test "Repository source wheel redraw preserves semantic and pointer owners" {
+    const allocator = std.testing.allocator;
+    var app = try repositoryWheelAppForTest(
+        allocator,
+        "main.zig\x00",
+        "row 00\nrow 01\nrow 02\nrow 03\nrow 04\nrow 05\nrow 06\nrow 07\nrow 08\nrow 09\nrow 10\nrow 11\n",
+    );
+    defer app.pages.repository.deinit(allocator);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const body_size = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true }).bodySize();
+    const source = switch (app.pages.repository.displayed_document.?.value) {
+        .source => |*document| document,
+        .inert => return error.ExpectedRepositorySource,
+    };
+    app.pages.repository.viewer.source_cursor = source.rowCount() - 1;
+    app.pages.repository.viewer.source_vertical_scroll = std.math.maxInt(usize);
+    app.pages.repository.clampForBodySize(body_size);
+    const bottom = app.pages.repository.viewer.source_vertical_scroll;
+    try std.testing.expect(bottom > 0);
+
+    const wheel_down: App.Msg = .{ .repository = .mouse_source_wheel_down };
+    const wheel_up: App.Msg = .{ .repository = .mouse_source_wheel_up };
+
+    // With the viewport already at the bottom, the first event still advances
+    // the semantic cursor and focus. Only the following edge event is inert.
+    app.pages.repository.viewer.focus = .tree;
+    app.pages.repository.viewer.source_cursor = source.rowCount() - 2;
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(source.rowCount() - 1, app.pages.repository.viewer.source_cursor);
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_up, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+
+    // A keyboard-line owner keeps its token, endpoint, and semantic cursor;
+    // pointer wheel changes only the source viewport.
+    const token = repositoryContentTokenForTest(&app.pages.repository);
+    app.pages.repository.viewer.focus = .source;
+    app.pages.repository.viewer.source_cursor = 3;
+    app.pages.repository.viewer.source_vertical_scroll = bottom - 1;
+    app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(token, 3) };
+    const endpoint_before = app.pages.repository.selection_owner.activeKeyboardLineSelection().?.focus;
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(bottom, app.pages.repository.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.repository.viewer.source_cursor);
+    try std.testing.expect(std.meta.eql(endpoint_before, app.pages.repository.selection_owner.activeKeyboardLineSelection().?.focus));
+    try std.testing.expect(app.pages.repository.selection_owner.activeKeyboardLineSelection().?.token.eql(token));
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    var incoming = try page_link.RepositoryIncoming.initOwned(
+        allocator,
+        app.pages.repository.repo_epoch,
+        app.pages.repository.root_identity.?,
+        .{ .location = .{ .path = "incoming.zig" } },
+    );
+    app.pages.repository.acceptIncoming(allocator, &incoming);
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(app.pages.repository.incoming == .none);
+    try std.testing.expect(app.pages.repository.activeKeyboardLineSelection());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_down, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(wheel_up, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
 }
 
 test "repository incoming viewport scroll App immediate and deferred routes use current body size" {
@@ -1288,6 +1472,76 @@ fn repositoryIncomingViewportBundleForTest(allocator: std.mem.Allocator) !reposi
     return .{
         .document = document,
         .tree = try repository_tree.Tree.build(allocator, &document),
+    };
+}
+
+fn repositoryWheelAppForTest(
+    allocator: std.mem.Allocator,
+    paths: []const u8,
+    content: []const u8,
+) !App {
+    const repository_manifest = @import("../../repository/manifest.zig");
+    const repository_tree = @import("../../repository/tree.zig");
+    const source_document = @import("../../repository/source.zig");
+
+    var manifest = try repository_manifest.parseOwned(allocator, try allocator.dupe(u8, paths));
+    var manifest_owned = true;
+    errdefer if (manifest_owned) manifest.deinit(allocator);
+    const tree = try repository_tree.Tree.build(allocator, &manifest);
+    var repository: repository_page.RepositoryPageState = .{
+        .active = true,
+        .activation_id = 2,
+        .repo_epoch = 3,
+        .root_identity = .{ .device = 5, .inode = 8 },
+        .bundle = .{
+            .document = manifest,
+            .tree = tree,
+        },
+        .load_state = .loaded,
+        .freshness = .fresh,
+        .manifest_revision = 6,
+        .source_revision = 7,
+        .viewer = .{ .tree_cursor = 1 },
+    };
+    manifest_owned = false;
+    errdefer repository.deinit(allocator);
+    repository.selected_path = repository.bundle.?.tree.firstFilePath();
+
+    const source_bytes = try allocator.dupe(u8, content);
+    var source = try source_document.Document.initOwned(
+        allocator,
+        source_bytes,
+        .init(source_bytes),
+    );
+    errdefer source.deinit(allocator);
+    repository.displayed_document = .{
+        .path = try allocator.dupe(u8, repository.selected_path.?),
+        .manifest_revision = repository.manifest_revision,
+        .source_revision = repository.source_revision,
+        .authority = .accepted,
+        .value = .{ .source = source },
+    };
+
+    return .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .terminal_size = .{ .width = 80, .height = 10 },
+        .pages = .{ .repository = repository },
+    };
+}
+
+fn repositoryContentTokenForTest(
+    state: *const repository_page.RepositoryPageState,
+) repository_selection.RepositoryContentToken {
+    const source = switch (state.displayed_document.?.value) {
+        .source => |document| document,
+        .inert => unreachable,
+    };
+    return .{
+        .repo_epoch = state.repo_epoch,
+        .root_identity = state.root_identity.?,
+        .path = state.selected_path.?,
+        .source_fingerprint = source.fingerprint,
     };
 }
 

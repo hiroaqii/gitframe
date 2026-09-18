@@ -1478,7 +1478,7 @@ test "mouse uses full body as diff pane while sidebar is hidden" {
     try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
 }
 
-test "help overlay wheel scrolls help and ignores clicks" {
+test "help overlay wheel redraw changes once skips at edge and reverses" {
     var app: App = .{
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -1487,16 +1487,30 @@ test "help overlay wheel scrolls help and ignores clicks" {
         .overlay = .{ .kind = .help },
     };
 
+    var ctx: chasen.Ctx(App.Msg) = .{};
+    const max_scroll = app_view.helpMaxScroll(layoutSize(&app), app.active_page);
+    try std.testing.expect(max_scroll > 0);
+    app.overlay.help_scroll = max_scroll - 1;
     const content = app_shell_layout.contentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedHelpWheelMessage;
     try std.testing.expectEqual(App.Msg.help_scroll_down, msg);
-    try app.update(msg, undefined);
-    try std.testing.expect(app.overlay.help_scroll > 0);
+    try app.update(msg, &ctx);
+    try std.testing.expectEqual(max_scroll, app.overlay.help_scroll);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(msg, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.help_scroll_up, &ctx);
+    try std.testing.expectEqual(max_scroll - 1, app.overlay.help_scroll);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
 
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }
 
-test "push error overlay wheel scrolls details and ignores clicks" {
+test "push error overlay wheel redraw changes once skips at edge and reverses" {
     const long_message =
         "line 1\nline 2\nline 3\nline 4\nline 5\n" ++
         "line 6\nline 7\nline 8\nline 9\nline 10\n";
@@ -1510,11 +1524,25 @@ test "push error overlay wheel scrolls details and ignores clicks" {
     defer app.remote_workflow.deinit(std.testing.allocator);
     app.overlay.openPushError();
 
+    var ctx: chasen.Ctx(App.Msg) = .{};
+    const max_scroll = app_view.pushErrorMaxScroll(layoutSize(&app), app.remote_workflow.push_error_message);
+    try std.testing.expect(max_scroll > 0);
+    app.overlay.push_error_scroll = max_scroll - 1;
     const content = app_shell_layout.contentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedPushErrorWheelMessage;
     try std.testing.expectEqual(App.Msg.push_error_scroll_down, msg);
-    try app.update(msg, undefined);
-    try std.testing.expect(app.overlay.push_error_scroll > 0);
+    try app.update(msg, &ctx);
+    try std.testing.expectEqual(max_scroll, app.overlay.push_error_scroll);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(msg, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.push_error_scroll_up, &ctx);
+    try std.testing.expectEqual(max_scroll - 1, app.overlay.push_error_scroll);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
 
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }

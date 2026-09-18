@@ -1002,12 +1002,12 @@ pub const App = struct {
                 self.overlay.openHelpForPage(self.active_page);
             },
             .close_help => self.overlay.close(),
-            .help_scroll_up => self.overlayScroll().scrollHelp(-1),
-            .help_scroll_down => self.overlayScroll().scrollHelp(1),
+            .help_scroll_up => if (!self.overlayScroll().scrollHelp(-1)) self.redraw_plan.requestSkip(),
+            .help_scroll_down => if (!self.overlayScroll().scrollHelp(1)) self.redraw_plan.requestSkip(),
             .help_page_up => self.overlayScroll().pageHelp(-1),
             .help_page_down => self.overlayScroll().pageHelp(1),
-            .push_error_scroll_up => self.overlayScroll().scrollPushError(-1),
-            .push_error_scroll_down => self.overlayScroll().scrollPushError(1),
+            .push_error_scroll_up => if (!self.overlayScroll().scrollPushError(-1)) self.redraw_plan.requestSkip(),
+            .push_error_scroll_down => if (!self.overlayScroll().scrollPushError(1)) self.redraw_plan.requestSkip(),
             .push_error_page_up => self.overlayScroll().pagePushError(-1),
             .push_error_page_down => self.overlayScroll().pagePushError(1),
             .copy_popup => self.copyPopup(ctx),
@@ -1072,9 +1072,9 @@ pub const App = struct {
             .visible => self.redraw_plan.requireFrame(),
         }
         if (try self.changesRead().maybeStartQueuedRevalidation(ctx)) self.redraw_plan.requireFrame();
-        try self.repositoryCoordinator().startPending(ctx);
+        if (try self.repositoryCoordinator().startPending(ctx)) self.redraw_plan.requireFrame();
         if (try self.historyCoordinator().startPending(ctx)) self.redraw_plan.requireFrame();
-        self.reconcileCommandLine();
+        if (self.reconcileCommandLine()) self.redraw_plan.requireFrame();
         const revalidation_queued_before_projection = self.changesRead().hasQueuedFullRevalidation();
         if (self.active_page == .changes) try self.changesRead().ensureProjection(ctx);
         // Boundary inert retention queues its repair revalidation inside
@@ -1906,20 +1906,21 @@ pub const App = struct {
     /// Async source publication and repository replacement can invalidate an
     /// otherwise idle command between input events. Close it at the common
     /// update tail before any later Enter can reuse the stale target.
-    fn reconcileCommandLine(self: *App) void {
+    fn reconcileCommandLine(self: *App) bool {
         const execution = switch (self.command_session) {
-            .inactive => return,
+            .inactive => return false,
             .active => |active| active.context,
         };
         switch (execution) {
             .repository_source => |target| {
                 if (self.active_page != .repository) {
                     self.command_session = .inactive;
-                    return;
+                    return true;
                 }
-                if (self.pages.repository.commandSourceTargetMatches(target)) return;
+                if (self.pages.repository.commandSourceTargetMatches(target)) return false;
                 self.command_session = .inactive;
                 self.pages.repository.status.set("command source is no longer available", .{});
+                return true;
             },
         }
     }
@@ -2620,7 +2621,7 @@ test "command line stale target reconciliation closes without execution" {
     var app: App = .{ .active_page = .repository };
     app.command_session = try commandSessionForTest("20");
 
-    app.reconcileCommandLine();
+    _ = app.reconcileCommandLine();
 
     try std.testing.expect(app.commandLineView() == null);
     try std.testing.expectEqualStrings(

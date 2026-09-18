@@ -116,7 +116,7 @@ test "Repository branch App route runs owned task and preserves primary status" 
     app.pages.repository.status.set("Selected source range", .{});
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
 
-    try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
     const queued = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
     const task: *RepositoryBranchTask = @ptrCast(@alignCast(queued[0].ctx));
@@ -163,7 +163,7 @@ test "Repository path history App route runs one task and preserves primary stat
     app.pages.repository.status.set("Selected source range", .{});
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
 
-    try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
     const queued = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
     const task: *RepositoryPathHistoryTask = @ptrCast(@alignCast(queued[0].ctx));
@@ -203,7 +203,7 @@ test "Repository branch App start failures close request owners and stay branch 
         var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
 
-        try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+        _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
 
         try std.testing.expect(app.pages.repository.branch.pending == null);
         try std.testing.expectEqual(@as(u64, 0), app.pages.repository.branch.generation);
@@ -226,7 +226,7 @@ test "Repository branch App start failures close request owners and stay branch 
         var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
 
-        try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+        _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
 
         try std.testing.expect(app.pages.repository.branch.pending == null);
         try std.testing.expectEqual(@as(u64, 1), app.pages.repository.branch.generation);
@@ -257,7 +257,7 @@ test "Repository branch App start failures close request owners and stay branch 
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
         for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
 
-        try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+        _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
 
         try std.testing.expect(app.pages.repository.branch.pending == null);
         try std.testing.expectEqual(@as(u64, 1), app.pages.repository.branch.generation);
@@ -287,7 +287,7 @@ test "Repository branch App runtime terminals preserve diagnostic ownership" {
         try configureRepositoryBranchAppForTest(&app, allocator, root_path);
         app.pages.repository.status.set("Copy failed", .{});
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
-        try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+        _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
         const queued = ctx.takePendingTasksWith();
         try std.testing.expectEqual(@as(usize, 1), queued.len);
 
@@ -312,7 +312,7 @@ test "Repository branch App runtime terminals preserve diagnostic ownership" {
         defer app.repo_session.repo_state.deinit(allocator);
         try configureRepositoryBranchAppForTest(&app, allocator, root_path);
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
-        try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+        _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
         const queued = ctx.takePendingTasksWith();
         try std.testing.expectEqual(@as(usize, 1), queued.len);
 
@@ -434,7 +434,7 @@ test "repository transition missing document capability closes incoming owner" {
     ));
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
-    try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
 
     const unavailable = app.pages.repository.incomingUnavailable().?;
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, unavailable.reason);
@@ -461,7 +461,7 @@ test "repository transition ordinary document capability loss preserves retry" {
     app.pages.repository.status.set("retained diagnostic", .{});
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
-    try app_testing.repositoryCoordinator(&app).startPending(&ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
 
     try std.testing.expect(app.pages.repository.needs_document_revalidation);
     try std.testing.expectEqualStrings("retained diagnostic", app.pages.repository.status.text());
@@ -522,7 +522,7 @@ test "repository syntax task allocation and spawn failures release owners and re
     // object allocation and let the unconsumed request defer release path/root.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
     var allocation_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
-    try app_testing.repositoryCoordinator(&app).startPending(&allocation_ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&allocation_ctx);
     try std.testing.expect(app.pages.repository.wantsSyntaxRequest());
     try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasksWith().len);
 
@@ -536,13 +536,13 @@ test "repository syntax task allocation and spawn failures release owners and re
     };
     var spawn_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
     for (0..16) |_| try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
-    try app_testing.repositoryCoordinator(&app).startPending(&spawn_ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&spawn_ctx);
     try std.testing.expect(app.pages.repository.wantsSyntaxRequest());
     try std.testing.expectEqual(@as(usize, 0), spawn_ctx.takePendingTasksWith().len);
     try std.testing.expectEqual(@as(usize, 16), spawn_ctx.takePendingTasks().len);
 
     var retry_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
-    try app_testing.repositoryCoordinator(&app).startPending(&retry_ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&retry_ctx);
     const queued = retry_ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
     var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
@@ -602,7 +602,7 @@ test "repository change map task allocation and spawn failures release owners an
     // allocation and prove the request defer returns all three owners.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
     var allocation_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
-    try app_testing.repositoryCoordinator(&app).startPending(&allocation_ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&allocation_ctx);
     try std.testing.expect(app.pages.repository.wantsChangeMapRequest());
     try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasksWith().len);
 
@@ -616,13 +616,13 @@ test "repository change map task allocation and spawn failures release owners an
     };
     var spawn_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
     for (0..16) |_| try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
-    try app_testing.repositoryCoordinator(&app).startPending(&spawn_ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&spawn_ctx);
     try std.testing.expect(app.pages.repository.wantsChangeMapRequest());
     try std.testing.expectEqual(@as(usize, 0), spawn_ctx.takePendingTasksWith().len);
     try std.testing.expectEqual(@as(usize, 16), spawn_ctx.takePendingTasks().len);
 
     var retry_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
-    try app_testing.repositoryCoordinator(&app).startPending(&retry_ctx);
+    _ = try app_testing.repositoryCoordinator(&app).startPending(&retry_ctx);
     const queued = retry_ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
     var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
