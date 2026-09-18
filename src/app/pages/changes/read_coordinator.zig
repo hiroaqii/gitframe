@@ -167,10 +167,14 @@ pub const Controller = struct {
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
         action_generation: u64,
-    ) void {
+    ) bool {
         if (self.page_state.action_cursor.actionGeneration()) |generation| {
-            if (action_generation > generation) self.navigationOwner().clearActionCursor(ctx.allocator());
+            if (action_generation > generation) {
+                self.navigationOwner().clearActionCursor(ctx.allocator());
+                return self.active_page == .changes;
+            }
         }
+        return false;
     }
 
     fn readBusy(self: Controller) bool {
@@ -210,14 +214,15 @@ pub const Controller = struct {
         if (outcome == .needs_repo_discovery) try self.startRepoDiscovery(ctx, null);
     }
 
-    pub fn maybeStartQueuedRevalidation(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.active_page != .changes or self.readBusy()) return;
-        if (!self.page_state.activation.hasQueuedFullRevalidation()) return;
+    pub fn maybeStartQueuedRevalidation(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !bool {
+        if (self.active_page != .changes or self.readBusy()) return false;
+        if (!self.page_state.activation.hasQueuedFullRevalidation()) return false;
         if (diff_source.sourceIsOneShotInput(self.source)) {
             self.page_state.activation.discardTerminalRevalidation();
-            return;
+            return false;
         }
         self.startRevalidation(ctx) catch {};
+        return true;
     }
 
     pub fn startRepoDiscovery(

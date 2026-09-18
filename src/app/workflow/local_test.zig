@@ -579,7 +579,7 @@ fn abandonSingleQueuedAction(
         else => return error.ExpectedLocalActionTerminal,
     }
 
-    try app.changesRead().maybeStartQueuedRevalidation(ctx);
+    _ = try app.changesRead().maybeStartQueuedRevalidation(ctx);
     const revalidation = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 3), revalidation.len);
     const status_task: *StatusLoadTask = @ptrCast(@alignCast(revalidation[0].ctx));

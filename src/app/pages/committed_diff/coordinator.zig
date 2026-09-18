@@ -23,6 +23,7 @@ pub const ClipboardEffect = struct {
 pub const UpdateOutcome = struct {
     clipboard: ?ClipboardEffect = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    redraw: diff_surface.update.Redraw = .default,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -75,11 +76,13 @@ pub const Controller = struct {
         defer applied.deinit(allocator);
         adapter.applyRetentionTransition(allocator, applied.retention_transition);
         const auto_scroll = applied.auto_scroll;
-        const effect = applied.takeEffect() orelse return .{ .auto_scroll = auto_scroll };
+        const redraw = applied.redraw;
+        const effect = applied.takeEffect() orelse return .{ .auto_scroll = auto_scroll, .redraw = redraw };
         return switch (effect) {
             .copy_diff_selection => |copy| .{
                 .clipboard = self.ownedSelectionClipboard("diff selection", copy),
                 .auto_scroll = auto_scroll,
+                .redraw = redraw,
             },
             .copy_diff_header_path => |selection_value| blk: {
                 const selection = selection_value;
@@ -90,6 +93,7 @@ pub const Controller = struct {
                 break :blk .{
                     .clipboard = self.borrowedClipboard("file path", path),
                     .auto_scroll = auto_scroll,
+                    .redraw = redraw,
                 };
             },
         };

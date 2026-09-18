@@ -21,11 +21,13 @@ const repo_discovery = @import("../../../repo/discovery.zig");
 const CompareLoadTask = app_load.CompareLoadTask(app_message.Msg);
 const BranchListTask = app_load.CompareBranchListLoadTask(app_message.Msg);
 
-pub const Redraw = enum { default, skip };
+pub const Redraw = diff_surface.update.Redraw;
+pub const DeferredApply = enum { none, visible, discarded };
 pub const ClipboardEffect = committed_diff_coordinator.ClipboardEffect;
 pub const UpdateOutcome = struct {
     clipboard: ?ClipboardEffect = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    redraw: Redraw = .default,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -80,6 +82,7 @@ pub const Controller = struct {
                 return .{
                     .clipboard = outcome.takeClipboard(),
                     .auto_scroll = outcome.auto_scroll,
+                    .redraw = outcome.redraw,
                 };
             },
             .open_base_picker => try self.startBasePicker(ctx),
@@ -219,11 +222,14 @@ pub const Controller = struct {
         return if (accepted and visible) .default else .skip;
     }
 
-    pub fn applyDeferred(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !Redraw {
-        if (self.page_state.diff.selection_owner.activeMouseSelection()) return .default;
-        const deferred = self.page_state.deferred_load_apply orelse return .default;
+    pub fn applyDeferred(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !DeferredApply {
+        if (self.page_state.diff.selection_owner.activeMouseSelection()) return .none;
+        const deferred = self.page_state.deferred_load_apply orelse return .none;
         self.page_state.deferred_load_apply = null;
-        return self.finishLoad(ctx, deferred.finished);
+        return switch (try self.finishLoad(ctx, deferred.finished)) {
+            .default => .visible,
+            .skip => .discarded,
+        };
     }
 
     pub fn prepareModalRedraw(self: Controller, io: std.Io) void {

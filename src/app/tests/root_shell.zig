@@ -1279,6 +1279,187 @@ test "mouse wheel scrolls the pane under the pointer" {
     try std.testing.expect(app.pages.changes.viewer.diff_scroll > 0);
 }
 
+test "wheel redraw reaches root for meaningful sidebar transition complete noop and reverse" {
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = .{ .no_index = .{ .left = "left", .right = "right" } } },
+        .pages = .{ .changes = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
+            .viewer = .{ .focus = .diff, .selected_target = .{ .diff_file = 0 }, .selected_node = 0 },
+            .selection_owner = .{ .keyboard_side_choice = .{
+                .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+                .before = .{ .hunk_index = 0, .line_index = 0 },
+                .after = .{ .hunk_index = 0, .line_index = 0 },
+            } },
+        } },
+        .terminal_size = .{ .width = 100, .height = 20 },
+    };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
+    try std.testing.expectEqual(diff_selection.Owner.none, app.pages.changes.selection_owner);
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    app.pages.changes.status.set("prior diagnostic", .{});
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqualStrings("", app.pages.changes.status.text());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .changes = .mouse_sidebar_wheel_down }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+}
+
+test "wheel redraw reaches root for semantic vertical and horizontal edges" {
+    const source: diff_source.SourceMode = .{ .no_index = .{ .left = "left", .right = "right" } };
+    var vertical: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = source },
+        .pages = .{ .changes = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .diff, .sidebar_hidden = true, .display_mode = .unified },
+            .selection_owner = .{ .diff = .{
+                .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+                .side = .new,
+                .mode = .line,
+                .anchor = .{ .hunk_index = 0, .line_index = 0 },
+                .focus = .{ .hunk_index = 0, .line_index = 0 },
+                .moved = true,
+            } },
+        } },
+        .terminal_size = .{ .width = 80, .height = 12 },
+    };
+    var vertical_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer vertical_ctx.runtimeClearPendingEffectCopies();
+    vertical.pages.changes.viewer.diff_cursor = changesNavigation(&vertical).view().selectedCoordinateAtOffset(0) orelse
+        return error.ExpectedCursorOffset;
+    const vertical_owner = vertical.pages.changes.selection_owner;
+    const vertical_scroll_before = vertical.pages.changes.viewer.diff_scroll;
+    const vertical_cursor_before = changesNavigation(&vertical).view().selectedDiffCursorOffset();
+    vertical_ctx.resetRedrawSuppressed();
+    try vertical.update(.{ .changes = .mouse_diff_wheel_down }, &vertical_ctx);
+    try std.testing.expect(!vertical_ctx.redrawWasSuppressed());
+    try std.testing.expect(
+        vertical.pages.changes.viewer.diff_scroll != vertical_scroll_before or
+            changesNavigation(&vertical).view().selectedDiffCursorOffset() != vertical_cursor_before,
+    );
+    try std.testing.expectEqual(changes_page.Focus.diff, vertical.pages.changes.viewer.focus);
+    try std.testing.expect(vertical.pages.changes.selection_owner.activeMouseSelection());
+    try std.testing.expectEqualDeep(vertical_owner, vertical.pages.changes.selection_owner);
+
+    var reached_vertical_noop = false;
+    for (0..128) |_| {
+        vertical_ctx.resetRedrawSuppressed();
+        try vertical.update(.{ .changes = .mouse_diff_wheel_down }, &vertical_ctx);
+        if (vertical_ctx.redrawWasSuppressed()) {
+            reached_vertical_noop = true;
+            break;
+        }
+    }
+    try std.testing.expect(reached_vertical_noop);
+    const vertical_edge = changesNavigation(&vertical).view().selectedDiffCursorOffset() orelse
+        return error.ExpectedCursorOffset;
+    const vertical_edge_scroll = vertical.pages.changes.viewer.diff_scroll;
+    try std.testing.expect(vertical_edge > 1);
+    try std.testing.expectEqualDeep(vertical_owner, vertical.pages.changes.selection_owner);
+    vertical_ctx.resetRedrawSuppressed();
+    try vertical.update(.{ .changes = .mouse_diff_wheel_up }, &vertical_ctx);
+    try std.testing.expect(!vertical_ctx.redrawWasSuppressed());
+    try std.testing.expect(
+        vertical.pages.changes.viewer.diff_scroll != vertical_edge_scroll or
+            changesNavigation(&vertical).view().selectedDiffCursorOffset().? != vertical_edge,
+    );
+    try std.testing.expectEqualDeep(vertical_owner, vertical.pages.changes.selection_owner);
+
+    var horizontal: App = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .source = source },
+        .pages = .{ .changes = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
+            .viewer = .{ .focus = .sidebar, .sidebar_hidden = true, .display_mode = .unified },
+        } },
+        .terminal_size = .{ .width = 40, .height = 12 },
+    };
+    var horizontal_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer horizontal_ctx.runtimeClearPendingEffectCopies();
+    var meaningful_horizontal = false;
+    var reached_horizontal_noop = false;
+    for (0..256) |_| {
+        horizontal_ctx.resetRedrawSuppressed();
+        try horizontal.update(.{ .changes = .mouse_diff_wheel_right }, &horizontal_ctx);
+        if (horizontal_ctx.redrawWasSuppressed()) {
+            reached_horizontal_noop = true;
+            break;
+        }
+        meaningful_horizontal = true;
+    }
+    try std.testing.expect(meaningful_horizontal);
+    try std.testing.expect(reached_horizontal_noop);
+    horizontal_ctx.resetRedrawSuppressed();
+    try horizontal.update(.{ .changes = .mouse_diff_wheel_left }, &horizontal_ctx);
+    try std.testing.expect(!horizontal_ctx.redrawWasSuppressed());
+}
+
+test "Compare wheel redraw reaches root for meaningful complete noop and reverse" {
+    const allocator = std.testing.allocator;
+    var app: App = .{
+        .active_page = .compare,
+        .allocator = allocator,
+        .pages = .{ .compare = .{ .diff = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{ .focus = .diff, .sidebar_hidden = true, .display_mode = .unified },
+        } } },
+        .terminal_size = .{ .width = 80, .height = 12 },
+    };
+    defer app.pages.compare.deinit(allocator);
+    _ = app.pages.compare.activate(app.repo_session.repo_epoch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    const view = compareNavigation(&app).view();
+    var resolver = view.resolver();
+    const body = view.bodyView(&resolver);
+    app.pages.compare.diff.viewer.diff_cursor = body.selectedCoordinateAtOffset(0) orelse
+        return error.ExpectedCursorOffset;
+    const first_cursor = body.selectedDiffCursorOffset();
+    try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_down } } }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(body.selectedDiffCursorOffset() != first_cursor);
+
+    var reached_noop = false;
+    for (0..128) |_| {
+        ctx.resetRedrawSuppressed();
+        try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_down } } }, &ctx);
+        if (ctx.redrawWasSuppressed()) {
+            reached_noop = true;
+            break;
+        }
+    }
+    try std.testing.expect(reached_noop);
+    const edge_cursor = body.selectedDiffCursorOffset();
+    const edge_scroll = app.pages.compare.diff.viewer.diff_scroll;
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_up } } }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(
+        app.pages.compare.diff.viewer.diff_scroll != edge_scroll or
+            body.selectedDiffCursorOffset() != edge_cursor,
+    );
+}
+
 test "mouse uses full body as diff pane while sidebar is hidden" {
     var app: App = .{
         .pages = .{ .changes = .{

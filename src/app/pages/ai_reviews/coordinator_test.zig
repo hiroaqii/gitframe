@@ -2465,9 +2465,11 @@ fn findingPointerPoint(
     };
 }
 
+const FindingPointerBlockKind = enum { card, spacer };
+
 fn findingPointerBlock(
     rows: diff_render.PresentationRows,
-    kind: enum { card, spacer },
+    kind: FindingPointerBlockKind,
     token: usize,
 ) ?diff_render.InlineBlock {
     for (rows.blocks) |block| switch (block.kind) {
@@ -2475,6 +2477,18 @@ fn findingPointerBlock(
         .spacer => if (kind == .spacer) return block,
     };
     return null;
+}
+
+fn findingBlockPoint(
+    harness: *FindingNavigationHarness,
+    layout: diff_surface.Layout,
+    kind: FindingPointerBlockKind,
+) !diff_surface.MousePoint {
+    var frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(std.testing.allocator)).?;
+    defer frame.deinit(std.testing.allocator);
+    const block = findingPointerBlock(frame.presentation_rows, kind, 0) orelse
+        return error.ExpectedFindingBlock;
+    return findingPointerPoint(harness, layout, block.presentation_start, 7);
 }
 
 test "side-by-side Finding pointer keeps pane-local actions and inert padding" {
@@ -2645,7 +2659,7 @@ test "Finding wheel at content edges steps semantic source rows" {
     }
 }
 
-test "Finding pointer routes exact card cells with one semantic command" {
+test "Finding wheel redraw routes exact card cells with one semantic command" {
     const allocator = std.testing.allocator;
     const layout: diff_surface.Layout = .{ .width = 100, .height = 18 };
     var harness = try FindingNavigationHarness.init(allocator, true);
@@ -2720,6 +2734,7 @@ test "Finding pointer routes exact card cells with one semantic command" {
     try std.testing.expectEqual(viewport_before_body_scroll, harness.page_state.diff.viewer.diff_scroll);
     const card_before_horizontal = harness.page_state.finding_card;
     var horizontal = try harness.pointer(allocator, layout, body_point, .wheel_right);
+    try std.testing.expectEqual(ai_reviews_coordinator.Redraw.skip, horizontal.redraw);
     horizontal.deinit(allocator);
     try std.testing.expectEqualDeep(card_before_horizontal, harness.page_state.finding_card);
     try std.testing.expectEqual(viewport_before_body_scroll, harness.page_state.diff.viewer.diff_scroll);
@@ -2797,6 +2812,7 @@ test "Finding pointer routes exact card cells with one semantic command" {
     var spacer_press = try harness.pointer(allocator, layout, spacer_point, .left);
     spacer_press.deinit(allocator);
     var spacer_horizontal = try harness.pointer(allocator, layout, spacer_point, .wheel_left);
+    try std.testing.expectEqual(ai_reviews_coordinator.Redraw.skip, spacer_horizontal.redraw);
     spacer_horizontal.deinit(allocator);
     try std.testing.expectEqualDeep(spacer_viewer_before, harness.page_state.diff.viewer);
     try std.testing.expectEqualDeep(spacer_card_before, harness.page_state.finding_card);
@@ -2846,6 +2862,294 @@ test "Finding pointer routes exact card cells with one semantic command" {
     var header_wheel = try harness.pointer(allocator, layout, header_point, header_button);
     header_wheel.deinit(allocator);
     try std.testing.expectEqual(expected_header_scroll, harness.page_state.diff.viewer.diff_scroll);
+}
+
+test "Finding wheel redraw classifies fallback owned and diagnostic branches" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 18 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    harness.page_state.diff.viewer.sidebar_hidden = true;
+    harness.page_state.diff.viewer.focus = .diff;
+
+    const controller = harness.controller(layout);
+    controller.ensureFindingPresentationCache();
+    var frame = controller.navigationView().cachedFindingCardFrame() orelse
+        return error.ExpectedFindingFrame;
+    var finding_view = controller.navigationView().withPresentationRows(&frame.presentation_rows);
+    var resolver = finding_view.resolver();
+    const body = finding_view.bodyView(&resolver);
+    try std.testing.expect(body.sourceDiffLineCount() > 1);
+
+    // These are distinct Finding-owned routing branches that the source-cell
+    // root proof cannot observe: each must retain shared vertical fallback.
+    for ([_]FindingPointerBlockKind{ .card, .spacer }) |kind| {
+        harness.page_state.diff.viewer.diff_scroll = 1;
+        harness.page_state.diff.viewer.diff_cursor = body.selectedCoordinateAtOffset(1).?;
+        const first_cursor = body.selectedDiffCursorOffset();
+        const first_scroll = harness.page_state.diff.viewer.diff_scroll;
+        var first = try harness.pointer(allocator, layout, try findingBlockPoint(&harness, layout, kind), .wheel_up);
+        try std.testing.expectEqual(ai_reviews_coordinator.Redraw.default, first.redraw);
+        first.deinit(allocator);
+        try std.testing.expect(
+            harness.page_state.diff.viewer.diff_scroll != first_scroll or
+                body.selectedDiffCursorOffset() != first_cursor,
+        );
+
+        var reached_noop = false;
+        for (0..128) |_| {
+            const viewer_before = harness.page_state.diff.viewer;
+            const card_before = harness.page_state.finding_card;
+            var toward_edge = try harness.pointer(allocator, layout, try findingBlockPoint(&harness, layout, kind), .wheel_up);
+            if (toward_edge.redraw == .skip) {
+                reached_noop = true;
+                try std.testing.expectEqualDeep(viewer_before, harness.page_state.diff.viewer);
+                try std.testing.expectEqualDeep(card_before, harness.page_state.finding_card);
+            }
+            toward_edge.deinit(allocator);
+            if (reached_noop) break;
+        }
+        try std.testing.expect(reached_noop);
+        const edge_cursor = body.selectedDiffCursorOffset();
+        const edge_scroll = harness.page_state.diff.viewer.diff_scroll;
+
+        var reverse = try harness.pointer(allocator, layout, try findingBlockPoint(&harness, layout, kind), .wheel_down);
+        try std.testing.expectEqual(ai_reviews_coordinator.Redraw.default, reverse.redraw);
+        reverse.deinit(allocator);
+        try std.testing.expect(
+            harness.page_state.diff.viewer.diff_scroll != edge_scroll or
+                body.selectedDiffCursorOffset() != edge_cursor,
+        );
+    }
+
+    // A source-cell horizontal wheel falls through shared navigation. One
+    // narrow viewport proves its first change, edge no-op, and reverse.
+    const source_layout: diff_surface.Layout = .{ .width = 20, .height = 18 };
+    const source_controller = harness.controller(source_layout);
+    source_controller.ensureFindingPresentationCache();
+    frame = source_controller.navigationView().cachedFindingCardFrame() orelse
+        return error.ExpectedFindingFrame;
+    const source_offset = frame.presentation_rows.blocks[0].after_source_offset;
+    const source_presentation = frame.presentation_rows.sourceToPresentation(source_offset).?;
+    const max_scroll = frame.presentation_rows.total_rows -| source_controller.navigationView().view().diffVisibleRows();
+    harness.page_state.diff.viewer.diff_scroll = @min(source_presentation, max_scroll);
+    var source_view = source_controller.navigationView().withPresentationRows(&frame.presentation_rows);
+    var source_resolver = source_view.resolver();
+    try std.testing.expect(source_view.bodyView(&source_resolver).visibleBodyTextMaxHorizontalScroll() > 0);
+    const source_point = try findingPointerPoint(&harness, source_layout, source_presentation, 12);
+    harness.page_state.diff.viewer.focus = .sidebar;
+    var source_first = try harness.pointer(allocator, source_layout, source_point, .wheel_right);
+    try std.testing.expectEqual(ai_reviews_coordinator.Redraw.default, source_first.redraw);
+    source_first.deinit(allocator);
+    try std.testing.expectEqual(diff_surface.Focus.diff, harness.page_state.diff.viewer.focus);
+    try std.testing.expect(harness.page_state.diff.viewer.diff_horizontal_scroll > 0);
+    var reached_source_noop = false;
+    for (0..128) |_| {
+        var toward_edge = try harness.pointer(allocator, source_layout, source_point, .wheel_right);
+        if (toward_edge.redraw == .skip) reached_source_noop = true;
+        toward_edge.deinit(allocator);
+        if (reached_source_noop) break;
+    }
+    try std.testing.expect(reached_source_noop);
+    const reverse_horizontal_before = harness.page_state.diff.viewer.diff_horizontal_scroll;
+    var source_reverse = try harness.pointer(allocator, source_layout, source_point, .wheel_left);
+    try std.testing.expectEqual(ai_reviews_coordinator.Redraw.default, source_reverse.redraw);
+    source_reverse.deinit(allocator);
+    try std.testing.expect(harness.page_state.diff.viewer.diff_horizontal_scroll < reverse_horizontal_before);
+
+    const card_point = try findingBlockPoint(&harness, layout, .card);
+    const card_before = harness.page_state.finding_card;
+    const viewer_before = harness.page_state.diff.viewer;
+    var collapsed_horizontal = try harness.pointer(
+        allocator,
+        layout,
+        card_point,
+        .wheel_left,
+    );
+    try std.testing.expectEqual(ai_reviews_coordinator.Redraw.skip, collapsed_horizontal.redraw);
+    collapsed_horizontal.deinit(allocator);
+    try std.testing.expectEqualDeep(card_before, harness.page_state.finding_card);
+    try std.testing.expectEqualDeep(viewer_before, harness.page_state.diff.viewer);
+
+    // Keep the presentation hit but invalidate its card-token lookup. The
+    // diagnostic is visible and therefore must retain the default redraw.
+    const cache = &harness.page_state.selectedRun().?.finding_presentation_cache.?;
+    cache.frame.?.row_plan.cards = cache.frame.?.row_plan.cards[0..0];
+    var invalid = try harness.pointer(allocator, layout, card_point, .wheel_down);
+    try std.testing.expectEqual(ai_reviews_coordinator.Redraw.default, invalid.redraw);
+    invalid.deinit(allocator);
+    try std.testing.expectEqualStrings("Could not resolve Finding pointer", harness.page_state.status.text());
+}
+
+test "Finding wheel redraw reaches root for card and source fallback boundaries" {
+    const allocator = std.testing.allocator;
+    const layout: diff_surface.Layout = .{ .width = 100, .height = 18 };
+    var harness = try FindingNavigationHarness.init(allocator, true);
+    defer harness.deinit(allocator);
+    harness.page_state.diff.viewer.sidebar_hidden = true;
+    harness.page_state.diff.viewer.focus = .diff;
+
+    const projection = &harness.page_state.selectedRunConst().?.selection.finding_projection;
+    const model = finding_card.FindingCardModel.init(projection, projection.files[0].mapped_entry_indices[0]).?;
+    _ = harness.page_state.finding_card.apply(.{ .focus = model });
+    _ = harness.page_state.finding_card.apply(.toggle);
+
+    var card_frame = (try harness.controller(layout).navigationView().buildFindingCardFrame(allocator)).?;
+    const card_index = card_frame.row_plan.cardIndex(model).?;
+    const card_start = card_frame.presentation_rows.cardStart(card_index).?;
+    harness.page_state.diff.viewer.diff_scroll = @min(
+        card_start,
+        card_frame.presentation_rows.total_rows -| harness.controller(layout).navigationView().view().diffVisibleRows(),
+    );
+    const card_header_point = try findingPointerPoint(&harness, layout, card_start, 5);
+    const card_body_point = try findingPointerPoint(&harness, layout, card_start + finding_card.body_start_row, 8);
+    card_frame.deinit(allocator);
+
+    const content = harness.page_state.contentForFindingCard(model).?;
+    const max_body_scroll = try ai_reviews_page.findingCardMaxBodyScroll(
+        allocator,
+        content,
+        ai_reviews_page.findingCardContentWidth(harness.controller(layout).navigationView().view().diffPaneWidth()),
+    );
+    try std.testing.expect(max_body_scroll > 0);
+    for (0..max_body_scroll - 1) |_| {
+        _ = harness.page_state.finding_card.apply(.{ .scroll = .{ .direction = .down, .max_scroll = max_body_scroll } });
+    }
+
+    var app: app_root.App = .{
+        .allocator = allocator,
+        .active_page = .ai_reviews,
+        .terminal_size = .{ .width = layout.width, .height = layout.height + 2 },
+    };
+    app.pages.ai_reviews = harness.page_state;
+    harness.page_state = .{};
+    defer app.pages.ai_reviews.deinit(allocator);
+    defer app.review_store_operations.deinit(allocator);
+    defer app.human_review_sessions.deinit();
+    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try app.update(.{ .ai_reviews = .{ .finding_pointer = .{
+        .point = card_body_point,
+        .button = .wheel_down,
+    } } }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(max_body_scroll, app.pages.ai_reviews.finding_card.bodyScroll(model));
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .ai_reviews = .{ .finding_pointer = .{
+        .point = card_body_point,
+        .button = .wheel_down,
+    } } }, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(max_body_scroll, app.pages.ai_reviews.finding_card.bodyScroll(model));
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .ai_reviews = .{ .finding_pointer = .{
+        .point = card_body_point,
+        .button = .wheel_up,
+    } } }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqual(max_body_scroll - 1, app.pages.ai_reviews.finding_card.bodyScroll(model));
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .ai_reviews = .{ .finding_pointer = .{
+        .point = card_header_point,
+        .button = .left,
+    } } }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(!app.pages.ai_reviews.finding_card.expanded(model));
+
+    var key_buffer: [16]u8 = undefined;
+    const controller: ai_reviews_coordinator.Controller = .{
+        .page_state = &app.pages.ai_reviews,
+        .repo = app.repo_session.view(),
+        .layout = layout,
+        .mode_toggle_hint_width = diff_render.modeToggleHintWidth(
+            app.keymap.display(.toggle_display_mode, key_buffer[0..]),
+        ),
+        .env_map = null,
+        .sessions = &app.human_review_sessions,
+        .operations = &app.review_store_operations,
+    };
+    var source_frame = (try controller.navigationView().buildFindingCardFrame(allocator)).?;
+    defer source_frame.deinit(allocator);
+    var source_view = controller.navigationView().withPresentationRows(&source_frame.presentation_rows);
+    var source_resolver = source_view.resolver();
+    const body = source_view.bodyView(&source_resolver);
+    const source_rows = body.sourceDiffLineCount();
+    try std.testing.expect(source_rows > 1);
+    const visible_rows = source_view.view().diffVisibleRows();
+    const max_scroll = source_frame.presentation_rows.total_rows -| visible_rows;
+    app.pages.ai_reviews.diff.viewer.diff_scroll = max_scroll;
+    app.pages.ai_reviews.diff.viewer.diff_cursor = body.selectedCoordinateAtOffset(source_rows - 2).?;
+    app.pages.ai_reviews.diff.selection_owner = .{ .diff = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "src/alpha/a.zig" } },
+        .side = .new,
+        .mode = .line,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 0, .line_index = 0 },
+        .moved = true,
+    } };
+    const selection_owner = app.pages.ai_reviews.diff.selection_owner;
+
+    var source_presentation: ?usize = null;
+    for (max_scroll..@min(max_scroll + visible_rows, source_frame.presentation_rows.total_rows)) |row| {
+        if (body.presentationToSourceOffset(row) != null) {
+            source_presentation = row;
+            break;
+        }
+    }
+    const presentation = source_presentation orelse return error.ExpectedSourceRow;
+    const raw = source_view.view().rawDiffPaneGeometry() orelse return error.ExpectedDiffPane;
+    const source_point: diff_surface.MousePoint = .{
+        .col = raw.col + (raw.width - source_view.view().diffPaneWidth()) + 12,
+        .row = diff_render.body_start_row + @as(u16, @intCast(presentation - max_scroll)),
+    };
+    try std.testing.expect(std.meta.activeTag(body.presentationCellHit(source_point).?) == .source);
+
+    const source_scroll_before = app.pages.ai_reviews.diff.viewer.diff_scroll;
+    const source_cursor_before = body.selectedDiffCursorOffset().?;
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .ai_reviews = .{ .finding_pointer = .{
+        .point = source_point,
+        .button = .wheel_down,
+    } } }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expectEqualDeep(selection_owner, app.pages.ai_reviews.diff.selection_owner);
+    try std.testing.expect(
+        app.pages.ai_reviews.diff.viewer.diff_scroll != source_scroll_before or
+            body.selectedDiffCursorOffset().? != source_cursor_before,
+    );
+
+    var reached_source_noop = false;
+    for (0..source_rows + 4) |_| {
+        ctx.resetRedrawSuppressed();
+        try app.update(.{ .ai_reviews = .{ .finding_pointer = .{
+            .point = source_point,
+            .button = .wheel_down,
+        } } }, &ctx);
+        try std.testing.expectEqualDeep(selection_owner, app.pages.ai_reviews.diff.selection_owner);
+        if (ctx.redrawWasSuppressed()) {
+            reached_source_noop = true;
+            break;
+        }
+    }
+    try std.testing.expect(reached_source_noop);
+    try std.testing.expectEqual(source_rows - 1, body.selectedDiffCursorOffset().?);
+    const source_edge_scroll = app.pages.ai_reviews.diff.viewer.diff_scroll;
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.{ .ai_reviews = .{ .finding_pointer = .{
+        .point = source_point,
+        .button = .wheel_up,
+    } } }, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(
+        app.pages.ai_reviews.diff.viewer.diff_scroll != source_edge_scroll or
+            body.selectedDiffCursorOffset().? != source_rows - 1,
+    );
+    try std.testing.expectEqualDeep(selection_owner, app.pages.ai_reviews.diff.selection_owner);
 }
 
 test "Finding pointer isolates card selection lifecycle and allocation failures" {

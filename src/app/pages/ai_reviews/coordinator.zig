@@ -32,10 +32,7 @@ const HistoryScanTask = app_load.AiReviewScanTask(app_message.Msg);
 const HistorySelectionTask = app_load.AiReviewSelectionTask(app_message.Msg);
 const DeleteTask = delete_confirmation.Task(app_message.Msg);
 
-pub const Redraw = enum {
-    default,
-    skip,
-};
+pub const Redraw = diff_surface.update.Redraw;
 
 pub const HistorySelectionFinish = struct {
     redraw: Redraw,
@@ -62,6 +59,7 @@ pub const UpdateOutcome = struct {
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
     human_review_save: bool = false,
     human_review_finalize: ?committed_review.ReviewResultValue = null,
+    redraw: Redraw = .default,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -277,11 +275,13 @@ pub const Controller = struct {
             }
         }
         const auto_scroll = page_update.auto_scroll;
-        const effect = page_update.takeEffect() orelse return .{ .auto_scroll = auto_scroll };
+        const redraw = page_update.redraw;
+        const effect = page_update.takeEffect() orelse return .{ .auto_scroll = auto_scroll, .redraw = redraw };
         return switch (effect) {
             .copy_diff_selection => |copy| .{
                 .clipboard = self.ownedSelectionClipboard("diff selection", copy),
                 .auto_scroll = auto_scroll,
+                .redraw = redraw,
             },
             .copy_diff_header_path => |selection_value| blk: {
                 const selection = selection_value;
@@ -292,6 +292,7 @@ pub const Controller = struct {
                 break :blk .{
                     .clipboard = self.borrowedClipboard("file path", path),
                     .auto_scroll = auto_scroll,
+                    .redraw = redraw,
                 };
             },
         };
@@ -1070,7 +1071,8 @@ pub const Controller = struct {
             .source => return try self.updateSharedWithFindingFrame(ctx, shared_msg, &current_frame),
             .spacer => switch (pointer.button) {
                 .wheel_up, .wheel_down => return try self.updateSharedWithFindingFrame(ctx, shared_msg, &current_frame),
-                .left, .wheel_left, .wheel_right => return .{},
+                .left => return .{},
+                .wheel_left, .wheel_right => return .{ .redraw = .skip },
             },
             .card => |card_hit| {
                 if (card_hit.token >= current_frame.row_plan.cards.len) {
@@ -1130,14 +1132,15 @@ pub const Controller = struct {
                         };
                         const max_scroll = cached_body.rowCount() -| finding_card.body_rows;
                         var next_state = self.page_state.finding_card;
+                        const before = next_state;
                         _ = next_state.apply(.{ .scroll = .{
                             .direction = if (pointer.button == .wheel_up) .up else .down,
                             .max_scroll = max_scroll,
                         } });
                         self.page_state.finding_card = next_state;
-                        return .{};
+                        return .{ .redraw = if (std.meta.eql(before, next_state)) .skip else .default };
                     },
-                    .wheel_left, .wheel_right => return .{},
+                    .wheel_left, .wheel_right => return .{ .redraw = .skip },
                 }
             },
         }

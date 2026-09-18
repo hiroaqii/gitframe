@@ -466,12 +466,13 @@ fn commitDiscovery(
     return repoSession(app).commitDiscovered(&ctx, result, active_index, origin);
 }
 
-test "Compare completion defers as one bundle during drag and applies afterward" {
+test "Compare wheel redraw completion defers as one bundle during drag and applies afterward" {
     const allocator = std.testing.allocator;
     var app: App = .{ .allocator = allocator, .active_page = .compare };
     defer app.pages.compare.deinit(allocator);
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
 
     const initial = app.pages.compare.beginRefresh().?;
     try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
@@ -501,9 +502,20 @@ test "Compare completion defers as one bundle during drag and applies afterward"
     try std.testing.expect(app.pages.compare.deferred_load_apply != null);
     try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.compare.basis.?.target.head_oid.slice());
     app.pages.compare.diff.selection_owner = .none;
-    try app.update(.focus_lost, &ctx);
+
+    // This skip-producing spinner message is a synthetic root-tail
+    // composition, not a claim that a wheel and deferred publication naturally
+    // arrive as one event. The visible deferred owner must win over the
+    // provisional skip candidate.
+    ctx.resetRedrawSuppressed();
+    try app.update(.git_action_spinner_tick, &ctx);
+    try std.testing.expect(!ctx.redrawWasSuppressed());
     try std.testing.expect(app.pages.compare.deferred_load_apply == null);
     try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.compare.basis.?.target.head_oid.slice());
+
+    ctx.resetRedrawSuppressed();
+    try app.update(.git_action_spinner_tick, &ctx);
+    try std.testing.expect(ctx.redrawWasSuppressed());
 }
 
 const CompareInactiveCompletionOrder = enum { completion_before_reentry, completion_after_reentry };
@@ -817,6 +829,57 @@ test "changes repository transition post-commit manifest start failures stay on 
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     }
+}
+
+test "wheel redraw error terminal does not suppress the root frame" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .history,
+        .repo_session = .{
+            .repo_epoch = 7,
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        },
+        .terminal_size = .{ .width = 80, .height = 8 },
+    };
+    defer app.pages.history.deinit(allocator);
+    defer app.repo_session.deinit(allocator);
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    app.pages.history.activate(
+        allocator,
+        app.repo_session.repo_epoch,
+        app.repo_session.view().activeIdentity(),
+    );
+    app.pages.history.needs_initial = false;
+    app.pages.history.load_state = .loaded;
+    app.pages.history.current_view = .diff;
+    app.pages.history.diff.load = app_test_support.loadState(app_test_support.loadedDiffOne());
+    app.pages.history.diff.viewer = .{ .focus = .diff, .sidebar_hidden = true, .display_mode = .unified };
+
+    const wheel_down: App.Msg = .{ .history = .{ .common = .{ .shared = .mouse_diff_wheel_down } } };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    var reached_noop = false;
+    for (0..128) |_| {
+        ctx.resetRedrawSuppressed();
+        try app.update(wheel_down, &ctx);
+        if (ctx.redrawWasSuppressed()) {
+            reached_noop = true;
+            break;
+        }
+    }
+    try std.testing.expect(reached_noop);
+
+    app.pages.history.needs_initial = true;
+    app.pages.history.load_state = .loading;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var failing_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator() };
+    defer failing_ctx.runtimeClearPendingEffectCopies();
+    try std.testing.expectError(error.OutOfMemory, app.update(wheel_down, &failing_ctx));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!failing_ctx.redrawWasSuppressed());
 }
 
 test "repository incoming viewport scroll App immediate and deferred routes use current body size" {

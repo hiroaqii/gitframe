@@ -56,6 +56,7 @@ pub const ChangesUpdate = struct {
     command: ?Command = null,
     capture_display_override: bool = false,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    redraw: diff_surface_update.Redraw = .default,
 
     pub fn deinit(self: *ChangesUpdate, allocator: ?std.mem.Allocator) void {
         if (self.command) |*command| command.deinit(allocator);
@@ -86,6 +87,7 @@ pub const Controller = struct {
             }
             if (shared_update.takeEffect()) |effect| result.command = commandFromEffect(effect);
             result.auto_scroll = shared_update.auto_scroll;
+            result.redraw = shared_update.redraw;
 
             // This boundary sees semantic Changes input after it has either
             // changed the sidebar/file intent or proved to be a no-op. Internal

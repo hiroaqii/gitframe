@@ -1,6 +1,7 @@
 //! Page-independent semantic updates for a diff surface.
 //!
 const std = @import("std");
+const diff_surface = @import("../diff_surface.zig");
 const context = @import("../../context.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const drag_auto_scroll = @import("../drag_auto_scroll.zig");
@@ -13,6 +14,8 @@ pub const SelectionCopy = struct {
     text: []u8,
     generation: u64,
 };
+
+pub const Redraw = enum { default, skip };
 
 /// Owned output which a page adapter translates into its physical effect.
 pub const Effect = union(enum) {
@@ -36,6 +39,7 @@ pub const Update = struct {
     explicit_sidebar_selection_changed: bool = false,
     display_navigation_changed: bool = false,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    redraw: Redraw = .default,
 
     pub fn deinit(self: *Update, allocator: ?std.mem.Allocator) void {
         if (self.effect) |*effect| effect.deinit(allocator);
@@ -81,6 +85,8 @@ pub const Controller = struct {
     retained_selection_install: ?InstallHook = null,
 
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !Update {
+        const tracks_wheel_redraw = isMouseWheel(msg);
+        const wheel_before = if (tracks_wheel_redraw) wheelSnapshot(self.navigation) else undefined;
         const tracks_navigation = tracksDisplayNavigation(msg);
         const before = if (tracks_navigation) self.navigation.view().view.displayNavigationSnapshot() else undefined;
         const tracks_sidebar_selection = tracksExplicitSidebarSelection(msg);
@@ -295,6 +301,9 @@ pub const Controller = struct {
         if (tracks_navigation) {
             result.display_navigation_changed = !std.meta.eql(before, self.navigation.view().view.displayNavigationSnapshot());
         }
+        if (tracks_wheel_redraw and std.meta.eql(wheel_before, wheelSnapshot(self.navigation))) {
+            result.redraw = .skip;
+        }
         return result;
     }
 
@@ -485,6 +494,33 @@ pub const Controller = struct {
         };
     }
 };
+
+const WheelSnapshot = struct {
+    navigation: diff_surface.DisplayNavigationSnapshot,
+    focus: diff_surface.Focus,
+    selection_owner: diff_selection.Owner,
+};
+
+fn wheelSnapshot(controller: navigation.BodyController) WheelSnapshot {
+    return .{
+        .navigation = controller.view().view.displayNavigationSnapshot(),
+        .focus = controller.controller.surface.viewer.focus,
+        .selection_owner = controller.controller.surface.selection_owner.*,
+    };
+}
+
+fn isMouseWheel(msg: message.Msg) bool {
+    return switch (msg) {
+        .mouse_sidebar_wheel_up,
+        .mouse_sidebar_wheel_down,
+        .mouse_diff_wheel_up,
+        .mouse_diff_wheel_down,
+        .mouse_diff_wheel_left,
+        .mouse_diff_wheel_right,
+        => true,
+        else => false,
+    };
+}
 
 fn advanceLayoutRevision(revision: *u64) void {
     revision.* +%= 1;

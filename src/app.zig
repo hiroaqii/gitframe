@@ -258,7 +258,7 @@ pub const App = struct {
                             accepted.operation_id,
                             accepted.superseded_operation_id,
                         );
-                        self.pumpReviewStoreOperations(ctx);
+                        _ = self.pumpReviewStoreOperations(ctx);
                         return .{ .accepted = accepted.operation_id };
                     },
                 }
@@ -288,7 +288,9 @@ pub const App = struct {
 
         var draft_operation_id: ?app_message.ReviewStoreOperationId = null;
         var pump_on_return = false;
-        defer if (pump_on_return) self.pumpReviewStoreOperations(ctx);
+        defer {
+            if (pump_on_return) _ = self.pumpReviewStoreOperations(ctx);
+        }
 
         const draft_token = self.review_store_operations.queueToken(session.binding);
         const draft_preparation = session.prepareSave(
@@ -381,7 +383,7 @@ pub const App = struct {
             self.env_map,
             request,
         );
-        self.pumpReviewStoreOperations(ctx);
+        _ = self.pumpReviewStoreOperations(ctx);
         return admission;
     }
 
@@ -401,7 +403,7 @@ pub const App = struct {
             self.env_map,
             request,
         );
-        self.pumpReviewStoreOperations(ctx);
+        _ = self.pumpReviewStoreOperations(ctx);
         return admission;
     }
 
@@ -534,7 +536,7 @@ pub const App = struct {
             .none => {},
             .changes_revalidation => try self.changesRead().requestRevalidation(ctx),
             .changes_repository_changed => try self.changesRead().startDiffLoad(ctx, .repo_switch),
-            .history_refresh => try self.historyCoordinator().startPending(ctx),
+            .history_refresh => _ = try self.historyCoordinator().startPending(ctx),
             .compare_refresh => try self.compareCoordinator().refresh(ctx),
         }
     }
@@ -768,9 +770,10 @@ pub const App = struct {
 
     pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
         self.redraw_plan = .{};
-        defer if (self.redraw_plan.resolvesToSkip()) ctx.redraw().skip();
+        var update_succeeded = false;
+        defer if (update_succeeded and self.redraw_plan.resolvesToSkip()) ctx.redraw().skip();
         defer self.reconcileDragAutoScroll(ctx);
-        self.clearEphemeralStatusForUserAction(msg);
+        if (self.clearEphemeralStatusForUserAction(msg)) self.redraw_plan.requireFrame();
 
         switch (msg) {
             .switch_page => |target| {
@@ -1059,13 +1062,18 @@ pub const App = struct {
                 self.requestQuit(ctx);
             },
         }
-        self.changesRead().retireSupersededActionCursor(ctx, self.actionLifecycleView().generation());
+        if (self.changesRead().retireSupersededActionCursor(ctx, self.actionLifecycleView().generation())) {
+            self.redraw_plan.requireFrame();
+        }
         try self.changesRead().applyDeferredSourceIfReady(ctx);
         try self.changesRead().applyDeferredProjectionIfReady(ctx);
-        if (try self.compareCoordinator().applyDeferred(ctx) == .skip) self.redraw_plan.requestSkip();
-        try self.changesRead().maybeStartQueuedRevalidation(ctx);
+        switch (try self.compareCoordinator().applyDeferred(ctx)) {
+            .none, .discarded => {},
+            .visible => self.redraw_plan.requireFrame(),
+        }
+        if (try self.changesRead().maybeStartQueuedRevalidation(ctx)) self.redraw_plan.requireFrame();
         try self.repositoryCoordinator().startPending(ctx);
-        try self.historyCoordinator().startPending(ctx);
+        if (try self.historyCoordinator().startPending(ctx)) self.redraw_plan.requireFrame();
         self.reconcileCommandLine();
         const revalidation_queued_before_projection = self.changesRead().hasQueuedFullRevalidation();
         if (self.active_page == .changes) try self.changesRead().ensureProjection(ctx);
@@ -1077,11 +1085,11 @@ pub const App = struct {
         if (!revalidation_queued_before_projection and
             self.changesRead().hasQueuedFullRevalidation())
         {
-            try self.changesRead().maybeStartQueuedRevalidation(ctx);
+            if (try self.changesRead().maybeStartQueuedRevalidation(ctx)) self.redraw_plan.requireFrame();
         }
         self.actionLifecycle().reconcileSpinner(ctx);
-        self.pumpReviewStoreOperations(ctx);
-        self.resumeQuitAfterStoreDrain(ctx);
+        if (self.pumpReviewStoreOperations(ctx)) self.redraw_plan.requireFrame();
+        if (self.resumeQuitAfterStoreDrain(ctx)) self.redraw_plan.requireFrame();
         if (!self.redraw_plan.resolvesToSkip() and self.active_page == .ai_reviews) {
             self.aiReviewsCoordinator().ensureFindingPresentationCache();
         }
@@ -1097,6 +1105,7 @@ pub const App = struct {
         if (!self.redraw_plan.resolvesToSkip() and self.overlay.isSwitchBranch()) {
             self.remoteWorkflow().prepareBranchSwitchModalRedraw(ctx.io());
         }
+        update_succeeded = true;
     }
 
     fn requestQuit(self: *App, ctx: *chasen.Ctx(Msg)) void {
@@ -1129,17 +1138,19 @@ pub const App = struct {
         }
     }
 
-    fn pumpReviewStoreOperations(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        if (!self.review_store_operations.hasWork()) return;
-        _ = self.review_store_operations.pump(ctx) catch {
+    fn pumpReviewStoreOperations(self: *App, ctx: *chasen.Ctx(Msg)) bool {
+        if (!self.review_store_operations.hasWork()) return false;
+        const started = self.review_store_operations.pump(ctx) catch {
             if (self.review_store_operations.isDraining()) {
                 self.review_store_operations.cancelDrain(.io_failed);
                 self.quit_after_store_drain = false;
                 self.setStatus("AI review save failed: io_failed", .{});
-                return;
+                return true;
             }
             self.setStatus("could not start AI review save", .{});
+            return true;
         };
+        return started > 0;
     }
 
     fn enqueuePreparedHumanReviewDraft(
@@ -1276,20 +1287,21 @@ pub const App = struct {
                 }
             }
         }
-        if (outcome.quit_ready and !reconciliation_required) self.resumeQuitAfterStoreDrain(ctx);
+        if (outcome.quit_ready and !reconciliation_required) _ = self.resumeQuitAfterStoreDrain(ctx);
     }
 
-    fn resumeQuitAfterStoreDrain(self: *App, ctx: *chasen.Ctx(Msg)) void {
+    fn resumeQuitAfterStoreDrain(self: *App, ctx: *chasen.Ctx(Msg)) bool {
         if (!self.quit_after_store_drain or
             self.review_store_operations.isDraining() or
-            self.review_store_operations.hasWork()) return;
+            self.review_store_operations.hasWork()) return false;
         if (self.actionLifecycleView().hasPending()) {
             self.setStatus("finish current git action before quitting", .{});
-            return;
+            return true;
         }
         self.quit_after_store_drain = false;
         self.teardown_requested = true;
         ctx.quit();
+        return true;
     }
 
     fn reviewStorePresentationMatches(
@@ -1482,6 +1494,7 @@ pub const App = struct {
         }).apply(self.allocator, msg);
         defer page_update.deinit(self.allocator);
         const auto_scroll = page_update.auto_scroll;
+        if (page_update.redraw == .skip) self.redraw_plan.requestSkip();
 
         if (page_update.capture_display_override) {
             try self.changesRead().captureDisplayOverride(ctx.allocator());
@@ -1529,6 +1542,7 @@ pub const App = struct {
         var outcome = try self.compareCoordinator().update(ctx, msg);
         defer outcome.deinit(ctx.allocator());
         const auto_scroll = outcome.auto_scroll;
+        if (outcome.redraw == .skip) self.redraw_plan.requestSkip();
         if (outcome.takeClipboard()) |taken| {
             var effect = taken;
             defer effect.deinit(ctx.allocator());
@@ -1550,6 +1564,7 @@ pub const App = struct {
         var outcome = try self.historyCoordinator().update(ctx, msg);
         defer outcome.deinit(ctx.allocator());
         const auto_scroll = outcome.auto_scroll;
+        if (outcome.redraw == .skip) self.redraw_plan.requestSkip();
         if (outcome.takeClipboard()) |taken| {
             var effect = taken;
             defer effect.deinit(ctx.allocator());
@@ -1571,6 +1586,7 @@ pub const App = struct {
         var outcome = try self.aiReviewsCoordinator().update(ctx, msg);
         defer outcome.deinit(ctx.allocator());
         const auto_scroll = outcome.auto_scroll;
+        if (outcome.redraw == .skip) self.redraw_plan.requestSkip();
         if (outcome.takeClipboard()) |taken| {
             var effect = taken;
             defer effect.deinit(ctx.allocator());
@@ -1908,14 +1924,15 @@ pub const App = struct {
         }
     }
 
-    fn clearEphemeralStatusForUserAction(self: *App, msg: Msg) void {
-        if (app_message.keepsEphemeralStatus(msg)) return;
+    fn clearEphemeralStatusForUserAction(self: *App, msg: Msg) bool {
+        if (app_message.keepsEphemeralStatus(msg)) return false;
+        var changed = self.status.clear_on_next_input;
         self.status.clearIfEphemeral();
-        if (self.active_page == .changes) self.pages.changes.status.clearIfEphemeral();
-        if (self.active_page == .compare) self.pages.compare.status.clearIfEphemeral();
-        if (self.active_page == .ai_reviews) self.pages.ai_reviews.status.clearIfEphemeral();
-        if (self.active_page == .repository) self.pages.repository.status.clearIfEphemeral();
-        if (self.active_page == .history) self.pages.history.status.clearIfEphemeral();
+        if (self.activePageStatusMut()) |active_status| {
+            changed = changed or active_status.clear_on_next_input;
+            active_status.clearIfEphemeral();
+        }
+        return changed;
     }
 
     pub fn view(self: *const App, surface: *chasen.Surface) !void {
@@ -3127,7 +3144,7 @@ test "human review result session App admission faults preserve exact prepared i
         initial_admission.accepted.operation_id,
         initial_admission.accepted.superseded_operation_id,
     );
-    app.pumpReviewStoreOperations(&ctx);
+    _ = app.pumpReviewStoreOperations(&ctx);
 
     try session.editSummary(allocator, "second");
     const pending_token = app.review_store_operations.queueToken(binding);

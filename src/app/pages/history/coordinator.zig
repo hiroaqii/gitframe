@@ -20,6 +20,7 @@ const DiffTask = app_load.HistoryDiffTask(app_message.Msg);
 pub const UpdateOutcome = struct {
     clipboard: ?committed_diff_coordinator.ClipboardEffect = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    redraw: diff_surface.update.Redraw = .default,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -76,6 +77,7 @@ pub const Controller = struct {
                 return .{
                     .clipboard = outcome.takeClipboard(),
                     .auto_scroll = outcome.auto_scroll,
+                    .redraw = outcome.redraw,
                 };
             },
             .load_diff => try self.startDiff(ctx),
@@ -127,20 +129,20 @@ pub const Controller = struct {
         return outcome;
     }
 
-    pub fn startPending(self: Controller, ctx: *chasen.Ctx(@import("../../message.zig").Msg)) !void {
-        if (self.active_page != .history) return;
-        const request = self.page_state.nextRequest() orelse return;
+    pub fn startPending(self: Controller, ctx: *chasen.Ctx(@import("../../message.zig").Msg)) !bool {
+        if (self.active_page != .history) return false;
+        const request = self.page_state.nextRequest() orelse return false;
         const capability = self.repo.activeCapability() orelse {
             self.page_state.rejectPreparation();
-            return;
+            return true;
         };
         const root_identity = self.repo.activeIdentity() orelse {
             self.page_state.rejectPreparation();
-            return;
+            return true;
         };
         const identity = self.currentIdentity() orelse {
             self.page_state.rejectPreparation();
-            return;
+            return true;
         };
         const generation = self.page_state.reserveGeneration();
         const task = try ctx.allocator().create(CatalogTask);
@@ -167,6 +169,7 @@ pub const Controller = struct {
             self.page_state.rejectSpawn(generation);
             return err;
         };
+        return true;
     }
 
     pub fn clampDetailViewport(self: Controller) void {

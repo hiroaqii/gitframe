@@ -289,14 +289,14 @@ fn runReadCoordinationTail(
     app: *ReadHarness,
     ctx: *chasen.Ctx(ReadHarness.Msg),
 ) !void {
-    app.changesRead().retireSupersededActionCursor(ctx, app.action_runtime.view().generation());
+    _ = app.changesRead().retireSupersededActionCursor(ctx, app.action_runtime.view().generation());
     try app.changesRead().applyDeferredSourceIfReady(ctx);
     try app.changesRead().applyDeferredProjectionIfReady(ctx);
-    try app.changesRead().maybeStartQueuedRevalidation(ctx);
+    _ = try app.changesRead().maybeStartQueuedRevalidation(ctx);
     const queued_before_projection = app.changesRead().hasQueuedFullRevalidation();
     if (app.active_page == .changes) try app.changesRead().ensureProjection(ctx);
     if (!queued_before_projection and app.changesRead().hasQueuedFullRevalidation()) {
-        try app.changesRead().maybeStartQueuedRevalidation(ctx);
+        _ = try app.changesRead().maybeStartQueuedRevalidation(ctx);
     }
 }
 
