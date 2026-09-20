@@ -64,7 +64,6 @@ test {
     _ = @import("app/load.zig");
     _ = @import("app/load_state.zig");
     _ = @import("local_time.zig");
-    _ = @import("app/review_store_operations.zig");
     _ = @import("app/page.zig");
     _ = @import("app/page_header.zig");
     _ = @import("app/page_link.zig");

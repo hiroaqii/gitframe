@@ -20,7 +20,6 @@ const changes_navigation = if (builtin.is_test) @import("pages/changes/navigatio
 const changes_page = if (builtin.is_test) @import("pages/changes.zig") else struct {};
 const changes_reload = if (builtin.is_test) @import("pages/changes/reload.zig") else struct {};
 const compare_page = @import("pages/compare.zig");
-const ai_reviews_page = @import("pages/ai_reviews.zig");
 const repository_page = @import("pages/repository.zig");
 const history_page = @import("pages/history.zig");
 const discovery = @import("../repo/discovery.zig");
@@ -219,14 +218,6 @@ pub const HistoryInvalidationPort = struct {
     }
 };
 
-pub const AiReviewsInvalidationPort = struct {
-    page: *ai_reviews_page.AiReviewsPageState,
-
-    fn invalidateBeforeReplacement(self: AiReviewsInvalidationPort, allocator: std.mem.Allocator) void {
-        self.page.deinit(allocator);
-    }
-};
-
 pub const Controller = struct {
     state: *State,
     status: *app_state.StatusMessage,
@@ -239,7 +230,6 @@ pub const Controller = struct {
     repository: RepositoryInvalidationPort,
     history: ?HistoryInvalidationPort = null,
     compare: CompareInvalidationPort,
-    ai_reviews: AiReviewsInvalidationPort,
     shell: remote_state.RepositoryInvalidationPort,
 
     fn view(self: Controller) View {
@@ -333,7 +323,6 @@ pub const Controller = struct {
                 if (prepared.candidate) |root| root.identity else null,
             );
             self.compare.invalidateBeforeReplacement(allocator);
-            self.ai_reviews.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(
                 allocator,
                 next_epoch,
@@ -417,7 +406,6 @@ pub const Controller = struct {
             self.changes.invalidateBeforeReplacement(allocator);
             if (self.history) |history| history.invalidateBeforeReplacement(allocator, next_epoch, prepared.candidate.?.identity);
             self.compare.invalidateBeforeReplacement(allocator);
-            self.ai_reviews.invalidateBeforeReplacement(allocator);
             self.repository.invalidateBeforeReplacement(allocator, next_epoch, prepared.candidate.?.identity);
             self.state.repo_epoch = next_epoch;
             const committed = prepared.candidate.?;
@@ -953,7 +941,6 @@ const RepoSessionTestPages = struct {
     changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
-    ai_reviews: ai_reviews_page.AiReviewsPageState = .{},
 };
 
 /// Exact test assembly for this owner. It mirrors the root's short-lived
@@ -1023,7 +1010,6 @@ const RepoSessionTestApp = struct {
             },
             .repository = .{ .page = &self.pages.repository },
             .compare = .{ .page = &self.pages.compare },
-            .ai_reviews = .{ .page = &self.pages.ai_reviews },
             .shell = self.remote.repositoryInvalidationPort(&self.overlay),
         };
     }

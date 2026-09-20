@@ -107,7 +107,6 @@ pub const Controller = struct {
     mode_toggle_hint_width: u16 = 0,
     live_drag_deferred_source: bool = false,
     presentation_rows: ?*const diff_render.PresentationRows = null,
-    sidebar_annotation_width_resolver: ?diff_surface.navigation.SidebarAnnotationWidthResolver = null,
 
     pub fn sharedController(self: Controller) diff_surface.navigation.Controller {
         return .{
@@ -124,7 +123,6 @@ pub const Controller = struct {
             .repo_epoch = self.repo_epoch,
             .mode_toggle_hint_width = self.mode_toggle_hint_width,
             .presentation_rows = self.presentation_rows,
-            .sidebar_annotation_width_resolver = self.sidebar_annotation_width_resolver,
             .diagnostics = .{ .target = self.status },
         };
     }

@@ -10,16 +10,12 @@ const load = @import("load.zig");
 const page = @import("page.zig");
 const push_retry = @import("push_retry.zig");
 const compare_input = @import("pages/compare/input.zig");
-const ai_reviews_input = @import("pages/ai_reviews/input.zig");
-const ai_review_delete = @import("pages/ai_reviews/delete_confirmation.zig");
 const diff_surface = @import("diff_surface.zig");
 const drag_auto_scroll = @import("drag_auto_scroll.zig");
 const repository_page = @import("pages/repository.zig");
 const history_page = @import("pages/history.zig");
 const repository_layout = @import("pages/repository/layout.zig");
 const changes_message = @import("pages/changes/message.zig");
-const review_store = @import("../review_store.zig");
-const human_review_session = @import("human_review_session.zig");
 
 pub const LoadFinished = load.ReadFinished;
 
@@ -67,78 +63,12 @@ pub const MouseSelectionTarget = union(enum) {
     changes: ?changes_message.MousePoint,
     history: ?diff_surface.MousePoint,
     compare: ?diff_surface.MousePoint,
-    ai_reviews: ?diff_surface.MousePoint,
     repository: ?repository_layout.BodyPoint,
 };
 
 pub const MouseSelectionContinuation = struct {
     pointer: drag_auto_scroll.PointerSample,
     target: MouseSelectionTarget,
-};
-
-pub const ReviewStoreOperationId = human_review_session.OperationId;
-
-pub const ReviewStoreOperationKind = human_review_session.OperationKind;
-
-pub const ReviewStoreOperationResult = union(enum) {
-    draft: review_store.DraftSaveResult,
-    result: review_store.ReviewResultCreateResult,
-
-    pub fn deinit(self: *ReviewStoreOperationResult, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .draft => |*value| value.deinit(allocator),
-            .result => |*value| value.deinit(allocator),
-        }
-        self.* = undefined;
-    }
-
-    pub fn failure(self: *const ReviewStoreOperationResult) ?review_store.PersistenceFailure {
-        return switch (self.*) {
-            .draft => |*value| switch (value.*) {
-                .committed => null,
-                .failure => |value_failure| value_failure,
-            },
-            .result => |*value| switch (value.*) {
-                .committed => null,
-                .failure => |value_failure| value_failure,
-            },
-        };
-    }
-
-    pub fn committedRevision(self: *const ReviewStoreOperationResult) ?u64 {
-        return switch (self.*) {
-            .draft => |*value| switch (value.*) {
-                .committed => |commit| commit.revision,
-                .failure => null,
-            },
-            .result => |*value| switch (value.*) {
-                .committed => |commit| commit.revision,
-                .failure => null,
-            },
-        };
-    }
-
-    pub fn completedAt(self: *const ReviewStoreOperationResult) ?[20]u8 {
-        return switch (self.*) {
-            .draft => null,
-            .result => |*value| switch (value.*) {
-                .committed => |commit| commit.completed_at,
-                .failure => null,
-            },
-        };
-    }
-};
-
-pub const ReviewStoreOperationFinished = struct {
-    operation_id: ReviewStoreOperationId,
-    binding: review_store.ReviewRunBinding,
-    kind: ReviewStoreOperationKind,
-    result: ReviewStoreOperationResult,
-
-    pub fn deinit(self: *ReviewStoreOperationFinished, allocator: std.mem.Allocator) void {
-        self.result.deinit(allocator);
-        self.* = undefined;
-    }
 };
 
 pub const Msg = union(enum) {
@@ -151,11 +81,8 @@ pub const Msg = union(enum) {
     push_inspection_finished: push_retry.Finished,
     push_upstream_finalize_finished: push_retry.FinalizeFinished,
     shell_effect_finished: ShellEffectFinished,
-    review_store_operation_finished: ReviewStoreOperationFinished,
-    ai_review_delete_finished: ai_review_delete.Finished,
     changes: changes_message.Msg,
     compare: compare_input.Msg,
-    ai_reviews: ai_reviews_input.Msg,
     repository: repository_page.Msg,
     history: history_page.Msg,
     command_line: command_line.Msg,
@@ -266,8 +193,6 @@ pub const Msg = union(enum) {
             .load_finished => |*finished| finished.deinit(allocator),
             .action_finished => |*finished| finished.deinit(allocator),
             .push_inspection_finished => |*finished| finished.deinit(allocator),
-            .review_store_operation_finished => |*finished| finished.deinit(allocator),
-            .ai_review_delete_finished => |*finished| finished.deinit(allocator),
             .repository => |*repository_msg| repository_msg.deinitUndelivered(allocator),
             else => {},
         }
@@ -286,8 +211,6 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         .push_inspection_finished,
         .push_upstream_finalize_finished,
         .shell_effect_finished,
-        .review_store_operation_finished,
-        .ai_review_delete_finished,
         .auto_reload_tick,
         .drag_auto_scroll_tick,
         .focus_lost,
@@ -438,31 +361,6 @@ test "undelivered remaining read routes release owned payloads" {
         } },
     } } });
     compare_msg.deinitUndelivered(allocator);
-}
-
-test "AI Reviews picker undelivered task terminals preserve semantic store identity" {
-    const allocator = std.testing.allocator;
-    const identity = page.RequestIdentity.aiReviews(3, 5);
-    var store = try review_store.ConfiguredStore.initConfigured(allocator, "/store");
-    defer store.deinit(allocator);
-    const store_identity = store.identity();
-
-    var scan = Msg.loadFinished(.{ .ai_reviews = .{ .history_scan = .{
-        .identity = identity,
-        .generation = 1,
-        .store_identity = store_identity,
-        .result = .{ .failed_static = "scan failed" },
-    } } });
-    scan.deinitUndelivered(allocator);
-
-    var selection = Msg.loadFinished(.{ .ai_reviews = .{ .history_selection = .{
-        .identity = identity,
-        .generation = 2,
-        .store_identity = store_identity,
-        .review_id = undefined,
-        .result = .{ .failed_static = "selection failed" },
-    } } });
-    selection.deinitUndelivered(allocator);
 }
 
 test "undelivered plain root message is a no-op" {

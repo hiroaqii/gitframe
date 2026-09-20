@@ -101,7 +101,6 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .page_changes,
         .page_repository,
         .page_compare,
-        .page_ai_reviews,
         .page_config,
         .help,
         .reload,

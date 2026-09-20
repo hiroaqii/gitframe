@@ -15,7 +15,6 @@ const page_link = @import("page_link.zig");
 const page_transition = @import("page_transition.zig");
 const repo_session = @import("repo_session.zig");
 const compare_page = @import("pages/compare.zig");
-const ai_reviews_page = @import("pages/ai_reviews.zig");
 const repository_page = @import("pages/repository.zig");
 const history_page = @import("pages/history.zig");
 const changes_page = @import("pages/changes.zig");
@@ -50,7 +49,6 @@ pub const Controller = struct {
     repository: *repository_page.RepositoryPageState,
     history: *history_page.HistoryPageState,
     compare: *compare_page.ComparePageState,
-    ai_reviews: *ai_reviews_page.AiReviewsPageState,
     config_page: *page.LazyPlaceholder,
     repo: repo_session.View,
     source: diff_source.SourceMode,
@@ -88,11 +86,6 @@ pub const Controller = struct {
             .history => blk: {
                 self.history.activate(allocator, self.repo.epoch(), self.repo.activeIdentity());
                 break :blk .history_refresh;
-            },
-            .ai_reviews => blk: {
-                self.ai_reviews.releaseFindingPresentationCache(allocator);
-                _ = self.ai_reviews.activate(self.repo.epoch());
-                break :blk .none;
             },
             .repository, .config => .none,
         };
@@ -142,9 +135,6 @@ pub const Controller = struct {
         if (self.active_page.* == .repository) self.deactivateRepositoryForPageSwitch();
         if (self.active_page.* == .history) self.history.deactivate();
         if (self.active_page.* == .compare) self.compare.deactivate();
-        if (self.active_page.* == .ai_reviews) {
-            self.ai_reviews.deactivate();
-        }
         self.active_page.* = target;
         return switch (target) {
             .changes => blk: {
@@ -163,10 +153,6 @@ pub const Controller = struct {
                 _ = self.compare.activate(self.repo.epoch());
                 break :blk .compare_refresh;
             },
-            .ai_reviews => blk: {
-                _ = self.ai_reviews.activate(self.repo.epoch());
-                break :blk .none;
-            },
             .config => blk: {
                 self.config_page.ensureInitialized();
                 break :blk .none;
@@ -180,7 +166,6 @@ pub const Controller = struct {
             .changes_mouse_selection = active == .changes and self.changes.selection_owner.activeMouseSelection(),
             .history_mouse_selection = active == .history and self.history.diff.selection_owner.activeMouseSelection(),
             .compare_mouse_selection = active == .compare and self.compare.diff.selection_owner.activeMouseSelection(),
-            .ai_reviews_mouse_selection = active == .ai_reviews and self.ai_reviews.diff.selection_owner.activeMouseSelection(),
             .repository_mouse_selection = active == .repository and self.repository.activeMouseSourceRange(),
             .changes_deferred_apply = active == .changes and self.changes.deferredSourceBlocksPageTransition(),
             .compare_deferred_apply = active == .compare and self.compare.deferred_load_apply != null,
@@ -191,8 +176,6 @@ pub const Controller = struct {
             .history_commit_detail = active == .history and self.history.detailOpen(),
             .compare_search = active == .compare and self.compare.diff.search.mode,
             .compare_file_search = active == .compare and self.compare.diff.file_search.mode,
-            .ai_reviews_search = active == .ai_reviews and self.ai_reviews.diff.search.mode,
-            .ai_reviews_file_search = active == .ai_reviews and self.ai_reviews.diff.file_search.mode,
             .repository_source_search = active == .repository and self.repository.source_search.mode,
             .repository_file_search = active == .repository and self.repository.file_search.mode,
             .repo_picker = self.repo.picker().model.mode,
@@ -201,8 +184,6 @@ pub const Controller = struct {
             .confirmation = self.shell_blockers.confirmation,
             .branch_switch = self.shell_blockers.branch_switch,
             .compare_base_picker = active == .compare and self.compare.base_picker.open,
-            .ai_reviews_picker = active == .ai_reviews and self.ai_reviews.picker.isPickerVisible(),
-            .ai_reviews_human_decision = active == .ai_reviews and self.ai_reviews.human_review_decision.isOpen(),
             .push_error = self.shell_blockers.push_error,
             .git_action = self.shell_blockers.git_action,
             .foreground_command = self.shell_blockers.foreground_command,

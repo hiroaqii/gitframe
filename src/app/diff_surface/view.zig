@@ -42,14 +42,6 @@ pub const FooterView = struct {
     auto_reload_enabled: bool,
     source_label: ?[]const u8,
     activation: ?ActivationPresentation,
-    finding_summary: ?FindingSummaryPresentation = null,
-};
-
-pub const FindingSummaryPresentation = struct {
-    mapped: usize,
-    unmapped: usize,
-    stale: usize,
-    failed: usize,
 };
 
 pub const ActivationPresentation = enum {
@@ -76,7 +68,6 @@ pub fn footer(args: FooterArgs) FooterView {
         .auto_reload_enabled = args.auto_reload_enabled,
         .source_label = sourceFooterLabel(args.surface.source),
         .activation = activationPresentation(args.surface.activation, args.surface.source),
-        .finding_summary = null,
     };
 }
 
@@ -312,30 +303,6 @@ pub const DiffPaneRenderer = struct {
     }
 };
 
-/// Page-neutral Finding presentation for one diff file. The page adapter
-/// resolves these scalar values synchronously from its accepted authority;
-/// the shared surface never retains a projection or page-owned pointer.
-pub const FindingAnnotation = struct {
-    total: usize,
-    mapped: usize,
-    highest_severity: Severity,
-
-    pub const Severity = enum {
-        info,
-        warning,
-        @"error",
-    };
-};
-
-pub const FindingAnnotationResolver = struct {
-    ctx: *anyopaque,
-    resolve_fn: *const fn (ctx: *anyopaque, file_index: usize) ?FindingAnnotation,
-
-    pub fn resolve(self: FindingAnnotationResolver, file_index: usize) ?FindingAnnotation {
-        return self.resolve_fn(self.ctx, file_index);
-    }
-};
-
 pub const ViewArgs = struct {
     state: diff_surface.ReadSurface,
     palette: theme.Palette,
@@ -344,7 +311,6 @@ pub const ViewArgs = struct {
     file_filter_binding: ?[]const u8 = null,
     no_changes_actions: NoChangesActionPresentation,
     empty_message: ?StateMessage = null,
-    finding_annotation_resolver: ?FindingAnnotationResolver = null,
     diff_pane: DiffPaneRenderer,
 };
 
@@ -455,13 +421,12 @@ fn viewLoadedDiff(surface: *chasen.Surface, args: ViewArgs, loaded: loaded_diff.
         .width = sidebar_width,
         .height = size.height,
     });
-    try viewSidebarWithFindingAnnotations(
+    try viewSidebar(
         &sidebar,
         args.state,
         loaded,
         args.repo_root,
         args.file_filter_binding,
-        args.finding_annotation_resolver,
         args.palette,
     );
     drawSidebarSeparator(surface, sidebar_width, args.palette);
@@ -1167,18 +1132,6 @@ pub fn viewSidebar(
     filter_binding: ?[]const u8,
     palette: theme.Palette,
 ) !void {
-    return viewSidebarWithFindingAnnotations(surface, state, loaded, repo_root, filter_binding, null, palette);
-}
-
-fn viewSidebarWithFindingAnnotations(
-    surface: *chasen.Surface,
-    state: diff_surface.ReadSurface,
-    loaded: loaded_diff.LoadedDiff,
-    repo_root: ?[]const u8,
-    filter_binding: ?[]const u8,
-    finding_annotation_resolver: ?FindingAnnotationResolver,
-    palette: theme.Palette,
-) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
@@ -1209,14 +1162,12 @@ fn viewSidebarWithFindingAnnotations(
             .visible_nodes = loaded.materializedVisibleNodes(),
         }, visible_index, state.viewer.selected_node) orelse continue;
         const cursor_active = state.viewer.focus == .sidebar and !state.file_search.mode;
-        const finding_annotation = resolveFindingAnnotation(loaded, row_model, finding_annotation_resolver);
-        try drawSidebarRowWithFindingAnnotation(
+        try drawSidebarRow(
             surface,
             row,
             row_model,
             cursor_active,
             state.viewer.sidebar_horizontal_scroll,
-            finding_annotation,
             palette,
         );
     }
@@ -1281,17 +1232,6 @@ pub fn drawSidebarDetailRow(
     try draw.copyClippedTextAt(surface, hint_col, row, hint, hint_style);
 }
 
-fn resolveFindingAnnotation(
-    loaded: loaded_diff.LoadedDiff,
-    row_model: sidebar_view_model.Row,
-    resolver: ?FindingAnnotationResolver,
-) ?FindingAnnotation {
-    if (row_model.kind != .file or row_model.node_index >= loaded.tree.nodes.len) return null;
-    const file_index = loaded.tree.nodes[row_model.node_index].diffFileIndex() orelse return null;
-    const annotation = (resolver orelse return null).resolve(file_index) orelse return null;
-    return if (annotation.total == 0) null else annotation;
-}
-
 pub fn drawSidebarRow(
     surface: *chasen.Surface,
     row: u16,
@@ -1300,28 +1240,8 @@ pub fn drawSidebarRow(
     horizontal_scroll: usize,
     palette: theme.Palette,
 ) !void {
-    return drawSidebarRowWithFindingAnnotation(surface, row, row_model, cursor_active, horizontal_scroll, null, palette);
-}
-
-fn drawSidebarRowWithFindingAnnotation(
-    surface: *chasen.Surface,
-    row: u16,
-    row_model: sidebar_view_model.Row,
-    cursor_active: bool,
-    horizontal_scroll: usize,
-    finding_annotation: ?FindingAnnotation,
-    palette: theme.Palette,
-) !void {
     const width = surface.size().width;
-    const annotation_text = if (finding_annotation) |annotation|
-        try formatFindingAnnotation(surface.frameAllocator(), annotation)
-    else
-        null;
-    const annotation_width: u16 = if (annotation_text) |text_value|
-        @intCast(@min(text_value.width(), std.math.maxInt(u16)))
-    else
-        0;
-    const row_layout = sidebar_view_model.layoutWithFindingAnnotation(row_model, width, annotation_width);
+    const row_layout = sidebar_view_model.layout(row_model, width);
     const cursor_bg: ?chasen.Color = if (cursor_active and row_model.selected) palette.color(.pane_cursor_bg) else null;
     const style = withCursorBackground(sidebarRowStyle(row_model, palette), cursor_bg);
 
@@ -1340,20 +1260,12 @@ fn drawSidebarRowWithFindingAnnotation(
         const content = try sidebarTreeContent(surface.frameAllocator(), row_model);
         const effective_scroll = @min(
             horizontal_scroll,
-            sidebar_view_model.maxHorizontalScrollWithFindingAnnotation(row_model, width, annotation_width),
+            sidebar_view_model.maxHorizontalScroll(row_model, width),
         );
         const visible = chasen.text.dropToWidth(content, view_primitives.scrollCells(effective_scroll));
         try draw.copyClippedTextAt(&path_area, 0, 0, visible, style);
     }
 
-    if (annotation_text) |text_value| {
-        if (row_layout.finding_annotation_col) |annotation_col| {
-            try drawFindingAnnotation(surface, annotation_col, row, text_value, palette, cursor_bg);
-        }
-    }
-
-    // Fixed semantic gutters win only in widths too small to contain both
-    // them and the complete right-aligned annotation.
     if (row_model.status) |status| {
         if (row_layout.badge_col) |badge_col| {
             if (width > badge_col) {
@@ -1373,64 +1285,6 @@ fn drawSidebarRowWithFindingAnnotation(
             _ = surface.borrowTextAt(reviewed_col, row, "✓", reviewedStyle(palette, cursor_bg));
         }
     }
-}
-
-const FindingAnnotationText = struct {
-    primary: []const u8,
-    non_mapped: ?[]const u8,
-    severity: FindingAnnotation.Severity,
-
-    fn width(self: FindingAnnotationText) usize {
-        return chasen.text.displayWidth(self.primary) + if (self.non_mapped) |value|
-            1 + chasen.text.displayWidth(value)
-        else
-            0;
-    }
-};
-
-fn formatFindingAnnotation(allocator: std.mem.Allocator, annotation: FindingAnnotation) !FindingAnnotationText {
-    const severity_prefix: u8 = switch (annotation.highest_severity) {
-        .info => 'I',
-        .warning => 'W',
-        .@"error" => 'E',
-    };
-    const primary = try std.fmt.allocPrint(allocator, "{c}{d}", .{ severity_prefix, annotation.total });
-    const non_mapped_count = annotation.total -| annotation.mapped;
-    return .{
-        .primary = primary,
-        .non_mapped = if (non_mapped_count > 0)
-            try std.fmt.allocPrint(allocator, "N{d}", .{non_mapped_count})
-        else
-            null,
-        .severity = annotation.highest_severity,
-    };
-}
-
-fn drawFindingAnnotation(
-    surface: *chasen.Surface,
-    col: u16,
-    row: u16,
-    text_value: FindingAnnotationText,
-    palette: theme.Palette,
-    cursor_bg: ?chasen.Color,
-) !void {
-    const primary_role: theme.Role = switch (text_value.severity) {
-        .info => .info,
-        .warning => .warning,
-        .@"error" => .danger,
-    };
-    try draw.copyClippedTextAt(
-        surface,
-        col,
-        row,
-        text_value.primary,
-        withCursorBackground(.{ .fg = palette.color(primary_role), .bold = true }, cursor_bg),
-    );
-    const non_mapped = text_value.non_mapped orelse return;
-    var secondary_style = withCursorBackground(palette.style(.muted), cursor_bg);
-    secondary_style.dim = true;
-    const secondary_col = col +| @as(u16, @intCast(chasen.text.displayWidth(text_value.primary))) +| 1;
-    try draw.copyClippedTextAt(surface, secondary_col, row, non_mapped, secondary_style);
 }
 
 fn fillSidebarCursorRow(surface: *chasen.Surface, row: u16, style: chasen.TextStyle) void {
@@ -1495,125 +1349,4 @@ fn reviewedStyle(palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextSt
 
 fn modeBadgeStyle(palette: theme.Palette, cursor_bg: ?chasen.Color) chasen.TextStyle {
     return withCursorBackground(.{ .fg = palette.color(.info), .bold = true }, cursor_bg);
-}
-
-test "Finding discovery renders severity metadata and resolves only visible file rows" {
-    const test_support = @import("../test_support.zig");
-    const diff_selection = @import("../../diff/selection.zig");
-    const reviewed_files = @import("../../reviewed_files.zig");
-    const palette: theme.Palette = .default();
-
-    var row_surface: chasen.testing.TestSurface = undefined;
-    try row_surface.init(24, 1);
-    defer row_surface.deinit();
-    try drawSidebarRowWithFindingAnnotation(&row_surface.surface, 0, .{
-        .node_index = 0,
-        .kind = .file,
-        .selected = true,
-        .depth = 0,
-        .name = "main.zig",
-        .path = "main.zig",
-        .stats = .{},
-        .status = .modified,
-        .stage_presence = .clean_or_unknown,
-        .mode_changed = true,
-        .reviewed = true,
-        .fold = .none,
-    }, true, 999, .{
-        .total = 3,
-        .mapped = 2,
-        .highest_severity = .@"error",
-    }, palette);
-    const row_snapshot = try row_surface.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(row_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, row_snapshot, "E3 N1") != null);
-    try std.testing.expectEqualStrings(" ", row_surface.surface.readCell(18, 0).?.char.grapheme);
-    const primary = row_surface.surface.readCell(19, 0).?;
-    try std.testing.expectEqualStrings("E", primary.char.grapheme);
-    try std.testing.expect(primary.style.bold);
-    try std.testing.expect(primary.style.fg.eql(palette.color(.danger)));
-    try std.testing.expect(primary.style.bg.eql(palette.color(.pane_cursor_bg)));
-    const non_mapped = row_surface.surface.readCell(22, 0).?;
-    try std.testing.expect(non_mapped.style.dim);
-    try std.testing.expect(non_mapped.style.fg.eql(palette.color(.muted)));
-    try std.testing.expect(non_mapped.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expectEqualStrings("✓", row_surface.surface.readCell(1, 0).?.char.grapheme);
-    try std.testing.expectEqualStrings("M", row_surface.surface.readCell(2, 0).?.char.grapheme);
-    try std.testing.expectEqualStrings("m", row_surface.surface.readCell(4, 0).?.char.grapheme);
-
-    const FakeResolver = struct {
-        calls: [2]usize = undefined,
-        len: usize = 0,
-
-        fn resolve(ctx: *anyopaque, file_index: usize) ?FindingAnnotation {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls[self.len] = file_index;
-            self.len += 1;
-            return .{ .total = 3, .mapped = 2, .highest_severity = .warning };
-        }
-    };
-
-    const loaded = test_support.loadedDiffNested();
-    var activation = diff_surface.authority.Lifecycle.init(.compare);
-    var status: app_state.StatusMessage = .{};
-    var load = test_support.loadState(loaded);
-    defer load.clearCurrent(null);
-    var viewer: diff_surface.ViewerState = .{ .selected_node = 1 };
-    var search: diff_surface.DiffSearchState = .{};
-    var file_search_state: file_search.State = .{};
-    var file_search_return_focus: diff_surface.Focus = .sidebar;
-    var accepted_sidebar_revision: u64 = 1;
-    var review_display: app_state.ReviewDisplayState = .{};
-    var reviewed_store: reviewed_files.Store = .{};
-    var tree_order: file_tree.StableOrder = .{};
-    var tree_order_scope: ?[]u8 = null;
-    var selection_owner: diff_selection.Owner = .none;
-    var completed_selection: ?diff_surface.selection.CompletedSelection = null;
-    var selection_generation: u64 = 0;
-    var source_session_revision: u64 = 0;
-    var pending_initial_selection = false;
-    var selection_layout_revision: u64 = 1;
-    const state: diff_surface.ReadSurface = .{
-        .activation = &activation,
-        .status = &status,
-        .load = &load,
-        .viewer = &viewer,
-        .search = &search,
-        .file_search = &file_search_state,
-        .file_search_return_focus = &file_search_return_focus,
-        .accepted_sidebar_revision = &accepted_sidebar_revision,
-        .review_display = &review_display,
-        .reviewed_store = &reviewed_store,
-        .tree_order = &tree_order,
-        .tree_order_scope = &tree_order_scope,
-        .selection_owner = &selection_owner,
-        .completed_selection = &completed_selection,
-        .selection_generation = &selection_generation,
-        .source_session_revision = &source_session_revision,
-        .pending_initial_first_visible_selection = &pending_initial_selection,
-        .selection_layout_revision = &selection_layout_revision,
-        .reload_anchor = null,
-        .live_drag_deferred_source = false,
-        .selection_completion_policy = .retain_with_actions,
-        .source = .{ .range = "review" },
-        .layout = .{ .width = 24, .height = 4 },
-    };
-    var sidebar: chasen.testing.TestSurface = undefined;
-    try sidebar.init(24, 4);
-    defer sidebar.deinit();
-    var fake: FakeResolver = .{};
-    try viewSidebarWithFindingAnnotations(
-        &sidebar.surface,
-        state,
-        loaded,
-        null,
-        null,
-        .{ .ctx = &fake, .resolve_fn = FakeResolver.resolve },
-        palette,
-    );
-    try std.testing.expectEqual(@as(usize, 1), fake.len);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls[0]);
-    const sidebar_snapshot = try sidebar.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(sidebar_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, sidebar_snapshot, "W3 N1") != null);
 }

@@ -35,11 +35,10 @@ const ActiveDiffSelectionOwner = union(enum) {
     changes: *const diff_selection.Owner,
     history: *const diff_selection.Owner,
     compare: *const diff_selection.Owner,
-    ai_reviews: *const diff_selection.Owner,
 
     fn active(self: ActiveDiffSelectionOwner) bool {
         return switch (self) {
-            inline .changes, .history, .compare, .ai_reviews => |owner| owner.activeMouseSelection(),
+            inline .changes, .history, .compare => |owner| owner.activeMouseSelection(),
         };
     }
 };
@@ -65,15 +64,6 @@ pub const CompareContext = struct {
     sidebar_width: ?u16,
 };
 
-pub const AiReviewsContext = struct {
-    key: app_input.AiReviewsContext,
-    selection_owner: *const diff_selection.Owner,
-    loaded: ?*const loaded_diff.LoadedDiff,
-    selected_node: usize,
-    sidebar_hidden: bool,
-    sidebar_width: ?u16,
-};
-
 pub const RepositoryContext = struct {
     key: repository_input.Context,
     page_state: *const repository_page.RepositoryPageState,
@@ -92,7 +82,6 @@ pub const View = struct {
     active_page: page.Id,
     changes: ChangesContext,
     compare: CompareContext,
-    ai_reviews: AiReviewsContext,
     repository: RepositoryContext,
     history: HistoryContext = .{},
     commit_panel_mode: bool,
@@ -119,7 +108,6 @@ pub const View = struct {
             .active_page = self.active_page,
             .changes = self.changes.key,
             .compare = self.compare.key,
-            .ai_reviews = self.ai_reviews.key,
             .repository = self.repository.key,
             .history = self.history.key,
             .commit_panel_mode = self.commit_panel_mode,
@@ -142,7 +130,6 @@ pub const View = struct {
 
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
         if (self.command_line_active) return null;
-        if (self.active_page == .ai_reviews and self.ai_reviews.key.human_review.open) return null;
         if (self.active_page == .history and self.history.key.detail_open) {
             if (mouse.type != .press) return null;
             switch (mouse.button) {
@@ -199,17 +186,6 @@ pub const View = struct {
                     } },
                     else => {},
                 },
-                .ai_reviews => switch (mouse.type) {
-                    .drag => return .{ .mouse_selection_drag = .{
-                        .pointer = self.bodyPointerSample(mouse),
-                        .target = .{ .ai_reviews = self.bodyMousePoint(mouse) },
-                    } },
-                    .release => return .{ .mouse_selection_release = .{
-                        .pointer = self.bodyPointerSample(mouse),
-                        .target = .{ .ai_reviews = self.bodyMousePoint(mouse) },
-                    } },
-                    else => {},
-                },
             };
         }
 
@@ -239,10 +215,8 @@ pub const View = struct {
 
         if ((self.active_page == .changes and (self.changes.key.search_mode or self.changes.key.file_search_mode)) or
             (self.active_page == .compare and (self.compare.key.common.search_mode or self.compare.key.common.file_search_mode or
-                self.compare.key.base_picker_open or self.compare.key.ai_review_handoff_open)) or
+                self.compare.key.base_picker_open)) or
             (self.active_page == .history and (self.history.key.common.search_mode or self.history.key.common.file_search_mode)) or
-            (self.active_page == .ai_reviews and (self.ai_reviews.key.common.search_mode or self.ai_reviews.key.common.file_search_mode or
-                self.ai_reviews.key.picker_open)) or
             (self.active_page == .repository and (self.repository.key.source_search_mode or self.repository.key.file_search_mode)) or
             self.commit_panel_mode or self.repo_picker_mode) return null;
         if (mouse.type != .press) return null;
@@ -340,43 +314,6 @@ pub const View = struct {
                 else => null,
             };
         }
-        if (self.active_page == .ai_reviews) {
-            const pane = self.committedDiffMousePane(self.ai_reviews, mouse) orelse return null;
-            return switch (mouse.button) {
-                .left => switch (pane) {
-                    .sidebar => .{ .ai_reviews = .{ .common = .{ .shared = self.committedDiffSidebarClickToMsg(self.ai_reviews, mouse) } } },
-                    .diff => if (self.ai_reviews.key.selected_run)
-                        .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .left } } }
-                    else
-                        .{ .ai_reviews = .{ .common = .{ .shared = .{ .mouse_diff_press = self.bodyMousePoint(mouse) orelse return null } } } },
-                },
-                .wheel_up => if (pane == .sidebar)
-                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_sidebar_wheel_up } } }
-                else if (self.ai_reviews.key.selected_run)
-                    .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_up } } }
-                else
-                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_diff_wheel_up } } },
-                .wheel_down => if (pane == .sidebar)
-                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_sidebar_wheel_down } } }
-                else if (self.ai_reviews.key.selected_run)
-                    .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_down } } }
-                else
-                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_diff_wheel_down } } },
-                .wheel_left => if (pane != .diff)
-                    null
-                else if (self.ai_reviews.key.selected_run)
-                    .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_left } } }
-                else
-                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_diff_wheel_left } } },
-                .wheel_right => if (pane != .diff)
-                    null
-                else if (self.ai_reviews.key.selected_run)
-                    .{ .ai_reviews = .{ .finding_pointer = .{ .point = self.bodyMousePoint(mouse) orelse return null, .button = .wheel_right } } }
-                else
-                    .{ .ai_reviews = .{ .common = .{ .shared = .mouse_diff_wheel_right } } },
-                else => null,
-            };
-        }
         if (self.active_page != .changes) return null;
 
         const pane = self.changesMousePane(mouse) orelse return null;
@@ -398,7 +335,6 @@ pub const View = struct {
             .changes => .{ .changes = self.changes.selection_owner },
             .history => .{ .history = self.history.selection_owner orelse return null },
             .compare => .{ .compare = self.compare.selection_owner },
-            .ai_reviews => .{ .ai_reviews = self.ai_reviews.selection_owner },
             .repository, .config => null,
         };
     }
@@ -538,7 +474,7 @@ fn applySignedScroll(current: usize, delta: isize) usize {
     return current +| @as(usize, @intCast(delta));
 }
 
-test "human review result modal blocks mouse routing while Repository Help scrolling stays bounded" {
+test "Repository Help scrolling stays bounded" {
     const size: chasen.Size = .{ .width = 80, .height = 12 };
     const visible_rows: usize = app_view.helpVisibleRows(size, .repository);
     const max_scroll = app_view.helpMaxScroll(size, .repository);
@@ -564,160 +500,6 @@ test "human review result modal blocks mouse routing while Repository Help scrol
     try std.testing.expectEqual(max_scroll -| visible_rows, overlay.help_scroll);
     _ = controller.scrollHelp(-std.math.maxInt(isize));
     try std.testing.expectEqual(@as(usize, 0), overlay.help_scroll);
-
-    overlay.close();
-    var selection_owner: diff_selection.Owner = .none;
-    var repository_state: repository_page.RepositoryPageState = .{};
-    const modal_view: View = .{
-        .active_page = .ai_reviews,
-        .changes = .{
-            .key = .{},
-            .selection_owner = &selection_owner,
-            .loaded = null,
-            .selected_node = 0,
-            .sidebar_hidden = false,
-            .sidebar_width = null,
-        },
-        .compare = .{
-            .key = .{},
-            .selection_owner = &selection_owner,
-            .loaded = null,
-            .selected_node = 0,
-            .sidebar_hidden = false,
-            .sidebar_width = null,
-        },
-        .ai_reviews = .{
-            .key = .{ .human_review = .{ .open = true } },
-            .selection_owner = &selection_owner,
-            .loaded = null,
-            .selected_node = 0,
-            .sidebar_hidden = false,
-            .sidebar_width = null,
-        },
-        .repository = .{ .key = .{}, .page_state = &repository_state },
-        .commit_panel_mode = false,
-        .repo_picker_mode = false,
-        .repo_picker_input_mode = .list,
-        .keymap = .{},
-        .overlay = &overlay,
-        .layout = app_shell_layout.compute(.{ .width = 80, .height = 24 }, .{ .page_bar_visible = true }),
-    };
-    try std.testing.expect(modal_view.handleEvent(.{ .mouse = .{
-        .col = 2,
-        .row = 2,
-        .button = .left,
-        .mods = .{},
-        .type = .press,
-    } }) == null);
-    try std.testing.expect(modal_view.handleEvent(.{ .mouse = .{
-        .col = 2,
-        .row = 2,
-        .button = .wheel_down,
-        .mods = .{},
-        .type = .press,
-    } }) == null);
-}
-
-test "Finding pointer shell preserves the AI Reviews body point and button once" {
-    var overlay: app_state.OverlayState = .{};
-    var selection_owner: diff_selection.Owner = .none;
-    var repository_state: repository_page.RepositoryPageState = .{};
-    var loaded: loaded_diff.LoadedDiff = undefined;
-    const layout = app_shell_layout.compute(.{ .width = 80, .height = 24 }, .{ .page_bar_visible = true });
-    const view: View = .{
-        .active_page = .ai_reviews,
-        .changes = .{
-            .key = .{},
-            .selection_owner = &selection_owner,
-            .loaded = null,
-            .selected_node = 0,
-            .sidebar_hidden = false,
-            .sidebar_width = null,
-        },
-        .compare = .{
-            .key = .{},
-            .selection_owner = &selection_owner,
-            .loaded = null,
-            .selected_node = 0,
-            .sidebar_hidden = false,
-            .sidebar_width = null,
-        },
-        .ai_reviews = .{
-            .key = .{ .selected_run = true },
-            .selection_owner = &selection_owner,
-            .loaded = &loaded,
-            .selected_node = 0,
-            .sidebar_hidden = true,
-            .sidebar_width = null,
-        },
-        .repository = .{ .key = .{}, .page_state = &repository_state },
-        .commit_panel_mode = false,
-        .repo_picker_mode = false,
-        .repo_picker_input_mode = .list,
-        .keymap = .{},
-        .overlay = &overlay,
-        .layout = layout,
-    };
-    const point: MousePoint = .{ .col = 10, .row = 5 };
-    const terminal_col: i16 = @intCast(layout.body.col + point.col);
-    const terminal_row: i16 = @intCast(layout.body.row + point.row);
-    const cases = [_]struct {
-        event: chasen.Event,
-        button: @import("pages/ai_reviews/input.zig").FindingPointerEvent.Button,
-    }{
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .left, .mods = .{}, .type = .press } }, .button = .left },
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_up, .mods = .{}, .type = .press } }, .button = .wheel_up },
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_down, .mods = .{}, .type = .press } }, .button = .wheel_down },
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_left, .mods = .{}, .type = .press } }, .button = .wheel_left },
-        .{ .event = .{ .mouse = .{ .col = terminal_col, .row = terminal_row, .button = .wheel_right, .mods = .{}, .type = .press } }, .button = .wheel_right },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            app_message.Msg{ .ai_reviews = .{ .finding_pointer = .{ .point = point, .button = case.button } } },
-            view.handleEvent(case.event).?,
-        );
-    }
-
-    try std.testing.expect(view.handleEvent(.{ .mouse = .{
-        .col = terminal_col,
-        .row = terminal_row,
-        .button = .left,
-        .mods = .{},
-        .type = .drag,
-    } }) == null);
-    try std.testing.expect(view.handleEvent(.{ .mouse = .{
-        .col = terminal_col,
-        .row = terminal_row,
-        .button = .left,
-        .mods = .{},
-        .type = .release,
-    } }) == null);
-
-    var sidebar_view = view;
-    sidebar_view.ai_reviews.sidebar_hidden = false;
-    try std.testing.expectEqual(
-        app_message.Msg{ .ai_reviews = .{ .common = .{ .shared = .mouse_sidebar_wheel_down } } },
-        sidebar_view.handleEvent(.{ .mouse = .{
-            .col = @intCast(layout.body.col + 1),
-            .row = @intCast(layout.body.row + 5),
-            .button = .wheel_down,
-            .mods = .{},
-            .type = .press,
-        } }).?,
-    );
-
-    var normal_view = view;
-    normal_view.ai_reviews.key.selected_run = false;
-    try std.testing.expectEqual(
-        app_message.Msg{ .ai_reviews = .{ .common = .{ .shared = .{ .mouse_diff_press = point } } } },
-        normal_view.handleEvent(.{ .mouse = .{
-            .col = terminal_col,
-            .row = terminal_row,
-            .button = .left,
-            .mods = .{},
-            .type = .press,
-        } }).?,
-    );
 }
 
 test "History routes committed diff and bounded picker wheel through the shell" {
@@ -737,14 +519,6 @@ test "History routes committed diff and bounded picker wheel through the shell" 
             .sidebar_width = null,
         },
         .compare = .{
-            .key = .{},
-            .selection_owner = &selection_owner,
-            .loaded = null,
-            .selected_node = 0,
-            .sidebar_hidden = false,
-            .sidebar_width = null,
-        },
-        .ai_reviews = .{
             .key = .{},
             .selection_owner = &selection_owner,
             .loaded = null,

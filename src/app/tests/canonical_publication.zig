@@ -151,7 +151,6 @@ fn repoSession(app: *App) repo_session.Controller {
         .changes = .{ .page = &app.pages.changes, .navigation = changesNavigation(app), .reload = changesReload(app) },
         .repository = .{ .page = &app.pages.repository },
         .compare = .{ .page = &app.pages.compare },
-        .ai_reviews = .{ .page = &app.pages.ai_reviews },
         .shell = app.remote_workflow.repositoryInvalidationPort(&app.overlay),
     };
 }
@@ -1721,7 +1720,7 @@ test "Changes canonical publication page transition retires generic page exits" 
     var roots = try TestRepoPair.init();
     defer roots.deinit();
 
-    for ([_]page.Id{ .history, .compare, .ai_reviews, .config }, 0..) |target, index| {
+    for ([_]page.Id{ .history, .compare, .config }, 0..) |target, index| {
         var app = try canonicalPublicationTestApp(allocator, roots.a);
         defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
@@ -2831,8 +2830,7 @@ fn canonicalPageTransitionMessage(
                 .repository => '2',
                 .history => '3',
                 .compare => '4',
-                .ai_reviews => '5',
-                .config => '6',
+                .config => '5',
             },
         } }),
         .page_bar => blk: {

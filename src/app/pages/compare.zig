@@ -13,10 +13,8 @@ const git_refs = @import("../../git/refs.zig");
 const page = @import("../page.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const commit_time = @import("../branch_commit_time.zig");
-const ai_review_handoff = @import("compare/ai_review_handoff.zig");
 
 pub const selection_source: diff_source.SourceMode = .{ .range = "compare" };
-pub const AiReviewHandoffModal = ai_review_handoff.Modal;
 
 pub const BasePickerRequest = struct {
     identity: page.RequestIdentity,
@@ -291,7 +289,6 @@ pub const ComparePageState = struct {
     basis_failure: ?BasisFailureState = null,
     load_failure: ?[]u8 = null,
     base_picker: BasePickerState = .{},
-    ai_review_handoff: AiReviewHandoffModal = .{},
     refresh_generation: u64 = 0,
     deferred_load_apply: ?DeferredLoadApply = null,
 
@@ -344,23 +341,6 @@ pub const ComparePageState = struct {
 
     pub fn closeBasePicker(self: *ComparePageState, allocator: std.mem.Allocator) void {
         self.base_picker.close(allocator);
-    }
-
-    pub fn beginAiReviewHandoff(
-        self: *ComparePageState,
-        allocator: std.mem.Allocator,
-        input: ai_review_handoff.OpenInput,
-    ) void {
-        if (self.diff.selection_owner.activeMouseSelection() or
-            self.diff.selection_owner.activeKeyboardSideChoice() != null)
-        {
-            self.diff.selection_owner = .none;
-        }
-        self.ai_review_handoff.begin(allocator, input);
-    }
-
-    pub fn closeAiReviewHandoff(self: *ComparePageState, allocator: std.mem.Allocator) void {
-        self.ai_review_handoff.close(allocator);
     }
 
     pub fn chooseBasePickerTarget(self: *ComparePageState, allocator: std.mem.Allocator) !bool {
@@ -487,7 +467,6 @@ pub const ComparePageState = struct {
         if (self.basis_failure) |*failure| failure.deinit(allocator);
         if (self.load_failure) |message| allocator.free(message);
         self.base_picker.deinit(allocator);
-        self.ai_review_handoff.deinit(allocator);
         if (self.deferred_load_apply) |*deferred| deferred.deinit(allocator);
         self.* = .{};
     }

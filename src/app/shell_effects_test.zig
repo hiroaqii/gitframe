@@ -12,7 +12,6 @@ const page = @import("page.zig");
 const compare_page = @import("pages/compare.zig");
 const history_page = @import("pages/history.zig");
 const committed_review = @import("../committed_review.zig");
-const ai_reviews_page = @import("pages/ai_reviews.zig");
 const repository_page = @import("pages/repository.zig");
 const changes_content = @import("pages/changes/content.zig");
 const changes_page = @import("pages/changes.zig");
@@ -24,7 +23,6 @@ const ShellPages = struct {
     repository: repository_page.RepositoryPageState = .{},
     history: history_page.HistoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
-    ai_reviews: ai_reviews_page.AiReviewsPageState = .{},
 };
 
 const RedrawPlan = struct {
@@ -57,13 +55,8 @@ const ShellHarness = struct {
                 .repository_activation_id = self.pages.repository.activation_id,
                 .history_activation_id = self.pages.history.activation.next_activation_id,
                 .compare_activation_id = self.pages.compare.activation.next_activation_id,
-                .ai_reviews_activation_id = self.pages.ai_reviews.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = null,
-                .compare_ai_review_handoff = if (self.pages.compare.ai_review_handoff.currentCopyAuthority()) |authority| .{
-                    .modal_instance_id = authority.modal_instance_id,
-                    .copy_generation = authority.copy_generation,
-                } else null,
                 .history_commit_detail = if (self.pages.history.currentDetailCopyAuthority()) |authority| .{
                     .modal_instance_id = authority.modal_instance_id,
                     .copy_generation = authority.copy_generation,
@@ -73,7 +66,6 @@ const ShellHarness = struct {
             .repository_repo_epoch = self.pages.repository.repo_epoch,
             .history_repo_epoch = self.repo_epoch,
             .compare_repo_epoch = self.repo_epoch,
-            .ai_reviews_repo_epoch = self.repo_epoch,
         };
     }
 
@@ -89,8 +81,6 @@ const ShellHarness = struct {
                 .repository = &self.pages.repository.status,
                 .history = &self.pages.history.status,
                 .compare = &self.pages.compare.status,
-                .compare_ai_review_handoff = self.pages.compare.ai_review_handoff.statusMessage(),
-                .ai_reviews = &self.pages.ai_reviews.status,
             },
             .redraw = .{ .skip_requested = &self.redraw_plan.skip_requested },
         };
@@ -109,33 +99,6 @@ const ShellHarness = struct {
     }
 };
 
-fn handoffTestTarget() committed_review.CommittedReviewTarget {
-    const base = committed_review.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111") catch unreachable;
-    const head = committed_review.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222") catch unreachable;
-    return .{
-        .object_format = .sha1,
-        .source_kind = .branch_range,
-        .base_oid = base,
-        .head_oid = head,
-        .diff_base_oid = base,
-    };
-}
-
-fn openTestHandoff(app: *ShellHarness, repository: ?[]const u8) void {
-    app.pages.compare.ai_review_handoff.begin(std.testing.allocator, .{
-        .executable_path = "/gitframe",
-        .repository_path = repository,
-        .target = handoffTestTarget(),
-    });
-}
-
-fn handoffOrigin(app: *ShellHarness, copy: @import("pages/compare/ai_review_handoff.zig").Copy) effect_origin.Origin {
-    return .{ .compare_ai_review_handoff = .{
-        .page = app.shellEffects().compareOrigin(),
-        .modal_instance_id = copy.modal_instance_id,
-        .copy_generation = copy.copy_generation,
-    } };
-}
 test "clipboard copy result status uses best-effort wording" {
     var app: ShellHarness = .{};
     defer app.shell_state.clipboard_copies.deinit(std.testing.allocator);
@@ -313,152 +276,6 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
     try std.testing.expectEqualStrings("clipboard copy already queued", app.pages.compare.status.text());
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
-}
-
-test "AI Review Handoff close and reopen drain every old clipboard terminal silently" {
-    const allocator = std.testing.allocator;
-    var app: ShellHarness = .{ .active_page = .compare };
-    defer app.pages.compare.deinit(allocator);
-    defer app.shell_state.clipboard_copies.deinit(allocator);
-    _ = app.pages.compare.activate(0);
-    openTestHandoff(&app, "/repo-a");
-
-    const outcomes = [_]app_message.ClipboardCopyOutcome{
-        .sent,
-        .unsupported_runtime,
-        .{ .write_failed = "BrokenPipe" },
-    };
-    for (outcomes, 100..) |_, request_id| {
-        const copy = app.pages.compare.ai_review_handoff.beginCopy().?;
-        try app.shell_state.clipboard_copies.put(allocator, request_id, .{
-            .origin = handoffOrigin(&app, copy),
-            .label = "AI review handoff prompt",
-        });
-    }
-
-    app.pages.compare.ai_review_handoff.close(allocator);
-    openTestHandoff(&app, null);
-    try std.testing.expectEqual(
-        @import("pages/compare/ai_review_handoff.zig").UnavailableReason.repository_unavailable,
-        app.pages.compare.ai_review_handoff.unavailableReason().?,
-    );
-    for (outcomes, 100..) |outcome, request_id| {
-        app.redraw_plan = .{};
-        _ = app.shellEffects().finishClipboard(.{
-            .request_id = .{ .id = request_id },
-            .outcome = outcome,
-        });
-        try std.testing.expectEqualStrings("", app.pages.compare.ai_review_handoff.status.text());
-        try std.testing.expect(app.redraw_plan.resolvesToSkip());
-    }
-    try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
-}
-
-test "AI Review Handoff presents every finite clipboard terminal on the current modal" {
-    const allocator = std.testing.allocator;
-    var app: ShellHarness = .{ .active_page = .compare };
-    defer app.pages.compare.deinit(allocator);
-    defer app.shell_state.clipboard_copies.deinit(allocator);
-    _ = app.pages.compare.activate(0);
-    openTestHandoff(&app, "/repo");
-
-    const cases = [_]struct {
-        outcome: app_message.ClipboardCopyOutcome,
-        expected: []const u8,
-    }{
-        .{ .outcome = .sent, .expected = "clipboard copy sent: AI review handoff prompt" },
-        .{ .outcome = .unsupported_runtime, .expected = "clipboard copy unavailable: AI review handoff prompt" },
-        .{ .outcome = .{ .write_failed = "BrokenPipe" }, .expected = "clipboard copy failed: AI review handoff prompt: BrokenPipe" },
-    };
-    for (cases, 150..) |case, request_id| {
-        const copy = app.pages.compare.ai_review_handoff.beginCopy().?;
-        try app.shell_state.clipboard_copies.put(allocator, request_id, .{
-            .origin = handoffOrigin(&app, copy),
-            .label = "AI review handoff prompt",
-        });
-        _ = app.shellEffects().finishClipboard(.{
-            .request_id = .{ .id = request_id },
-            .outcome = case.outcome,
-        });
-        try std.testing.expectEqualStrings(case.expected, app.pages.compare.ai_review_handoff.status.text());
-    }
-    try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
-}
-
-test "AI Review Handoff latest generation alone owns out of order completion status" {
-    const allocator = std.testing.allocator;
-    var app: ShellHarness = .{ .active_page = .compare };
-    defer app.pages.compare.deinit(allocator);
-    defer app.shell_state.clipboard_copies.deinit(allocator);
-    _ = app.pages.compare.activate(0);
-    openTestHandoff(&app, "/repo");
-    const first = app.pages.compare.ai_review_handoff.beginCopy().?;
-    const second = app.pages.compare.ai_review_handoff.beginCopy().?;
-    try app.shell_state.clipboard_copies.put(allocator, 200, .{
-        .origin = handoffOrigin(&app, first),
-        .label = "AI review handoff prompt",
-    });
-    try app.shell_state.clipboard_copies.put(allocator, 201, .{
-        .origin = handoffOrigin(&app, second),
-        .label = "AI review handoff prompt",
-    });
-
-    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 201 }, .outcome = .sent });
-    const latest_status = try allocator.dupe(u8, app.pages.compare.ai_review_handoff.status.text());
-    defer allocator.free(latest_status);
-    try std.testing.expectEqualStrings("clipboard copy sent: AI review handoff prompt", latest_status);
-    app.redraw_plan = .{};
-    _ = app.shellEffects().finishClipboard(.{
-        .request_id = .{ .id = 200 },
-        .outcome = .{ .write_failed = "late" },
-    });
-    try std.testing.expectEqualStrings(latest_status, app.pages.compare.ai_review_handoff.status.text());
-    try std.testing.expect(app.redraw_plan.resolvesToSkip());
-    try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
-}
-
-test "AI Review Handoff synchronous queue rejection supersedes an older async completion" {
-    const allocator = std.testing.allocator;
-    var app: ShellHarness = .{ .active_page = .compare };
-    defer app.pages.compare.deinit(allocator);
-    defer app.shell_state.clipboard_copies.deinit(allocator);
-    _ = app.pages.compare.activate(0);
-    openTestHandoff(&app, "/repo");
-    var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
-
-    const first = app.pages.compare.ai_review_handoff.beginCopy().?;
-    try std.testing.expect(app.shellEffects().queueClipboardAccepted(&ctx, .{
-        .origin = handoffOrigin(&app, first),
-        .label = "AI review handoff prompt",
-        .text = first.prompt,
-    }));
-    const first_request_id = ctx._pending_clipboard_copies[0].request_id;
-    for (0..3) |_| {
-        _ = try ctx.terminal().copyToClipboard(.{
-            .text = "occupied",
-            .finished = ShellHarness.Msg.clipboardFinished,
-        });
-    }
-
-    const second = app.pages.compare.ai_review_handoff.beginCopy().?;
-    try std.testing.expect(!app.shellEffects().queueClipboardAccepted(&ctx, .{
-        .origin = handoffOrigin(&app, second),
-        .label = "AI review handoff prompt",
-        .text = second.prompt,
-    }));
-    try std.testing.expectEqualStrings(
-        "clipboard copy already queued",
-        app.pages.compare.ai_review_handoff.status.text(),
-    );
-    app.redraw_plan = .{};
-    _ = app.shellEffects().finishClipboard(.{ .request_id = first_request_id, .outcome = .sent });
-    try std.testing.expectEqualStrings(
-        "clipboard copy already queued",
-        app.pages.compare.ai_review_handoff.status.text(),
-    );
-    try std.testing.expect(app.redraw_plan.resolvesToSkip());
-    try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
 }
 
 test "inactive Changes clipboard completion retains diagnostic without redraw" {

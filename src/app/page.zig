@@ -5,7 +5,6 @@ pub const Id = enum {
     repository,
     history,
     compare,
-    ai_reviews,
     config,
 
     pub fn label(self: Id) []const u8 {
@@ -14,7 +13,6 @@ pub const Id = enum {
             .repository => "Repository",
             .history => "History",
             .compare => "Compare",
-            .ai_reviews => "AI Reviews",
             .config => "Config",
         };
     }
@@ -25,13 +23,12 @@ pub const Id = enum {
             .repository => "Repository browser is not initialized",
             .history => "Commit history is not loaded",
             .compare => "Compare: not loaded",
-            .ai_reviews => "AI Reviews: select a review",
             .config => "Configuration viewer is not initialized",
         };
     }
 };
 
-pub const all = [_]Id{ .changes, .repository, .history, .compare, .ai_reviews, .config };
+pub const all = [_]Id{ .changes, .repository, .history, .compare, .config };
 
 /// Scheduling identity shared by every page-owned asynchronous read.
 ///
@@ -66,15 +63,6 @@ pub const RequestIdentity = struct {
         std.debug.assert(activation_id != 0);
         return .{
             .origin = .history,
-            .repo_epoch = repo_epoch,
-            .activation_id = activation_id,
-        };
-    }
-
-    pub fn aiReviews(repo_epoch: u64, activation_id: u64) RequestIdentity {
-        std.debug.assert(activation_id != 0);
-        return .{
-            .origin = .ai_reviews,
             .repo_epoch = repo_epoch,
             .activation_id = activation_id,
         };
@@ -132,23 +120,19 @@ test "page vocabulary has stable visible order" {
     try std.testing.expectEqualStrings("Repository", all[1].label());
     try std.testing.expectEqualStrings("History", all[2].label());
     try std.testing.expectEqualStrings("Compare", all[3].label());
-    try std.testing.expectEqualStrings("AI Reviews", all[4].label());
-    try std.testing.expectEqualStrings("Config", all[5].label());
+    try std.testing.expectEqualStrings("Config", all[4].label());
 }
 
-test "History Compare and AI Reviews request identities are distinct" {
+test "History and Compare request identities are distinct" {
     const changes = RequestIdentity.changes(3, 7);
     const history = RequestIdentity.history(3, 7);
     const compare = RequestIdentity.compare(3, 7);
-    const ai_reviews = RequestIdentity.aiReviews(3, 7);
     try std.testing.expectEqual(Id.changes, changes.origin);
     try std.testing.expectEqual(Id.history, history.origin);
     try std.testing.expectEqual(Id.compare, compare.origin);
-    try std.testing.expectEqual(Id.ai_reviews, ai_reviews.origin);
     try std.testing.expect(changes.origin != compare.origin);
     try std.testing.expect(changes.origin != history.origin);
     try std.testing.expect(history.origin != compare.origin);
-    try std.testing.expect(compare.origin != ai_reviews.origin);
 }
 
 test "placeholder is lazy" {

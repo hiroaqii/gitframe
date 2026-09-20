@@ -16,7 +16,6 @@ const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const commit_time = @import("../../branch_commit_time.zig");
 const local_time = @import("../../../local_time.zig");
-const ai_review_handoff = @import("ai_review_handoff.zig");
 
 pub const Context = struct {
     page: *const compare_page.ComparePageState,
@@ -196,119 +195,6 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.palette.style(.accent));
 }
 
-pub fn viewAiReviewHandoff(app: Context, surface: *chasen.Surface) !void {
-    const modal = &app.page.ai_review_handoff;
-    if (!modal.open) return;
-    const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, 100),
-        .dialog_height = @min(surface.size().height, 24),
-        .title = "AI Review Handoff",
-        .backdrop = false,
-        .border = .rounded,
-        .title_style = app.palette.boldStyle(.accent),
-        .border_style = app.palette.style(.accent),
-    };
-    const frame = ui.Modal.frame(surface, opts) orelse return;
-    var dialog = frame.dialogSurface();
-    dialog.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
-    frame.view();
-    var content = frame.contentSurface();
-    const size = content.size();
-    if (size.width == 0 or size.height == 0) return;
-    const prompt_height = size.height -| 2;
-    if (prompt_height > 0) {
-        var prompt_surface = content.child(.{ .col = 0, .row = 0, .width = size.width, .height = prompt_height });
-        if (modal.ready()) |ready| {
-            _ = drawWrappedTextScrolled(
-                &prompt_surface,
-                ready.snapshot.canonical_prompt,
-                ready.viewport.top_visual_row,
-                chasen.TextStyle{},
-            );
-        } else if (modal.unavailableReason()) |reason| {
-            try draw.copyClippedTextAt(&prompt_surface, 0, 0, reason.text(), app.palette.boldStyle(.danger));
-        }
-    }
-
-    if (prompt_height < size.height and modal.status.text().len > 0) {
-        const style = if (std.mem.startsWith(u8, modal.status.text(), "clipboard copy sent:"))
-            app.palette.style(.accent)
-        else
-            app.palette.style(.danger);
-        try draw.copyClippedTextAt(&content, 0, prompt_height, modal.status.text(), style);
-    }
-    if (prompt_height +| 1 < size.height) {
-        const footer = if (size.width >= 72)
-            "y: Copy prompt  j/k/PgUp/PgDn/Home/End: Scroll  Esc: Close"
-        else
-            "y: Copy prompt  Esc: Close";
-        try draw.copyClippedTextAt(&content, 0, prompt_height + 1, footer, app.palette.style(.accent));
-    }
-}
-
-pub fn aiReviewHandoffPromptSize(size: chasen.Size) ai_review_handoff.PromptSize {
-    const overlay: chasen.Rect = .{ .col = 0, .row = 0, .width = size.width, .height = size.height };
-    const dialog = ui.Modal.dialogRectFor(overlay, .{
-        .dialog_width = @min(size.width, 100),
-        .dialog_height = @min(size.height, 24),
-    });
-    const content = ui.Modal.contentRectFor(dialog, .{ .top = 1, .right = 1, .bottom = 1, .left = 1 });
-    return .{ .width = content.width, .height = content.height -| 2 };
-}
-
-fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: usize, style: chasen.TextStyle) usize {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return 0;
-    const clamped_scroll = @min(scroll, ai_review_handoff.promptMaxOffset(text, .{
-        .width = size.width,
-        .height = size.height,
-    }));
-    var logical_row: usize = 0;
-    var drawn_rows: usize = 0;
-    var line_start: usize = 0;
-    var line_end: usize = 0;
-    var line_width: u32 = 0;
-    var iter = chasen.text.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        if (bytes.len == 1 and bytes[0] == '\n') {
-            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style)) return drawn_rows;
-            logical_row += 1;
-            line_start = grapheme.start + grapheme.len;
-            line_end = line_start;
-            line_width = 0;
-            continue;
-        }
-        const grapheme_width = chasen.text.displayWidth(bytes);
-        if (line_width > 0 and line_width + grapheme_width > size.width) {
-            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style)) return drawn_rows;
-            logical_row += 1;
-            line_start = grapheme.start;
-            line_end = grapheme.start;
-            line_width = 0;
-        }
-        line_end = grapheme.start + grapheme.len;
-        line_width += grapheme_width;
-    }
-    _ = drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style);
-    return drawn_rows;
-}
-
-fn drawWrappedLine(
-    surface: *chasen.Surface,
-    line: []const u8,
-    logical_row: usize,
-    scroll: usize,
-    drawn_rows: *usize,
-    style: chasen.TextStyle,
-) bool {
-    if (logical_row < scroll) return false;
-    if (drawn_rows.* >= @as(usize, surface.size().height)) return true;
-    _ = surface.borrowTextAt(0, @intCast(drawn_rows.*), line, style);
-    drawn_rows.* += 1;
-    return drawn_rows.* >= @as(usize, surface.size().height);
-}
-
 fn navigationView(app: Context) committed_diff_navigation.View {
     var key_buffer: [16]u8 = undefined;
     return .{
@@ -327,7 +213,7 @@ fn navigationView(app: Context) committed_diff_navigation.View {
 }
 
 fn displayModeToggleKey(app: Context, buffer: []u8) ?[]const u8 {
-    if (app.page.diff.search.mode or app.page.diff.file_search.mode or app.page.base_picker.open or app.page.ai_review_handoff.open) return null;
+    if (app.page.diff.search.mode or app.page.diff.file_search.mode or app.page.base_picker.open) return null;
     return app.keymap.display(.toggle_display_mode, buffer);
 }
 
@@ -428,80 +314,4 @@ test "Compare empty state distinguishes commits from net file diff" {
     defer arena.deinit();
     const message = try emptyStateMessage(arena.allocator(), "main", 1);
     try std.testing.expectEqualStrings("No file changes against main", message.title);
-}
-
-test "AI Review Handoff renders exact prompt start and finitely reachable end at supported sizes" {
-    var page_state: compare_page.ComparePageState = .{};
-    defer page_state.deinit(std.testing.allocator);
-    const base = try @import("../../../committed_review.zig").ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
-    const head = try @import("../../../committed_review.zig").ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
-    page_state.beginAiReviewHandoff(std.testing.allocator, .{
-        .executable_path = "/opt/gitframe/bin/gitframe",
-        .repository_path = "/work/repository",
-        .target = .{
-            .object_format = .sha1,
-            .source_kind = .branch_range,
-            .base_oid = base,
-            .head_oid = head,
-            .diff_base_oid = base,
-        },
-    });
-    for ([_]chasen.Size{ .{ .width = 120, .height = 32 }, .{ .width = 80, .height = 24 }, .{ .width = 40, .height = 12 } }) |size| {
-        var surface: chasen.testing.TestSurface = undefined;
-        try surface.init(size.width, size.height);
-        defer surface.deinit();
-        try viewAiReviewHandoff(.{
-            .page = &page_state,
-            .palette = .default(),
-            .repo_root = null,
-            .repo_epoch = 1,
-            .root_identity = null,
-            .layout = .{ .width = size.width, .height = size.height },
-        }, &surface.surface);
-        const start = try surface.snapshot(std.testing.allocator);
-        defer std.testing.allocator.free(start);
-        try std.testing.expect(std.mem.indexOf(u8, start, "AI Review Handoff") != null);
-        try std.testing.expect(std.mem.indexOf(u8, start, "Use the installed skill") != null);
-        try std.testing.expect(std.mem.indexOf(u8, start, "y: Copy prompt") != null);
-
-        page_state.ai_review_handoff.scroll(.end, aiReviewHandoffPromptSize(size));
-        try viewAiReviewHandoff(.{
-            .page = &page_state,
-            .palette = .default(),
-            .repo_root = null,
-            .repo_epoch = 1,
-            .root_identity = null,
-            .layout = .{ .width = size.width, .height = size.height },
-        }, &surface.surface);
-        const end = try surface.snapshot(std.testing.allocator);
-        defer std.testing.allocator.free(end);
-        try std.testing.expect(std.mem.indexOf(u8, end, "Head OID:") != null);
-        page_state.ai_review_handoff.scroll(.home, aiReviewHandoffPromptSize(size));
-    }
-}
-
-test "AI Review Handoff unavailable modal shows one finite reason and inert copy status" {
-    var page_state: compare_page.ComparePageState = .{};
-    defer page_state.deinit(std.testing.allocator);
-    page_state.beginAiReviewHandoff(std.testing.allocator, .{
-        .executable_path = null,
-        .repository_path = null,
-        .target = null,
-    });
-    var surface: chasen.testing.TestSurface = undefined;
-    try surface.init(40, 12);
-    defer surface.deinit();
-    try viewAiReviewHandoff(.{
-        .page = &page_state,
-        .palette = .default(),
-        .repo_root = null,
-        .repo_epoch = 1,
-        .root_identity = null,
-        .layout = .{ .width = 40, .height = 12 },
-    }, &surface.surface);
-    const snapshot = try surface.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Repository unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "GitFrame executable:") == null);
-    try std.testing.expect(page_state.ai_review_handoff.beginCopy() == null);
 }

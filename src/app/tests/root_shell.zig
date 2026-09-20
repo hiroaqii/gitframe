@@ -1609,7 +1609,7 @@ test "mouse horizontal wheel scrolls diff pane horizontally" {
 test "footer status click copies full page diagnostic across shared screens" {
     const allocator = std.testing.allocator;
     const status_text = "警告: clipped footerでも保持しているmessage全体をcopyする";
-    const page_ids = [_]page.Id{ .changes, .repository, .history, .compare, .ai_reviews };
+    const page_ids = [_]page.Id{ .changes, .repository, .history, .compare };
 
     for (page_ids, 0..) |page_id, index| {
         var app: App = .{
@@ -1625,7 +1625,6 @@ test "footer status click copies full page diagnostic across shared screens" {
             .repository => &app.pages.repository.status,
             .history => &app.pages.history.status,
             .compare => &app.pages.compare.status,
-            .ai_reviews => &app.pages.ai_reviews.status,
             .config => unreachable,
         };
         page_status.set("{s}", .{status_text});

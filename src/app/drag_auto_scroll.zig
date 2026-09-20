@@ -13,7 +13,6 @@ pub const Target = enum {
     changes,
     history,
     compare,
-    ai_reviews,
     repository,
 };
 
@@ -167,7 +166,7 @@ test "drag auto-scroll keeps one generation at an edge and rejects stale ticks a
     try std.testing.expect(state.acceptedTick(first.generation) != null);
     state.observe(.changes, .{ .col = 7, .row = 6 }, viewport);
     try std.testing.expect(state.active == null);
-    state.observe(.ai_reviews, .{ .col = 7, .row = 10 }, viewport);
+    state.observe(.history, .{ .col = 7, .row = 10 }, viewport);
     try std.testing.expect(state.active.?.generation != first.generation);
     try std.testing.expect(state.acceptedTick(first.generation) == null);
 }

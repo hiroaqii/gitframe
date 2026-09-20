@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const committed_review = @import("../committed_review.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const chasen = @import("chasen");
 const auto_reload = @import("auto_reload.zig");
@@ -33,7 +32,6 @@ const changes_projection = @import("changes_projection.zig");
 const changes_read_epoch = @import("changes_read_epoch.zig");
 const repo_discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
-const review_store = @import("../review_store.zig");
 const selected_document = @import("../repository/document.zig");
 const repository_source = @import("../repository/source.zig");
 const source_syntax = @import("../syntax/source.zig");
@@ -288,71 +286,6 @@ pub const HistoryReadFinished = union(enum) {
     }
 };
 
-pub const AiReviewScanTaskResult = union(enum) {
-    empty,
-    scanned: review_store.ScanResult,
-    failed_static: []const u8,
-
-    pub fn deinit(self: *AiReviewScanTaskResult, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .scanned => |*result| result.deinit(allocator),
-            .empty, .failed_static => {},
-        }
-        self.* = .empty;
-    }
-};
-
-pub const AiReviewScanFinished = struct {
-    identity: page.RequestIdentity,
-    generation: u64,
-    store_identity: review_store.ConfigurationIdentity,
-    result: AiReviewScanTaskResult,
-
-    pub fn deinit(self: *AiReviewScanFinished, allocator: std.mem.Allocator) void {
-        self.result.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const AiReviewLoadedBundle = struct {
-    selection: review_store.SelectedRunRead,
-    diff: CommittedDiffBundle,
-
-    pub fn deinit(self: *AiReviewLoadedBundle, allocator: std.mem.Allocator) void {
-        self.diff.deinit();
-        self.selection.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const AiReviewSelectionTaskResult = union(enum) {
-    empty,
-    loaded: AiReviewLoadedBundle,
-    selection_failed: review_store.SelectionFailure,
-    failed_static: []const u8,
-
-    pub fn deinit(self: *AiReviewSelectionTaskResult, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .loaded => |*bundle| bundle.deinit(allocator),
-            .empty, .selection_failed, .failed_static => {},
-        }
-        self.* = .empty;
-    }
-};
-
-pub const AiReviewSelectionFinished = struct {
-    identity: page.RequestIdentity,
-    generation: u64,
-    store_identity: review_store.ConfigurationIdentity,
-    review_id: committed_review.ReviewId,
-    result: AiReviewSelectionTaskResult,
-
-    pub fn deinit(self: *AiReviewSelectionFinished, allocator: std.mem.Allocator) void {
-        self.result.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
 pub const ChangesProjectionFinished = changes_projection.Finished;
 
 /// Read results whose acceptance and retained state belong to the Changes page.
@@ -379,19 +312,6 @@ pub const CompareReadFinished = union(enum) {
     branch_list: CompareBranchListFinished,
 
     pub fn deinit(self: *CompareReadFinished, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            inline else => |*finished| finished.deinit(allocator),
-        }
-        self.* = undefined;
-    }
-};
-
-/// Read results whose acceptance and retained state belong to AI Reviews.
-pub const AiReviewsReadFinished = union(enum) {
-    history_scan: AiReviewScanFinished,
-    history_selection: AiReviewSelectionFinished,
-
-    pub fn deinit(self: *AiReviewsReadFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
             inline else => |*finished| finished.deinit(allocator),
         }
@@ -433,7 +353,6 @@ pub const ReadFinished = union(enum) {
     changes: ChangesReadFinished,
     history: HistoryReadFinished,
     compare: CompareReadFinished,
-    ai_reviews: AiReviewsReadFinished,
     shell: ShellReadFinished,
     coordinator: CoordinatorReadFinished,
 
@@ -1250,216 +1169,6 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
             } } });
         }
     };
-}
-
-/// Explicit-open Review history scan. Every input needed by the worker is
-/// duplicated before spawn; the completion carries the exact Store path
-/// snapshot used by the read for event-loop admission.
-pub fn AiReviewScanTask(comptime Msg: type) type {
-    return struct {
-        identity: page.RequestIdentity,
-        generation: u64,
-        store: review_store.ConfiguredStore,
-        root: root_capability.RootCapability,
-        environment: git_command.LocalGitEnvironment,
-
-        pub fn init(
-            identity: page.RequestIdentity,
-            generation: u64,
-            store: *const review_store.ConfiguredStore,
-            root: root_capability.RootCapability,
-            env_map: ?*const std.process.Environ.Map,
-            allocator: std.mem.Allocator,
-        ) !@This() {
-            var owned_store = try store.clone(allocator);
-            errdefer owned_store.deinit(allocator);
-            var owned_root = try root.duplicate();
-            errdefer owned_root.deinit();
-            return .{
-                .identity = identity,
-                .generation = generation,
-                .store = owned_store,
-                .root = owned_root,
-                .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map),
-            };
-        }
-
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            const scanned = review_store.scan(allocator, io, &task.store, .{
-                .capability = &task.root,
-                .environment = &task.environment,
-            }) catch return task.finish(allocator, .{ .failed_static = "Could not load AI reviews: out of memory" });
-            return task.finish(allocator, .{ .scanned = scanned });
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
-        }
-
-        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
-            task.deinitOwned(allocator);
-            allocator.destroy(task);
-        }
-
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: AiReviewScanTaskResult) Msg {
-            defer {
-                task.environment.deinit();
-                task.root.deinit();
-                task.store.deinit(allocator);
-                allocator.destroy(task);
-            }
-            const store_identity = task.store.identity();
-            return Msg.loadFinished(.{ .ai_reviews = .{ .history_scan = .{
-                .identity = task.identity,
-                .generation = task.generation,
-                .store_identity = store_identity,
-                .result = result,
-            } } });
-        }
-
-        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
-            task.environment.deinit();
-            task.root.deinit();
-            task.store.deinit(allocator);
-        }
-    };
-}
-
-/// Selection-time revalidation and exact projection parse for one scanned Run.
-pub fn AiReviewSelectionTask(comptime Msg: type) type {
-    return struct {
-        identity: page.RequestIdentity,
-        generation: u64,
-        store: review_store.ConfiguredStore,
-        root: root_capability.RootCapability,
-        environment: git_command.LocalGitEnvironment,
-        expected_store: review_store.StoreSnapshot,
-        review_id: committed_review.ReviewId,
-        expected_artifacts: review_store.ArtifactSnapshot,
-        direct: bool,
-
-        pub fn init(
-            identity: page.RequestIdentity,
-            generation: u64,
-            store: *const review_store.ConfiguredStore,
-            root: root_capability.RootCapability,
-            env_map: ?*const std.process.Environ.Map,
-            expected_store: review_store.StoreSnapshot,
-            review_id: committed_review.ReviewId,
-            expected_artifacts: review_store.ArtifactSnapshot,
-            direct: bool,
-            allocator: std.mem.Allocator,
-        ) !@This() {
-            var owned_store = try store.clone(allocator);
-            errdefer owned_store.deinit(allocator);
-            var owned_root = try root.duplicate();
-            errdefer owned_root.deinit();
-            return .{
-                .identity = identity,
-                .generation = generation,
-                .store = owned_store,
-                .root = owned_root,
-                .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map),
-                .expected_store = expected_store,
-                .review_id = review_id,
-                .expected_artifacts = expected_artifacts,
-                .direct = direct,
-            };
-        }
-
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runAiReviewSelection(
-                allocator,
-                io,
-                &task.store,
-                .{ .capability = &task.root, .environment = &task.environment },
-                task.expected_store,
-                task.review_id,
-                task.expected_artifacts,
-                task.direct,
-            ));
-        }
-
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
-        }
-
-        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
-            task.deinitOwned(allocator);
-            allocator.destroy(task);
-        }
-
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: AiReviewSelectionTaskResult) Msg {
-            defer {
-                task.environment.deinit();
-                task.root.deinit();
-                task.store.deinit(allocator);
-                allocator.destroy(task);
-            }
-            const store_identity = task.store.identity();
-            return Msg.loadFinished(.{ .ai_reviews = .{ .history_selection = .{
-                .identity = task.identity,
-                .generation = task.generation,
-                .store_identity = store_identity,
-                .review_id = task.review_id,
-                .result = result,
-            } } });
-        }
-
-        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
-            task.environment.deinit();
-            task.root.deinit();
-            task.store.deinit(allocator);
-        }
-    };
-}
-
-pub fn runAiReviewSelection(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    configured_store: *const review_store.ConfiguredStore,
-    repository: review_store.RepositoryContext,
-    expected_store: review_store.StoreSnapshot,
-    review_id: committed_review.ReviewId,
-    expected_artifacts: review_store.ArtifactSnapshot,
-    direct: bool,
-) AiReviewSelectionTaskResult {
-    var selected = (if (direct) review_store.selectExactReload(
-        allocator,
-        io,
-        configured_store,
-        repository,
-        expected_store,
-        review_id,
-        expected_artifacts,
-    ) else review_store.selectExact(
-        allocator,
-        io,
-        configured_store,
-        repository,
-        expected_store,
-        review_id,
-        expected_artifacts,
-    )) catch return .{ .failed_static = "Could not load AI review: out of memory" };
-    defer selected.deinit(allocator);
-    switch (selected) {
-        .failure => |failure| return .{ .selection_failed = failure },
-        .selected => |*read| {
-            var diff: CommittedDiffBundle = if (read.projection.patch_bytes.len == 0)
-                .empty
-            else
-                .{ .loaded = buildLoadedBundleWithIo(allocator, io, read.projection.patch_bytes) catch
-                    return .{ .failed_static = "Could not parse AI review diff" } };
-            errdefer diff.deinit();
-            const owned_read = read.*;
-            selected = .{ .failure = .run_invalid };
-            return .{ .loaded = .{ .selection = owned_read, .diff = diff } };
-        },
-    }
 }
 
 pub fn ChangesProjectionTask(comptime Msg: type) type {

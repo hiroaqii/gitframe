@@ -7,7 +7,6 @@ pub const Blocker = enum {
     changes_mouse_selection,
     history_mouse_selection,
     compare_mouse_selection,
-    ai_reviews_mouse_selection,
     repository_mouse_selection,
     changes_deferred_apply,
     compare_deferred_apply,
@@ -18,8 +17,6 @@ pub const Blocker = enum {
     history_commit_detail,
     compare_search,
     compare_file_search,
-    ai_reviews_search,
-    ai_reviews_file_search,
     repository_source_search,
     repository_file_search,
     repo_picker,
@@ -28,8 +25,6 @@ pub const Blocker = enum {
     confirmation,
     branch_switch,
     compare_base_picker,
-    ai_reviews_picker,
-    ai_reviews_human_decision,
     push_error,
     git_action,
     foreground_command,
@@ -40,7 +35,6 @@ pub const Blocker = enum {
             .changes_mouse_selection => "finish mouse selection before switching pages",
             .history_mouse_selection => "finish History mouse selection before switching pages",
             .compare_mouse_selection => "finish Compare mouse selection before switching pages",
-            .ai_reviews_mouse_selection => "finish AI Reviews mouse selection before switching pages",
             .repository_mouse_selection => "finish Repository mouse selection before switching pages",
             .changes_deferred_apply => "finish deferred Changes update before switching pages",
             .compare_deferred_apply => "finish deferred Compare update before switching pages",
@@ -51,8 +45,6 @@ pub const Blocker = enum {
             .history_commit_detail => "close History commit detail before switching pages",
             .compare_search => "finish Compare search before switching pages",
             .compare_file_search => "finish Compare file search before switching pages",
-            .ai_reviews_search => "finish AI Reviews search before switching pages",
-            .ai_reviews_file_search => "finish AI Reviews file search before switching pages",
             .repository_source_search => "finish source search before switching pages",
             .repository_file_search => "finish file search before switching pages",
             .repo_picker => "close repository picker before switching pages",
@@ -61,8 +53,6 @@ pub const Blocker = enum {
             .confirmation => "finish confirmation before switching pages",
             .branch_switch => "finish branch switch before switching pages",
             .compare_base_picker => "close Compare base picker before switching pages",
-            .ai_reviews_picker => "close AI Reviews picker before switching pages",
-            .ai_reviews_human_decision => "close AI Reviews finalization before switching pages",
             .push_error => "close push error before switching pages",
             .git_action => "finish current git action before switching pages",
             .foreground_command => "finish foreground command before switching pages",
@@ -75,7 +65,6 @@ pub const Snapshot = struct {
     changes_mouse_selection: bool = false,
     history_mouse_selection: bool = false,
     compare_mouse_selection: bool = false,
-    ai_reviews_mouse_selection: bool = false,
     repository_mouse_selection: bool = false,
     changes_deferred_apply: bool = false,
     compare_deferred_apply: bool = false,
@@ -86,8 +75,6 @@ pub const Snapshot = struct {
     history_commit_detail: bool = false,
     compare_search: bool = false,
     compare_file_search: bool = false,
-    ai_reviews_search: bool = false,
-    ai_reviews_file_search: bool = false,
     repository_source_search: bool = false,
     repository_file_search: bool = false,
     repo_picker: bool = false,
@@ -96,8 +83,6 @@ pub const Snapshot = struct {
     confirmation: bool = false,
     branch_switch: bool = false,
     compare_base_picker: bool = false,
-    ai_reviews_picker: bool = false,
-    ai_reviews_human_decision: bool = false,
     push_error: bool = false,
     git_action: bool = false,
     foreground_command: bool = false,
@@ -121,8 +106,6 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.confirmation) return .{ .blocked = .confirmation };
     if (snapshot.branch_switch) return .{ .blocked = .branch_switch };
     if (snapshot.compare_base_picker) return .{ .blocked = .compare_base_picker };
-    if (snapshot.ai_reviews_picker) return .{ .blocked = .ai_reviews_picker };
-    if (snapshot.ai_reviews_human_decision) return .{ .blocked = .ai_reviews_human_decision };
     if (snapshot.push_error) return .{ .blocked = .push_error };
     if (snapshot.changes_search) return .{ .blocked = .changes_search };
     if (snapshot.changes_file_search) return .{ .blocked = .changes_file_search };
@@ -131,14 +114,11 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.history_commit_detail) return .{ .blocked = .history_commit_detail };
     if (snapshot.compare_search) return .{ .blocked = .compare_search };
     if (snapshot.compare_file_search) return .{ .blocked = .compare_file_search };
-    if (snapshot.ai_reviews_search) return .{ .blocked = .ai_reviews_search };
-    if (snapshot.ai_reviews_file_search) return .{ .blocked = .ai_reviews_file_search };
     if (snapshot.repository_source_search) return .{ .blocked = .repository_source_search };
     if (snapshot.repository_file_search) return .{ .blocked = .repository_file_search };
     if (snapshot.changes_mouse_selection) return .{ .blocked = .changes_mouse_selection };
     if (snapshot.history_mouse_selection) return .{ .blocked = .history_mouse_selection };
     if (snapshot.compare_mouse_selection) return .{ .blocked = .compare_mouse_selection };
-    if (snapshot.ai_reviews_mouse_selection) return .{ .blocked = .ai_reviews_mouse_selection };
     if (snapshot.repository_mouse_selection) return .{ .blocked = .repository_mouse_selection };
     if (snapshot.changes_deferred_apply) return .{ .blocked = .changes_deferred_apply };
     if (snapshot.compare_deferred_apply) return .{ .blocked = .compare_deferred_apply };
@@ -148,19 +128,15 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
 test "page-local blockers are independent" {
     try std.testing.expectEqual(
         Disposition{ .blocked = .compare_base_picker },
-        disposition(.compare, .ai_reviews, .{ .compare_base_picker = true }),
+        disposition(.compare, .config, .{ .compare_base_picker = true }),
     );
-    try std.testing.expectEqual(
-        Disposition{ .blocked = .ai_reviews_picker },
-        disposition(.ai_reviews, .compare, .{ .ai_reviews_picker = true }),
-    );
-    try std.testing.expectEqual(Disposition.allowed, disposition(.compare, .ai_reviews, .{}));
+    try std.testing.expectEqual(Disposition.allowed, disposition(.compare, .config, .{}));
 }
 
 test "same-page requests remain unchanged even while blocked" {
     try std.testing.expectEqual(
         Disposition.unchanged,
-        disposition(.ai_reviews, .ai_reviews, .{ .ai_reviews_human_decision = true }),
+        disposition(.compare, .compare, .{ .compare_base_picker = true }),
     );
 }
 
@@ -172,7 +148,6 @@ test "every blocker prevents transitions between independent pages" {
         .{ .blocker = .changes_mouse_selection, .snapshot = .{ .changes_mouse_selection = true } },
         .{ .blocker = .history_mouse_selection, .snapshot = .{ .history_mouse_selection = true } },
         .{ .blocker = .compare_mouse_selection, .snapshot = .{ .compare_mouse_selection = true } },
-        .{ .blocker = .ai_reviews_mouse_selection, .snapshot = .{ .ai_reviews_mouse_selection = true } },
         .{ .blocker = .repository_mouse_selection, .snapshot = .{ .repository_mouse_selection = true } },
         .{ .blocker = .changes_deferred_apply, .snapshot = .{ .changes_deferred_apply = true } },
         .{ .blocker = .compare_deferred_apply, .snapshot = .{ .compare_deferred_apply = true } },
@@ -183,8 +158,6 @@ test "every blocker prevents transitions between independent pages" {
         .{ .blocker = .history_commit_detail, .snapshot = .{ .history_commit_detail = true } },
         .{ .blocker = .compare_search, .snapshot = .{ .compare_search = true } },
         .{ .blocker = .compare_file_search, .snapshot = .{ .compare_file_search = true } },
-        .{ .blocker = .ai_reviews_search, .snapshot = .{ .ai_reviews_search = true } },
-        .{ .blocker = .ai_reviews_file_search, .snapshot = .{ .ai_reviews_file_search = true } },
         .{ .blocker = .repository_source_search, .snapshot = .{ .repository_source_search = true } },
         .{ .blocker = .repository_file_search, .snapshot = .{ .repository_file_search = true } },
         .{ .blocker = .repo_picker, .snapshot = .{ .repo_picker = true } },
@@ -193,8 +166,6 @@ test "every blocker prevents transitions between independent pages" {
         .{ .blocker = .confirmation, .snapshot = .{ .confirmation = true } },
         .{ .blocker = .branch_switch, .snapshot = .{ .branch_switch = true } },
         .{ .blocker = .compare_base_picker, .snapshot = .{ .compare_base_picker = true } },
-        .{ .blocker = .ai_reviews_picker, .snapshot = .{ .ai_reviews_picker = true } },
-        .{ .blocker = .ai_reviews_human_decision, .snapshot = .{ .ai_reviews_human_decision = true } },
         .{ .blocker = .push_error, .snapshot = .{ .push_error = true } },
         .{ .blocker = .git_action, .snapshot = .{ .git_action = true } },
         .{ .blocker = .foreground_command, .snapshot = .{ .foreground_command = true } },
@@ -203,8 +174,8 @@ test "every blocker prevents transitions between independent pages" {
     const directions = [_]struct { active: page.Id, target: page.Id }{
         .{ .active = .changes, .target = .repository },
         .{ .active = .repository, .target = .compare },
-        .{ .active = .compare, .target = .ai_reviews },
-        .{ .active = .ai_reviews, .target = .config },
+        .{ .active = .compare, .target = .config },
+        .{ .active = .config, .target = .history },
         .{ .active = .config, .target = .changes },
     };
 

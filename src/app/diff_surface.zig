@@ -4,7 +4,7 @@
 //! This module owns the shared view-state vocabulary (viewer, search,
 //! file-search, selection, activation) and the `DiffSurface` pointer bundle
 //! that page adapters build per call. It must not import any page namespace
-//! (`pages/changes*`, `pages/compare*`, `pages/ai_reviews*`): pages depend on
+//! (`pages/changes*`, `pages/compare*`): pages depend on
 //! the surface, never the other way around.
 
 const std = @import("std");

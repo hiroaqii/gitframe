@@ -1265,11 +1265,9 @@ test "keymap accepts History, Compare, and AI Reviews pages" {
         \\[keymap]
         \\page_history = "3"
         \\page_compare = "4"
-        \\page_ai_reviews = "5"
     );
     try std.testing.expect(parsed.keymap.get(.page_history).?.eql(.{ .plain_codepoint = '3' }));
     try std.testing.expect(parsed.keymap.get(.page_compare).?.eql(.{ .plain_codepoint = '4' }));
-    try std.testing.expect(parsed.keymap.get(.page_ai_reviews).?.eql(.{ .plain_codepoint = '5' }));
 }
 
 test "keymap rejects removed file edges and accepts document navigation actions" {

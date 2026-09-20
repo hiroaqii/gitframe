@@ -20,10 +20,6 @@ const app_shell_layout = @import("app/shell_layout.zig");
 const compare_page = @import("app/pages/compare.zig");
 const compare_coordinator = @import("app/pages/compare/coordinator.zig");
 const compare_input = @import("app/pages/compare/input.zig");
-const ai_reviews_page = @import("app/pages/ai_reviews.zig");
-const ai_reviews_coordinator = @import("app/pages/ai_reviews/coordinator.zig");
-const ai_reviews_input = @import("app/pages/ai_reviews/input.zig");
-const ai_reviews_navigation = @import("app/pages/ai_reviews/navigation.zig");
 const committed_diff_navigation = @import("app/pages/committed_diff/navigation.zig");
 const changes_page = @import("app/pages/changes.zig");
 const changes_content = @import("app/pages/changes/content.zig");
@@ -46,8 +42,6 @@ const action_lifecycle = @import("app/workflow/action_lifecycle.zig");
 const workflow_local = @import("app/workflow/local.zig");
 const workflow_remote = @import("app/workflow/remote.zig");
 const shell_effects = @import("app/shell_effects.zig");
-const human_review_session_mod = @import("app/human_review_session.zig");
-const review_store_operations_mod = @import("app/review_store_operations.zig");
 const context = @import("context.zig");
 const config_mod = @import("config.zig");
 const diff_surface = @import("app/diff_surface.zig");
@@ -56,8 +50,6 @@ const diff_selection = @import("diff/selection.zig");
 const diff_source = @import("diff/source.zig");
 const keymap = @import("keymap");
 const theme = @import("theme");
-const review_store = @import("review_store.zig");
-const committed_review = @import("committed_review.zig");
 
 const auto_reload_timer_id = "gitframe.auto_reload";
 const CliConfig = diff_source.CliConfig;
@@ -67,18 +59,11 @@ const LoadFinishedMsg = app_message.LoadFinished;
 const ActionFinishedMsg = app_message.ActionFinished;
 const ShellEffectFinishedMsg = app_message.ShellEffectFinished;
 
-comptime {
-    if (human_review_session_mod.max_detached_sessions != review_store_operations_mod.max_active_runs) {
-        @compileError("human Review recovery and mutation queue capacities must remain equal");
-    }
-}
-
 const PageStates = struct {
     changes: changes_page.ChangesPageState = .{},
     repository: repository_page.RepositoryPageState = .{},
     history: history_page.HistoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
-    ai_reviews: ai_reviews_page.AiReviewsPageState = .{},
     config: page.LazyPlaceholder = .{},
 };
 
@@ -119,32 +104,16 @@ pub const RedrawPlan = struct {
     }
 };
 
-pub const HumanReviewSaveOutcome = union(enum) {
-    no_change,
-    accepted: app_message.ReviewStoreOperationId,
-    rejected: human_review_session_mod.AdmissionFailure,
-};
-
-pub const HumanReviewFinalizeOutcome = union(enum) {
-    accepted: struct {
-        draft_operation_id: ?app_message.ReviewStoreOperationId,
-        result_operation_id: app_message.ReviewStoreOperationId,
-    },
-    rejected: human_review_session_mod.AdmissionFailure,
-};
-
 pub const App = struct {
     active_page: page.Id = .changes,
     repo_session: repo_session.State = .{},
     pages: PageStates = .{},
     config: CliConfig = .{},
     user_config: config_mod.Config = .{},
-    configured_review_store: ?review_store.ConfiguredStore = null,
     keymap: keymap.Effective = .{},
     theme: theme.Palette = .default(),
     env_map: ?*std.process.Environ.Map = null,
     /// Absolute running executable path borrowed from the startup arena.
-    /// Failure to resolve it is represented by `null` in the handoff modal.
     executable_path: ?[]const u8 = null,
     /// Set immediately before handing terminal ownership to Chasen teardown.
     /// The event loop normally stops at once; retaining the bit also makes the
@@ -162,11 +131,6 @@ pub const App = struct {
     remote_workflow: workflow_remote.State = .{},
     overlay: app_state.OverlayState = .{},
     shell_effects_state: shell_effects.State = .{},
-    human_review_sessions: human_review_session_mod.Owner = .{},
-    review_store_operations: review_store_operations_mod.Owner = .{},
-    /// Retains the user's quit intent after Store drain success until the
-    /// existing Git action lifecycle is also terminal.
-    quit_after_store_drain: bool = false,
     drag_auto_scroll: drag_auto_scroll.State = .{},
     command_session: CommandSession = .inactive,
 
@@ -179,11 +143,6 @@ pub const App = struct {
 
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
-        self.configured_review_store = try review_store.ConfiguredStore.init(
-            ctx.allocator(),
-            self.user_config.ai_review.store_root,
-            self.env_map,
-        );
         self.local_workflow = workflow_local.LocalState.init(ctx.allocator());
         self.pages.changes.init(self.config.auto_reload, self.user_config.reload, self.config.source);
         _ = self.pageCoordinator().activateChanges();
@@ -203,219 +162,14 @@ pub const App = struct {
         self.pages.repository.deinit(deinit_ctx.allocator);
         self.pages.history.deinit(deinit_ctx.allocator);
         self.pages.compare.deinit(deinit_ctx.allocator);
-        self.pages.ai_reviews.deinit(deinit_ctx.allocator);
-        if (self.configured_review_store) |*store| store.deinit(deinit_ctx.allocator);
         self.repo_session.deinit(deinit_ctx.allocator);
         self.local_workflow.deinit(deinit_ctx.allocator);
         self.remote_workflow.deinit(deinit_ctx.allocator);
         self.shell_effects_state.deinit(deinit_ctx.allocator);
-        self.review_store_operations.deinit(deinit_ctx.allocator);
-        self.human_review_sessions.deinit();
-    }
-
-    /// Prepare, checked-admit, and infallibly track the current session's
-    /// complete working snapshot before starting Store work.
-    pub fn saveHumanReviewSession(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-    ) !HumanReviewSaveOutcome {
-        const session = self.human_review_sessions.currentSession() orelse
-            return error.NoHumanReviewSession;
-        if (self.aiReviewDeletionHolds(session.binding)) return .{ .rejected = .admission_closed };
-        const token = self.review_store_operations.queueToken(session.binding);
-        const preparation = session.prepareSave(ctx.allocator(), token, .dirty_only) catch |err| {
-            self.recordHumanReviewPreparationFailure(ctx, session, &token, .draft, null, err);
-            return err;
-        };
-        switch (preparation) {
-            .no_change => return .no_change,
-            .ready => |value| {
-                var prepared = value;
-                defer prepared.deinit();
-                const store = if (self.configured_review_store) |*configured| configured else {
-                    session.rejectDraft(&prepared, .store_unavailable);
-                    return .{ .rejected = .store_unavailable };
-                };
-                if (!store.isConfigured()) {
-                    session.rejectDraft(&prepared, .store_unavailable);
-                    return .{ .rejected = .store_unavailable };
-                }
-                const admission = try self.enqueuePreparedHumanReviewDraft(
-                    ctx.allocator(),
-                    store,
-                    session,
-                    &prepared,
-                );
-                switch (admission) {
-                    .rejected => |reason| {
-                        const mapped = mapHumanReviewAdmissionFailure(reason);
-                        session.rejectDraft(&prepared, mapped);
-                        return .{ .rejected = mapped };
-                    },
-                    .accepted => |accepted| {
-                        session.commitDraft(
-                            &prepared,
-                            accepted.operation_id,
-                            accepted.superseded_operation_id,
-                        );
-                        _ = self.pumpReviewStoreOperations(ctx);
-                        return .{ .accepted = accepted.operation_id };
-                    },
-                }
-            },
-        }
-    }
-
-    /// Admit an optional exact draft followed by one result bound to the
-    /// revision that draft is guaranteed to commit. Pumping happens only
-    /// after every accepted operation has an infallible session ledger entry.
-    pub fn finalizeHumanReviewSession(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-        decision: @import("committed_review.zig").ReviewResultValue,
-    ) !HumanReviewFinalizeOutcome {
-        const session = self.human_review_sessions.currentSession() orelse
-            return error.NoHumanReviewSession;
-        if (self.aiReviewDeletionHolds(session.binding)) return .{ .rejected = .admission_closed };
-        const store = if (self.configured_review_store) |*value| value else {
-            session.markAdmissionFailure(.result, decision, .store_unavailable);
-            return .{ .rejected = .store_unavailable };
-        };
-        if (!store.isConfigured()) {
-            session.markAdmissionFailure(.result, decision, .store_unavailable);
-            return .{ .rejected = .store_unavailable };
-        }
-
-        var draft_operation_id: ?app_message.ReviewStoreOperationId = null;
-        var pump_on_return = false;
-        defer {
-            if (pump_on_return) _ = self.pumpReviewStoreOperations(ctx);
-        }
-
-        const draft_token = self.review_store_operations.queueToken(session.binding);
-        const draft_preparation = session.prepareSave(
-            ctx.allocator(),
-            draft_token,
-            .ensure_persisted,
-        ) catch |err| {
-            self.recordHumanReviewPreparationFailure(ctx, session, &draft_token, .draft, decision, err);
-            return err;
-        };
-        switch (draft_preparation) {
-            .no_change => {},
-            .ready => |value| {
-                var prepared = value;
-                defer prepared.deinit();
-                const admission = try self.enqueuePreparedHumanReviewDraft(
-                    ctx.allocator(),
-                    store,
-                    session,
-                    &prepared,
-                );
-                switch (admission) {
-                    .rejected => |reason| {
-                        const mapped = mapHumanReviewAdmissionFailure(reason);
-                        session.rejectDraft(&prepared, mapped);
-                        return .{ .rejected = mapped };
-                    },
-                    .accepted => |accepted| {
-                        session.commitDraft(
-                            &prepared,
-                            accepted.operation_id,
-                            accepted.superseded_operation_id,
-                        );
-                        draft_operation_id = accepted.operation_id;
-                        pump_on_return = true;
-                    },
-                }
-            },
-        }
-
-        const result_token = self.review_store_operations.queueToken(session.binding);
-        var prepared_result = session.prepareResult(
-            ctx.allocator(),
-            result_token,
-            decision,
-        ) catch |err| {
-            self.recordHumanReviewPreparationFailure(ctx, session, &result_token, .result, decision, err);
-            return err;
-        };
-        defer prepared_result.deinit();
-        const result_admission = try self.enqueuePreparedHumanReviewResult(
-            ctx.allocator(),
-            store,
-            session,
-            &prepared_result,
-        );
-        return switch (result_admission) {
-            .rejected => |reason| blk: {
-                const mapped = mapHumanReviewAdmissionFailure(reason);
-                session.rejectResult(&prepared_result, mapped);
-                break :blk .{ .rejected = mapped };
-            },
-            .accepted => |accepted| blk: {
-                session.commitResult(
-                    &prepared_result,
-                    accepted.operation_id,
-                );
-                pump_on_return = true;
-                break :blk .{ .accepted = .{
-                    .draft_operation_id = draft_operation_id,
-                    .result_operation_id = accepted.operation_id,
-                } };
-            },
-        };
-    }
-
-    /// Test-only raw bridge retained for mutation-owner discrimination.
-    fn persistReviewDraft(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-        request: review_store.DraftSaveRequest,
-    ) !review_store_operations_mod.Admission {
-        if (self.aiReviewDeletionHolds(request.binding)) return .{ .rejected = .admission_closed };
-        const store = if (self.configured_review_store) |*value| value else return .{ .rejected = .store_unavailable };
-        if (!store.isConfigured()) return .{ .rejected = .store_unavailable };
-        const admission = try self.review_store_operations.enqueueDraft(
-            ctx.allocator(),
-            store,
-            self.repoSessionView().activeCapability(),
-            self.env_map,
-            request,
-        );
-        _ = self.pumpReviewStoreOperations(ctx);
-        return admission;
-    }
-
-    /// Admit create-once completion behind any accepted draft for the Run.
-    fn persistReviewResult(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-        request: review_store.ReviewResultCreateRequest,
-    ) !review_store_operations_mod.Admission {
-        if (self.aiReviewDeletionHolds(request.binding)) return .{ .rejected = .admission_closed };
-        const store = if (self.configured_review_store) |*value| value else return .{ .rejected = .store_unavailable };
-        if (!store.isConfigured()) return .{ .rejected = .store_unavailable };
-        const admission = try self.review_store_operations.enqueueResult(
-            ctx.allocator(),
-            store,
-            self.repoSessionView().activeCapability(),
-            self.env_map,
-            request,
-        );
-        _ = self.pumpReviewStoreOperations(ctx);
-        return admission;
     }
 
     fn repoSessionView(self: *const App) repo_session.View {
         return self.repo_session.view();
-    }
-
-    fn aiReviewDeletionHolds(self: *const App, binding: review_store.ReviewRunBinding) bool {
-        return self.pages.ai_reviews.delete_confirmation.holdsRun(
-            binding.review_repository_id,
-            binding.review_id,
-        );
     }
 
     fn repoSession(self: *App) repo_session.Controller {
@@ -430,13 +184,11 @@ pub const App = struct {
             .source = self.config.source,
             .home = home,
             .env_map = self.env_map,
-            .action_pending = self.actionLifecycleView().hasPending() or
-                self.pages.ai_reviews.delete_confirmation.isOpen(),
+            .action_pending = self.actionLifecycleView().hasPending(),
             .changes = self.changesRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
             .history = .{ .page = &self.pages.history },
             .compare = .{ .page = &self.pages.compare },
-            .ai_reviews = .{ .page = &self.pages.ai_reviews },
             .shell = self.remote_workflow.repositoryInvalidationPort(&self.overlay),
         };
     }
@@ -465,20 +217,6 @@ pub const App = struct {
         };
     }
 
-    fn aiReviewsCoordinator(self: *App) ai_reviews_coordinator.Controller {
-        const body_size = self.shellLayout().bodySize();
-        return .{
-            .page_state = &self.pages.ai_reviews,
-            .repo = self.repoSessionView(),
-            .layout = .{ .width = body_size.width, .height = body_size.height },
-            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.ai_reviews),
-            .env_map = self.env_map,
-            .store = if (self.configured_review_store) |*value| value else null,
-            .sessions = &self.human_review_sessions,
-            .operations = &self.review_store_operations,
-        };
-    }
-
     fn compareCoordinator(self: *App) compare_coordinator.Controller {
         const body_size = self.shellLayout().bodySize();
         return .{
@@ -487,16 +225,7 @@ pub const App = struct {
             .layout = .{ .width = body_size.width, .height = body_size.height },
             .mode_toggle_hint_width = self.displayModeToggleHintWidth(.compare),
             .env_map = self.env_map,
-            .executable_path = self.executable_path,
-            .handoff_overlay_size = self.shellLayout().contentSize(),
         };
-    }
-
-    fn humanReviewPresentation(self: *const App) ?human_review_session_mod.Presentation {
-        const selected = self.pages.ai_reviews.selectedRunConst() orelse return null;
-        const presentation = self.human_review_sessions.currentPresentation() orelse return null;
-        if (!selected.binding().eql(presentation.binding)) return null;
-        return presentation;
     }
 
     fn pageCoordinator(self: *App) page_coordinator.Controller {
@@ -506,7 +235,6 @@ pub const App = struct {
             .repository = &self.pages.repository,
             .history = &self.pages.history,
             .compare = &self.pages.compare,
-            .ai_reviews = &self.pages.ai_reviews,
             .config_page = &self.pages.config,
             .repo = self.repoSessionView(),
             .source = self.config.source,
@@ -516,8 +244,7 @@ pub const App = struct {
                 .help = self.overlay.isHelp(),
                 .commit_input = self.localWorkflowView().commitPanelOpen(),
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
-                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or
-                    self.pages.ai_reviews.delete_confirmation.isOpen(),
+                    self.overlay.isPushBranch() or self.overlay.isPullBranch(),
                 .branch_switch = self.overlay.isSwitchBranch(),
                 .push_error = self.overlay.isPushError(),
                 .git_action = self.actionLifecycleView().hasPending(),
@@ -577,9 +304,6 @@ pub const App = struct {
             .compare => !self.pages.compare.diff.search.mode and
                 !self.pages.compare.diff.file_search.mode and
                 !self.pages.compare.base_picker.open,
-            .ai_reviews => !self.pages.ai_reviews.diff.search.mode and
-                !self.pages.ai_reviews.diff.file_search.mode and
-                !self.pages.ai_reviews.picker.isPickerVisible(),
             .history => self.pages.history.current_view == .diff and
                 !self.pages.history.diff.search.mode and
                 !self.pages.history.diff.file_search.mode,
@@ -691,7 +415,6 @@ pub const App = struct {
         const changes_identity = self.pages.changes.activation.currentIdentity();
         const history_identity = self.pages.history.activation.currentIdentity();
         const compare_identity = self.pages.compare.activation.currentIdentity();
-        const ai_reviews_identity = self.pages.ai_reviews.activation.currentIdentity();
         return .{
             .snapshot = .{
                 .active_page = self.active_page,
@@ -700,13 +423,8 @@ pub const App = struct {
                 .repository_activation_id = self.pages.repository.activation_id,
                 .history_activation_id = self.pages.history.activation.next_activation_id,
                 .compare_activation_id = self.pages.compare.activation.next_activation_id,
-                .ai_reviews_activation_id = self.pages.ai_reviews.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = self.localWorkflowView().commitPanelInstanceId(),
-                .compare_ai_review_handoff = if (self.pages.compare.ai_review_handoff.currentCopyAuthority()) |authority| .{
-                    .modal_instance_id = authority.modal_instance_id,
-                    .copy_generation = authority.copy_generation,
-                } else null,
                 .history_commit_detail = if (self.pages.history.currentDetailCopyAuthority()) |authority| .{
                     .modal_instance_id = authority.modal_instance_id,
                     .copy_generation = authority.copy_generation,
@@ -716,7 +434,6 @@ pub const App = struct {
             .repository_repo_epoch = self.pages.repository.repo_epoch,
             .history_repo_epoch = if (history_identity) |identity| identity.repo_epoch else self.pages.history.repo_epoch,
             .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
-            .ai_reviews_repo_epoch = if (ai_reviews_identity) |identity| identity.repo_epoch else repo_epoch,
         };
     }
 
@@ -732,8 +449,6 @@ pub const App = struct {
                 .repository = &self.pages.repository.status,
                 .history = &self.pages.history.status,
                 .compare = &self.pages.compare.status,
-                .compare_ai_review_handoff = self.pages.compare.ai_review_handoff.statusMessage(),
-                .ai_reviews = &self.pages.ai_reviews.status,
             },
             .redraw = .{ .skip_requested = &self.redraw_plan.skip_requested },
         };
@@ -797,19 +512,6 @@ pub const App = struct {
                 var previous_history_resolver = previous_history_view.resolver();
                 const previous_history_body = previous_history_view.bodyView(&previous_history_resolver);
                 const history_selection_anchor = previous_history_body.captureSelectionViewportAnchor();
-                const previous_ai_reviews_base_view = self.aiReviewsCoordinator().navigationView();
-                const resize_allocator = self.allocator;
-                var previous_ai_reviews_frame = if (resize_allocator) |allocator|
-                    try previous_ai_reviews_base_view.buildFindingCardFrame(allocator)
-                else
-                    null;
-                defer if (previous_ai_reviews_frame) |*frame| frame.deinit(resize_allocator.?);
-                const previous_ai_reviews_view = previous_ai_reviews_base_view.withPresentationRows(
-                    if (previous_ai_reviews_frame) |*frame| &frame.presentation_rows else null,
-                );
-                var previous_ai_reviews_adapter = previous_ai_reviews_view.resolver();
-                const previous_ai_reviews_body = previous_ai_reviews_view.bodyView(&previous_ai_reviews_adapter);
-                const ai_reviews_selection_anchor = previous_ai_reviews_body.captureSelectionViewportAnchor();
                 const repository_selection_anchor = self.pages.repository.captureSelectionViewportAnchor();
                 const previous_width = self.changesNavigationView().diffPaneWidth();
                 const previous_mode = self.changesNavigationView().effectiveDisplayMode();
@@ -817,13 +519,6 @@ pub const App = struct {
                 const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
                 const previous_history_width = previous_history_body.view.diffPaneWidth();
                 const previous_history_mode = previous_history_body.view.effectiveDisplayMode();
-                const previous_ai_reviews_width = previous_ai_reviews_body.view.diffPaneWidth();
-                const previous_ai_reviews_display_mode = previous_ai_reviews_body.view.effectiveDisplayMode();
-                var incoming_ai_reviews_preparation = if (resize_allocator) |allocator|
-                    try previous_ai_reviews_base_view.prepareFindingCardFrame(allocator)
-                else
-                    null;
-                defer if (incoming_ai_reviews_preparation) |*preparation| preparation.deinit();
 
                 self.drag_auto_scroll.clear();
                 self.changesNavigation().clearMouseDiffSelection();
@@ -833,12 +528,8 @@ pub const App = struct {
                 if (self.pages.history.diff.selection_owner.activeMouseSelection()) {
                     self.pages.history.diff.selection_owner = .none;
                 }
-                if (self.pages.ai_reviews.diff.selection_owner.activeMouseSelection()) {
-                    self.pages.ai_reviews.diff.selection_owner = .none;
-                }
                 self.pages.repository.cancelMouseOwner();
                 self.terminal_size = size;
-                self.compareCoordinator().clampAiReviewHandoffViewport();
                 self.historyCoordinator().clampDetailViewport();
                 self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
                 if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
@@ -880,28 +571,6 @@ pub const App = struct {
                 history_body.updateSearchMatchOffset();
                 history_body.controller.scrollSearchMatchIntoView();
                 history_body.clampDiffNavigation();
-                self.aiReviewsCoordinator().reconcileFindingCardVisibility();
-                const current_ai_reviews_view = self.aiReviewsCoordinator().navigationView();
-                var current_ai_reviews_frame = if (incoming_ai_reviews_preparation) |*preparation|
-                    preparation.fill(current_ai_reviews_view, self.pages.ai_reviews.finding_card)
-                else
-                    null;
-                var ai_reviews_controller = self.aiReviewsCoordinator().navigation();
-                ai_reviews_controller.presentation_rows = if (current_ai_reviews_frame) |*frame| &frame.presentation_rows else null;
-                var ai_reviews_adapter = ai_reviews_controller.updateAdapter();
-                var ai_reviews_body = ai_reviews_adapter.bodyController();
-                ai_reviews_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_ai_reviews_width);
-                if (previous_ai_reviews_display_mode != ai_reviews_body.controller.view().effectiveDisplayMode()) {
-                    ai_reviews_body.controller.clearMouseDiffSelection();
-                    ai_reviews_body.controller.clearKeyboardSideChoice();
-                    self.pages.ai_reviews.advanceSelectionLayoutRevision();
-                }
-                if (ai_reviews_selection_anchor) |anchor| ai_reviews_body.restoreSelectionViewportAnchor(anchor);
-                ai_reviews_body.controller.clampSidebarHorizontalScroll();
-                ai_reviews_body.clampDiffNavigationKeepingHunkVisible();
-                ai_reviews_body.updateSearchMatchOffset();
-                ai_reviews_body.controller.scrollSearchMatchIntoView();
-                ai_reviews_body.clampDiffNavigation();
                 const repository_body_size = self.shellLayout().bodySize();
                 if (repository_selection_anchor) |anchor|
                     self.pages.repository.restoreSelectionViewportAnchor(anchor, repository_body_size)
@@ -919,15 +588,8 @@ pub const App = struct {
                 self.remoteWorkflow().finishPushUpstreamFinalize(ctx.allocator(), finished),
             ),
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
-            .review_store_operation_finished => |finished| self.finishReviewStoreOperation(ctx, finished),
-            .ai_review_delete_finished => |finished| {
-                if (try self.aiReviewsCoordinator().finishDelete(ctx, finished) == .skip) {
-                    self.redraw_plan.requestSkip();
-                }
-            },
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
             .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
-            .ai_reviews => |ai_reviews_msg| _ = try self.updateAiReviews(ctx, ai_reviews_msg),
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
             .history => |history_msg| _ = try self.updateHistory(ctx, history_msg),
             .command_line => |command_msg| self.updateCommandLine(command_msg),
@@ -993,9 +655,6 @@ pub const App = struct {
                 if (self.active_page == .history and self.pages.history.diff.selection_owner.activeMouseSelection()) {
                     self.pages.history.diff.selection_owner = .none;
                 }
-                if (self.active_page == .ai_reviews and self.pages.ai_reviews.diff.selection_owner.activeMouseSelection()) {
-                    self.pages.ai_reviews.diff.selection_owner = .none;
-                }
                 if (self.active_page == .repository) {
                     self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize());
                 }
@@ -1039,7 +698,6 @@ pub const App = struct {
                 .repository => self.repositoryCoordinator().requestReload(),
                 .history => self.historyCoordinator().refresh(self.allocator orelse ctx.allocator()),
                 .compare => try self.compareCoordinator().refresh(ctx),
-                .ai_reviews => try self.aiReviewsCoordinator().refresh(ctx),
                 .config => self.status.set("reload is not available on this page yet", .{}),
             },
             .auto_reload_tick => try self.changesRead().autoReloadTick(ctx),
@@ -1051,7 +709,6 @@ pub const App = struct {
                     .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
                     .history => self.pages.history.diff.selection_owner = .none,
                     .compare => self.pages.compare.diff.selection_owner = .none,
-                    .ai_reviews => self.pages.ai_reviews.diff.selection_owner = .none,
                     .config => {},
                 }
             },
@@ -1088,17 +745,6 @@ pub const App = struct {
             if (try self.changesRead().maybeStartQueuedRevalidation(ctx)) self.redraw_plan.requireFrame();
         }
         self.actionLifecycle().reconcileSpinner(ctx);
-        if (self.pumpReviewStoreOperations(ctx)) self.redraw_plan.requireFrame();
-        if (self.resumeQuitAfterStoreDrain(ctx)) self.redraw_plan.requireFrame();
-        if (!self.redraw_plan.resolvesToSkip() and self.active_page == .ai_reviews) {
-            self.aiReviewsCoordinator().ensureFindingPresentationCache();
-        }
-        if (!self.redraw_plan.resolvesToSkip() and
-            self.active_page == .ai_reviews and
-            self.pages.ai_reviews.picker.isPickerVisible())
-        {
-            self.aiReviewsCoordinator().prepareModalRedraw(ctx.io());
-        }
         if (!self.redraw_plan.resolvesToSkip() and self.active_page == .compare and self.pages.compare.base_picker.open) {
             self.compareCoordinator().prepareModalRedraw(ctx.io());
         }
@@ -1114,207 +760,8 @@ pub const App = struct {
             self.setStatus("finish current git action before quitting", .{});
             return;
         }
-        switch (self.review_store_operations.requestQuit()) {
-            .ready => {
-                self.quit_after_store_drain = false;
-                self.teardown_requested = true;
-                ctx.quit();
-            },
-            .draining => {
-                self.quit_after_store_drain = true;
-                // Store scans/selections are read generations, not accepted
-                // mutations. Invalidate them while retaining the selected
-                // Run presentation and keep the event loop responsive.
-                self.pages.ai_reviews.picker.close(ctx.allocator());
-                self.setStatus("finishing AI review save before quitting", .{});
-            },
-            .failed => |failure| {
-                self.quit_after_store_drain = false;
-                self.setStatus(
-                    "cannot quit while AI review save needs reconciliation: {s}",
-                    .{@tagName(failure)},
-                );
-            },
-        }
-    }
-
-    fn pumpReviewStoreOperations(self: *App, ctx: *chasen.Ctx(Msg)) bool {
-        if (!self.review_store_operations.hasWork()) return false;
-        const started = self.review_store_operations.pump(ctx) catch {
-            if (self.review_store_operations.isDraining()) {
-                self.review_store_operations.cancelDrain(.io_failed);
-                self.quit_after_store_drain = false;
-                self.setStatus("AI review save failed: io_failed", .{});
-                return true;
-            }
-            self.setStatus("could not start AI review save", .{});
-            return true;
-        };
-        return started > 0;
-    }
-
-    fn enqueuePreparedHumanReviewDraft(
-        self: *App,
-        allocator: std.mem.Allocator,
-        store: *const review_store.ConfiguredStore,
-        session: *human_review_session_mod.Session,
-        prepared: *const human_review_session_mod.PreparedDraft,
-    ) !review_store_operations_mod.Admission {
-        return self.review_store_operations.enqueueDraftChecked(
-            allocator,
-            store,
-            self.repoSessionView().activeCapability(),
-            self.env_map,
-            prepared.request(),
-            prepared.token,
-        ) catch |err| {
-            session.rejectDraft(prepared, .preparation_failed);
-            return err;
-        };
-    }
-
-    fn enqueuePreparedHumanReviewResult(
-        self: *App,
-        allocator: std.mem.Allocator,
-        store: *const review_store.ConfiguredStore,
-        session: *human_review_session_mod.Session,
-        prepared: *const human_review_session_mod.PreparedResult,
-    ) !review_store_operations_mod.Admission {
-        return self.review_store_operations.enqueueResultChecked(
-            allocator,
-            store,
-            self.repoSessionView().activeCapability(),
-            self.env_map,
-            prepared.request(),
-            prepared.token,
-        ) catch |err| {
-            session.rejectResult(prepared, .preparation_failed);
-            return err;
-        };
-    }
-
-    fn recordHumanReviewPreparationFailure(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-        session: *human_review_session_mod.Session,
-        token: *const human_review_session_mod.QueueToken,
-        kind: human_review_session_mod.OperationKind,
-        decision: ?@import("committed_review.zig").ReviewResultValue,
-        err: anyerror,
-    ) void {
-        if (err != error.QueueMismatch) {
-            session.markPreparationFailure(token, kind, decision);
-            return;
-        }
-        const binding = session.binding;
-        session.markQueueMismatch(kind, decision);
-        const retired = self.review_store_operations.retireUnstarted(
-            ctx.allocator(),
-            binding,
-            .run_invalid,
-            self.reviewStorePresentationMatches(binding),
-        );
-        for (retired.dependentTerminals()) |terminal| {
-            _ = self.human_review_sessions.reduce(humanReviewCompletion(terminal));
-        }
-        if (retired.quit_canceled) self.quit_after_store_drain = false;
-    }
-
-    fn finishReviewStoreOperation(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-        completion: app_message.ReviewStoreOperationFinished,
-    ) void {
-        var finished = completion;
-        const presentation_matches = self.reviewStorePresentationMatches(finished.binding);
-        const kind = finished.kind;
-        const outcome = self.review_store_operations.finish(
-            ctx.allocator(),
-            &finished,
-            presentation_matches,
-        );
-        if (!outcome.accepted) return;
-        var reconciliation_required = false;
-        var reconciliation_current = false;
-        if (outcome.direct_terminal) |terminal| {
-            const routed = self.human_review_sessions.reduce(humanReviewCompletion(terminal));
-            reconciliation_required = routed.reduction == .reconciliation_required;
-            reconciliation_current = reconciliation_required and routed.current_match;
-        }
-        for (outcome.dependentTerminals()) |terminal| {
-            const routed = self.human_review_sessions.reduce(humanReviewCompletion(terminal));
-            reconciliation_required = reconciliation_required or
-                routed.reduction == .reconciliation_required;
-            reconciliation_current = reconciliation_current or
-                (routed.reduction == .reconciliation_required and routed.current_match);
-        }
-        var reconciliation_quit_canceled = false;
-        if (reconciliation_required) {
-            const retired = self.review_store_operations.retireUnstarted(
-                ctx.allocator(),
-                completion.binding,
-                .run_invalid,
-                presentation_matches,
-            );
-            for (retired.dependentTerminals()) |terminal| {
-                _ = self.human_review_sessions.reduce(humanReviewCompletion(terminal));
-            }
-            reconciliation_quit_canceled = retired.quit_canceled or outcome.quit_ready;
-            self.review_store_operations.reopenAfterReconciliation();
-            self.quit_after_store_drain = false;
-            if (reconciliation_current and presentation_matches) {
-                const reason = if (outcome.failure) |failure| @tagName(failure) else "internal_mismatch";
-                self.setStatus("AI review save requires exact reload: {s}", .{reason});
-            }
-        }
-        if (outcome.quit_canceled or reconciliation_quit_canceled) self.quit_after_store_drain = false;
-        if (!reconciliation_required) {
-            if (outcome.failure) |failure| {
-                if (presentation_matches or outcome.quit_canceled) {
-                    if (outcome.dependent_terminal_count == 0) {
-                        self.setStatus("AI review save failed: {s}", .{@tagName(failure)});
-                    } else {
-                        self.setStatus(
-                            "AI review save failed: {s}; canceled {d} dependent save(s)",
-                            .{ @tagName(failure), outcome.dependent_terminal_count },
-                        );
-                    }
-                }
-            } else if (presentation_matches) {
-                switch (kind) {
-                    .draft => self.pages.ai_reviews.status.set("AI review draft saved", .{}),
-                    .result => self.pages.ai_reviews.status.set("AI review result saved", .{}),
-                }
-            }
-        }
-        if (outcome.quit_ready and !reconciliation_required) _ = self.resumeQuitAfterStoreDrain(ctx);
-    }
-
-    fn resumeQuitAfterStoreDrain(self: *App, ctx: *chasen.Ctx(Msg)) bool {
-        if (!self.quit_after_store_drain or
-            self.review_store_operations.isDraining() or
-            self.review_store_operations.hasWork()) return false;
-        if (self.actionLifecycleView().hasPending()) {
-            self.setStatus("finish current git action before quitting", .{});
-            return true;
-        }
-        self.quit_after_store_drain = false;
         self.teardown_requested = true;
         ctx.quit();
-        return true;
-    }
-
-    fn reviewStorePresentationMatches(
-        self: *const App,
-        binding: review_store.ReviewRunBinding,
-    ) bool {
-        if (self.active_page != .ai_reviews) return false;
-        const selected = self.pages.ai_reviews.selectedRunConst() orelse return false;
-        const manifest = &selected.selection.artifacts.manifest.value;
-        return manifest.review_repository_id.eql(binding.review_repository_id) and
-            manifest.review_id.eql(binding.review_id) and
-            manifest.target.eql(&binding.target) and
-            manifest.findings_digest.eql(binding.findings_digest);
     }
 
     fn updateMouseSelectionDrag(
@@ -1337,11 +784,6 @@ pub const App = struct {
                 if (self.active_page != .history) break :blk .history;
                 _ = try self.updateHistory(ctx, .{ .common = .{ .shared = .{ .mouse_diff_drag = point } } });
                 break :blk .history;
-            },
-            .ai_reviews => |point| blk: {
-                if (self.active_page != .ai_reviews) break :blk .ai_reviews;
-                _ = try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_drag = point } } });
-                break :blk .ai_reviews;
             },
             .repository => |point| blk: {
                 if (self.active_page != .repository) break :blk .repository;
@@ -1374,9 +816,6 @@ pub const App = struct {
             .history => |point| {
                 if (self.active_page == .history) _ = try self.updateHistory(ctx, .{ .common = .{ .shared = .{ .mouse_diff_release = point } } });
             },
-            .ai_reviews => |point| {
-                if (self.active_page == .ai_reviews) _ = try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_release = point } } });
-            },
             .repository => |point| {
                 if (self.active_page == .repository) _ = self.updateRepository(ctx, .{ .mouse_owner_release = point });
             },
@@ -1402,7 +841,6 @@ pub const App = struct {
             .changes => try self.updateChanges(ctx, .{ .mouse_diff_auto_scroll_step = active.intent }),
             .history => try self.updateHistory(ctx, .{ .common = .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } } }),
             .compare => try self.updateCompare(ctx, .{ .common = .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } } }),
-            .ai_reviews => try self.updateAiReviews(ctx, .{ .common = .{ .shared = .{ .mouse_diff_auto_scroll_step = active.intent } } }),
             .repository => blk: {
                 const body_size = self.shellLayout().bodySize();
                 const body_point: repository_layout.BodyPoint = .{
@@ -1432,7 +870,6 @@ pub const App = struct {
             .changes => page.Id.changes,
             .history => page.Id.history,
             .compare => page.Id.compare,
-            .ai_reviews => page.Id.ai_reviews,
             .repository => page.Id.repository,
         }) return null;
 
@@ -1447,10 +884,6 @@ pub const App = struct {
             },
             .compare => blk: {
                 var adapter = self.compareCoordinator().navigation().updateAdapter();
-                break :blk diffAutoScrollViewport(adapter.bodyController());
-            },
-            .ai_reviews => blk: {
-                var adapter = self.aiReviewsCoordinator().navigation().updateAdapter();
                 break :blk diffAutoScrollViewport(adapter.bodyController());
             },
             .repository => self.pages.repository.sourceAutoScrollViewport(self.shellLayout().bodySize()),
@@ -1578,50 +1011,6 @@ pub const App = struct {
         return auto_scroll;
     }
 
-    fn updateAiReviews(
-        self: *App,
-        ctx: *chasen.Ctx(Msg),
-        msg: ai_reviews_input.Msg,
-    ) !?drag_auto_scroll.StepOutcome {
-        var outcome = try self.aiReviewsCoordinator().update(ctx, msg);
-        defer outcome.deinit(ctx.allocator());
-        const auto_scroll = outcome.auto_scroll;
-        if (outcome.redraw == .skip) self.redraw_plan.requestSkip();
-        if (outcome.takeClipboard()) |taken| {
-            var effect = taken;
-            defer effect.deinit(ctx.allocator());
-            self.shellEffects().queueClipboard(ctx, .{
-                .origin = effect.origin,
-                .label = effect.label,
-                .text = effect.text,
-                .selection_generation = effect.selection_generation,
-            });
-        }
-        if (outcome.takeHumanReviewSave()) {
-            const saved = self.saveHumanReviewSession(ctx) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                self.setStatus("AI review save could not be prepared: {s}", .{@errorName(err)});
-                return auto_scroll;
-            };
-            switch (saved) {
-                .no_change, .accepted => {},
-                .rejected => |reason| self.setStatus("AI review save rejected: {s}", .{@tagName(reason)}),
-            }
-        }
-        if (outcome.takeHumanReviewFinalize()) |decision| {
-            const finalized = self.finalizeHumanReviewSession(ctx, decision) catch |err| {
-                self.pages.ai_reviews.human_review_decision.markFinalizeError(err);
-                if (err == error.OutOfMemory) return err;
-                return auto_scroll;
-            };
-            switch (finalized) {
-                .accepted => self.pages.ai_reviews.human_review_decision.markFinalizeAccepted(),
-                .rejected => |reason| self.pages.ai_reviews.human_review_decision.markFinalizeRejected(reason),
-            }
-        }
-        return auto_scroll;
-    }
-
     fn updateRepository(
         self: *App,
         ctx: *chasen.Ctx(Msg),
@@ -1675,19 +1064,6 @@ pub const App = struct {
                 },
                 .branch_list => |result| {
                     if (self.compareCoordinator().finishBranchList(ctx.allocator(), result) == .skip) {
-                        self.redraw_plan.requestSkip();
-                    }
-                },
-            },
-            .ai_reviews => |review_result| switch (review_result) {
-                .history_scan => |result| {
-                    if (self.aiReviewsCoordinator().finishHistoryScan(ctx.allocator(), result) == .skip) {
-                        self.redraw_plan.requestSkip();
-                    }
-                },
-                .history_selection => |result| {
-                    const outcome = try self.aiReviewsCoordinator().finishHistorySelection(ctx, result);
-                    if (outcome.redraw == .skip) {
                         self.redraw_plan.requestSkip();
                     }
                 },
@@ -1957,16 +1333,6 @@ pub const App = struct {
                 .layout = .{ .width = body_size.width, .height = body_size.height },
                 .keymap = self.keymap,
             },
-            .ai_reviews = .{
-                .page = &self.pages.ai_reviews,
-                .human_review = self.humanReviewPresentation(),
-                .palette = self.theme,
-                .repo_root = self.repoSessionView().activeRoot(),
-                .repo_epoch = self.repoSessionView().epoch(),
-                .root_identity = self.repoSessionView().activeIdentity(),
-                .layout = .{ .width = body_size.width, .height = body_size.height },
-                .keymap = self.keymap,
-            },
             .repository = .{
                 .page_state = &self.pages.repository,
                 .palette = self.theme,
@@ -2089,16 +1455,6 @@ pub const App = struct {
         const history_body_view = history_navigation_view.bodyView(&history_body_adapter);
         var history_key = self.pages.history.inputContext(self.keymap);
         history_key.common.side_by_side = history_navigation_view.view().effectiveDisplayMode() == .side_by_side;
-        const ai_reviews_navigation_view: ai_reviews_navigation.View = .{
-            .page = &self.pages.ai_reviews,
-            .repo_root = repo.activeRoot(),
-            .repo_epoch = repo.epoch(),
-            .root_identity = repo.activeIdentity(),
-            .layout = .{ .width = body_size.width, .height = body_size.height },
-            .mode_toggle_hint_width = self.displayModeToggleHintWidth(.ai_reviews),
-        };
-        var ai_reviews_body_adapter = ai_reviews_navigation_view.resolver();
-        const ai_reviews_body_view = ai_reviews_navigation_view.bodyView(&ai_reviews_body_adapter);
         const changes_navigation_view = self.changesNavigationView();
         return .{
             .active_page = self.active_page,
@@ -2136,45 +1492,12 @@ pub const App = struct {
                     .base_picker_open = self.pages.compare.base_picker.open,
                     .base_picker_query_mode = self.pages.compare.base_picker.input_mode == .query,
                     .base_picker_query_len = self.pages.compare.base_picker.query.len,
-                    .ai_review_handoff_open = self.pages.compare.ai_review_handoff.open,
                 },
                 .selection_owner = &self.pages.compare.diff.selection_owner,
                 .loaded = compare_navigation_view.view().activeLoadedDiffConst(),
                 .selected_node = self.pages.compare.diff.viewer.selected_node,
                 .sidebar_hidden = self.pages.compare.diff.viewer.sidebar_hidden,
                 .sidebar_width = self.pages.compare.diff.viewer.sidebar_width,
-            },
-            .ai_reviews = .{
-                .key = .{
-                    .common = .{
-                        .search_mode = self.pages.ai_reviews.diff.search.mode,
-                        .file_search_mode = self.pages.ai_reviews.diff.file_search.mode,
-                        .search_query_len = self.pages.ai_reviews.diff.search.query.len,
-                        .focus = self.pages.ai_reviews.diff.viewer.focus,
-                        .sidebar_hidden = self.pages.ai_reviews.diff.viewer.sidebar_hidden,
-                        .side_by_side = ai_reviews_navigation_view.view().effectiveDisplayMode() == .side_by_side,
-                        .selection_owner = diff_surface.input.selectionOwnerKind(self.pages.ai_reviews.diff.selection_owner),
-                        .retained_selection_action_available = ai_reviews_body_view.retainedSelectionActionAvailable(),
-                        .keymap = self.keymap,
-                    },
-                    .picker_open = self.pages.ai_reviews.picker.isPickerVisible(),
-                    .picker_query_mode = self.pages.ai_reviews.picker.queryMode(),
-                    .picker_query_len = self.pages.ai_reviews.picker.query.len,
-                    .picker_loading = self.pages.ai_reviews.picker.loading(),
-                    .delete_confirmation_open = self.pages.ai_reviews.delete_confirmation.isOpen(),
-                    .delete_confirmation_deleting = self.pages.ai_reviews.delete_confirmation.isDeleting(),
-                    .selected_run = self.pages.ai_reviews.selectedRunConst() != null,
-                    .human_review = self.pages.ai_reviews.human_review_decision.inputContext(
-                        self.humanReviewPresentation(),
-                    ),
-                    .finding_card_focused = self.pages.ai_reviews.finding_card.isFocused(),
-                    .finding_card_at_cursor = ai_reviews_navigation_view.findingCardAtCursor(),
-                },
-                .selection_owner = &self.pages.ai_reviews.diff.selection_owner,
-                .loaded = ai_reviews_body_view.view.activeLoadedDiffConst(),
-                .selected_node = self.pages.ai_reviews.diff.viewer.selected_node,
-                .sidebar_hidden = self.pages.ai_reviews.diff.viewer.sidebar_hidden,
-                .sidebar_width = self.pages.ai_reviews.diff.viewer.sidebar_width,
             },
             .repository = .{
                 .key = self.pages.repository.inputContext(self.keymap),
@@ -2214,7 +1537,6 @@ pub const App = struct {
             .repository => &self.pages.repository.status,
             .history => &self.pages.history.status,
             .compare => &self.pages.compare.status,
-            .ai_reviews => &self.pages.ai_reviews.status,
             .config => null,
         };
     }
@@ -2225,7 +1547,6 @@ pub const App = struct {
             .repository => &self.pages.repository.status,
             .history => &self.pages.history.status,
             .compare => &self.pages.compare.status,
-            .ai_reviews => &self.pages.ai_reviews.status,
             .config => null,
         };
     }
@@ -2304,13 +1625,6 @@ pub const App = struct {
                     completion.generation,
                 )) self.pages.compare.diff.pinned_selection_basis = null;
             },
-            .ai_reviews => {
-                var adapter = self.aiReviewsCoordinator().navigation().updateAdapter();
-                if (adapter.bodyController().clearCompletedSelectionAfterCopy(
-                    allocator,
-                    completion.generation,
-                )) self.pages.ai_reviews.diff.pinned_selection_basis = null;
-            },
             .repository => _ = self.pages.repository.clearCompletedSelectionAfterCopy(
                 allocator,
                 completion.generation,
@@ -2372,7 +1686,6 @@ pub const App = struct {
             .repository => effects.repositoryOrigin(),
             .history => effects.historyOrigin(),
             .compare => effects.compareOrigin(),
-            .ai_reviews => effects.aiReviewsOrigin(),
             .config => return,
         };
         const queued = effects.queueClipboardAccepted(ctx, .{
@@ -2441,7 +1754,7 @@ pub const App = struct {
 
     /// Applies only the shell effects authorized by a completed repository
     /// commitment. A rejected capability open must not reload or reset the
-    /// still-authoritative Changes, Compare, or AI Reviews page.
+    /// still-authoritative Changes or Compare page.
     fn finishChangesRepoDiscovery(
         self: *App,
         ctx: *chasen.Ctx(Msg),
@@ -2467,25 +1780,17 @@ pub const App = struct {
         }
 
         try self.changesRead().acceptRepoDiscoveryCommit(ctx);
-        if (outcome == .changed and (self.active_page == .compare or self.active_page == .ai_reviews)) {
+        if (outcome == .changed and self.active_page == .compare) {
             try self.applyRepoSessionCommit(ctx, outcome);
         }
     }
 
     fn applyRepoSessionCommit(self: *App, ctx: *chasen.Ctx(Msg), outcome: repo_session.CommitOutcome) !void {
         switch (outcome) {
-            .changed => {
-                const session_transition = self.human_review_sessions.prepareClear() catch null;
-                try self.applyPageCoordinationIntent(
-                    ctx,
-                    self.pageCoordinator().acceptedRepositoryChange(self.allocator orelse ctx.allocator()),
-                );
-                if (session_transition) |plan| {
-                    self.human_review_sessions.commitClear(plan);
-                } else if (self.human_review_sessions.currentSessionConst() != null) {
-                    self.setStatus("AI review has unsaved state; reselect it to reconcile", .{});
-                }
-            },
+            .changed => try self.applyPageCoordinationIntent(
+                ctx,
+                self.pageCoordinator().acceptedRepositoryChange(self.allocator orelse ctx.allocator()),
+            ),
             .unchanged => {},
             .rejected => self.setStatus("Repository root could not be opened safely", .{}),
         }
@@ -2499,32 +1804,6 @@ pub const App = struct {
         );
     }
 };
-
-fn mapHumanReviewAdmissionFailure(
-    reason: review_store_operations_mod.Rejection,
-) human_review_session_mod.AdmissionFailure {
-    return switch (reason) {
-        .admission_closed => .admission_closed,
-        .capacity => .capacity,
-        .incompatible_queue => .incompatible_queue,
-        .store_unavailable => .store_unavailable,
-        .queue_changed => .queue_changed,
-    };
-}
-
-fn humanReviewCompletion(
-    terminal: review_store_operations_mod.CompletionRecord,
-) human_review_session_mod.Completion {
-    return .{
-        .operation_id = terminal.operation_id,
-        .binding = terminal.binding,
-        .kind = terminal.kind,
-        .expected_revision = terminal.expected_revision,
-        .committed_revision = terminal.committed_revision,
-        .completed_at = terminal.completed_at,
-        .failure = terminal.failure,
-    };
-}
 
 fn diffAutoScrollViewport(
     body: diff_surface.navigation.BodyController,
@@ -2689,6 +1968,7 @@ test "command line keeps input across resize and cancels on focus or page transi
 
 test "History commit detail copy is wired through the root shell effect terminal" {
     const allocator = std.testing.allocator;
+    const committed_review = @import("committed_review.zig");
     const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
     var app: App = .{
         .allocator = allocator,
@@ -2723,1111 +2003,4 @@ test "History commit detail copy is wired through the root shell effect terminal
     } } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 0), app.shellEffectsView().pendingClipboardCount());
     try std.testing.expectEqualStrings("clipboard copy sent: History commit detail", app.pages.history.status.text());
-}
-
-fn installReviewStoreRepositoryForTest(app: *App, allocator: std.mem.Allocator) !void {
-    const path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
-    defer allocator.free(path);
-    app.repo_session.repo_state.root = try @import("repo/root_capability.zig").RootCapability.openCanonical(path);
-}
-
-test "review state persistence App quit drains accepted mutation and reopens after failure" {
-    const allocator = std.testing.allocator;
-    const committed = @import("committed_review.zig");
-    const repository_id = try committed.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
-    const review_id = try committed.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
-    const oid = try committed.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    const binding: review_store.ReviewRunBinding = .{
-        .review_repository_id = repository_id,
-        .review_id = review_id,
-        .target = .{
-            .object_format = .sha1,
-            .source_kind = .branch_range,
-            .base_oid = oid,
-            .head_oid = oid,
-            .diff_base_oid = oid,
-        },
-        .findings_digest = committed.Sha256Digest.hash("findings\n"),
-    };
-    var app: App = .{
-        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
-        .allocator = allocator,
-    };
-    try installReviewStoreRepositoryForTest(&app, allocator);
-    defer app.repo_session.repo_state.root.?.deinit();
-    defer app.configured_review_store.?.deinit(allocator);
-    defer app.review_store_operations.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer ctx.runtimeClearPendingEffectCopies();
-
-    const admission = try app.persistReviewDraft(&ctx, .{
-        .binding = binding,
-        .expected_revision = 0,
-        .summary = "dirty caller-owned draft",
-        .finding_dispositions = &.{},
-        .anchored_notes = &.{},
-    });
-    try std.testing.expect(admission == .accepted);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-
-    try app.update(.quit, &ctx);
-    try std.testing.expect(app.review_store_operations.isDraining());
-    try std.testing.expect(!ctx.shouldQuit());
-    const queued = ctx.takePendingTasksWith();
-    const completion = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-    try app.update(completion, &ctx);
-
-    try std.testing.expect(!app.review_store_operations.isDraining());
-    try std.testing.expect(app.review_store_operations.admissionsOpen());
-    try std.testing.expect(!ctx.shouldQuit());
-    try std.testing.expectEqualStrings("AI review save failed: io_failed", app.status.text());
-
-    const saved = try app.persistReviewDraft(&ctx, .{
-        .binding = binding,
-        .expected_revision = 0,
-        .summary = "retry after reconciliation",
-        .finding_dispositions = &.{},
-        .anchored_notes = &.{},
-    });
-    try app.update(.quit, &ctx);
-    try std.testing.expect(app.quit_after_store_drain);
-    const store_tasks = ctx.takePendingTasksWith();
-    var abandoned = store_tasks[0].failed(store_tasks[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-
-    // Admit an exact existing Git lifecycle owner after Store drain began.
-    // Store success must return through the common quit coordinator instead
-    // of bypassing this later owner.
-    const prepared = app.actionLifecycle().prepare(.stage_file);
-    const accepted_action = app.actionLifecycle().acceptSpawn(allocator, prepared);
-    try std.testing.expect(app.actionLifecycleView().isAccepted(accepted_action.pending));
-
-    try app.update(.{ .review_store_operation_finished = .{
-        .operation_id = saved.accepted.operation_id,
-        .binding = binding,
-        .kind = .draft,
-        .result = .{ .draft = .{ .committed = .{
-            .revision = 1,
-            .canonical_bytes = try allocator.dupe(u8, "draft\n"),
-        } } },
-    } }, &ctx);
-    try std.testing.expect(!ctx.shouldQuit());
-    try std.testing.expect(app.quit_after_store_drain);
-    try std.testing.expect(app.actionLifecycleView().isAccepted(accepted_action.pending));
-    try std.testing.expectEqualStrings("finish current git action before quitting", app.status.text());
-
-    try app.update(App.Msg.actionFinished(.{ .stage_file = .{
-        .pending = accepted_action.pending,
-        .path = try allocator.dupe(u8, "late-action"),
-        .result = .{ .failed_static = "fixture terminal" },
-    } }), &ctx);
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(ctx.shouldQuit());
-    try std.testing.expect(app.teardown_requested);
-    try std.testing.expect(!app.quit_after_store_drain);
-}
-
-test "human review result session App bridge tracks every accepted draft and result before pump" {
-    const allocator = std.testing.allocator;
-    const committed = @import("committed_review.zig");
-    const repository_id = try committed.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
-    const review_id = try committed.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
-    const oid = try committed.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    const binding: review_store.ReviewRunBinding = .{
-        .review_repository_id = repository_id,
-        .review_id = review_id,
-        .target = .{
-            .object_format = .sha1,
-            .source_kind = .branch_range,
-            .base_oid = oid,
-            .head_oid = oid,
-            .diff_base_oid = oid,
-        },
-        .findings_digest = committed.Sha256Digest.hash("findings\n"),
-    };
-    const findings: committed.FindingSet = .{
-        .schema_version = committed.limits.schema_version,
-        .review_id = review_id,
-        .created_at = "2026-08-27T00:00:00Z",
-        .timing = .{ .duration_ms = 1 },
-        .target = binding.target,
-        .producer = .{ .name = "test" },
-        .findings = &.{},
-    };
-    var app: App = .{
-        .active_page = .ai_reviews,
-        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
-        .allocator = allocator,
-    };
-    try installReviewStoreRepositoryForTest(&app, allocator);
-    defer app.repo_session.repo_state.root.?.deinit();
-    defer app.configured_review_store.?.deinit(allocator);
-    defer app.review_store_operations.deinit(allocator);
-    defer app.human_review_sessions.deinit();
-    defer app.pages.ai_reviews.deinit(allocator);
-    _ = app.pages.ai_reviews.activate(0);
-    app.human_review_sessions.current = try human_review_session_mod.Session.init(
-        allocator,
-        binding,
-        &findings,
-        null,
-        null,
-    );
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer ctx.runtimeClearPendingEffectCopies();
-
-    var delete_row: review_store.RunSummary = .{
-        .review_id = review_id,
-        .target = binding.target,
-        .status = .draft,
-        .created_at = "2026-08-27T00:00:00Z".*,
-        .created_at_unix = 0,
-        .producer_name = @constCast("test"),
-        .producer_model = null,
-        .base_label = null,
-        .head_label = null,
-        .finding_count = 0,
-        .availability = .available,
-        .artifact_snapshot = .{
-            .manifest_digest = committed.Sha256Digest.hash("manifest"),
-            .findings_digest = binding.findings_digest,
-            .draft_state = .valid,
-            .draft_digest = committed.Sha256Digest.hash("draft"),
-            .result_digest = null,
-        },
-    };
-    try app.pages.ai_reviews.delete_confirmation.begin(
-        allocator,
-        humanReviewTestStoreSnapshot(repository_id),
-        &delete_row,
-        null,
-    );
-    try app.human_review_sessions.currentSession().?.editSummary(allocator, "blocked");
-    try std.testing.expect((try app.saveHumanReviewSession(&ctx)) == .rejected);
-    try app.update(.{ .switch_page = .config }, &ctx);
-    try std.testing.expectEqual(page.Id.ai_reviews, app.active_page);
-    try std.testing.expectEqualStrings("finish confirmation before switching pages", app.status.text());
-
-    _ = app.pages.ai_reviews.delete_confirmation.confirm(
-        app.pages.ai_reviews.activation.currentIdentity().?,
-        .{ .device = 5, .inode = 6 },
-        app.configured_review_store.?.identity(),
-    ).?;
-    try app.repoSession().enterPicker(allocator);
-    try std.testing.expect(!app.repo_session.repo_picker.mode);
-    try std.testing.expectEqualStrings("finish current git action before switching repos", app.status.text());
-    try std.testing.expect((try app.saveHumanReviewSession(&ctx)) == .rejected);
-    try std.testing.expectEqual(
-        human_review_session_mod.AdmissionFailure.admission_closed,
-        (try app.finalizeHumanReviewSession(&ctx, .needs_changes)).rejected,
-    );
-    try std.testing.expectEqual(@as(usize, 0), app.human_review_sessions.currentSessionConst().?.operationCount());
-    app.pages.ai_reviews.delete_confirmation.restoreConfirmation();
-    try std.testing.expect(app.pages.ai_reviews.delete_confirmation.cancel(allocator));
-
-    try app.human_review_sessions.currentSession().?.editSummary(allocator, "first");
-    const first = try app.saveHumanReviewSession(&ctx);
-    try std.testing.expect(first == .accepted);
-    try std.testing.expectEqual(@as(usize, 1), app.human_review_sessions.currentSessionConst().?.operationCount());
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-
-    try app.human_review_sessions.currentSession().?.editSummary(allocator, "second");
-    const second = try app.saveHumanReviewSession(&ctx);
-    try std.testing.expect(second == .accepted);
-    try app.human_review_sessions.currentSession().?.editSummary(allocator, "final");
-    const finalized = try app.finalizeHumanReviewSession(&ctx, .needs_changes);
-    try std.testing.expect(finalized == .accepted);
-    try std.testing.expect(finalized.accepted.draft_operation_id != null);
-    try std.testing.expectEqual(
-        @as(usize, 3),
-        app.human_review_sessions.currentSessionConst().?.operationCount(),
-    );
-    try std.testing.expectEqual(human_review_session_mod.Lifecycle.finalizing, app.human_review_sessions.currentSessionConst().?.lifecycle());
-
-    var active_tasks = ctx.takePendingTasksWith();
-    var abandoned = active_tasks[0].failed(active_tasks[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-    try app.update(.{ .review_store_operation_finished = .{
-        .operation_id = first.accepted,
-        .binding = binding,
-        .kind = .draft,
-        .result = .{ .draft = .{ .committed = .{
-            .revision = 1,
-            .canonical_bytes = try allocator.dupe(u8, "draft-1\n"),
-        } } },
-    } }, &ctx);
-
-    active_tasks = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), active_tasks.len);
-    abandoned = active_tasks[0].failed(active_tasks[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-    try app.update(.{ .review_store_operation_finished = .{
-        .operation_id = finalized.accepted.draft_operation_id.?,
-        .binding = binding,
-        .kind = .draft,
-        .result = .{ .draft = .{ .committed = .{
-            .revision = 2,
-            .canonical_bytes = try allocator.dupe(u8, "draft-2\n"),
-        } } },
-    } }, &ctx);
-
-    active_tasks = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), active_tasks.len);
-    abandoned = active_tasks[0].failed(active_tasks[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-    try app.update(.{ .review_store_operation_finished = .{
-        .operation_id = finalized.accepted.result_operation_id,
-        .binding = binding,
-        .kind = .result,
-        .result = .{ .result = .{ .committed = .{
-            .revision = 2,
-            .completed_at = "2026-08-27T12:00:00Z".*,
-            .canonical_bytes = try allocator.dupe(u8, "result\n"),
-        } } },
-    } }, &ctx);
-    try std.testing.expectEqual(human_review_session_mod.Lifecycle.completed, app.human_review_sessions.currentSessionConst().?.lifecycle());
-    try std.testing.expect(!app.review_store_operations.hasWork());
-}
-
-test "Finding disposition App bridge immediately admits the existing draft save" {
-    const allocator = std.testing.allocator;
-    const binding = try humanReviewTestBinding(31);
-    const finding: committed_review.Finding = .{
-        .finding_id = .{ .bytes = "F-1" },
-        .anchor = .{
-            .path_bytes = "src/main.zig",
-            .side = .after,
-            .start_line = 1,
-            .end_line = 1,
-            .content_digest = committed_review.Sha256Digest.hash("line\n"),
-        },
-        .severity = .warning,
-        .title = "fixture",
-        .body = "fixture body",
-    };
-    const findings: committed_review.FindingSet = .{
-        .schema_version = committed_review.limits.schema_version,
-        .review_id = binding.review_id,
-        .created_at = "2026-09-04T00:00:00Z",
-        .timing = .{ .duration_ms = 1 },
-        .target = binding.target,
-        .producer = .{ .name = "test" },
-        .findings = &.{finding},
-    };
-    var app: App = .{
-        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
-        .allocator = allocator,
-    };
-    try installReviewStoreRepositoryForTest(&app, allocator);
-    defer app.repo_session.repo_state.root.?.deinit();
-    defer app.configured_review_store.?.deinit(allocator);
-    defer app.review_store_operations.deinit(allocator);
-    defer app.human_review_sessions.deinit();
-    app.human_review_sessions.current = try human_review_session_mod.Session.init(
-        allocator,
-        binding,
-        &findings,
-        null,
-        null,
-    );
-    const session = app.human_review_sessions.currentSession().?;
-    try session.editDisposition(allocator, .{ .bytes = "F-1" }, .accepted);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer ctx.runtimeClearPendingEffectCopies();
-    const saved = try app.saveHumanReviewSession(&ctx);
-    try std.testing.expect(saved == .accepted);
-    try std.testing.expectEqual(@as(usize, 1), session.operationCount());
-    try std.testing.expectEqual(
-        committed_review.FindingDispositionValue.accepted,
-        session.workingSnapshot().?.finding_dispositions[0].disposition,
-    );
-    const tasks = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), tasks.len);
-    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-}
-
-test "human review result session App admission faults preserve exact prepared intents" {
-    const allocator = std.testing.allocator;
-    const binding = try humanReviewTestBinding(14);
-    const findings = humanReviewTestFindings(binding);
-    var app: App = .{
-        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
-        .allocator = allocator,
-    };
-    try installReviewStoreRepositoryForTest(&app, allocator);
-    defer app.repo_session.repo_state.root.?.deinit();
-    defer app.configured_review_store.?.deinit(allocator);
-    defer app.review_store_operations.deinit(allocator);
-    defer app.human_review_sessions.deinit();
-    defer app.pages.ai_reviews.deinit(allocator);
-    app.human_review_sessions.current = try human_review_session_mod.Session.init(
-        allocator,
-        binding,
-        &findings,
-        null,
-        null,
-    );
-    const session = app.human_review_sessions.currentSession().?;
-    const store = &app.configured_review_store.?;
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer ctx.runtimeClearPendingEffectCopies();
-
-    try session.editSummary(allocator, "first");
-    try app.pages.ai_reviews.human_review_decision.open(allocator, session.presentation());
-    _ = try app.pages.ai_reviews.human_review_decision.apply(.focus_next, session.presentation());
-    _ = try app.pages.ai_reviews.human_review_decision.apply(.activate, session.presentation());
-    _ = try app.pages.ai_reviews.human_review_decision.apply(.focus_next, session.presentation());
-    _ = try app.pages.ai_reviews.human_review_decision.apply(.focus_next, session.presentation());
-    _ = try app.pages.ai_reviews.human_review_decision.apply(.activate, session.presentation());
-    const initial_generation = session.generation;
-    const draft_preparation_token = app.review_store_operations.queueToken(binding);
-    var draft_preparation_failing = std.testing.FailingAllocator.init(
-        allocator,
-        .{ .fail_index = 0 },
-    );
-    try std.testing.expectError(
-        error.OutOfMemory,
-        session.prepareSave(
-            draft_preparation_failing.allocator(),
-            draft_preparation_token,
-            .dirty_only,
-        ),
-    );
-    app.recordHumanReviewPreparationFailure(
-        &ctx,
-        session,
-        &draft_preparation_token,
-        .draft,
-        null,
-        error.OutOfMemory,
-    );
-    const queue_after_draft_preparation = app.review_store_operations.queueToken(binding);
-    try std.testing.expect(draft_preparation_token.eql(&queue_after_draft_preparation));
-    try std.testing.expectEqual(@as(usize, 0), session.operationCount());
-    try std.testing.expectEqual(@as(u64, 0), session.last_failure.?.expected_revision);
-    try std.testing.expectEqual(initial_generation, session.last_failure.?.submitted_generation);
-    try std.testing.expectEqual(human_review_session_mod.OperationKind.draft, session.last_failure.?.kind);
-
-    const initial_token = app.review_store_operations.queueToken(binding);
-    const initial_preparation = try session.prepareSave(allocator, initial_token, .dirty_only);
-    var initial = initial_preparation.ready;
-    defer initial.deinit();
-    const initial_queue = app.review_store_operations.queueToken(binding);
-    var initial_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(
-        error.OutOfMemory,
-        app.enqueuePreparedHumanReviewDraft(
-            initial_failing.allocator(),
-            store,
-            session,
-            &initial,
-        ),
-    );
-    const queue_after_initial_admission = app.review_store_operations.queueToken(binding);
-    try std.testing.expect(initial_queue.eql(&queue_after_initial_admission));
-    try std.testing.expectEqual(@as(usize, 0), session.operationCount());
-    try std.testing.expectEqual(@as(u64, 0), session.last_failure.?.expected_revision);
-    try std.testing.expectEqual(initial_generation, session.last_failure.?.submitted_generation);
-    try std.testing.expectEqual(
-        human_review_session_mod.AdmissionFailure.preparation_failed,
-        session.last_failure.?.reason.admission,
-    );
-
-    const initial_admission = try app.enqueuePreparedHumanReviewDraft(
-        allocator,
-        store,
-        session,
-        &initial,
-    );
-    session.commitDraft(
-        &initial,
-        initial_admission.accepted.operation_id,
-        initial_admission.accepted.superseded_operation_id,
-    );
-    _ = app.pumpReviewStoreOperations(&ctx);
-
-    try session.editSummary(allocator, "second");
-    const pending_token = app.review_store_operations.queueToken(binding);
-    const pending_preparation = try session.prepareSave(allocator, pending_token, .dirty_only);
-    var pending = pending_preparation.ready;
-    defer pending.deinit();
-    const pending_admission = try app.enqueuePreparedHumanReviewDraft(
-        allocator,
-        store,
-        session,
-        &pending,
-    );
-    session.commitDraft(
-        &pending,
-        pending_admission.accepted.operation_id,
-        pending_admission.accepted.superseded_operation_id,
-    );
-
-    try session.editSummary(allocator, "third");
-    const replacement_generation = session.generation;
-    const replacement_token = app.review_store_operations.queueToken(binding);
-    const replacement_preparation = try session.prepareSave(
-        allocator,
-        replacement_token,
-        .dirty_only,
-    );
-    var replacement = replacement_preparation.ready;
-    defer replacement.deinit();
-    const replacement_queue = app.review_store_operations.queueToken(binding);
-    var replacement_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(
-        error.OutOfMemory,
-        app.enqueuePreparedHumanReviewDraft(
-            replacement_failing.allocator(),
-            store,
-            session,
-            &replacement,
-        ),
-    );
-    const queue_after_replacement_admission = app.review_store_operations.queueToken(binding);
-    try std.testing.expect(replacement_queue.eql(&queue_after_replacement_admission));
-    try std.testing.expectEqual(@as(usize, 2), session.operationCount());
-    try std.testing.expectEqual(@as(u64, 1), session.last_failure.?.expected_revision);
-    try std.testing.expectEqual(replacement_generation, session.last_failure.?.submitted_generation);
-
-    const replacement_admission = try app.enqueuePreparedHumanReviewDraft(
-        allocator,
-        store,
-        session,
-        &replacement,
-    );
-    session.commitDraft(
-        &replacement,
-        replacement_admission.accepted.operation_id,
-        replacement_admission.accepted.superseded_operation_id,
-    );
-
-    const result_token = app.review_store_operations.queueToken(binding);
-    const result_generation = session.generation;
-    var preparation_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(
-        error.OutOfMemory,
-        session.prepareResult(preparation_failing.allocator(), result_token, .needs_changes),
-    );
-    app.recordHumanReviewPreparationFailure(
-        &ctx,
-        session,
-        &result_token,
-        .result,
-        .needs_changes,
-        error.OutOfMemory,
-    );
-    const queue_after_result_preparation = app.review_store_operations.queueToken(binding);
-    try std.testing.expect(result_token.eql(&queue_after_result_preparation));
-    try std.testing.expectEqual(@as(usize, 2), session.operationCount());
-    try std.testing.expectEqual(@as(u64, 2), session.last_failure.?.expected_revision);
-    try std.testing.expectEqual(result_generation, session.last_failure.?.submitted_generation);
-    try std.testing.expectEqual(
-        committed_review.ReviewResultValue.needs_changes,
-        session.last_failure.?.decision.?,
-    );
-
-    const saving_after_preparation_failure = session.presentation();
-    try std.testing.expectEqual(human_review_session_mod.Lifecycle.saving, saving_after_preparation_failure.lifecycle);
-    try std.testing.expect(app.pages.ai_reviews.human_review_decision.inputContext(saving_after_preparation_failure).read_only);
-    const focus_before_blocked_input = app.pages.ai_reviews.human_review_decision.focus();
-    const decision_before_blocked_input = app.pages.ai_reviews.human_review_decision.selectedDecision();
-    const queue_before_blocked_input = app.review_store_operations.queueToken(binding);
-    const operation_count_before_blocked_input = session.operationCount();
-    const generation_before_blocked_input = session.generation;
-    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
-        .{ .summary_paste = "must not replace accepted draft bytes" },
-        saving_after_preparation_failure,
-    )) == .none);
-    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
-        .focus_next,
-        saving_after_preparation_failure,
-    )) == .none);
-    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
-        .activate,
-        saving_after_preparation_failure,
-    )) == .none);
-    try std.testing.expectEqual(focus_before_blocked_input, app.pages.ai_reviews.human_review_decision.focus());
-    try std.testing.expectEqual(decision_before_blocked_input, app.pages.ai_reviews.human_review_decision.selectedDecision());
-    try std.testing.expectEqualStrings("first", app.pages.ai_reviews.human_review_decision.submittedSummary().?);
-    try std.testing.expectEqualStrings("third", session.workingSnapshot().?.summary.?);
-    try std.testing.expectEqual(generation_before_blocked_input, session.generation);
-    try std.testing.expectEqual(operation_count_before_blocked_input, session.operationCount());
-    const queue_after_blocked_input = app.review_store_operations.queueToken(binding);
-    try std.testing.expect(queue_before_blocked_input.eql(&queue_after_blocked_input));
-    app.pages.ai_reviews.human_review_decision.close();
-    try std.testing.expect(!app.pages.ai_reviews.human_review_decision.isOpen());
-    try app.pages.ai_reviews.human_review_decision.open(allocator, saving_after_preparation_failure);
-    try std.testing.expect(app.pages.ai_reviews.human_review_decision.inputContext(saving_after_preparation_failure).read_only);
-    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
-        .activate,
-        saving_after_preparation_failure,
-    )) == .none);
-    try std.testing.expect(app.pages.ai_reviews.human_review_decision.selectedDecision() == null);
-    app.pages.ai_reviews.human_review_decision.close();
-
-    var result = try session.prepareResult(allocator, result_token, .needs_changes);
-    defer result.deinit();
-    const result_queue = app.review_store_operations.queueToken(binding);
-    var result_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(
-        error.OutOfMemory,
-        app.enqueuePreparedHumanReviewResult(
-            result_failing.allocator(),
-            store,
-            session,
-            &result,
-        ),
-    );
-    const queue_after_result_admission = app.review_store_operations.queueToken(binding);
-    try std.testing.expect(result_queue.eql(&queue_after_result_admission));
-    try std.testing.expectEqual(@as(usize, 2), session.operationCount());
-    try std.testing.expectEqual(@as(u64, 2), session.last_failure.?.expected_revision);
-    try std.testing.expectEqual(result_generation, session.last_failure.?.submitted_generation);
-    try std.testing.expectEqual(
-        committed_review.ReviewResultValue.needs_changes,
-        session.last_failure.?.decision.?,
-    );
-
-    const saving_after_admission_failure = session.presentation();
-    try std.testing.expectEqual(human_review_session_mod.Lifecycle.saving, saving_after_admission_failure.lifecycle);
-    const queue_before_reopen = app.review_store_operations.queueToken(binding);
-    try app.pages.ai_reviews.human_review_decision.open(allocator, saving_after_admission_failure);
-    try std.testing.expect((try app.pages.ai_reviews.human_review_decision.apply(
-        .activate,
-        saving_after_admission_failure,
-    )) == .none);
-    try std.testing.expectEqualStrings("third", app.pages.ai_reviews.human_review_decision.submittedSummary().?);
-    try std.testing.expect(app.pages.ai_reviews.human_review_decision.selectedDecision() == null);
-    app.pages.ai_reviews.human_review_decision.close();
-    const queue_after_reopen = app.review_store_operations.queueToken(binding);
-    try std.testing.expect(queue_before_reopen.eql(&queue_after_reopen));
-
-    const tasks = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), tasks.len);
-    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-}
-
-test "human review result session App bridge keeps detached failure on original Run" {
-    const allocator = std.testing.allocator;
-    const binding_a = try humanReviewTestBinding(11);
-    const binding_b = try humanReviewTestBinding(12);
-    const findings_a = humanReviewTestFindings(binding_a);
-    const findings_b = humanReviewTestFindings(binding_b);
-    var app: App = .{
-        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
-        .allocator = allocator,
-    };
-    try installReviewStoreRepositoryForTest(&app, allocator);
-    defer app.repo_session.repo_state.root.?.deinit();
-    defer app.configured_review_store.?.deinit(allocator);
-    defer app.review_store_operations.deinit(allocator);
-    defer app.human_review_sessions.deinit();
-    app.human_review_sessions.current = try human_review_session_mod.Session.init(
-        allocator,
-        binding_a,
-        &findings_a,
-        null,
-        null,
-    );
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer ctx.runtimeClearPendingEffectCopies();
-
-    try app.human_review_sessions.currentSession().?.editSummary(allocator, "A recovery bytes");
-    const save = try app.saveHumanReviewSession(&ctx);
-    try std.testing.expect(save == .accepted);
-    var session_b = try human_review_session_mod.Session.init(
-        allocator,
-        binding_b,
-        &findings_b,
-        null,
-        null,
-    );
-    var install_b = try app.human_review_sessions.prepareInstall(&session_b);
-    defer install_b.deinit();
-    app.human_review_sessions.commitInstall(&install_b);
-    app.status.set("B status stays", .{});
-
-    const tasks = ctx.takePendingTasksWith();
-    const failed = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
-    try app.update(failed, &ctx);
-    try std.testing.expectEqualStrings("B status stays", app.status.text());
-    try std.testing.expect(app.human_review_sessions.currentSessionConst().?.binding.eql(binding_b));
-    try std.testing.expectEqual(@as(usize, 1), app.human_review_sessions.detached_len);
-    try std.testing.expectEqual(@as(usize, 1), app.human_review_sessions.detached[0].recoveryCount());
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        app.human_review_sessions.detached[0].last_failure.?.expected_revision,
-    );
-
-    var fresh_a = try human_review_session_mod.Session.init(
-        allocator,
-        binding_a,
-        &findings_a,
-        null,
-        null,
-    );
-    var reattach = try app.human_review_sessions.prepareInstall(&fresh_a);
-    defer reattach.deinit();
-    app.human_review_sessions.commitInstall(&reattach);
-    try std.testing.expect(app.human_review_sessions.currentSessionConst().?.binding.eql(binding_a));
-    try std.testing.expectEqual(human_review_session_mod.Lifecycle.failed, app.human_review_sessions.currentSessionConst().?.lifecycle());
-    try std.testing.expectEqualStrings(
-        "A recovery bytes",
-        app.human_review_sessions.currentSessionConst().?.workingSnapshot().?.summary.?,
-    );
-}
-
-test "human review result session App mismatch cancels quit and requires exact reload" {
-    const allocator = std.testing.allocator;
-    const binding = try humanReviewTestBinding(13);
-    const findings = humanReviewTestFindings(binding);
-    var app: App = .{
-        .configured_review_store = try review_store.ConfiguredStore.initConfigured(allocator, "/unused"),
-        .allocator = allocator,
-    };
-    try installReviewStoreRepositoryForTest(&app, allocator);
-    defer app.repo_session.repo_state.root.?.deinit();
-    defer app.configured_review_store.?.deinit(allocator);
-    defer app.review_store_operations.deinit(allocator);
-    defer app.human_review_sessions.deinit();
-    app.human_review_sessions.current = try human_review_session_mod.Session.init(
-        allocator,
-        binding,
-        &findings,
-        null,
-        null,
-    );
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer ctx.runtimeClearPendingEffectCopies();
-
-    try app.human_review_sessions.currentSession().?.editSummary(allocator, "unconfirmed");
-    const save = try app.saveHumanReviewSession(&ctx);
-    try app.update(.quit, &ctx);
-    try std.testing.expect(app.review_store_operations.isDraining());
-    const tasks = ctx.takePendingTasksWith();
-    var abandoned = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-    try app.update(.{ .review_store_operation_finished = .{
-        .operation_id = save.accepted,
-        .binding = binding,
-        .kind = .draft,
-        .result = .{ .draft = .{ .committed = .{
-            .revision = 9,
-            .canonical_bytes = try allocator.dupe(u8, "unexpected\n"),
-        } } },
-    } }, &ctx);
-    try std.testing.expect(!ctx.shouldQuit());
-    try std.testing.expect(!app.quit_after_store_drain);
-    try std.testing.expect(app.review_store_operations.admissionsOpen());
-    try std.testing.expectEqual(
-        human_review_session_mod.Reconciliation.reload_required,
-        app.human_review_sessions.currentSessionConst().?.reconciliation,
-    );
-    try std.testing.expectEqual(@as(?u64, 0), app.human_review_sessions.currentSessionConst().?.confirmedRevision());
-    try std.testing.expectEqual(@as(usize, 1), app.human_review_sessions.currentSessionConst().?.recoveryCount());
-}
-
-fn humanReviewTestBinding(suffix: u8) !review_store.ReviewRunBinding {
-    var repository_id = try committed_review.ReviewRepositoryId.parse("123e4567-e89b-42d3-a456-426614174000");
-    repository_id.bytes[15] = suffix;
-    var review_id = try committed_review.ReviewId.parse("223e4567-e89b-42d3-a456-426614174000");
-    review_id.bytes[15] = suffix;
-    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    return .{
-        .review_repository_id = repository_id,
-        .review_id = review_id,
-        .target = .{
-            .object_format = .sha1,
-            .source_kind = .branch_range,
-            .base_oid = oid,
-            .head_oid = oid,
-            .diff_base_oid = oid,
-        },
-        .findings_digest = committed_review.Sha256Digest.hash(&.{suffix}),
-    };
-}
-
-fn humanReviewTestStoreSnapshot(
-    repository_id: committed_review.ReviewRepositoryId,
-) review_store.StoreSnapshot {
-    const display = review_store.RepositoryDisplayName.fromStored("repository") catch unreachable;
-    return .{
-        .root_device = 1,
-        .root_inode = 2,
-        .namespace_device = 3,
-        .namespace_inode = 4,
-        .repository_instance_id = committed_review.RepositoryInstanceId.parse("123e4567-e89b-42d3-a456-426614174010") catch unreachable,
-        .review_repository_id = repository_id,
-        .repository_display_name = display,
-        .repository_directory_name = review_store.RepositoryDirectoryName.format(&display, repository_id),
-    };
-}
-
-fn humanReviewTestFindings(binding: review_store.ReviewRunBinding) committed_review.FindingSet {
-    return .{
-        .schema_version = committed_review.limits.schema_version,
-        .review_id = binding.review_id,
-        .created_at = "2026-08-27T00:00:00Z",
-        .timing = .{ .duration_ms = 1 },
-        .target = binding.target,
-        .producer = .{ .name = "test" },
-        .findings = &.{},
-    };
-}
-
-test "human review result session App and Store keep an in-flight revert on one completed snapshot" {
-    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var fixture = try HumanReviewStoreFixture.init(allocator, io, tmp.dir, "store");
-    defer fixture.deinit(allocator);
-
-    var loaded = try committed_review.ReviewDraftState.parseStrict(
-        allocator,
-        fixture.draft_bytes,
-    );
-    defer loaded.deinit();
-
-    var app: App = .{
-        .configured_review_store = try review_store.ConfiguredStore.initConfigured(
-            allocator,
-            fixture.store_root,
-        ),
-        .allocator = allocator,
-    };
-    app.repo_session.repo_state.root = try fixture.repository_root.duplicate();
-    defer app.repo_session.repo_state.root.?.deinit();
-    defer app.configured_review_store.?.deinit(allocator);
-    defer app.review_store_operations.deinit(allocator);
-    defer app.human_review_sessions.deinit();
-    app.human_review_sessions.current = try human_review_session_mod.Session.init(
-        allocator,
-        fixture.binding,
-        &fixture.findings,
-        &loaded.value,
-        null,
-    );
-    const session = app.human_review_sessions.currentSession().?;
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
-    defer ctx.runtimeClearPendingEffectCopies();
-
-    try session.editSummary(allocator, "B");
-    const b_save = try app.saveHumanReviewSession(&ctx);
-    try std.testing.expect(b_save == .accepted);
-    try session.editSummary(allocator, "A");
-    const finalized = try app.finalizeHumanReviewSession(&ctx, .approved);
-    try std.testing.expect(finalized == .accepted);
-    try std.testing.expect(finalized.accepted.draft_operation_id != null);
-    try std.testing.expectEqual(@as(usize, 3), session.operationCount());
-
-    const b_tasks = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), b_tasks.len);
-    const b_message = b_tasks[0].run(b_tasks[0].ctx, allocator, io);
-    try std.testing.expect(b_message == .review_store_operation_finished);
-    try std.testing.expect(b_message.review_store_operation_finished.result == .draft);
-    try std.testing.expect(b_message.review_store_operation_finished.result.draft == .committed);
-    var durable_b = try committed_review.ReviewDraftState.parseStrict(
-        allocator,
-        b_message.review_store_operation_finished.result.draft.committed.canonical_bytes,
-    );
-    defer durable_b.deinit();
-    try std.testing.expectEqualStrings("B", durable_b.value.summary.?);
-    try app.update(b_message, &ctx);
-    try std.testing.expectEqualStrings("A", session.workingSnapshot().?.summary.?);
-
-    const corrective_tasks = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), corrective_tasks.len);
-    const corrective_message = corrective_tasks[0].run(corrective_tasks[0].ctx, allocator, io);
-    try std.testing.expect(corrective_message == .review_store_operation_finished);
-    try std.testing.expect(corrective_message.review_store_operation_finished.result == .draft);
-    try std.testing.expect(corrective_message.review_store_operation_finished.result.draft == .committed);
-    var durable_a = try committed_review.ReviewDraftState.parseStrict(
-        allocator,
-        corrective_message.review_store_operation_finished.result.draft.committed.canonical_bytes,
-    );
-    defer durable_a.deinit();
-    try std.testing.expectEqual(@as(u64, 3), durable_a.value.revision);
-    try std.testing.expectEqualStrings("A", durable_a.value.summary.?);
-    try app.update(corrective_message, &ctx);
-
-    const result_tasks = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), result_tasks.len);
-    const result_message = result_tasks[0].run(result_tasks[0].ctx, allocator, io);
-    try std.testing.expect(result_message == .review_store_operation_finished);
-    try std.testing.expect(result_message.review_store_operation_finished.result == .result);
-    try std.testing.expect(result_message.review_store_operation_finished.result.result == .committed);
-    var durable_result = try committed_review.RevisionReviewResult.parseStrict(
-        allocator,
-        result_message.review_store_operation_finished.result.result.committed.canonical_bytes,
-    );
-    defer durable_result.deinit();
-    try std.testing.expectEqual(
-        @as(u64, 3),
-        result_message.review_store_operation_finished.result.result.committed.revision,
-    );
-    try std.testing.expectEqualStrings("A", durable_result.value.summary.?);
-    try app.update(result_message, &ctx);
-
-    try std.testing.expectEqual(human_review_session_mod.Lifecycle.completed, session.lifecycle());
-    try std.testing.expectEqualStrings(
-        durable_result.value.summary.?,
-        session.completedSnapshot().?.summary.?,
-    );
-    try std.testing.expect(!app.review_store_operations.hasWork());
-
-    try tmp.dir.createDir(io, "switch-case", .fromMode(0o700));
-    var switch_parent = try tmp.dir.openDir(io, "switch-case", .{});
-    defer switch_parent.close(io);
-    var switch_fixture = try HumanReviewStoreFixture.init(allocator, io, switch_parent, "store");
-    defer switch_fixture.deinit(allocator);
-    var switch_app: App = .{
-        .configured_review_store = try review_store.ConfiguredStore.initConfigured(
-            allocator,
-            switch_fixture.store_root,
-        ),
-        .allocator = allocator,
-    };
-    switch_app.repo_session.repo_state.root = try switch_fixture.repository_root.duplicate();
-    defer switch_app.repo_session.repo_state.root.?.deinit();
-    defer switch_app.configured_review_store.?.deinit(allocator);
-    defer switch_app.review_store_operations.deinit(allocator);
-    const accepted = try switch_app.review_store_operations.enqueueDraft(
-        allocator,
-        &switch_app.configured_review_store.?,
-        &switch_app.repo_session.repo_state.root.?,
-        null,
-        .{
-            .binding = switch_fixture.binding,
-            .expected_revision = 1,
-            .summary = "captured original",
-            .finding_dispositions = &.{},
-            .anchored_notes = &.{},
-        },
-    );
-    try std.testing.expect(accepted == .accepted);
-    try switch_parent.createDir(io, "other", .fromMode(0o700));
-    var other = try switch_parent.openDir(io, "other", .{});
-    defer other.close(io);
-    const initialized = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "init", "--initial-branch=main" },
-        .cwd = .{ .dir = other },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    });
-    defer allocator.free(initialized.stdout);
-    defer allocator.free(initialized.stderr);
-    if (initialized.term != .exited or initialized.term.exited != 0) return error.GitCommandFailed;
-    const other_path = try switch_parent.realPathFileAlloc(io, "other", allocator);
-    defer allocator.free(other_path);
-    switch_app.repo_session.repo_state.root.?.deinit();
-    switch_app.repo_session.repo_state.root = try @import("repo/root_capability.zig").RootCapability.openCanonical(other_path);
-    var switch_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
-    defer switch_ctx.runtimeClearPendingEffectCopies();
-    try std.testing.expectEqual(@as(usize, 1), try switch_app.review_store_operations.pump(&switch_ctx));
-    const captured_tasks = switch_ctx.takePendingTasksWith();
-    var captured_message = captured_tasks[0].run(captured_tasks[0].ctx, allocator, io);
-    var captured_finished = captured_message.review_store_operation_finished;
-    captured_message = undefined;
-    try std.testing.expect(captured_finished.result.draft == .committed);
-    const captured_outcome = switch_app.review_store_operations.finish(allocator, &captured_finished, false);
-    try std.testing.expect(captured_outcome.accepted);
-
-    _ = try switch_app.review_store_operations.enqueueDraft(
-        allocator,
-        &switch_app.configured_review_store.?,
-        &switch_fixture.repository_root,
-        null,
-        .{
-            .binding = switch_fixture.binding,
-            .expected_revision = 2,
-            .summary = "must fail on marker drift",
-            .finding_dispositions = &.{},
-            .anchored_notes = &.{},
-        },
-    );
-    var original = try switch_parent.openDir(io, "repository", .{});
-    defer original.close(io);
-    try original.deleteFile(io, ".git/gitframe/repository-id-v1");
-    try original.writeFile(io, .{
-        .sub_path = ".git/gitframe/repository-id-v1",
-        .data = "923e4567-e89b-42d3-a456-426614174010\n",
-        .flags = .{ .permissions = .fromMode(0o600) },
-    });
-    try std.testing.expectEqual(@as(usize, 1), try switch_app.review_store_operations.pump(&switch_ctx));
-    const drift_tasks = switch_ctx.takePendingTasksWith();
-    var drift_message = drift_tasks[0].run(drift_tasks[0].ctx, allocator, io);
-    var drift_finished = drift_message.review_store_operation_finished;
-    drift_message = undefined;
-    try std.testing.expectEqual(review_store.PersistenceFailure.binding_changed, drift_finished.result.draft.failure);
-    const drift_outcome = switch_app.review_store_operations.finish(allocator, &drift_finished, false);
-    try std.testing.expect(drift_outcome.accepted);
-    try std.testing.expectEqual(review_store.PersistenceFailure.binding_changed, drift_outcome.failure.?);
-    try std.testing.expect(!switch_app.review_store_operations.hasWork());
-}
-
-const HumanReviewStoreFixture = struct {
-    store_root: [:0]u8,
-    repository_root: @import("repo/root_capability.zig").RootCapability,
-    binding: review_store.ReviewRunBinding,
-    findings: committed_review.FindingSet,
-    draft_bytes: []u8,
-
-    fn init(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        parent: std.Io.Dir,
-        name: []const u8,
-    ) !HumanReviewStoreFixture {
-        const repository_id = try committed_review.ReviewRepositoryId.parse(
-            "123e4567-e89b-42d3-a456-426614174000",
-        );
-        const review_id = try committed_review.ReviewId.parse(
-            "223e4567-e89b-42d3-a456-426614174000",
-        );
-        const oid = try committed_review.ObjectId.parse(
-            .sha1,
-            "0123456789abcdef0123456789abcdef01234567",
-        );
-        const review_target: committed_review.CommittedReviewTarget = .{
-            .object_format = .sha1,
-            .source_kind = .branch_range,
-            .base_oid = oid,
-            .head_oid = oid,
-            .diff_base_oid = oid,
-        };
-        const findings: committed_review.FindingSet = .{
-            .schema_version = committed_review.limits.schema_version,
-            .review_id = review_id,
-            .created_at = "2026-08-28T00:00:00Z",
-            .timing = .{ .duration_ms = 1 },
-            .target = review_target,
-            .producer = .{ .name = "test" },
-            .findings = &.{},
-        };
-        const findings_bytes = try findings.writeCanonical(allocator);
-        defer allocator.free(findings_bytes);
-        const findings_digest = committed_review.Sha256Digest.hash(findings_bytes);
-        const manifest: committed_review.ReviewRunManifest = .{
-            .schema_version = committed_review.limits.schema_version,
-            .review_id = review_id,
-            .review_repository_id = repository_id,
-            .target = review_target,
-            .created_at = findings.created_at,
-            .display = null,
-            .finding_count = 0,
-            .producer = findings.producer,
-            .findings_digest = findings_digest,
-        };
-        const manifest_bytes = try manifest.writeCanonical(allocator);
-        defer allocator.free(manifest_bytes);
-        const draft: committed_review.ReviewDraftState = .{
-            .schema_version = committed_review.limits.schema_version,
-            .review_id = review_id,
-            .target = review_target,
-            .findings_digest = findings_digest,
-            .revision = 1,
-            .summary = "A",
-            .finding_dispositions = &.{},
-            .anchored_notes = &.{},
-        };
-        const draft_bytes = try draft.writeCanonical(allocator);
-        errdefer allocator.free(draft_bytes);
-
-        try parent.createDir(io, "repository", .fromMode(0o700));
-        var repository = try parent.openDir(io, "repository", .{});
-        defer repository.close(io);
-        const initialized = try std.process.run(allocator, io, .{
-            .argv = &.{ "git", "init", "--initial-branch=main" },
-            .cwd = .{ .dir = repository },
-            .stdout_limit = .limited(64 * 1024),
-            .stderr_limit = .limited(64 * 1024),
-        });
-        defer allocator.free(initialized.stdout);
-        defer allocator.free(initialized.stderr);
-        switch (initialized.term) {
-            .exited => |code| if (code != 0) return error.GitCommandFailed,
-            else => return error.GitCommandFailed,
-        }
-        try repository.createDir(io, ".git/gitframe", .fromMode(0o700));
-        try repository.writeFile(io, .{
-            .sub_path = ".git/gitframe/repository-id-v1",
-            .data = "123e4567-e89b-42d3-a456-426614174010\n",
-            .flags = .{ .permissions = .fromMode(0o600) },
-        });
-        const repository_path = try parent.realPathFileAlloc(io, "repository", allocator);
-        defer allocator.free(repository_path);
-        const common_path = try repository.realPathFileAlloc(io, ".git", allocator);
-        defer allocator.free(common_path);
-        var repository_root = try @import("repo/root_capability.zig").RootCapability.openCanonical(repository_path);
-        errdefer repository_root.deinit();
-
-        try parent.createDir(io, name, .fromMode(0o700));
-        var store = try parent.openDir(io, name, .{});
-        defer store.close(io);
-        try store.createDir(io, ".locks", .fromMode(0o700));
-        var locks = try store.openDir(io, ".locks", .{});
-        defer locks.close(io);
-        const repository_text = repository_id.canonical();
-        try locks.createDir(io, &repository_text, .fromMode(0o700));
-        try store.createDir(io, "repository-123e4567", .fromMode(0o700));
-        var namespace = try store.openDir(io, "repository-123e4567", .{});
-        defer namespace.close(io);
-        const run_directory_name = "20260828-0000-test-223e4567";
-        try namespace.createDir(io, run_directory_name, .fromMode(0o700));
-        var run = try namespace.openDir(io, run_directory_name, .{});
-        defer run.close(io);
-        try writeHumanReviewFixtureFile(io, run, "manifest.json", manifest_bytes);
-        try writeHumanReviewFixtureFile(io, run, "findings.json", findings_bytes);
-        try writeHumanReviewFixtureFile(io, run, "review_state.json", draft_bytes);
-        try writeHumanReviewFixtureFile(
-            io,
-            namespace,
-            ".run-223e4567-e89b-42d3-a456-426614174000",
-            "{\"schema_version\":1,\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"review_id\":\"223e4567-e89b-42d3-a456-426614174000\",\"directory_name\":\"20260828-0000-test-223e4567\"}\n",
-        );
-        const registry_bytes = try std.fmt.allocPrint(
-            allocator,
-            "{{\"schema_version\":1,\"bindings\":[{{\"repository_instance_id\":\"123e4567-e89b-42d3-a456-426614174010\",\"review_repository_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"repository_display_name\":\"repository\",\"directory_name\":\"repository-123e4567\",\"last_seen_path\":{{\"encoding\":\"utf8\",\"value\":\"{s}\"}}}}]}}\n",
-            .{common_path},
-        );
-        defer allocator.free(registry_bytes);
-        try writeHumanReviewFixtureFile(io, store, "registry.json", registry_bytes);
-        return .{
-            .store_root = try parent.realPathFileAlloc(io, name, allocator),
-            .repository_root = repository_root,
-            .binding = .{
-                .review_repository_id = repository_id,
-                .review_id = review_id,
-                .target = review_target,
-                .findings_digest = findings_digest,
-            },
-            .findings = findings,
-            .draft_bytes = draft_bytes,
-        };
-    }
-
-    fn deinit(self: *HumanReviewStoreFixture, allocator: std.mem.Allocator) void {
-        self.repository_root.deinit();
-        allocator.free(self.draft_bytes);
-        allocator.free(self.store_root);
-        self.* = undefined;
-    }
-};
-
-fn writeHumanReviewFixtureFile(
-    io: std.Io,
-    directory: std.Io.Dir,
-    name: []const u8,
-    bytes: []const u8,
-) !void {
-    try directory.writeFile(io, .{
-        .sub_path = name,
-        .data = bytes,
-        .flags = .{ .permissions = .fromMode(0o600) },
-    });
 }

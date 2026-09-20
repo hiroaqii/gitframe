@@ -450,7 +450,6 @@ fn repoSession(app: *App) repo_session.Controller {
         .changes = .{ .page = &app.pages.changes, .navigation = changesNavigation(app), .reload = changesReload(app) },
         .repository = .{ .page = &app.pages.repository },
         .compare = .{ .page = &app.pages.compare },
-        .ai_reviews = .{ .page = &app.pages.ai_reviews },
         .shell = app.remote_workflow.repositoryInvalidationPort(&app.overlay),
     };
 }

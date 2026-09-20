@@ -14,7 +14,6 @@ const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const changes_input = @import("pages/changes/input.zig");
 const compare_input = @import("pages/compare/input.zig");
-const ai_reviews_input = @import("pages/ai_reviews/input.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_input = @import("pages/repository/input.zig");
 const history_input = @import("pages/history/input.zig");
@@ -23,14 +22,12 @@ const history_input = @import("pages/history/input.zig");
 /// Keeping this small prevents input mapping from depending on full App state.
 pub const ChangesContext = changes_input.Context;
 pub const CompareContext = compare_input.Context;
-pub const AiReviewsContext = ai_reviews_input.Context;
 pub const HistoryContext = history_input.Context;
 
 pub const KeyContext = struct {
     active_page: page.Id = .changes,
     changes: ChangesContext = .{},
     compare: CompareContext = .{},
-    ai_reviews: AiReviewsContext = .{},
     repository: repository_input.Context = .{},
     history: HistoryContext = .{},
     commit_panel_mode: bool = false,
@@ -118,21 +115,12 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     else
         .owned_noop };
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
-    if (context.active_page == .ai_reviews and context.ai_reviews.human_review.open) {
-        const msg = ai_reviews_input.pasteToMsg(context.ai_reviews, text) orelse return null;
-        return .{ .ai_reviews = msg };
-    }
-    if (context.active_page == .compare and context.compare.ai_review_handoff_open) {
-        const msg = compare_input.pasteToMsg(context.compare, text) orelse return null;
-        return .{ .compare = msg };
-    }
     if (context.active_page == .history and context.history.detail_open) {
         return .{ .history = history_input.pasteToMsg(context.history, text) orelse .owned_noop };
     }
     // Picker search is key-event-only. A visible modal owns paste so bytes
     // cannot leak into a retained diff/file search below it.
     if (context.active_page == .compare and context.compare.base_picker_open) return null;
-    if (context.active_page == .ai_reviews and context.ai_reviews.picker_open) return null;
     if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
         const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
         return translateChangesMsg(changes_msg);
@@ -148,10 +136,6 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     if (context.active_page == .compare and (context.compare.common.search_mode or context.compare.common.file_search_mode)) {
         const msg = compare_input.pasteToMsg(context.compare, text) orelse return null;
         return .{ .compare = msg };
-    }
-    if (context.active_page == .ai_reviews and (context.ai_reviews.common.search_mode or context.ai_reviews.common.file_search_mode)) {
-        const msg = ai_reviews_input.pasteToMsg(context.ai_reviews, text) orelse return null;
-        return .{ .ai_reviews = msg };
     }
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
     if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
@@ -169,14 +153,6 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.command_line_active) return .{ .command_line = commandLineKeyToMsg(key) };
-    if (context.active_page == .ai_reviews and context.ai_reviews.human_review.open) {
-        const msg = ai_reviews_input.keyToMsg(context.ai_reviews, key) orelse return null;
-        return .{ .ai_reviews = msg };
-    }
-    if (context.active_page == .compare and context.compare.ai_review_handoff_open) {
-        const msg = compare_input.keyToMsg(context.compare, key) orelse return null;
-        return .{ .compare = msg };
-    }
     if (context.active_page == .history and context.history.detail_open) {
         if (history_input.keyToMsg(context.history, key)) |msg| return .{ .history = msg };
         const routing_key = normalRoutingKey(key);
@@ -205,27 +181,6 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     {
         const msg = compare_input.keyToMsg(context.compare, key) orelse return null;
         return .{ .compare = msg };
-    }
-    // Finding cards are retained inline page state, not a modal. Keep their
-    // local command grammar while still allowing global page navigation so a
-    // round trip can preserve the focused/expanded Finding exactly.
-    if (context.active_page == .ai_reviews and
-        context.ai_reviews.finding_card_focused and
-        !context.ai_reviews.picker_open and
-        !context.ai_reviews.common.search_mode and
-        !context.ai_reviews.common.file_search_mode)
-    {
-        if (pageForKey(context.keymap, normalRoutingKey(key))) |target| {
-            return .{ .switch_page = target };
-        }
-    }
-    if (context.active_page == .ai_reviews and
-        (context.ai_reviews.common.search_mode or context.ai_reviews.common.file_search_mode or
-            context.ai_reviews.picker_open or context.ai_reviews.human_review.open or
-            context.ai_reviews.finding_card_focused))
-    {
-        const msg = ai_reviews_input.keyToMsg(context.ai_reviews, key) orelse return null;
-        return .{ .ai_reviews = msg };
     }
     if (context.repo_picker_mode) return repoPickerKeyToMsg(context, key);
     if (context.help_mode) return helpKeyToMsg(context, key);
@@ -287,11 +242,6 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
             return .{ .compare = msg };
         }
     }
-    if (context.active_page == .ai_reviews) {
-        if (ai_reviews_input.keyToMsg(context.ai_reviews, routing_key)) |msg| {
-            return .{ .ai_reviews = msg };
-        }
-    }
     if (routing_key.codepoint == 'q' and !key_input.hasCommandModifier(routing_key)) return app_message.Msg.quit;
     return null;
 }
@@ -318,7 +268,6 @@ fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     return switch (context.active_page) {
         .changes => translateChangesMsg(changes_input.selectionKeyToMsg(context.changes, key) orelse return null),
         .compare => .{ .compare = compare_input.selectionKeyToMsg(context.compare, key) orelse return null },
-        .ai_reviews => .{ .ai_reviews = ai_reviews_input.selectionKeyToMsg(context.ai_reviews, key) orelse return null },
         .repository => .{ .repository = repository_input.selectionKeyToMsg(
             repository_page.Msg,
             context.repository,
@@ -335,7 +284,6 @@ fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
         .{ .action = .page_repository, .id = .repository },
         .{ .action = .page_history, .id = .history },
         .{ .action = .page_compare, .id = .compare },
-        .{ .action = .page_ai_reviews, .id = .ai_reviews },
         .{ .action = .page_config, .id = .config },
     };
     for (bindings) |binding| {
@@ -556,9 +504,9 @@ fn expectMsg(expected: app_message.Msg, actual: app_message.Msg) !void {
     try std.testing.expectEqual(expected, actual);
 }
 
-test "human review result modal precedes normal root page and remote-cancel routes" {
+test "root page routing respects modes and remapped keys" {
     try expectMsg(.{ .switch_page = .changes }, keyToMsg(.{}, .{ .codepoint = '1' }).?);
-    try expectMsg(.{ .switch_page = .config }, keyToMsg(.{}, .{ .codepoint = '6' }).?);
+    try expectMsg(.{ .switch_page = .config }, keyToMsg(.{}, .{ .codepoint = '5' }).?);
     try std.testing.expectEqual(changesMsg(.{ .search_insert = '2' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, .{ .codepoint = '2' }).?);
     try expectMsg(.{ .commit_panel_insert = '3' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = '3' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = '2', .mods = .{ .ctrl = true } }));
@@ -569,49 +517,6 @@ test "human review result modal precedes normal root page and remote-cancel rout
     const remapped = keymap.Effective.fromConfig(config);
     try expectMsg(.{ .switch_page = .repository }, keyToMsg(.{ .keymap = remapped }, .{ .codepoint = 'w' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .keymap = remapped }, .{ .codepoint = '2' }));
-
-    const modal: KeyContext = .{
-        .active_page = .ai_reviews,
-        .remote_action_cancelable = true,
-        .ai_reviews = .{ .human_review = .{ .open = true } },
-    };
-    try expectMsg(
-        .{ .ai_reviews = .{ .human_review_decision = .close } },
-        keyToMsg(modal, .{ .codepoint = chasen.Key.escape }).?,
-    );
-    try expectMsg(
-        .{ .ai_reviews = .{ .human_review_decision = .close } },
-        keyToMsg(modal, .{ .codepoint = 'q' }).?,
-    );
-    try std.testing.expect(keyToMsg(modal, .{ .codepoint = '1' }) == null);
-    try std.testing.expect(pasteToMsg(modal, "underlying diff") == null);
-
-    var summary_modal = modal;
-    summary_modal.ai_reviews.human_review.focus = .summary;
-    summary_modal.ai_reviews.human_review.summary_editing = true;
-    try expectMsg(
-        .{ .ai_reviews = .{ .human_review_decision = .{ .summary_paste = "人の要約" } } },
-        pasteToMsg(summary_modal, "人の要約").?,
-    );
-}
-
-test "AI Reviews Finding focus admits page keys but retains card commands" {
-    const context: KeyContext = .{
-        .active_page = .ai_reviews,
-        .ai_reviews = .{
-            .selected_run = true,
-            .finding_card_focused = true,
-        },
-    };
-    try expectMsg(.{ .switch_page = .compare }, keyToMsg(context, .{ .codepoint = '4' }).?);
-    try expectMsg(
-        .{ .ai_reviews = .{ .finding_card = .accept } },
-        keyToMsg(context, .{ .codepoint = 'a' }).?,
-    );
-    try expectMsg(
-        .{ .ai_reviews = .{ .finding_card = .retry } },
-        keyToMsg(context, .{ .codepoint = 'r' }).?,
-    );
 }
 
 test "History catalog loading admits only cancel page transition and quit" {
@@ -1412,36 +1317,6 @@ test "remote cancel Escape takes priority while a background action is active" {
     try std.testing.expectEqual(
         app_message.Msg.quit,
         keyToMsg(.{ .remote_action_cancelable = true }, .{ .codepoint = 'q' }).?,
-    );
-}
-
-test "AI Review Handoff owns root input before remote backgrounds" {
-    const escape: chasen.Key = .{ .codepoint = chasen.Key.escape };
-    try expectMsg(
-        .{ .compare = .close_ai_review_handoff },
-        keyToMsg(.{
-            .active_page = .compare,
-            .compare = .{ .ai_review_handoff_open = true },
-            .remote_action_cancelable = true,
-        }, escape).?,
-    );
-    const modal_over_background: KeyContext = .{
-        .active_page = .compare,
-        .compare = .{ .ai_review_handoff_open = true },
-        .remote_action_cancelable = true,
-    };
-    try expectMsg(
-        .{ .compare = .copy_ai_review_handoff },
-        keyToMsg(modal_over_background, .{ .codepoint = 'y' }).?,
-    );
-    try expectMsg(
-        .{ .compare = .close_ai_review_handoff },
-        keyToMsg(modal_over_background, .{ .codepoint = 'q' }).?,
-    );
-    try std.testing.expect(keyToMsg(modal_over_background, .{ .codepoint = '1' }) == null);
-    try std.testing.expectEqual(
-        app_message.Msg.cancel_remote_action,
-        keyToMsg(.{ .remote_action_cancelable = true }, escape).?,
     );
 }
 

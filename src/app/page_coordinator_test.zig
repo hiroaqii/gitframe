@@ -11,7 +11,6 @@ const page_coordinator = @import("page_coordinator.zig");
 const page_link = @import("page_link.zig");
 const repo_session = @import("repo_session.zig");
 const compare_page = @import("pages/compare.zig");
-const ai_reviews_page = @import("pages/ai_reviews.zig");
 const repository_page = @import("pages/repository.zig");
 const history_page = @import("pages/history.zig");
 const repository_selection = @import("pages/repository/selection.zig");
@@ -36,7 +35,6 @@ const PageStates = struct {
     repository: repository_page.RepositoryPageState = .{},
     history: history_page.HistoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
-    ai_reviews: ai_reviews_page.AiReviewsPageState = .{},
     config: page.LazyPlaceholder = .{},
 };
 
@@ -59,7 +57,6 @@ const TestApp = struct {
             .repository = &self.pages.repository,
             .history = &self.pages.history,
             .compare = &self.pages.compare,
-            .ai_reviews = &self.pages.ai_reviews,
             .config_page = &self.pages.config,
             .repo = self.repo_session.view(),
             .source = self.config.source,
@@ -171,7 +168,7 @@ test "repository source header page switch cancels header owner without weakenin
 
 test "repository keyboard line selection page exits preserve semantic viewport" {
     const allocator = std.testing.allocator;
-    const targets = [_]page.Id{ .compare, .ai_reviews, .changes };
+    const targets = [_]page.Id{ .compare, .changes };
 
     inline for (targets) |target| inline for (.{ false, true }) |retain_prior| {
         var app: TestApp = .{
@@ -249,11 +246,10 @@ test "History commit detail blocks direct page switch without releasing owned st
     try std.testing.expectEqualStrings("close History commit detail before switching pages", app.status.text());
 }
 
-test "Compare transient owners block transitions while direct AI Run reload does not" {
+test "Compare transient owners block transitions" {
     const allocator = std.testing.allocator;
     var app: TestApp = .{ .allocator = allocator, .active_page = .compare };
     defer app.pages.compare.deinit(allocator);
-    defer app.pages.ai_reviews.deinit(allocator);
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
@@ -282,24 +278,8 @@ test "Compare transient owners block transitions while direct AI Run reload does
     try std.testing.expectEqualStrings("finish Compare search before switching pages", app.status.text());
 
     app.pages.compare.diff.search.mode = false;
-    try requestPageSwitchForTest(&app, &ctx, .ai_reviews);
-    const review_id = try committed_review.ReviewId.parse("723e4567-e89b-42d3-a456-426614174000");
-    app.pages.ai_reviews.picker.phase = .{ .selection_loading = .{ .review_id = review_id, .direct = true } };
-    try std.testing.expect(app.pages.ai_reviews.picker.isOpen());
-    try std.testing.expect(!app.pages.ai_reviews.picker.isPickerVisible());
     try requestPageSwitchForTest(&app, &ctx, .config);
     try std.testing.expectEqual(page.Id.config, app.active_page);
-
-    // Even a synthetic retained direct-failure phase stays non-modal and
-    // cannot make its target page unreachable.
-    app.pages.ai_reviews.picker.phase = .{ .selection_failed = .{
-        .review_id = review_id,
-        .direct = true,
-        .message = "refresh failed",
-    } };
-    try std.testing.expect(!app.pages.ai_reviews.picker.isPickerVisible());
-    try requestPageSwitchForTest(&app, &ctx, .ai_reviews);
-    try std.testing.expectEqual(page.Id.ai_reviews, app.active_page);
 }
 
 test "Compare retained selection survives page transitions and clears on repository replacement" {

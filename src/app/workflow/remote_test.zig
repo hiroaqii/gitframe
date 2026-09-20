@@ -141,7 +141,6 @@ const RemoteHarness = struct {
             .changes_activation_id = self.pages.changes.activation.next_activation_id,
             .repository_activation_id = 0,
             .compare_activation_id = 0,
-            .ai_reviews_activation_id = 0,
             .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
             .commit_panel_instance_id = null,
         };
