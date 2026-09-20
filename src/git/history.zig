@@ -6,11 +6,11 @@
 //! published.
 
 const std = @import("std");
-const committed_review = @import("committed_review.zig");
+const commit_diff = @import("commit_diff.zig");
 const git_command = @import("command.zig");
 
-pub const ObjectFormat = committed_review.ObjectFormat;
-pub const ObjectId = committed_review.ObjectId;
+pub const ObjectFormat = commit_diff.ObjectFormat;
+pub const ObjectId = commit_diff.ObjectId;
 
 pub const page_size: usize = 200;
 pub const traversal_limit: usize = page_size + 1;
@@ -156,7 +156,7 @@ pub const SelectionIntent = union(enum) {
 pub const SelectionRequest = struct {
     snapshot_head: ObjectId,
     intent: SelectionIntent,
-    basis: committed_review.CommittedDiffBasis,
+    basis: commit_diff.Basis,
 };
 
 pub const SelectionUnavailable = union(enum) {
@@ -219,7 +219,7 @@ pub fn resolveSelection(
     }
 
     const oldest = &records[oldest_index];
-    const before: committed_review.CommittedDiffBasis.Before = switch (oldest.first_parent) {
+    const before: commit_diff.Basis.Before = switch (oldest.first_parent) {
         .available => |oid| .{ .commit = oid },
         .true_root => .empty_tree,
         .missing => |oid| return .{ .unavailable = .{ .missing_first_parent = .{

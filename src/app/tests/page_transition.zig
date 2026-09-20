@@ -936,7 +936,6 @@ fn reviewAppLoadedFinished(
                 .head_display = head_display,
                 .target = .{
                     .object_format = .sha1,
-                    .source_kind = .branch_range,
                     .base_oid = reviewAppTestOid(base_byte),
                     .head_oid = reviewAppTestOid(head_byte),
                     .diff_base_oid = reviewAppTestOid(base_byte),

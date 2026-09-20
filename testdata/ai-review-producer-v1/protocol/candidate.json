@@ -1,1 +1,0 @@
-{"findings":[{"start_location":"a0002","end_location":"a0002","severity":"warning","title":"Check replacement","body":"The replacement changes behavior.","suggestion":"newSafe();"}]}

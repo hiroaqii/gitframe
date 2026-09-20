@@ -1,28 +1,6 @@
 const app = @import("app.zig");
 const build_options = @import("build_options");
 pub const config = @import("config.zig");
-pub const ai_review = @import("ai_review.zig");
-pub const committed_review = @import("committed_review.zig");
-pub const review_store = @import("review_store.zig");
-/// Installed process adapter for exact-target committed patch transport.
-pub const review_projection_command = @import("committed_review/projection_command.zig");
-/// Installed process adapter for target-only committed revision resolution.
-pub const review_target_command = @import("committed_review/target_command.zig");
-/// Installed process adapter for explicit Review Store binding preparation.
-pub const review_store_prepare_command = @import("review_store/prepare_command.zig");
-/// Installed process adapter for exact immutable Review Run publication.
-pub const review_store_publish_command = @import("review_store/publish_command.zig");
-/// Installed no-write adapter for exact Review Store publication identity.
-pub const review_store_read_command = @import("ai_review/store_read_command.zig");
-/// Installed no-write adapter for one exact admitted human review result.
-pub const review_maintenance_command = @import("ai_review/maintenance_command.zig");
-pub const review_result_read_command = @import("ai_review/result_read_command.zig");
-/// Installed side-effect-free AI review capability handshake.
-pub const review_capabilities_command = @import("ai_review/capabilities_command.zig");
-/// Installed side-effect-free deterministic review input materializer.
-pub const review_input_command = @import("ai_review/input_command.zig");
-/// Installed read-only adapter for canonical AI review artifact construction.
-pub const review_producer_command = @import("ai_review/producer_command.zig");
 pub const keymap = @import("keymap");
 pub const repo_state = @import("repo/state.zig");
 pub const theme = @import("theme");
@@ -110,21 +88,7 @@ test {
     _ = @import("app/view.zig");
     _ = @import("app/view_primitives.zig");
     _ = @import("config.zig");
-    _ = @import("ai_review.zig");
-    _ = @import("ai_review/capabilities_command.zig");
-    _ = @import("ai_review/input_command.zig");
-    _ = @import("ai_review/producer_command.zig");
-    _ = @import("ai_review/store_service.zig");
-    _ = @import("ai_review/store_read_command.zig");
-    _ = @import("ai_review/result_read_command.zig");
-    _ = review_maintenance_command;
     _ = @import("content_fingerprint.zig");
-    _ = @import("committed_review.zig");
-    _ = @import("review_store.zig");
-    _ = @import("committed_review/projection_command.zig");
-    _ = @import("committed_review/target_command.zig");
-    _ = @import("review_store/prepare_command.zig");
-    _ = @import("review_store/publish_command.zig");
     _ = @import("context.zig");
     _ = @import("context_export.zig");
     _ = @import("draw");
@@ -142,13 +106,11 @@ test {
     _ = @import("git/remote.zig");
     _ = @import("git/branch_status.zig");
     _ = @import("git/command.zig");
-    _ = @import("git/committed_review.zig");
-    _ = @import("git/committed_review/instructions.zig");
+    _ = @import("git/commit_diff.zig");
     _ = @import("git/compare.zig");
     _ = @import("git/history.zig");
     _ = @import("git/operations.zig");
     _ = @import("git/read.zig");
-    _ = @import("git/repository_locator.zig");
     _ = @import("git/refs.zig");
     _ = @import("git/status.zig");
     _ = @import("keymap");

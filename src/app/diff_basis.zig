@@ -1,19 +1,17 @@
 //! Page-independent identity and ownership types for read-only committed diffs.
 //!
-//! Review v1 constructs branch bases. Future History source kinds are added to
-//! the versioned committed-review contract when their semantics exist; this
-//! module does not reserve a lossy placeholder authority.
+//! Compare constructs branch bases while History owns direct commit bases.
 
 const std = @import("std");
-const committed_review = @import("../committed_review.zig");
+const commit_diff = @import("../git/commit_diff.zig");
 const git_ref = @import("../git/ref.zig");
 
 /// Git object id storage for SHA-1 (40 hex) and SHA-256 (64 hex) repositories.
-pub const Oid = committed_review.ObjectId;
+pub const Oid = commit_diff.ObjectId;
 
 pub const BaseKind = git_ref.BranchKind;
 
-/// User intent: which full ref should be resolved by the next Review load.
+/// User intent: which full ref should be resolved by the next Compare load.
 pub const BaseTarget = struct {
     full_ref: []u8,
     display_name: []u8,
@@ -63,7 +61,7 @@ pub const BaseSelection = struct {
 pub const BranchDiffBasis = struct {
     base: BaseSelection,
     head_display: []u8,
-    target: committed_review.CommittedReviewTarget,
+    target: commit_diff.Target,
     ahead_count: usize,
 
     pub fn clone(self: BranchDiffBasis, allocator: std.mem.Allocator) !BranchDiffBasis {
@@ -111,7 +109,6 @@ test "branch basis clone owns every display and authority slice" {
         .head_display = try allocator.dupe(u8, "feature/compare"),
         .target = .{
             .object_format = .sha1,
-            .source_kind = .branch_range,
             .base_oid = .{},
             .head_oid = .{},
             .diff_base_oid = .{},

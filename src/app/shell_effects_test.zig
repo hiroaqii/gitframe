@@ -11,7 +11,7 @@ const effect_origin = @import("effect_origin.zig");
 const page = @import("page.zig");
 const compare_page = @import("pages/compare.zig");
 const history_page = @import("pages/history.zig");
-const committed_review = @import("../committed_review.zig");
+const commit_diff = @import("../git/commit_diff.zig");
 const repository_page = @import("pages/repository.zig");
 const changes_content = @import("pages/changes/content.zig");
 const changes_page = @import("pages/changes.zig");
@@ -140,7 +140,7 @@ test "clipboard copy result status uses best-effort wording" {
 
 test "History commit detail clipboard presents only the latest live generation" {
     const allocator = std.testing.allocator;
-    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const oid = try commit_diff.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
     var app: ShellHarness = .{
         .active_page = .history,
         .pages = .{ .history = .{ .detail = .{ .open = .{
@@ -216,9 +216,8 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
         } },
     };
     app.pages.compare.diff.pinned_selection_basis = .{
-        .identity = .{ .review_target = .{
+        .identity = .{ .target = .{
             .object_format = .sha1,
-            .source_kind = .branch_range,
             .base_oid = .{},
             .head_oid = .{},
             .diff_base_oid = .{},

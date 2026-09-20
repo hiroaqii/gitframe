@@ -6,12 +6,6 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
-    if (helperCommand(args)) |command| {
-        const exit_code = runHelper(command, init, args[2..]) catch 70;
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
     if (wantsHelp(args)) {
         try printHelp(init.io);
         return;
@@ -123,109 +117,6 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
-const HelperCommand = enum {
-    ai_review,
-    review_capabilities,
-    review_input,
-    review_producer,
-    review_target,
-    review_projection,
-    review_store_prepare,
-    review_store_publish,
-    review_store_read,
-    review_result_read,
-};
-
-fn helperCommand(args: []const []const u8) ?HelperCommand {
-    if (args.len < 2) return null;
-    if (std.mem.eql(u8, args[1], "ai-review")) return .ai_review;
-    if (std.mem.eql(u8, args[1], "review-capabilities")) return .review_capabilities;
-    if (std.mem.eql(u8, args[1], "review-input")) return .review_input;
-    if (std.mem.eql(u8, args[1], "review-producer")) return .review_producer;
-    if (std.mem.eql(u8, args[1], "review-target")) return .review_target;
-    if (std.mem.eql(u8, args[1], "review-projection")) return .review_projection;
-    if (std.mem.eql(u8, args[1], "review-store-prepare")) return .review_store_prepare;
-    if (std.mem.eql(u8, args[1], "review-store-publish")) return .review_store_publish;
-    if (std.mem.eql(u8, args[1], "review-store-read")) return .review_store_read;
-    if (std.mem.eql(u8, args[1], "review-result-read")) return .review_result_read;
-    return null;
-}
-
-fn runHelper(command: HelperCommand, init: std.process.Init, arguments: []const []const u8) !u8 {
-    return switch (command) {
-        .ai_review => gitframe.review_maintenance_command.run(init.gpa, init.io, init.environ_map, arguments, .stdin(), .stdout(), .stderr()),
-        .review_capabilities => gitframe.review_capabilities_command.run(
-            init.gpa,
-            init.io,
-            arguments,
-            .stdout(),
-        ),
-        .review_input => gitframe.review_input_command.run(
-            init.gpa,
-            init.io,
-            init.environ_map,
-            arguments,
-            .stdin(),
-            .stdout(),
-        ),
-        .review_producer => gitframe.review_producer_command.run(
-            init.gpa,
-            init.io,
-            init.environ_map,
-            arguments,
-            .stdin(),
-            .stdout(),
-        ),
-        .review_target => gitframe.review_target_command.run(
-            init.gpa,
-            init.io,
-            init.environ_map,
-            arguments,
-            .stdout(),
-        ),
-        .review_projection => gitframe.review_projection_command.run(
-            init.gpa,
-            init.io,
-            init.environ_map,
-            arguments,
-            .stdin(),
-            .stdout(),
-        ),
-        .review_store_prepare => gitframe.review_store_prepare_command.run(
-            init.gpa,
-            init.io,
-            init.environ_map,
-            arguments,
-            .stdin(),
-            .stdout(),
-        ),
-        .review_store_publish => gitframe.review_store_publish_command.run(
-            init.gpa,
-            init.io,
-            init.environ_map,
-            arguments,
-            .stdin(),
-            .stdout(),
-        ),
-        .review_store_read => gitframe.review_store_read_command.run(
-            init.gpa,
-            init.io,
-            init.environ_map,
-            arguments,
-            .stdin(),
-            .stdout(),
-        ),
-        .review_result_read => gitframe.review_result_read_command.run(
-            init.gpa,
-            init.io,
-            init.environ_map,
-            arguments,
-            .stdin(),
-            .stdout(),
-        ),
-    };
-}
-
 fn startupDiagnosticWriter(file: std.Io.File, io: std.Io, buffer: []u8) std.Io.File.Writer {
     // A positional writer does not advance a regular file's shared descriptor
     // offset. If main then returns an error, Zig's top-level error terminal can
@@ -284,10 +175,6 @@ fn configForStartup(
                 ),
                 .duplicate_action_input => try stderr.print(
                     "gitframe: cannot load config {s}: multiple external actions use the same stdin\n",
-                    .{display_path},
-                ),
-                .invalid_ai_review_store_root => try stderr.print(
-                    "gitframe: cannot load config {s}: invalid AI review Store root\n",
                     .{display_path},
                 ),
                 .unsupported_schema_version => try stderr.print(
@@ -441,39 +328,6 @@ test "wantsHelp detects help flags" {
     try std.testing.expect(wantsHelp(args[0..]));
 }
 
-test "helper first-token dispatch precedes global help scanning" {
-    try std.testing.expectEqual(HelperCommand.ai_review, helperCommand(&.{ "gitframe", "ai-review", "delete" }).?);
-    const capability_args = [_][]const u8{ "gitframe", "review-capabilities", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_capabilities, helperCommand(&capability_args).?);
-    try std.testing.expect(wantsHelp(&capability_args));
-    const target_args = [_][]const u8{ "gitframe", "review-target", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_target, helperCommand(&target_args).?);
-    try std.testing.expect(wantsHelp(&target_args));
-    const input_args = [_][]const u8{ "gitframe", "review-input", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_input, helperCommand(&input_args).?);
-    try std.testing.expect(wantsHelp(&input_args));
-    const producer_args = [_][]const u8{ "gitframe", "review-producer", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_producer, helperCommand(&producer_args).?);
-    try std.testing.expect(wantsHelp(&producer_args));
-    const projection_args = [_][]const u8{ "gitframe", "review-projection", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_projection, helperCommand(&projection_args).?);
-    try std.testing.expect(wantsHelp(&projection_args));
-    const prepare_args = [_][]const u8{ "gitframe", "review-store-prepare", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_store_prepare, helperCommand(&prepare_args).?);
-    try std.testing.expect(wantsHelp(&prepare_args));
-    const publish_args = [_][]const u8{ "gitframe", "review-store-publish", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_store_publish, helperCommand(&publish_args).?);
-
-    const read_args = [_][]const u8{ "gitframe", "review-store-read", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_store_read, helperCommand(&read_args).?);
-    try std.testing.expect(wantsHelp(&read_args));
-    const result_read_args = [_][]const u8{ "gitframe", "review-result-read", "--help" };
-    try std.testing.expectEqual(HelperCommand.review_result_read, helperCommand(&result_read_args).?);
-    try std.testing.expect(wantsHelp(&result_read_args));
-    const global_args = [_][]const u8{ "gitframe", "--help" };
-    try std.testing.expect(helperCommand(&global_args) == null);
-}
-
 test "config startup borrows a successful result-owned config" {
     var result: gitframe.config.LoadConfigResult = .{ .success = .{} };
     defer result.deinit();
@@ -500,7 +354,6 @@ test "config startup rejects every failure reason before runtime setup" {
         .{ .failure = .invalid_action_config, .reason = "invalid external action configuration" },
         .{ .failure = .missing_action_input, .reason = "external action is missing required stdin" },
         .{ .failure = .duplicate_action_input, .reason = "multiple external actions use the same stdin" },
-        .{ .failure = .invalid_ai_review_store_root, .reason = "invalid AI review Store root" },
         .{ .failure = .unsupported_schema_version, .reason = "unsupported schema version" },
         .{ .failure = .unsupported_action_schema, .reason = "unsupported external action schema" },
     };
@@ -517,38 +370,6 @@ test "config startup rejects every failure reason before runtime setup" {
         );
         try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "/tmp/config.toml") != null);
         try std.testing.expect(std.mem.indexOf(u8, stderr.written(), case.reason) != null);
-    }
-}
-
-test "config startup reports removed hosted AI review keys as invalid TOML" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(directory);
-    const path = try std.fs.path.join(allocator, &.{ directory, "config.toml" });
-    defer allocator.free(path);
-    var buffer: [256]u8 = undefined;
-    const removed = [_]struct { key: []const u8, value: []const u8 }{
-        .{ .key = "codex_executable", .value = "\"/usr/bin/codex\"" },
-        .{ .key = "codex_model", .value = "\"requested\"" },
-        .{ .key = "max_input_bytes", .value = "2097152" },
-        .{ .key = "max_final_output_bytes", .value = "262144" },
-        .{ .key = "max_stream_output_bytes", .value = "8388608" },
-        .{ .key = "timeout_seconds", .value = "1800" },
-    };
-    for (removed) |entry| {
-        const contents = try std.fmt.bufPrint(&buffer, "[ai_review]\n{s} = {s}\n", .{ entry.key, entry.value });
-        try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = contents });
-        var result = gitframe.config.loadConfig(allocator, io, path);
-        defer result.deinit();
-        var stderr: std.Io.Writer.Allocating = .init(allocator);
-        defer stderr.deinit();
-        try std.testing.expectError(error.InvalidConfig, configForStartup(&result, path, &stderr.writer));
-        try std.testing.expect(std.mem.indexOf(u8, stderr.written(), path) != null);
-        try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "invalid TOML") != null);
-        try std.testing.expect(std.mem.indexOf(u8, stderr.written(), entry.key) == null);
     }
 }
 

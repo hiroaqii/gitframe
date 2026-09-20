@@ -454,7 +454,6 @@ test "terminal resize cancels live drag before geometry and retains completed se
                     .head_display = try allocator.dupe(u8, "topic"),
                     .target = .{
                         .object_format = .sha1,
-                        .source_kind = .branch_range,
                         .base_oid = .{},
                         .head_oid = .{},
                         .diff_base_oid = .{},
@@ -621,7 +620,6 @@ test "Compare retained actions route keyboard and mouse through App after narrow
                 .head_display = try allocator.dupe(u8, "topic"),
                 .target = .{
                     .object_format = .sha1,
-                    .source_kind = .branch_range,
                     .base_oid = .{},
                     .head_oid = .{},
                     .diff_base_oid = .{},

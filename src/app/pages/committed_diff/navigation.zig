@@ -6,7 +6,7 @@ const app_state = @import("../../state.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const context = @import("../../../context.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
-const committed_review = @import("../../../committed_review.zig");
+const commit_diff = @import("../../../git/commit_diff.zig");
 const diff_file = @import("../../../diff/file.zig");
 const diff_parser = @import("../../../diff/parser.zig");
 const diff_render = @import("../../../diff/render.zig");
@@ -20,7 +20,7 @@ pub const View = struct {
     diff: *const committed_diff.State,
     activation: *const diff_surface.authority.Lifecycle,
     status: *const app_state.StatusMessage,
-    current_target: ?committed_review.CommittedReviewTarget,
+    current_target: ?commit_diff.Target,
     presentation_identity: ?committed_diff.PresentationIdentity = null,
     repo_root: ?[]const u8,
     repo_epoch: u64,
@@ -97,7 +97,7 @@ pub const Controller = struct {
     diff: *committed_diff.State,
     activation: *diff_surface.authority.Lifecycle,
     status: *app_state.StatusMessage,
-    current_target: ?committed_review.CommittedReviewTarget,
+    current_target: ?commit_diff.Target,
     presentation_identity: ?committed_diff.PresentationIdentity = null,
     repo_root: ?[]const u8,
     repo_epoch: u64,
@@ -166,7 +166,7 @@ pub const Controller = struct {
         fn installRetainedSelection(ctx: *anyopaque) bool {
             const self: *UpdateAdapter = @ptrCast(@alignCast(ctx));
             const identity = self.navigation.presentation_identity orelse if (self.navigation.current_target) |target|
-                committed_diff.PresentationIdentity{ .review_target = target }
+                committed_diff.PresentationIdentity{ .target = target }
             else
                 null;
             return self.navigation.diff.installPinnedPresentationIdentity(identity);

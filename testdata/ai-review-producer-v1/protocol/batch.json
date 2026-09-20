@@ -1,1 +1,0 @@
-{"schema_version":1,"plan_digest":"sha256:64879f7d6b960a01909762d911a32d4582c20010c5641ee90278b644a9e3b525","unit_id":"unit-0001","status":"reviewed","findings":[{"start_location":"a0002","end_location":"a0002","severity":"warning","title":"Check replacement","body":"The replacement changes behavior.","suggestion":"newSafe();"}]}

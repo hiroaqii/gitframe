@@ -304,7 +304,7 @@ pub const ComparePageState = struct {
         self.activation.deactivate();
     }
 
-    pub fn currentTarget(self: *const ComparePageState) ?@import("../../committed_review.zig").CommittedReviewTarget {
+    pub fn currentTarget(self: *const ComparePageState) ?@import("../../git/commit_diff.zig").Target {
         return if (self.basis) |basis| basis.target else null;
     }
 

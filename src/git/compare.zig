@@ -1,8 +1,8 @@
-//! Branch Review caller policy.
+//! Compare caller policy.
 //!
-//! This module selects display refs for the current Branch Review. It owns no
-//! object resolution, merge-base, ahead, projection, or anchor semantics;
-//! those live in `git/committed_review.zig` and receive explicit inputs.
+//! This module selects display refs for Compare. It owns no object resolution,
+//! merge-base, ahead, or materialization semantics; those live in
+//! `git/commit_diff.zig` and receive explicit inputs.
 
 const std = @import("std");
 const git_command = @import("command.zig");
@@ -55,7 +55,7 @@ pub const HeadNameResult = union(enum) {
     }
 };
 
-/// Apply the existing Branch Review fallback before invoking the strict target
+/// Apply the existing Compare fallback before invoking the strict target
 /// resolver. The returned full ref is the resolver's explicit base input.
 pub fn selectDefaultTarget(
     allocator: std.mem.Allocator,
@@ -268,7 +268,7 @@ fn runTestGit(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) !void {
     return error.GitCommandFailed;
 }
 
-test "Branch Review fallback policy selects origin HEAD then main without resolving target objects" {
+test "Compare fallback policy selects origin HEAD then main without resolving target objects" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -291,7 +291,7 @@ test "Branch Review fallback policy selects origin HEAD then main without resolv
     try std.testing.expectEqualStrings("refs/remotes/origin/main", preferred.target.full_ref);
 }
 
-test "Branch Review fallback policy retains master and missing-master terminals" {
+test "Compare fallback policy retains master and missing-master terminals" {
     const io = std.testing.io;
     var master_tmp = std.testing.tmpDir(.{});
     defer master_tmp.cleanup();
@@ -313,7 +313,7 @@ test "Branch Review fallback policy retains master and missing-master terminals"
     try std.testing.expectEqualStrings("refs/heads/master", missing.missing.full_ref);
 }
 
-test "Branch Review HEAD display policy accepts detached HEAD" {
+test "Compare HEAD display policy accepts detached HEAD" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;

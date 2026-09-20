@@ -1,6 +1,6 @@
 //! Shared retained state for read-only committed-diff pages.
 //!
-//! History, Compare, and AI Reviews own independent activation, selection or
+//! History and Compare own independent activation, selection or
 //! target, request, modal, and diagnostics. This component owns only the diff
 //! interaction state whose contract is identical for those pages.
 
@@ -10,8 +10,7 @@ const app_state = @import("../state.zig");
 const diff_surface = @import("../diff_surface.zig");
 const load_state = @import("../load_state.zig");
 const app_load = @import("../load.zig");
-const committed_review = @import("../../committed_review.zig");
-const git_committed_review = @import("../../git/committed_review.zig");
+const commit_diff = @import("../../git/commit_diff.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
@@ -33,20 +32,20 @@ pub const AcceptedRepositoryIdentity = struct {
 
 /// Page-local presentation identity used only to admit retained selection
 /// actions for the exact committed diff still on screen. This is deliberately
-/// not a durable review target: Compare keeps its review target, while History
+/// not durable product state: Compare keeps its target, while History
 /// pins the already-resolved direct endpoint basis.
 pub const PresentationIdentity = union(enum) {
-    review_target: committed_review.CommittedReviewTarget,
-    diff_basis: git_committed_review.CommittedDiffBasis,
+    target: commit_diff.Target,
+    diff_basis: commit_diff.Basis,
 
     pub fn eql(self: PresentationIdentity, other: PresentationIdentity) bool {
         return switch (self) {
-            .review_target => |target| switch (other) {
-                .review_target => |candidate| target.eql(&candidate),
+            .target => |target| switch (other) {
+                .target => |candidate| target.eql(&candidate),
                 .diff_basis => false,
             },
             .diff_basis => |basis| switch (other) {
-                .review_target => false,
+                .target => false,
                 .diff_basis => |candidate| std.meta.eql(basis, candidate),
             },
         };
@@ -56,8 +55,8 @@ pub const PresentationIdentity = union(enum) {
 pub const PinnedSelectionBasis = struct {
     identity: PresentationIdentity,
 
-    pub fn init(target: committed_review.CommittedReviewTarget) PinnedSelectionBasis {
-        return .{ .identity = .{ .review_target = target } };
+    pub fn init(target: commit_diff.Target) PinnedSelectionBasis {
+        return .{ .identity = .{ .target = target } };
     }
 
     pub fn initIdentity(identity: PresentationIdentity) PinnedSelectionBasis {
@@ -74,13 +73,13 @@ pub const SurfaceOwner = struct {
     status: *app_state.StatusMessage,
     source: diff_source.SourceMode,
     layout: diff_surface.Layout,
-    current_target: ?committed_review.CommittedReviewTarget,
+    current_target: ?commit_diff.Target,
     presentation_identity: ?PresentationIdentity = null,
     live_drag_deferred_source: bool,
 
     fn currentPresentation(self: SurfaceOwner) ?PresentationIdentity {
         return self.presentation_identity orelse if (self.current_target) |target|
-            PresentationIdentity{ .review_target = target }
+            PresentationIdentity{ .target = target }
         else
             null;
     }
@@ -91,13 +90,13 @@ pub const ReadSurfaceOwner = struct {
     status: *const app_state.StatusMessage,
     source: diff_source.SourceMode,
     layout: diff_surface.Layout,
-    current_target: ?committed_review.CommittedReviewTarget,
+    current_target: ?commit_diff.Target,
     presentation_identity: ?PresentationIdentity = null,
     live_drag_deferred_source: bool,
 
     fn currentPresentation(self: ReadSurfaceOwner) ?PresentationIdentity {
         return self.presentation_identity orelse if (self.current_target) |target|
-            PresentationIdentity{ .review_target = target }
+            PresentationIdentity{ .target = target }
         else
             null;
     }
@@ -150,10 +149,10 @@ pub const State = struct {
 
     pub fn retainedSelectionInstallAvailable(
         self: *const State,
-        current_target: ?committed_review.CommittedReviewTarget,
+        current_target: ?commit_diff.Target,
     ) bool {
         return self.retainedSelectionInstallAvailableWithIdentity(if (current_target) |target|
-            .{ .review_target = target }
+            .{ .target = target }
         else
             null);
     }
@@ -167,10 +166,10 @@ pub const State = struct {
 
     pub fn retainedSelectionAdmitted(
         self: *const State,
-        current_target: ?committed_review.CommittedReviewTarget,
+        current_target: ?commit_diff.Target,
     ) bool {
         return self.retainedSelectionAdmittedWithIdentity(if (current_target) |target|
-            .{ .review_target = target }
+            .{ .target = target }
         else
             null);
     }
@@ -195,10 +194,10 @@ pub const State = struct {
 
     pub fn installPinnedSelectionBasis(
         self: *State,
-        current_target: ?committed_review.CommittedReviewTarget,
+        current_target: ?commit_diff.Target,
     ) bool {
         return self.installPinnedPresentationIdentity(if (current_target) |target|
-            .{ .review_target = target }
+            .{ .target = target }
         else
             null);
     }
@@ -244,16 +243,16 @@ pub const State = struct {
         repo_epoch: u64,
         root_identity: ?root_capability.Identity,
         source: diff_source.SourceMode,
-        current_target: ?committed_review.CommittedReviewTarget,
-        incoming_target: committed_review.CommittedReviewTarget,
+        current_target: ?commit_diff.Target,
+        incoming_target: commit_diff.Target,
         incoming_diff: *const app_load.CommittedDiffBundle,
     ) bool {
         return self.retainedSelectionTransfersWithIdentity(
             repo_epoch,
             root_identity,
             source,
-            if (current_target) |target| .{ .review_target = target } else null,
-            .{ .review_target = incoming_target },
+            if (current_target) |target| .{ .target = target } else null,
+            .{ .target = incoming_target },
             incoming_diff,
         );
     }
@@ -300,7 +299,7 @@ pub const State = struct {
         repo_root: ?[]const u8,
         root_identity: ?root_capability.Identity,
         source: diff_source.SourceMode,
-        current_target: committed_review.CommittedReviewTarget,
+        current_target: commit_diff.Target,
         pair_changed: bool,
         transfer_selection: bool,
         incoming: *app_load.CommittedDiffBundle,
@@ -311,7 +310,7 @@ pub const State = struct {
             repo_root,
             root_identity,
             source,
-            .{ .review_target = current_target },
+            .{ .target = current_target },
             pair_changed,
             transfer_selection,
             incoming,
@@ -492,11 +491,11 @@ test "committed diff state owns shared navigation without page target authority"
     try std.testing.expect(surface.viewer == &state.viewer);
 }
 
-test "committed diff selection pin admits one exact History basis without changing review targets" {
+test "committed diff selection pin admits one exact History basis without changing targets" {
     var state: State = .{};
-    const before = try git_committed_review.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
-    const after = try git_committed_review.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
-    const basis: git_committed_review.CommittedDiffBasis = .{
+    const before = try commit_diff.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const after = try commit_diff.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const basis: commit_diff.Basis = .{
         .object_format = .sha1,
         .before = .{ .commit = before },
         .after = after,

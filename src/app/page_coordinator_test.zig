@@ -19,7 +19,7 @@ const changes_page = @import("pages/changes.zig");
 const changes_content = @import("pages/changes/content.zig");
 const changes_navigation = @import("pages/changes/navigation.zig");
 const changes_authority = @import("diff_surface/authority.zig");
-const committed_review = @import("../committed_review.zig");
+const commit_diff = @import("../git/commit_diff.zig");
 const context = @import("../context.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const diff_source = @import("../diff/source.zig");
@@ -220,7 +220,7 @@ test "page transition blocker leaves page and Changes state unchanged" {
 
 test "History commit detail blocks direct page switch without releasing owned state" {
     const allocator = std.testing.allocator;
-    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const oid = try commit_diff.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
     var app: TestApp = .{
         .allocator = allocator,
         .active_page = .history,
@@ -311,9 +311,8 @@ test "Compare retained selection survives page transitions and clears on reposit
         } },
     };
     app.pages.compare.diff.pinned_selection_basis = .{
-        .identity = .{ .review_target = .{
+        .identity = .{ .target = .{
             .object_format = .sha1,
-            .source_kind = .branch_range,
             .base_oid = .{},
             .head_oid = .{},
             .diff_base_oid = .{},

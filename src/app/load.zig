@@ -18,7 +18,7 @@ const diff_syntax_view = @import("../diff/syntax_view.zig");
 const diff_view_model = @import("../diff/view_model.zig");
 const file_tree = @import("../file_tree.zig");
 const git_command = @import("../git/command.zig");
-const git_committed_review = @import("../git/committed_review.zig");
+const commit_diff = @import("../git/commit_diff.zig");
 const git_compare = @import("../git/compare.zig");
 const git_history = @import("../git/history.zig");
 const git_read = @import("../git/read.zig");
@@ -187,7 +187,7 @@ pub const BranchListLoadFinished = struct {
     }
 };
 
-/// One atomically resolved Review read. Identity and generation remain beside
+/// One atomically resolved Compare read. Identity and generation remain beside
 /// the owned result until the Compare page accepts or rejects the completion.
 pub const CompareLoadFinished = struct {
     identity: page.RequestIdentity,
@@ -249,7 +249,7 @@ pub const HistoryCatalogFinished = struct {
 pub const HistoryDiffTaskResult = union(enum) {
     empty,
     loaded: CommittedDiffBundle,
-    unavailable: git_committed_review.ProjectionFailure,
+    unavailable: commit_diff.MaterializationFailure,
     failed_static: []const u8,
 
     pub fn deinit(self: *HistoryDiffTaskResult) void {
@@ -1587,8 +1587,8 @@ pub fn runCompareBranchListLoad(
 ) BranchListLoadTaskResult {
     var environment = git_command.LocalGitEnvironment.initFromParent(allocator, env_map) catch |err| {
         return .{
-            .failed = std.fmt.allocPrint(allocator, "Review base list failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Review base list failed: OutOfMemory" },
+            .failed = std.fmt.allocPrint(allocator, "Compare base list failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Compare base list failed: OutOfMemory" },
         };
     };
     defer environment.deinit();
@@ -1598,8 +1598,8 @@ pub fn runCompareBranchListLoad(
         .include_tip_committer_unix = true,
     }) catch |err| {
         return .{
-            .failed = std.fmt.allocPrint(allocator, "Review base list failed: {s}", .{@errorName(err)}) catch
-                return .{ .failed_static = "Review base list failed: OutOfMemory" },
+            .failed = std.fmt.allocPrint(allocator, "Compare base list failed: {s}", .{@errorName(err)}) catch
+                return .{ .failed_static = "Compare base list failed: OutOfMemory" },
         };
     };
 
@@ -1622,7 +1622,7 @@ pub fn runHistoryDiffLoad(
         return .{ .unavailable = .projection_git_command_failed };
     }
 
-    var materialized = git_committed_review.materializeCommittedDiff(
+    var materialized = commit_diff.materializeBasis(
         allocator,
         io,
         context,
@@ -1739,9 +1739,8 @@ test "History exact diff load covers normal root merge range and allow-empty fro
     }
 }
 
-/// Resolve the Branch Review caller policy, then run the target, ahead, and
-/// projection operations separately. Only a fully parsed candidate is
-/// published as one accepted Review bundle.
+/// Resolve the Compare caller policy, then run target resolution, ahead count,
+/// and materialization separately. Only a fully parsed candidate is published.
 pub fn runCompareLoad(
     cwd: std.Io.Dir,
     target: ?diff_basis.BaseTarget,
@@ -1755,10 +1754,10 @@ pub fn runCompareLoad(
             .full_ref = value.full_ref,
             .display_name = value.display_name,
             .kind = value.kind,
-        }) catch |err| return reviewLoadError(allocator, "Review base policy failed", err)
+        }) catch |err| return compareLoadError(allocator, "Compare base policy failed", err)
     else selected: {
         var policy = git_compare.selectDefaultTarget(allocator, io, context) catch |err|
-            return reviewLoadError(allocator, "Review base policy failed", err);
+            return compareLoadError(allocator, "Compare base policy failed", err);
         defer policy.deinit(allocator);
         break :selected switch (policy) {
             .target => |selected_target| value: {
@@ -1766,71 +1765,70 @@ pub fn runCompareLoad(
                 break :value selected_target;
             },
             .missing => |attempted| {
-                return translateReviewBasisFailure(allocator, .missing_base_ref, .{
+                return translateCompareBasisFailure(allocator, .missing_base_ref, .{
                     .full_ref = attempted.full_ref,
                     .display_name = attempted.display_name,
                     .kind = attempted.kind,
                 });
             },
-            .failed => return .{ .failed_static = "Review base policy failed" },
+            .failed => return .{ .failed_static = "Compare base policy failed" },
         };
     };
     defer selected.deinit(allocator);
 
     var head_name = git_compare.readHeadName(allocator, io, context) catch |err|
-        return reviewLoadError(allocator, "Review head display failed", err);
+        return compareLoadError(allocator, "Compare head display failed", err);
     defer head_name.deinit(allocator);
-    if (head_name == .failed) return .{ .failed_static = "Review head display failed" };
+    if (head_name == .failed) return .{ .failed_static = "Compare head display failed" };
 
-    const target_result = git_committed_review.resolveTarget(allocator, io, context, .{
-        .source_kind = .branch_range,
+    const target_result = commit_diff.resolveTarget(allocator, io, context, .{
         .base = selected.full_ref,
         .head = "HEAD",
-    }) catch |err| return reviewLoadError(allocator, "Review target resolution failed", err);
+    }) catch |err| return compareLoadError(allocator, "Compare target resolution failed", err);
     const committed_target = switch (target_result) {
         .target => |resolved| resolved,
         .failure => |failure| return translateTargetResolutionFailure(allocator, failure, selected),
     };
 
-    const ahead_result = git_committed_review.computeAheadDisplay(allocator, io, context, committed_target) catch |err|
-        return reviewLoadError(allocator, "Review ahead display failed", err);
+    const ahead_result = commit_diff.computeAhead(allocator, io, context, committed_target) catch |err|
+        return compareLoadError(allocator, "Compare ahead count failed", err);
     const ahead_count_u64 = switch (ahead_result) {
         .count => |count| count,
-        .failure => |failure| return reviewOperationFailure(allocator, "Review ahead display failed", @tagName(failure)),
+        .failure => |failure| return compareOperationFailure(allocator, "Compare ahead count failed", @tagName(failure)),
     };
     const ahead_count = std.math.cast(usize, ahead_count_u64) orelse
-        return .{ .failed_static = "Review ahead display returned an invalid count" };
+        return .{ .failed_static = "Compare ahead count was invalid" };
 
-    var projection_result = git_committed_review.materializeCommittedProjection(allocator, io, context, committed_target) catch |err|
-        return reviewLoadError(allocator, "Review projection failed", err);
-    defer projection_result.deinit(allocator);
-    const patch = switch (projection_result) {
-        .projection => |*projection| projection.patch_bytes,
-        .failure => |failure| return reviewOperationFailure(allocator, "Review projection failed", @tagName(failure)),
+    var materialization_result = commit_diff.materializeTarget(allocator, io, context, committed_target) catch |err|
+        return compareLoadError(allocator, "Compare materialization failed", err);
+    defer materialization_result.deinit(allocator);
+    const patch = switch (materialization_result) {
+        .materialization => |*materialization| materialization.patch_bytes,
+        .failure => |failure| return compareOperationFailure(allocator, "Compare materialization failed", @tagName(failure)),
     };
 
     var diff: CommittedDiffBundle = if (patch.len == 0)
         .empty
     else
         .{ .loaded = buildLoadedBundleWithIo(allocator, io, patch) catch |err| {
-            return reviewLoadError(allocator, "Review diff parse failed", err);
+            return compareLoadError(allocator, "Compare diff parse failed", err);
         } };
     var diff_owned = true;
     defer if (diff_owned) diff.deinit();
 
     const full_ref = allocator.dupe(u8, selected.full_ref) catch
-        return .{ .failed_static = "Review load failed: OutOfMemory" };
+        return .{ .failed_static = "Compare load failed: OutOfMemory" };
     var full_ref_owned = true;
     defer if (full_ref_owned) allocator.free(full_ref);
     const display_name = allocator.dupe(u8, selected.display_name) catch
-        return .{ .failed_static = "Review load failed: OutOfMemory" };
+        return .{ .failed_static = "Compare load failed: OutOfMemory" };
     var display_name_owned = true;
     defer if (display_name_owned) allocator.free(display_name);
     const head_display = if (head_name.name) |name|
-        allocator.dupe(u8, name) catch return .{ .failed_static = "Review load failed: OutOfMemory" }
+        allocator.dupe(u8, name) catch return .{ .failed_static = "Compare load failed: OutOfMemory" }
     else
         std.fmt.allocPrint(allocator, "HEAD@{s}", .{committed_target.head_oid.short()}) catch
-            return .{ .failed_static = "Review load failed: OutOfMemory" };
+            return .{ .failed_static = "Compare load failed: OutOfMemory" };
     var head_display_owned = true;
     defer if (head_display_owned) allocator.free(head_display);
 
@@ -1855,28 +1853,28 @@ pub fn runCompareLoad(
 
 fn translateTargetResolutionFailure(
     allocator: std.mem.Allocator,
-    failure: git_committed_review.TargetResolutionFailure,
+    failure: commit_diff.TargetResolutionFailure,
     attempted: git_compare.CompareTarget,
 ) CompareLoadTaskResult {
     return switch (failure) {
-        .base_unresolved => translateReviewBasisFailure(allocator, .missing_base_ref, attempted),
-        .head_unresolved => translateReviewBasisFailure(allocator, .head_unresolved, attempted),
-        .no_merge_base => translateReviewBasisFailure(allocator, .no_merge_base, attempted),
-        else => reviewOperationFailure(allocator, "Review target resolution failed", @tagName(failure)),
+        .base_unresolved => translateCompareBasisFailure(allocator, .missing_base_ref, attempted),
+        .head_unresolved => translateCompareBasisFailure(allocator, .head_unresolved, attempted),
+        .no_merge_base => translateCompareBasisFailure(allocator, .no_merge_base, attempted),
+        else => compareOperationFailure(allocator, "Compare target resolution failed", @tagName(failure)),
     };
 }
 
-fn translateReviewBasisFailure(
+fn translateCompareBasisFailure(
     allocator: std.mem.Allocator,
     kind: diff_basis.BasisFailure,
     attempted: git_compare.CompareTarget,
 ) CompareLoadTaskResult {
     const full_ref = allocator.dupe(u8, attempted.full_ref) catch
-        return .{ .failed_static = "Review load failed: OutOfMemory" };
+        return .{ .failed_static = "Compare load failed: OutOfMemory" };
     var full_ref_owned = true;
     defer if (full_ref_owned) allocator.free(full_ref);
     const display_name = allocator.dupe(u8, attempted.display_name) catch
-        return .{ .failed_static = "Review load failed: OutOfMemory" };
+        return .{ .failed_static = "Compare load failed: OutOfMemory" };
     full_ref_owned = false;
     return .{ .basis_failed = .{
         .kind = kind,
@@ -1888,17 +1886,17 @@ fn translateReviewBasisFailure(
     } };
 }
 
-fn reviewOperationFailure(allocator: std.mem.Allocator, prefix: []const u8, code: []const u8) CompareLoadTaskResult {
+fn compareOperationFailure(allocator: std.mem.Allocator, prefix: []const u8, code: []const u8) CompareLoadTaskResult {
     return .{
         .failed = std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, code }) catch
-            return .{ .failed_static = "Review load failed: OutOfMemory" },
+            return .{ .failed_static = "Compare load failed: OutOfMemory" },
     };
 }
 
-fn reviewLoadError(allocator: std.mem.Allocator, prefix: []const u8, err: anyerror) CompareLoadTaskResult {
+fn compareLoadError(allocator: std.mem.Allocator, prefix: []const u8, err: anyerror) CompareLoadTaskResult {
     return .{
         .failed = std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, @errorName(err) }) catch
-            return .{ .failed_static = "Review load failed: OutOfMemory" },
+            return .{ .failed_static = "Compare load failed: OutOfMemory" },
     };
 }
 
@@ -3731,7 +3729,7 @@ test "runCompareLoad clean committed projection preserves text binary add delete
     }, &environment, allocator, io);
     defer failed.deinit(allocator);
     switch (failed) {
-        .failed => |message| try std.testing.expect(std.mem.startsWith(u8, message, "Review projection failed: projection_git_command_failed")),
+        .failed => |message| try std.testing.expect(std.mem.startsWith(u8, message, "Compare materialization failed: projection_git_command_failed")),
         else => return error.ExpectedProjectionFailure,
     }
 }
@@ -3759,7 +3757,7 @@ test "runCompareLoad treats empty diff as success and labels detached head" {
             try std.testing.expectEqual(@as(usize, 0), bundle.basis.ahead_count);
             try std.testing.expect(bundle.diff == .empty);
         },
-        else => return error.ExpectedEmptyReviewLoad,
+        else => return error.ExpectedEmptyCompareLoad,
     }
 }
 
@@ -3950,7 +3948,7 @@ test "Compare task translation keeps basis failure kinds and attempted target" {
         .{ .kind = .head_unresolved },
     };
     for (cases) |case| {
-        var result = translateReviewBasisFailure(allocator, case.kind, .{
+        var result = translateCompareBasisFailure(allocator, case.kind, .{
             .full_ref = @constCast("refs/heads/base"),
             .display_name = @constCast("base"),
             .kind = .local,

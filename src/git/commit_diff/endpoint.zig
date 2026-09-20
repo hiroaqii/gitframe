@@ -1,4 +1,4 @@
-//! Closed v1 grammar for commit-ish endpoints admitted by strict resolution.
+//! Closed grammar for commit-ish endpoints admitted by strict resolution.
 //!
 //! The parser recognizes a bounded base token followed only by enumerated
 //! ancestry/commit-peel suffixes; it does not delegate arbitrary extended SHA
@@ -14,7 +14,7 @@ pub const max_suffixes: usize = 64;
 /// The input is outside the closed grammar; it is not a Git resolution result.
 pub const ParseError = error{UnsupportedCommitish};
 
-/// A fully preflighted member of the v1 closed commit-ish language. `base`
+/// A fully preflighted member of the closed commit-ish language. `base`
 /// and `suffix_text` borrow the caller's input; no unvalidated bytes are ever
 /// passed to an object command.
 pub const Parsed = struct {

@@ -1,1 +1,0 @@
-{"schema_version":1,"status":"error","error":{"code":"projection_too_large","message":"committed projection exceeds the 16 MiB limit"}}

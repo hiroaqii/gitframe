@@ -350,7 +350,6 @@ test "undelivered remaining read routes release owned payloads" {
                 .head_display = try allocator.dupe(u8, "feature"),
                 .target = .{
                     .object_format = .sha1,
-                    .source_kind = .branch_range,
                     .base_oid = .{},
                     .head_oid = .{},
                     .diff_base_oid = .{},

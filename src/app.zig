@@ -1968,8 +1968,8 @@ test "command line keeps input across resize and cancels on focus or page transi
 
 test "History commit detail copy is wired through the root shell effect terminal" {
     const allocator = std.testing.allocator;
-    const committed_review = @import("committed_review.zig");
-    const oid = try committed_review.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    const commit_diff = @import("git/commit_diff.zig");
+    const oid = try commit_diff.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
     var app: App = .{
         .allocator = allocator,
         .active_page = .history,
