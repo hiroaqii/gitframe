@@ -5,6 +5,7 @@ const diff_surface = @import("../diff_surface.zig");
 const context = @import("../../context.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const drag_auto_scroll = @import("../drag_auto_scroll.zig");
+const content_view = @import("content.zig");
 const navigation = @import("navigation.zig");
 const message = @import("message.zig");
 const selection = @import("selection.zig");
@@ -20,11 +21,13 @@ pub const Redraw = enum { default, skip };
 /// Owned output which a page adapter translates into its physical effect.
 pub const Effect = union(enum) {
     copy_diff_selection: SelectionCopy,
+    copy_hunk_diff: []u8,
     copy_diff_header_path: diff_selection.HeaderPathSelection,
 
     pub fn deinit(self: *Effect, allocator: ?std.mem.Allocator) void {
         switch (self.*) {
             .copy_diff_selection => |copy| (allocator orelse unreachable).free(copy.text),
+            .copy_hunk_diff => |text| (allocator orelse unreachable).free(text),
             .copy_diff_header_path => |*header| (allocator orelse unreachable).free(header.identity.path_key),
         }
         self.* = undefined;
@@ -61,10 +64,10 @@ pub const RetentionTransition = enum {
 
 pub const Hook = struct {
     ctx: *anyopaque,
-    callback: *const fn (ctx: *anyopaque) void,
+    callback: *const fn (ctx: *anyopaque, cleanup: navigation.SelectionMappingCleanup) void,
 
-    pub fn call(self: Hook) void {
-        self.callback(self.ctx);
+    pub fn call(self: Hook, cleanup: navigation.SelectionMappingCleanup) void {
+        self.callback(self.ctx, cleanup);
     }
 };
 
@@ -83,8 +86,30 @@ pub const Controller = struct {
     /// can use the shared body operation directly.
     toggle_hunk_fold: ?Hook = null,
     retained_selection_install: ?InstallHook = null,
+    selection_mapping_residual: ?navigation.ResidualSelectionOwner = null,
 
     pub fn apply(self: Controller, allocator: ?std.mem.Allocator, msg: message.Msg) !Update {
+        const retained_before = self.navigation.controller.surface.completed_selection.* != null;
+        const cleanup: ?navigation.SelectionMappingCleanup = if (allocator) |owner|
+            .{
+                .allocator = owner,
+                .residual_owner = self.selection_mapping_residual,
+            }
+        else
+            null;
+        var result = try self.applyWithMappingCleanup(allocator, cleanup, msg);
+        if (retained_before and self.navigation.controller.surface.completed_selection.* == null) {
+            result.retention_transition = .cleared;
+        }
+        return result;
+    }
+
+    fn applyWithMappingCleanup(
+        self: Controller,
+        allocator: ?std.mem.Allocator,
+        mapping_cleanup: ?navigation.SelectionMappingCleanup,
+        msg: message.Msg,
+    ) !Update {
         const tracks_wheel_redraw = isMouseWheel(msg);
         const wheel_before = if (tracks_wheel_redraw) wheelSnapshot(self.navigation) else undefined;
         const tracks_navigation = tracksDisplayNavigation(msg);
@@ -99,8 +124,8 @@ pub const Controller = struct {
 
         var result: Update = .{};
         switch (msg) {
-            .select_previous_file => self.navigation.selectFileDelta(-1),
-            .select_next_file => self.navigation.selectFileDelta(1),
+            .select_previous_file => self.navigation.selectFileDelta(mapping_cleanup orelse return error.MissingAllocator, -1),
+            .select_next_file => self.navigation.selectFileDelta(mapping_cleanup orelse return error.MissingAllocator, 1),
             .toggle_directory => try self.navigation.toggleSelectedDirectory(),
             .expand_directory => try self.navigation.expandSelectedDirectory(),
             .collapse_or_parent_directory => try self.navigation.collapseOrSelectParentDirectory(),
@@ -118,9 +143,12 @@ pub const Controller = struct {
             .page_diff_down => self.navigation.moveDiffCursorPage(.down),
             .select_previous_hunk => self.navigation.selectHunkDelta(-1),
             .select_next_hunk => self.navigation.selectHunkDelta(1),
-            .toggle_hunk_fold => if (self.toggle_hunk_fold) |hook| hook.call() else self.navigation.toggleSelectedHunkFold(),
-            .select_first_file => self.navigation.selectFileAbsolute(0),
-            .select_last_file => self.navigation.selectLastFile(),
+            .toggle_hunk_fold => if (self.navigation.view().bodyAllowsHunkFold())
+                self.navigation.toggleSelectedHunkFold(mapping_cleanup orelse return error.MissingAllocator)
+            else if (self.toggle_hunk_fold) |hook|
+                hook.call(mapping_cleanup orelse return error.MissingAllocator),
+            .select_first_file => self.navigation.selectFileAbsolute(mapping_cleanup orelse return error.MissingAllocator, 0),
+            .select_last_file => self.navigation.selectLastFile(mapping_cleanup orelse return error.MissingAllocator),
             .toggle_focus => {
                 if (!self.navigation.controller.surface.viewer.sidebar_hidden) {
                     self.navigation.controller.surface.viewer.focus = self.navigation.controller.surface.viewer.focus.toggled();
@@ -129,19 +157,22 @@ pub const Controller = struct {
                     }
                 }
             },
-            .toggle_sidebar_visibility => self.navigation.toggleSidebarVisibility(),
-            .decrease_sidebar_width => self.navigation.adjustSidebarWidth(.shrink),
-            .increase_sidebar_width => self.navigation.adjustSidebarWidth(.grow),
+            .toggle_sidebar_visibility => self.navigation.toggleSidebarVisibility(mapping_cleanup orelse return error.MissingAllocator),
+            .decrease_sidebar_width => self.navigation.adjustSidebarWidth(mapping_cleanup orelse return error.MissingAllocator, .shrink),
+            .increase_sidebar_width => self.navigation.adjustSidebarWidth(mapping_cleanup orelse return error.MissingAllocator, .grow),
             .focus_sidebar => _ = self.navigation.controller.focusSidebar(),
             .focus_diff => self.navigation.controller.surface.viewer.focus = .diff,
-            .sidebar_click_node => |node_index| try self.navigation.clickSidebarNode(node_index),
+            .sidebar_click_node => |node_index| try self.navigation.clickSidebarNode(
+                mapping_cleanup orelse return error.MissingAllocator,
+                node_index,
+            ),
             .mouse_sidebar_wheel_up => {
                 _ = self.navigation.controller.focusSidebar();
-                self.navigation.selectFileDelta(-1);
+                self.navigation.selectFileDelta(mapping_cleanup orelse return error.MissingAllocator, -1);
             },
             .mouse_sidebar_wheel_down => {
                 _ = self.navigation.controller.focusSidebar();
-                self.navigation.selectFileDelta(1);
+                self.navigation.selectFileDelta(mapping_cleanup orelse return error.MissingAllocator, 1);
             },
             .mouse_diff_wheel_up => {
                 self.navigation.controller.surface.viewer.focus = .diff;
@@ -162,7 +193,7 @@ pub const Controller = struct {
             .mouse_diff_press => |point| {
                 if (self.navigation.view().selectionActionHit(point)) |hit| {
                     self.navigation.controller.surface.viewer.focus = .diff;
-                    if (hit.target) |target| self.applyCompletedSelectionAction(
+                    if (hit.target) |target| self.applyStatusSelectionAction(
                         allocator orelse return error.MissingAllocator,
                         target,
                         &result,
@@ -191,7 +222,7 @@ pub const Controller = struct {
                 const active = self.navigation.controller.surface.selection_owner.activeDiff();
                 if (!self.navigation.switchKeyboardSelectionSide(side) and
                     active != null and active.?.origin == .keyboard_line and
-                    active.?.selected_line_count == 1 and active.?.side != side)
+                    active.?.selected_line_count == 1 and active.?.selectedSide() != side)
                 {
                     self.navigation.controller.setStatus("No matching line on that selection side", .{});
                 }
@@ -203,14 +234,14 @@ pub const Controller = struct {
             .keyboard_line_selection_move => |direction| _ = self.navigation.moveKeyboardLineSelection(direction),
             .selection_action_unavailable => self.navigation.controller.setStatus("Ask is not available for this selection", .{}),
             .toggle_display_mode => {
-                const selection_anchor = self.navigation.captureSelectionViewportAnchor();
-                self.navigation.controller.clearDiffSelection();
+                const cleanup = mapping_cleanup orelse return error.MissingAllocator;
+                const prepared = cleanup.prepare(self.navigation);
                 const old_mode = self.navigation.controller.view().effectiveDisplayMode();
                 const old_scroll = self.navigation.view().renderDiffScroll();
                 self.navigation.controller.surface.viewer.display_mode = self.navigation.controller.surface.viewer.display_mode.toggled();
                 const new_mode = self.navigation.controller.view().effectiveDisplayMode();
                 self.navigation.controller.surface.viewer.diff_scroll = self.navigation.view().remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
-                if (selection_anchor) |anchor| self.navigation.restoreSelectionViewportAnchor(anchor);
+                cleanup.complete(self.navigation, prepared);
                 self.navigation.controller.resetDiffHorizontalScroll();
                 self.navigation.updateSearchMatchOffset();
                 self.navigation.scrollSearchMatchIntoView();
@@ -221,20 +252,14 @@ pub const Controller = struct {
                 self.navigation.clampDiffHorizontalScrollToVisibleRows();
             },
             .enter_search => {
-                if (self.navigation.controller.surface.completed_selection.* != null) {
-                    self.navigation.controller.clearCompletedSelectionWithViewport(
-                        self.navigation.resolver,
-                        allocator orelse return error.MissingAllocator,
-                    );
-                    result.retention_transition = .cleared;
-                } else if (self.navigation.controller.surface.selection_owner.* != .none) {
+                if (self.navigation.controller.surface.selection_owner.* != .none) {
                     self.navigation.controller.clearDiffSelection();
                 }
                 self.navigation.enterSearchMode();
             },
             .cancel_search => self.navigation.controller.cancelSearchMode(),
             .clear_search => self.navigation.controller.clearSearch(),
-            .submit_search => self.navigation.submitSearch(),
+            .submit_search => self.navigation.submitSearch(mapping_cleanup orelse return error.MissingAllocator),
             .search_insert => |codepoint| self.navigation.controller.surface.search.input.insert(codepoint) catch {
                 self.navigation.controller.setStatus("search query is too long", .{});
             },
@@ -244,11 +269,14 @@ pub const Controller = struct {
             .search_backspace => self.navigation.controller.surface.search.input.backspace(),
             .search_move_left => self.navigation.controller.surface.search.input.moveLeft(),
             .search_move_right => self.navigation.controller.surface.search.input.moveRight(),
-            .select_next_search_match => self.navigation.selectSearchMatch(.forward),
-            .select_previous_search_match => self.navigation.selectSearchMatch(.backward),
+            .select_next_search_match => self.navigation.selectSearchMatch(mapping_cleanup orelse return error.MissingAllocator, .forward),
+            .select_previous_search_match => self.navigation.selectSearchMatch(mapping_cleanup orelse return error.MissingAllocator, .backward),
             .enter_file_search => self.navigation.controller.enterFileSearchMode(allocator orelse return error.MissingAllocator),
             .cancel_file_search => self.navigation.controller.cancelFileSearchMode(allocator orelse return error.MissingAllocator),
-            .submit_file_search => self.navigation.submitFileSearch(allocator orelse return error.MissingAllocator),
+            .submit_file_search => self.navigation.submitFileSearch(
+                mapping_cleanup orelse return error.MissingAllocator,
+                allocator orelse return error.MissingAllocator,
+            ),
             .file_search_previous => self.navigation.controller.surface.file_search.move(-1),
             .file_search_next => self.navigation.controller.surface.file_search.move(1),
             // Prepare fixed-capacity edits by value so overflow and a missing
@@ -280,9 +308,18 @@ pub const Controller = struct {
                 self.navigation.controller.surface.file_search.input = prepared;
                 self.navigation.controller.rebuildFileSearchProjection(owner);
             },
-            .toggle_reviewed_file => try self.navigation.toggleReviewedFile(allocator orelse return error.MissingAllocator),
-            .toggle_hide_reviewed_files => try self.navigation.toggleHideReviewedFiles(allocator orelse return error.MissingAllocator),
-            .cycle_changed_file_filter => try self.navigation.cycleChangedFileFilter(allocator orelse return error.MissingAllocator),
+            .toggle_reviewed_file => try self.navigation.toggleReviewedFile(
+                mapping_cleanup orelse return error.MissingAllocator,
+                allocator orelse return error.MissingAllocator,
+            ),
+            .toggle_hide_reviewed_files => try self.navigation.toggleHideReviewedFiles(
+                mapping_cleanup orelse return error.MissingAllocator,
+                allocator orelse return error.MissingAllocator,
+            ),
+            .cycle_changed_file_filter => try self.navigation.cycleChangedFileFilter(
+                mapping_cleanup orelse return error.MissingAllocator,
+                allocator orelse return error.MissingAllocator,
+            ),
         }
 
         if (!std.meta.eql(selected_target_before, self.navigation.controller.surface.viewer.selected_target) or
@@ -424,6 +461,38 @@ pub const Controller = struct {
         }
     }
 
+    fn applyStatusSelectionAction(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        action: selection_action.StatusAction,
+        result: *Update,
+    ) void {
+        if (action.retained()) |retained| {
+            self.applyCompletedSelectionAction(allocator, retained, result);
+            return;
+        }
+        switch (action) {
+            .copy, .clear => unreachable,
+            .copy_hunk => {},
+        }
+
+        const presentation = self.navigation.view().selectionPresentation() orelse return;
+        if (presentation.view.content != .unified_diff) return;
+        var content = (content_view.View{ .navigation = self.navigation.view() }).selectedHunkCopyText(allocator) catch {
+            self.navigation.controller.setStatus("Could not prepare hunk diff for copying", .{});
+            return;
+        };
+        defer content.deinit(allocator);
+        switch (content) {
+            .ready => |text| {
+                content = .no_hunk;
+                result.effect = .{ .copy_hunk_diff = text };
+            },
+            .no_hunk => self.navigation.controller.setStatus("no hunk selected", .{}),
+            .no_new_side => unreachable,
+        }
+    }
+
     fn completeKeyboardSelection(self: Controller, allocator: std.mem.Allocator, result: *Update) bool {
         const drag = self.navigation.controller.surface.selection_owner.activeDiff() orelse return false;
         if (drag.origin != .keyboard_line) return false;
@@ -484,12 +553,26 @@ pub const Controller = struct {
         return switch (drag.identity) {
             .loaded_file, .projection_file => blk: {
                 const target = self.navigation.view().parsedSelectionTarget(drag.identity) orelse return error.StaleSelection;
-                break :blk try selection.buildParsed(allocator, token, target.file, drag);
+                break :blk try selection.buildParsedFolded(
+                    allocator,
+                    token,
+                    target.file,
+                    target.folded_hunks,
+                    self.navigation.controller.surface.selection_layout_revision.*,
+                    drag,
+                );
             },
             .generated_file => |generated| blk: {
                 const body = self.navigation.view().generatedBody() orelse return error.StaleSelection;
                 if (!std.mem.eql(u8, generated.path_key, body.path)) return error.StaleSelection;
-                break :blk try selection.buildGenerated(allocator, token, body.path, body.source, drag);
+                break :blk try selection.buildGeneratedForLayout(
+                    allocator,
+                    token,
+                    body.path,
+                    body.source,
+                    self.navigation.controller.surface.selection_layout_revision.*,
+                    drag,
+                );
             },
         };
     }
@@ -645,6 +728,7 @@ test "takeEffect transfers the sole payload owner" {
             try std.testing.expectEqualStrings("transferred text", copy.text);
             try std.testing.expectEqual(@as(u64, 8), copy.generation);
         },
+        .copy_hunk_diff => return error.ExpectedSelectionEffect,
         .copy_diff_header_path => return error.ExpectedSelectionEffect,
     }
 }

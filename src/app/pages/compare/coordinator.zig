@@ -172,17 +172,18 @@ pub const Controller = struct {
         }
 
         var adapter = self.navigation().updateAdapter();
-        var body = adapter.bodyController();
+        const cleanup = adapter.selectionMappingCleanup(ctx.allocator());
+        const body = adapter.bodyController();
         if (body.controller.activeLoadedDiff()) |loaded| {
             if (self.page_state.diff.takeReloadAnchor()) |anchor_value| {
                 var anchor = anchor_value;
                 defer anchor.deinit(ctx.allocator());
-                _ = body.restoreReloadAnchor(loaded, &anchor);
+                _ = body.restoreReloadAnchor(cleanup, loaded, &anchor);
             } else {
                 body.controller.syncSidebarNodeToSelectedFile(loaded);
                 body.initializeDiffCursorForSelectedFile();
                 body.clampDiffNavigation();
-                body.refreshSearchForSelectedFile();
+                body.refreshSearchForSelectedFile(cleanup);
             }
             body.controller.rebuildFileSearchProjection(ctx.allocator());
         } else {

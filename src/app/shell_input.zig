@@ -568,8 +568,7 @@ test "History routes committed diff and bounded picker wheel through the shell" 
 
     selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "file.txt" } },
-        .side = .new,
-        .mode = .line,
+        .content = .{ .source_side = .{ .side = .new } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 0 },
         .anchor_cell = .{ .col = point.col, .row = point.row },

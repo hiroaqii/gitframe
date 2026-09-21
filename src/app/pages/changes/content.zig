@@ -39,6 +39,7 @@ pub const EditorTargetResult = union(enum) {
 };
 
 pub const HunkCopyResult = diff_surface.content.HunkCopyResult;
+pub const LineCopyResult = diff_surface.content.LineCopyResult;
 
 pub const View = struct {
     page: *const changes_page.ChangesPageState,
@@ -135,9 +136,9 @@ pub const View = struct {
         );
     }
 
-    pub fn currentLineCopyText(self: View) ?[]const u8 {
+    pub fn currentLineCopyText(self: View, allocator: std.mem.Allocator) !?LineCopyResult {
         var adapter = self.navigation.contentResolverAdapter();
-        return self.navigation.contentView(&adapter).currentLineCopyText();
+        return self.navigation.contentView(&adapter).currentLineCopyText(allocator);
     }
 
     pub fn selectedHunkCopyText(self: View, allocator: std.mem.Allocator) !HunkCopyResult {

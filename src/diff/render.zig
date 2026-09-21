@@ -1762,13 +1762,13 @@ fn unifiedSelectionForLine(options: RenderOptions, rows: diff_view_model.BodyRow
     const selection = options.selection orelse return null;
     const hunk_index = rows.currentHunkIndex() orelse return null;
     const line_index = rows.currentUnifiedLineIndex() orelse return null;
-    return diff_selection.visualRangeForLine(selection, hunk_index, line_index, line, selection.side);
+    return diff_selection.visualRangeForLine(selection, hunk_index, line_index, line, null);
 }
 
 fn generatedUnifiedSelection(options: RenderOptions, line_index: usize, line: diff_parser.DiffLine) ?diff_selection.LineVisualRange {
     const selection = options.selection orelse return null;
     if (selection.identity != .generated_file) return null;
-    return diff_selection.visualRangeForLine(selection, 0, line_index, line, .new);
+    return diff_selection.visualRangeForLine(selection, 0, line_index, line, if (selection.content == .unified_diff) null else .new);
 }
 
 fn generatedSideBySideSelection(options: RenderOptions, line_index: usize, line: diff_parser.DiffLine) ?SideBySideSelection {
@@ -1877,7 +1877,8 @@ fn sideBySideSelectionForLine(options: RenderOptions, file: diff_parser.FileDiff
     const selection = options.selection orelse return null;
     _ = file;
     const hunk_index = hunk_index_opt orelse return null;
-    return switch (selection.side) {
+    const source = selection.sourceSide() orelse return null;
+    return switch (source.side) {
         .old => if (diff_selection.visualRangeForLine(selection, hunk_index, line.line_index, line.line, .old)) |range| .{ .old = range } else null,
         .new => if (diff_selection.visualRangeForLine(selection, hunk_index, line.line_index, line.line, .new)) |range| .{ .new = range } else null,
     };
@@ -2615,8 +2616,7 @@ test "full-row diff background preserves cursor and selection precedence" {
         .syntax = .initDirect(&spans, 0),
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .new,
-            .mode = .character,
+            .content = .unified_diff,
             .start = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
             .end = .{ .hunk_index = 0, .line_index = 0, .leading = 2, .trailing = 3 },
         },
@@ -2627,10 +2627,10 @@ test "full-row diff background preserves cursor and selection precedence" {
     const pane_bg = palette.color(.pane_cursor_bg);
     const selection_bg = palette.color(.diff_selection_bg);
     try std.testing.expect(character.surface.readCell(0, row).?.style.bg.eql(pane_bg));
-    try std.testing.expect(character.surface.readCell(text_col, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(character.surface.readCell(text_col, row).?.style.bg.eql(selection_bg));
     try std.testing.expect(character.surface.readCell(text_col + 1, row).?.style.bg.eql(selection_bg));
     try std.testing.expect(character.surface.readCell(text_col + 2, row).?.style.bg.eql(selection_bg));
-    try std.testing.expect(character.surface.readCell(79, row).?.style.bg.eql(pane_bg));
+    try std.testing.expect(character.surface.readCell(79, row).?.style.bg.eql(selection_bg));
     try std.testing.expect(character.surface.readCell(text_col + 1, row).?.style.fg.eql(palette.color(.syntax_keyword)));
 
     const paired_file: diff_parser.FileDiff = .{
@@ -2659,7 +2659,7 @@ test "full-row diff background preserves cursor and selection precedence" {
         .palette = palette,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .old,
+            .content = .{ .source_side = .{ .side = .old } },
             .start = .{ .hunk_index = 0, .line_index = 0 },
             .end = .{ .hunk_index = 0, .line_index = 0 },
         },
@@ -3373,7 +3373,7 @@ test "renderFile highlights only the selected side-by-side pane side" {
         .requested_mode = .side_by_side,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .old,
+            .content = .{ .source_side = .{ .side = .old } },
             .start = .{ .hunk_index = 0, .line_index = 0 },
             .end = .{ .hunk_index = 0, .line_index = 0 },
         },
@@ -3392,7 +3392,7 @@ test "renderFile highlights only the selected side-by-side pane side" {
     try std.testing.expect(new_body.style.bg.eql(palette.color(.diff_added_bg)));
 }
 
-test "review diff cursor character selection preserves syntax without stage dim" {
+test "review diff cursor unified whole-row selection preserves syntax without stage dim" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
     defer ts.deinit();
@@ -3427,10 +3427,9 @@ test "review diff cursor character selection preserves syntax without stage dim"
         .hunk_stages = .all_staged,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .new,
-            .mode = .character,
-            .start = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
-            .end = .{ .hunk_index = 0, .line_index = 0, .leading = 2, .trailing = 3 },
+            .content = .unified_diff,
+            .start = .{ .hunk_index = 0, .line_index = 0 },
+            .end = .{ .hunk_index = 0, .line_index = 0 },
         },
     });
 
@@ -3442,14 +3441,11 @@ test "review diff cursor character selection preserves syntax without stage dim"
     const pane_bg = palette.color(.pane_cursor_bg);
     try std.testing.expect(ts.surface.readCell(0, 4).?.style.bg.eql(pane_bg));
     try std.testing.expect(ts.surface.readCell(1, 4).?.style.bg.eql(pane_bg));
-    try std.testing.expect(ts.surface.readCell(5, 4).?.style.bg.eql(pane_bg));
-    try std.testing.expect(ts.surface.readCell(10, 4).?.style.bg.eql(pane_bg));
-    try std.testing.expect(ts.surface.readCell(12, 4).?.style.bg.eql(pane_bg));
-    try std.testing.expect(first.style.bg.eql(pane_bg));
+    try std.testing.expect(first.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(selected_b.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(selected_c.style.bg.eql(palette.color(.diff_selection_bg)));
-    try std.testing.expect(last.style.bg.eql(pane_bg));
-    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(last.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(selected_b.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(selected_c.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(!selected_b.style.dim);
@@ -3485,8 +3481,7 @@ test "review diff cursor side-by-side character selection stays inside the locke
         .palette = palette,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .old,
-            .mode = .character,
+            .content = .{ .source_side = .{ .side = .old, .mode = .character } },
             .start = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
             .end = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
         },
@@ -3508,7 +3503,7 @@ test "review diff cursor side-by-side character selection stays inside the locke
     try std.testing.expect(ts.surface.readCell(99, 4).?.style.bg.eql(pane_bg));
 }
 
-test "review diff cursor TAB selection and syntax use the same multi-cell projection" {
+test "review diff cursor unified TAB row selection preserves syntax" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
     defer ts.deinit();
@@ -3542,34 +3537,28 @@ test "review diff cursor TAB selection and syntax use the same multi-cell projec
         .syntax = .initDirect(&spans, 0),
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .new,
-            .mode = .character,
-            .start = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
-            .end = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
+            .content = .unified_diff,
+            .start = .{ .hunk_index = 0, .line_index = 0 },
+            .end = .{ .hunk_index = 0, .line_index = 0 },
         },
     });
 
     const text_col = cursor_gutter_width + lineTextStart(true, .unified);
-    const pane_bg = palette.color(.pane_cursor_bg);
-    try std.testing.expect(ts.surface.readCell(text_col, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(text_col, 4).?.style.bg.eql(palette.color(.diff_selection_bg)));
     try expectBgRange(&ts.surface, 4, text_col + 1, text_col + 4, palette.color(.diff_selection_bg));
     const b = ts.surface.readCell(text_col + 4, 4).?;
-    try std.testing.expect(b.style.bg.eql(pane_bg));
+    try std.testing.expect(b.style.bg.eql(palette.color(.diff_selection_bg)));
     try std.testing.expect(b.style.fg.eql(palette.color(.syntax_keyword)));
-    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(palette.color(.diff_selection_bg)));
 }
 
-test "review diff cursor keeps wide combining and emoji graphemes atomic under character selection" {
+test "review diff cursor unified row keeps wide combining and emoji graphemes atomic" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(80, 6);
     defer ts.deinit();
 
     const palette = reviewCursorTestPalette();
     const text = "a界e\u{301}👩‍💻z";
-    const wide_start = 1;
-    const wide_end = wide_start + "界".len;
-    const emoji_start = wide_end + "e\u{301}".len;
-    const selected_end = text.len - 1;
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
         .old_path = "a/a",
@@ -3591,17 +3580,15 @@ test "review diff cursor keeps wide combining and emoji graphemes atomic under c
         .palette = palette,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .new,
-            .mode = .character,
-            .start = .{ .hunk_index = 0, .line_index = 0, .leading = wide_start, .trailing = wide_end },
-            .end = .{ .hunk_index = 0, .line_index = 0, .leading = emoji_start, .trailing = selected_end },
+            .content = .unified_diff,
+            .start = .{ .hunk_index = 0, .line_index = 0 },
+            .end = .{ .hunk_index = 0, .line_index = 0 },
         },
     });
 
     const text_col = cursor_gutter_width + lineTextStart(true, .unified);
-    const pane_bg = palette.color(.pane_cursor_bg);
     const selection_bg = palette.color(.diff_selection_bg);
-    try std.testing.expect(ts.surface.readCell(text_col, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(text_col, 4).?.style.bg.eql(selection_bg));
     // Vaxis stores a wide grapheme as one styled Cell with width 2, rather
     // than exposing its second occupied terminal column as another token.
     // Assert grapheme bytes and width together so a byte-interior or
@@ -3617,8 +3604,8 @@ test "review diff cursor keeps wide combining and emoji graphemes atomic under c
     try std.testing.expectEqualStrings("👩‍💻", emoji.char.grapheme);
     try std.testing.expectEqual(@as(u8, 2), emoji.char.width);
     try std.testing.expect(emoji.style.bg.eql(selection_bg));
-    try std.testing.expect(ts.surface.readCell(text_col + 6, 4).?.style.bg.eql(pane_bg));
-    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(pane_bg));
+    try std.testing.expect(ts.surface.readCell(text_col + 6, 4).?.style.bg.eql(selection_bg));
+    try std.testing.expect(ts.surface.readCell(79, 4).?.style.bg.eql(selection_bg));
 }
 
 test "renderFile normalizes highlighted side-by-side body base foreground" {
@@ -4633,7 +4620,7 @@ test "review diff cursor composes unified selection inside pane chrome" {
         .palette = palette,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .new,
+            .content = .unified_diff,
             .start = .{ .hunk_index = 0, .line_index = 0 },
             .end = .{ .hunk_index = 0, .line_index = 0 },
         },
@@ -4689,7 +4676,7 @@ test "review diff cursor keeps side-by-side separator outside selected side" {
         .palette = palette,
         .selection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .old,
+            .content = .{ .source_side = .{ .side = .old } },
             .start = .{ .hunk_index = 0, .line_index = 0 },
             .end = .{ .hunk_index = 0, .line_index = 0 },
         },

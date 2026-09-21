@@ -118,6 +118,9 @@ pub const Controller = struct {
         finished: *app_load.HistoryDiffFinished,
     ) !history_page.ApplyOutcome {
         const identity = self.currentIdentity() orelse return .discarded;
+        const previous_view = self.navigationView();
+        var previous_resolver = previous_view.resolver();
+        const transferred_viewport = previous_view.bodyView(&previous_resolver).captureSelectionViewportAnchor();
         const outcome = try self.page_state.applyDiffFinished(
             allocator,
             self.repo.activeRoot(),
@@ -125,7 +128,7 @@ pub const Controller = struct {
             self.repo.activeIdentity(),
             finished,
         );
-        if (outcome == .changed) self.commonCoordinator().initializeAcceptedBody(allocator);
+        if (outcome == .changed) self.commonCoordinator().initializeAcceptedBody(allocator, transferred_viewport);
         return outcome;
     }
 

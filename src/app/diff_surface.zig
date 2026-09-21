@@ -132,8 +132,7 @@ pub const MousePoint = struct { col: u16, row: u16 };
 
 pub const DiffMouseHit = struct {
     identity: diff_selection.Identity,
-    side: diff_selection.Side,
-    mode: diff_selection.Mode,
+    content: diff_selection.Content,
     point: diff_selection.Point,
 };
 

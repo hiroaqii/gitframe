@@ -803,16 +803,20 @@ fn installCanonicalPublicationLineageOwners(
         return error.ExpectedContentToken;
     const selection: diff_selection.DragSelection = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .line,
+        .content = if (app.changesNavigationView().effectiveDisplayMode() == .unified)
+            .unified_diff
+        else
+            .{ .source_side = .{ .side = .new } },
         .anchor = .{ .hunk_index = 1, .line_index = 0 },
         .focus = .{ .hunk_index = 1, .line_index = 0 },
         .moved = true,
     };
-    app.pages.changes.completed_selection = try content_selection.buildParsed(
+    app.pages.changes.completed_selection = try content_selection.buildParsedFolded(
         allocator,
         token,
         displayed,
+        app.changesNavigationView().selectedFoldedHunks(),
+        app.pages.changes.selection_layout_revision,
         selection,
     );
     try app.pages.changes.staged_hunks.addExact(allocator, repo_root, "a", .{
@@ -1317,7 +1321,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
 
     app.changesNavigation().enterSearchMode();
     setDiffSearchInput(&app, "new");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     const search_before = app.pages.changes.search.match orelse
         return error.ExpectedSearchMatch;
     const search_offset_before = app.pages.changes.search.match_offset;
@@ -2819,7 +2823,7 @@ test "Changes ordinary primary publication retains primary until cached result" 
 
         app.changesNavigation().enterSearchMode();
         setDiffSearchInput(&app, "new");
-        app.changesNavigation().submitSearch();
+        app.changesNavigation().submitSearch(std.testing.allocator);
         try std.testing.expect(app.pages.changes.search.match != null);
         const primary = switch (app.changesNavigationView().displayedChangesBody()) {
             .primary => |value| value,
@@ -3000,7 +3004,7 @@ test "Changes canonical publication exact acceptance retains navigation search a
 
     app.changesNavigation().enterSearchMode();
     setDiffSearchInput(&app, "staged");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     const search_before = app.pages.changes.search.match orelse return error.ExpectedSearchMatch;
     const search_offset_before = app.pages.changes.search.match_offset;
     app.pages.changes.viewer.diff_horizontal_scroll = 2;
@@ -3011,16 +3015,20 @@ test "Changes canonical publication exact acceptance retains navigation search a
         return error.ExpectedDisplayedDiff;
     const selection: diff_selection.DragSelection = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .line,
+        .content = if (app.changesNavigationView().effectiveDisplayMode() == .unified)
+            .unified_diff
+        else
+            .{ .source_side = .{ .side = .new } },
         .anchor = .{ .hunk_index = 1, .line_index = 0 },
         .focus = .{ .hunk_index = 1, .line_index = 0 },
         .moved = true,
     };
-    app.pages.changes.completed_selection = try content_selection.buildParsed(
+    app.pages.changes.completed_selection = try content_selection.buildParsedFolded(
         allocator,
         app.changesNavigationView().currentContentToken() orelse return error.ExpectedContentToken,
         displayed,
+        app.changesNavigationView().selectedFoldedHunks(),
+        app.pages.changes.selection_layout_revision,
         selection,
     );
     const selected_tail = app.changesNavigationView().displayedDiffLineCount() -|
@@ -4714,7 +4722,7 @@ test "cached preview keeps search input while projection is pending" {
     app.changesNavigation().enterSearchMode();
     try std.testing.expect(app.pages.changes.search.mode);
     setDiffSearchInput(&app, "staged");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     try std.testing.expect(!app.pages.changes.search.mode);
     try std.testing.expect(app.pages.changes.search.match == null);
     try std.testing.expectEqualStrings("staged", app.pages.changes.search.query.slice());
@@ -6633,7 +6641,7 @@ fn expectLaterDirectoryLikeSelectionAcrossRefresh(
     const activation_id = app.pageCoordinator().activateChanges();
     const loaded = app.changesNavigation().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     const selected_file = changes_navigation.findFileNodeByPathKey(loaded, "src/a") orelse return error.ExpectedSelectedFile;
-    app.changesNavigation().selectSidebarNode(loaded, selected_file);
+    app.changesNavigation().selectSidebarNode(std.testing.allocator, loaded, selected_file);
 
     app.pages.changes.status_load = .{ .generation = 7, .pending = .{ .generation = 7 } };
     if (order != .status_only) {

@@ -91,18 +91,33 @@ pub const Parsed = struct {
     canonical_path: []u8,
     old_path: ?[]u8,
     new_path: ?[]u8,
-    selected_path: []u8,
-    side: diff_selection.Side,
-    mode: diff_selection.Mode,
     range: diff_selection.Range,
-    fragments: diff_selection.OwnedFragments,
+    content: union(enum) {
+        source_side: SourceSide,
+        unified_diff: diff_selection.OwnedUnifiedDiff,
+
+        pub const SourceSide = struct {
+            selected_path: []u8,
+            side: diff_selection.Side,
+            mode: diff_selection.Mode,
+            fragments: diff_selection.OwnedFragments,
+
+            fn deinit(self: *SourceSide, allocator: std.mem.Allocator) void {
+                allocator.free(self.selected_path);
+                self.fragments.deinit(allocator);
+                self.* = undefined;
+            }
+        };
+    },
 
     fn deinit(self: *Parsed, allocator: std.mem.Allocator) void {
         allocator.free(self.canonical_path);
         if (self.old_path) |path| allocator.free(path);
         if (self.new_path) |path| allocator.free(path);
-        allocator.free(self.selected_path);
-        self.fragments.deinit(allocator);
+        switch (self.content) {
+            .source_side => |*source| source.deinit(allocator),
+            .unified_diff => |*unified| unified.deinit(allocator),
+        }
         self.* = undefined;
     }
 };
@@ -121,20 +136,35 @@ pub const GeneratedFragment = struct {
 
 pub const Generated = struct {
     path: []u8,
-    side: diff_selection.Side = .new,
-    mode: diff_selection.Mode,
     range: diff_selection.Range,
-    fragment: GeneratedFragment,
+    content: union(enum) {
+        source_side: SourceSide,
+        unified_diff: diff_selection.OwnedUnifiedDiff,
+
+        pub const SourceSide = struct {
+            mode: diff_selection.Mode,
+            fragment: GeneratedFragment,
+
+            fn deinit(self: *SourceSide, allocator: std.mem.Allocator) void {
+                self.fragment.deinit(allocator);
+                self.* = undefined;
+            }
+        };
+    },
 
     fn deinit(self: *Generated, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
-        self.fragment.deinit(allocator);
+        switch (self.content) {
+            .source_side => |*source| source.deinit(allocator),
+            .unified_diff => |*unified| unified.deinit(allocator),
+        }
         self.* = undefined;
     }
 };
 
 pub const CompletedSelection = struct {
     token: ContentToken,
+    selection_layout_revision: u64 = 0,
     value: union(enum) {
         parsed_diff: Parsed,
         generated_untracked: Generated,
@@ -157,22 +187,34 @@ pub const CompletedSelection = struct {
 
     pub fn lineCount(self: CompletedSelection) usize {
         return switch (self.value) {
-            .parsed_diff => |parsed| parsed.fragments.line_count,
-            .generated_untracked => |generated| generated.fragment.line_count,
+            .parsed_diff => |parsed| switch (parsed.content) {
+                .source_side => |source| source.fragments.line_count,
+                .unified_diff => |unified| unified.line_count,
+            },
+            .generated_untracked => |generated| switch (generated.content) {
+                .source_side => |source| source.fragment.line_count,
+                .unified_diff => |unified| unified.line_count,
+            },
         };
     }
 
     pub fn clipboardText(self: CompletedSelection, allocator: std.mem.Allocator) ![]u8 {
         return switch (self.value) {
-            .parsed_diff => |parsed| parsed.fragments.clipboardText(allocator),
-            .generated_untracked => |generated| blk: {
-                if (generated.mode != .line or generated.fragment.line_count < 2) {
-                    break :blk allocator.dupe(u8, generated.fragment.text);
-                }
-                const text = try allocator.alloc(u8, generated.fragment.text.len + 1);
-                @memcpy(text[0..generated.fragment.text.len], generated.fragment.text);
-                text[text.len - 1] = '\n';
-                break :blk text;
+            .parsed_diff => |parsed| switch (parsed.content) {
+                .source_side => |source| source.fragments.clipboardText(allocator),
+                .unified_diff => |unified| unified.clipboardText(allocator),
+            },
+            .generated_untracked => |generated| switch (generated.content) {
+                .source_side => |source| blk: {
+                    if (source.mode != .line or source.fragment.line_count < 2) {
+                        break :blk allocator.dupe(u8, source.fragment.text);
+                    }
+                    const text = try allocator.alloc(u8, source.fragment.text.len + 1);
+                    @memcpy(text[0..source.fragment.text.len], source.fragment.text);
+                    text[text.len - 1] = '\n';
+                    break :blk text;
+                },
+                .unified_diff => |unified| unified.clipboardText(allocator),
             },
         };
     }
@@ -184,38 +226,67 @@ pub fn buildParsed(
     file: diff_parser.FileDiff,
     selection: diff_selection.DragSelection,
 ) !CompletedSelection {
-    var fragments = try diff_selection.buildFragments(allocator, file, selection);
-    errdefer fragments.deinit(allocator);
-    if (fragments.items.len == 0) return error.EmptySelection;
+    return buildParsedFolded(allocator, token, file, &.{}, 1, selection);
+}
 
+pub fn buildParsedFolded(
+    allocator: std.mem.Allocator,
+    token: ContentToken,
+    file: diff_parser.FileDiff,
+    folded_hunks: []const bool,
+    selection_layout_revision: u64,
+    selection: diff_selection.DragSelection,
+) !CompletedSelection {
     const canonical = diff_file.canonicalPathKey(file) orelse return error.NoPath;
     const old_path = normalizedOptionalPath(file.old_path);
     const new_path = normalizedOptionalPath(file.new_path);
-    const selected_borrowed = switch (selection.side) {
-        .old => old_path,
-        .new => new_path,
-    } orelse return error.NoSelectedSidePath;
-
     const canonical_owned = try allocator.dupe(u8, canonical);
     errdefer allocator.free(canonical_owned);
     const old_owned = try dupeOptional(allocator, old_path);
     errdefer if (old_owned) |path| allocator.free(path);
     const new_owned = try dupeOptional(allocator, new_path);
     errdefer if (new_owned) |path| allocator.free(path);
-    const selected_owned = try allocator.dupe(u8, selected_borrowed);
-    errdefer allocator.free(selected_owned);
+    var content: @FieldType(Parsed, "content") = switch (selection.content) {
+        .source_side => |source| blk: {
+            var fragments = try diff_selection.buildFragments(allocator, file, selection);
+            errdefer fragments.deinit(allocator);
+            if (fragments.items.len == 0) return error.EmptySelection;
+            const selected_borrowed = switch (source.side) {
+                .old => old_path,
+                .new => new_path,
+            } orelse return error.NoSelectedSidePath;
+            const selected_owned = try allocator.dupe(u8, selected_borrowed);
+            break :blk .{ .source_side = .{
+                .selected_path = selected_owned,
+                .side = source.side,
+                .mode = source.mode,
+                .fragments = fragments,
+            } };
+        },
+        .unified_diff => blk: {
+            const unified = try diff_selection.buildUnifiedDiff(allocator, file, folded_hunks, selection.range());
+            if (unified.line_count == 0) {
+                var empty = unified;
+                empty.deinit(allocator);
+                return error.EmptySelection;
+            }
+            break :blk .{ .unified_diff = unified };
+        },
+    };
+    errdefer switch (content) {
+        .source_side => |*source| source.deinit(allocator),
+        .unified_diff => |*unified| unified.deinit(allocator),
+    };
 
     return .{
         .token = token,
+        .selection_layout_revision = selection_layout_revision,
         .value = .{ .parsed_diff = .{
             .canonical_path = canonical_owned,
             .old_path = old_owned,
             .new_path = new_owned,
-            .selected_path = selected_owned,
-            .side = selection.side,
-            .mode = selection.mode,
             .range = selection.range(),
-            .fragments = fragments,
+            .content = content,
         } },
     };
 }
@@ -227,10 +298,52 @@ pub fn buildGenerated(
     document: *const repository_source.Document,
     selection: diff_selection.DragSelection,
 ) !CompletedSelection {
-    if (selection.side != .new) return error.InvalidSide;
+    return buildGeneratedForLayout(allocator, token, path, document, 1, selection);
+}
+
+pub fn buildGeneratedForLayout(
+    allocator: std.mem.Allocator,
+    token: ContentToken,
+    path: []const u8,
+    document: *const repository_source.Document,
+    selection_layout_revision: u64,
+    selection: diff_selection.DragSelection,
+) !CompletedSelection {
     const range = selection.range();
     if (range.start.hunk_index != 0 or range.end.hunk_index != 0 or range.start.line_index >= document.rowCount() or range.end.line_index >= document.rowCount()) return error.InvalidSelection;
 
+    var content: @FieldType(Generated, "content") = switch (selection.content) {
+        .source_side => |source| blk: {
+            if (source.side != .new) return error.InvalidSide;
+            break :blk .{ .source_side = .{
+                .mode = source.mode,
+                .fragment = try buildGeneratedFragment(allocator, document, range, source.mode),
+            } };
+        },
+        .unified_diff => .{ .unified_diff = try buildGeneratedUnified(allocator, document, range) },
+    };
+    errdefer switch (content) {
+        .source_side => |*source| source.deinit(allocator),
+        .unified_diff => |*unified| unified.deinit(allocator),
+    };
+    const owned_path = try allocator.dupe(u8, path);
+    return .{
+        .token = token,
+        .selection_layout_revision = selection_layout_revision,
+        .value = .{ .generated_untracked = .{
+            .path = owned_path,
+            .range = range,
+            .content = content,
+        } },
+    };
+}
+
+fn buildGeneratedFragment(
+    allocator: std.mem.Allocator,
+    document: *const repository_source.Document,
+    range: diff_selection.Range,
+    mode: diff_selection.Mode,
+) !GeneratedFragment {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     var line_count: usize = 0;
@@ -239,7 +352,7 @@ pub fn buildGenerated(
         const line = document.lineBody(line_index) orelse return error.InvalidSelection;
         var start: usize = 0;
         var end: usize = line.len;
-        if (selection.mode == .character) {
+        if (mode == .character) {
             if (line_index == range.start.line_index) start = range.start.leading;
             if (line_index == range.end.line_index) end = range.end.trailing;
             if (start > end) return error.InvalidSelection;
@@ -253,22 +366,37 @@ pub fn buildGenerated(
     }
     if (line_count == 0) return error.EmptySelection;
     const text = try out.toOwnedSlice();
-    errdefer allocator.free(text);
-    const owned_path = try allocator.dupe(u8, path);
     return .{
-        .token = token,
-        .value = .{ .generated_untracked = .{
-            .path = owned_path,
-            .mode = selection.mode,
-            .range = range,
-            .fragment = .{
-                .source_start = @intCast(range.start.line_index + 1),
-                .source_end = @intCast(range.end.line_index + 1),
-                .text = text,
-                .line_count = line_count,
-            },
-        } },
+        .source_start = @intCast(range.start.line_index + 1),
+        .source_end = @intCast(range.end.line_index + 1),
+        .text = text,
+        .line_count = line_count,
     };
+}
+
+fn buildGeneratedUnified(
+    allocator: std.mem.Allocator,
+    document: *const repository_source.Document,
+    range: diff_selection.Range,
+) !diff_selection.OwnedUnifiedDiff {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var points: std.ArrayList(diff_selection.Point) = .empty;
+    errdefer points.deinit(allocator);
+
+    var line_index = range.start.line_index;
+    while (line_index <= range.end.line_index) : (line_index += 1) {
+        const line = document.lineBody(line_index) orelse return error.InvalidSelection;
+        if (points.items.len > 0) try out.writer.writeByte('\n');
+        try out.writer.writeByte('+');
+        try out.writer.writeAll(line);
+        try points.append(allocator, diff_selection.pointFromLine(0, line_index));
+    }
+    if (points.items.len >= 2) try out.writer.writeByte('\n');
+    const text = try out.toOwnedSlice();
+    errdefer allocator.free(text);
+    const owned_points = try points.toOwnedSlice(allocator);
+    return .{ .text = text, .points = owned_points, .line_count = owned_points.len };
 }
 
 fn normalizedOptionalPath(path: ?[]const u8) ?[]const u8 {
@@ -368,8 +496,7 @@ test "generated candidate is not represented as a parser hunk" {
         .display = .{ .generated_untracked = .{ .status_snapshot_revision = 1, .source = document.fingerprint } },
     }, "new.zig", &document, .{
         .identity = .{ .generated_file = .{ .path_key = "new.zig" } },
-        .side = .new,
-        .mode = .character,
+        .content = .{ .source_side = .{ .side = .new, .mode = .character } },
         .anchor = .{ .hunk_index = 0, .line_index = 0, .leading = 3, .trailing = 4 },
         .focus = .{ .hunk_index = 0, .line_index = 1, .leading = 4, .trailing = 5 },
         .moved = true,
@@ -380,9 +507,9 @@ test "generated candidate is not represented as a parser hunk" {
     try std.testing.expectEqualStrings("DEFG\nHIJKL", clipboard);
     try std.testing.expect(completed.value == .generated_untracked);
     const generated = completed.value.generated_untracked;
-    try std.testing.expectEqual(diff_selection.Side.new, generated.side);
-    try std.testing.expectEqual(diff_selection.Mode.character, generated.mode);
-    try std.testing.expectEqual(@as(usize, 2), generated.fragment.line_count);
+    const source = generated.content.source_side;
+    try std.testing.expectEqual(diff_selection.Mode.character, source.mode);
+    try std.testing.expectEqual(@as(usize, 2), source.fragment.line_count);
     try std.testing.expectEqualDeep(diff_selection.Range{
         .start = .{ .hunk_index = 0, .line_index = 0, .leading = 3, .trailing = 4 },
         .end = .{ .hunk_index = 0, .line_index = 1, .leading = 4, .trailing = 5 },
@@ -403,8 +530,7 @@ test "parsed candidate retains exact cross-hunk range and character bytes" {
     };
     const drag: diff_selection.DragSelection = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .character,
+        .content = .{ .source_side = .{ .side = .new, .mode = .character } },
         .anchor = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
         .focus = .{ .hunk_index = 1, .line_index = 0, .leading = 1, .trailing = 2 },
         .moved = true,
@@ -421,7 +547,7 @@ test "parsed candidate retains exact cross-hunk range and character bytes" {
     defer allocator.free(clipboard);
     try std.testing.expectEqualStrings("bc\nxy", clipboard);
     try std.testing.expectEqualDeep(drag.range(), completed.value.parsed_diff.range);
-    try std.testing.expectEqual(@as(usize, 2), completed.value.parsed_diff.fragments.line_count);
+    try std.testing.expectEqual(@as(usize, 2), completed.value.parsed_diff.content.source_side.fragments.line_count);
 }
 
 test "parsed candidate owns byte-exact rename paths for the selected side" {
@@ -454,8 +580,7 @@ test "parsed candidate owns byte-exact rename paths for the selected side" {
         .display = .{ .loaded = Fingerprint.init("rename diff") },
     }, file, .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "new-\xfe.zig" } },
-        .side = .old,
-        .mode = .character,
+        .content = .{ .source_side = .{ .side = .old, .mode = .character } },
         .anchor = .{ .hunk_index = 0, .line_index = 0, .leading = 0, .trailing = 1 },
         .focus = .{ .hunk_index = 0, .line_index = 0, .leading = 4, .trailing = 5 },
         .moved = true,
@@ -467,6 +592,6 @@ test "parsed candidate owns byte-exact rename paths for the selected side" {
     try std.testing.expectEqualStrings("new-\xfe.zig", parsed.canonical_path);
     try std.testing.expectEqualStrings("old-\xff.zig", parsed.old_path.?);
     try std.testing.expectEqualStrings("new-\xfe.zig", parsed.new_path.?);
-    try std.testing.expectEqualStrings("old-\xff.zig", parsed.selected_path);
-    try std.testing.expectEqual(diff_selection.Side.old, parsed.side);
+    try std.testing.expectEqualStrings("old-\xff.zig", parsed.content.source_side.selected_path);
+    try std.testing.expectEqual(diff_selection.Side.old, parsed.content.source_side.side);
 }

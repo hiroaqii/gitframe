@@ -255,8 +255,7 @@ test "Compare transient owners block transitions" {
 
     app.pages.compare.diff.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "b/src/compare.zig" } },
-        .side = .new,
-        .mode = .line,
+        .content = .{ .source_side = .{ .side = .new } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
@@ -297,17 +296,19 @@ test "Compare retained selection survives page transitions and clears on reposit
         },
         .value = .{ .generated_untracked = .{
             .path = try allocator.dupe(u8, "src/main.zig"),
-            .mode = .line,
             .range = .{
                 .start = .{ .hunk_index = 0, .line_index = 0 },
                 .end = .{ .hunk_index = 0, .line_index = 0 },
             },
-            .fragment = .{
-                .source_start = 0,
-                .source_end = 1,
-                .text = try allocator.dupe(u8, "selected compare"),
-                .line_count = 1,
-            },
+            .content = .{ .source_side = .{
+                .mode = .line,
+                .fragment = .{
+                    .source_start = 0,
+                    .source_end = 1,
+                    .text = try allocator.dupe(u8, "selected compare"),
+                    .line_count = 1,
+                },
+            } },
         } },
     };
     app.pages.compare.diff.pinned_selection_basis = .{

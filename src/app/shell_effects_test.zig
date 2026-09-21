@@ -202,17 +202,19 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
         },
         .value = .{ .generated_untracked = .{
             .path = try allocator.dupe(u8, "src/main.zig"),
-            .mode = .line,
             .range = .{
                 .start = .{ .hunk_index = 0, .line_index = 0 },
                 .end = .{ .hunk_index = 0, .line_index = 0 },
             },
-            .fragment = .{
-                .source_start = 0,
-                .source_end = 1,
-                .text = try allocator.dupe(u8, "selected compare"),
-                .line_count = 1,
-            },
+            .content = .{ .source_side = .{
+                .mode = .line,
+                .fragment = .{
+                    .source_start = 0,
+                    .source_end = 1,
+                    .text = try allocator.dupe(u8, "selected compare"),
+                    .line_count = 1,
+                },
+            } },
         } },
     };
     app.pages.compare.diff.pinned_selection_basis = .{

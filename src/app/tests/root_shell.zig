@@ -157,35 +157,35 @@ fn installRootCompareSelection(app: *App, allocator: std.mem.Allocator) !void {
     };
     const selection: diff_selection.DragSelection = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .line,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 3 },
         .moved = true,
     };
-    app.pages.compare.diff.completed_selection = try diff_surface.selection.buildParsed(allocator, .{
+    app.pages.compare.diff.completed_selection = try diff_surface.selection.buildParsedFolded(allocator, .{
         .repo_epoch = app.repo_session.view().epoch(),
         .root_identity = app.repo_session.view().activeIdentity(),
         .source = diff_surface.selection.SourceBasis.init(compare_page.selection_source),
         .source_session_revision = app.pages.compare.diff.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
-    }, loaded.document.files[0], selection);
+    }, loaded.document.files[0], loaded.foldedHunksForFile(0), app.pages.compare.diff.selection_layout_revision, selection);
     _ = selection_action.advanceGeneration(&app.pages.compare.diff.selection_generation);
     if (!app.pages.compare.diff.installPinnedSelectionBasis(app.pages.compare.currentTarget())) return error.ExpectedCompareSelectionPin;
 }
 
-fn compareActionMouseEvent(app: *App, target: selection_action.Action) !chasen.Event {
-    const navigation_view = compareNavigation(app).view();
-    var resolver = navigation_view.resolver();
-    const body = navigation_view.bodyView(&resolver);
-    const presentation = body.selectionStatusPresentation() orelse return error.ExpectedSelectionStatus;
-    const raw = body.view.rawDiffPaneGeometry() orelse return error.ExpectedDiffPane;
+fn selectionActionMouseEvent(
+    app: *App,
+    raw: diff_surface.RawDiffPaneGeometry,
+    presentation: diff_surface.selection_action.StatusPresentation,
+    target: selection_action.StatusAction,
+) !chasen.Event {
     const action_layout = diff_surface.selection_action.statusLayout(
         .{ .col = 1, .width = raw.width - 1 },
         presentation,
     );
     const region = switch (target) {
         .copy => action_layout.copy orelse return error.ExpectedCopyAction,
+        .copy_hunk => action_layout.copy_hunk orelse return error.ExpectedCopyHunkAction,
         .clear => action_layout.clear orelse return error.ExpectedClearAction,
     };
     const layout = shellLayout(app);
@@ -193,6 +193,28 @@ fn compareActionMouseEvent(app: *App, target: selection_action.Action) !chasen.E
         layout.body.col + raw.col + region.col,
         layout.body.row + 1,
         .left,
+    );
+}
+
+fn changesActionMouseEvent(app: *App, target: selection_action.StatusAction) !chasen.Event {
+    const view = changesNavigation(app).view();
+    return selectionActionMouseEvent(
+        app,
+        view.rawDiffPaneGeometry() orelse return error.ExpectedDiffPane,
+        view.selectionStatusPresentation() orelse return error.ExpectedSelectionStatus,
+        target,
+    );
+}
+
+fn compareActionMouseEvent(app: *App, target: selection_action.StatusAction) !chasen.Event {
+    const navigation_view = compareNavigation(app).view();
+    var resolver = navigation_view.resolver();
+    const body = navigation_view.bodyView(&resolver);
+    return selectionActionMouseEvent(
+        app,
+        body.view.rawDiffPaneGeometry() orelse return error.ExpectedDiffPane,
+        body.selectionStatusPresentation() orelse return error.ExpectedSelectionStatus,
+        target,
     );
 }
 
@@ -233,8 +255,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     defer app.shell_effects_state.deinit(allocator);
     app.pages.changes.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .line,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 0 },
         .anchor_cell = .{ .col = 12, .row = diff_render.body_start_row },
@@ -330,12 +351,12 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     try std.testing.expect(repeated_ticks >= 2);
     try std.testing.expect(encountered_non_selectable_row);
     try std.testing.expectEqual(@as(usize, 1), completed_focus.focus.hunk_index);
-    try std.testing.expect(completed_focus.side == .new);
+    try std.testing.expect(completed_focus.content == .unified_diff);
     try std.testing.expectEqual(third_generation, app.drag_auto_scroll.active.?.generation);
 
     // Release clears root intent before page completion, then reconciles the
     // admitted repeating timer to a cancel. Copy freezes the exact semantic
-    // new-side range reached by the repeated fake ticks.
+    // unified diff-row range reached by the repeated fake ticks.
     tc.resetTransient();
     try app.update(.{ .mouse_selection_release = .{
         .pointer = .{ .col = 12, .row = last_row },
@@ -345,9 +366,44 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
     try std.testing.expect(app.pages.changes.completed_selection != null);
+    app.pages.changes.viewer.diff_cursor = .{ .hunk_header = 1 };
     try app.update(.{ .changes = .{ .selection_action = .copy } }, &tc.ctx);
     try std.testing.expectEqual(@as(u8, 1), tc.ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("one\ntwo\nnew\nfour\nlate one\n", tc.ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n four\n late one\n", tc.ctx._pending_clipboard_copies[0].text);
+
+    const retained_token = app.pages.changes.completed_selection.?.token;
+    const retained_generation = app.pages.changes.selection_generation;
+    const hunk_text = "@@ -20,2 +20,2 @@ second\n late one\n-late old\n+late new\n";
+
+    tc.resetTransient();
+    const copies_before_keyboard_hunk = app.shell_effects_state.clipboard_copies.count();
+    const keyboard_hunk = app.handleEvent(.{ .key_press = .{ .codepoint = 'Y' } }) orelse
+        return error.ExpectedChangesKeyboardHunkCopy;
+    try std.testing.expectEqual(App.Msg{ .changes = .copy_current_hunk }, keyboard_hunk);
+    try app.update(keyboard_hunk, &tc.ctx);
+    try std.testing.expectEqual(@as(u8, 1), tc.ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(copies_before_keyboard_hunk + 1, app.shell_effects_state.clipboard_copies.count());
+    try std.testing.expectEqualStrings(hunk_text, tc.ctx._pending_clipboard_copies[0].text);
+    try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(retained_token));
+    try std.testing.expectEqual(retained_generation, app.pages.changes.selection_generation);
+
+    tc.resetTransient();
+    const copies_before_mouse_hunk = app.shell_effects_state.clipboard_copies.count();
+    const mouse_hunk = app.handleEvent(try changesActionMouseEvent(&app, .copy_hunk)) orelse
+        return error.ExpectedChangesMouseHunkCopy;
+    switch (mouse_hunk) {
+        .changes => |msg| switch (msg) {
+            .mouse_diff_press => {},
+            else => return error.ExpectedChangesMouseHunkCopy,
+        },
+        else => return error.ExpectedChangesMouseHunkCopy,
+    }
+    try app.update(mouse_hunk, &tc.ctx);
+    try std.testing.expectEqual(@as(u8, 1), tc.ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(copies_before_mouse_hunk + 1, app.shell_effects_state.clipboard_copies.count());
+    try std.testing.expectEqualStrings(hunk_text, tc.ctx._pending_clipboard_copies[0].text);
+    try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(retained_token));
+    try std.testing.expectEqual(retained_generation, app.pages.changes.selection_generation);
 
     // A later live drag can coexist with the retained status line. The fixed
     // header row must never become a semantic selection endpoint.
@@ -355,8 +411,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     try app.update(.{ .terminal_resized = .{ .width = 80, .height = 10 } }, &tc.ctx);
     app.pages.changes.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .line,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 0 },
         .anchor_cell = .{ .col = 12, .row = diff_render.body_start_row },
@@ -381,8 +436,7 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
             .viewer = .{ .sidebar_hidden = true, .focus = .diff, .display_mode = .unified },
             .selection_owner = .{ .diff = .{
                 .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-                .side = .new,
-                .mode = .line,
+                .content = .unified_diff,
                 .anchor = .{ .hunk_index = 0, .line_index = 0 },
                 .focus = .{ .hunk_index = 0, .line_index = 0 },
                 .anchor_cell = .{ .col = 12, .row = diff_render.body_start_row },
@@ -435,7 +489,7 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
 }
 
-test "terminal resize cancels live drag before geometry and retains completed selection" {
+test "terminal resize clears diff selections before an effective-mode geometry change" {
     const allocator = std.testing.allocator;
     const content_selection = @import("../diff_surface/selection.zig");
     var app: App = .{
@@ -461,17 +515,21 @@ test "terminal resize cancels live drag before geometry and retains completed se
                     .ahead_count = 1,
                 },
             },
+            .history = .{
+                .current_view = .diff,
+                .diff = .{ .load = app_test_support.loadState(app_test_support.loadedDiffOne()) },
+            },
         },
         .allocator = allocator,
         .terminal_size = .{ .width = 80, .height = 20 },
     };
     defer changesReload(&app).clearLoadedDiff(allocator);
     defer app.pages.compare.deinit(allocator);
+    defer app.pages.history.deinit(allocator);
 
     const selection: diff_selection.DragSelection = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .line,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
@@ -483,7 +541,6 @@ test "terminal resize cancels live drag before geometry and retains completed se
         .source_session_revision = app.pages.changes.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
     }, app_test_support.loadedDiffOne().document.files[0], selection);
-    const retained_token = app.pages.changes.completed_selection.?.token;
     app.pages.compare.diff.completed_selection = try content_selection.buildParsed(allocator, .{
         .repo_epoch = 0,
         .root_identity = null,
@@ -491,11 +548,20 @@ test "terminal resize cancels live drag before geometry and retains completed se
         .source_session_revision = app.pages.compare.diff.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
     }, app_test_support.loadedDiffOne().document.files[0], selection);
+    app.pages.history.diff.completed_selection = try content_selection.buildParsed(allocator, .{
+        .repo_epoch = 0,
+        .root_identity = null,
+        .source = content_selection.SourceBasis.init(.{ .range = "history" }),
+        .source_session_revision = app.pages.history.diff.source_session_revision,
+        .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
+    }, app_test_support.loadedDiffOne().document.files[0], selection);
     try std.testing.expect(app.pages.compare.diff.installPinnedSelectionBasis(app.pages.compare.currentTarget()));
-    const compare_retained_token = app.pages.compare.diff.completed_selection.?.token;
-    const compare_retained_pin = app.pages.compare.diff.pinned_selection_basis.?;
+    app.pages.history.diff.pinned_selection_basis = .init(
+        app.pages.compare.currentTarget() orelse return error.ExpectedCompareTarget,
+    );
     app.pages.changes.selection_owner = .{ .diff = selection };
     app.pages.compare.diff.selection_owner = .{ .diff = selection };
+    app.pages.history.diff.selection_owner = .{ .diff = selection };
     app.drag_auto_scroll.active = .{
         .generation = 9,
         .target = .changes,
@@ -505,15 +571,41 @@ test "terminal resize cancels live drag before geometry and retains completed se
     var tc: chasen.testing.TestCtx(App.Msg) = .{};
     defer tc.resetTransient();
 
+    const changes_token = app.pages.changes.completed_selection.?.token;
+    const compare_token = app.pages.compare.diff.completed_selection.?.token;
+    const history_token = app.pages.history.diff.completed_selection.?.token;
+    const compare_pin = app.pages.compare.diff.pinned_selection_basis.?;
+    const history_pin = app.pages.history.diff.pinned_selection_basis.?;
+    const changes_revision = app.pages.changes.selection_layout_revision;
+    const compare_revision = app.pages.compare.diff.selection_layout_revision;
+    const history_revision = app.pages.history.diff.selection_layout_revision;
+
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 21 } }, &tc.ctx);
+    try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(changes_token));
+    try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(compare_token));
+    try std.testing.expect(app.pages.history.diff.completed_selection.?.token.eql(history_token));
+    try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(compare_pin));
+    try std.testing.expect(app.pages.history.diff.pinned_selection_basis.?.eql(history_pin));
+    try std.testing.expectEqual(changes_revision, app.pages.changes.selection_layout_revision);
+    try std.testing.expectEqual(compare_revision, app.pages.compare.diff.selection_layout_revision);
+    try std.testing.expectEqual(history_revision, app.pages.history.diff.selection_layout_revision);
+
+    app.pages.changes.selection_owner = .{ .diff = selection };
+    app.pages.compare.diff.selection_owner = .{ .diff = selection };
+    app.pages.history.diff.selection_owner = .{ .diff = selection };
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 30 } }, &tc.ctx);
 
     try std.testing.expect(app.pages.changes.selection_owner == .none);
     try std.testing.expect(app.pages.compare.diff.selection_owner == .none);
-    try std.testing.expect(app.pages.changes.completed_selection != null);
-    try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(retained_token));
-    try std.testing.expect(app.pages.compare.diff.completed_selection != null);
-    try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(compare_retained_token));
-    try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(compare_retained_pin));
+    try std.testing.expect(app.pages.history.diff.selection_owner == .none);
+    try std.testing.expect(app.pages.changes.completed_selection == null);
+    try std.testing.expect(app.pages.compare.diff.completed_selection == null);
+    try std.testing.expect(app.pages.history.diff.completed_selection == null);
+    try std.testing.expect(app.pages.compare.diff.pinned_selection_basis == null);
+    try std.testing.expect(app.pages.history.diff.pinned_selection_basis == null);
+    try std.testing.expectEqual(changes_revision + 1, app.pages.changes.selection_layout_revision);
+    try std.testing.expectEqual(compare_revision + 1, app.pages.compare.diff.selection_layout_revision);
+    try std.testing.expectEqual(history_revision + 1, app.pages.history.diff.selection_layout_revision);
     try std.testing.expectEqual(chasen.Size{ .width = 120, .height = 30 }, app.terminal_size);
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
@@ -636,8 +728,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
 
     app.pages.compare.diff.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .old,
-        .mode = .line,
+        .content = .{ .source_side = .{ .side = .old } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 0 },
         .anchor_cell = .{ .col = 20, .row = diff_render.body_start_row },
@@ -663,7 +754,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try std.testing.expect(repeated_ticks >= 2);
     try std.testing.expect(crossed_presentation_only_row);
     try std.testing.expectEqual(@as(usize, 1), live.focus.hunk_index);
-    try std.testing.expect(live.side == .old);
+    try std.testing.expect(live.selectedSide().? == .old);
     try std.testing.expectEqual(auto_scroll_generation, app.drag_auto_scroll.active.?.generation);
 
     try app.update(.{ .mouse_selection_release = .{
@@ -684,6 +775,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try installRootCompareSelection(&app, allocator);
     const retained_token = app.pages.compare.diff.completed_selection.?.token;
     const retained_pin = app.pages.compare.diff.pinned_selection_basis.?;
+    const retained_generation = app.pages.compare.diff.selection_generation;
     const keyboard_copy = app.handleEvent(.{ .key_press = .{ .codepoint = 'y' } }) orelse
         return error.ExpectedCompareKeyboardCopy;
     try std.testing.expectEqual(
@@ -692,7 +784,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     );
     try app.update(keyboard_copy, &ctx);
     try std.testing.expectEqual(@as(usize, 2), app.shell_effects_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings("one\ntwo\nnew\n", ctx._pending_clipboard_copies[1].text);
+    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n", ctx._pending_clipboard_copies[1].text);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 
@@ -712,13 +804,63 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     );
     try app.update(mouse_copy, &ctx);
     try std.testing.expectEqual(@as(usize, 3), app.shell_effects_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings("one\ntwo\nnew\n", ctx._pending_clipboard_copies[2].text);
+    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n", ctx._pending_clipboard_copies[2].text);
+    try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
+
+    app.pages.compare.diff.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const hunk_text = "@@ -1,4 +1,4 @@ first\n one\n two\n-old\n+new\n four\n";
+    const keyboard_hunk = app.handleEvent(.{ .key_press = .{ .codepoint = 'Y' } }) orelse
+        return error.ExpectedCompareKeyboardHunkCopy;
+    try std.testing.expectEqual(App.Msg{ .compare = .{ .common = .copy_current_hunk } }, keyboard_hunk);
+    try app.update(keyboard_hunk, &ctx);
+    try std.testing.expectEqual(@as(usize, 4), app.shell_effects_state.clipboard_copies.count());
+    try std.testing.expectEqualStrings(hunk_text, ctx._pending_clipboard_copies[3].text);
+    try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expectEqual(retained_generation, app.pages.compare.diff.selection_generation);
+
+    const older_request_id = ctx._pending_clipboard_copies[0].request_id;
+    const replacement_failure_request_id = ctx._pending_clipboard_copies[1].request_id;
+    const current_selection_request_id = ctx._pending_clipboard_copies[2].request_id;
+    const keyboard_hunk_request_id = ctx._pending_clipboard_copies[3].request_id;
+    ctx.runtimeClearPendingEffectCopies();
+
+    const mouse_hunk = app.handleEvent(try compareActionMouseEvent(&app, .copy_hunk)) orelse
+        return error.ExpectedCompareMouseHunkCopy;
+    switch (mouse_hunk) {
+        .compare => |msg| switch (msg) {
+            .common => |common| switch (common) {
+                .shared => |shared| switch (shared) {
+                    .mouse_diff_press => {},
+                    else => return error.ExpectedCompareMouseHunkCopy,
+                },
+                else => return error.ExpectedCompareMouseHunkCopy,
+            },
+            else => return error.ExpectedCompareMouseHunkCopy,
+        },
+        else => return error.ExpectedCompareMouseHunkCopy,
+    }
+    try app.update(mouse_hunk, &ctx);
+    try std.testing.expectEqual(@as(usize, 5), app.shell_effects_state.clipboard_copies.count());
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings(hunk_text, ctx._pending_clipboard_copies[0].text);
+    try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
+    try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
+    try std.testing.expectEqual(retained_generation, app.pages.compare.diff.selection_generation);
+    const mouse_hunk_request_id = ctx._pending_clipboard_copies[0].request_id;
+    inline for (.{ keyboard_hunk_request_id, mouse_hunk_request_id }) |request_id| {
+        try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+            .request_id = request_id,
+            .outcome = .sent,
+        } } }, &ctx);
+    }
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 
     // Success for an older generation must not clear the newer selection.
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
-        .request_id = ctx._pending_clipboard_copies[0].request_id,
+        .request_id = older_request_id,
         .outcome = .sent,
     } } }, &ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
@@ -728,7 +870,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     // Compare's retained basis. A failed older request cannot clear a later
     // replacement.
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
-        .request_id = ctx._pending_clipboard_copies[2].request_id,
+        .request_id = current_selection_request_id,
         .outcome = .sent,
     } } }, &ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection == null);
@@ -736,7 +878,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try installRootCompareSelection(&app, allocator);
     const replacement_token = app.pages.compare.diff.completed_selection.?.token;
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
-        .request_id = ctx._pending_clipboard_copies[1].request_id,
+        .request_id = replacement_failure_request_id,
         .outcome = .unsupported_runtime,
     } } }, &ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(replacement_token));
@@ -976,8 +1118,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
 
     app.pages.history.diff.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .old,
-        .mode = .line,
+        .content = .{ .source_side = .{ .side = .old } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 0 },
         .anchor_cell = .{ .col = diff_point.col, .row = diff_point.row },
@@ -1164,6 +1305,7 @@ test "mouse click focuses sidebar and diff panes" {
 
 test "mouse click selects sidebar file rows" {
     var app: App = .{
+        .allocator = std.testing.allocator,
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{ .focus = .diff },
@@ -1184,6 +1326,7 @@ test "mouse click selects sidebar file rows" {
 test "mouse click toggles sidebar directory rows" {
     const arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     var app: App = .{
+        .allocator = std.testing.allocator,
         .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, app_test_support.loadedDiffNested()),
             .viewer = .{ .focus = .diff, .selected_node = 1 },
@@ -1235,6 +1378,7 @@ test "mouse click uses filtered sidebar projection" {
     try loaded.rebuildVisibleNodes(arena.allocator(), false, .deleted);
 
     var app: App = .{
+        .allocator = std.testing.allocator,
         .pages = .{ .changes = .{
             .load = app_test_support.loadStateWithArena(arena, loaded),
             .viewer = .{ .focus = .diff, .selected_node = 0 },
@@ -1256,6 +1400,7 @@ test "mouse click uses filtered sidebar projection" {
 
 test "mouse wheel scrolls the pane under the pointer" {
     var app: App = .{
+        .allocator = std.testing.allocator,
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{ .focus = .diff },
@@ -1269,7 +1414,7 @@ test "mouse wheel scrolls the pane under the pointer" {
     try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 
-    changesNavigation(&app).selectFileAbsolute(0);
+    changesNavigation(&app).selectFileAbsolute(std.testing.allocator, 0);
     const diff_col = content.col + sidebarWidth(layoutSize(&app).width, app.pages.changes.viewer.sidebar_width) + 1;
     const diff_msg = app.handleEvent(app_test_support.mouseEvent(diff_col, content.row + 2, .wheel_down)) orelse return error.ExpectedDiffWheelMessage;
     try app.update(diff_msg, undefined);
@@ -1330,8 +1475,7 @@ test "wheel redraw reaches root for semantic vertical and horizontal edges" {
             .viewer = .{ .focus = .diff, .sidebar_hidden = true, .display_mode = .unified },
             .selection_owner = .{ .diff = .{
                 .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-                .side = .new,
-                .mode = .line,
+                .content = .unified_diff,
                 .anchor = .{ .hunk_index = 0, .line_index = 0 },
                 .focus = .{ .hunk_index = 0, .line_index = 0 },
                 .moved = true,

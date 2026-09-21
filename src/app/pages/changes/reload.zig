@@ -1118,16 +1118,20 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
         scope: ProjectionSelectionScope,
         ready: *const changes_projection.Ready,
-    ) void {
-        const completed = self.page.completed_selection orelse return;
-        const active_root = self.repo_root orelse return;
+    ) bool {
+        const completed = self.page.completed_selection orelse return false;
+        const active_root = self.repo_root orelse return false;
         if (!std.mem.eql(u8, active_root, scope.repo_root) or
-            !std.mem.eql(u8, completed.pathKey(), scope.path_key)) return;
+            !std.mem.eql(u8, completed.pathKey(), scope.path_key)) return false;
         const incoming = self.contentTokenForReady(ready) orelse {
             self.clearCompletedSelectionForProjection(allocator, scope);
-            return;
+            return false;
         };
-        if (!completed.token.eql(incoming)) self.clearCompletedSelectionForProjection(allocator, scope);
+        if (!completed.token.eql(incoming)) {
+            self.clearCompletedSelectionForProjection(allocator, scope);
+            return false;
+        }
+        return completed.selection_layout_revision == self.page.selection_layout_revision;
     }
 
     /// A normal loaded diff intentionally has no projection target. Reaching
@@ -1993,15 +1997,15 @@ pub const Controller = struct {
             }
             self.page.source_session_revision = expected_source_revision;
         }
-        if (prepared_tree) |*tree| self.installCurrentTree(tree, .restore_previous);
+        if (prepared_tree) |*tree| self.installCurrentTree(allocator, tree, .restore_previous);
 
         if (final_anchor) |*anchor| {
             if (self.navigation.activeLoadedDiff()) |loaded| {
-                _ = self.navigation.restoreReloadAnchor(loaded, anchor);
+                _ = self.navigation.restoreReloadAnchor(allocator, loaded, anchor);
             }
-            self.restoreDisplayedNavigation(anchor);
+            self.restoreDisplayedNavigation(allocator, anchor);
         } else {
-            self.navigation.refreshSearchForSelectedFile();
+            self.navigation.refreshSearchForSelectedFile(allocator);
         }
         self.page.status_load.markSuccess();
         self.page.pending_initial_first_visible_selection = false;
@@ -2347,11 +2351,16 @@ pub const Controller = struct {
                     if (outgoing_lineage) |lineage| self.clearPresentationLineage(allocator, lineage);
                     break :blk false;
                 };
-                if (!exact_presentation_transfer) self.page.advanceSelectionLayoutRevision();
-                self.reconcileCompletedSelectionForReady(allocator, .{
+                const retained_selection_mapping = self.reconcileCompletedSelectionForReady(allocator, .{
                     .repo_root = target.repo_root,
                     .path_key = target.path_key,
                 }, &hit.value);
+                if (!exact_presentation_transfer) {
+                    self.page.advanceSelectionLayoutRevision();
+                    if (retained_selection_mapping) {
+                        self.page.completed_selection.?.selection_layout_revision = self.page.selection_layout_revision;
+                    }
+                }
                 self.page.changes_projection.clearPending(allocator);
                 self.page.changes_projection.cacheOrClearDisplayed(
                     allocator,
@@ -2617,12 +2626,12 @@ pub const Controller = struct {
         local_navigation: ?*const changes_page.ReloadAnchor,
     ) void {
         if (self.page.pending_display_navigation_restore) |*restore| {
-            self.restoreDisplayedNavigation(restore.authoritative());
+            self.restoreDisplayedNavigation(allocator, restore.authoritative());
             self.clearDisplayRestore(allocator);
         } else if (local_navigation) |anchor| {
-            self.restoreDisplayedNavigation(anchor);
+            self.restoreDisplayedNavigation(allocator, anchor);
         } else {
-            self.navigation.refreshSearchForSelectedFile();
+            self.navigation.refreshSearchForSelectedFile(allocator);
         }
     }
 
@@ -2656,7 +2665,7 @@ pub const Controller = struct {
         allocator: std.mem.Allocator,
     ) void {
         if (self.page.pending_display_navigation_restore) |*restore| {
-            self.restoreDisplayedNavigation(restore.authoritative());
+            self.restoreDisplayedNavigation(allocator, restore.authoritative());
             self.clearDisplayRestore(allocator);
         } else {
             self.navigation.updateSearchMatchOffset();
@@ -3198,6 +3207,7 @@ pub const Controller = struct {
 
     fn installCurrentTree(
         self: Controller,
+        allocator: std.mem.Allocator,
         prepared: *PreparedCurrentTree,
         policy: CurrentTreeNavigation,
     ) void {
@@ -3207,10 +3217,10 @@ pub const Controller = struct {
         loaded.visible_node_count = prepared.visible_node_count;
         defer prepared.* = undefined;
         switch (policy) {
-            .restore_previous => self.restorePreparedTreeSelection(loaded, prepared),
+            .restore_previous => self.restorePreparedTreeSelection(allocator, loaded, prepared),
             .status_projection => |options| {
                 if (self.page.action_cursor.hasRestoreAuthority()) {
-                    _ = self.navigation.remapActionCursor(loaded);
+                    _ = self.navigation.remapActionCursor(allocator, loaded);
                     return;
                 }
                 // Source replacement can temporarily make the anchored path
@@ -3220,12 +3230,12 @@ pub const Controller = struct {
                 // retain the anchor until the matching projection result
                 // restores the body navigation.
                 if (self.page.pending_display_navigation_restore) |*restore| {
-                    if (self.navigation.restoreReloadAnchor(loaded, restore.authoritative())) return;
+                    if (self.navigation.restoreReloadAnchor(allocator, loaded, restore.authoritative())) return;
                 }
                 if (options.prefer_first_visible_file) {
-                    self.navigation.selectFirstVisibleFile(loaded);
+                    self.navigation.selectFirstVisibleFile(allocator, loaded);
                 } else {
-                    self.restorePreparedTreeSelection(loaded, prepared);
+                    self.restorePreparedTreeSelection(allocator, loaded, prepared);
                 }
             },
         }
@@ -3233,18 +3243,19 @@ pub const Controller = struct {
 
     fn restorePreparedTreeSelection(
         self: Controller,
+        allocator: std.mem.Allocator,
         loaded: *loaded_diff.LoadedDiff,
         prepared: *const PreparedCurrentTree,
     ) void {
         if (prepared.previous_path_key) |path_key| {
             if (navigation.findFileNodeByPathKey(loaded, path_key)) |node_index| {
-                self.navigation.selectSidebarNode(loaded, node_index);
+                self.navigation.selectSidebarNode(allocator, loaded, node_index);
             }
         }
         if (prepared.previous_sidebar_identity) |identity| {
-            _ = self.navigation.restoreSidebarIdentity(loaded, identity);
+            _ = self.navigation.restoreSidebarIdentity(allocator, loaded, identity);
         }
-        self.navigation.reconcileSelectionAfterVisibleNodeChange(loaded);
+        self.navigation.reconcileSelectionAfterVisibleNodeChange(allocator, loaded);
     }
 
     fn canonicalSourceFingerprint(
@@ -3445,7 +3456,7 @@ pub const Controller = struct {
             }
             self.page.source_session_revision = expected_source_revision;
         }
-        if (prepared_tree) |*tree| self.installCurrentTree(tree, .restore_previous);
+        if (prepared_tree) |*tree| self.installCurrentTree(allocator, tree, .restore_previous);
         if (reused) {
             // Exact comparison admitted the retained presentation before the
             // no-fail commit, but its lineage belongs to the final source and
@@ -3456,7 +3467,7 @@ pub const Controller = struct {
 
         if (source_changes and final_anchor != null) {
             if (self.navigation.activeLoadedDiff()) |loaded| {
-                _ = self.navigation.restoreReloadAnchor(loaded, &final_anchor.?);
+                _ = self.navigation.restoreReloadAnchor(allocator, loaded, &final_anchor.?);
             }
         }
 
@@ -3497,7 +3508,7 @@ pub const Controller = struct {
         _ = self.navigation.finalizeActionCursor(allocator);
         if (!reused) {
             if (final_anchor) |*anchor| {
-                self.restoreDisplayedNavigation(anchor);
+                self.restoreDisplayedNavigation(allocator, anchor);
             } else {
                 if (terminal_selection_viewport) |anchor| {
                     self.navigation.restoreSelectionViewportAnchor(anchor);
@@ -3683,6 +3694,7 @@ pub const Controller = struct {
         );
 
         var exact_presentation_transfer = false;
+        var retained_selection_mapping = false;
         switch (result.result) {
             .ready => |*ready| {
                 if (self.retainCombinedPresentationTokenIfExact(
@@ -3695,7 +3707,7 @@ pub const Controller = struct {
                 } else if (outgoing_lineage) |lineage| {
                     self.clearPresentationLineage(allocator, lineage);
                 }
-                self.reconcileCompletedSelectionForReady(allocator, .{
+                retained_selection_mapping = self.reconcileCompletedSelectionForReady(allocator, .{
                     .repo_root = current.repo_root,
                     .path_key = current.path_key,
                 }, ready);
@@ -3709,7 +3721,12 @@ pub const Controller = struct {
                 });
             },
         }
-        if (!exact_presentation_transfer) self.page.advanceSelectionLayoutRevision();
+        if (!exact_presentation_transfer) {
+            self.page.advanceSelectionLayoutRevision();
+            if (retained_selection_mapping) {
+                self.page.completed_selection.?.selection_layout_revision = self.page.selection_layout_revision;
+            }
+        }
 
         switch (result.result) {
             .ready => {
@@ -3946,9 +3963,9 @@ pub const Controller = struct {
 
                 const active_loaded = self.navigation.activeLoadedDiff().?;
                 const restored_from_anchor = if (self.page.pending_display_navigation_restore) |*restore|
-                    self.navigation.restoreReloadAnchor(active_loaded, restore.authoritative())
+                    self.navigation.restoreReloadAnchor(allocator, active_loaded, restore.authoritative())
                 else if (pending_reload) |*pending|
-                    if (pending.anchor) |*anchor| self.navigation.restoreReloadAnchor(active_loaded, anchor) else false
+                    if (pending.anchor) |*anchor| self.navigation.restoreReloadAnchor(allocator, active_loaded, anchor) else false
                 else
                     false;
                 if (restored_from_anchor) {
@@ -3956,18 +3973,18 @@ pub const Controller = struct {
                     self.navigation.clampDiffNavigation();
                 } else {
                     if (!had_loaded_before and !had_action_cursor) {
-                        self.navigation.selectFirstVisibleFile(active_loaded);
+                        self.navigation.selectFirstVisibleFile(allocator, active_loaded);
                     } else if (self.page.action_cursor.hasRestoreAuthority()) {
-                        _ = self.navigation.remapActionCursor(active_loaded);
+                        _ = self.navigation.remapActionCursor(allocator, active_loaded);
                     } else {
                         self.navigation.syncSidebarNodeToSelectedFile(active_loaded);
                     }
                     self.navigation.clampSelection(active_loaded.document.files.len);
                     if (self.page.review_display.hide_reviewed_files) {
-                        self.navigation.reconcileSelectionAfterVisibleNodeChange(active_loaded);
+                        self.navigation.reconcileSelectionAfterVisibleNodeChange(allocator, active_loaded);
                     }
                     self.navigation.clampDiffNavigation();
-                    self.navigation.refreshSearchForSelectedFile();
+                    self.navigation.refreshSearchForSelectedFile(allocator);
                 }
                 can_project_status = true;
             },
@@ -4039,7 +4056,11 @@ pub const Controller = struct {
         return if (diff_source.sourceIsOneShotInput(self.source)) .immutable else .fresh;
     }
 
-    pub fn restoreDisplayedNavigation(self: Controller, anchor: *const changes_page.ReloadAnchor) void {
+    pub fn restoreDisplayedNavigation(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        anchor: *const changes_page.ReloadAnchor,
+    ) void {
         self.page.viewer.diff_cursor = anchor.diff_cursor;
         if (self.navigation.view().selectedDiffCursorOffset() == null) {
             if (anchor.diff_cursor_offset) |offset| {
@@ -4058,7 +4079,7 @@ pub const Controller = struct {
         self.page.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
         self.navigation.clampDiffNavigation();
         self.navigation.keepDiffCursorVisible();
-        self.navigation.restoreSearchFromReloadAnchor(anchor);
+        self.navigation.restoreSearchFromReloadAnchor(allocator, anchor);
         self.navigation.clampSidebarHorizontalScroll();
         self.navigation.clampDiffHorizontalScrollToVisibleRows();
     }
@@ -4199,7 +4220,7 @@ pub const Controller = struct {
                     return if (action_projection_deferred) .deferred_sidebar else .current_sidebar;
                 }
                 if (action_projection_deferred) {
-                    _ = self.navigation.remapActionCursor(loaded);
+                    _ = self.navigation.remapActionCursor(allocator, loaded);
                     return .deferred_sidebar;
                 }
                 if (trigger != .accepted_source) {
@@ -4253,7 +4274,7 @@ pub const Controller = struct {
     ) !void {
         std.debug.assert(loaded == self.navigation.activeLoadedDiff().?);
         var prepared = (try self.prepareCurrentTree(app_allocator, status_document)) orelse return;
-        self.installCurrentTree(&prepared, .{
+        self.installCurrentTree(app_allocator, &prepared, .{
             .status_projection = .{ .prefer_first_visible_file = prefer_first_visible_file },
         });
     }
@@ -4277,12 +4298,12 @@ pub const Controller = struct {
             const node_index = active_loaded.visibleNodeAt(visible_index) orelse continue;
             if (active_loaded.tree.nodes[node_index].target == .directory or active_loaded.tree.nodes[node_index].target == .repo_root) continue;
             self.page.viewer.selected_node = node_index;
-            self.navigation.selectSidebarNode(active_loaded, node_index);
+            self.navigation.selectSidebarNode(allocator, active_loaded, node_index);
             break;
         }
-        if (self.page.action_cursor.hasRestoreAuthority()) _ = self.navigation.remapActionCursor(active_loaded);
+        if (self.page.action_cursor.hasRestoreAuthority()) _ = self.navigation.remapActionCursor(allocator, active_loaded);
         if (self.page.pending_display_navigation_restore) |*restore| {
-            _ = self.navigation.restoreReloadAnchor(active_loaded, restore.authoritative());
+            _ = self.navigation.restoreReloadAnchor(allocator, active_loaded, restore.authoritative());
         }
     }
 };
@@ -4615,13 +4636,22 @@ fn testPrimaryCandidateAt(
         .source_session_revision = controller.page.source_session_revision,
         .display = .{ .loaded = .init(controller.navigation.view().activeLoadedDiffConst().?.text) },
     };
-    var drag = @import("../../../diff/selection.zig").DragSelection.init(
-        .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .new,
-        .{ .hunk_index = 0, .line_index = line_index },
-    );
+    const identity: @import("../../../diff/selection.zig").Identity = .{
+        .loaded_file = .{ .file_index = 0, .path_key = "a" },
+    };
+    var drag = if (controller.navigation.view().effectiveDisplayMode() == .unified)
+        @import("../../../diff/selection.zig").DragSelection.initUnified(identity, .{ .hunk_index = 0, .line_index = line_index })
+    else
+        @import("../../../diff/selection.zig").DragSelection.init(identity, .new, .{ .hunk_index = 0, .line_index = line_index });
     drag.moved = true;
-    return content_selection.buildParsed(allocator, token, file, drag);
+    return content_selection.buildParsedFolded(
+        allocator,
+        token,
+        file,
+        controller.navigation.view().selectedFoldedHunks(),
+        controller.page.selection_layout_revision,
+        drag,
+    );
 }
 
 fn testPrimaryCandidateForFile(
@@ -4642,13 +4672,22 @@ fn testPrimaryCandidateForFile(
         .source_session_revision = controller.page.source_session_revision,
         .display = .{ .loaded = .init(loaded.text) },
     };
-    var drag = @import("../../../diff/selection.zig").DragSelection.init(
-        .{ .loaded_file = .{ .file_index = file_index, .path_key = path_key } },
-        .new,
-        .{ .hunk_index = 0, .line_index = line_index },
-    );
+    const identity: @import("../../../diff/selection.zig").Identity = .{
+        .loaded_file = .{ .file_index = file_index, .path_key = path_key },
+    };
+    var drag = if (controller.navigation.view().effectiveDisplayMode() == .unified)
+        @import("../../../diff/selection.zig").DragSelection.initUnified(identity, .{ .hunk_index = 0, .line_index = line_index })
+    else
+        @import("../../../diff/selection.zig").DragSelection.init(identity, .new, .{ .hunk_index = 0, .line_index = line_index });
     drag.moved = true;
-    return content_selection.buildParsed(allocator, token, file, drag);
+    return content_selection.buildParsedFolded(
+        allocator,
+        token,
+        file,
+        loaded.foldedHunksForFile(file_index),
+        controller.page.selection_layout_revision,
+        drag,
+    );
 }
 
 const TestProjectionSelectionOwner = enum {
@@ -4966,13 +5005,22 @@ fn testCombinedCandidate(
 ) !content_selection.CompletedSelection {
     const ready: changes_projection.Ready = .{ .combined_hunks = bundle.* };
     const token = controller.contentTokenForReady(&ready) orelse return error.ExpectedContentToken;
-    var drag = @import("../../../diff/selection.zig").DragSelection.init(
-        .{ .projection_file = .{ .kind = .combined, .path_key = "a" } },
-        .new,
-        .{ .hunk_index = 0, .line_index = 1 },
-    );
+    const identity: @import("../../../diff/selection.zig").Identity = .{
+        .projection_file = .{ .kind = .combined, .path_key = "a" },
+    };
+    var drag = if (controller.navigation.view().effectiveDisplayMode() == .unified)
+        @import("../../../diff/selection.zig").DragSelection.initUnified(identity, .{ .hunk_index = 0, .line_index = 1 })
+    else
+        @import("../../../diff/selection.zig").DragSelection.init(identity, .new, .{ .hunk_index = 0, .line_index = 1 });
     drag.moved = true;
-    return content_selection.buildParsed(allocator, token, bundle.displayFile(), drag);
+    return content_selection.buildParsedFolded(
+        allocator,
+        token,
+        bundle.displayFile(),
+        &.{},
+        controller.page.selection_layout_revision,
+        drag,
+    );
 }
 
 fn installTestCombinedCandidate(
@@ -7310,14 +7358,27 @@ fn testGeneratedCandidate(
 ) !content_selection.CompletedSelection {
     const ready: changes_projection.Ready = .{ .generated_added_file = bundle.* };
     const token = controller.contentTokenForReady(&ready) orelse return error.ExpectedContentToken;
-    var drag = @import("../../../diff/selection.zig").DragSelection.init(
-        .{ .generated_file = .{ .path_key = bundle.path } },
-        .new,
-        .{ .hunk_index = 0, .line_index = 0, .leading = 0, .trailing = 3 },
-    );
-    drag.mode = .character;
+    const identity: @import("../../../diff/selection.zig").Identity = .{ .generated_file = .{ .path_key = bundle.path } };
+    var drag = if (controller.navigation.view().effectiveDisplayMode() == .unified)
+        @import("../../../diff/selection.zig").DragSelection.initUnified(identity, .{ .hunk_index = 0, .line_index = 0 })
+    else blk: {
+        var source_drag = @import("../../../diff/selection.zig").DragSelection.init(
+            identity,
+            .new,
+            .{ .hunk_index = 0, .line_index = 0, .leading = 0, .trailing = 3 },
+        );
+        source_drag.content.source_side.mode = .character;
+        break :blk source_drag;
+    };
     drag.moved = true;
-    return content_selection.buildGenerated(allocator, token, bundle.path, &bundle.source, drag);
+    return content_selection.buildGeneratedForLayout(
+        allocator,
+        token,
+        bundle.path,
+        &bundle.source,
+        controller.page.selection_layout_revision,
+        drag,
+    );
 }
 
 test "projection completion defers without moving displayed ownership during live drag" {
@@ -7873,7 +7934,7 @@ test "selection viewport reload exact transfer preserves candidate and changed c
     try std.testing.expect(accepted.authority.cached_component.fingerprint.eql(content_fingerprint.Fingerprint.init(test_combined_after_cached)));
     try std.testing.expect(page.completed_selection != null);
     try expectTestSessionHunkMarks(&page, "/repo", "a", original_content, &.{ 0, 2 });
-    try std.testing.expectEqual(@import("../../../diff/selection.zig").Side.new, page.completed_selection.?.value.parsed_diff.side);
+    try std.testing.expect(page.completed_selection.?.value.parsed_diff.content == .unified_diff);
     const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(accepted_clipboard);
     try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
@@ -8154,7 +8215,7 @@ test "ordinary primary exact combined reuse retains active search match and curs
     const controller = testController(&page, &status_message, .unstaged);
 
     try page.search.query.insertSlice("beta");
-    controller.navigation.refreshSearchForSelectedFile();
+    controller.navigation.refreshSearchForSelectedFile(allocator);
     const search_before = page.search.match orelse return error.ExpectedSearchMatch;
     page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } };
     page.viewer.diff_scroll = 1;
@@ -8334,7 +8395,7 @@ test "ordinary primary staged-only status does not enter final-hunk projection b
     };
     try page.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
     try page.search.query.insertSlice("new");
-    controller.navigation.refreshSearchForSelectedFile();
+    controller.navigation.refreshSearchForSelectedFile(allocator);
     page.viewer.diff_scroll = 2;
     page.viewer.diff_horizontal_scroll = 3;
     const search_before = page.search.match.?;
@@ -8524,8 +8585,8 @@ test "final hunk stage retains primary presentation with staged-only authority" 
     });
     mixed_candidate.deinit();
     try page.search.query.insertSlice("gamma");
-    controller.navigation.refreshSearchForSelectedFile();
-    controller.navigation.selectSearchMatch(.forward);
+    controller.navigation.refreshSearchForSelectedFile(allocator);
+    controller.navigation.selectSearchMatch(allocator, .forward);
     page.viewer.diff_scroll = 6;
     page.viewer.diff_horizontal_scroll = 2;
     const search_before = page.search.match.?;
@@ -9211,8 +9272,8 @@ test "one hunk unstage restores combined authority over retained primary present
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
     try page.search.query.insertSlice("gamma");
-    controller.navigation.refreshSearchForSelectedFile();
-    controller.navigation.selectSearchMatch(.forward);
+    controller.navigation.refreshSearchForSelectedFile(allocator);
+    controller.navigation.selectSearchMatch(allocator, .forward);
     page.viewer.diff_scroll = 6;
     page.viewer.diff_horizontal_scroll = 2;
     const search_before = page.search.match.?;
@@ -9440,8 +9501,8 @@ test "final staged hunk unstage removes primary combined authority without repla
     const original_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(original_clipboard);
     try page.search.query.insertSlice("beta");
-    controller.navigation.refreshSearchForSelectedFile();
-    controller.navigation.selectSearchMatch(.forward);
+    controller.navigation.refreshSearchForSelectedFile(allocator);
+    controller.navigation.selectSearchMatch(allocator, .forward);
     page.viewer.diff_scroll = 4;
     page.viewer.diff_horizontal_scroll = 2;
     const search_before = page.search.match.?;

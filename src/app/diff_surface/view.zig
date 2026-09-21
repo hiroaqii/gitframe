@@ -561,13 +561,13 @@ pub fn viewDiffPane(
 test "primary diff presentation preserves active selection precedence" {
     const passive: diff_selection_model.View = .{
         .identity = .{ .generated_file = .{ .path_key = "passive" } },
-        .side = .new,
+        .content = .{ .source_side = .{ .side = .new } },
         .start = diff_selection_model.pointFromLine(0, 1),
         .end = diff_selection_model.pointFromLine(0, 2),
     };
     const active: diff_selection_model.View = .{
         .identity = .{ .generated_file = .{ .path_key = "active" } },
-        .side = .old,
+        .content = .{ .source_side = .{ .side = .old } },
         .start = diff_selection_model.pointFromLine(1, 3),
         .end = diff_selection_model.pointFromLine(1, 4),
     };

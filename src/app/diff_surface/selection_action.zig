@@ -9,6 +9,7 @@ const diff_selection = @import("../../diff/selection.zig");
 const diff_view_model = @import("../../diff/view_model.zig");
 
 pub const Action = common.Action;
+pub const StatusAction = common.StatusAction;
 pub const ViewportBasis = common.ViewportBasis;
 pub const StatusPresentation = common.StatusPresentation;
 pub const statusLayout = common.statusLayout;
@@ -20,9 +21,13 @@ pub const Presentation = struct {
     pub fn status(self: Presentation) StatusPresentation {
         return .{
             .line_count = self.line_count,
-            .side = switch (self.view.side) {
-                .old => .before,
-                .new => .after,
+            .actions = if (self.view.content == .unified_diff) .unified_diff else .source,
+            .side = switch (self.view.content) {
+                .unified_diff => .none,
+                .source_side => |source| switch (source.side) {
+                    .old => .before,
+                    .new => .after,
+                },
             },
         };
     }

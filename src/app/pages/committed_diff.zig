@@ -11,6 +11,7 @@ const diff_surface = @import("../diff_surface.zig");
 const load_state = @import("../load_state.zig");
 const app_load = @import("../load.zig");
 const commit_diff = @import("../../git/commit_diff.zig");
+const diff_presentation_identity = @import("../../diff/presentation_identity.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
 const file_tree = @import("../../file_tree.zig");
@@ -66,6 +67,11 @@ pub const PinnedSelectionBasis = struct {
     pub fn eql(self: PinnedSelectionBasis, other: PinnedSelectionBasis) bool {
         return self.identity.eql(other.identity);
     }
+};
+
+pub const RetainedSelectionTransfer = enum {
+    none,
+    preserve_exact_folds,
 };
 
 pub const SurfaceOwner = struct {
@@ -246,7 +252,7 @@ pub const State = struct {
         current_target: ?commit_diff.Target,
         incoming_target: commit_diff.Target,
         incoming_diff: *const app_load.CommittedDiffBundle,
-    ) bool {
+    ) RetainedSelectionTransfer {
         return self.retainedSelectionTransfersWithIdentity(
             repo_epoch,
             root_identity,
@@ -265,29 +271,32 @@ pub const State = struct {
         current_identity: ?PresentationIdentity,
         incoming_identity: PresentationIdentity,
         incoming_diff: *const app_load.CommittedDiffBundle,
-    ) bool {
-        const completed = self.completed_selection orelse return false;
-        const pinned = self.pinned_selection_basis orelse return false;
-        const current = current_identity orelse return false;
-        if (!pinned.eql(.initIdentity(current)) or !pinned.eql(.initIdentity(incoming_identity))) return false;
+    ) RetainedSelectionTransfer {
+        const completed = self.completed_selection orelse return .none;
+        const pinned = self.pinned_selection_basis orelse return .none;
+        const current = current_identity orelse return .none;
+        if (!pinned.eql(.initIdentity(current)) or !pinned.eql(.initIdentity(incoming_identity))) return .none;
+        if (completed.selection_layout_revision != self.selection_layout_revision) return .none;
         if (completed.token.repo_epoch != repo_epoch or
             !optionalRootIdentityEql(completed.token.root_identity, root_identity) or
             !completed.token.source.eql(diff_surface.selection.SourceBasis.init(source)) or
-            completed.token.source_session_revision != self.source_session_revision) return false;
+            completed.token.source_session_revision != self.source_session_revision) return .none;
         const current_loaded = switch (self.load.state) {
             .loaded => |session| &session.loaded,
-            else => return false,
+            else => return .none,
         };
         const incoming_loaded = switch (incoming_diff.*) {
             .loaded => |bundle| &bundle.loaded,
-            .empty => return false,
+            .empty => return .none,
         };
         const outgoing_fingerprint = content_fingerprint.Fingerprint.init(current_loaded.text);
         const incoming_fingerprint = content_fingerprint.Fingerprint.init(incoming_loaded.text);
-        return switch (completed.token.display) {
+        const fingerprint_matches = switch (completed.token.display) {
             .loaded => |fingerprint| fingerprint.eql(outgoing_fingerprint) and fingerprint.eql(incoming_fingerprint),
             else => false,
         };
+        if (!fingerprint_matches or !exactFoldTopology(current_loaded, incoming_loaded)) return .none;
+        return .preserve_exact_folds;
     }
 
     /// Prepare the complete replacement before releasing the current snapshot,
@@ -301,7 +310,7 @@ pub const State = struct {
         source: diff_source.SourceMode,
         current_target: commit_diff.Target,
         pair_changed: bool,
-        transfer_selection: bool,
+        transfer_selection: RetainedSelectionTransfer,
         incoming: *app_load.CommittedDiffBundle,
     ) !void {
         return self.replaceDiffWithIdentity(
@@ -326,7 +335,7 @@ pub const State = struct {
         source: diff_source.SourceMode,
         current_identity: PresentationIdentity,
         pair_changed: bool,
-        transfer_selection: bool,
+        transfer_selection: RetainedSelectionTransfer,
         incoming: *app_load.CommittedDiffBundle,
     ) !void {
         var prepared_session: ?load_state.LoadedSession = null;
@@ -363,8 +372,25 @@ pub const State = struct {
         }
         errdefer if (prepared_session) |*session| session.deinit(null);
 
+        if (transfer_selection == .preserve_exact_folds) {
+            const outgoing = switch (self.load.state) {
+                .loaded => |*session| &session.loaded,
+                else => unreachable,
+            };
+            const prepared = &prepared_session.?.loaded;
+            std.debug.assert(outgoing.collapsed_hunks.len == prepared.collapsed_hunks.len);
+            @memcpy(prepared.collapsed_hunks, outgoing.collapsed_hunks);
+            for (prepared.document.files, 0..) |_, file_index| {
+                prepared.rendered_line_cache.recomputeFile(
+                    prepared.document,
+                    file_index,
+                    prepared.foldedHunksForFile(file_index),
+                );
+            }
+        }
+
         self.file_search.deinit(allocator);
-        if (!transfer_selection) self.clearRetainedSelection(allocator);
+        if (transfer_selection == .none) self.clearRetainedSelection(allocator);
         self.selection_owner = .none;
         if (pair_changed) {
             self.reviewed_store.deinit(allocator);
@@ -379,7 +405,7 @@ pub const State = struct {
             self.resetAcceptedDisplayNavigation();
         }
         self.source_session_revision +%= 1;
-        if (transfer_selection) {
+        if (transfer_selection == .preserve_exact_folds) {
             const loaded = switch (self.load.state) {
                 .loaded => |*session| &session.loaded,
                 else => unreachable,
@@ -462,6 +488,18 @@ pub const State = struct {
     }
 };
 
+fn exactFoldTopology(outgoing: *const @import("../../loaded_diff.zig").LoadedDiff, incoming: *const @import("../../loaded_diff.zig").LoadedDiff) bool {
+    if (outgoing.document.files.len != incoming.document.files.len or
+        outgoing.collapsed_hunks.len != incoming.collapsed_hunks.len)
+        return false;
+    for (outgoing.document.files, incoming.document.files) |old_file, new_file| {
+        if (old_file.hunks.len != new_file.hunks.len or
+            !diff_presentation_identity.exactEqual(old_file, new_file))
+            return false;
+    }
+    return true;
+}
+
 fn optionalRootIdentityEql(left: ?root_capability.Identity, right: ?root_capability.Identity) bool {
     if (left == null or right == null) return left == null and right == null;
     return left.?.eql(right.?);
@@ -508,4 +546,207 @@ test "committed diff selection pin admits one exact History basis without changi
     different.after = before;
     try std.testing.expect(!state.retainedSelectionAdmittedWithIdentity(.{ .diff_basis = different }));
     try std.testing.expect(!state.retainedSelectionAdmitted(null));
+}
+
+test "committed diff exact reload preserves folds selection pin and indexes for Compare and History identities" {
+    const allocator = std.testing.allocator;
+    const before = try commit_diff.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const after = try commit_diff.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const target: commit_diff.Target = .{
+        .object_format = .sha1,
+        .base_oid = before,
+        .head_oid = after,
+        .diff_base_oid = before,
+    };
+    const basis: commit_diff.Basis = .{
+        .object_format = .sha1,
+        .before = .{ .commit = before },
+        .after = after,
+    };
+    const cases = [_]struct {
+        identity: PresentationIdentity,
+        source: diff_source.SourceMode,
+    }{
+        .{ .identity = .{ .target = target }, .source = .{ .range = "compare" } },
+        .{ .identity = .{ .diff_basis = basis }, .source = .{ .range = "history" } },
+    };
+    const patch =
+        "diff --git a/a b/a\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1,3 +1,3 @@ first\n" ++
+        " one\n" ++
+        "-old\n" ++
+        "+new\n" ++
+        " two\n" ++
+        "@@ -10,2 +10,2 @@ second\n" ++
+        " ten\n" ++
+        "-older\n" ++
+        "+newer\n";
+    const changed_patch =
+        "diff --git a/a b/a\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1,3 +1,3 @@ first\n" ++
+        " one\n" ++
+        "-old\n" ++
+        "+new\n" ++
+        " two\n" ++
+        "@@ -10,2 +10,2 @@ second\n" ++
+        " ten\n" ++
+        "-older\n" ++
+        "+newest\n";
+
+    for (cases) |case| {
+        var state: State = .{};
+        defer state.deinit(allocator);
+
+        var initial: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) };
+        defer initial.deinit();
+        try state.replaceDiffWithIdentity(
+            allocator,
+            7,
+            null,
+            null,
+            case.source,
+            case.identity,
+            true,
+            .none,
+            &initial,
+        );
+        const loaded = switch (state.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => return error.ExpectedLoadedDiff,
+        };
+        try std.testing.expectEqual(@as(usize, 2), loaded.document.files[0].hunks.len);
+        loaded.setHunkFolded(0, 1, true);
+        const folded_unified_rows = loaded.renderedLineIndex(0, .unified).lineCount();
+        const folded_side_rows = loaded.renderedLineIndex(0, .side_by_side).lineCount();
+
+        var selection = diff_selection.DragSelection.initUnified(
+            .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .{ .hunk_index = 0, .line_index = 0 },
+        );
+        selection.focus = .{ .hunk_index = 0, .line_index = 3 };
+        selection.moved = true;
+        state.completed_selection = try diff_surface.selection.buildParsedFolded(
+            allocator,
+            .{
+                .repo_epoch = 7,
+                .root_identity = null,
+                .source = diff_surface.selection.SourceBasis.init(case.source),
+                .source_session_revision = state.source_session_revision,
+                .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
+            },
+            loaded.document.files[0],
+            loaded.foldedHunksForFile(0),
+            state.selection_layout_revision,
+            selection,
+        );
+        try std.testing.expect(state.installPinnedPresentationIdentity(case.identity));
+        const clipboard_before = try state.completed_selection.?.clipboardText(allocator);
+        defer allocator.free(clipboard_before);
+        const layout_revision = state.selection_layout_revision;
+
+        var identical: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) };
+        defer identical.deinit();
+        try std.testing.expect(!identical.loaded.loaded.isHunkFolded(0, 1));
+        const transfer = state.retainedSelectionTransfersWithIdentity(
+            7,
+            null,
+            case.source,
+            case.identity,
+            case.identity,
+            &identical,
+        );
+        try std.testing.expectEqual(RetainedSelectionTransfer.preserve_exact_folds, transfer);
+        try state.replaceDiffWithIdentity(
+            allocator,
+            7,
+            null,
+            null,
+            case.source,
+            case.identity,
+            false,
+            transfer,
+            &identical,
+        );
+
+        const transferred = switch (state.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => return error.ExpectedTransferredDiff,
+        };
+        try std.testing.expect(transferred.isHunkFolded(0, 1));
+        try std.testing.expectEqual(folded_unified_rows, transferred.renderedLineIndex(0, .unified).lineCount());
+        try std.testing.expectEqual(folded_side_rows, transferred.renderedLineIndex(0, .side_by_side).lineCount());
+        try std.testing.expectEqual(layout_revision, state.selection_layout_revision);
+        try std.testing.expect(state.retainedSelectionAdmittedWithIdentity(case.identity));
+        try std.testing.expectEqual(state.source_session_revision, state.completed_selection.?.token.source_session_revision);
+        const clipboard_after = try state.completed_selection.?.clipboardText(allocator);
+        defer allocator.free(clipboard_after);
+        try std.testing.expectEqualStrings(clipboard_before, clipboard_after);
+
+        transferred.setHunkFolded(0, 1, false);
+        const unfolded_unified_rows = transferred.renderedLineIndex(0, .unified).lineCount();
+        const unfolded_side_rows = transferred.renderedLineIndex(0, .side_by_side).lineCount();
+        var unfolded_identical: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) };
+        defer unfolded_identical.deinit();
+        const unfolded_transfer = state.retainedSelectionTransfersWithIdentity(
+            7,
+            null,
+            case.source,
+            case.identity,
+            case.identity,
+            &unfolded_identical,
+        );
+        try std.testing.expectEqual(RetainedSelectionTransfer.preserve_exact_folds, unfolded_transfer);
+        try state.replaceDiffWithIdentity(
+            allocator,
+            7,
+            null,
+            null,
+            case.source,
+            case.identity,
+            false,
+            unfolded_transfer,
+            &unfolded_identical,
+        );
+        const unfolded = switch (state.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => return error.ExpectedTransferredDiff,
+        };
+        try std.testing.expect(!unfolded.isHunkFolded(0, 1));
+        try std.testing.expectEqual(unfolded_unified_rows, unfolded.renderedLineIndex(0, .unified).lineCount());
+        try std.testing.expectEqual(unfolded_side_rows, unfolded.renderedLineIndex(0, .side_by_side).lineCount());
+        try std.testing.expectEqual(layout_revision, state.selection_layout_revision);
+        try std.testing.expect(state.retainedSelectionAdmittedWithIdentity(case.identity));
+        const unfolded_clipboard = try state.completed_selection.?.clipboardText(allocator);
+        defer allocator.free(unfolded_clipboard);
+        try std.testing.expectEqualStrings(clipboard_before, unfolded_clipboard);
+
+        var changed: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, changed_patch) };
+        defer changed.deinit();
+        const rejected = state.retainedSelectionTransfersWithIdentity(
+            7,
+            null,
+            case.source,
+            case.identity,
+            case.identity,
+            &changed,
+        );
+        try std.testing.expectEqual(RetainedSelectionTransfer.none, rejected);
+        try state.replaceDiffWithIdentity(
+            allocator,
+            7,
+            null,
+            null,
+            case.source,
+            case.identity,
+            false,
+            rejected,
+            &changed,
+        );
+        try std.testing.expect(state.completed_selection == null);
+        try std.testing.expect(state.pinned_selection_basis == null);
+    }
 }

@@ -113,19 +113,18 @@ fn retainedCompareAppForViewTest(
     errdefer app.pages.compare.deinit(allocator);
     const drag: diff_selection.DragSelection = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = side,
-        .mode = .line,
+        .content = if (mode == .unified) .unified_diff else .{ .source_side = .{ .side = side } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 3 },
         .moved = true,
     };
-    app.pages.compare.diff.completed_selection = try @import("../diff_surface/selection.zig").buildParsed(allocator, .{
+    app.pages.compare.diff.completed_selection = try @import("../diff_surface/selection.zig").buildParsedFolded(allocator, .{
         .repo_epoch = 0,
         .root_identity = null,
         .source = @import("../diff_surface/selection.zig").SourceBasis.init(.{ .range = "compare" }),
         .source_session_revision = app.pages.compare.diff.source_session_revision,
         .display = .{ .loaded = content_fingerprint.Fingerprint.init("") },
-    }, app_test_support.loadedDiffOne().document.files[0], drag);
+    }, app_test_support.loadedDiffOne().document.files[0], &.{}, app.pages.compare.diff.selection_layout_revision, drag);
     try std.testing.expect(app.pages.compare.diff.installPinnedSelectionBasis(app.pages.compare.currentTarget()));
 
     return app;
@@ -230,15 +229,14 @@ test "Compare selection status renders in the fixed header row for unified and b
         try app.view(&surface.surface);
         const snapshot = try surface.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "3 lines selected") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "y Copy") != null);
+        const count = if (case.mode == .unified) "4 lines selected" else "3 lines selected";
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, count) != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, if (case.mode == .unified) "y Copy diff" else "y Copy") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Esc Clear") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "[y Copy]") == null);
         if (case.mode == .unified) {
-            const side_label = if (case.side == .old) "Selection side: BEFORE" else "Selection side: AFTER";
-            const opposite_label = if (case.side == .old) "Selection side: AFTER" else "Selection side: BEFORE";
-            try std.testing.expect(std.mem.indexOf(u8, snapshot, side_label) != null);
-            try std.testing.expect(std.mem.indexOf(u8, snapshot, opposite_label) == null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "Y Copy hunk diff") != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "Selection side:") == null);
         } else {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "Selection side:") == null);
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "BEFORE") == null);

@@ -230,7 +230,7 @@ pub const Controller = struct {
         switch (target) {
             .no_context => self.status.set("Repository has no resolved file to open in Changes", .{}),
             .location => |location| {
-                const outcome = self.changesNavigation().revealExactPath(location) catch {
+                const outcome = self.changesNavigation().revealExactPath(allocator, location) catch {
                     self.status.set("could not prepare page navigation", .{});
                     return;
                 };

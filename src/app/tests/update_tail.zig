@@ -483,8 +483,7 @@ test "Compare wheel redraw completion defers as one bundle during drag and appli
     ) } } }, &ctx);
     app.pages.compare.diff.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "b/src/compare.zig" } },
-        .side = .new,
-        .mode = .line,
+        .content = .{ .source_side = .{ .side = .new } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
@@ -2006,8 +2005,7 @@ test "Changes staged boundary result defers during drag and lands afterward" {
 
     app.pages.changes.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .line,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
@@ -2057,8 +2055,7 @@ test "Changes deferred boundary publication forces frame past skip latch" {
 
     app.pages.changes.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
-        .mode = .line,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,

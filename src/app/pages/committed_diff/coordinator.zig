@@ -45,7 +45,7 @@ pub const Controller = struct {
     pub fn update(self: Controller, allocator: std.mem.Allocator, msg: input.Msg) !UpdateOutcome {
         return switch (msg) {
             .shared => |shared_msg| self.updateShared(allocator, shared_msg),
-            .copy_current_line => self.copyCurrentLine(),
+            .copy_current_line => self.copyCurrentLine(allocator),
             .copy_current_hunk => self.copyCurrentHunk(allocator),
             .branch_switch_unavailable => blk: {
                 self.navigation.status.set("{s}", .{self.branch_unavailable_message});
@@ -54,14 +54,24 @@ pub const Controller = struct {
         };
     }
 
-    pub fn initializeAcceptedBody(self: Controller, allocator: std.mem.Allocator) void {
+    pub fn initializeAcceptedBody(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        transferred_viewport: ?diff_surface.selection_action.SelectionViewportAnchor,
+    ) void {
         var adapter = self.navigation.updateAdapter();
-        var body = adapter.bodyController();
+        const cleanup = adapter.selectionMappingCleanup(allocator);
+        const body = adapter.bodyController();
         if (body.controller.activeLoadedDiff()) |loaded| {
             body.controller.syncSidebarNodeToSelectedFile(loaded);
-            body.initializeDiffCursorForSelectedFile();
+            if (transferred_viewport == null or self.navigation.diff.completed_selection == null) {
+                body.initializeDiffCursorForSelectedFile();
+            }
             body.clampDiffNavigation();
-            body.refreshSearchForSelectedFile();
+            if (transferred_viewport) |anchor| {
+                if (self.navigation.diff.completed_selection != null) body.restoreSelectionViewportAnchor(anchor);
+            }
+            body.refreshSearchForSelectedFile(cleanup);
             body.controller.rebuildFileSearchProjection(allocator);
         }
     }
@@ -84,6 +94,11 @@ pub const Controller = struct {
                 .auto_scroll = auto_scroll,
                 .redraw = redraw,
             },
+            .copy_hunk_diff => |text| .{
+                .clipboard = self.ownedClipboard("current hunk diff", text),
+                .auto_scroll = auto_scroll,
+                .redraw = redraw,
+            },
             .copy_diff_header_path => |selection_value| blk: {
                 const selection = selection_value;
                 defer allocator.free(selection.identity.path_key);
@@ -99,14 +114,22 @@ pub const Controller = struct {
         };
     }
 
-    fn copyCurrentLine(self: Controller) UpdateOutcome {
+    fn copyCurrentLine(self: Controller, allocator: std.mem.Allocator) !UpdateOutcome {
         const view = self.navigation.view();
         var resolver = view.resolver();
-        const text = view.contentView(&resolver).currentLineCopyText() orelse {
+        var content = try view.contentView(&resolver).currentLineCopyText(allocator) orelse {
             self.navigation.status.set("no diff line selected", .{});
             return .{};
         };
-        return .{ .clipboard = self.borrowedClipboard("current line", text) };
+        defer content.deinit(allocator);
+        const label = if (view.view().effectiveDisplayMode() == .unified) "current diff line" else "current line";
+        return switch (content) {
+            .borrowed => |text| .{ .clipboard = self.borrowedClipboard(label, text) },
+            .owned => |text| blk: {
+                content = .{ .borrowed = "" };
+                break :blk .{ .clipboard = self.ownedClipboard(label, text) };
+            },
+        };
     }
 
     fn copyCurrentHunk(self: Controller, allocator: std.mem.Allocator) !UpdateOutcome {
@@ -114,10 +137,11 @@ pub const Controller = struct {
         var resolver = view.resolver();
         var content = try view.contentView(&resolver).selectedHunkCopyText(allocator);
         defer content.deinit(allocator);
+        const label = if (view.view().effectiveDisplayMode() == .unified) "current hunk diff" else "current hunk";
         switch (content) {
             .ready => |text| {
                 content = .no_hunk;
-                return .{ .clipboard = self.ownedClipboard("current hunk", text) };
+                return .{ .clipboard = self.ownedClipboard(label, text) };
             },
             .no_hunk => self.navigation.status.set("no hunk selected", .{}),
             .no_new_side => self.navigation.status.set("no new-side text in selected hunk", .{}),

@@ -1239,16 +1239,30 @@ pub const Controller = struct {
         navigation: Controller,
         resolver: ChangesBodyResolver,
 
+        pub fn bodyController(self: *UpdateAdapter) diff_surface.navigation.BodyController {
+            return self.navigation.sharedBodyController(&self.resolver);
+        }
+
+        pub fn selectionMappingCleanup(
+            _: *UpdateAdapter,
+            allocator: std.mem.Allocator,
+        ) diff_surface.navigation.SelectionMappingCleanup {
+            return .{ .allocator = allocator };
+        }
+
         pub fn shared(self: *UpdateAdapter) diff_surface.update.Controller {
             return .{
-                .navigation = self.navigation.sharedBodyController(&self.resolver),
+                .navigation = self.bodyController(),
                 .toggle_hunk_fold = .{ .ctx = self, .callback = toggleHunkFold },
             };
         }
 
-        fn toggleHunkFold(ctx: *anyopaque) void {
+        fn toggleHunkFold(
+            ctx: *anyopaque,
+            cleanup: diff_surface.navigation.SelectionMappingCleanup,
+        ) void {
             const self: *UpdateAdapter = @ptrCast(@alignCast(ctx));
-            self.navigation.toggleSelectedHunkFold();
+            self.navigation.toggleSelectedHunkFoldWithCleanup(cleanup);
         }
     };
 
@@ -1326,24 +1340,29 @@ pub const Controller = struct {
         self.page.viewer.diff_scroll = self.view().restoredSelectionViewportScroll(anchor);
     }
 
-    pub fn selectFileDelta(self: Controller, delta: i2) void {
+    pub fn selectFileDelta(self: Controller, allocator: std.mem.Allocator, delta: i2) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).selectFileDelta(delta);
+        self.sharedBodyController(&adapter).selectFileDelta(.{ .allocator = allocator }, delta);
     }
 
-    pub fn selectFileAbsolute(self: Controller, index: usize) void {
+    pub fn selectFileAbsolute(self: Controller, allocator: std.mem.Allocator, index: usize) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).selectFileAbsolute(index);
+        self.sharedBodyController(&adapter).selectFileAbsolute(.{ .allocator = allocator }, index);
     }
 
-    pub fn selectLastFile(self: Controller) void {
+    pub fn selectLastFile(self: Controller, allocator: std.mem.Allocator) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).selectLastFile();
+        self.sharedBodyController(&adapter).selectLastFile(.{ .allocator = allocator });
     }
 
-    pub fn selectSidebarNode(self: Controller, loaded: *LoadedDiff, node_index: usize) void {
+    pub fn selectSidebarNode(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        loaded: *LoadedDiff,
+        node_index: usize,
+    ) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).selectSidebarNode(loaded, node_index);
+        self.sharedBodyController(&adapter).selectSidebarNode(.{ .allocator = allocator }, loaded, node_index);
     }
 
     pub fn toggleSelectedDirectory(self: Controller) !void {
@@ -1351,9 +1370,9 @@ pub const Controller = struct {
         try self.sharedBodyController(&adapter).toggleSelectedDirectory();
     }
 
-    pub fn clickSidebarNode(self: Controller, node_index: usize) !void {
+    pub fn clickSidebarNode(self: Controller, allocator: std.mem.Allocator, node_index: usize) !void {
         var adapter = self.bodyResolverAdapter();
-        try self.sharedBodyController(&adapter).clickSidebarNode(node_index);
+        try self.sharedBodyController(&adapter).clickSidebarNode(.{ .allocator = allocator }, node_index);
     }
 
     pub fn expandSelectedDirectory(self: Controller) !void {
@@ -1404,29 +1423,22 @@ pub const Controller = struct {
         self.sharedBodyController(&adapter).selectHunkDelta(delta);
     }
 
-    pub fn toggleSelectedHunkFold(self: Controller) void {
+    fn toggleSelectedHunkFoldWithCleanup(
+        self: Controller,
+        cleanup: diff_surface.navigation.SelectionMappingCleanup,
+    ) void {
         const target = self.view().resolvedTarget();
         if (target.hunk_interaction != .available) return;
         if (!diff_surface.navigation.resolvedTargetAllowsHunkFold(target)) {
             self.setStatus("hunk fold is unavailable for projected view", .{});
             return;
         }
-        const hunk_index = self.view().selectedHunkIndex();
-        const before_folded = if (hunk_index) |index| blk: {
-            const folded = self.view().selectedFoldedHunks();
-            break :blk if (index < folded.len) folded[index] else null;
-        } else null;
-        const viewport_anchor = self.captureSelectionViewportAnchor();
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).toggleSelectedHunkFold();
-        const changed = if (hunk_index) |index| blk: {
-            const folded = self.view().selectedFoldedHunks();
-            break :blk index < folded.len and before_folded != null and folded[index] != before_folded.?;
-        } else false;
-        if (changed) {
-            self.page.advanceSelectionLayoutRevision();
-            if (viewport_anchor) |anchor| self.restoreSelectionViewportAnchor(anchor);
-        }
+        self.sharedBodyController(&adapter).toggleSelectedHunkFold(cleanup);
+    }
+
+    pub fn toggleSelectedHunkFold(self: Controller, allocator: std.mem.Allocator) void {
+        self.toggleSelectedHunkFoldWithCleanup(.{ .allocator = allocator });
     }
 
     pub fn clampDiffNavigation(self: Controller) void {
@@ -1485,17 +1497,17 @@ pub const Controller = struct {
 
     pub fn toggleReviewedFile(self: Controller, allocator: std.mem.Allocator) !void {
         var adapter = self.bodyResolverAdapter();
-        try self.sharedBodyController(&adapter).toggleReviewedFile(allocator);
+        try self.sharedBodyController(&adapter).toggleReviewedFile(.{ .allocator = allocator }, allocator);
     }
 
     pub fn toggleHideReviewedFiles(self: Controller, allocator: std.mem.Allocator) !void {
         var adapter = self.bodyResolverAdapter();
-        try self.sharedBodyController(&adapter).toggleHideReviewedFiles(allocator);
+        try self.sharedBodyController(&adapter).toggleHideReviewedFiles(.{ .allocator = allocator }, allocator);
     }
 
     pub fn cycleChangedFileFilter(self: Controller, allocator: std.mem.Allocator) !void {
         var adapter = self.bodyResolverAdapter();
-        try self.sharedBodyController(&adapter).cycleChangedFileFilter(allocator);
+        try self.sharedBodyController(&adapter).cycleChangedFileFilter(.{ .allocator = allocator }, allocator);
     }
 
     /// Replace the accepted Changes file-visibility lens transactionally.
@@ -1510,6 +1522,7 @@ pub const Controller = struct {
     ) !void {
         var adapter = self.bodyResolverAdapter();
         try self.sharedBodyController(&adapter).replaceFileVisibilityLens(
+            .{ .allocator = allocator },
             allocator,
             visible_allocator,
             hide_reviewed_files,
@@ -1519,7 +1532,7 @@ pub const Controller = struct {
 
     pub fn submitFileSearch(self: Controller, allocator: std.mem.Allocator) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).submitFileSearch(allocator);
+        self.sharedBodyController(&adapter).submitFileSearch(.{ .allocator = allocator }, allocator);
     }
 
     fn submitFileSearchWithVisibleAllocator(
@@ -1529,24 +1542,29 @@ pub const Controller = struct {
     ) void {
         var adapter = self.bodyResolverAdapter();
         self.sharedBodyController(&adapter).submitFileSearchWithVisibleAllocator(
+            .{ .allocator = allocator },
             allocator,
             visible_allocator_override,
         );
     }
 
-    pub fn submitSearch(self: Controller) void {
+    pub fn submitSearch(self: Controller, allocator: std.mem.Allocator) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).submitSearch();
+        self.sharedBodyController(&adapter).submitSearch(.{ .allocator = allocator });
     }
 
-    pub fn selectSearchMatch(self: Controller, direction: diff_search.Direction) void {
+    pub fn selectSearchMatch(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        direction: diff_search.Direction,
+    ) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).selectSearchMatch(direction);
+        self.sharedBodyController(&adapter).selectSearchMatch(.{ .allocator = allocator }, direction);
     }
 
-    pub fn refreshSearchForSelectedFile(self: Controller) void {
+    pub fn refreshSearchForSelectedFile(self: Controller, allocator: std.mem.Allocator) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).refreshSearchForSelectedFile();
+        self.sharedBodyController(&adapter).refreshSearchForSelectedFile(.{ .allocator = allocator });
     }
 
     pub fn clearSearchMatch(self: Controller) void {
@@ -1568,9 +1586,9 @@ pub const Controller = struct {
         return self.sharedBodyController(&adapter).blockUnsupportedSearchTarget();
     }
 
-    pub fn unfoldSearchMatchIfNeeded(self: Controller, match: diff_search.Match) void {
+    pub fn unfoldSearchMatchIfNeeded(self: Controller, allocator: std.mem.Allocator, match: diff_search.Match) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).unfoldSearchMatchIfNeeded(match);
+        self.sharedBodyController(&adapter).unfoldSearchMatchIfNeeded(.{ .allocator = allocator }, match);
     }
 
     pub fn scrollSearchMatchIntoView(self: Controller) void {
@@ -1615,9 +1633,9 @@ pub const Controller = struct {
 
     /// Rebind the tree cursor after one member replaces the tree, but retain
     /// the action owner until the exact source/status pair is terminal.
-    pub fn remapActionCursor(self: Controller, loaded: *LoadedDiff) bool {
+    pub fn remapActionCursor(self: Controller, allocator: std.mem.Allocator, loaded: *LoadedDiff) bool {
         const target = self.page.action_cursor.restoreTarget() orelse return false;
-        return self.restoreTypedActionTarget(loaded, target, false);
+        return self.restoreTypedActionTarget(allocator, loaded, target, false);
     }
 
     /// Consume one terminal action owner and restore its typed target exactly
@@ -1627,7 +1645,7 @@ pub const Controller = struct {
         defer owner.deinit(allocator);
         if (!owner.mayRestore()) return true;
         const loaded = self.activeLoadedDiff() orelse return true;
-        _ = self.restoreTypedActionTarget(loaded, &owner.target, true);
+        _ = self.restoreTypedActionTarget(allocator, loaded, &owner.target, true);
         self.clampSelection(loaded.document.files.len);
         self.clampDiffNavigation();
         return true;
@@ -1635,18 +1653,19 @@ pub const Controller = struct {
 
     fn restoreTypedActionTarget(
         self: Controller,
+        allocator: std.mem.Allocator,
         loaded: *LoadedDiff,
         target: *const changes_page.action_cursor.Target,
         final: bool,
     ) bool {
         if (typedActionNode(loaded, target)) |node_index| {
             if (loaded.visibleRowOfNode(node_index) != null) {
-                self.selectSidebarNode(loaded, node_index);
+                self.selectSidebarNode(allocator, loaded, node_index);
                 return true;
             }
             if (final and self.actionTargetIncludedByFilters(loaded, node_index)) {
                 if (self.revealActionNode(loaded, node_index)) {
-                    self.selectSidebarNode(loaded, node_index);
+                    self.selectSidebarNode(allocator, loaded, node_index);
                     return true;
                 }
             }
@@ -1654,7 +1673,7 @@ pub const Controller = struct {
 
         if (target.kind == .directory or target.kind == .repository_root) {
             if (deepestVisibleTypedAncestor(loaded, target.path_key)) |node_index| {
-                self.selectSidebarNode(loaded, node_index);
+                self.selectSidebarNode(allocator, loaded, node_index);
                 return true;
             }
             return false;
@@ -1667,7 +1686,7 @@ pub const Controller = struct {
         }
         const row = @min(target.visible_row, loaded.visibleNodeCount() - 1);
         if (nearestVisibleFileNode(loaded, row)) |node_index| {
-            self.selectSidebarNode(loaded, node_index);
+            self.selectSidebarNode(allocator, loaded, node_index);
             return true;
         }
         return false;
@@ -1708,18 +1727,24 @@ pub const Controller = struct {
         return loaded.visibleRowOfNode(node_index) != null;
     }
 
-    pub fn restoreReloadAnchor(self: Controller, loaded: *LoadedDiff, anchor: *const changes_page.ReloadAnchor) bool {
+    pub fn restoreReloadAnchor(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        loaded: *LoadedDiff,
+        anchor: *const changes_page.ReloadAnchor,
+    ) bool {
         var adapter = self.bodyResolverAdapter();
-        return self.sharedBodyController(&adapter).restoreReloadAnchor(loaded, anchor);
+        return self.sharedBodyController(&adapter).restoreReloadAnchor(.{ .allocator = allocator }, loaded, anchor);
     }
 
     pub fn restoreSidebarIdentity(
         self: Controller,
+        allocator: std.mem.Allocator,
         loaded: *LoadedDiff,
         identity: context.SidebarIdentity,
     ) bool {
         var adapter = self.bodyResolverAdapter();
-        return self.sharedBodyController(&adapter).restoreSidebarIdentity(loaded, identity);
+        return self.sharedBodyController(&adapter).restoreSidebarIdentity(.{ .allocator = allocator }, loaded, identity);
     }
 
     pub fn keepDiffCursorVisible(self: Controller) void {
@@ -1727,9 +1752,9 @@ pub const Controller = struct {
         self.sharedBodyController(&adapter).keepDiffCursorVisible();
     }
 
-    pub fn restoreSearchFromReloadAnchor(self: Controller, anchor: *const changes_page.ReloadAnchor) void {
+    pub fn restoreSearchFromReloadAnchor(self: Controller, allocator: std.mem.Allocator, anchor: *const changes_page.ReloadAnchor) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).restoreSearchFromReloadAnchor(anchor);
+        self.sharedBodyController(&adapter).restoreSearchFromReloadAnchor(.{ .allocator = allocator }, anchor);
     }
 
     pub fn ensureTreeOrderScope(self: Controller, allocator: std.mem.Allocator) !void {
@@ -1746,14 +1771,14 @@ pub const Controller = struct {
         self.sharedBodyController(&adapter).placeDiffCursorInComfortBand();
     }
 
-    pub fn toggleSidebarVisibility(self: Controller) void {
+    pub fn toggleSidebarVisibility(self: Controller, allocator: std.mem.Allocator) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).toggleSidebarVisibility();
+        self.sharedBodyController(&adapter).toggleSidebarVisibility(.{ .allocator = allocator });
     }
 
-    pub fn adjustSidebarWidth(self: Controller, direction: SizeDirection) void {
+    pub fn adjustSidebarWidth(self: Controller, allocator: std.mem.Allocator, direction: SizeDirection) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).adjustSidebarWidth(direction);
+        self.sharedBodyController(&adapter).adjustSidebarWidth(.{ .allocator = allocator }, direction);
     }
 
     pub fn resetDiffHorizontalScroll(self: Controller) void {
@@ -1769,9 +1794,13 @@ pub const Controller = struct {
         self.sharedBodyController(&adapter).clampSelection(file_count);
     }
 
-    pub fn reconcileSelectionAfterVisibleNodeChange(self: Controller, loaded: *LoadedDiff) void {
+    pub fn reconcileSelectionAfterVisibleNodeChange(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        loaded: *LoadedDiff,
+    ) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).reconcileSelectionAfterVisibleNodeChange(loaded);
+        self.sharedBodyController(&adapter).reconcileSelectionAfterVisibleNodeChange(.{ .allocator = allocator }, loaded);
     }
 
     pub fn setSelectedDiffFile(self: Controller, file_index: usize) void {
@@ -1782,9 +1811,9 @@ pub const Controller = struct {
         self.sharedController().syncSidebarNodeToSelectedFile(loaded);
     }
 
-    pub fn selectFirstVisibleFile(self: Controller, loaded: *LoadedDiff) void {
+    pub fn selectFirstVisibleFile(self: Controller, allocator: std.mem.Allocator, loaded: *LoadedDiff) void {
         var adapter = self.bodyResolverAdapter();
-        self.sharedBodyController(&adapter).selectFirstVisibleFile(loaded);
+        self.sharedBodyController(&adapter).selectFirstVisibleFile(.{ .allocator = allocator }, loaded);
     }
 
     pub fn materializeReviewedFiles(self: Controller, allocator: std.mem.Allocator, loaded: *LoadedDiff) !void {
@@ -1832,12 +1861,17 @@ pub const Controller = struct {
     /// Reveal and select one exact file without retaining the borrowed request.
     /// Fallible visible-tree preparation completes before
     /// collapsed ancestors or Changes navigation state can change.
-    pub fn revealExactPath(self: Controller, intent: page_link.ChangesLocationIntent) !ExactPathRevealResult {
-        return self.revealExactPathWithAllocator(intent, null);
+    pub fn revealExactPath(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        intent: page_link.ChangesLocationIntent,
+    ) !ExactPathRevealResult {
+        return self.revealExactPathWithAllocator(allocator, intent, null);
     }
 
     fn revealExactPathWithAllocator(
         self: Controller,
+        allocator: std.mem.Allocator,
         intent: page_link.ChangesLocationIntent,
         allocator_override: ?std.mem.Allocator,
     ) !ExactPathRevealResult {
@@ -1861,6 +1895,7 @@ pub const Controller = struct {
         }
 
         try self.revealAndSelectExactNode(
+            allocator,
             loaded,
             node_index,
             allocator_override orelse self.loadArenaAllocator(),
@@ -1873,12 +1908,14 @@ pub const Controller = struct {
     /// caller-specific failure policy deliberately remain outside this helper.
     fn revealAndSelectExactNode(
         self: Controller,
+        allocator: std.mem.Allocator,
         loaded: *LoadedDiff,
         node_index: usize,
         visible_allocator: ?std.mem.Allocator,
     ) !void {
         var adapter = self.bodyResolverAdapter();
         try self.sharedBodyController(&adapter).revealAndSelectExactNode(
+            .{ .allocator = allocator },
             loaded,
             node_index,
             visible_allocator,
@@ -1971,10 +2008,6 @@ fn parsedMouseLine(
 
 fn indexedLineForSide(row: diff_view_model.SideBySideIndexedRow, side: diff_selection.Side) ?diff_view_model.IndexedDiffLine {
     return diff_surface.navigation.indexedLineForSide(row, side);
-}
-
-fn selectionRegionForUnified(body_col: u16, line_numbers: bool, line: diff_parser.DiffLine, locked: ?diff_selection.DragSelection) ?SelectionRegion {
-    return diff_surface.navigation.selectionRegionForUnified(body_col, line_numbers, line, locked);
 }
 
 fn selectionRegionForGenerated(body_col: u16, body_width: u16, display_mode: diff_render.DisplayMode, line_numbers: bool, locked: ?diff_selection.DragSelection) ?SelectionRegion {
@@ -2211,20 +2244,12 @@ fn expectProjectionHunkFoldDenied(
         return error.ExpectedActiveDiffDisplay;
     try std.testing.expectEqual(@as(usize, 0), display.foldedHunks().len);
 
-    var controller = harness.controller();
-    var resolver = controller.bodyResolverAdapter();
-    controller.sharedBodyController(&resolver).toggleSelectedHunkFold();
-    try std.testing.expectEqual(folded_before, active.isHunkFolded(0, 0));
-    try std.testing.expectEqual(unified_lines_before, active.renderedLineIndex(0, .unified).lineCount());
-    try std.testing.expectEqual(unified_hunk_lines_before, active.renderedLineIndex(0, .unified).hunkLineCount(0));
-    try std.testing.expectEqual(side_by_side_lines_before, active.renderedLineIndex(0, .side_by_side).lineCount());
-    try std.testing.expectEqualDeep(cursor_before, harness.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(scroll_before, harness.pages.changes.viewer.diff_scroll);
-    try std.testing.expectEqual(horizontal_scroll_before, harness.pages.changes.viewer.diff_horizontal_scroll);
-    try std.testing.expectEqualDeep(search_before, harness.pages.changes.search);
-    try std.testing.expectEqualStrings("", harness.status.text());
+    const retained_token = try installDisplayedCompletedSelection(harness, allocator);
+    const revision_before = harness.pages.changes.selection_layout_revision;
+    var adapter = harness.controller().updateAdapter();
+    var outcome = try adapter.shared().apply(allocator, .toggle_hunk_fold);
+    defer outcome.deinit(allocator);
 
-    harness.controller().toggleSelectedHunkFold();
     try std.testing.expectEqual(folded_before, active.isHunkFolded(0, 0));
     try std.testing.expectEqual(unified_lines_before, active.renderedLineIndex(0, .unified).lineCount());
     try std.testing.expectEqual(unified_hunk_lines_before, active.renderedLineIndex(0, .unified).hunkLineCount(0));
@@ -2233,6 +2258,9 @@ fn expectProjectionHunkFoldDenied(
     try std.testing.expectEqual(scroll_before, harness.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(horizontal_scroll_before, harness.pages.changes.viewer.diff_horizontal_scroll);
     try std.testing.expectEqualDeep(search_before, harness.pages.changes.search);
+    try std.testing.expect(harness.pages.changes.completed_selection.?.token.eql(retained_token));
+    try std.testing.expectEqual(revision_before, harness.pages.changes.selection_layout_revision);
+    try std.testing.expectEqual(diff_surface.update.RetentionTransition.none, outcome.retention_transition);
     try std.testing.expectEqualStrings(
         "hunk fold is unavailable for projected view",
         harness.status.text(),
@@ -2515,6 +2543,30 @@ fn setAndRebuildFileSearch(app: *TestHarness, query: []const u8) void {
     app.changesNavigation().rebuildFileSearchProjection(std.testing.allocator);
 }
 
+fn installDisplayedCompletedSelection(
+    app: *TestHarness,
+    allocator: std.mem.Allocator,
+) !content_selection.ContentToken {
+    const view = app.changesNavigationView();
+    const target = view.parsedSelectionTarget(null) orelse return error.ExpectedParsedSelectionTarget;
+    const token = view.currentContentToken() orelse return error.ExpectedContentToken;
+    var selection = diff_selection.DragSelection.initUnified(
+        target.identity,
+        .{ .hunk_index = 0, .line_index = 0 },
+    );
+    selection.focus = .{ .hunk_index = 0, .line_index = 1 };
+    selection.moved = true;
+    app.pages.changes.completed_selection = try content_selection.buildParsedFolded(
+        allocator,
+        token,
+        target.file,
+        target.folded_hunks,
+        app.pages.changes.selection_layout_revision,
+        selection,
+    );
+    return token;
+}
+
 fn applySharedNavigation(app: *TestHarness, msg: diff_surface.message.Msg) !bool {
     var adapter = app.controller().updateAdapter();
     var outcome = try adapter.shared().apply(null, msg);
@@ -2561,13 +2613,13 @@ test "Changes navigation keeps diff position at file selection boundary" {
         },
     }, .{ .width = 100, .height = 8 });
 
-    harness.controller().selectFileDelta(-1);
+    harness.controller().selectFileDelta(std.testing.allocator, -1);
     const loaded = harness.controller().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(?usize, 0), harness.view().selectedFileIndex(loaded));
     try std.testing.expectEqual(@as(usize, 4), harness.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, 1), harness.view().selectedHunkIndex());
 
-    harness.controller().selectFileAbsolute(0);
+    harness.controller().selectFileAbsolute(std.testing.allocator, 0);
     try std.testing.expectEqual(@as(usize, 4), harness.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(@as(?usize, 1), harness.view().selectedHunkIndex());
 }
@@ -2713,7 +2765,7 @@ test "document navigation applies first last half and full page on rendered rows
 
     harness.pages.changes.viewer.diff_scroll = 0;
     setDiffSearchQuery(&harness, "new");
-    harness.controller().submitSearch();
+    harness.controller().submitSearch(std.testing.allocator);
     const search_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
     const search_row = search_offset - harness.pages.changes.viewer.diff_scroll;
     try std.testing.expect(search_row >= margin and search_row <= band_last);
@@ -2758,7 +2810,7 @@ test "reload search fallback resyncs match without interactive cursor placement"
     };
 
     const cursor_before = harness.pages.changes.viewer.diff_cursor;
-    harness.controller().restoreSearchFromReloadAnchor(&anchor);
+    harness.controller().restoreSearchFromReloadAnchor(std.testing.allocator, &anchor);
 
     try std.testing.expectEqual(cursor_before, harness.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
@@ -2781,7 +2833,7 @@ test "Changes mouse selection ignores the opposite side and resumes on its locke
         .row = diff_render.body_start_row + 1,
     });
     const started = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Side.old, started.side);
+    try std.testing.expectEqual(diff_selection.Side.old, started.selectedSide().?);
     try std.testing.expectEqual(@as(usize, 0), started.focus.line_index);
 
     harness.controller().dragDiffMouse(.{
@@ -2789,7 +2841,7 @@ test "Changes mouse selection ignores the opposite side and resumes on its locke
         .row = diff_render.body_start_row + 3,
     });
     const dragged = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Side.old, dragged.side);
+    try std.testing.expectEqual(diff_selection.Side.old, dragged.selectedSide().?);
     try std.testing.expectEqual(@as(usize, 0), dragged.focus.line_index);
     try std.testing.expect(!dragged.moved);
 
@@ -2798,7 +2850,7 @@ test "Changes mouse selection ignores the opposite side and resumes on its locke
         .row = diff_render.body_start_row + 3,
     });
     const resumed = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Side.old, resumed.side);
+    try std.testing.expectEqual(diff_selection.Side.old, resumed.selectedSide().?);
     try std.testing.expectEqual(@as(usize, 2), resumed.focus.line_index);
     try std.testing.expect(resumed.moved);
 }
@@ -2841,7 +2893,7 @@ test "Changes mouse selection projects scrolled TAB wide combining and emoji cel
     try std.testing.expect(pointForTextCell(3, 4, &invalid, .character, 0, 0) == null);
 }
 
-test "unified body selects characters while gutter keeps line gestures semantic" {
+test "unified body always selects complete marker-prefixed diff rows" {
     const lines = [_]diff_parser.DiffLine{
         .{ .kind = .context, .text = "ABCDEFG", .old_line = 1, .new_line = 1 },
         .{ .kind = .context, .text = "HIJKLMN", .old_line = 2, .new_line = 2 },
@@ -2882,41 +2934,24 @@ test "unified body selects characters while gutter keeps line gestures semantic"
 
     harness.controller().pressDiffMouse(.{ .col = text_start + 3, .row = diff_render.body_start_row + 1 });
     harness.controller().dragDiffMouse(.{ .col = text_start + 4, .row = diff_render.body_start_row + 2 });
-    const characters = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Mode.character, characters.mode);
-    try std.testing.expectEqual(diff_selection.Side.new, characters.side);
-    const range = characters.range();
-    try std.testing.expectEqual(@as(usize, 3), range.start.leading);
-    try std.testing.expectEqual(@as(usize, 4), range.start.trailing);
-    try std.testing.expectEqual(@as(usize, 4), range.end.leading);
-    try std.testing.expectEqual(@as(usize, 5), range.end.trailing);
-    const copied = try diff_selection.copyText(std.testing.allocator, files[0], characters);
+    const rows = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
+    try std.testing.expect(rows.content == .unified_diff);
+    const range = rows.range();
+    try std.testing.expectEqual(@as(usize, 0), range.start.leading);
+    try std.testing.expectEqual(@as(usize, 0), range.start.trailing);
+    try std.testing.expectEqual(@as(usize, 0), range.end.leading);
+    try std.testing.expectEqual(@as(usize, 0), range.end.trailing);
+    const copied = try diff_selection.copyText(std.testing.allocator, files[0], rows);
     defer std.testing.allocator.free(copied);
-    try std.testing.expectEqualStrings("DEFG\nHIJKL", copied);
+    try std.testing.expectEqualStrings(" ABCDEFG\n HIJKLMN\n", copied);
 
-    // Continuing a character gesture into its own gutter means the leading
-    // line boundary; it does not silently switch to whole-line mode.
+    // Moving through a line-number column keeps the same unified row model.
     const new_line_number_col = raw.col + content_gutter + diff_render.cursor_gutter_width + 6;
     harness.controller().dragDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
     const into_gutter = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Mode.character, into_gutter.mode);
+    try std.testing.expect(into_gutter.content == .unified_diff);
     try std.testing.expectEqual(@as(usize, 0), into_gutter.focus.leading);
     try std.testing.expectEqual(@as(usize, 0), into_gutter.focus.trailing);
-
-    harness.controller().clearDiffSelection();
-    harness.controller().pressDiffMouse(.{ .col = text_start, .row = diff_render.body_start_row + 1 });
-    harness.controller().dragDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
-    const first_token_to_gutter = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    const first_token_copy = try diff_selection.copyText(std.testing.allocator, files[0], first_token_to_gutter);
-    defer std.testing.allocator.free(first_token_copy);
-    try std.testing.expectEqualStrings("A", first_token_copy);
-
-    harness.controller().clearDiffSelection();
-    harness.controller().pressDiffMouse(.{ .col = new_line_number_col, .row = diff_render.body_start_row + 1 });
-    harness.controller().dragDiffMouse(.{ .col = text_start + 4, .row = diff_render.body_start_row + 2 });
-    const lines_selected = harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Mode.line, lines_selected.mode);
-    try std.testing.expectEqual(diff_selection.Side.new, lines_selected.side);
 }
 
 test "invalid primary file is inert while its valid sibling remains selectable" {
@@ -2961,14 +2996,14 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
     harness.controller().scrollDiff(.down);
     harness.controller().scrollDiffHorizontal(.right);
     harness.controller().selectHunkDelta(1);
-    harness.controller().toggleSelectedHunkFold();
+    harness.controller().toggleSelectedHunkFold(std.testing.allocator);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(harness.pages.changes.selection_owner == .none);
 
-    harness.controller().selectFileAbsolute(0);
+    harness.controller().selectFileAbsolute(std.testing.allocator, 0);
     try std.testing.expect(harness.view().displayedChangesBody() == .primary);
     try std.testing.expectEqualDeep(diff_surface.ResolvedTarget{
         .kind = .primary,
@@ -3121,7 +3156,7 @@ test "either invalid combined component remains inert without primary navigation
         harness.controller().scrollDiff(.down);
         harness.controller().scrollDiffHorizontal(.right);
         harness.controller().selectHunkDelta(1);
-        harness.controller().toggleSelectedHunkFold();
+        harness.controller().toggleSelectedHunkFold(std.testing.allocator);
         try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
         try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
         try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
@@ -3150,7 +3185,7 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
     const cached_text = cached_raw.col + (cached_raw.width - cached_content_width) + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .unified);
     cached_harness.controller().pressDiffMouse(.{ .col = cached_text + 1, .row = diff_render.body_start_row + 1 });
     const cached_selection = cached_harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Mode.character, cached_selection.mode);
+    try std.testing.expect(cached_selection.content == .unified_diff);
     try std.testing.expect(cached_selection.identity == .projection_file);
     try std.testing.expect(cached_selection.identity.projection_file.kind == .cached);
 
@@ -3242,8 +3277,8 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
     generated_harness.controller().pressDiffMouse(.{ .col = generated_text + 3, .row = diff_render.body_start_row });
     const generated_selection = generated_harness.pages.changes.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expect(generated_selection.identity == .generated_file);
-    try std.testing.expectEqual(diff_selection.Mode.character, generated_selection.mode);
-    try std.testing.expectEqual(@as(usize, 3), generated_selection.anchor.leading);
+    try std.testing.expect(generated_selection.content == .unified_diff);
+    try std.testing.expectEqual(@as(usize, 0), generated_selection.anchor.leading);
 
     generated_harness.controller().clearDiffSelection();
     generated_harness.pages.changes.viewer.display_mode = .side_by_side;
@@ -3255,7 +3290,7 @@ test "cached combined and generated displayed bodies expose typed mouse identiti
     const generated_keyboard_selection = generated_harness.pages.changes.selection_owner.activeDiff() orelse
         return error.ExpectedDiffSelection;
     try std.testing.expect(generated_keyboard_selection.identity == .generated_file);
-    try std.testing.expectEqual(diff_selection.Side.new, generated_keyboard_selection.side);
+    try std.testing.expectEqual(diff_selection.Side.new, generated_keyboard_selection.selectedSide().?);
     try std.testing.expectEqual(diff_selection.Origin.keyboard_line, generated_keyboard_selection.origin);
     try std.testing.expectEqual(@as(usize, 0), generated_keyboard_selection.focus.line_index);
 }
@@ -3305,7 +3340,7 @@ test "Changes navigation snapshot and reload restore share the page owner" {
     harness.pages.changes.search.match_offset = null;
 
     const loaded = harness.controller().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
-    try std.testing.expect(harness.controller().restoreReloadAnchor(loaded, &anchor));
+    try std.testing.expect(harness.controller().restoreReloadAnchor(std.testing.allocator, loaded, &anchor));
     try std.testing.expectEqual(snapshot.diff_cursor, harness.pages.changes.viewer.diff_cursor);
     try std.testing.expect(harness.pages.changes.viewer.diff_scroll >= snapshot.diff_scroll);
     try std.testing.expect(harness.view().visibleDiffCursorOffset() != null);
@@ -3327,16 +3362,20 @@ test "sidebar visibility toggle uses full diff width and keeps selection" {
     };
 
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
+    _ = try installDisplayedCompletedSelection(&app, std.testing.allocator);
+    const revision_before = app.pages.changes.selection_layout_revision;
 
-    app.changesNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility(std.testing.allocator);
 
     try std.testing.expect(app.pages.changes.viewer.sidebar_hidden);
     try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.changesNavigationView().effectiveDisplayMode());
+    try std.testing.expect(app.pages.changes.completed_selection == null);
+    try std.testing.expectEqual(revision_before + 1, app.pages.changes.selection_layout_revision);
 
-    app.changesNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility(std.testing.allocator);
 
     try std.testing.expect(!app.pages.changes.viewer.sidebar_hidden);
     try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
@@ -3354,16 +3393,22 @@ test "sidebar width adjustment clamps and affects effective mode" {
 
     try std.testing.expectEqual(@as(?u16, null), app.pages.changes.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
+    const retained_token = try installDisplayedCompletedSelection(&app, std.testing.allocator);
+    const revision_before = app.pages.changes.selection_layout_revision;
 
-    app.changesNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .shrink);
     try std.testing.expectEqual(@as(?u16, 30), app.pages.changes.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
+    try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(retained_token));
+    try std.testing.expectEqual(revision_before, app.pages.changes.selection_layout_revision);
 
-    app.changesNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .shrink);
     try std.testing.expectEqual(@as(?u16, 26), app.pages.changes.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.changesNavigationView().effectiveDisplayMode());
+    try std.testing.expect(app.pages.changes.completed_selection == null);
+    try std.testing.expectEqual(revision_before + 1, app.pages.changes.selection_layout_revision);
 
-    app.changesNavigation().adjustSidebarWidth(.grow);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .grow);
     try std.testing.expectEqual(@as(?u16, 30), app.pages.changes.viewer.sidebar_width);
 }
 
@@ -3376,15 +3421,15 @@ test "sidebar width remains stored while sidebar is hidden" {
         .terminal_size = .{ .width = 104, .height = 8 },
     };
 
-    app.changesNavigation().adjustSidebarWidth(.shrink);
-    app.changesNavigation().toggleSidebarVisibility();
-    app.changesNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .shrink);
+    app.changesNavigation().toggleSidebarVisibility(std.testing.allocator);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .shrink);
 
     try std.testing.expect(app.pages.changes.viewer.sidebar_hidden);
     try std.testing.expectEqual(@as(?u16, 26), app.pages.changes.viewer.sidebar_width);
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, app.changesNavigationView().effectiveDisplayMode());
 
-    app.changesNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility(std.testing.allocator);
 
     try std.testing.expect(!app.pages.changes.viewer.sidebar_hidden);
     try std.testing.expectEqual(@as(?u16, 26), app.pages.changes.viewer.sidebar_width);
@@ -3817,16 +3862,16 @@ test "layout changes reset horizontal scroll only when diff pane width changes" 
         .terminal_size = .{ .width = 100, .height = 8 },
     };
 
-    app.changesNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_horizontal_scroll);
 
     app.pages.changes.viewer.diff_horizontal_scroll = 16;
-    app.changesNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .shrink);
     try std.testing.expectEqual(@as(usize, 16), app.pages.changes.viewer.diff_horizontal_scroll);
 
-    app.changesNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility(std.testing.allocator);
     app.pages.changes.viewer.diff_horizontal_scroll = 16;
-    app.changesNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .shrink);
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_horizontal_scroll);
 }
 
@@ -3843,10 +3888,10 @@ test "search resync without pane width change keeps horizontal scroll" {
     };
 
     setDiffSearchQuery(&app, "wide");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     app.pages.changes.viewer.diff_horizontal_scroll = 16;
 
-    app.changesNavigation().adjustSidebarWidth(.shrink);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .shrink);
 
     try std.testing.expectEqual(@as(usize, 16), app.pages.changes.viewer.diff_horizontal_scroll);
 }
@@ -4024,7 +4069,7 @@ test "sidebar layout fallback clears active diff mouse drag" {
     app.changesNavigation().pressDiffMouse(.{ .col = 4, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(app.pages.changes.selection_owner.activeDiff() != null);
 
-    app.changesNavigation().toggleSidebarVisibility();
+    app.changesNavigation().toggleSidebarVisibility(std.testing.allocator);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
     try std.testing.expect(app.pages.changes.selection_owner.activeDiff() == null);
 }
@@ -4046,7 +4091,7 @@ test "sidebar width growth fallback clears active diff mouse drag" {
     app.changesNavigation().pressDiffMouse(.{ .col = 37, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(app.pages.changes.selection_owner.activeDiff() != null);
 
-    app.changesNavigation().adjustSidebarWidth(.grow);
+    app.changesNavigation().adjustSidebarWidth(std.testing.allocator, .grow);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.changesNavigationView().effectiveDisplayMode());
     try std.testing.expect(app.pages.changes.selection_owner.activeDiff() == null);
 }
@@ -4065,7 +4110,7 @@ test "diff scroll cursor sync keeps search state" {
         .terminal_size = .{ .width = 140, .height = 8 },
     };
     setDiffSearchQuery(&app, "late new");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     const old_match = app.pages.changes.search.match orelse return error.ExpectedSearchMatch;
     const old_match_offset = app.pages.changes.search.match_offset;
 
@@ -4114,7 +4159,7 @@ test "mode change resyncs search match to rendered body offsets" {
     };
     setDiffSearchQuery(&app, "late new");
 
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
     try std.testing.expectEqual(@as(?usize, 9), app.pages.changes.search.match_offset);
 
@@ -4138,10 +4183,10 @@ test "mode change keeps search near later matches" {
     };
     setDiffSearchQuery(&app, "new");
 
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
     try std.testing.expectEqual(@as(?usize, 4), app.pages.changes.search.match_offset);
-    app.changesNavigation().selectSearchMatch(.forward);
+    app.changesNavigation().selectSearchMatch(std.testing.allocator, .forward);
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
     try std.testing.expectEqual(@as(?usize, 9), app.pages.changes.search.match_offset);
 
@@ -4251,15 +4296,21 @@ test "projection hunk fold authority preserves primary fold behavior" {
         .terminal_size = .{ .width = 100, .height = 12 },
     };
     defer app.clearLoadedDiff();
+    defer if (app.pages.changes.completed_selection) |*selection| selection.deinit(std.testing.allocator);
 
     try std.testing.expect(app.changesNavigationView().bodyAllowsHunkFold());
     try std.testing.expectEqual(@as(usize, 10), app.changesNavigationView().selectedFileLineIndex(.unified).lineCount());
-    var controller = app.controller();
-    var resolver = controller.bodyResolverAdapter();
-    controller.sharedBodyController(&resolver).toggleSelectedHunkFold();
+    _ = try installDisplayedCompletedSelection(&app, std.testing.allocator);
+    const revision_before = app.pages.changes.selection_layout_revision;
+    var adapter = app.controller().updateAdapter();
+    var outcome = try adapter.shared().apply(std.testing.allocator, .toggle_hunk_fold);
+    defer outcome.deinit(std.testing.allocator);
 
     const active = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(active.isHunkFolded(0, 0));
+    try std.testing.expect(app.pages.changes.completed_selection == null);
+    try std.testing.expectEqual(revision_before + 1, app.pages.changes.selection_layout_revision);
+    try std.testing.expectEqual(diff_surface.update.RetentionTransition.cleared, outcome.retention_transition);
     try std.testing.expectEqualDeep(
         diff_view_model.BodyCoordinate{ .hunk_header = 0 },
         app.pages.changes.viewer.diff_cursor,
@@ -4269,7 +4320,7 @@ test "projection hunk fold authority preserves primary fold behavior" {
     try std.testing.expectEqual(@as(usize, 4), app.changesNavigationView().selectedFileLineIndex(.side_by_side).lineCount());
     try std.testing.expectEqual(@as(usize, 1), active.renderedLineIndex(0, .side_by_side).hunkLineCount(0));
 
-    app.changesNavigation().toggleSelectedHunkFold();
+    app.changesNavigation().toggleSelectedHunkFold(std.testing.allocator);
     try std.testing.expect(!active.isHunkFolded(0, 0));
     try std.testing.expectEqual(@as(usize, 10), app.changesNavigationView().selectedFileLineIndex(.unified).lineCount());
     try std.testing.expectEqual(@as(usize, 6), active.renderedLineIndex(0, .unified).hunkLineCount(0));
@@ -4296,7 +4347,7 @@ test "search unfolds folded hunk body matches before setting offset" {
     defer app.clearLoadedDiff();
     setDiffSearchQuery(&app, "new");
 
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
 
     const active = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
@@ -4330,12 +4381,16 @@ test "projection hunk fold authority preserves retained staged-only search unfol
         diff_surface.SearchUnfoldPolicy.unfold_underlying,
         app.view().resolvedTarget().search_unfold_policy,
     );
+    _ = try installDisplayedCompletedSelection(&app, allocator);
+    const revision_before = app.pages.changes.selection_layout_revision;
 
-    app.controller().unfoldSearchMatchIfNeeded(.{ .coordinate = .{ .hunk_line = .{
+    app.controller().unfoldSearchMatchIfNeeded(allocator, .{ .coordinate = .{ .hunk_line = .{
         .hunk_index = 0,
         .line_index = 0,
     } } });
     try std.testing.expect(!active.isHunkFolded(0, 0));
+    try std.testing.expect(app.pages.changes.completed_selection == null);
+    try std.testing.expectEqual(revision_before + 1, app.pages.changes.selection_layout_revision);
 }
 
 test "manual fold keeps hunk open when it contains active search match" {
@@ -4353,13 +4408,18 @@ test "manual fold keeps hunk open when it contains active search match" {
         .terminal_size = .{ .width = 100, .height = 12 },
     };
     defer app.clearLoadedDiff();
+    defer if (app.pages.changes.completed_selection) |*selection| selection.deinit(std.testing.allocator);
     setDiffSearchQuery(&app, "new");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
+    const retained_token = try installDisplayedCompletedSelection(&app, std.testing.allocator);
+    const revision_before = app.pages.changes.selection_layout_revision;
 
-    app.changesNavigation().toggleSelectedHunkFold();
+    app.changesNavigation().toggleSelectedHunkFold(std.testing.allocator);
 
     const active = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expect(!active.isHunkFolded(0, 0));
+    try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(retained_token));
+    try std.testing.expectEqual(revision_before, app.pages.changes.selection_layout_revision);
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } });
     try std.testing.expectEqual(@as(?usize, 4), app.pages.changes.search.match_offset);
 }
@@ -4374,7 +4434,7 @@ test "file change resyncs retained search query to selected file" {
     };
     setDiffSearchQuery(&app, "target");
 
-    app.changesNavigation().selectFileAbsolute(1);
+    app.changesNavigation().selectFileAbsolute(std.testing.allocator, 1);
 
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     try expectSearchCoordinate(&app, .{ .metadata = 0 });
@@ -4393,15 +4453,15 @@ test "sidebar navigation can select directories without changing selected file" 
         .terminal_size = .{ .width = 100, .height = 12 },
     };
 
-    app.changesNavigation().selectFileDelta(-1);
+    app.changesNavigation().selectFileDelta(std.testing.allocator, -1);
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 
-    app.changesNavigation().selectFileDelta(1);
+    app.changesNavigation().selectFileDelta(std.testing.allocator, 1);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 
-    app.changesNavigation().selectFileDelta(1);
+    app.changesNavigation().selectFileDelta(std.testing.allocator, 1);
     try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
@@ -4472,7 +4532,7 @@ test "changes root expansion mouse click selects root without hiding children" {
     };
     defer app.clearLoadedDiff();
 
-    try app.changesNavigation().clickSidebarNode(0);
+    try app.changesNavigation().clickSidebarNode(std.testing.allocator, 0);
 
     const loaded = app.changesNavigation().activeLoadedDiff().?;
     try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
@@ -4944,7 +5004,7 @@ test "changes transition exact reveal expands only target ancestors and selects 
     setDiffSearchQuery(&app, "target");
 
     try expectExactPathRevealSelected(
-        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "src/b")),
+        try app.changesNavigation().revealExactPath(std.testing.allocator, exactChangesIntent(&app, "src/b")),
         4,
     );
 
@@ -4994,7 +5054,7 @@ test "changes transition exact reveal selects status-only and reports unchanged"
     try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
     try expectExactPathRevealSelected(
-        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "new.zig")),
+        try app.changesNavigation().revealExactPath(std.testing.allocator, exactChangesIntent(&app, "new.zig")),
         1,
     );
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
@@ -5003,7 +5063,7 @@ test "changes transition exact reveal selects status-only and reports unchanged"
 
     app.pages.changes.viewer.diff_scroll = 9;
     try expectExactPathRevealUnchanged(
-        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "new.zig")),
+        try app.changesNavigation().revealExactPath(std.testing.allocator, exactChangesIntent(&app, "new.zig")),
         1,
     );
     try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll);
@@ -5029,7 +5089,7 @@ test "changes transition selected exact node still reveals collapsed ancestor" {
     try std.testing.expectEqual(@as(?usize, null), loaded.visibleRowOfNode(2));
 
     try expectExactPathRevealSelected(
-        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "src/b")),
+        try app.changesNavigation().revealExactPath(std.testing.allocator, exactChangesIntent(&app, "src/b")),
         2,
     );
 
@@ -5060,7 +5120,7 @@ test "changes root expansion exact reveal expands only ordinary ancestors" {
     try std.testing.expectEqual(@as(?usize, null), loaded.visibleRowOfNode(3));
 
     try expectExactPathRevealSelected(
-        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "src/b")),
+        try app.changesNavigation().revealExactPath(std.testing.allocator, exactChangesIntent(&app, "src/b")),
         3,
     );
 
@@ -5102,7 +5162,7 @@ test "changes transition unavailable exact reveal preserves navigation folds and
     try file_tree.collapse(app.changesNavigation().loadArenaAllocator().?, &loaded.collapsed_dirs, "src");
 
     try expectExactPathRevealUnavailable(
-        try app.changesNavigation().revealExactPath(exactChangesIntent(&app, "src/a")),
+        try app.changesNavigation().revealExactPath(std.testing.allocator, exactChangesIntent(&app, "src/a")),
         .hidden_by_filters,
     );
     try std.testing.expect(file_tree.isCollapsed(&loaded.collapsed_dirs, "src"));
@@ -5150,6 +5210,7 @@ test "changes transition exact reveal allocation failure rolls back before ances
     try std.testing.expectError(
         error.OutOfMemory,
         app.changesNavigation().revealExactPathWithAllocator(
+            std.testing.allocator,
             exactChangesIntent(&app, "src/b"),
             failing.allocator(),
         ),
@@ -5478,7 +5539,7 @@ test "cached preview supports diff search" {
     } };
 
     setDiffSearchInput(&app, "staged");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
 
     try std.testing.expect(app.pages.changes.search.match != null);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{
@@ -5633,7 +5694,7 @@ test "generated preview blocks diff search" {
     try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
 
     setDiffSearchInput(&app, "two");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     try std.testing.expect(app.pages.changes.search.match == null);
     try std.testing.expect(app.pages.changes.search.match_offset == null);
     try std.testing.expectEqualStrings("search is unavailable for generated file preview", app.status.text());
@@ -5681,7 +5742,7 @@ test "staged new file preview blocks diff search" {
     try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
 
     setDiffSearchInput(&app, "staged");
-    app.changesNavigation().submitSearch();
+    app.changesNavigation().submitSearch(std.testing.allocator);
     try std.testing.expect(app.pages.changes.search.match == null);
     try std.testing.expect(app.pages.changes.search.match_offset == null);
     try std.testing.expectEqualStrings("search is unavailable for staged new file preview", app.status.text());
@@ -5721,7 +5782,7 @@ test "staged new file preview does not refresh existing search query" {
     } };
 
     app.pages.changes.search.query.insertSlice("staged") catch unreachable;
-    app.changesNavigation().refreshSearchForSelectedFile();
+    app.changesNavigation().refreshSearchForSelectedFile(std.testing.allocator);
 
     try std.testing.expect(app.pages.changes.search.match == null);
     try std.testing.expect(app.pages.changes.search.match_offset == null);
@@ -5852,7 +5913,7 @@ test "typed action cursor remaps a directory without changing the sticky diff ta
     app.pages.changes.action_cursor.install(std.testing.allocator, &prepared, 7);
     const loaded = app.changesNavigation().activeLoadedDiff().?;
 
-    try std.testing.expect(app.changesNavigation().remapActionCursor(loaded));
+    try std.testing.expect(app.changesNavigation().remapActionCursor(std.testing.allocator, loaded));
     try std.testing.expect(app.pages.changes.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
@@ -5895,7 +5956,10 @@ test "typed action cursor remaps a repository root without changing the sticky d
     );
     app.pages.changes.action_cursor.install(std.testing.allocator, &prepared, 7);
 
-    try std.testing.expect(app.changesNavigation().remapActionCursor(app.changesNavigation().activeLoadedDiff().?));
+    try std.testing.expect(app.changesNavigation().remapActionCursor(
+        std.testing.allocator,
+        app.changesNavigation().activeLoadedDiff().?,
+    ));
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }

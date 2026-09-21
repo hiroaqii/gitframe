@@ -503,55 +503,86 @@ pub const App = struct {
                 // Mouse coordinates are relative to the old geometry. End the
                 // borrow before changing layout, then drain deferred owners at
                 // the common post-update boundary below.
-                const changes_selection_anchor = self.changesNavigation().captureSelectionViewportAnchor();
-                const previous_compare_view = self.compareCoordinator().navigationView();
-                var previous_compare_resolver = previous_compare_view.resolver();
-                const previous_compare_body = previous_compare_view.bodyView(&previous_compare_resolver);
+                var previous_changes_adapter = self.changesNavigation().updateAdapter();
+                const previous_changes_body = previous_changes_adapter.bodyController();
+                var previous_compare_adapter = self.compareCoordinator().navigation().updateAdapter();
+                const previous_compare_body = previous_compare_adapter.bodyController();
+                var previous_history_adapter = self.historyCoordinator().navigation().updateAdapter();
+                const previous_history_body = previous_history_adapter.bodyController();
+                const changes_selection_anchor = previous_changes_body.captureSelectionViewportAnchor();
                 const compare_selection_anchor = previous_compare_body.captureSelectionViewportAnchor();
-                const previous_history_view = self.historyCoordinator().navigationView();
-                var previous_history_resolver = previous_history_view.resolver();
-                const previous_history_body = previous_history_view.bodyView(&previous_history_resolver);
                 const history_selection_anchor = previous_history_body.captureSelectionViewportAnchor();
                 const repository_selection_anchor = self.pages.repository.captureSelectionViewportAnchor();
-                const previous_width = self.changesNavigationView().diffPaneWidth();
-                const previous_mode = self.changesNavigationView().effectiveDisplayMode();
-                const previous_compare_width = previous_compare_body.view.diffPaneWidth();
-                const previous_compare_mode = previous_compare_body.view.effectiveDisplayMode();
-                const previous_history_width = previous_history_body.view.diffPaneWidth();
-                const previous_history_mode = previous_history_body.view.effectiveDisplayMode();
+                const previous_width = previous_changes_body.controller.view().diffPaneWidth();
+                const previous_mode = previous_changes_body.controller.view().effectiveDisplayMode();
+                const previous_compare_width = previous_compare_body.controller.view().diffPaneWidth();
+                const previous_compare_mode = previous_compare_body.controller.view().effectiveDisplayMode();
+                const previous_history_width = previous_history_body.controller.view().diffPaneWidth();
+                const previous_history_mode = previous_history_body.controller.view().effectiveDisplayMode();
+                const next_body_size = app_shell_layout.compute(size, .{ .page_bar_visible = true }).bodySize();
+                const next_layout: diff_surface.Layout = .{ .width = next_body_size.width, .height = next_body_size.height };
+                const changes_mode_changes = previous_mode != diff_surface.navigation.effectiveDisplayModeForLayout(
+                    &self.pages.changes.viewer,
+                    next_layout,
+                );
+                const compare_mode_changes = previous_compare_mode != diff_surface.navigation.effectiveDisplayModeForLayout(
+                    &self.pages.compare.diff.viewer,
+                    next_layout,
+                );
+                const history_mode_changes = previous_history_mode != diff_surface.navigation.effectiveDisplayModeForLayout(
+                    &self.pages.history.diff.viewer,
+                    next_layout,
+                );
+                const needs_mapping_allocator =
+                    (changes_mode_changes and self.pages.changes.completed_selection != null) or
+                    (compare_mode_changes and self.pages.compare.diff.completed_selection != null) or
+                    (history_mode_changes and self.pages.history.diff.completed_selection != null);
+                const allocator = self.allocator orelse if (needs_mapping_allocator)
+                    ctx.allocator()
+                else
+                    std.heap.page_allocator;
+                const changes_cleanup = previous_changes_adapter.selectionMappingCleanup(allocator);
+                const compare_cleanup = previous_compare_adapter.selectionMappingCleanup(allocator);
+                const history_cleanup = previous_history_adapter.selectionMappingCleanup(allocator);
+                const changes_mapping = if (changes_mode_changes)
+                    changes_cleanup.prepare(previous_changes_body)
+                else
+                    null;
+                const compare_mapping = if (compare_mode_changes)
+                    compare_cleanup.prepare(previous_compare_body)
+                else
+                    null;
+                const history_mapping = if (history_mode_changes)
+                    history_cleanup.prepare(previous_history_body)
+                else
+                    null;
 
                 self.drag_auto_scroll.clear();
-                self.changesNavigation().clearMouseDiffSelection();
-                if (self.pages.compare.diff.selection_owner.activeMouseSelection()) {
-                    self.pages.compare.diff.selection_owner = .none;
-                }
-                if (self.pages.history.diff.selection_owner.activeMouseSelection()) {
-                    self.pages.history.diff.selection_owner = .none;
-                }
+                if (!changes_mode_changes) previous_changes_body.controller.clearMouseDiffSelection();
+                if (!compare_mode_changes) previous_compare_body.controller.clearMouseDiffSelection();
+                if (!history_mode_changes) previous_history_body.controller.clearMouseDiffSelection();
                 self.pages.repository.cancelMouseOwner();
                 self.terminal_size = size;
                 self.historyCoordinator().clampDetailViewport();
-                self.changesNavigation().resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
-                if (previous_mode != self.changesNavigationView().effectiveDisplayMode()) {
-                    self.changesNavigation().clearMouseDiffSelection();
-                    self.changesNavigation().clearKeyboardSideChoice();
-                    self.pages.changes.advanceSelectionLayoutRevision();
-                }
-                if (changes_selection_anchor) |anchor| self.changesNavigation().restoreSelectionViewportAnchor(anchor);
-                self.changesNavigation().clampSidebarHorizontalScroll();
-                self.changesNavigation().clampDiffNavigationKeepingHunkVisible();
-                self.changesNavigation().updateSearchMatchOffset();
-                self.changesNavigation().scrollSearchMatchIntoView();
-                self.changesNavigation().clampDiffNavigation();
+                var changes_adapter = self.changesNavigation().updateAdapter();
+                var changes_body = changes_adapter.bodyController();
+                changes_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
+                if (changes_mapping) |prepared|
+                    changes_cleanup.complete(changes_body, prepared)
+                else if (changes_selection_anchor) |anchor|
+                    changes_body.restoreSelectionViewportAnchor(anchor);
+                changes_body.controller.clampSidebarHorizontalScroll();
+                changes_body.clampDiffNavigationKeepingHunkVisible();
+                changes_body.updateSearchMatchOffset();
+                changes_body.controller.scrollSearchMatchIntoView();
+                changes_body.clampDiffNavigation();
                 var compare_adapter = self.compareCoordinator().navigation().updateAdapter();
                 var compare_body = compare_adapter.bodyController();
                 compare_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_compare_width);
-                if (previous_compare_mode != compare_body.controller.view().effectiveDisplayMode()) {
-                    compare_body.controller.clearMouseDiffSelection();
-                    compare_body.controller.clearKeyboardSideChoice();
-                    self.pages.compare.diff.advanceSelectionLayoutRevision();
-                }
-                if (compare_selection_anchor) |anchor| compare_body.restoreSelectionViewportAnchor(anchor);
+                if (compare_mapping) |prepared|
+                    compare_cleanup.complete(compare_body, prepared)
+                else if (compare_selection_anchor) |anchor|
+                    compare_body.restoreSelectionViewportAnchor(anchor);
                 compare_body.controller.clampSidebarHorizontalScroll();
                 compare_body.clampDiffNavigationKeepingHunkVisible();
                 compare_body.updateSearchMatchOffset();
@@ -560,12 +591,10 @@ pub const App = struct {
                 var history_adapter = self.historyCoordinator().navigation().updateAdapter();
                 var history_body = history_adapter.bodyController();
                 history_body.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_history_width);
-                if (previous_history_mode != history_body.controller.view().effectiveDisplayMode()) {
-                    history_body.controller.clearMouseDiffSelection();
-                    history_body.controller.clearKeyboardSideChoice();
-                    self.pages.history.diff.advanceSelectionLayoutRevision();
-                }
-                if (history_selection_anchor) |anchor| history_body.restoreSelectionViewportAnchor(anchor);
+                if (history_mapping) |prepared|
+                    history_cleanup.complete(history_body, prepared)
+                else if (history_selection_anchor) |anchor|
+                    history_body.restoreSelectionViewportAnchor(anchor);
                 history_body.controller.clampSidebarHorizontalScroll();
                 history_body.clampDiffNavigationKeepingHunkVisible();
                 history_body.updateSearchMatchOffset();
@@ -961,6 +990,11 @@ pub const App = struct {
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .copy_current_line => self.copyCurrentLine(ctx),
             .copy_current_hunk => try self.copyCurrentHunk(ctx),
+            .copy_hunk_diff => |text| self.shellEffects().queueClipboard(ctx, .{
+                .origin = .{ .page = self.shellEffects().changesOrigin() },
+                .label = "current hunk diff",
+                .text = text,
+            }),
             .copy_diff_selection => |copy| self.copyDiffSelection(ctx, copy),
             .copy_diff_header_path => |selection| self.copyDiffHeaderPath(ctx, selection),
         }
@@ -1570,24 +1604,30 @@ pub const App = struct {
     }
 
     fn copyCurrentLine(self: *App, ctx: *chasen.Ctx(Msg)) void {
-        const text = self.changesContent().currentLineCopyText() orelse {
+        var content = self.changesContent().currentLineCopyText(ctx.allocator()) catch {
+            self.setChangesStatus("could not prepare diff line for copying", .{});
+            return;
+        } orelse {
             self.setChangesStatus("no diff line selected", .{});
             return;
         };
+        defer content.deinit(ctx.allocator());
+        const unified = self.changesNavigationView().effectiveDisplayMode() == .unified;
         self.shellEffects().queueClipboard(ctx, .{
             .origin = .{ .page = self.shellEffects().changesOrigin() },
-            .label = "current line",
-            .text = text,
+            .label = if (unified) "current diff line" else "current line",
+            .text = content.text(),
         });
     }
 
     fn copyCurrentHunk(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         var content = try self.changesContent().selectedHunkCopyText(ctx.allocator());
         defer content.deinit(ctx.allocator());
+        const unified = self.changesNavigationView().effectiveDisplayMode() == .unified;
         switch (content) {
             .ready => |text| self.shellEffects().queueClipboard(ctx, .{
                 .origin = .{ .page = self.shellEffects().changesOrigin() },
-                .label = "current hunk",
+                .label = if (unified) "current hunk diff" else "current hunk",
                 .text = text,
             }),
             .no_hunk => self.setChangesStatus("no hunk selected", .{}),

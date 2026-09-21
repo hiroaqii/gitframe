@@ -20,6 +20,8 @@ const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const page_header = @import("page_header.zig");
 const file_tree = @import("../file_tree.zig");
+const diff_render = @import("../diff/render.zig");
+const diff_surface = @import("diff_surface.zig");
 const draw = @import("draw");
 const keymap = @import("keymap");
 const repo_state = @import("../repo/state.zig");
@@ -2102,9 +2104,37 @@ fn drawHelpItem(app: Context, surface: *chasen.Surface, row: u16, item: HelpItem
             break :blk std.fmt.bufPrint(pair_buffer[0..], "{s} / {s}", .{ left, right }) catch left;
         },
     };
-    try draw.copyClippedTextAt(surface, 0, row, key, .{ .bold = true });
-    if (surface.size().width <= key_width) return;
-    try draw.copyClippedTextAt(surface, key_width, row, item.description, .{});
+    const description = switch (item.dynamic) {
+        .none => item.description,
+        .copy_line => if (effectiveHelpDiffMode(app) == .unified) "Copy diff" else "Copy line",
+        .copy_hunk => if (effectiveHelpDiffMode(app) == .unified) "Copy hunk diff" else "Copy hunk",
+    };
+    var padding: [18]u8 = undefined;
+    @memset(&padding, ' ');
+    const key_cells = @min(chasen.text.displayWidth(key), key_width);
+    const delimiter = padding[0 .. key_width - key_cells];
+    _ = try ui.key_hint.draw(surface, 0, row, &.{ui.key_hint.item(key, description)}, .{
+        .key_style = .{ .bold = true },
+        .delimiter = delimiter,
+    });
+}
+
+fn effectiveHelpDiffMode(app: Context) diff_render.DisplayMode {
+    return switch (app.active_page) {
+        .changes => app.changes.navigation.effectiveDisplayMode(),
+        .compare => diff_surface.navigation.effectiveDisplayModeForLayout(
+            &app.compare.page.diff.viewer,
+            app.compare.layout,
+        ),
+        .history => if (app.history) |history|
+            diff_surface.navigation.effectiveDisplayModeForLayout(
+                &history.page_state.diff.viewer,
+                history.layout,
+            )
+        else
+            .unified,
+        .repository, .config => .unified,
+    };
 }
 
 fn drawHelpScrollIndicator(surface: *chasen.Surface, scroll: usize, visible_rows: u16, total_rows: usize, palette: theme.Palette) !void {
@@ -2987,6 +3017,70 @@ test "help popup max scroll helper separates outer and content sizes" {
     try std.testing.expectEqual(helpMaxScrollForContentSize(content, .changes), helpMaxScroll(outer, .changes));
 }
 
+test "diff Help copy vocabulary follows effective mode for Changes Compare and History" {
+    var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 160, .height = 40 } };
+    var history: history_page.HistoryPageState = .{};
+    harness.changes.viewer.sidebar_hidden = true;
+    harness.compare.diff.viewer.sidebar_hidden = true;
+    history.diff.viewer.sidebar_hidden = true;
+
+    const cases = [_]struct {
+        requested: diff_render.DisplayMode,
+        width: u16,
+    }{
+        .{ .requested = .unified, .width = 160 },
+        .{ .requested = .side_by_side, .width = 160 },
+        .{ .requested = .side_by_side, .width = 60 },
+    };
+    for (cases) |case| {
+        harness.terminal_size.width = case.width;
+        harness.changes.viewer.display_mode = case.requested;
+        harness.compare.diff.viewer.display_mode = case.requested;
+        history.diff.viewer.display_mode = case.requested;
+
+        for ([_]page.Id{ .changes, .compare, .history }) |help_page| {
+            var context = harness.context();
+            context.active_page = help_page;
+            context.history = .{
+                .page_state = &history,
+                .palette = harness.theme,
+                .layout = .{ .width = case.width, .height = 40 },
+                .keymap = harness.keymap,
+            };
+            const canonical_mode = switch (help_page) {
+                .changes => context.changes.navigation.effectiveDisplayMode(),
+                .compare => diff_surface.navigation.effectiveDisplayModeForLayout(
+                    &harness.compare.diff.viewer,
+                    context.compare.layout,
+                ),
+                .history => diff_surface.navigation.effectiveDisplayModeForLayout(
+                    &history.diff.viewer,
+                    context.history.?.layout,
+                ),
+                .repository, .config => unreachable,
+            };
+            try std.testing.expectEqual(canonical_mode, effectiveHelpDiffMode(context));
+
+            var popup: chasen.testing.TestSurface = undefined;
+            try popup.init(60, 2);
+            defer popup.deinit();
+            try drawHelpItem(context, &popup.surface, 0, help_diff_navigation_items[13]);
+            try drawHelpItem(context, &popup.surface, 1, help_diff_navigation_items[14]);
+            const snapshot = try popup.snapshot(std.testing.allocator);
+            defer std.testing.allocator.free(snapshot);
+
+            if (canonical_mode == .unified) {
+                try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy diff") != null);
+                try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy hunk diff") != null);
+            } else {
+                try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy line") != null);
+                try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy hunk") != null);
+                try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy hunk diff") == null);
+            }
+        }
+    }
+}
+
 test "help popup uses effective document navigation labels and reaches its tail at 80x12" {
     const size = chasen.Size{ .width = 80, .height = 12 };
     const content = helpContentSize(size);
@@ -3259,6 +3353,7 @@ test "branch switch popup renders relative times and selected exact commit detai
 const HelpItem = struct {
     key: HelpKey,
     description: []const u8,
+    dynamic: enum { none, copy_line, copy_hunk } = .none,
 };
 
 const HelpKey = union(enum) {
@@ -3319,7 +3414,6 @@ const help_compare_items = [_]HelpItem{
     .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
-    .{ .key = .{ .text = "y / Y" }, .description = "copy current line / hunk" },
 };
 
 const help_history_items = [_]HelpItem{
@@ -3428,6 +3522,8 @@ const help_diff_navigation_items = [_]HelpItem{
     .{ .key = .{ .text = "J / K" }, .description = "next / previous hunk" },
     .{ .key = .{ .text = "n / p" }, .description = "next / previous match or hunk" },
     .{ .key = .{ .text = "N" }, .description = "previous search match when query is active" },
+    .{ .key = .{ .text = "y" }, .description = "", .dynamic = .copy_line },
+    .{ .key = .{ .text = "Y" }, .description = "", .dynamic = .copy_hunk },
 };
 
 const help_changes_diff_items = [_]HelpItem{

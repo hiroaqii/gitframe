@@ -15,6 +15,37 @@ pub const Mode = enum {
     character,
 };
 
+/// What the user is selecting, independent of how the diff happens to be
+/// laid out on screen. Unified selections are whole diff rows and therefore
+/// deliberately have neither a source side nor a character mode.
+pub const Content = union(enum) {
+    source_side: SourceSide,
+    unified_diff,
+
+    pub const SourceSide = struct {
+        side: Side,
+        mode: Mode = .line,
+    };
+
+    pub fn sourceSide(self: Content) ?SourceSide {
+        return switch (self) {
+            .source_side => |source| source,
+            .unified_diff => null,
+        };
+    }
+
+    pub fn mode(self: Content) Mode {
+        return switch (self) {
+            .source_side => |source| source.mode,
+            .unified_diff => .line,
+        };
+    }
+
+    pub fn isUnified(self: Content) bool {
+        return self == .unified_diff;
+    }
+};
+
 pub const Origin = enum {
     mouse,
     keyboard_line,
@@ -132,8 +163,7 @@ pub const KeyboardSideChoice = struct {
 
 pub const DragSelection = struct {
     identity: Identity,
-    side: Side,
-    mode: Mode = .line,
+    content: Content,
     origin: Origin = .mouse,
     anchor: Point,
     focus: Point,
@@ -146,17 +176,20 @@ pub const DragSelection = struct {
     pub fn init(identity: Identity, side: Side, point: Point) DragSelection {
         return .{
             .identity = identity,
-            .side = side,
+            .content = .{ .source_side = .{ .side = side } },
             .anchor = point,
             .focus = point,
         };
     }
 
-    pub fn initAtCell(identity: Identity, side: Side, mode: Mode, point: Point, cell: Cell) DragSelection {
+    pub fn initAtCell(identity: Identity, side: Side, selection_mode: Mode, point: Point, cell: Cell) DragSelection {
+        return initContentAtCell(identity, .{ .source_side = .{ .side = side, .mode = selection_mode } }, point, cell);
+    }
+
+    pub fn initContentAtCell(identity: Identity, content: Content, point: Point, cell: Cell) DragSelection {
         return .{
             .identity = identity,
-            .side = side,
-            .mode = mode,
+            .content = content,
             .anchor = point,
             .focus = point,
             .anchor_cell = cell,
@@ -164,16 +197,55 @@ pub const DragSelection = struct {
     }
 
     pub fn initKeyboardLine(identity: Identity, side: Side, point: Point) DragSelection {
+        return initContentKeyboardLine(identity, .{ .source_side = .{ .side = side } }, point);
+    }
+
+    pub fn initContentKeyboardLine(identity: Identity, content: Content, point: Point) DragSelection {
         return .{
             .identity = identity,
-            .side = side,
-            .mode = .line,
+            .content = content,
             .origin = .keyboard_line,
             .anchor = point,
             .focus = point,
             .moved = true,
             .selected_line_count = 1,
         };
+    }
+
+    pub fn initUnified(identity: Identity, point: Point) DragSelection {
+        return .{
+            .identity = identity,
+            .content = .unified_diff,
+            .anchor = point,
+            .focus = point,
+        };
+    }
+
+    pub fn initUnifiedAtCell(identity: Identity, point: Point, cell: Cell) DragSelection {
+        return .{
+            .identity = identity,
+            .content = .unified_diff,
+            .anchor = point,
+            .focus = point,
+            .anchor_cell = cell,
+        };
+    }
+
+    pub fn initUnifiedKeyboardLine(identity: Identity, point: Point) DragSelection {
+        return initContentKeyboardLine(identity, .unified_diff, point);
+    }
+
+    pub fn sourceSide(self: DragSelection) ?Content.SourceSide {
+        return self.content.sourceSide();
+    }
+
+    pub fn mode(self: DragSelection) Mode {
+        return self.content.mode();
+    }
+
+    pub fn selectedSide(self: DragSelection) ?Side {
+        const source = self.sourceSide() orelse return null;
+        return source.side;
     }
 
     pub fn update(self: *DragSelection, point: Point) void {
@@ -194,7 +266,7 @@ pub const DragSelection = struct {
 
     pub fn updateKeyboardLine(self: *DragSelection, point: Point, selected_line_count: usize) void {
         std.debug.assert(self.origin == .keyboard_line);
-        std.debug.assert(self.mode == .line);
+        std.debug.assert(self.mode() == .line);
         std.debug.assert(selected_line_count > 0);
         self.update(point);
         self.selected_line_count = selected_line_count;
@@ -211,8 +283,7 @@ pub const DragSelection = struct {
         const selected_range = self.range();
         return .{
             .identity = self.identity,
-            .side = self.side,
-            .mode = self.mode,
+            .content = self.content,
             .start = selected_range.start,
             .end = selected_range.end,
         };
@@ -274,13 +345,29 @@ pub const Owner = union(enum) {
 
 pub const View = struct {
     identity: Identity,
-    side: Side,
-    mode: Mode = .line,
+    content: Content,
     start: Point,
     end: Point,
+    /// Present only for retained unified selections. These points describe
+    /// the exact visible rows captured at release, so later rendering never
+    /// expands a retained range across folded or newly visible rows.
+    selected_points: ?[]const Point = null,
 
     pub fn range(self: View) Range {
         return .{ .start = self.start, .end = self.end };
+    }
+
+    pub fn sourceSide(self: View) ?Content.SourceSide {
+        return self.content.sourceSide();
+    }
+
+    pub fn mode(self: View) Mode {
+        return self.content.mode();
+    }
+
+    pub fn selectedSide(self: View) ?Side {
+        const source = self.sourceSide() orelse return null;
+        return source.side;
     }
 };
 
@@ -290,15 +377,33 @@ pub const LineVisualRange = struct {
     byte_end: usize,
 };
 
-pub fn visualRangeForLine(view: View, hunk_index: usize, line_index: usize, line: diff_parser.DiffLine, side: Side) ?LineVisualRange {
-    if (view.side != side or !lineVisibleOnSide(line, side)) return null;
+pub fn visualRangeForLine(view: View, hunk_index: usize, line_index: usize, line: diff_parser.DiffLine, side: ?Side) ?LineVisualRange {
+    const mode = switch (view.content) {
+        .source_side => |source| blk: {
+            const rendered_side = side orelse return null;
+            if (source.side != rendered_side or !lineVisibleOnSide(line, rendered_side)) return null;
+            break :blk source.mode;
+        },
+        .unified_diff => blk: {
+            if (side != null or !lineSelectableInUnified(line)) return null;
+            if (view.selected_points) |points| {
+                if (!containsPoint(points, pointFromLine(hunk_index, line_index))) return null;
+            }
+            break :blk .line;
+        },
+    };
     const range = view.range();
     if (hunk_index < range.start.hunk_index or hunk_index > range.end.hunk_index) return null;
     if (hunk_index == range.start.hunk_index and line_index < range.start.line_index) return null;
     if (hunk_index == range.end.hunk_index and line_index > range.end.line_index) return null;
-    const bytes = selectedBytesForLine(line.text, view.mode, range, hunk_index, line_index) orelse return null;
-    if (view.mode == .character and bytes.start == bytes.end) return null;
-    return .{ .mode = view.mode, .byte_start = bytes.start, .byte_end = bytes.end };
+    const bytes = selectedBytesForLine(line.text, mode, range, hunk_index, line_index) orelse return null;
+    if (mode == .character and bytes.start == bytes.end) return null;
+    return .{ .mode = mode, .byte_start = bytes.start, .byte_end = bytes.end };
+}
+
+fn containsPoint(points: []const Point, needle: Point) bool {
+    for (points) |point| if (point.eql(needle)) return true;
+    return false;
 }
 
 pub fn pointFromLine(hunk_index: usize, line_index: usize) Point {
@@ -330,6 +435,22 @@ pub fn lineVisibleOnSide(line: diff_parser.DiffLine, side: Side) bool {
     };
 }
 
+pub fn lineSelectableInUnified(line: diff_parser.DiffLine) bool {
+    return switch (line.kind) {
+        .context, .removed, .added => true,
+        .metadata => false,
+    };
+}
+
+pub fn unifiedMarker(line: diff_parser.DiffLine) ?u8 {
+    return switch (line.kind) {
+        .context => ' ',
+        .removed => '-',
+        .added => '+',
+        .metadata => null,
+    };
+}
+
 /// Number of semantic lines on `side` strictly after one endpoint through the
 /// other endpoint. Both endpoints must identify selectable lines. This lets a
 /// single presentation step account for folded hunks without rebuilding an
@@ -353,6 +474,28 @@ pub fn semanticLineDistance(file: diff_parser.FileDiff, side: Side, a: Point, b:
     return count;
 }
 
+/// Number of visible unified diff rows strictly after one endpoint through
+/// the other endpoint. Folded hunks are not part of unified selection space.
+pub fn unifiedLineDistance(file: diff_parser.FileDiff, folded_hunks: []const bool, a: Point, b: Point) ?usize {
+    if (a.eql(b)) return 0;
+    const start = if (a.order(b) == .lt) a else b;
+    const end = if (a.order(b) == .lt) b else a;
+    if (!selectableUnifiedPoint(file, folded_hunks, start) or !selectableUnifiedPoint(file, folded_hunks, end)) return null;
+
+    var count: usize = 0;
+    var hunk_index = start.hunk_index;
+    while (hunk_index <= end.hunk_index) : (hunk_index += 1) {
+        if (hunkIsFolded(folded_hunks, hunk_index)) continue;
+        const hunk = file.hunks[hunk_index];
+        var line_index: usize = if (hunk_index == start.hunk_index) start.line_index + 1 else 0;
+        const stop = if (hunk_index == end.hunk_index) end.line_index else hunk.lines.len -| 1;
+        while (line_index < hunk.lines.len and line_index <= stop) : (line_index += 1) {
+            if (lineSelectableInUnified(hunk.lines[line_index])) count += 1;
+        }
+    }
+    return count;
+}
+
 fn selectablePoint(file: diff_parser.FileDiff, side: Side, point: Point) bool {
     if (point.hunk_index >= file.hunks.len) return false;
     const hunk = file.hunks[point.hunk_index];
@@ -360,14 +503,43 @@ fn selectablePoint(file: diff_parser.FileDiff, side: Side, point: Point) bool {
     return lineVisibleOnSide(hunk.lines[point.line_index], side);
 }
 
+fn selectableUnifiedPoint(file: diff_parser.FileDiff, folded_hunks: []const bool, point: Point) bool {
+    if (point.hunk_index >= file.hunks.len or hunkIsFolded(folded_hunks, point.hunk_index)) return false;
+    const hunk = file.hunks[point.hunk_index];
+    if (point.line_index >= hunk.lines.len) return false;
+    return lineSelectableInUnified(hunk.lines[point.line_index]);
+}
+
+fn hunkIsFolded(folded_hunks: []const bool, hunk_index: usize) bool {
+    return hunk_index < folded_hunks.len and folded_hunks[hunk_index];
+}
+
 pub fn copyText(
     allocator: std.mem.Allocator,
     file: diff_parser.FileDiff,
     selection: DragSelection,
 ) ![]u8 {
-    var fragments = try buildFragments(allocator, file, selection);
-    defer fragments.deinit(allocator);
-    return fragments.clipboardText(allocator);
+    return copyTextFolded(allocator, file, &.{}, selection);
+}
+
+pub fn copyTextFolded(
+    allocator: std.mem.Allocator,
+    file: diff_parser.FileDiff,
+    folded_hunks: []const bool,
+    selection: DragSelection,
+) ![]u8 {
+    return switch (selection.content) {
+        .source_side => blk: {
+            var fragments = try buildFragments(allocator, file, selection);
+            defer fragments.deinit(allocator);
+            break :blk fragments.clipboardText(allocator);
+        },
+        .unified_diff => blk: {
+            var unified = try buildUnifiedDiff(allocator, file, folded_hunks, selection.range());
+            defer unified.deinit(allocator);
+            break :blk unified.clipboardText(allocator);
+        },
+    };
 }
 
 pub const OwnedFragment = struct {
@@ -406,12 +578,68 @@ pub const OwnedFragments = struct {
     }
 };
 
+pub const OwnedUnifiedDiff = struct {
+    text: []u8,
+    points: []Point,
+    line_count: usize,
+
+    pub fn deinit(self: *OwnedUnifiedDiff, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.points);
+        self.* = undefined;
+    }
+
+    pub fn clipboardText(self: OwnedUnifiedDiff, allocator: std.mem.Allocator) ![]u8 {
+        return allocator.dupe(u8, self.text);
+    }
+};
+
+pub fn buildUnifiedDiff(
+    allocator: std.mem.Allocator,
+    file: diff_parser.FileDiff,
+    folded_hunks: []const bool,
+    selected_range: Range,
+) BuildFragmentsError!OwnedUnifiedDiff {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var points: std.ArrayList(Point) = .empty;
+    errdefer points.deinit(allocator);
+
+    if (selected_range.start.hunk_index < file.hunks.len and selected_range.end.hunk_index < file.hunks.len) {
+        var hunk_index = selected_range.start.hunk_index;
+        while (hunk_index <= selected_range.end.hunk_index) : (hunk_index += 1) {
+            if (hunkIsFolded(folded_hunks, hunk_index)) continue;
+            const hunk = file.hunks[hunk_index];
+            if (hunk.lines.len == 0) continue;
+            const start_line = if (hunk_index == selected_range.start.hunk_index) selected_range.start.line_index else 0;
+            const end_line = if (hunk_index == selected_range.end.hunk_index) selected_range.end.line_index else hunk.lines.len - 1;
+            if (start_line >= hunk.lines.len) continue;
+            var line_index = start_line;
+            while (line_index < hunk.lines.len and line_index <= end_line) : (line_index += 1) {
+                const line = hunk.lines[line_index];
+                const marker = unifiedMarker(line) orelse continue;
+                if (points.items.len > 0) out.writer.writeByte('\n') catch return error.OutOfMemory;
+                out.writer.writeByte(marker) catch return error.OutOfMemory;
+                out.writer.writeAll(line.text) catch return error.OutOfMemory;
+                points.append(allocator, pointFromLine(hunk_index, line_index)) catch return error.OutOfMemory;
+            }
+        }
+    }
+
+    if (points.items.len >= 2) out.writer.writeByte('\n') catch return error.OutOfMemory;
+    const text = try out.toOwnedSlice();
+    errdefer allocator.free(text);
+    const owned_points = try points.toOwnedSlice(allocator);
+    return .{ .text = text, .points = owned_points, .line_count = owned_points.len };
+}
+
 pub const BuildFragmentsError = error{ InvalidSelection, OutOfMemory };
 
 pub fn buildFragments(allocator: std.mem.Allocator, file: diff_parser.FileDiff, selection: DragSelection) BuildFragmentsError!OwnedFragments {
+    const source = selection.sourceSide() orelse return error.InvalidSelection;
     const selected_range = selection.range();
     if (selected_range.start.hunk_index >= file.hunks.len or selected_range.end.hunk_index >= file.hunks.len) {
-        return .{ .mode = selection.mode, .items = try allocator.alloc(OwnedFragment, 0), .line_count = 0 };
+        return .{ .mode = source.mode, .items = try allocator.alloc(OwnedFragment, 0), .line_count = 0 };
     }
 
     var fragments: std.ArrayList(OwnedFragment) = .empty;
@@ -434,8 +662,8 @@ pub fn buildFragments(allocator: std.mem.Allocator, file: diff_parser.FileDiff, 
         var line_index = start_line;
         while (line_index < hunk.lines.len and line_index <= end_line) : (line_index += 1) {
             const line = hunk.lines[line_index];
-            if (!lineVisibleOnSide(line, selection.side)) continue;
-            const range = selectedBytesForLine(line.text, selection.mode, selected_range, hunk_index, line_index) orelse continue;
+            if (!lineVisibleOnSide(line, source.side)) continue;
+            const range = selectedBytesForLine(line.text, source.mode, selected_range, hunk_index, line_index) orelse continue;
             if (range.start > range.end or range.end > line.text.len) return error.InvalidSelection;
             const projection = text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width }) catch return error.InvalidSelection;
             if (!projection.isBoundary(range.start) or !projection.isBoundary(range.end)) return error.InvalidSelection;
@@ -443,7 +671,7 @@ pub fn buildFragments(allocator: std.mem.Allocator, file: diff_parser.FileDiff, 
                 selected_range.start.line_index == selected_range.end.line_index) continue;
             if (fragment_line_count > 0) out.writer.writeByte('\n') catch return error.OutOfMemory;
             out.writer.writeAll(line.text[range.start..range.end]) catch return error.OutOfMemory;
-            const source_line = lineNumberForSide(line, selection.side) orelse return error.InvalidSelection;
+            const source_line = lineNumberForSide(line, source.side) orelse return error.InvalidSelection;
             if (source_start == null) source_start = source_line;
             source_end = source_line;
             fragment_line_count += 1;
@@ -467,7 +695,7 @@ pub fn buildFragments(allocator: std.mem.Allocator, file: diff_parser.FileDiff, 
     }
 
     return .{
-        .mode = selection.mode,
+        .mode = source.mode,
         .items = try fragments.toOwnedSlice(allocator),
         .line_count = total_line_count,
     };
@@ -515,7 +743,7 @@ test "copyText preserves side-specific lines and whitespace" {
     const identity: Identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } };
     const old_text = try copyText(std.testing.allocator, file, .{
         .identity = identity,
-        .side = .old,
+        .content = .{ .source_side = .{ .side = .old } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 2 },
         .moved = true,
@@ -525,13 +753,79 @@ test "copyText preserves side-specific lines and whitespace" {
 
     const new_text = try copyText(std.testing.allocator, file, .{
         .identity = identity,
-        .side = .new,
+        .content = .{ .source_side = .{ .side = .new } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 2 },
         .moved = true,
     });
     defer std.testing.allocator.free(new_text);
     try std.testing.expectEqualStrings(" same \n  new\n", new_text);
+}
+
+test "unified diff selection copies exact visible marker-prefixed logical rows" {
+    const file: diff_parser.FileDiff = .{
+        .header = "diff --git a/a b/a",
+        .metadata = &.{"index 1..2"},
+        .hunks = &.{
+            .{
+                .header = "@@ -1,2 +1,2 @@",
+                .old_start = 1,
+                .old_count = 2,
+                .new_start = 1,
+                .new_count = 2,
+                .section = "",
+                .lines = &.{
+                    .{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 },
+                    .{ .kind = .removed, .text = "old", .old_line = 2 },
+                    .{ .kind = .added, .text = "new", .new_line = 2 },
+                    .{ .kind = .metadata, .text = "\\ No newline at end of file" },
+                },
+            },
+            .{
+                .header = "@@ -9 +9 @@",
+                .old_start = 9,
+                .old_count = 1,
+                .new_start = 9,
+                .new_count = 1,
+                .section = "",
+                .lines = &.{.{ .kind = .context, .text = "folded", .old_line = 9, .new_line = 9 }},
+            },
+            .{
+                .header = "@@ -20 +20 @@",
+                .old_start = 20,
+                .old_count = 1,
+                .new_start = 20,
+                .new_count = 1,
+                .section = "",
+                .lines = &.{.{ .kind = .added, .text = "last", .new_line = 20 }},
+            },
+        },
+    };
+    const selection: DragSelection = .{
+        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+        .content = .unified_diff,
+        .anchor = .{ .hunk_index = 0, .line_index = 0 },
+        .focus = .{ .hunk_index = 2, .line_index = 0 },
+        .moved = true,
+    };
+    const text = try copyTextFolded(std.testing.allocator, file, &.{ false, true, false }, selection);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(" same\n-old\n+new\n+last\n", text);
+
+    var owned = try buildUnifiedDiff(
+        std.testing.allocator,
+        file,
+        &.{ false, true, false },
+        selection.range(),
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), owned.line_count);
+    try std.testing.expectEqualSlices(Point, &.{
+        .{ .hunk_index = 0, .line_index = 0 },
+        .{ .hunk_index = 0, .line_index = 1 },
+        .{ .hunk_index = 0, .line_index = 2 },
+        .{ .hunk_index = 2, .line_index = 0 },
+    }, owned.points);
 }
 
 test "semantic line distance counts selected side across holes and hunk boundaries" {
@@ -591,8 +885,7 @@ test "character fragments copy exact forward and reverse multi-line bytes" {
     const identity: Identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "example" } };
     const forward = DragSelection{
         .identity = identity,
-        .side = .new,
-        .mode = .character,
+        .content = .{ .source_side = .{ .side = .new, .mode = .character } },
         .anchor = .{ .hunk_index = 0, .line_index = 0, .leading = 3, .trailing = 4 },
         .focus = .{ .hunk_index = 0, .line_index = 1, .leading = 4, .trailing = 5 },
         .moved = true,
@@ -644,8 +937,7 @@ test "character selection from the first token to its leading boundary keeps the
         };
         const selection: DragSelection = .{
             .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-            .side = .new,
-            .mode = .character,
+            .content = .{ .source_side = .{ .side = .new, .mode = .character } },
             .anchor = pointFromToken(0, 0, .{
                 .byte_start = 0,
                 .byte_end = case.token_end,
@@ -673,8 +965,7 @@ test "cross-hunk character fragments use one glue LF and no trailing LF" {
     };
     const text = try copyText(std.testing.allocator, file, .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "example" } },
-        .side = .new,
-        .mode = .character,
+        .content = .{ .source_side = .{ .side = .new, .mode = .character } },
         .anchor = .{ .hunk_index = 0, .line_index = 0, .leading = 1, .trailing = 2 },
         .focus = .{ .hunk_index = 1, .line_index = 0, .leading = 1, .trailing = 2 },
         .moved = true,
@@ -701,7 +992,7 @@ test "copyText does not add trailing newline for one selected line" {
 
     const text = try copyText(std.testing.allocator, file, .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
+        .content = .{ .source_side = .{ .side = .new } },
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 0 },
         .moved = true,

@@ -36,6 +36,7 @@ pub const Command = union(enum) {
     open_selected_file_in_editor,
     copy_current_line,
     copy_current_hunk,
+    copy_hunk_diff: []u8,
     /// Separately owned clipboard bytes assembled from the installed page
     /// candidate. They never borrow the displayed diff/source owner.
     copy_diff_selection: diff_surface_update.SelectionCopy,
@@ -45,6 +46,7 @@ pub const Command = union(enum) {
     pub fn deinit(self: *Command, allocator: ?std.mem.Allocator) void {
         switch (self.*) {
             .copy_diff_selection => |copy| (allocator orelse unreachable).free(copy.text),
+            .copy_hunk_diff => |text| (allocator orelse unreachable).free(text),
             .copy_diff_header_path => |*selection| (allocator orelse unreachable).free(selection.identity.path_key),
             else => {},
         }
@@ -123,6 +125,7 @@ pub const Controller = struct {
 fn commandFromEffect(effect: diff_surface_update.Effect) Command {
     return switch (effect) {
         .copy_diff_selection => |copy| .{ .copy_diff_selection = copy },
+        .copy_hunk_diff => |text| .{ .copy_hunk_diff = text },
         .copy_diff_header_path => |header| .{ .copy_diff_header_path = header },
     };
 }
@@ -171,17 +174,17 @@ test "Changes advances selection layout revision only for mapping mode and fold 
     focus.deinit(null);
     try std.testing.expectEqual(initial, page.selection_layout_revision);
 
-    var mode = try controller.apply(null, .toggle_display_mode);
+    var mode = try controller.apply(allocator, .toggle_display_mode);
     mode.deinit(null);
     try std.testing.expectEqual(initial + 1, page.selection_layout_revision);
 
-    var file = try controller.apply(null, .select_next_file);
+    var file = try controller.apply(allocator, .select_next_file);
     file.deinit(null);
     try std.testing.expectEqual(initial + 2, page.selection_layout_revision);
 
     page.viewer.selected_target = .{ .diff_file = 0 };
     page.viewer.diff_cursor = .{ .hunk_header = 0 };
-    var fold = try controller.apply(null, .toggle_hunk_fold);
+    var fold = try controller.apply(allocator, .toggle_hunk_fold);
     fold.deinit(null);
     try std.testing.expectEqual(initial + 3, page.selection_layout_revision);
 }
@@ -223,11 +226,11 @@ test "explicit sidebar update supersedes action restore while internal remap doe
         .diagnostics = .{ .target = &page.status },
     } };
 
-    controller.navigation.selectSidebarNode(controller.navigation.activeLoadedDiff().?, 1);
-    controller.navigation.selectSidebarNode(controller.navigation.activeLoadedDiff().?, 0);
+    controller.navigation.selectSidebarNode(allocator, controller.navigation.activeLoadedDiff().?, 1);
+    controller.navigation.selectSidebarNode(allocator, controller.navigation.activeLoadedDiff().?, 0);
     try std.testing.expect(page.action_cursor.hasRestoreAuthority());
 
-    var explicit = try controller.apply(null, .select_next_file);
+    var explicit = try controller.apply(allocator, .select_next_file);
     explicit.deinit(null);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, page.viewer.selected_target.?);
     try std.testing.expect(!page.action_cursor.hasRestoreAuthority());
@@ -292,7 +295,7 @@ test "file search supersedes action restore only when submit changes selection" 
     try installUpdateTestActionCursor(&page, allocator, "b");
     try std.testing.expect(page.action_cursor.promote(7, 3, .{ .device = 5, .inode = 8 }, .status_only));
     try std.testing.expect(page.action_cursor.startMember(7, .status, 12));
-    var wheel = try controller.apply(null, .mouse_sidebar_wheel_up);
+    var wheel = try controller.apply(allocator, .mouse_sidebar_wheel_up);
     wheel.deinit(null);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, page.viewer.selected_target.?);
     try std.testing.expect(!page.action_cursor.hasRestoreAuthority());
@@ -534,7 +537,7 @@ test "changes mouse release retains candidate until explicit copy or clear" {
     defer page.deinit(std.testing.allocator);
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 3 },
         .moved = true,
@@ -559,7 +562,7 @@ test "changes mouse release retains candidate until explicit copy or clear" {
     defer command.deinit(std.testing.allocator);
     const copy_generation = switch (command) {
         .copy_diff_selection => |copy| blk: {
-            try std.testing.expectEqualStrings("one\ntwo\nnew\n", copy.text);
+            try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n", copy.text);
             break :blk copy.generation;
         },
         else => return error.ExpectedCopyCommand,
@@ -567,7 +570,7 @@ test "changes mouse release retains candidate until explicit copy or clear" {
     try std.testing.expect(page.completed_selection != null);
 
     const navigation_token = page.completed_selection.?.token;
-    for ([_]message.Msg{ .focus_diff, .scroll_diff_down, .toggle_display_mode }) |navigation_msg| {
+    for ([_]message.Msg{ .focus_diff, .scroll_diff_down }) |navigation_msg| {
         var navigation_update = try controller.apply(null, navigation_msg);
         navigation_update.deinit(null);
         try std.testing.expect(page.completed_selection != null);
@@ -578,7 +581,7 @@ test "changes mouse release retains candidate until explicit copy or clear" {
     const retained_token = page.completed_selection.?.token;
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 0 },
         .moved = false,
@@ -630,7 +633,7 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     choose_before.deinit(null);
     const started = page.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(diff_selection.Origin.keyboard_line, started.origin);
-    try std.testing.expectEqual(diff_selection.Side.old, started.side);
+    try std.testing.expectEqual(diff_selection.Side.old, started.selectedSide().?);
     try std.testing.expectEqual(@as(usize, 1), started.selected_line_count);
     try std.testing.expectEqual(@as(usize, 1), controller.navigation.view().selectionStatusPresentation().?.line_count);
 
@@ -654,7 +657,7 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
         moved.deinit(failing.allocator());
     }
     const extended = page.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
-    try std.testing.expectEqual(diff_selection.Side.old, extended.side);
+    try std.testing.expectEqual(diff_selection.Side.old, extended.selectedSide().?);
     try std.testing.expectEqual(@as(usize, 3), extended.selected_line_count);
     try std.testing.expectEqual(@as(usize, 3), controller.navigation.view().selectionStatusPresentation().?.line_count);
 
@@ -735,10 +738,10 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     var choice_before_mode = try controller.apply(null, .begin_keyboard_line_selection);
     choice_before_mode.deinit(null);
     try std.testing.expect(page.selection_owner.activeKeyboardSideChoice() != null);
-    var mode_change = try controller.apply(null, .toggle_display_mode);
-    mode_change.deinit(null);
+    var mode_change = try controller.apply(allocator, .toggle_display_mode);
+    mode_change.deinit(allocator);
     try std.testing.expect(page.selection_owner == .none);
-    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(page.completed_selection == null);
 
     page.viewer.diff_cursor = .{ .metadata = 0 };
     var unified_nearby = try controller.apply(null, .begin_keyboard_line_selection);
@@ -757,7 +760,7 @@ test "Changes keyboard line selection locks side moves allocation-free and compl
     page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
     var removed_begin = try controller.apply(null, .begin_keyboard_line_selection);
     removed_begin.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.old, page.selection_owner.activeDiff().?.side);
+    try std.testing.expect(page.selection_owner.activeDiff().?.content == .unified_diff);
     var final_clear = try controller.apply(allocator, .{ .selection_action = .clear });
     final_clear.deinit(allocator);
 }
@@ -790,7 +793,7 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
     page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
     var equal_context = try controller.apply(null, .begin_keyboard_line_selection);
     equal_context.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.selectedSide().?);
     var clear_context = try controller.apply(allocator, .{ .selection_action = .clear });
     clear_context.deinit(allocator);
 
@@ -828,12 +831,12 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
 
     var choose = try controller.apply(null, .{ .choose_keyboard_selection_side = .old });
     choose.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.old, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(diff_selection.Side.old, page.selection_owner.activeDiff().?.selectedSide().?);
     try std.testing.expectEqual(selection_action.StatusSide.before, controller.navigation.view().selectionStatusPresentation().?.side);
 
     var switch_after = try controller.apply(null, .{ .switch_keyboard_selection_side = .new });
     switch_after.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.selectedSide().?);
     try std.testing.expectEqual(@as(usize, 3), page.selection_owner.activeDiff().?.focus.line_index);
     try std.testing.expectEqual(selection_action.StatusSide.after, controller.navigation.view().selectionStatusPresentation().?.side);
 
@@ -842,7 +845,7 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
     try std.testing.expectEqual(@as(usize, 2), page.selection_owner.activeDiff().?.selected_line_count);
     var locked = try controller.apply(null, .{ .switch_keyboard_selection_side = .old });
     locked.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(diff_selection.Side.new, page.selection_owner.activeDiff().?.selectedSide().?);
     try std.testing.expectEqual(@as(usize, 2), page.selection_owner.activeDiff().?.selected_line_count);
 
     var shrink = try controller.apply(null, .{ .keyboard_line_selection_move = .down });
@@ -850,7 +853,7 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
     try std.testing.expectEqual(@as(usize, 1), page.selection_owner.activeDiff().?.selected_line_count);
     var switch_before = try controller.apply(null, .{ .switch_keyboard_selection_side = .old });
     switch_before.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.old, page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(diff_selection.Side.old, page.selection_owner.activeDiff().?.selectedSide().?);
     try std.testing.expectEqual(@as(usize, 2), page.selection_owner.activeDiff().?.focus.line_index);
 
     var copied = try controller.apply(allocator, .{ .selection_action = .copy });
@@ -904,10 +907,10 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
     one_sided_page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
     var removed_direct = try one_sided.apply(null, .begin_keyboard_line_selection);
     removed_direct.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.old, one_sided_page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(diff_selection.Side.old, one_sided_page.selection_owner.activeDiff().?.selectedSide().?);
     var missing_after = try one_sided.apply(null, .{ .switch_keyboard_selection_side = .new });
     missing_after.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.old, one_sided_page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(diff_selection.Side.old, one_sided_page.selection_owner.activeDiff().?.selectedSide().?);
     try std.testing.expectEqualStrings("No matching line on that selection side", one_sided_page.status.text());
     var clear_removed = try one_sided.apply(allocator, .{ .selection_action = .clear });
     clear_removed.deinit(allocator);
@@ -915,7 +918,7 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
     one_sided_page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } };
     var added_direct = try one_sided.apply(null, .begin_keyboard_line_selection);
     added_direct.deinit(null);
-    try std.testing.expectEqual(diff_selection.Side.new, one_sided_page.selection_owner.activeDiff().?.side);
+    try std.testing.expectEqual(diff_selection.Side.new, one_sided_page.selection_owner.activeDiff().?.selectedSide().?);
 
     var focus_page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffRootedNested()),
@@ -939,7 +942,7 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
     var same_file_choice = try focus_controller.apply(null, .begin_keyboard_line_selection);
     same_file_choice.deinit(null);
     try std.testing.expect(focus_page.selection_owner.activeKeyboardSideChoice() != null);
-    var same_file_click = try focus_controller.apply(null, .{ .sidebar_click_node = 2 });
+    var same_file_click = try focus_controller.apply(allocator, .{ .sidebar_click_node = 2 });
     same_file_click.deinit(null);
     try std.testing.expect(focus_page.selection_owner == .none);
     try std.testing.expectEqual(diff_surface.Focus.sidebar, focus_page.viewer.focus);
@@ -947,7 +950,7 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
     focus_page.viewer.focus = .diff;
     var directory_choice = try focus_controller.apply(null, .begin_keyboard_line_selection);
     directory_choice.deinit(null);
-    var directory_click = try focus_controller.apply(null, .{ .sidebar_click_node = 1 });
+    var directory_click = try focus_controller.apply(allocator, .{ .sidebar_click_node = 1 });
     directory_click.deinit(null);
     try std.testing.expect(focus_page.selection_owner == .none);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, focus_page.viewer.selected_target.?);
@@ -956,7 +959,7 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
     focus_page.viewer.focus = .diff;
     var boundary_choice = try focus_controller.apply(null, .begin_keyboard_line_selection);
     boundary_choice.deinit(null);
-    var boundary_wheel = try focus_controller.apply(null, .mouse_sidebar_wheel_up);
+    var boundary_wheel = try focus_controller.apply(allocator, .mouse_sidebar_wheel_up);
     boundary_wheel.deinit(null);
     try std.testing.expect(focus_page.selection_owner == .none);
     try std.testing.expectEqual(@as(usize, 0), focus_page.viewer.selected_node);
@@ -1010,7 +1013,7 @@ test "Changes keyboard line selection clipboard preparation failure installs a r
     try std.testing.expect(observed_clipboard_failure);
 }
 
-test "Changes keyboard line selection skips a folded hunk but counts and copies its semantic lines" {
+test "Changes unified keyboard selection omits a folded hunk from count and copy" {
     const Fixture = struct {
         const first_lines = [_]diff_parser.DiffLine{
             .{ .kind = .context, .text = "start", .old_line = 1, .new_line = 1 },
@@ -1075,8 +1078,8 @@ test "Changes keyboard line selection skips a folded hunk but counts and copies 
     moved.deinit(null);
     const active = page.selection_owner.activeDiff() orelse return error.ExpectedDiffSelection;
     try std.testing.expectEqual(@as(usize, 2), active.focus.hunk_index);
-    try std.testing.expectEqual(@as(usize, 4), active.selected_line_count);
-    try std.testing.expectEqual(@as(usize, 4), controller.navigation.view().selectionStatusPresentation().?.line_count);
+    try std.testing.expectEqual(@as(usize, 2), active.selected_line_count);
+    try std.testing.expectEqual(@as(usize, 2), controller.navigation.view().selectionStatusPresentation().?.line_count);
 
     var copied = try controller.apply(allocator, .{ .selection_action = .copy });
     defer copied.deinit(allocator);
@@ -1084,19 +1087,19 @@ test "Changes keyboard line selection skips a folded hunk but counts and copies 
     defer command.deinit(allocator);
     switch (command) {
         .copy_diff_selection => |copy| try std.testing.expectEqualStrings(
-            "start\nhidden context\nhidden added\nend\n",
+            " start\n end\n",
             copy.text,
         ),
         else => return error.ExpectedCopyCommand,
     }
-    try std.testing.expectEqual(@as(usize, 4), page.completed_selection.?.lineCount());
+    try std.testing.expectEqual(@as(usize, 2), page.completed_selection.?.lineCount());
 }
 
 test "Changes fixed status row routes mouse Copy and Clear without changing body coordinates" {
     const allocator = std.testing.allocator;
     var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
-        .viewer = .{ .sidebar_hidden = true },
+        .viewer = .{ .sidebar_hidden = true, .display_mode = .unified },
     };
     defer page.deinit(allocator);
     const controller: Controller = .{ .navigation = .{
@@ -1109,7 +1112,7 @@ test "Changes fixed status row routes mouse Copy and Clear without changing body
 
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 3 },
         .moved = true,
@@ -1140,7 +1143,7 @@ test "Changes fixed status row routes mouse Copy and Clear without changing body
     var copy_command = copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer copy_command.deinit(allocator);
     switch (copy_command) {
-        .copy_diff_selection => |copy| try std.testing.expectEqualStrings("one\ntwo\nnew\n", copy.text),
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n", copy.text),
         else => return error.ExpectedCopyCommand,
     }
     try std.testing.expect(page.completed_selection != null);
@@ -1184,7 +1187,7 @@ test "Changes fixed status row routes mouse Copy and Clear without changing body
     var active_copy_command = active_copied.takeCommand() orelse return error.ExpectedCopyCommand;
     defer active_copy_command.deinit(allocator);
     switch (active_copy_command) {
-        .copy_diff_selection => |copy| try std.testing.expectEqualStrings("one", copy.text),
+        .copy_diff_selection => |copy| try std.testing.expectEqualStrings(" one", copy.text),
         else => return error.ExpectedCopyCommand,
     }
     try std.testing.expect(page.selection_owner == .none);
@@ -1271,7 +1274,7 @@ test "failed moved release preserves prior candidate without emitting clipboard 
 
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
@@ -1283,7 +1286,7 @@ test "failed moved release preserves prior candidate without emitting clipboard 
 
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "different" } },
-        .side = .new,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
@@ -1304,7 +1307,7 @@ test "clipboard allocation failure retains the accepted candidate" {
     defer page.deinit(allocator);
     page.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .side = .new,
+        .content = .unified_diff,
         .anchor = .{ .hunk_index = 0, .line_index = 0 },
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,

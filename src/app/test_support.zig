@@ -343,6 +343,7 @@ pub const file_with_hunks = diff_parser.FileDiff{
 
 pub const hunks = [_]diff_parser.Hunk{
     .{
+        .header = "@@ -1,4 +1,4 @@ first",
         .old_start = 1,
         .old_count = 4,
         .new_start = 1,
@@ -351,6 +352,7 @@ pub const hunks = [_]diff_parser.Hunk{
         .lines = &hunk_first_lines,
     },
     .{
+        .header = "@@ -20,2 +20,2 @@ second",
         .old_start = 20,
         .old_count = 2,
         .new_start = 20,

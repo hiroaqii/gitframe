@@ -2790,7 +2790,7 @@ pub const RepositoryPageState = struct {
             .{ .line_count = presentation.line_count },
         );
         return if (layout.targetAt(point.col)) |action|
-            .{ .target = action }
+            if (action.retained()) |retained| .{ .target = retained } else .inert
         else
             .inert;
     }

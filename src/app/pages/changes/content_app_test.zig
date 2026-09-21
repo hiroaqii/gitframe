@@ -189,6 +189,38 @@ test "selectedEditorTarget rejects live sources without active repo" {
     try std.testing.expectEqual(changes_content.EditorTargetResult.no_repo, changesContent(&app).editorTarget());
 }
 
+test "current line copy uses unified markers and keeps side-by-side bytes unchanged" {
+    var app: App = .{
+        .pages = .{ .changes = .{
+            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
+            .viewer = .{
+                .selected_target = .{ .diff_file = 0 },
+                .display_mode = .unified,
+                .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
+            },
+        } },
+        .terminal_size = .{ .width = 120, .height = 30 },
+    };
+    defer app.pages.changes.load.clearCurrent(std.testing.allocator);
+
+    const expected = [_][]const u8{ " one", "-old", "+new" };
+    const indexes = [_]usize{ 0, 2, 3 };
+    for (indexes, expected) |line_index, text| {
+        app.pages.changes.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = line_index } };
+        var copied = (try changesContent(&app).currentLineCopyText(std.testing.allocator)) orelse
+            return error.ExpectedCurrentLine;
+        defer copied.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(text, copied.text());
+    }
+
+    app.pages.changes.viewer.display_mode = .side_by_side;
+    app.pages.changes.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } };
+    var side = (try changesContent(&app).currentLineCopyText(std.testing.allocator)) orelse
+        return error.ExpectedCurrentLine;
+    defer side.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("new", side.text());
+}
+
 test "selectedEditorTarget rejects directory rows" {
     var app: App = .{
         .pages = .{ .changes = .{

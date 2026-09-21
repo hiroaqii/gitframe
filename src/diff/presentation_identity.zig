@@ -12,7 +12,7 @@
 //!
 //! - resolved old/new/display paths;
 //! - ordered visible canonical metadata facts and binary state;
-//! - ordered hunk coordinates, counts, and sections; and
+//! - ordered raw hunk headers, coordinates, counts, and sections; and
 //! - ordered line kinds, text, and old/new coordinates.
 //!
 //! Stage state, syntax/action origins, revisions, request IDs, and UI state are
@@ -152,6 +152,7 @@ pub fn fingerprint(file: diff_parser.FileDiff) Fingerprint {
     writeU64(&hasher, .hunk_count, file.hunks.len);
     for (file.hunks) |hunk| {
         writeTag(&hasher, .hunk);
+        writeBytes(&hasher, .hunk_header, hunk.header);
         writeU32(&hasher, .hunk_old_start, hunk.old_start);
         writeU32(&hasher, .hunk_old_count, hunk.old_count);
         writeU32(&hasher, .hunk_new_start, hunk.new_start);
@@ -187,7 +188,8 @@ pub fn exactEqual(lhs: diff_parser.FileDiff, rhs: diff_parser.FileDiff) bool {
     if (lhs.is_binary != rhs.is_binary or lhs.hunks.len != rhs.hunks.len) return false;
 
     for (lhs.hunks, rhs.hunks) |left_hunk, right_hunk| {
-        if (left_hunk.old_start != right_hunk.old_start or
+        if (!std.mem.eql(u8, left_hunk.header, right_hunk.header) or
+            left_hunk.old_start != right_hunk.old_start or
             left_hunk.old_count != right_hunk.old_count or
             left_hunk.new_start != right_hunk.new_start or
             left_hunk.new_count != right_hunk.new_count or
@@ -274,6 +276,7 @@ const HashTag = enum(u8) {
     binary,
     hunk_count,
     hunk,
+    hunk_header,
     hunk_old_start,
     hunk_old_count,
     hunk_new_start,
@@ -355,6 +358,7 @@ const second_lines = [_]diff_parser.DiffLine{
 
 const base_hunks = [_]diff_parser.Hunk{
     .{
+        .header = "@@ -10 +10 @@ fn 計算()",
         .old_start = 10,
         .old_count = 1,
         .new_start = 10,
@@ -363,6 +367,7 @@ const base_hunks = [_]diff_parser.Hunk{
         .lines = &base_lines,
     },
     .{
+        .header = "@@ -20 +20 @@ fn read()",
         .old_start = 20,
         .old_count = 1,
         .new_start = 20,
@@ -495,6 +500,11 @@ test "every hunk field and hunk order affect identity" {
 
     changed_hunks = .{ base_hunks[1], base_hunks[0] };
     changed = base;
+    changed.hunks = &changed_hunks;
+    try expectMutationUnequal(base, changed);
+
+    changed_hunks = base_hunks;
+    changed_hunks[0].header = "@@ -10,1 +10,1 @@ fn 計算()";
     changed.hunks = &changed_hunks;
     try expectMutationUnequal(base, changed);
 

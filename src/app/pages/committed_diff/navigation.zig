@@ -156,11 +156,27 @@ pub const Controller = struct {
             };
         }
 
+        pub fn selectionMappingCleanup(
+            self: *UpdateAdapter,
+            allocator: std.mem.Allocator,
+        ) diff_surface.navigation.SelectionMappingCleanup {
+            return .{
+                .allocator = allocator,
+                .residual_owner = .{ .ctx = self, .callback = clearPinnedSelection },
+            };
+        }
+
         pub fn shared(self: *UpdateAdapter) diff_surface.update.Controller {
             return .{
                 .navigation = self.bodyController(),
                 .retained_selection_install = .{ .ctx = self, .callback = installRetainedSelection },
+                .selection_mapping_residual = .{ .ctx = self, .callback = clearPinnedSelection },
             };
+        }
+
+        fn clearPinnedSelection(ctx: *anyopaque) void {
+            const self: *UpdateAdapter = @ptrCast(@alignCast(ctx));
+            self.navigation.diff.pinned_selection_basis = null;
         }
 
         fn installRetainedSelection(ctx: *anyopaque) bool {
@@ -323,6 +339,145 @@ pub const BodyResolverAdapter = struct {
         return .{ .identity = identity, .display_path = diff_file.displayPath(file) };
     }
 };
+
+test "search unfold mapping cleanup clears retained selection and pin for Compare and History" {
+    const allocator = std.testing.allocator;
+    const app_load = @import("../../load.zig");
+    const before = try commit_diff.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const after = try commit_diff.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const target: commit_diff.Target = .{
+        .object_format = .sha1,
+        .base_oid = before,
+        .head_oid = after,
+        .diff_base_oid = before,
+    };
+    const basis: commit_diff.Basis = .{
+        .object_format = .sha1,
+        .before = .{ .commit = before },
+        .after = after,
+    };
+    const cases = [_]struct {
+        owner: diff_surface.authority.Owner,
+        identity: committed_diff.PresentationIdentity,
+        current_target: ?commit_diff.Target,
+        presentation_identity: ?committed_diff.PresentationIdentity,
+        source: diff_source.SourceMode,
+    }{
+        .{ .owner = .compare, .identity = .{ .target = target }, .current_target = target, .presentation_identity = null, .source = .{ .range = "compare" } },
+        .{ .owner = .history, .identity = .{ .diff_basis = basis }, .current_target = null, .presentation_identity = .{ .diff_basis = basis }, .source = .{ .range = "history" } },
+    };
+    const patch =
+        "diff --git a/a b/a\n" ++
+        "--- a/a\n" ++
+        "+++ b/a\n" ++
+        "@@ -1,2 +1,2 @@ first\n" ++
+        " one\n" ++
+        "-old\n" ++
+        "+new\n" ++
+        "@@ -10,2 +10,2 @@ second\n" ++
+        " ten\n" ++
+        "-older\n" ++
+        "+newer\n";
+
+    for (cases) |case| {
+        var state: committed_diff.State = .{};
+        defer state.deinit(allocator);
+        var bundle: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) };
+        defer bundle.deinit();
+        try state.replaceDiffWithIdentity(
+            allocator,
+            7,
+            null,
+            null,
+            case.source,
+            case.identity,
+            true,
+            .none,
+            &bundle,
+        );
+        state.viewer.selected_target = .{ .diff_file = 0 };
+        state.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
+        state.viewer.diff_scroll = 1;
+        const loaded = switch (state.load.state) {
+            .loaded => |*session| &session.loaded,
+            else => return error.ExpectedLoadedDiff,
+        };
+        loaded.setHunkFolded(0, 1, true);
+
+        var selection = diff_selection.DragSelection.initUnified(
+            .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
+            .{ .hunk_index = 0, .line_index = 0 },
+        );
+        selection.focus = .{ .hunk_index = 0, .line_index = 2 };
+        selection.moved = true;
+        state.completed_selection = try diff_surface.selection.buildParsedFolded(
+            allocator,
+            .{
+                .repo_epoch = 7,
+                .root_identity = null,
+                .source = diff_surface.selection.SourceBasis.init(case.source),
+                .source_session_revision = state.source_session_revision,
+                .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
+            },
+            loaded.document.files[0],
+            loaded.foldedHunksForFile(0),
+            state.selection_layout_revision,
+            selection,
+        );
+        try std.testing.expect(state.installPinnedPresentationIdentity(case.identity));
+
+        var activation = diff_surface.authority.Lifecycle.init(case.owner);
+        _ = activation.activate(7, .fresh, .unavailable, .unavailable);
+        var status: app_state.StatusMessage = .{};
+        const controller: Controller = .{
+            .diff = &state,
+            .activation = &activation,
+            .status = &status,
+            .current_target = case.current_target,
+            .presentation_identity = case.presentation_identity,
+            .repo_root = null,
+            .repo_epoch = 7,
+            .root_identity = null,
+            .source = case.source,
+            .layout = .{ .width = 100, .height = 12 },
+        };
+        var adapter = controller.updateAdapter();
+        const cleanup = adapter.selectionMappingCleanup(allocator);
+        const body = adapter.bodyController();
+        const viewport = body.captureSelectionViewportAnchor() orelse return error.ExpectedSelectionViewport;
+        const revision = state.selection_layout_revision;
+        body.unfoldSearchMatchIfNeeded(cleanup, .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } } });
+        try std.testing.expect(!loaded.isHunkFolded(0, 1));
+        try std.testing.expect(state.completed_selection == null);
+        try std.testing.expect(state.pinned_selection_basis == null);
+        try std.testing.expectEqual(revision + 1, state.selection_layout_revision);
+        try std.testing.expectEqual(body.view().restoreSelectionViewportAnchor(viewport), state.viewer.diff_scroll);
+
+        state.completed_selection = try diff_surface.selection.buildParsedFolded(
+            allocator,
+            .{
+                .repo_epoch = 7,
+                .root_identity = null,
+                .source = diff_surface.selection.SourceBasis.init(case.source),
+                .source_session_revision = state.source_session_revision,
+                .display = .{ .loaded = content_fingerprint.Fingerprint.init(loaded.text) },
+            },
+            loaded.document.files[0],
+            loaded.foldedHunksForFile(0),
+            state.selection_layout_revision,
+            selection,
+        );
+        try std.testing.expect(state.installPinnedPresentationIdentity(case.identity));
+        var noop_adapter = controller.updateAdapter();
+        const noop_cleanup = noop_adapter.selectionMappingCleanup(allocator);
+        const noop_body = noop_adapter.bodyController();
+        const noop_revision = state.selection_layout_revision;
+        noop_body.unfoldSearchMatchIfNeeded(noop_cleanup, .{ .coordinate = .{ .hunk_line = .{ .hunk_index = 1, .line_index = 0 } } });
+        try std.testing.expect(state.completed_selection != null);
+        try std.testing.expect(state.pinned_selection_basis != null);
+        try std.testing.expectEqual(noop_revision, state.selection_layout_revision);
+    }
+}
 
 fn emptyResolvedTarget() diff_surface.ResolvedTarget {
     return .{

@@ -43,6 +43,10 @@ pub const FileDiff = struct {
 };
 
 pub const Hunk = struct {
+    /// The complete borrowed `@@ ... @@` line as it appeared in the input.
+    /// Keeping this distinct from `section` lets copy actions reproduce a
+    /// syntactically valid unified hunk without reconstructing its ranges.
+    header: []const u8 = "",
     old_start: u32,
     old_count: u32,
     new_start: u32,
@@ -203,6 +207,7 @@ const Parser = struct {
         try self.ensureFile(parsed.header);
         try self.finishHunk();
         self.current_hunk = .{
+            .header = parsed.header,
             .old_start = parsed.old_start,
             .old_count = parsed.old_count,
             .new_start = parsed.new_start,
@@ -221,6 +226,7 @@ const Parser = struct {
             errdefer self.allocator.free(lines);
 
             try self.current_file.?.hunks.append(self.allocator, .{
+                .header = hunk.header,
                 .old_start = hunk.old_start,
                 .old_count = hunk.old_count,
                 .new_start = hunk.new_start,
@@ -287,6 +293,7 @@ const FileBuilder = struct {
 };
 
 const HunkBuilder = struct {
+    header: []const u8,
     old_start: u32,
     old_count: u32,
     new_start: u32,
@@ -389,6 +396,7 @@ test "parse unified diff with one file and one hunk" {
     try std.testing.expectEqualStrings("b/src/main.zig", doc.files[0].new_path.?);
     try std.testing.expectEqual(@as(u32, 1), doc.files[0].hunks[0].old_start);
     try std.testing.expectEqual(@as(u32, 3), doc.files[0].hunks[0].new_count);
+    try std.testing.expectEqualStrings("@@ -1,2 +1,3 @@ fn main", doc.files[0].hunks[0].header);
     try std.testing.expectEqual(DiffLine.Kind.removed, doc.files[0].hunks[0].lines[1].kind);
     try std.testing.expectEqual(@as(u32, 2), doc.files[0].hunks[0].lines[1].old_line.?);
     try std.testing.expect(doc.files[0].hunks[0].lines[1].new_line == null);
@@ -432,6 +440,7 @@ test "parse hunk ranges without explicit counts" {
     try std.testing.expectEqual(@as(u32, 1), doc.files[0].hunks[0].old_count);
     try std.testing.expectEqual(@as(u32, 5), doc.files[0].hunks[0].new_start);
     try std.testing.expectEqual(@as(u32, 1), doc.files[0].hunks[0].new_count);
+    try std.testing.expectEqualStrings("@@ -4 +5 @@", doc.files[0].hunks[0].header);
 }
 
 test "parse hunk lines that look like file path headers" {

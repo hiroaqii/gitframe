@@ -107,6 +107,7 @@ fn testCombinedHunkBundle(allocator: std.mem.Allocator) !app_changes_projection.
 
 test "display mode and search navigation reset horizontal scroll" {
     var app: App = .{
+        .allocator = std.testing.allocator,
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffWide()),
             .viewer = .{
@@ -122,7 +123,7 @@ test "display mode and search navigation reset horizontal scroll" {
 
     app.pages.changes.viewer.diff_horizontal_scroll = 16;
     setDiffSearchQuery(&app, "wide");
-    changesNavigation(&app).submitSearch();
+    changesNavigation(&app).submitSearch(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_horizontal_scroll);
 }
 
@@ -150,6 +151,7 @@ test "line number toggle clamps horizontal scroll without changing vertical scro
 
 test "display mode toggle keeps nearby vertical scroll position" {
     var app: App = .{
+        .allocator = std.testing.allocator,
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
@@ -171,6 +173,7 @@ test "display mode toggle keeps nearby vertical scroll position" {
 
 test "display mode toggle brings cursor back into view after wheel scroll" {
     var app: App = .{
+        .allocator = std.testing.allocator,
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
@@ -220,6 +223,7 @@ test "diff wheel comfort routes through Changes and recenters an edge cursor" {
 
 test "diff mouse drag supports unified fallback and clears on invalidation" {
     var app: App = .{
+        .allocator = std.testing.allocator,
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
@@ -292,7 +296,7 @@ test "sidebar navigation keeps status-only target through clamp" {
         return error.ExpectedStatusOnlyNode;
     };
 
-    changesNavigation(&app).selectSidebarNode(loaded, status_node);
+    changesNavigation(&app).selectSidebarNode(std.testing.allocator, loaded, status_node);
     changesNavigation(&app).clampSelection(loaded.document.files.len);
 
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.changes.viewer.selected_target.?);
@@ -317,11 +321,11 @@ test "sidebar navigation moves between status-only nodes" {
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.changes.viewer.selected_target.?);
     const first_node = app.pages.changes.viewer.selected_node;
 
-    changesNavigation(&app).selectFileDelta(1);
+    changesNavigation(&app).selectFileDelta(std.testing.allocator, 1);
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 1 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expect(app.pages.changes.viewer.selected_node != first_node);
 
-    changesNavigation(&app).selectFileDelta(-1);
+    changesNavigation(&app).selectFileDelta(std.testing.allocator, -1);
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expectEqual(first_node, app.pages.changes.viewer.selected_node);
 }
@@ -462,7 +466,7 @@ test "Changes document navigation updates pending restore only on display change
     // the acceptance-time cursor and viewport.
     app.pages.changes.viewer.diff_cursor = restore.original.diff_cursor;
     app.pages.changes.viewer.diff_scroll = restore.original.diff_scroll;
-    changesReload(&app).restoreDisplayedNavigation(restore.authoritative());
+    changesReload(&app).restoreDisplayedNavigation(std.testing.allocator, restore.authoritative());
     try std.testing.expectEqual(latest_cursor, app.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqual(latest_cursor_offset, changesNavigationView(&app).selectedDiffCursorOffset());
     try std.testing.expectEqual(latest_scroll, app.pages.changes.viewer.diff_scroll);
@@ -501,8 +505,7 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
             },
             .selection_owner = .{ .diff = .{
                 .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-                .side = .new,
-                .mode = .line,
+                .content = .unified_diff,
                 .anchor = .{ .hunk_index = 0, .line_index = 0 },
                 .focus = .{ .hunk_index = 0, .line_index = 1 },
                 .anchor_cell = .{ .col = 20, .row = diff_render.body_start_row + 1 },
