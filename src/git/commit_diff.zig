@@ -137,7 +137,7 @@ pub const Basis = struct {
     before: Before,
     after: ObjectId,
 
-    fn validate(self: Basis) error{InvalidBasis}!void {
+    pub fn validate(self: Basis) error{InvalidBasis}!void {
         if (!self.after.validFor(self.object_format)) return error.InvalidBasis;
         switch (self.before) {
             .commit => |oid| if (!oid.validFor(self.object_format)) return error.InvalidBasis,
@@ -145,12 +145,82 @@ pub const Basis = struct {
         }
     }
 
-    fn beforeOid(self: Basis) ObjectId {
+    pub fn beforeOid(self: Basis) ObjectId {
         return switch (self.before) {
             .commit => |oid| oid,
             .empty_tree => canonicalEmptyTreeOid(self.object_format),
         };
     }
+
+    pub fn eql(self: Basis, other: Basis) bool {
+        if (self.object_format != other.object_format or !self.after.eql(&other.after)) return false;
+        return switch (self.before) {
+            .commit => |left| switch (other.before) {
+                .commit => |right| left.eql(&right),
+                .empty_tree => false,
+            },
+            .empty_tree => other.before == .empty_tree,
+        };
+    }
+};
+
+/// One explicit committed-diff policy shared by every projection.
+pub const DiffPolicy = struct {
+    rename_similarity_percent: u8,
+    rename_candidate_limit: u32,
+    detect_copies: bool,
+    allow_external_diff: bool,
+    use_textconv: bool,
+};
+
+pub const committed_diff_policy: DiffPolicy = .{
+    .rename_similarity_percent = 50,
+    .rename_candidate_limit = 1_000,
+    .detect_copies = false,
+    .allow_external_diff = false,
+    .use_textconv = false,
+};
+
+pub const DiffProjection = enum {
+    patch,
+    raw_z,
+    numstat_z,
+};
+
+/// Owned argv for one exact-basis projection. Dynamic arguments are owned so
+/// no slice points into a returned struct or caller-local Basis copy.
+pub const DiffCommand = struct {
+    argv: []const []const u8,
+    attr_source: []u8,
+    rename_similarity: []u8,
+    rename_limit: []u8,
+    before_oid: []u8,
+    after_oid: []u8,
+
+    pub fn deinit(self: *DiffCommand, allocator: std.mem.Allocator) void {
+        allocator.free(self.argv);
+        allocator.free(self.attr_source);
+        allocator.free(self.rename_similarity);
+        allocator.free(self.rename_limit);
+        allocator.free(self.before_oid);
+        allocator.free(self.after_oid);
+        self.* = undefined;
+    }
+};
+
+pub const BasisAdmissionFailure = enum {
+    invalid_basis,
+    repository_format_drift,
+    before_missing,
+    before_wrong_kind,
+    after_missing,
+    after_wrong_kind,
+    git_command_failed,
+};
+
+pub const BasisAdmissionResult = union(enum) {
+    admitted,
+    failure: BasisAdmissionFailure,
 };
 
 pub const Materialization = struct {
@@ -383,7 +453,7 @@ const MaterializationCapture = union(enum) {
     failure: MaterializationFailure,
 };
 
-fn canonicalEmptyTreeOid(format: ObjectFormat) ObjectId {
+pub fn canonicalEmptyTreeOid(format: ObjectFormat) ObjectId {
     const text = switch (format) {
         .sha1 => "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         .sha256 => "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
@@ -391,19 +461,73 @@ fn canonicalEmptyTreeOid(format: ObjectFormat) ObjectId {
     return ObjectId.parse(format, text) catch unreachable;
 }
 
-fn admitBasis(
+/// Build the exact command contract after admission. Projection-specific
+/// flags are the only variation; strict execution, attribute source, rename,
+/// copy, external-diff, and textconv semantics are shared.
+pub fn buildDiffCommand(
+    allocator: std.mem.Allocator,
+    basis: Basis,
+    projection: DiffProjection,
+) (std.mem.Allocator.Error || error{InvalidBasis})!DiffCommand {
+    try basis.validate();
+    const before = basis.beforeOid();
+    const attr_source = try std.fmt.allocPrint(allocator, "--attr-source={s}", .{basis.after.slice()});
+    errdefer allocator.free(attr_source);
+    const rename_similarity = try std.fmt.allocPrint(allocator, "--find-renames={d}%", .{committed_diff_policy.rename_similarity_percent});
+    errdefer allocator.free(rename_similarity);
+    const rename_limit = try std.fmt.allocPrint(allocator, "-l{d}", .{committed_diff_policy.rename_candidate_limit});
+    errdefer allocator.free(rename_limit);
+    const before_oid = try allocator.dupe(u8, before.slice());
+    errdefer allocator.free(before_oid);
+    const after_oid = try allocator.dupe(u8, basis.after.slice());
+    errdefer allocator.free(after_oid);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
+        strict_prefix[0],
+        strict_prefix[1],
+        strict_prefix[2],
+        strict_prefix[3],
+        attr_source,
+        "diff",
+        "--no-color",
+    });
+    if (!committed_diff_policy.allow_external_diff) try argv.append(allocator, "--no-ext-diff");
+    if (!committed_diff_policy.use_textconv) try argv.append(allocator, "--no-textconv");
+    try argv.appendSlice(allocator, &.{ "--no-renames", rename_similarity, rename_limit });
+    if (committed_diff_policy.detect_copies) try argv.append(allocator, "--find-copies");
+    switch (projection) {
+        .patch => try argv.appendSlice(allocator, &.{ "--src-prefix=a/", "--dst-prefix=b/" }),
+        .raw_z => try argv.appendSlice(allocator, &.{ "--raw", "--no-abbrev", "-z" }),
+        .numstat_z => try argv.appendSlice(allocator, &.{ "--numstat", "-z" }),
+    }
+    try argv.appendSlice(allocator, &.{ before_oid, after_oid });
+
+    return .{
+        .argv = try argv.toOwnedSlice(allocator),
+        .attr_source = attr_source,
+        .rename_similarity = rename_similarity,
+        .rename_limit = rename_limit,
+        .before_oid = before_oid,
+        .after_oid = after_oid,
+    };
+}
+
+pub fn admitBasis(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: git_command.DirectoryContext,
     basis: Basis,
-) std.mem.Allocator.Error!bool {
-    basis.validate() catch return false;
+) std.mem.Allocator.Error!BasisAdmissionResult {
+    basis.validate() catch return .{ .failure = .invalid_basis };
     const format_result = try readObjectFormat(allocator, io, context);
     const repository_format = switch (format_result) {
         .format => |value| value,
-        .invalid_repository, .unsupported, .failed => return false,
+        .unsupported => return .{ .failure = .repository_format_drift },
+        .invalid_repository, .failed => return .{ .failure = .git_command_failed },
     };
-    if (repository_format != basis.object_format) return false;
+    if (repository_format != basis.object_format) return .{ .failure = .repository_format_drift };
 
     const before_oid = basis.beforeOid();
     const stdin = try std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{
@@ -429,17 +553,17 @@ fn admitBasis(
     defer result.deinit(allocator);
     const completed = switch (result) {
         .completed => |value| value,
-        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return false,
+        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return .{ .failure = .git_command_failed },
     };
-    if (!termExited(completed.term, 0)) return false;
-    return validBasisObjectRecords(basis, before_oid, completed.stdout);
+    if (!termExited(completed.term, 0)) return .{ .failure = .git_command_failed };
+    return classifyBasisObjectRecords(basis, before_oid, completed.stdout);
 }
 
-fn validBasisObjectRecords(
+fn classifyBasisObjectRecords(
     basis: Basis,
     before_oid: ObjectId,
     stdout: []const u8,
-) bool {
+) BasisAdmissionResult {
     var lines = std.mem.splitScalar(u8, stdout, '\n');
     const expected_oids = [_]*const ObjectId{ &before_oid, &basis.after };
     const before_kind: []const u8 = switch (basis.before) {
@@ -447,15 +571,20 @@ fn validBasisObjectRecords(
         .empty_tree => "tree",
     };
     const expected_kinds = [_][]const u8{ before_kind, "commit" };
-    for (expected_oids, expected_kinds) |oid, kind| {
-        const line = lines.next() orelse return false;
-        if (line.len != oid.slice().len + 1 + kind.len or
+    const missing_failures = [_]BasisAdmissionFailure{ .before_missing, .after_missing };
+    const wrong_kind_failures = [_]BasisAdmissionFailure{ .before_wrong_kind, .after_wrong_kind };
+    for (expected_oids, expected_kinds, missing_failures, wrong_kind_failures) |oid, kind, missing, wrong_kind| {
+        const line = lines.next() orelse return .{ .failure = .git_command_failed };
+        if (line.len <= oid.slice().len or
             !std.mem.eql(u8, line[0..oid.slice().len], oid.slice()) or
-            line[oid.slice().len] != ' ' or
-            !std.mem.eql(u8, line[oid.slice().len + 1 ..], kind)) return false;
+            line[oid.slice().len] != ' ') return .{ .failure = .git_command_failed };
+        const actual = line[oid.slice().len + 1 ..];
+        if (std.mem.eql(u8, actual, "missing")) return .{ .failure = missing };
+        if (!std.mem.eql(u8, actual, kind)) return .{ .failure = wrong_kind };
     }
-    const terminal = lines.next() orelse return false;
-    return terminal.len == 0 and lines.next() == null;
+    const terminal = lines.next() orelse return .{ .failure = .git_command_failed };
+    if (terminal.len != 0 or lines.next() != null) return .{ .failure = .git_command_failed };
+    return .admitted;
 }
 
 fn captureBasis(
@@ -464,32 +593,15 @@ fn captureBasis(
     context: git_command.DirectoryContext,
     basis: Basis,
 ) std.mem.Allocator.Error!MaterializationCapture {
-    if (!try admitBasis(allocator, io, context, basis))
+    if (try admitBasis(allocator, io, context, basis) != .admitted)
         return .{ .failure = .projection_git_command_failed };
-    const before_oid = basis.beforeOid();
-    const attr_source = try std.fmt.allocPrint(allocator, "--attr-source={s}", .{basis.after.slice()});
-    defer allocator.free(attr_source);
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{
-        strict_prefix[0],
-        strict_prefix[1],
-        strict_prefix[2],
-        strict_prefix[3],
-        attr_source,
-        "diff",
-    });
-    try argv.appendSlice(allocator, &.{
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        before_oid.slice(),
-        basis.after.slice(),
-    });
+    var command = buildDiffCommand(allocator, basis, .patch) catch |err| switch (err) {
+        error.InvalidBasis => return .{ .failure = .projection_git_command_failed },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer command.deinit(allocator);
     var result = try git_command.runCapturedBounded(allocator, io, context, .{
-        .argv = argv.items,
+        .argv = command.argv,
         .stdout_limit = .limited(max_patch_bytes),
         .stderr_limit = .limited(stderr_capture_bytes),
     });
@@ -1053,6 +1165,33 @@ fn testGitOutput(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
     return result.stdout;
 }
 
+fn testDiffProjectionOutput(io: std.Io, cwd: std.Io.Dir, basis: Basis, projection: DiffProjection) ![]u8 {
+    var command = try buildDiffCommand(std.testing.allocator, basis, projection);
+    defer command.deinit(std.testing.allocator);
+    return testGitOutput(io, cwd, command.argv);
+}
+
+fn expectHistoryPreviewRenamePolicyOutput(io: std.Io, cwd: std.Io.Dir, basis: Basis) !void {
+    const patch = try testDiffProjectionOutput(io, cwd, basis, .patch);
+    defer std.testing.allocator.free(patch);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "similarity index 100%\nrename from rename-old.txt\nrename to rename-new.txt\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "diff --git a/copy-new.txt b/copy-new.txt\nnew file mode ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "copy from ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "copy to ") == null);
+
+    const raw = try testDiffProjectionOutput(io, cwd, basis, .raw_z);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, " R100\x00rename-old.txt\x00rename-new.txt\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, " A\x00copy-new.txt\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, " C") == null);
+
+    const numstat = try testDiffProjectionOutput(io, cwd, basis, .numstat_z);
+    defer std.testing.allocator.free(numstat);
+    try std.testing.expect(std.mem.indexOf(u8, numstat, "0\t0\t\x00rename-old.txt\x00rename-new.txt\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, numstat, "1\t0\tcopy-new.txt\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, numstat, "\x00copy-source.txt\x00copy-new.txt\x00") == null);
+}
+
 fn testOutputLine(bytes: []const u8) ![]const u8 {
     return singleLfLine(bytes) orelse error.ExpectedSingleLine;
 }
@@ -1064,17 +1203,56 @@ fn expectTarget(result: TargetResolutionResult) !Target {
     };
 }
 
-fn testRawPatch(io: std.Io, cwd: std.Io.Dir, target: Target) ![]u8 {
-    const attr_source = try std.fmt.allocPrint(std.testing.allocator, "--attr-source={s}", .{target.head_oid.slice()});
-    defer std.testing.allocator.free(attr_source);
-    const argv = [_][]const u8{
-        strict_prefix[0],        strict_prefix[1],  strict_prefix[2],  strict_prefix[3],
-        attr_source,             "diff",            "--no-color",      "--no-ext-diff",
-        "--no-textconv",         "--src-prefix=a/", "--dst-prefix=b/", target.diff_base_oid.slice(),
-        target.head_oid.slice(),
+fn expectAdmitted(result: BasisAdmissionResult) !void {
+    switch (result) {
+        .admitted => {},
+        .failure => return error.ExpectedAdmittedBasis,
+    }
+}
+
+fn expectAdmissionFailure(result: BasisAdmissionResult, expected: BasisAdmissionFailure) !void {
+    switch (result) {
+        .admitted => return error.ExpectedBasisAdmissionFailure,
+        .failure => |actual| try std.testing.expectEqual(expected, actual),
+    }
+}
+
+fn expectCommandPrefix(command: DiffCommand, basis: Basis) !void {
+    const expected = [_][]const u8{
+        "git",
+        "--no-replace-objects",
+        "--no-lazy-fetch",
+        "--no-optional-locks",
+        command.attr_source,
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        command.rename_similarity,
+        command.rename_limit,
     };
+    try std.testing.expect(command.argv.len >= expected.len + 2);
+    for (expected, command.argv[0..expected.len]) |want, actual| {
+        try std.testing.expectEqualStrings(want, actual);
+    }
+    try std.testing.expectEqualStrings("--attr-source=2222222222222222222222222222222222222222", command.attr_source);
+    try std.testing.expectEqualStrings("--find-renames=50%", command.rename_similarity);
+    try std.testing.expectEqualStrings("-l1000", command.rename_limit);
+    try std.testing.expectEqualStrings(basis.beforeOid().slice(), command.argv[command.argv.len - 2]);
+    try std.testing.expectEqualStrings(basis.after.slice(), command.argv[command.argv.len - 1]);
+}
+
+fn testRawPatch(io: std.Io, cwd: std.Io.Dir, target: Target) ![]u8 {
+    const basis: Basis = .{
+        .object_format = target.object_format,
+        .before = .{ .commit = target.diff_base_oid },
+        .after = target.head_oid,
+    };
+    var command = try buildDiffCommand(std.testing.allocator, basis, .patch);
+    defer command.deinit(std.testing.allocator);
     const result = try std.process.run(std.testing.allocator, io, .{
-        .argv = &argv,
+        .argv = command.argv,
         .cwd = .{ .dir = cwd },
         .stdout_limit = .limited(max_patch_bytes + 2 * 1024 * 1024),
         .stderr_limit = .limited(stderr_capture_bytes),
@@ -1179,6 +1357,163 @@ test "object IDs and targets enforce format width lowercase and four-field equal
     invalid.head_oid.bytes[0] = 'A';
     try std.testing.expectError(error.InvalidTarget, invalid.validate());
     try std.testing.expect(!target.eql(&invalid));
+}
+
+test "History preview diff projections share one exact committed policy" {
+    const before = try ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const after = try ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const basis: Basis = .{
+        .object_format = .sha1,
+        .before = .{ .commit = before },
+        .after = after,
+    };
+    try std.testing.expectEqual(@as(u8, 50), committed_diff_policy.rename_similarity_percent);
+    try std.testing.expectEqual(@as(u32, 1_000), committed_diff_policy.rename_candidate_limit);
+    try std.testing.expect(!committed_diff_policy.detect_copies);
+    try std.testing.expect(!committed_diff_policy.allow_external_diff);
+    try std.testing.expect(!committed_diff_policy.use_textconv);
+
+    var patch = try buildDiffCommand(std.testing.allocator, basis, .patch);
+    defer patch.deinit(std.testing.allocator);
+    try expectCommandPrefix(patch, basis);
+    try std.testing.expectEqualSlices([]const u8, &.{ "--src-prefix=a/", "--dst-prefix=b/" }, patch.argv[12 .. patch.argv.len - 2]);
+
+    var raw = try buildDiffCommand(std.testing.allocator, basis, .raw_z);
+    defer raw.deinit(std.testing.allocator);
+    try expectCommandPrefix(raw, basis);
+    try std.testing.expectEqualSlices([]const u8, &.{ "--raw", "--no-abbrev", "-z" }, raw.argv[12 .. raw.argv.len - 2]);
+
+    var numstat = try buildDiffCommand(std.testing.allocator, basis, .numstat_z);
+    defer numstat.deinit(std.testing.allocator);
+    try expectCommandPrefix(numstat, basis);
+    try std.testing.expectEqualSlices([]const u8, &.{ "--numstat", "-z" }, numstat.argv[12 .. numstat.argv.len - 2]);
+}
+
+test "History preview real Git projections override ambient rename and copy settings" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try runTestGit(io, tmp.dir, &.{ "git", "init", "--initial-branch=main" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "rename-old.txt", .data = "rename content\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "copy-source.txt", .data = "copy candidate\n" });
+    try runTestGit(io, tmp.dir, &.{ "git", "add", "rename-old.txt", "copy-source.txt" });
+    try runTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+
+    const before_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD" });
+    defer std.testing.allocator.free(before_output);
+    const before = try ObjectId.parse(.sha1, try testOutputLine(before_output));
+
+    try runTestGit(io, tmp.dir, &.{ "git", "mv", "rename-old.txt", "rename-new.txt" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "copy-source.txt", .data = "copy candidate\nmodified\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "copy-new.txt", .data = "copy candidate\n" });
+    try runTestGit(io, tmp.dir, &.{ "git", "add", "--all" });
+    try runTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "rename and copy candidate" });
+
+    const after_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD" });
+    defer std.testing.allocator.free(after_output);
+    const after = try ObjectId.parse(.sha1, try testOutputLine(after_output));
+    const basis: Basis = .{
+        .object_format = .sha1,
+        .before = .{ .commit = before },
+        .after = after,
+    };
+
+    const explicit_copy = try testGitOutput(io, tmp.dir, &.{
+        "git", "diff", "--find-copies", "--raw", "--no-abbrev", "-z", before.slice(), after.slice(),
+    });
+    defer std.testing.allocator.free(explicit_copy);
+    try std.testing.expect(std.mem.indexOf(u8, explicit_copy, " C100\x00copy-source.txt\x00copy-new.txt\x00") != null);
+
+    try runTestGit(io, tmp.dir, &.{ "git", "config", "diff.renames", "false" });
+    try expectHistoryPreviewRenamePolicyOutput(io, tmp.dir, basis);
+
+    try runTestGit(io, tmp.dir, &.{ "git", "config", "diff.renames", "copies" });
+    try expectHistoryPreviewRenamePolicyOutput(io, tmp.dir, basis);
+}
+
+test "History preview Basis admission distinguishes exact endpoint terminals" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try runTestGit(io, tmp.dir, &.{ "git", "init", "--initial-branch=main" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "file", .data = "content\n" });
+    try runTestGit(io, tmp.dir, &.{ "git", "add", "file" });
+    try runTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+
+    const commit_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD" });
+    defer std.testing.allocator.free(commit_output);
+    const commit_oid = try ObjectId.parse(.sha1, try testOutputLine(commit_output));
+    const tree_output = try testGitOutput(io, tmp.dir, &.{ "git", "rev-parse", "HEAD^{tree}" });
+    defer std.testing.allocator.free(tree_output);
+    const tree_oid = try ObjectId.parse(.sha1, try testOutputLine(tree_output));
+    const missing_oid = try ObjectId.parse(.sha1, "0000000000000000000000000000000000000000");
+    const sha256_missing = try ObjectId.parse(.sha256, "0000000000000000000000000000000000000000000000000000000000000000");
+
+    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
+    defer environment.deinit();
+    const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+
+    try expectAdmitted(try admitBasis(std.testing.allocator, io, context, .{
+        .object_format = .sha1,
+        .before = .{ .commit = commit_oid },
+        .after = commit_oid,
+    }));
+    try expectAdmitted(try admitBasis(std.testing.allocator, io, context, .{
+        .object_format = .sha1,
+        .before = .empty_tree,
+        .after = commit_oid,
+    }));
+    try expectAdmissionFailure(try admitBasis(std.testing.allocator, io, context, .{
+        .object_format = .sha1,
+        .before = .{ .commit = missing_oid },
+        .after = commit_oid,
+    }), .before_missing);
+    try expectAdmissionFailure(try admitBasis(std.testing.allocator, io, context, .{
+        .object_format = .sha1,
+        .before = .{ .commit = tree_oid },
+        .after = commit_oid,
+    }), .before_wrong_kind);
+    try expectAdmissionFailure(try admitBasis(std.testing.allocator, io, context, .{
+        .object_format = .sha1,
+        .before = .{ .commit = commit_oid },
+        .after = missing_oid,
+    }), .after_missing);
+    try expectAdmissionFailure(try admitBasis(std.testing.allocator, io, context, .{
+        .object_format = .sha1,
+        .before = .{ .commit = commit_oid },
+        .after = tree_oid,
+    }), .after_wrong_kind);
+    try expectAdmissionFailure(try admitBasis(std.testing.allocator, io, context, .{
+        .object_format = .sha256,
+        .before = .{ .commit = sha256_missing },
+        .after = sha256_missing,
+    }), .repository_format_drift);
+
+    var non_repository = std.testing.tmpDir(.{});
+    defer non_repository.cleanup();
+    try non_repository.dir.writeFile(io, .{
+        .sub_path = ".git",
+        .data = "gitdir: /definitely/missing-history-preview-repository\n",
+    });
+    const non_repository_context: git_command.DirectoryContext = .{
+        .cwd = non_repository.dir,
+        .environment = &environment,
+    };
+    try expectAdmissionFailure(try admitBasis(std.testing.allocator, io, non_repository_context, .{
+        .object_format = .sha1,
+        .before = .{ .commit = commit_oid },
+        .after = commit_oid,
+    }), .git_command_failed);
+
+    var invalid = commit_oid;
+    invalid.len = 1;
+    try expectAdmissionFailure(try admitBasis(std.testing.allocator, io, context, .{
+        .object_format = .sha1,
+        .before = .{ .commit = commit_oid },
+        .after = invalid,
+    }), .invalid_basis);
 }
 
 test "Compare target resolution ahead count and History basis share exact patch bytes" {
@@ -1632,11 +1967,13 @@ test "SHA-256 root basis materializes when Git supports the object format" {
     }));
     try std.testing.expectEqual(ObjectFormat.sha256, target.object_format);
     try std.testing.expectEqual(@as(u8, 64), target.head_oid.len);
-    var root = try materializeBasis(std.testing.allocator, io, context, .{
+    const root_basis: Basis = .{
         .object_format = .sha256,
         .before = .empty_tree,
         .after = target.head_oid,
-    });
+    };
+    try expectAdmitted(try admitBasis(std.testing.allocator, io, context, root_basis));
+    var root = try materializeBasis(std.testing.allocator, io, context, root_basis);
     defer root.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, root.materialization.patch_bytes, "+sha256") != null);
 }

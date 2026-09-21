@@ -109,6 +109,7 @@ test {
     _ = @import("git/commit_diff.zig");
     _ = @import("git/compare.zig");
     _ = @import("git/history.zig");
+    _ = @import("git/history_preview.zig");
     _ = @import("git/operations.zig");
     _ = @import("git/read.zig");
     _ = @import("git/refs.zig");

@@ -4,6 +4,7 @@ const context = @import("context.zig");
 const diff_file = @import("diff/file.zig");
 const diff_parser = @import("diff/parser.zig");
 const git_status = @import("git/status.zig");
+const path_order = @import("path_key.zig");
 
 pub const CollapsedSet = std.StringHashMapUnmanaged(void);
 
@@ -384,8 +385,16 @@ fn appendSortedNodeRange(
 fn nodeSpanLessThan(source: []const Node, lhs: NodeSpan, rhs: NodeSpan) bool {
     const lhs_node = source[lhs.start];
     const rhs_node = source[rhs.start];
-    if (lhs_node.kind != rhs_node.kind) return lhs_node.kind == .directory;
-    if (!std.mem.eql(u8, lhs_node.name, rhs_node.name)) return std.mem.lessThan(u8, lhs_node.name, rhs_node.name);
+    switch (path_order.displaySiblingOrder(
+        lhs_node.kind == .directory,
+        lhs_node.name,
+        rhs_node.kind == .directory,
+        rhs_node.name,
+    )) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
     return std.mem.lessThan(u8, lhs_node.path, rhs_node.path);
 }
 
@@ -754,6 +763,65 @@ test "build sorts sibling directories before files" {
     try std.testing.expectEqualStrings("src/main.zig", tree.nodes[3].path);
     try std.testing.expectEqualStrings("a.zig", tree.nodes[4].path);
     try std.testing.expectEqualStrings("b.zig", tree.nodes[5].path);
+}
+
+test "History preview flat path order matches file tree file-node traversal" {
+    const text =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/src/z.zig b/src/z.zig
+        \\--- a/src/z.zig
+        \\+++ b/src/z.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/src/lib/root.zig b/src/lib/root.zig
+        \\--- a/src/lib/root.zig
+        \\+++ b/src/lib/root.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/src/a.zig b/src/a.zig
+        \\--- a/src/a.zig
+        \\+++ b/src/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/docs/readme.md b/docs/readme.md
+        \\--- a/docs/readme.md
+        \\+++ b/docs/readme.md
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const document = try diff_parser.parse(allocator, text);
+    const tree = try build(allocator, document);
+
+    var flat = [_][]const u8{
+        "a.zig",
+        "src/z.zig",
+        "src/lib/root.zig",
+        "src/a.zig",
+        "docs/readme.md",
+    };
+    std.mem.sort([]const u8, &flat, {}, path_order.displayPathLessThan);
+
+    var flat_index: usize = 0;
+    for (tree.nodes) |node| {
+        if (node.kind != .file) continue;
+        try std.testing.expect(flat_index < flat.len);
+        try std.testing.expectEqualStrings(node.path_key, flat[flat_index]);
+        flat_index += 1;
+    }
+    try std.testing.expectEqual(flat.len, flat_index);
 }
 
 test "buildWithStatus adds untracked status-only rows" {
