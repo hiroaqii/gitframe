@@ -252,15 +252,17 @@ pub const MaterializationResult = union(enum) {
 };
 
 const max_patch_bytes: usize = 16 * 1024 * 1024;
-const stderr_capture_bytes: usize = 8 * 1024;
+const stderr_capture_bytes: usize = 16 * 1024;
 const oid_record_slack: usize = 2;
 
-const strict_prefix = [_][]const u8{
+/// Shared process prefix for pinned, non-mutating object reads.
+pub const strict_command_prefix = [_][]const u8{
     "git",
     "--no-replace-objects",
     "--no-lazy-fetch",
     "--no-optional-locks",
 };
+const strict_prefix = strict_command_prefix;
 
 const EndpointSide = enum { base, head };
 
@@ -553,7 +555,11 @@ pub fn admitBasis(
     defer result.deinit(allocator);
     const completed = switch (result) {
         .completed => |value| value,
-        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return .{ .failure = .git_command_failed },
+        .stdout_limit_exceeded, .stderr_limit_exceeded => return .{ .failure = .git_command_failed },
+        .failed => |failure| {
+            if (failure.toError() == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failure = .git_command_failed };
+        },
     };
     if (!termExited(completed.term, 0)) return .{ .failure = .git_command_failed };
     return classifyBasisObjectRecords(basis, before_oid, completed.stdout);
@@ -646,7 +652,11 @@ fn readObjectFormat(
     defer result.deinit(allocator);
     const completed = switch (result) {
         .completed => |value| value,
-        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return .failed,
+        .stdout_limit_exceeded, .stderr_limit_exceeded => return .failed,
+        .failed => |failure| {
+            if (failure.toError() == error.OutOfMemory) return error.OutOfMemory;
+            return .failed;
+        },
     };
     if (!termExited(completed.term, 0)) {
         return if (try strictPrefixSupported(allocator, io, context)) .invalid_repository else .failed;
@@ -673,7 +683,11 @@ fn strictPrefixSupported(
     defer result.deinit(allocator);
     return switch (result) {
         .completed => |value| termExited(value.term, 0),
-        else => false,
+        .failed => |failure| if (failure.toError() == error.OutOfMemory)
+            error.OutOfMemory
+        else
+            false,
+        .stdout_limit_exceeded, .stderr_limit_exceeded => false,
     };
 }
 
