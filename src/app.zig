@@ -1089,6 +1089,12 @@ pub const App = struct {
                     if (try self.historyCoordinator().finishDiff(ctx.allocator(), &result) == .discarded)
                         self.redraw_plan.requestSkip();
                 },
+                .preview => |result_value| {
+                    var result = result_value;
+                    defer result.deinit(ctx.allocator());
+                    if (try self.historyCoordinator().finishPreview(ctx, &result) == .discarded)
+                        self.redraw_plan.requestSkip();
+                },
             },
             .compare => |compare_result| switch (compare_result) {
                 .source => |result| {

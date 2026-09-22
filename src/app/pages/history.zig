@@ -12,6 +12,7 @@ const root_capability = @import("../../repo/root_capability.zig");
 const committed_diff = @import("committed_diff.zig");
 const catalog = @import("history/catalog.zig");
 const input = @import("history/input.zig");
+pub const preview = @import("history/preview.zig");
 const selection = @import("history/selection.zig");
 const git_history = @import("../../git/history.zig");
 
@@ -204,6 +205,7 @@ pub const HistoryPageState = struct {
     render_now_unix: ?i64 = null,
     current_view: CurrentView = .picker,
     accepted: ?AcceptedSelection = null,
+    preview_state: preview.State = .{},
     diff: committed_diff.State = .{},
     status: app_state.StatusMessage = .{},
     detail: CommitDetail = .closed,
@@ -214,12 +216,14 @@ pub const HistoryPageState = struct {
         self.catalog.deinit(allocator);
         if (self.observed_context) |*snapshot| snapshot.deinit(allocator);
         if (self.accepted) |*accepted| accepted.deinit(allocator);
+        self.preview_state.deinit(allocator);
         self.diff.deinit(allocator);
         self.* = .{};
     }
 
     pub fn activate(self: *HistoryPageState, allocator: std.mem.Allocator, repo_epoch: u64, identity: ?root_capability.Identity) void {
         self.clearDetail(allocator);
+        self.preview_state.invalidate(allocator);
         self.pending = null;
         self.needs_probe = null;
         self.needs_initial = false;
@@ -269,6 +273,7 @@ pub const HistoryPageState = struct {
 
     pub fn deactivate(self: *HistoryPageState) void {
         std.debug.assert(!self.detailOpen());
+        self.preview_state.deactivate();
         self.diff.selection_owner = .none;
         self.activation.deactivate();
         self.pending = null;
@@ -285,6 +290,7 @@ pub const HistoryPageState = struct {
         identity: ?root_capability.Identity,
     ) void {
         self.clearDetail(allocator);
+        self.preview_state.invalidate(allocator);
         self.catalog.clear(allocator);
         self.clearObservedContext(allocator);
         self.catalog_hidden = false;
@@ -309,6 +315,7 @@ pub const HistoryPageState = struct {
             self.status.set("Cancel range selection before reloading", .{});
             return;
         }
+        self.preview_state.invalidate(allocator);
         self.pending = null;
         self.needs_probe = null;
         self.needs_initial = false;
@@ -476,7 +483,10 @@ pub const HistoryPageState = struct {
                 switch (pending.request) {
                     .probe => |reason| return self.applyProbe(allocator, reason, page),
                     .initial => |policy| try self.applyInitial(allocator, policy, page, finished.render_now_unix),
-                    .continuation => try self.catalog.append(allocator, page),
+                    .continuation => {
+                        try self.catalog.append(allocator, page);
+                        self.preview_state.catalogPublished(allocator);
+                    },
                 }
                 if (std.meta.activeTag(pending.request) == .continuation) {
                     self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
@@ -625,6 +635,42 @@ pub const HistoryPageState = struct {
             self.draft.anchor(),
             self.catalog.cursor,
         );
+    }
+
+    /// S3 lifecycle entry point. Live cursor/input wiring remains in S6.
+    pub fn queueCurrentPreview(self: *HistoryPageState, allocator: std.mem.Allocator) ?preview.QueueOutcome {
+        const page_identity = self.activation.currentIdentity() orelse {
+            self.preview_state.clearSelection(allocator);
+            return null;
+        };
+        const root = self.root_identity orelse {
+            self.preview_state.clearSelection(allocator);
+            return null;
+        };
+        const request = switch (self.selectionRequest()) {
+            .request => |value| value,
+            .unavailable => {
+                self.preview_state.clearSelection(allocator);
+                return null;
+            },
+        };
+        const selected_index = switch (request.intent) {
+            .single => |single| single.index,
+            .range => |range| range.newest_index,
+        };
+        if (selected_index >= self.catalog.records.items.len) {
+            self.preview_state.clearSelection(allocator);
+            return null;
+        }
+        return self.preview_state.queue(allocator, .{
+            .page = page_identity,
+            .root = root,
+            .catalog_instance = self.preview_state.catalog_instance,
+            .selection = preview.summaryForRequest(
+                request,
+                self.catalog.records.items[selected_index].parent_count,
+            ),
+        }, request);
     }
 
     pub fn inputContext(self: *const HistoryPageState, effective: @import("keymap").Effective) input.Context {
@@ -833,6 +879,7 @@ pub const HistoryPageState = struct {
         }
 
         const same_branch_context = if (current) |snapshot| sameBranchContext(snapshot.display, incoming.display) else false;
+        self.preview_state.invalidate(allocator);
         self.clearObservedContext(allocator);
         self.observed_context = page.takeSnapshot();
         self.needs_initial = true;
@@ -873,6 +920,7 @@ pub const HistoryPageState = struct {
         };
 
         try self.catalog.replace(allocator, page);
+        self.preview_state.catalogPublished(allocator);
         self.draft = .single;
         const restored = if (restore) |value| self.restorePicker(value) else false;
         if (policy != .reset and !restored) {
@@ -1033,6 +1081,49 @@ fn selectionMatchesCatalog(
     };
 }
 
+test "History preview lifecycle stays independent of catalog and diff pending" {
+    const allocator = std.testing.allocator;
+    const page_identity = app_page.RequestIdentity.history(3, 5);
+    const root_identity: root_capability.Identity = .{ .device = 7, .inode = 11 };
+    const selected = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const request: git_history.SelectionRequest = .{
+        .snapshot_head = selected,
+        .intent = .{ .single = .{ .index = 0, .oid = selected } },
+        .basis = .{ .object_format = .sha1, .before = .empty_tree, .after = selected },
+    };
+    var state: HistoryPageState = .{};
+    defer state.deinit(allocator);
+    state.pending = .{ .catalog = .{
+        .identity = page_identity,
+        .root_identity = root_identity,
+        .generation = 13,
+        .request = .{ .probe = .reload },
+    } };
+    const catalog_pending = state.pending.?;
+    try std.testing.expectEqual(preview.QueueOutcome.start_debounce, state.preview_state.queue(allocator, .{
+        .page = page_identity,
+        .root = root_identity,
+        .catalog_instance = 17,
+        .selection = preview.summaryForRequest(request, 0),
+    }, request));
+    try std.testing.expect(std.meta.eql(catalog_pending, state.pending.?));
+
+    const stamp = state.preview_state.reserveDebounce().?;
+    state.preview_state.armDebounce(stamp);
+    state.pending = .{ .diff = .{
+        .identity = page_identity,
+        .root_identity = root_identity,
+        .generation = 19,
+        .request = request,
+    } };
+    const diff_pending = state.pending.?;
+    try std.testing.expectEqual(
+        preview.DebounceOutcome.settled,
+        state.preview_state.finishDebounce(stamp, .{ .failed = .task_start }),
+    );
+    try std.testing.expect(std.meta.eql(diff_pending, state.pending.?));
+}
+
 test "History completion adopts only an admitted initial presentation clock" {
     const allocator = std.testing.allocator;
     const identity = app_page.RequestIdentity.history(9, 4);
@@ -1077,6 +1168,7 @@ test "History completion adopts only an admitted initial presentation clock" {
         try state.applyFinished(allocator, identity, root_identity, &initial),
     );
     try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
+    try std.testing.expectEqual(@as(u64, 1), state.preview_state.catalog_instance);
 
     state.armCatalog(.{
         .identity = identity,
@@ -1099,6 +1191,7 @@ test "History completion adopts only an admitted initial presentation clock" {
         try state.applyFinished(allocator, identity, root_identity, &continuation),
     );
     try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
+    try std.testing.expectEqual(@as(u64, 2), state.preview_state.catalog_instance);
 
     state.armCatalog(.{
         .identity = identity,
@@ -1116,6 +1209,7 @@ test "History completion adopts only an admitted initial presentation clock" {
     };
     try std.testing.expectEqual(ApplyOutcome.failed, try state.applyFinished(allocator, identity, root_identity, &failed));
     try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
+    try std.testing.expectEqual(@as(u64, 2), state.preview_state.catalog_instance);
 
     state.armCatalog(.{
         .identity = identity,

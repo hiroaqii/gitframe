@@ -21,6 +21,7 @@ const git_command = @import("../git/command.zig");
 const commit_diff = @import("../git/commit_diff.zig");
 const git_compare = @import("../git/compare.zig");
 const git_history = @import("../git/history.zig");
+const git_history_preview = @import("../git/history_preview.zig");
 const git_read = @import("../git/read.zig");
 const git_refs = @import("../git/refs.zig");
 const git_branch_status = @import("../git/branch_status.zig");
@@ -34,6 +35,7 @@ const repo_discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const selected_document = @import("../repository/document.zig");
 const repository_source = @import("../repository/source.zig");
+const history_preview = @import("pages/history/preview.zig");
 const source_syntax = @import("../syntax/source.zig");
 const source_syntax_runtime = @import("../syntax/source_runtime.zig");
 const syntax_provider = @import("../syntax/provider_runtime.zig");
@@ -274,9 +276,38 @@ pub const HistoryDiffFinished = struct {
     }
 };
 
+pub const HistoryPreviewDebounceFinished = struct {
+    stamp: history_preview.DebounceStamp,
+    result: history_preview.DebounceResult,
+};
+
+pub const HistoryPreviewReadFinished = struct {
+    key: history_preview.RequestKey,
+    result: git_history_preview.PreviewReadResult,
+
+    pub fn deinit(self: *HistoryPreviewReadFinished, allocator: std.mem.Allocator) void {
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const HistoryPreviewFinished = union(enum) {
+    debounce: HistoryPreviewDebounceFinished,
+    read: HistoryPreviewReadFinished,
+
+    pub fn deinit(self: *HistoryPreviewFinished, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .debounce => {},
+            .read => |*finished| finished.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const HistoryReadFinished = union(enum) {
     catalog: HistoryCatalogFinished,
     diff: HistoryDiffFinished,
+    preview: HistoryPreviewFinished,
 
     pub fn deinit(self: *HistoryReadFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -1113,6 +1144,111 @@ pub fn HistoryDiffTask(comptime Msg: type) type {
                 .result = result,
             } } });
         }
+    };
+}
+
+/// Finite coalescing worker. Its context is one plain stamp: it owns neither
+/// repository authority nor a selection request.
+pub fn HistoryPreviewDebounceTask(comptime Msg: type) type {
+    return struct {
+        stamp: history_preview.DebounceStamp,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            io.sleep(.fromMilliseconds(75), .awake) catch
+                return task.finish(allocator, .{ .failed = .runtime_abandoned });
+            return task.finish(allocator, .elapsed);
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed = historyPreviewTaskFailure(failure) });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: history_preview.DebounceResult) Msg {
+            defer task.destroy(allocator);
+            return Msg.loadFinished(.{ .history = .{ .preview = .{ .debounce = .{
+                .stamp = task.stamp,
+                .result = result,
+            } } } });
+        }
+    };
+}
+
+/// One exact History preview read. Key and request are inline; the duplicated
+/// root plus the command boundary's sanitized environment are its only owned
+/// execution inputs.
+pub fn HistoryPreviewReadTask(comptime Msg: type) type {
+    return struct {
+        key: history_preview.RequestKey,
+        request: git_history.SelectionRequest,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn init(
+            key: history_preview.RequestKey,
+            request: git_history.SelectionRequest,
+            root: *const root_capability.RootCapability,
+            env_map: ?*const std.process.Environ.Map,
+            allocator: std.mem.Allocator,
+        ) !@This() {
+            std.debug.assert(key.identity.root.eql(root.identity));
+            var owned_root = try root.duplicate();
+            errdefer owned_root.deinit();
+            var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, env_map);
+            errdefer environment.deinit();
+            return .{
+                .key = key,
+                .request = request,
+                .root = owned_root,
+                .environment = environment,
+            };
+        }
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, git_history_preview.readPreview(
+                allocator,
+                io,
+                .{
+                    .cwd = task.root.dir(),
+                    .environment = &task.environment,
+                },
+                task.request,
+            ));
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .rejected = .{
+                .failed = historyPreviewTaskFailure(failure),
+            } });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_history_preview.PreviewReadResult) Msg {
+            defer task.destroy(allocator);
+            return Msg.loadFinished(.{ .history = .{ .preview = .{ .read = .{
+                .key = task.key,
+                .result = result,
+            } } } });
+        }
+    };
+}
+
+fn historyPreviewTaskFailure(failure: chasen.TaskFailure) git_history_preview.FailureReason {
+    return switch (failure) {
+        .start_failed => .task_start,
+        .runtime_abandoned => .runtime_abandoned,
     };
 }
 
@@ -4319,4 +4455,72 @@ test "GeneratedSyntaxTask rereads pinned matching source and retains read epoch"
     try std.testing.expect(finished.request.read_epoch.eql(.{ .value = 59 }));
     try std.testing.expect(finished.snapshot_fingerprint.?.eql(.init(content)));
     try std.testing.expect(finished.result == .loaded);
+}
+
+test "History preview reader failure releases its duplicated root and stays undeliverable" {
+    const TestLoadMsg = ReadFinished;
+    const TestMsg = union(enum) {
+        load: TestLoadMsg,
+
+        pub fn loadFinished(msg: TestLoadMsg) @This() {
+            return .{ .load = msg };
+        }
+    };
+    const Task = HistoryPreviewReadTask(TestMsg);
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root_path);
+    var root = try root_capability.RootCapability.openCanonical(root_path);
+    defer root.deinit();
+
+    const selected = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const request: git_history.SelectionRequest = .{
+        .snapshot_head = selected,
+        .intent = .{ .single = .{ .index = 0, .oid = selected } },
+        .basis = .{ .object_format = .sha1, .before = .empty_tree, .after = selected },
+    };
+    const key: history_preview.RequestKey = .{
+        .identity = .{
+            .page = page.RequestIdentity.history(3, 5),
+            .root = root.identity,
+            .catalog_instance = 7,
+            .selection = .{ .single = .{
+                .selected_oid = selected,
+                .parent_count = 0,
+                .basis = request.basis,
+            } },
+        },
+        .generation = 11,
+    };
+    const task = try allocator.create(Task);
+    task.* = try Task.init(key, request, &root, null, allocator);
+    const root_observer = task.root;
+
+    const message = Task.failed(task, .runtime_abandoned, allocator);
+    var finished = switch (message) {
+        .load => |load_finished| switch (load_finished) {
+            .history => |history_finished| switch (history_finished) {
+                .preview => |preview_finished| switch (preview_finished) {
+                    .read => |read| read,
+                    else => return error.UnexpectedPreviewRoute,
+                },
+                else => return error.UnexpectedHistoryRoute,
+            },
+            else => return error.UnexpectedReadRoute,
+        },
+    };
+    defer finished.deinit(allocator);
+    try std.testing.expect(finished.key.eql(key));
+    try std.testing.expectEqual(
+        git_history_preview.FailureReason.runtime_abandoned,
+        finished.result.rejected.failed,
+    );
+    if (root_observer.duplicate()) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.deinit();
+        return error.ExpectedClosedRootCapability;
+    } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 }

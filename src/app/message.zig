@@ -362,6 +362,56 @@ test "undelivered remaining read routes release owned payloads" {
     compare_msg.deinitUndelivered(allocator);
 }
 
+test "undelivered History preview completion releases its owned payload" {
+    const allocator = std.testing.allocator;
+    const git_history = @import("../git/history.zig");
+    const git_preview = @import("../git/history_preview.zig");
+    const selected = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const basis = @import("../git/commit_diff.zig").Basis{
+        .object_format = .sha1,
+        .before = .empty_tree,
+        .after = selected,
+    };
+    const summary = git_preview.SelectionSummary{ .single = .{
+        .selected_oid = selected,
+        .parent_count = 0,
+        .basis = basis,
+    } };
+    var msg = Msg.loadFinished(.{ .history = .{ .preview = .{ .read = .{
+        .key = .{
+            .identity = .{
+                .page = page.RequestIdentity.history(3, 5),
+                .root = .{ .device = 7, .inode = 11 },
+                .catalog_instance = 13,
+                .selection = summary,
+            },
+            .generation = 17,
+        },
+        .result = .{ .verified = .{
+            .summary = summary,
+            .payload = .{
+                .detail = .{ .ready = .{ .single = .{
+                    .summary = summary.single,
+                    .author = .{
+                        .name = try allocator.dupe(u8, "Author"),
+                        .email = try allocator.dupe(u8, "author@example.invalid"),
+                    },
+                    .authored = .{ .unix_seconds = 0, .original_offset = "+0000".*, .offset_minutes = 0 },
+                    .committer = .{
+                        .name = try allocator.dupe(u8, "Committer"),
+                        .email = try allocator.dupe(u8, "committer@example.invalid"),
+                    },
+                    .committed = .{ .unix_seconds = 0, .original_offset = "+0000".*, .offset_minutes = 0 },
+                    .refs = .{ .local_branches = &.{}, .tags = &.{}, .remote_branches = &.{} },
+                    .message = try allocator.dupe(u8, "owned message\n"),
+                } } },
+                .files = .{ .ready = &.{} },
+            },
+        } },
+    } } } });
+    msg.deinitUndelivered(allocator);
+}
+
 test "undelivered plain root message is a no-op" {
     var msg: Msg = .quit;
     msg.deinitUndelivered(std.testing.allocator);

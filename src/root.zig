@@ -76,6 +76,7 @@ test {
     _ = @import("app/pages/history.zig");
     _ = @import("app/pages/history/catalog.zig");
     _ = @import("app/pages/history/input.zig");
+    _ = @import("app/pages/history/preview.zig");
     _ = @import("app/pages/history/view.zig");
     _ = @import("app/prompt.zig");
     _ = @import("app/push_retry.zig");

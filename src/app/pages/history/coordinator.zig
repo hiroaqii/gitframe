@@ -16,6 +16,8 @@ const committed_diff_navigation = @import("../committed_diff/navigation.zig");
 
 const CatalogTask = app_load.HistoryCatalogTask(app_message.Msg);
 const DiffTask = app_load.HistoryDiffTask(app_message.Msg);
+const PreviewDebounceTask = app_load.HistoryPreviewDebounceTask(app_message.Msg);
+const PreviewReadTask = app_load.HistoryPreviewReadTask(app_message.Msg);
 
 pub const UpdateOutcome = struct {
     clipboard: ?committed_diff_coordinator.ClipboardEffect = null,
@@ -132,6 +134,51 @@ pub const Controller = struct {
         return outcome;
     }
 
+    /// S3 lifecycle entry point; selection input does not call this until the
+    /// dedicated integration slice.
+    pub fn requestPreview(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !?history_page.preview.QueueOutcome {
+        if (self.active_page != .history) return null;
+        const outcome = self.page_state.queueCurrentPreview(ctx.allocator()) orelse return null;
+        if (outcome == .start_debounce) try self.startPreviewDebounce(ctx);
+        return outcome;
+    }
+
+    pub fn finishPreview(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        finished: *app_load.HistoryPreviewFinished,
+    ) !history_page.ApplyOutcome {
+        return switch (finished.*) {
+            .debounce => |debounce| switch (self.page_state.preview_state.finishDebounce(
+                debounce.stamp,
+                debounce.result,
+            )) {
+                .discarded => .discarded,
+                .settled => .failed,
+                .start_debounce => blk: {
+                    try self.startPreviewDebounce(ctx);
+                    break :blk .changed;
+                },
+                .start_reader => |latest| blk: {
+                    try self.startPreviewReader(ctx, latest);
+                    break :blk .changed;
+                },
+            },
+            .read => |*read| switch (self.page_state.preview_state.finishReader(
+                ctx.allocator(),
+                read.key,
+                &read.result,
+            )) {
+                .discarded => .discarded,
+                .settled => .changed,
+                .start_debounce => blk: {
+                    try self.startPreviewDebounce(ctx);
+                    break :blk .changed;
+                },
+            },
+        };
+    }
+
     pub fn startPending(self: Controller, ctx: *chasen.Ctx(@import("../../message.zig").Msg)) !bool {
         if (self.active_page != .history) return false;
         const request = self.page_state.nextRequest() orelse return false;
@@ -220,6 +267,68 @@ pub const Controller = struct {
         ctx.task().spawnWith(.{ .ctx = task, .run = DiffTask.run, .failed = DiffTask.failed }) catch |err| {
             DiffTask.destroy(task, ctx.allocator());
             self.page_state.rejectDiffSpawn(generation, "History diff task could not be started");
+            return err;
+        };
+    }
+
+    fn startPreviewDebounce(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        const stamp = self.page_state.preview_state.reserveDebounce() orelse return;
+        const task = ctx.allocator().create(PreviewDebounceTask) catch |err| {
+            self.page_state.preview_state.rejectDebouncePreparation(stamp, .allocation);
+            return err;
+        };
+        task.* = .{ .stamp = stamp };
+        self.page_state.preview_state.armDebounce(stamp);
+        ctx.task().spawnWith(.{
+            .ctx = task,
+            .run = PreviewDebounceTask.run,
+            .failed = PreviewDebounceTask.failed,
+        }) catch |err| {
+            PreviewDebounceTask.destroy(task, ctx.allocator());
+            self.page_state.preview_state.rejectDebounceStart(stamp, .task_start);
+            return err;
+        };
+    }
+
+    fn startPreviewReader(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        latest: history_page.preview.LatestRequest,
+    ) !void {
+        self.page_state.preview_state.armReader(latest.key);
+        const capability = self.repo.activeCapability() orelse {
+            self.page_state.preview_state.rejectReaderStart(latest.key, .task_start);
+            return;
+        };
+        if (!capability.identity.eql(latest.key.identity.root)) {
+            self.page_state.preview_state.rejectReaderStart(latest.key, .task_start);
+            return;
+        }
+        const task = ctx.allocator().create(PreviewReadTask) catch |err| {
+            self.page_state.preview_state.rejectReaderStart(latest.key, .allocation);
+            return err;
+        };
+        task.* = PreviewReadTask.init(
+            latest.key,
+            latest.request,
+            capability,
+            self.env_map,
+            ctx.allocator(),
+        ) catch |err| {
+            ctx.allocator().destroy(task);
+            self.page_state.preview_state.rejectReaderStart(
+                latest.key,
+                if (err == error.OutOfMemory) .allocation else .task_start,
+            );
+            return err;
+        };
+        ctx.task().spawnWith(.{
+            .ctx = task,
+            .run = PreviewReadTask.run,
+            .failed = PreviewReadTask.failed,
+        }) catch |err| {
+            PreviewReadTask.destroy(task, ctx.allocator());
+            self.page_state.preview_state.rejectReaderStart(latest.key, .task_start);
             return err;
         };
     }
