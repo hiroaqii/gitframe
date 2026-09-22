@@ -2,8 +2,10 @@
 
 const std = @import("std");
 const app_page = @import("../../page.zig");
+const commit_diff = @import("../../../git/commit_diff.zig");
 const git_history = @import("../../../git/history.zig");
 const git_preview = @import("../../../git/history_preview.zig");
+const path_key = @import("../../../path_key.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 
 pub const cache_entry_limit: usize = 16;
@@ -468,6 +470,140 @@ pub fn summaryForRequest(request: git_history.SelectionRequest, selected_parent_
     };
 }
 
+/// Allocate the width- and viewport-independent clipboard representation for
+/// one ready detail value. Clipboard dispatch remains an S6 responsibility.
+pub fn canonicalDetailAlloc(allocator: std.mem.Allocator, detail: git_preview.Detail) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    switch (detail) {
+        .single => |single| {
+            try out.writer.print("Commit: {s}\nAuthor: {s} <{s}>\nAuthored: ", .{
+                single.summary.selected_oid.slice(),
+                single.author.name,
+                single.author.email,
+            });
+            try writeTimestamp(&out.writer, single.authored);
+            try out.writer.print("\nCommitter: {s} <{s}>\nCommitted: ", .{
+                single.committer.name,
+                single.committer.email,
+            });
+            try writeTimestamp(&out.writer, single.committed);
+            try out.writer.writeAll("\nBranches: ");
+            try writeRefs(&out.writer, single.refs.local_branches);
+            try out.writer.writeAll("\nTags: ");
+            try writeRefs(&out.writer, single.refs.tags);
+            try out.writer.writeAll("\nRemotes: ");
+            try writeRefs(&out.writer, single.refs.remote_branches);
+            try out.writer.writeAll("\nDiff: ");
+            try writeSingleBasis(&out.writer, single.summary);
+            try out.writer.writeAll("\nMessage:\n");
+            try out.writer.writeAll(single.message);
+        },
+        .range => |range| {
+            try out.writer.print("Count: {d}\nOldest: {s}\nNewest: {s}\nBefore: ", .{
+                range.count,
+                range.oldest_oid.slice(),
+                range.newest_oid.slice(),
+            });
+            try writeBefore(&out.writer, range.basis);
+            try out.writer.print("\nAfter: {s}", .{range.basis.after.slice()});
+        },
+    }
+    return out.toOwnedSlice();
+}
+
+/// Compose the already-finalized quoted-token codec into the changed-files
+/// path-field grammar without introducing a second escaping policy.
+pub fn pathFieldAlloc(allocator: std.mem.Allocator, kind: git_preview.FileChangeKind) ![]u8 {
+    return switch (kind) {
+        .modified, .added, .deleted, .type_changed => |path| path_key.quotedDisplayAlloc(allocator, path),
+        .renamed => |rename| blk: {
+            const old = try path_key.quotedDisplayAlloc(allocator, rename.old);
+            defer allocator.free(old);
+            const new = try path_key.quotedDisplayAlloc(allocator, rename.new);
+            defer allocator.free(new);
+            break :blk try std.fmt.allocPrint(allocator, "old {s} -> new {s}", .{ old, new });
+        },
+    };
+}
+
+fn writeRefs(writer: *std.Io.Writer, refs: []const []const u8) !void {
+    if (refs.len == 0) return writer.writeAll("—");
+    for (refs, 0..) |ref, index| {
+        if (index != 0) try writer.writeAll(", ");
+        try writer.writeAll(ref);
+    }
+}
+
+fn writeSingleBasis(writer: *std.Io.Writer, summary: git_preview.SingleSummary) !void {
+    switch (summary.basis.before) {
+        .empty_tree => {
+            try writer.writeAll("empty tree (");
+            const empty = summary.basis.beforeOid();
+            try writer.print("{s}) -> {s}", .{ empty.slice(), summary.basis.after.slice() });
+        },
+        .commit => |before| if (summary.parent_count > 1)
+            try writer.print("parent 1/{d} {s} -> {s}", .{
+                summary.parent_count,
+                before.slice(),
+                summary.basis.after.slice(),
+            })
+        else
+            try writer.print("first parent {s} -> {s}", .{
+                before.slice(),
+                summary.basis.after.slice(),
+            }),
+    }
+}
+
+fn writeBefore(writer: *std.Io.Writer, basis: commit_diff.Basis) !void {
+    switch (basis.before) {
+        .commit => |before| try writer.writeAll(before.slice()),
+        .empty_tree => {
+            const empty = basis.beforeOid();
+            try writer.print("empty tree ({s})", .{empty.slice()});
+        },
+    }
+}
+
+fn writeTimestamp(writer: *std.Io.Writer, timestamp: git_preview.Timestamp) !void {
+    const offset_seconds = @as(i64, timestamp.offset_minutes) * 60;
+    const wall = std.math.add(i64, timestamp.unix_seconds, offset_seconds) catch return error.InvalidTimestamp;
+    const seconds_of_day: u32 = @intCast(@mod(wall, 86_400));
+    const civil = civilFromDays(@divFloor(wall, 86_400)) orelse return error.InvalidTimestamp;
+    try writer.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}", .{
+        civil.year,
+        civil.month,
+        civil.day,
+        @divTrunc(seconds_of_day, 3_600),
+        @divTrunc(@mod(seconds_of_day, 3_600), 60),
+        @mod(seconds_of_day, 60),
+        &timestamp.original_offset,
+    });
+}
+
+const CivilDate = struct { year: u16, month: u8, day: u8 };
+
+fn civilFromDays(days_since_epoch: i64) ?CivilDate {
+    const shifted = days_since_epoch + 719_468;
+    const era = @divFloor(shifted, 146_097);
+    const day_of_era = shifted - era * 146_097;
+    const year_of_era = @divFloor(day_of_era - @divFloor(day_of_era, 1_460) +
+        @divFloor(day_of_era, 36_524) - @divFloor(day_of_era, 146_096), 365);
+    var year = year_of_era + era * 400;
+    const day_of_year = day_of_era - (365 * year_of_era + @divFloor(year_of_era, 4) - @divFloor(year_of_era, 100));
+    const month_prime = @divFloor(5 * day_of_year + 2, 153);
+    const day = day_of_year - @divFloor(153 * month_prime + 2, 5) + 1;
+    const month = month_prime + (if (month_prime < 10) @as(i64, 3) else -9);
+    year += if (month <= 2) 1 else 0;
+    if (year < 1 or year > 9999) return null;
+    return .{
+        .year = @intCast(year),
+        .month = @intCast(month),
+        .day = @intCast(day),
+    };
+}
+
 fn payloadCacheable(payload: *const git_preview.PreviewPayload) bool {
     return payload.detail == .ready and payload.files == .ready;
 }
@@ -731,6 +867,79 @@ test "History preview rejects a verified summary mismatch without disturbing a n
     try std.testing.expect(state.accepted == null);
     try std.testing.expect(state.phase == .terminal);
     try std.testing.expect(state.phase.terminal == .malformed);
+}
+
+test "History preview canonical detail is exact for single and range" {
+    const before = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const after = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const oldest = try git_history.ObjectId.parse(.sha1, "3333333333333333333333333333333333333333");
+    const branches = [_][]const u8{ "main", "release" };
+    const tags = [_][]const u8{"v1"};
+    const single_summary: git_preview.SingleSummary = .{
+        .selected_oid = after,
+        .parent_count = 2,
+        .basis = .{ .object_format = .sha1, .before = .{ .commit = before }, .after = after },
+    };
+    const single = try canonicalDetailAlloc(std.testing.allocator, .{ .single = .{
+        .summary = single_summary,
+        .author = .{ .name = "A U Thor", .email = "author@example.com" },
+        .authored = .{ .unix_seconds = 0, .original_offset = "+0900".*, .offset_minutes = 540 },
+        .committer = .{ .name = "C O M", .email = "commit@example.com" },
+        .committed = .{ .unix_seconds = 0, .original_offset = "-0230".*, .offset_minutes = -150 },
+        .refs = .{ .local_branches = &branches, .tags = &tags, .remote_branches = &.{} },
+        .message = "subject\n\nbody",
+    } });
+    defer std.testing.allocator.free(single);
+    try std.testing.expectEqualStrings(
+        "Commit: 2222222222222222222222222222222222222222\n" ++
+            "Author: A U Thor <author@example.com>\n" ++
+            "Authored: 1970-01-01 09:00:00 +0900\n" ++
+            "Committer: C O M <commit@example.com>\n" ++
+            "Committed: 1969-12-31 21:30:00 -0230\n" ++
+            "Branches: main, release\nTags: v1\nRemotes: —\n" ++
+            "Diff: parent 1/2 1111111111111111111111111111111111111111 -> 2222222222222222222222222222222222222222\n" ++
+            "Message:\nsubject\n\nbody",
+        single,
+    );
+
+    const range = try canonicalDetailAlloc(std.testing.allocator, .{ .range = .{
+        .count = 3,
+        .oldest_oid = oldest,
+        .newest_oid = after,
+        .basis = .{ .object_format = .sha1, .before = .empty_tree, .after = after },
+    } });
+    defer std.testing.allocator.free(range);
+    try std.testing.expectEqualStrings(
+        "Count: 3\nOldest: 3333333333333333333333333333333333333333\n" ++
+            "Newest: 2222222222222222222222222222222222222222\n" ++
+            "Before: empty tree (4b825dc642cb6eb9a060e54bf8d69288fbee4904)\n" ++
+            "After: 2222222222222222222222222222222222222222",
+        range,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, range, "Message") == null);
+    try std.testing.expect(std.mem.indexOf(u8, range, "Branches") == null);
+}
+
+test "History preview path field keeps quoted rename boundaries unique" {
+    const single = try pathFieldAlloc(std.testing.allocator, .{ .modified = "src/a -> b\"\\\t\xff" });
+    defer std.testing.allocator.free(single);
+    try std.testing.expectEqualStrings("\"src/a -> b\\\"\\\\\\t\\xFF\"", single);
+
+    const left_arrow = try pathFieldAlloc(std.testing.allocator, .{ .renamed = .{
+        .similarity = 100,
+        .old = "a -> b\"\\\t\xff",
+        .new = "c",
+    } });
+    defer std.testing.allocator.free(left_arrow);
+    const right_arrow = try pathFieldAlloc(std.testing.allocator, .{ .renamed = .{
+        .similarity = 100,
+        .old = "a",
+        .new = "b -> c\"\\\t\xff",
+    } });
+    defer std.testing.allocator.free(right_arrow);
+    try std.testing.expectEqualStrings("old \"a -> b\\\"\\\\\\t\\xFF\" -> new \"c\"", left_arrow);
+    try std.testing.expectEqualStrings("old \"a\" -> new \"b -> c\\\"\\\\\\t\\xFF\"", right_arrow);
+    try std.testing.expect(!std.mem.eql(u8, left_arrow, right_arrow));
 }
 
 fn settleReadyForTest(
