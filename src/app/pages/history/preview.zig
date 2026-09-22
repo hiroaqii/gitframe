@@ -718,7 +718,16 @@ test "History preview single-flight keeps only the latest inline request" {
     try std.testing.expect(std.meta.eql(copy_a, state.currentCopyAuthority().?));
     const stamp = state.reserveDebounce().?;
     state.armDebounce(stamp);
-    try std.testing.expectEqual(QueueOutcome.queued, state.queue(allocator, identity_b, request_b));
+    var input_step: usize = 1;
+    while (input_step < 100) : (input_step += 1) {
+        const next_identity = if (input_step % 2 == 0) identity_a else identity_b;
+        const next_request = if (input_step % 2 == 0) request_a else request_b;
+        try std.testing.expectEqual(QueueOutcome.queued, state.queue(allocator, next_identity, next_request));
+        try std.testing.expectEqual(@as(usize, 1), state.activeCount());
+        try std.testing.expectEqual(@as(usize, 1), state.latestCount());
+        try std.testing.expect(state.latest.?.key.identity.eql(next_identity));
+        try std.testing.expectEqual(@as(u64, 3), state.latest.?.key.identity.catalog_instance);
+    }
     try std.testing.expect(copy_a.selection_generation != state.currentCopyAuthority().?.selection_generation);
     const copy_b = state.reserveCopyAuthority().?;
     try std.testing.expect(copy_b.copy_generation > copy_a.copy_generation);
@@ -768,6 +777,26 @@ test "History preview single-flight keeps only the latest inline request" {
     try std.testing.expectEqual(@as(usize, 0), state.activeCount());
     try std.testing.expect(state.phase == .terminal);
     try std.testing.expect(state.phase.terminal == .failed);
+
+    try std.testing.expectEqual(QueueOutcome.start_debounce, state.queue(allocator, identity_a, request_a));
+    const retry_stamp = state.reserveDebounce().?;
+    state.armDebounce(retry_stamp);
+    try std.testing.expectEqual(QueueOutcome.queued, state.queue(allocator, identity_b, request_b));
+    const retry_reader = switch (state.finishDebounce(retry_stamp, .elapsed)) {
+        .start_reader => |latest| latest,
+        else => return error.ExpectedPreviewReader,
+    };
+    state.armReader(retry_reader.key);
+    var retry_result: git_preview.PreviewReadResult = .{ .verified = .{
+        .summary = identity_b.selection,
+        .payload = readyRangePayload(identity_b.selection),
+    } };
+    defer retry_result.deinit(allocator);
+    try std.testing.expectEqual(
+        ReaderOutcome.settled,
+        state.finishReader(allocator, retry_reader.key, &retry_result),
+    );
+    try std.testing.expect(state.accepted.?.key.identity.eql(identity_b));
 
     try std.testing.expectEqual(QueueOutcome.start_debounce, state.queue(allocator, identity_a, request_a));
     const stale_stamp = state.reserveDebounce().?;
@@ -825,6 +854,8 @@ test "History preview cache moves ready ownership to a new generation and stays 
     }
     try std.testing.expectEqual(cache_entry_limit, bounded.len);
     try std.testing.expect(bounded.payload_bytes <= cache_payload_limit);
+    try std.testing.expectEqual(@as(u64, cache_entry_limit + 1), bounded.entries[0].?.identity.catalog_instance);
+    try std.testing.expectEqual(@as(u64, 2), bounded.entries[bounded.len - 1].?.identity.catalog_instance);
     var failed_identity = identity_a;
     failed_identity.catalog_instance = 99;
     bounded.insert(allocator, failed_identity, .{
@@ -832,6 +863,7 @@ test "History preview cache moves ready ownership to a new generation and stays 
         .files = .{ .ready = &.{} },
     });
     try std.testing.expectEqual(cache_entry_limit, bounded.len);
+    try std.testing.expectEqual(@as(u64, cache_entry_limit + 1), bounded.entries[0].?.identity.catalog_instance);
 
     const large_message = try allocator.alloc(u8, cache_payload_limit + 1);
     const single_oid = try git_history.ObjectId.parse(

@@ -1281,6 +1281,7 @@ test "History preview three pane renders focus structured detail and flat files"
     try wrapped.expectCellText(9, 0, "a");
     try wrapped.expectCellText(9, 1, "f");
 
+    const completed = page_state.preview_state.accepted.?;
     page_state.preview_state.accepted = null;
     page_state.preview_state.phase = .loading;
     var loading: chasen.testing.TestSurface = undefined;
@@ -1291,6 +1292,23 @@ test "History preview three pane renders focus structured detail and flat files"
     defer std.testing.allocator.free(loading_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Count: 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Loading preview…") != null);
+
+    // A resize can land while the reader is active. The later completion uses
+    // the current geometry, preserving the visible range-summary position and
+    // retaining no unavailable file-list offset.
+    page_state.interaction_state.detail_anchor = .{ .block_index = 9, .source_byte_offset = 99 };
+    page_state.interaction_state.files_vertical_offset = 99;
+    page_state.interaction_state.files_horizontal_offset = 99;
+    try reflowPreview(&page_state, std.testing.allocator, .{ .width = 62, .height = 13 });
+    const resized_anchor = page_state.interaction_state.detail_anchor;
+    try std.testing.expectEqual(@as(usize, 0), page_state.interaction_state.files_vertical_offset);
+    try std.testing.expectEqual(@as(usize, 0), page_state.interaction_state.files_horizontal_offset);
+    page_state.preview_state.accepted = completed;
+    page_state.preview_state.phase = .resolved;
+    try reflowPreview(&page_state, std.testing.allocator, .{ .width = 62, .height = 13 });
+    try std.testing.expectEqual(resized_anchor, page_state.interaction_state.detail_anchor);
+    try std.testing.expectEqual(@as(usize, 0), page_state.interaction_state.files_vertical_offset);
+    try std.testing.expectEqual(@as(usize, 0), page_state.interaction_state.files_horizontal_offset);
 }
 
 test "History catalog renders selected rows at 80x24 and 120x32" {
