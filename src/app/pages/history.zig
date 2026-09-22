@@ -1,9 +1,7 @@
 //! History page state and catalog task admission.
 
 const std = @import("std");
-const ui = @import("chasen_ui");
 const app_load = @import("../load.zig");
-const local_time = @import("../../local_time.zig");
 const app_page = @import("../page.zig");
 const app_state = @import("../state.zig");
 const diff_surface = @import("../diff_surface.zig");
@@ -104,90 +102,6 @@ pub const AcceptedSelection = struct {
 
 pub const ApplyOutcome = enum { discarded, changed, failed };
 
-pub const DetailScrollAction = input.DetailScrollAction;
-
-pub const DetailSize = struct {
-    width: u16,
-    height: u16,
-};
-
-pub const CommitDetailSnapshot = struct {
-    oid: git_history.ObjectId,
-    author: []u8,
-    committed: []u8,
-    decorations: []u8,
-    subject: []u8,
-    canonical_payload: []u8,
-
-    fn init(allocator: std.mem.Allocator, record: git_history.Record) !CommitDetailSnapshot {
-        const author = try allocator.dupe(u8, record.author);
-        errdefer allocator.free(author);
-        const exact = local_time.formatExact(record.committer_unix);
-        const committed = try allocator.dupe(u8, if (exact) |value| value.text() else "—");
-        errdefer allocator.free(committed);
-        const decorations = try allocator.dupe(u8, record.decorations);
-        errdefer allocator.free(decorations);
-        const subject = try allocator.dupe(u8, record.subject);
-        errdefer allocator.free(subject);
-        const canonical_payload = try std.fmt.allocPrint(
-            allocator,
-            "Commit: {s}\nAuthor: {s}\nCommitted: {s}\nRefs: {s}\nSubject: {s}",
-            .{
-                record.oid.slice(),
-                author,
-                committed,
-                if (decorations.len == 0) "—" else decorations,
-                subject,
-            },
-        );
-        return .{
-            .oid = record.oid,
-            .author = author,
-            .committed = committed,
-            .decorations = decorations,
-            .subject = subject,
-            .canonical_payload = canonical_payload,
-        };
-    }
-
-    fn deinit(self: *CommitDetailSnapshot, allocator: std.mem.Allocator) void {
-        allocator.free(self.author);
-        allocator.free(self.committed);
-        allocator.free(self.decorations);
-        allocator.free(self.subject);
-        allocator.free(self.canonical_payload);
-        self.* = undefined;
-    }
-};
-
-pub const OpenCommitDetail = struct {
-    snapshot: CommitDetailSnapshot,
-    top_visual_row: usize = 0,
-    modal_instance_id: u64,
-    latest_copy_generation: u64 = 0,
-
-    fn deinit(self: *OpenCommitDetail, allocator: std.mem.Allocator) void {
-        self.snapshot.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const CommitDetail = union(enum) {
-    closed,
-    open: OpenCommitDetail,
-};
-
-pub const DetailCopy = struct {
-    modal_instance_id: u64,
-    copy_generation: u64,
-    payload: []const u8,
-};
-
-pub const DetailCopyAuthority = struct {
-    modal_instance_id: u64,
-    copy_generation: u64,
-};
-
 pub const HistoryPageState = struct {
     activation: diff_surface.authority.Lifecycle = .init(.history),
     repo_epoch: u64 = 0,
@@ -210,11 +124,8 @@ pub const HistoryPageState = struct {
     preview_state: preview.State = .{},
     diff: committed_diff.State = .{},
     status: app_state.StatusMessage = .{},
-    detail: CommitDetail = .closed,
-    next_detail_instance_id: u64 = 0,
 
     pub fn deinit(self: *HistoryPageState, allocator: std.mem.Allocator) void {
-        self.clearDetail(allocator);
         self.catalog.deinit(allocator);
         if (self.observed_context) |*snapshot| snapshot.deinit(allocator);
         if (self.accepted) |*accepted| accepted.deinit(allocator);
@@ -224,7 +135,6 @@ pub const HistoryPageState = struct {
     }
 
     pub fn activate(self: *HistoryPageState, allocator: std.mem.Allocator, repo_epoch: u64, identity: ?root_capability.Identity) void {
-        self.clearDetail(allocator);
         self.preview_state.invalidate(allocator);
         self.pending = null;
         self.needs_probe = null;
@@ -274,7 +184,6 @@ pub const HistoryPageState = struct {
     }
 
     pub fn deactivate(self: *HistoryPageState) void {
-        std.debug.assert(!self.detailOpen());
         self.preview_state.deactivate();
         self.diff.selection_owner = .none;
         self.activation.deactivate();
@@ -291,7 +200,6 @@ pub const HistoryPageState = struct {
         repo_epoch: u64,
         identity: ?root_capability.Identity,
     ) void {
-        self.clearDetail(allocator);
         self.preview_state.invalidate(allocator);
         self.catalog.clear(allocator);
         self.clearObservedContext(allocator);
@@ -312,7 +220,6 @@ pub const HistoryPageState = struct {
     }
 
     pub fn requestReload(self: *HistoryPageState, allocator: std.mem.Allocator) void {
-        self.clearDetail(allocator);
         if (self.current_view == .picker and !self.catalog_hidden and self.draft.isRange()) {
             self.status.set("Cancel range selection before reloading", .{});
             return;
@@ -607,6 +514,8 @@ pub const HistoryPageState = struct {
     }
 
     pub fn applyInput(self: *HistoryPageState, msg: Msg, body_height: u16) void {
+        const previous_cursor = self.catalog.cursor;
+        const previous_anchor = self.draft.anchor();
         switch (msg) {
             .move_previous => self.catalog.movePrevious(body_height),
             .move_next => self.catalog.moveNext(body_height),
@@ -624,8 +533,11 @@ pub const HistoryPageState = struct {
             .cancel_draft => if (!self.returnToAccepted() and !self.draft.clearAnchor())
                 self.status.set("No previously selected diff", .{}),
             .unsupported_search => self.status.set("Commit search is not available in v1", .{}),
-            .load_diff, .open_picker, .open_detail, .close_detail, .copy_detail, .scroll_detail, .common => unreachable,
+            .load_diff, .open_picker, .focus_next, .focus_previous, .move_detail, .move_files, .scroll_files, .adjust_width, .common => unreachable,
             .owned_noop => {},
+        }
+        if (previous_cursor != self.catalog.cursor or previous_anchor != self.draft.anchor()) {
+            self.interaction_state.selectionChanged();
         }
     }
 
@@ -678,9 +590,9 @@ pub const HistoryPageState = struct {
 
     pub fn inputContext(self: *const HistoryPageState, effective: @import("keymap").Effective) input.Context {
         return .{
-            .detail_open = self.detailOpen(),
             .loading = self.current_view == .picker and self.load_state == .loading,
             .diff_view = self.current_view == .diff and self.accepted != null,
+            .focus = self.interaction_state.focus,
             .more_row_selected = !self.catalog_hidden and self.catalog.moreRowSelected(),
             .picker_ready = !self.catalog_hidden and self.catalog.records.items.len > 0,
             .picker_can_move_previous = !self.catalog_hidden and self.catalog.canMovePrevious(),
@@ -720,102 +632,6 @@ pub const HistoryPageState = struct {
             !headDisplayEql(current.display, accepted.origin);
     }
 
-    pub fn detailOpen(self: *const HistoryPageState) bool {
-        return self.detail == .open;
-    }
-
-    pub fn openDetail(self: *HistoryPageState, allocator: std.mem.Allocator) void {
-        if (self.detailOpen()) return;
-        if (self.current_view != .picker or self.catalog_hidden or self.load_state != .loaded) {
-            self.status.set("Commit detail is not available", .{});
-            return;
-        }
-        if (self.catalog.moreRowSelected()) {
-            self.status.set("Press Enter to load older commits", .{});
-            return;
-        }
-        if (self.catalog.cursor >= self.catalog.records.items.len) {
-            self.status.set("No commit selected", .{});
-            return;
-        }
-        const snapshot = CommitDetailSnapshot.init(
-            allocator,
-            self.catalog.records.items[self.catalog.cursor],
-        ) catch {
-            self.status.set("Could not prepare commit detail", .{});
-            return;
-        };
-        self.next_detail_instance_id +%= 1;
-        if (self.next_detail_instance_id == 0) self.next_detail_instance_id = 1;
-        self.detail = .{ .open = .{
-            .snapshot = snapshot,
-            .modal_instance_id = self.next_detail_instance_id,
-        } };
-        self.status.clear();
-    }
-
-    pub fn closeDetail(self: *HistoryPageState, allocator: std.mem.Allocator) void {
-        self.clearDetail(allocator);
-        self.status.clear();
-    }
-
-    pub fn openDetailConst(self: *const HistoryPageState) ?*const OpenCommitDetail {
-        return switch (self.detail) {
-            .closed => null,
-            .open => |*detail| detail,
-        };
-    }
-
-    pub fn beginDetailCopy(self: *HistoryPageState) ?DetailCopy {
-        const detail = switch (self.detail) {
-            .closed => return null,
-            .open => |*value| value,
-        };
-        detail.latest_copy_generation +%= 1;
-        if (detail.latest_copy_generation == 0) detail.latest_copy_generation = 1;
-        self.status.clear();
-        return .{
-            .modal_instance_id = detail.modal_instance_id,
-            .copy_generation = detail.latest_copy_generation,
-            .payload = detail.snapshot.canonical_payload,
-        };
-    }
-
-    pub fn currentDetailCopyAuthority(self: *const HistoryPageState) ?DetailCopyAuthority {
-        const detail = self.openDetailConst() orelse return null;
-        return .{
-            .modal_instance_id = detail.modal_instance_id,
-            .copy_generation = detail.latest_copy_generation,
-        };
-    }
-
-    pub fn scrollDetail(self: *HistoryPageState, action: DetailScrollAction, size: DetailSize) void {
-        const detail = switch (self.detail) {
-            .closed => return,
-            .open => |*value| value,
-        };
-        const max_offset = detailMaxOffset(detail.snapshot.canonical_payload, size);
-        detail.top_visual_row = switch (action) {
-            .row_up => detail.top_visual_row -| 1,
-            .row_down => @min(detail.top_visual_row +| 1, max_offset),
-            .page_up => detail.top_visual_row -| @as(usize, size.height),
-            .page_down => @min(detail.top_visual_row +| @as(usize, size.height), max_offset),
-            .home => 0,
-            .end => max_offset,
-        };
-    }
-
-    pub fn clampDetailViewport(self: *HistoryPageState, size: DetailSize) void {
-        const detail = switch (self.detail) {
-            .closed => return,
-            .open => |*value| value,
-        };
-        detail.top_visual_row = @min(
-            detail.top_visual_row,
-            detailMaxOffset(detail.snapshot.canonical_payload, size),
-        );
-    }
-
     pub fn openPicker(self: *HistoryPageState, _: std.mem.Allocator) void {
         if (self.accepted == null) return;
         self.diff.selection_owner = .none;
@@ -841,14 +657,6 @@ pub const HistoryPageState = struct {
         self.accepted = null;
         self.current_view = .picker;
         self.diff.deinit(allocator);
-    }
-
-    fn clearDetail(self: *HistoryPageState, allocator: std.mem.Allocator) void {
-        switch (self.detail) {
-            .closed => {},
-            .open => |*detail| detail.deinit(allocator),
-        }
-        self.detail = .closed;
     }
 
     fn applyProbe(
@@ -968,17 +776,6 @@ pub const HistoryPageState = struct {
         self.observed_context = null;
     }
 };
-
-pub fn detailVisualRowCount(payload: []const u8, width: u16) usize {
-    return ui.Paragraph.init(.{ .text = payload }).lineCount(width);
-}
-
-pub fn detailMaxOffset(payload: []const u8, size: DetailSize) usize {
-    return ui.Viewport.init(.{
-        .total = detailVisualRowCount(payload, size.width),
-        .height = size.height,
-    }).maxOffset();
-}
 
 const PickerRestore = struct {
     request: git_history.SelectionRequest,
@@ -2056,97 +1853,4 @@ fn pickerTestRecord(
         .decorations = decorations,
         .subject = owned_subject,
     };
-}
-
-test "History commit detail owns exact payload viewport generations and lifecycle terminals" {
-    const allocator = std.testing.allocator;
-    const oid = try git_history.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    var state: HistoryPageState = .{ .load_state = .loaded };
-    defer state.deinit(allocator);
-    try state.catalog.records.append(allocator, try pickerTestRecord(allocator, oid, 0, .true_root, "wide 猫 e\u{301} subject"));
-    allocator.free(state.catalog.records.items[0].author);
-    state.catalog.records.items[0].author = try allocator.dupe(u8, "Full Author");
-    allocator.free(state.catalog.records.items[0].decorations);
-    state.catalog.records.items[0].decorations = try allocator.dupe(u8, "HEAD -> main, tag: v1");
-    state.catalog.records.items[0].committer_unix = 1_725_196_523;
-
-    state.openDetail(allocator);
-    const first = state.openDetailConst().?;
-    const exact = local_time.formatExact(state.catalog.records.items[0].committer_unix).?;
-    const expected_payload = try std.fmt.allocPrint(
-        allocator,
-        "Commit: 0123456789abcdef0123456789abcdef01234567\n" ++
-            "Author: Full Author\n" ++
-            "Committed: {s}\n" ++
-            "Refs: HEAD -> main, tag: v1\n" ++
-            "Subject: wide 猫 e\u{301} subject",
-        .{exact.text()},
-    );
-    defer allocator.free(expected_payload);
-    try std.testing.expectEqualStrings(
-        expected_payload,
-        first.snapshot.canonical_payload,
-    );
-    const instance = first.modal_instance_id;
-    const copy_one = state.beginDetailCopy().?;
-    const copy_two = state.beginDetailCopy().?;
-    try std.testing.expectEqual(@as(u64, 1), copy_one.copy_generation);
-    try std.testing.expectEqual(@as(u64, 2), copy_two.copy_generation);
-    try std.testing.expectEqualStrings(first.snapshot.canonical_payload, copy_two.payload);
-    try std.testing.expectEqual(DetailCopyAuthority{
-        .modal_instance_id = instance,
-        .copy_generation = 2,
-    }, state.currentDetailCopyAuthority().?);
-
-    const narrow: DetailSize = .{ .width = 12, .height = 3 };
-    state.scrollDetail(.end, narrow);
-    try std.testing.expectEqual(
-        detailMaxOffset(first.snapshot.canonical_payload, narrow),
-        state.openDetailConst().?.top_visual_row,
-    );
-    state.clampDetailViewport(.{ .width = 120, .height = 20 });
-    try std.testing.expectEqual(@as(usize, 0), state.openDetailConst().?.top_visual_row);
-
-    state.closeDetail(allocator);
-    try std.testing.expect(!state.detailOpen());
-    state.openDetail(allocator);
-    try std.testing.expect(state.openDetailConst().?.modal_instance_id != instance);
-    state.requestReload(allocator);
-    try std.testing.expect(!state.detailOpen());
-    state.load_state = .loaded;
-    state.openDetail(allocator);
-    state.repositoryChanged(allocator, 3, null);
-    try std.testing.expect(!state.detailOpen());
-}
-
-test "History commit detail allocation failure and load-more row close finitely" {
-    const allocator = std.testing.allocator;
-    const oid = try git_history.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    var state: HistoryPageState = .{ .load_state = .loaded };
-    defer state.deinit(allocator);
-    try state.catalog.records.append(allocator, try pickerTestRecord(allocator, oid, 0, .true_root, "subject"));
-
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    state.openDetail(failing.allocator());
-    try std.testing.expect(!state.detailOpen());
-    try std.testing.expectEqualStrings("Could not prepare commit detail", state.status.text());
-
-    state.status.clear();
-    state.openDetail(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, state.openDetailConst().?.snapshot.canonical_payload, "Refs: —") != null);
-    state.closeDetail(allocator);
-
-    state.catalog.continuation = oid;
-    state.catalog.cursor = 1;
-    state.status.clear();
-    state.openDetail(allocator);
-    try std.testing.expect(!state.detailOpen());
-    try std.testing.expectEqualStrings("Press Enter to load older commits", state.status.text());
-
-    state.catalog.continuation = null;
-    state.catalog.cursor = 0;
-    state.openDetail(allocator);
-    try std.testing.expect(state.detailOpen());
-    state.activate(allocator, 9, null);
-    try std.testing.expect(!state.detailOpen());
 }

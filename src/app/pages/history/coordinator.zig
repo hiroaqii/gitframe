@@ -44,7 +44,6 @@ pub const Controller = struct {
     layout: diff_surface.Layout,
     mode_toggle_hint_width: u16 = 0,
     env_map: ?*const std.process.Environ.Map,
-    detail_overlay_size: chasen.Size = .{ .width = 0, .height = 0 },
 
     pub fn refresh(self: Controller, allocator: std.mem.Allocator) void {
         self.page_state.requestReload(allocator);
@@ -84,13 +83,25 @@ pub const Controller = struct {
             },
             .load_diff => try self.startDiff(ctx),
             .open_picker => self.page_state.openPicker(ctx.allocator()),
-            .open_detail => self.page_state.openDetail(ctx.allocator()),
-            .close_detail => self.page_state.closeDetail(ctx.allocator()),
-            .copy_detail => return self.copyDetail(),
-            .scroll_detail => |action| self.page_state.scrollDetail(
+            .focus_next => self.page_state.interaction_state.focusNext(),
+            .focus_previous => self.page_state.interaction_state.focusPrevious(),
+            .move_detail => |action| try history_view.moveDetail(
+                self.page_state,
+                ctx.allocator(),
+                self.body_size,
                 action,
-                history_view.detailContentSize(self.detail_overlay_size),
             ),
+            .move_files => |action| history_view.moveFiles(self.page_state, self.body_size, action),
+            .scroll_files => |action| try history_view.scrollFiles(
+                self.page_state,
+                ctx.allocator(),
+                self.body_size,
+                action,
+            ),
+            .adjust_width => |action| {
+                self.page_state.interaction_state.adjustWidth(self.body_size.width, action);
+                try history_view.reflowPreview(self.page_state, ctx.allocator(), self.body_size);
+            },
             else => self.page_state.applyInput(msg, self.body_size.height),
         }
         return .{};
@@ -222,8 +233,8 @@ pub const Controller = struct {
         return true;
     }
 
-    pub fn clampDetailViewport(self: Controller) void {
-        self.page_state.clampDetailViewport(history_view.detailContentSize(self.detail_overlay_size));
+    pub fn reflowPreview(self: Controller, allocator: std.mem.Allocator) !void {
+        try history_view.reflowPreview(self.page_state, allocator, self.body_size);
     }
 
     fn startDiff(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
@@ -339,19 +350,6 @@ pub const Controller = struct {
             .effect_origin = self.pageOrigin(),
             .branch_unavailable_message = "branch switching is not available in History",
         };
-    }
-
-    fn copyDetail(self: Controller) UpdateOutcome {
-        const copy = self.page_state.beginDetailCopy() orelse return .{};
-        return .{ .clipboard = .{
-            .origin = .{ .history_commit_detail = .{
-                .page = self.pageOrigin(),
-                .modal_instance_id = copy.modal_instance_id,
-                .copy_generation = copy.copy_generation,
-            } },
-            .label = "History commit detail",
-            .text = copy.payload,
-        } };
     }
 
     fn currentIdentity(self: Controller) ?app_page.RequestIdentity {

@@ -130,27 +130,6 @@ pub const View = struct {
 
     fn mouseToMsg(self: View, mouse: anytype) ?app_message.Msg {
         if (self.command_line_active) return null;
-        if (self.active_page == .history and self.history.key.detail_open) {
-            if (mouse.type != .press) return null;
-            switch (mouse.button) {
-                .wheel_up => return .{ .history = .{ .scroll_detail = .row_up } },
-                .wheel_down => return .{ .history = .{ .scroll_detail = .row_down } },
-                .left => if (self.layout.page_bar) |bar| {
-                    if (self.layout.terminalToContent(mouse.col, mouse.row)) |point| {
-                        if (point.row == app_shell_layout.page_bar_label_row) {
-                            const compact = self.layout.body.height == 0 or self.layout.footer.height == 0;
-                            const target = if (compact)
-                                if (point.col >= 1 and point.col < @min(bar.width, self.active_page.label().len + 3)) self.active_page else null
-                            else
-                                page.tabAtColumn(bar.width, point.col);
-                            if (target) |id| return .{ .switch_page = id };
-                        }
-                    }
-                },
-                else => {},
-            }
-            return null;
-        }
         if (self.activeDiffSelectionOwner()) |selection| {
             if (selection.active()) switch (selection) {
                 .changes => switch (mouse.type) {
@@ -306,12 +285,25 @@ pub const View = struct {
             };
         }
         if (self.active_page == .history) {
-            if (self.history.key.loading or !self.history.key.picker_ready) return null;
             _ = self.bodyMousePoint(mouse) orelse return null;
-            return switch (mouse.button) {
-                .wheel_up => if (self.history.key.picker_can_move_previous) .{ .history = .move_previous } else null,
-                .wheel_down => if (self.history.key.picker_can_move_next) .{ .history = .move_next } else null,
-                else => null,
+            return switch (self.history.key.focus) {
+                .history => if (self.history.key.loading or !self.history.key.picker_ready)
+                    null
+                else switch (mouse.button) {
+                    .wheel_up => if (self.history.key.picker_can_move_previous) .{ .history = .move_previous } else null,
+                    .wheel_down => if (self.history.key.picker_can_move_next) .{ .history = .move_next } else null,
+                    else => null,
+                },
+                .commit_detail => switch (mouse.button) {
+                    .wheel_up => .{ .history = .{ .move_detail = .row_previous } },
+                    .wheel_down => .{ .history = .{ .move_detail = .row_next } },
+                    else => null,
+                },
+                .changed_files => switch (mouse.button) {
+                    .wheel_up => .{ .history = .{ .move_files = .row_previous } },
+                    .wheel_down => .{ .history = .{ .move_files = .row_next } },
+                    else => null,
+                },
             };
         }
         if (self.active_page != .changes) return null;
@@ -638,18 +630,16 @@ test "History routes committed diff and bounded picker wheel through the shell" 
     try std.testing.expect(picker_view.handleEvent(picker_wheel_down) == null);
 
     var detail_view = picker_view;
-    detail_view.history.key = .{ .detail_open = true };
+    detail_view.history.key.focus = .commit_detail;
     try std.testing.expectEqual(
-        app_message.Msg{ .history = .{ .scroll_detail = .row_down } },
+        app_message.Msg{ .history = .{ .move_detail = .row_next } },
         detail_view.handleEvent(picker_wheel_down).?,
     );
-    try std.testing.expect(detail_view.handleEvent(.{ .mouse = .{
-        .col = terminal_col,
-        .row = terminal_row,
-        .button = .left,
-        .mods = .{},
-        .type = .press,
-    } }) == null);
+    detail_view.history.key.focus = .changed_files;
+    try std.testing.expectEqual(
+        app_message.Msg{ .history = .{ .move_files = .row_previous } },
+        detail_view.handleEvent(picker_wheel_up).?,
+    );
     const compare_tab = page.tab(.compare);
     try std.testing.expectEqual(
         app_message.Msg{ .switch_page = .compare },

@@ -196,11 +196,6 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.active_page == .compare and app.compare.page.base_picker.open) {
         try compare_view.viewBasePicker(app.compare, surface);
     }
-    if (app.active_page == .history) {
-        if (app.history) |history| if (history.page_state.detailOpen()) {
-            try history_view.viewCommitDetail(history, surface);
-        };
-    }
 }
 
 fn shellFrameOptions(palette: theme.Palette) ui.Panel.ViewOptions {
@@ -1816,7 +1811,23 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                             ),
                             .primary,
                         );
-                        result.append(ui.key_hint.item("i", "inspect"), .secondary);
+                    }
+                    result.append(ui.key_hint.item("Tab/j/k", "focus/nav"), .focus);
+                    resize_hint: {
+                        if (result.len < footer_hint_capacity) {
+                            var left_buffer: [16]u8 = undefined;
+                            var right_buffer: [16]u8 = undefined;
+                            if (app.keymap.display(.decrease_sidebar_width, &left_buffer)) |left| {
+                                if (app.keymap.display(.increase_sidebar_width, &right_buffer)) |right| {
+                                    const pair = std.fmt.bufPrint(
+                                        key_buffers[result.len][0..],
+                                        "{s}/{s}",
+                                        .{ left, right },
+                                    ) catch break :resize_hint;
+                                    result.append(ui.key_hint.item(pair, "resize"), .secondary);
+                                }
+                            }
+                        }
                     }
                     if (!range_active) {
                         appendFooterAction(app, &result, key_buffers, .reload, "reload", .secondary);
@@ -2504,6 +2515,8 @@ test "footer normal-mode hints match the decided page lists" {
     };
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Tab/j/k", "focus/nav"),
+        ui.key_hint.item("[/]", "resize"),
         ui.key_hint.item("r", "reload"),
         ui.key_hint.item("Esc", "previous diff"),
         ui.key_hint.item("R", "switch repo"),
@@ -2560,7 +2573,8 @@ test "History picker footer keeps the range action visible and explains an activ
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("Space", "start range"),
         ui.key_hint.item("Enter", "open diff"),
-        ui.key_hint.item("i", "inspect"),
+        ui.key_hint.item("Tab/j/k", "focus/nav"),
+        ui.key_hint.item("[/]", "resize"),
         ui.key_hint.item("r", "reload"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2572,7 +2586,8 @@ test "History picker footer keeps the range action visible and explains an activ
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("Space", "clear range"),
         ui.key_hint.item("Enter", "open range diff"),
-        ui.key_hint.item("i", "inspect"),
+        ui.key_hint.item("Tab/j/k", "focus/nav"),
+        ui.key_hint.item("[/]", "resize"),
         ui.key_hint.item("Esc", "cancel range"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -3418,12 +3433,13 @@ const help_compare_items = [_]HelpItem{
 
 const help_history_items = [_]HelpItem{
     .{ .key = .{ .text = "Row" }, .description = "Commit · Date · Author · [Refs] Subject" },
-    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move through commits" },
+    .{ .key = .{ .text = "Tab / Shift+Tab" }, .description = "cycle History / detail / files focus" },
+    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "navigate the focused pane" },
     .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "move one visible page" },
-    .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last catalog row" },
-    .{ .key = .{ .text = "Space" }, .description = "start / clear a contiguous range" },
+    .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last focused row" },
+    .{ .key = .{ .text = "Space" }, .description = "start / clear a range from History focus" },
     .{ .key = .{ .text = "Enter" }, .description = "open selected diff / load older commits" },
-    .{ .key = .{ .text = "i" }, .description = "inspect selected commit metadata; y copies it" },
+    .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize History pane" },
     .{ .key = .{ .text = "m" }, .description = "choose commits from an accepted diff" },
     .{ .key = .{ .action = .reload }, .description = "recheck and reload exact current HEAD" },
     .{ .key = .{ .text = "/" }, .description = "search diff; commit search unavailable" },

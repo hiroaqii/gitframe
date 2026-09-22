@@ -11,7 +11,6 @@ const effect_origin = @import("effect_origin.zig");
 const page = @import("page.zig");
 const compare_page = @import("pages/compare.zig");
 const history_page = @import("pages/history.zig");
-const commit_diff = @import("../git/commit_diff.zig");
 const repository_page = @import("pages/repository.zig");
 const changes_content = @import("pages/changes/content.zig");
 const changes_page = @import("pages/changes.zig");
@@ -57,10 +56,6 @@ const ShellHarness = struct {
                 .compare_activation_id = self.pages.compare.activation.next_activation_id,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = null,
-                .history_commit_detail = if (self.pages.history.currentDetailCopyAuthority()) |authority| .{
-                    .modal_instance_id = authority.modal_instance_id,
-                    .copy_generation = authority.copy_generation,
-                } else null,
             },
             .changes_repo_epoch = self.repo_epoch,
             .repository_repo_epoch = self.pages.repository.repo_epoch,
@@ -136,54 +131,6 @@ test "clipboard copy result status uses best-effort wording" {
         .outcome = .unsupported_runtime,
     }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
-}
-
-test "History commit detail clipboard presents only the latest live generation" {
-    const allocator = std.testing.allocator;
-    const oid = try commit_diff.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    var app: ShellHarness = .{
-        .active_page = .history,
-        .pages = .{ .history = .{ .detail = .{ .open = .{
-            .snapshot = .{
-                .oid = oid,
-                .author = try allocator.dupe(u8, "Author"),
-                .committed = try allocator.dupe(u8, "2024-09-01 12:35:23 +00:00"),
-                .decorations = try allocator.dupe(u8, "main"),
-                .subject = try allocator.dupe(u8, "subject"),
-                .canonical_payload = try allocator.dupe(u8, "Commit: 0123456789abcdef0123456789abcdef01234567"),
-            },
-            .modal_instance_id = 10,
-        } } } },
-    };
-    defer app.pages.history.deinit(allocator);
-    defer app.shell_state.clipboard_copies.deinit(allocator);
-    const first = app.pages.history.beginDetailCopy().?;
-    const second = app.pages.history.beginDetailCopy().?;
-    try app.shell_state.clipboard_copies.put(allocator, 40, .{
-        .origin = .{ .history_commit_detail = .{
-            .page = app.shellEffects().historyOrigin(),
-            .modal_instance_id = first.modal_instance_id,
-            .copy_generation = first.copy_generation,
-        } },
-        .label = "History commit detail",
-    });
-    try app.shell_state.clipboard_copies.put(allocator, 41, .{
-        .origin = .{ .history_commit_detail = .{
-            .page = app.shellEffects().historyOrigin(),
-            .modal_instance_id = second.modal_instance_id,
-            .copy_generation = second.copy_generation,
-        } },
-        .label = "History commit detail",
-    });
-
-    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 40 }, .outcome = .sent });
-    try std.testing.expectEqualStrings("", app.pages.history.status.text());
-    try std.testing.expect(app.redraw_plan.resolvesToSkip());
-
-    app.redraw_plan = .{};
-    _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 41 }, .outcome = .sent });
-    try std.testing.expectEqualStrings("clipboard copy sent: History commit detail", app.pages.history.status.text());
-    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "Compare clipboard terminals and queue failure preserve retained selection authority" {

@@ -115,11 +115,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
     else
         .owned_noop };
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
-    if (context.active_page == .history and context.history.detail_open) {
-        return .{ .history = history_input.pasteToMsg(context.history, text) orelse .owned_noop };
-    }
-    // Picker search is key-event-only. A visible modal owns paste so bytes
-    // cannot leak into a retained diff/file search below it.
+    // Picker search is key-event-only.
     if (context.active_page == .compare and context.compare.base_picker_open) return null;
     if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
         const changes_msg = changes_input.pasteToMsg(context.changes, text) orelse return null;
@@ -153,12 +149,6 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.command_line_active) return .{ .command_line = commandLineKeyToMsg(key) };
-    if (context.active_page == .history and context.history.detail_open) {
-        if (history_input.keyToMsg(context.history, key)) |msg| return .{ .history = msg };
-        const routing_key = normalRoutingKey(key);
-        if (pageForKey(context.keymap, routing_key)) |target| return .{ .switch_page = target };
-        return .{ .history = .owned_noop };
-    }
     if (context.remote_action_cancelable and key.matches(chasen.Key.escape, .{}))
         return app_message.Msg.cancel_remote_action;
     if (context.active_page == .changes and (context.changes.search_mode or context.changes.file_search_mode)) {
@@ -191,11 +181,6 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
     if (context.push_error_mode) return pushErrorKeyToMsg(key);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
-    if (context.active_page == .history and !context.history.diff_view and
-        context.history.picker_ready and !key_input.hasCommandModifier(key) and key.codepoint == 'i')
-    {
-        return .{ .history = history_input.keyToMsg(context.history, key) orelse .owned_noop };
-    }
     if (context.active_page == .history and context.history.loading) {
         const routing_key = normalRoutingKey(key);
         if (pageForKey(context.keymap, routing_key)) |target| return .{ .switch_page = target };
@@ -565,41 +550,22 @@ test "History committed diff text input precedes page shortcuts and picker key s
     try expectMsg(.{ .history = .open_picker }, keyToMsg(normal, .{ .codepoint = 'm' }).?);
 }
 
-test "History commit detail priority preserves literal open copy and central page switching" {
-    var open_config: keymap.Config = .{};
-    open_config.set(.page_changes, .{ .plain_codepoint = 'i' });
-    const open_keymap = keymap.Effective.fromConfig(open_config);
+test "History picker leaves i unclaimed so configured page routing wins" {
+    var config: keymap.Config = .{};
+    config.set(.page_changes, .{ .plain_codepoint = 'i' });
+    const effective = keymap.Effective.fromConfig(config);
     try expectMsg(
-        .{ .history = .open_detail },
+        .{ .switch_page = .changes },
         keyToMsg(.{
             .active_page = .history,
-            .history = .{ .picker_ready = true, .keymap = open_keymap },
-            .keymap = open_keymap,
+            .history = .{ .picker_ready = true, .keymap = effective },
+            .keymap = effective,
         }, .{ .codepoint = 'i' }).?,
     );
-    try expectMsg(
-        .{ .history = .close_detail },
-        keyToMsg(.{
-            .active_page = .history,
-            .history = .{ .detail_open = true, .keymap = open_keymap },
-            .keymap = open_keymap,
-        }, .{ .codepoint = 'i' }).?,
-    );
-
-    var detail_config: keymap.Config = .{};
-    detail_config.set(.page_changes, .{ .plain_codepoint = 'y' });
-    detail_config.set(.copy_current_line, .{ .plain_codepoint = 'z' });
-    const detail_keymap = keymap.Effective.fromConfig(detail_config);
-    const detail: KeyContext = .{
+    try std.testing.expect(keyToMsg(.{
         .active_page = .history,
-        .history = .{ .detail_open = true, .keymap = detail_keymap },
-        .keymap = detail_keymap,
-    };
-    try expectMsg(.{ .history = .copy_detail }, keyToMsg(detail, .{ .codepoint = 'y' }).?);
-    try expectMsg(.{ .history = .{ .scroll_detail = .row_down } }, keyToMsg(detail, .{ .codepoint = 'j' }).?);
-    try expectMsg(.{ .switch_page = .compare }, keyToMsg(detail, .{ .codepoint = '4' }).?);
-    try expectMsg(.{ .history = .owned_noop }, keyToMsg(detail, .{ .codepoint = 'z' }).?);
-    try expectMsg(.{ .history = .owned_noop }, pasteToMsg(detail, "underlay").?);
+        .history = .{ .picker_ready = true },
+    }, .{ .codepoint = 'i' }) == null);
 }
 
 test "command line owns key and paste input before every normal route" {

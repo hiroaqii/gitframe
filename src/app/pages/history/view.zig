@@ -8,13 +8,13 @@ const text_presentation = ui.text_presentation;
 const draw = @import("draw");
 const keymap = @import("keymap");
 const local_time = @import("../../../local_time.zig");
-const app_state = @import("../../state.zig");
 const diff_surface = @import("../../diff_surface.zig");
 const page_header = @import("../../page_header.zig");
 const committed_diff_navigation = @import("../committed_diff/navigation.zig");
 const diff_render = @import("../../../diff/render.zig");
 const file_tree = @import("../../../file_tree.zig");
 const git_history = @import("../../../git/history.zig");
+const git_preview = @import("../../../git/history_preview.zig");
 const history_page = @import("../history.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
@@ -70,7 +70,6 @@ pub const ViewContext = struct {
     root_identity: ?root_capability.Identity = null,
     layout: diff_surface.Layout = .{ .width = 0, .height = 0 },
     keymap: keymap.Effective = .{},
-    shell_status: ?*const app_state.StatusMessage = null,
 
     pub fn footer(self: ViewContext) diff_surface.view.FooterView {
         const navigation = navigationView(self);
@@ -129,145 +128,501 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     if (context.page_state.current_view == .diff and context.page_state.accepted != null) {
         return viewDiff(context, surface);
     }
-    return viewPicker(context, surface);
+    return viewThreePane(context, surface);
 }
 
-pub fn viewCommitDetail(context: ViewContext, surface: *chasen.Surface) !void {
-    const detail = context.page_state.openDetailConst() orelse return;
-    const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, 100),
-        .dialog_height = @min(surface.size().height, 24),
-        .title = "Commit detail",
-        .backdrop = true,
-        .border = .rounded,
-        .title_style = context.palette.boldStyle(.accent),
-        .border_style = context.palette.style(.accent),
-    };
-    const frame = ui.Modal.frame(surface, opts) orelse return;
-    var dialog = frame.dialogSurface();
-    dialog.fillAll(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
-    frame.view();
-    var content = frame.contentSurface();
-    const size = content.size();
-    if (size.width == 0 or size.height == 0) return;
-    const body_height = size.height -| 2;
-    if (body_height > 0) {
-        var body = content.child(.{ .col = 0, .row = 0, .width = size.width, .height = body_height });
-        _ = drawWrappedTextScrolled(
-            &body,
-            detail.snapshot.canonical_payload,
-            detail.top_visual_row,
-            chasen.TextStyle{},
-        );
-    }
+pub const PickerLayout = struct {
+    history: chasen.Rect,
+    outer_divider: chasen.Rect,
+    detail: chasen.Rect,
+    inner_divider: chasen.Rect,
+    files: chasen.Rect,
+};
 
-    if (body_height < size.height) {
-        const total = history_page.detailVisualRowCount(detail.snapshot.canonical_payload, size.width);
-        const end = @min(total, detail.top_visual_row + @as(usize, body_height));
-        const visible_status = if (context.page_state.status.text().len > 0)
-            context.page_state.status.text()
-        else if (context.shell_status) |status|
-            status.text()
-        else
-            "";
-        const indicator = if (visible_status.len > 0)
-            visible_status
-        else if (total > @as(usize, body_height))
-            try std.fmt.allocPrint(content.frameAllocator(), "Rows {d}-{d} of {d}", .{
-                @min(detail.top_visual_row + 1, total),
-                end,
-                total,
-            })
-        else
-            "";
-        const indicator_style = if (std.mem.startsWith(u8, indicator, "clipboard copy sent:"))
-            context.palette.style(.accent)
-        else if (visible_status.len > 0)
-            context.palette.style(.danger)
-        else
-            context.palette.style(.muted);
-        try draw.copyClippedTextAt(&content, 0, body_height, indicator, indicator_style);
-    }
-    if (body_height +| 1 < size.height) {
-        const items = [_]ui.key_hint.Item{
-            ui.key_hint.item("y", "copy"),
-            ui.key_hint.item("j/k PgUp/PgDn Home/End", "scroll"),
-            ui.key_hint.item("i/Esc/q", "close"),
-        };
-        _ = try ui.key_hint.draw(&content, 0, body_height + 1, &items, .{
-            .key_style = context.palette.boldStyle(.accent),
-            .action_style = context.palette.style(.muted),
-        });
-    }
-}
-
-pub fn detailContentSize(size: chasen.Size) history_page.DetailSize {
-    const overlay: chasen.Rect = .{ .col = 0, .row = 0, .width = size.width, .height = size.height };
-    const dialog = ui.Modal.dialogRectFor(overlay, .{
-        .dialog_width = @min(size.width, 100),
-        .dialog_height = @min(size.height, 24),
-    });
-    const content = ui.Modal.contentRectFor(dialog, .{ .top = 1, .right = 1, .bottom = 1, .left = 1 });
-    return .{ .width = content.width, .height = content.height -| 2 };
-}
-
-fn drawWrappedTextScrolled(surface: *chasen.Surface, text: []const u8, scroll: usize, style: chasen.TextStyle) usize {
-    const size = surface.size();
-    if (size.width == 0 or size.height == 0) return 0;
-    const clamped_scroll = @min(scroll, history_page.detailMaxOffset(text, .{
-        .width = size.width,
+pub fn pickerLayout(size: chasen.Size, state: history_page.interaction.State) PickerLayout {
+    const outer = state.outerWidths(size.width);
+    const history: chasen.Rect = .{
+        .col = 0,
+        .row = 0,
+        .width = outer.left,
         .height = size.height,
-    }));
-    var logical_row: usize = 0;
-    var drawn_rows: usize = 0;
-    var line_start: usize = 0;
-    var line_end: usize = 0;
-    var line_width: u32 = 0;
-    var iter = chasen.text.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        if (bytes.len == 1 and bytes[0] == '\n') {
-            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style)) return drawn_rows;
-            logical_row += 1;
-            line_start = grapheme.start + grapheme.len;
-            line_end = line_start;
-            line_width = 0;
-            continue;
-        }
-        const grapheme_width = chasen.text.displayWidth(bytes);
-        if (line_width > 0 and line_width + grapheme_width > size.width) {
-            if (drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style)) return drawn_rows;
-            logical_row += 1;
-            line_start = grapheme.start;
-            line_end = grapheme.start;
-            line_width = 0;
-        }
-        line_end = grapheme.start + grapheme.len;
-        line_width += grapheme_width;
+    };
+    const outer_divider: chasen.Rect = .{
+        .col = outer.left,
+        .row = 0,
+        .width = outer.divider,
+        .height = size.height,
+    };
+    const right: chasen.Rect = .{
+        .col = outer.left +| outer.divider,
+        .row = 0,
+        .width = outer.right,
+        .height = size.height,
+    };
+    var right_parts: [3]chasen.Rect = undefined;
+    _ = ui.layout.splitVertical(&right_parts, right, &.{
+        .{ .fill = 2 },
+        .{ .length = 1 },
+        .{ .fill = 3 },
+    });
+    return .{
+        .history = history,
+        .outer_divider = outer_divider,
+        .detail = right_parts[0],
+        .inner_divider = right_parts[1],
+        .files = right_parts[2],
+    };
+}
+
+pub fn moveDetail(
+    page: *history_page.HistoryPageState,
+    allocator: std.mem.Allocator,
+    size: chasen.Size,
+    action: history_page.interaction.VerticalAction,
+) !void {
+    const detail = readyDetail(page) orelse return;
+    var projection = try DetailProjection.init(allocator, detail);
+    defer projection.deinit(allocator);
+    const body = paneBodyRect(pickerLayout(size, page.interaction_state).detail);
+    page.interaction_state.moveDetail(projection.slice(), body.width, body.height, action);
+}
+
+pub fn moveFiles(
+    page: *history_page.HistoryPageState,
+    size: chasen.Size,
+    action: history_page.interaction.VerticalAction,
+) void {
+    const files = readyFiles(page) orelse return;
+    const body = paneBodyRect(pickerLayout(size, page.interaction_state).files);
+    page.interaction_state.moveFilesVertical(files.len, body.height, action);
+}
+
+pub fn scrollFiles(
+    page: *history_page.HistoryPageState,
+    allocator: std.mem.Allocator,
+    size: chasen.Size,
+    action: history_page.interaction.HorizontalAction,
+) !void {
+    const files = readyFiles(page) orelse return;
+    const body = paneBodyRect(pickerLayout(size, page.interaction_state).files);
+    const columns = fileColumns(body.width, maxStatsWidth(files));
+    page.interaction_state.moveFilesHorizontal(
+        try maxPathCells(allocator, files),
+        columns.path_width,
+        action,
+    );
+}
+
+pub fn reflowPreview(
+    page: *history_page.HistoryPageState,
+    allocator: std.mem.Allocator,
+    size: chasen.Size,
+) !void {
+    const layout = pickerLayout(size, page.interaction_state);
+    const detail_body = paneBodyRect(layout.detail);
+    if (readyDetail(page)) |detail| {
+        var projection = try DetailProjection.init(allocator, detail);
+        defer projection.deinit(allocator);
+        page.interaction_state.reflowDetail(projection.slice(), detail_body.width, detail_body.height);
+    } else {
+        page.interaction_state.detail_anchor = .{};
     }
-    _ = drawWrappedLine(surface, text[line_start..line_end], logical_row, clamped_scroll, &drawn_rows, style);
-    return drawn_rows;
+
+    const files_body = paneBodyRect(layout.files);
+    if (readyFiles(page)) |files| {
+        const columns = fileColumns(files_body.width, maxStatsWidth(files));
+        page.interaction_state.clampFiles(
+            files.len,
+            files_body.height,
+            try maxPathCells(allocator, files),
+            columns.path_width,
+        );
+    } else {
+        page.interaction_state.files_vertical_offset = 0;
+        page.interaction_state.files_horizontal_offset = 0;
+    }
 }
 
-fn drawWrappedLine(
+fn viewThreePane(context: ViewContext, surface: *chasen.Surface) !void {
+    const layout = pickerLayout(surface.size(), context.page_state.interaction_state);
+    var history_surface = surface.child(layout.history);
+    try viewPicker(context, &history_surface, context.page_state.interaction_state.focus == .history);
+
+    const divider = ui.Divider.init(.{});
+    var outer_divider = surface.child(layout.outer_divider);
+    divider.view(&outer_divider, .{
+        .direction = .vertical,
+        .glyph = "│",
+        .style = context.palette.style(.muted),
+    });
+
+    var detail_surface = surface.child(layout.detail);
+    try viewDetailPane(context, &detail_surface);
+    var inner_divider = surface.child(layout.inner_divider);
+    divider.view(&inner_divider, .{
+        .direction = .horizontal,
+        .glyph = "─",
+        .style = context.palette.style(.muted),
+    });
+    var files_surface = surface.child(layout.files);
+    try viewFilesPane(context, &files_surface);
+}
+
+fn paneBodyRect(rect: chasen.Rect) chasen.Rect {
+    return .{
+        .col = rect.col,
+        .row = rect.row +| @min(rect.height, 1),
+        .width = rect.width,
+        .height = rect.height -| 1,
+    };
+}
+
+fn drawPaneTitle(surface: *chasen.Surface, title: []const u8, active: bool, palette: theme.Palette) !void {
+    if (surface.size().height == 0) return;
+    try drawClipped(
+        surface,
+        0,
+        0,
+        try std.fmt.allocPrint(surface.frameAllocator(), "{s} {s}", .{ if (active) ">" else " ", title }),
+        if (active) palette.boldStyle(.accent) else palette.style(.muted),
+    );
+}
+
+fn viewDetailPane(context: ViewContext, surface: *chasen.Surface) !void {
+    const active = context.page_state.interaction_state.focus == .commit_detail;
+    try drawPaneTitle(surface, detailTitle(context.page_state), active, context.palette);
+    if (surface.size().height <= 1) return;
+    var body = surface.child(.{
+        .col = 0,
+        .row = 1,
+        .width = surface.size().width,
+        .height = surface.size().height - 1,
+    });
+    const detail = readyDetail(context.page_state) orelse {
+        try drawPaneMessage(&body, detailStateText(context.page_state), context.palette);
+        return;
+    };
+    const projection = try DetailProjection.init(surface.frameAllocator(), detail);
+    try drawDetailBlocks(
+        &body,
+        projection.slice(),
+        context.page_state.interaction_state.detail_anchor,
+        active,
+        context.palette,
+    );
+}
+
+fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
+    const active = context.page_state.interaction_state.focus == .changed_files;
+    try drawPaneTitle(surface, "Changed files", active, context.palette);
+    if (surface.size().height <= 1) return;
+    var body = surface.child(.{
+        .col = 0,
+        .row = 1,
+        .width = surface.size().width,
+        .height = surface.size().height - 1,
+    });
+    const files = readyFiles(context.page_state) orelse {
+        try drawPaneMessage(&body, filesStateText(context.page_state), context.palette);
+        return;
+    };
+    if (files.len == 0) {
+        try drawPaneMessage(&body, "No changed files", context.palette);
+        return;
+    }
+
+    const columns = fileColumns(body.size().width, maxStatsWidth(files));
+    const start = @min(context.page_state.interaction_state.files_vertical_offset, files.len);
+    const end = @min(files.len, start +| @as(usize, body.size().height));
+    for (files[start..end], 0..) |file, visible_index| {
+        const row: u16 = @intCast(visible_index);
+        if (columns.status_width > 0) {
+            try drawClipped(&body, 0, row, file.statusBadge(), context.palette.boldStyle(.accent));
+        }
+        if (columns.path_width > 0) {
+            const path = try history_page.preview.pathFieldAlloc(body.frameAllocator(), file.kind);
+            try drawProjectedWindow(
+                &body,
+                columns.path_col,
+                row,
+                path,
+                context.page_state.interaction_state.files_horizontal_offset,
+                columns.path_width,
+                chasen.TextStyle{},
+            );
+        }
+        if (columns.stats_width > 0) {
+            try drawClipped(
+                &body,
+                columns.stats_col,
+                row,
+                try statsText(body.frameAllocator(), file.stats),
+                context.palette.style(.muted),
+            );
+        }
+    }
+}
+
+fn drawPaneMessage(surface: *chasen.Surface, message: []const u8, palette: theme.Palette) !void {
+    if (surface.size().width == 0 or surface.size().height == 0) return;
+    try drawClipped(surface, @min(surface.size().width, 1), 0, message, palette.style(.muted));
+}
+
+fn detailTitle(page: *const history_page.HistoryPageState) []const u8 {
+    if (page.preview_state.accepted) |accepted| return switch (accepted.payload.detail) {
+        .ready => |detail| switch (detail) {
+            .single => "Commit detail",
+            .range => "Range summary",
+        },
+        else => selectionTitle(accepted.key.identity.selection),
+    };
+    if (page.preview_state.current_key) |key| return selectionTitle(key.identity.selection);
+    return "Commit detail";
+}
+
+fn selectionTitle(summary: git_preview.SelectionSummary) []const u8 {
+    return switch (summary) {
+        .single => "Commit detail",
+        .range => "Range summary",
+    };
+}
+
+fn detailStateText(page: *const history_page.HistoryPageState) []const u8 {
+    if (page.preview_state.accepted) |accepted| return switch (accepted.payload.detail) {
+        .ready => unreachable,
+        .too_large => "Detail too large",
+        .unavailable => "Detail unavailable",
+        .failed => "Detail failed",
+    };
+    return phaseText(page.preview_state.phase);
+}
+
+fn filesStateText(page: *const history_page.HistoryPageState) []const u8 {
+    if (page.preview_state.accepted) |accepted| return switch (accepted.payload.files) {
+        .ready => unreachable,
+        .too_large => "File list too large",
+        .unavailable => "File list unavailable",
+        .failed => "File list failed",
+    };
+    return phaseText(page.preview_state.phase);
+}
+
+fn phaseText(phase: history_page.preview.Phase) []const u8 {
+    return switch (phase) {
+        .idle => "Preview idle",
+        .loading => "Loading preview…",
+        .resolved => "Preview unavailable",
+        .terminal => "Preview unavailable",
+    };
+}
+
+fn readyDetail(page: *const history_page.HistoryPageState) ?git_preview.Detail {
+    const accepted = page.preview_state.accepted orelse return null;
+    return switch (accepted.payload.detail) {
+        .ready => |detail| detail,
+        else => null,
+    };
+}
+
+fn readyFiles(page: *const history_page.HistoryPageState) ?[]const git_preview.FileChange {
+    const accepted = page.preview_state.accepted orelse return null;
+    return switch (accepted.payload.files) {
+        .ready => |files| files,
+        else => null,
+    };
+}
+
+const DetailProjection = struct {
+    payload: []u8,
+    blocks: [10]history_page.interaction.DetailBlock = undefined,
+    len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, detail: git_preview.Detail) !DetailProjection {
+        var result: DetailProjection = .{
+            .payload = try history_page.preview.canonicalDetailAlloc(allocator, detail),
+        };
+        errdefer allocator.free(result.payload);
+        var remaining: []const u8 = result.payload;
+        const expected: usize = switch (detail) {
+            .single => 10,
+            .range => 5,
+        };
+        while (result.len < expected) : (result.len += 1) {
+            if (expected == 10 and result.len == 9) {
+                const prefix = "Message:\n";
+                if (!std.mem.startsWith(u8, remaining, prefix)) return error.MalformedDetailPresentation;
+                result.blocks[result.len] = .{ .label = "Message: ", .value = remaining[prefix.len..] };
+                remaining = "";
+                continue;
+            }
+            const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+            const line = remaining[0..line_end];
+            const separator = std.mem.indexOf(u8, line, ": ") orelse return error.MalformedDetailPresentation;
+            result.blocks[result.len] = .{
+                .label = line[0 .. separator + 2],
+                .value = line[separator + 2 ..],
+            };
+            remaining = if (line_end < remaining.len) remaining[line_end + 1 ..] else "";
+        }
+        if (remaining.len != 0) return error.MalformedDetailPresentation;
+        return result;
+    }
+
+    fn deinit(self: *DetailProjection, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+
+    fn slice(self: *const DetailProjection) []const history_page.interaction.DetailBlock {
+        return self.blocks[0..self.len];
+    }
+};
+
+fn drawDetailBlocks(
     surface: *chasen.Surface,
-    line: []const u8,
-    logical_row: usize,
-    scroll: usize,
-    drawn_rows: *usize,
-    style: chasen.TextStyle,
-) bool {
-    if (logical_row < scroll) return false;
-    if (drawn_rows.* >= @as(usize, surface.size().height)) return true;
-    _ = surface.borrowTextAt(0, @intCast(drawn_rows.*), line, style);
-    drawn_rows.* += 1;
-    return drawn_rows.* >= @as(usize, surface.size().height);
+    blocks: []const history_page.interaction.DetailBlock,
+    anchor: history_page.interaction.ContentAnchor,
+    active: bool,
+    palette: theme.Palette,
+) !void {
+    var lines = (history_page.interaction.DetailLayout{
+        .blocks = blocks,
+        .width = surface.size().width,
+    }).lineStarts();
+    var current = lines.next();
+    var row: u16 = 0;
+    var started = false;
+    while (current) |line| {
+        const next = lines.next();
+        if (!started and (line.block_index > anchor.block_index or
+            (line.block_index == anchor.block_index and line.source_byte_offset >= anchor.source_byte_offset)))
+        {
+            started = true;
+        }
+        if (started and row < surface.size().height) {
+            const block = blocks[line.block_index];
+            var end = if (next) |next_line|
+                if (next_line.block_index == line.block_index) next_line.source_byte_offset else block.value.len
+            else
+                block.value.len;
+            if (end > line.source_byte_offset and block.value[end - 1] == '\n') end -= 1;
+            const label_width: u16 = @intCast(@min(chasen.text.displayWidth(block.label), std.math.maxInt(u16)));
+            if (line.source_byte_offset == 0) {
+                try drawClipped(
+                    surface,
+                    0,
+                    row,
+                    block.label,
+                    if (active) palette.boldStyle(.accent) else palette.style(.prompt),
+                );
+            }
+            try drawClipped(
+                surface,
+                @min(label_width, surface.size().width -| 1),
+                row,
+                block.value[line.source_byte_offset..end],
+                chasen.TextStyle{},
+            );
+            row += 1;
+        }
+        if (row >= surface.size().height) break;
+        current = next;
+    }
 }
 
-fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
+const FileColumns = struct {
+    status_width: u16,
+    path_col: u16,
+    path_width: u16,
+    stats_col: u16,
+    stats_width: u16,
+};
+
+fn fileColumns(width: u16, requested_stats_width: u16) FileColumns {
+    const status_width = @min(width, 1);
+    const first_gap = @min(width -| status_width, 1);
+    const remaining = width -| status_width -| first_gap;
+    const stats_width = if (remaining >= 2) @min(requested_stats_width, remaining - 2) else 0;
+    const stats_gap = if (stats_width > 0 and remaining > stats_width) @as(u16, 1) else 0;
+    const path_width = remaining -| stats_gap -| stats_width;
+    const path_col = status_width +| first_gap;
+    return .{
+        .status_width = status_width,
+        .path_col = path_col,
+        .path_width = path_width,
+        .stats_col = path_col +| path_width +| stats_gap,
+        .stats_width = stats_width,
+    };
+}
+
+fn maxStatsWidth(files: []const git_preview.FileChange) u16 {
+    var result: usize = 0;
+    for (files) |file| result = @max(result, statsTextWidth(file.stats));
+    return @intCast(@min(result, 43));
+}
+
+fn statsTextWidth(stats: git_preview.StatsKind) usize {
+    return switch (stats) {
+        .text => |text| std.fmt.count("+{d} -{d}", .{ text.added, text.removed }),
+        .binary => "binary".len,
+        .mode_only => "mode".len,
+        .submodule => "submodule".len,
+    };
+}
+
+fn statsText(allocator: std.mem.Allocator, stats: git_preview.StatsKind) ![]const u8 {
+    return switch (stats) {
+        .text => |text| try std.fmt.allocPrint(allocator, "+{d} -{d}", .{ text.added, text.removed }),
+        .binary => "binary",
+        .mode_only => "mode",
+        .submodule => "submodule",
+    };
+}
+
+fn maxPathCells(allocator: std.mem.Allocator, files: []const git_preview.FileChange) !usize {
+    var result: usize = 0;
+    for (files) |file| {
+        const path = try history_page.preview.pathFieldAlloc(allocator, file.kind);
+        defer allocator.free(path);
+        const projection = try ui.text_projection.Projection.init(path, .{ .tab_width = 4 });
+        result = @max(result, projection.displayWidth());
+    }
+    return result;
+}
+
+fn drawProjectedWindow(
+    surface: *chasen.Surface,
+    start_col: u16,
+    row: u16,
+    text: []const u8,
+    offset: usize,
+    width: u16,
+    style: chasen.TextStyle,
+) !void {
+    if (width == 0 or start_col >= surface.size().width or row >= surface.size().height) return;
+    const projection = try ui.text_projection.Projection.init(text, .{ .tab_width = 4 });
+    var visible = projection.visibleSegments(offset, width);
+    var col = start_col;
+    while (visible.next()) |segment| switch (segment.materialization) {
+        .source => |bytes| {
+            _ = surface.borrowTextAt(col, row, bytes, style);
+            col +|= @intCast(@min(chasen.text.displayWidth(bytes), std.math.maxInt(u16)));
+        },
+        .spaces => |count| {
+            var index: usize = 0;
+            while (index < count and col < start_col +| width) : (index += 1) {
+                _ = surface.borrowTextAt(col, row, " ", style);
+                col +|= 1;
+            }
+        },
+    };
+}
+
+fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
     const page = context.page_state;
+    try drawPaneTitle(surface, "History", pane_active, context.palette);
 
     if (page.load_state == .no_repository) {
         drawState(surface, context.palette, "History", "History requires a repository", "R: switch repository");
@@ -322,7 +677,7 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
         try previousDiffLabel(surface.frameAllocator(), page.accepted.?)
     else
         null;
-    try drawCatalogContext(surface, context.palette, page, snapshot, previous);
+    try drawCatalogContext(surface, context.palette, page, snapshot, previous, pane_active);
 
     if (page.catalog.records.items.len == 0) {
         if (size.height > 1) try drawClipped(
@@ -339,10 +694,11 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
     for (range.start..range.end) |index| {
         const row: u16 = @intCast(1 + index - range.start);
         if (row >= size.height) break;
-        const focused = index == page.catalog.cursor;
+        const selected = index == page.catalog.cursor;
+        const focused = selected and pane_active;
         if (focused) fillSelectedRow(surface, row, context.palette.color(.pane_cursor_bg));
         if (index == page.catalog.records.items.len) {
-            const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s} … ", .{if (focused) "›" else " "});
+            const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s} … ", .{if (selected) "›" else " "});
             try drawClipped(surface, 0, row, markers, catalogStyle(context.palette, .prompt, focused));
             const label = if (page.load_state == .loading) "Loading older commits…" else "Load 200 older commits…";
             try drawClipped(surface, row_prefix_width, row, label, catalogStyle(context.palette, .prompt, focused));
@@ -359,7 +715,7 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface) !void {
         else
             null;
         const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}{s} ", .{
-            if (focused) "›" else " ",
+            if (selected) "›" else " ",
             range_marker orelse " ",
             topologyMarker(record),
         });
@@ -486,11 +842,16 @@ fn drawCatalogContext(
     page: *const history_page.HistoryPageState,
     snapshot: *const git_history.Snapshot,
     previous: ?[]const u8,
+    pane_active: bool,
 ) !void {
     const size = surface.size();
     if (size.width <= 2 or size.height == 0) return;
     const allocator = surface.frameAllocator();
-    const base = try catalogHeadContextLabel(allocator, snapshot);
+    const base = try std.fmt.allocPrint(
+        allocator,
+        "History · {s}",
+        .{try catalogHeadContextLabel(allocator, snapshot)},
+    );
     var left = base;
     if (page.catalog.capped) {
         left = try std.fmt.allocPrint(allocator, "{s} · Limit: 2,000 commits loaded", .{left});
@@ -503,12 +864,12 @@ fn drawCatalogContext(
 
     const position = try catalogPositionLabel(allocator, page);
     const content_width: u16 = size.width -| 2;
-    const base_width = chasen.text.displayWidth(base);
+    const left_text_width = chasen.text.displayWidth(left);
     const full_width = chasen.text.displayWidth(position.full);
     const compact_width = chasen.text.displayWidth(position.compact);
-    const right = if (base_width +| column_gap +| full_width <= content_width)
+    const right = if (left_text_width +| column_gap +| full_width <= content_width)
         position.full
-    else if (base_width +| column_gap +| compact_width <= content_width)
+    else if (left_text_width +| column_gap +| compact_width <= content_width)
         position.compact
     else
         null;
@@ -517,12 +878,25 @@ fn drawCatalogContext(
         const right_width = chasen.text.displayWidth(right_text);
         const right_col: u16 = size.width - @as(u16, @intCast(right_width));
         const left_width = right_col -| column_gap -| 2;
-        try drawClippedField(surface, 2, 0, left_width, left, palette.boldStyle(.accent));
+        try drawClippedField(
+            surface,
+            2,
+            0,
+            left_width,
+            left,
+            if (pane_active) palette.boldStyle(.accent) else palette.style(.muted),
+        );
         try drawClipped(surface, right_col, 0, right_text, palette.style(.muted));
         return;
     }
 
-    try drawClipped(surface, 2, 0, left, palette.boldStyle(.accent));
+    try drawClipped(
+        surface,
+        2,
+        0,
+        left,
+        if (pane_active) palette.boldStyle(.accent) else palette.style(.muted),
+    );
 }
 
 fn catalogHeadContextLabel(allocator: std.mem.Allocator, snapshot: *const git_history.Snapshot) ![]const u8 {
@@ -733,6 +1107,113 @@ fn drawClipped(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, s
     });
 }
 
+test "History preview three pane layout is exact and saturates a tiny body" {
+    const layout = pickerLayout(.{ .width = 120, .height = 27 }, .{});
+    try std.testing.expectEqual(chasen.Rect{ .col = 0, .row = 0, .width = 59, .height = 27 }, layout.history);
+    try std.testing.expectEqual(chasen.Rect{ .col = 59, .row = 0, .width = 1, .height = 27 }, layout.outer_divider);
+    try std.testing.expectEqual(chasen.Rect{ .col = 60, .row = 0, .width = 60, .height = 11 }, layout.detail);
+    try std.testing.expectEqual(chasen.Rect{ .col = 60, .row = 11, .width = 60, .height = 1 }, layout.inner_divider);
+    try std.testing.expectEqual(chasen.Rect{ .col = 60, .row = 12, .width = 60, .height = 15 }, layout.files);
+
+    const tiny = pickerLayout(.{ .width = 1, .height = 0 }, .{});
+    for ([_]chasen.Rect{ tiny.history, tiny.outer_divider, tiny.detail, tiny.inner_divider, tiny.files }) |rect| {
+        try std.testing.expect(rect.col +| rect.width <= 1);
+        try std.testing.expectEqual(@as(u16, 0), rect.height);
+    }
+}
+
+test "History preview three pane renders focus structured detail and flat files" {
+    const before = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const after = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const oldest = try git_history.ObjectId.parse(.sha1, "3333333333333333333333333333333333333333");
+    const summary: git_preview.RangeSummary = .{
+        .count = 3,
+        .oldest_oid = oldest,
+        .newest_oid = after,
+        .basis = .{ .object_format = .sha1, .before = .{ .commit = before }, .after = after },
+    };
+    const path = "src/history/preview-with-a-very-long-component-name-that-needs-horizontal-scrolling.zig";
+    var files = [_]git_preview.FileChange{.{
+        .kind = .{ .modified = @constCast(path) },
+        .old_mode = 0o100644,
+        .new_mode = 0o100644,
+        .old_oid = before,
+        .new_oid = after,
+        .stats = .{ .text = .{ .added = 3, .removed = 1 } },
+    }};
+    var page_state: history_page.HistoryPageState = .{};
+    defer {
+        page_state.preview_state.accepted = null;
+        page_state.deinit(std.testing.allocator);
+    }
+    page_state.interaction_state.focus = .changed_files;
+    page_state.preview_state.phase = .resolved;
+    page_state.preview_state.accepted = .{
+        .key = .{
+            .identity = .{
+                .page = .{ .origin = .history, .repo_epoch = 1, .activation_id = 1 },
+                .root = .{ .device = 1, .inode = 2 },
+                .catalog_instance = 1,
+                .selection = .{ .range = summary },
+            },
+            .generation = 1,
+        },
+        .payload = .{
+            .detail = .{ .ready = .{ .range = summary } },
+            .files = .{ .ready = files[0..] },
+        },
+    };
+
+    var palette = theme.Palette.default();
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    var rendered: chasen.testing.TestSurface = undefined;
+    try rendered.init(120, 27);
+    defer rendered.deinit();
+    try view(.{ .page_state = &page_state, .palette = palette }, &rendered.surface);
+
+    const snapshot = try rendered.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "History") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Range summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Count: 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/history/preview-with") != null);
+    try rendered.expectCellText(59, 0, "│");
+    const divider_cell = rendered.surface.readCell(59, 0) orelse return error.ExpectedOuterDivider;
+    try std.testing.expect(divider_cell.style.fg.eql(palette.color(.muted)));
+    try rendered.expectCellText(60, 11, "─");
+    const horizontal_divider_cell = rendered.surface.readCell(60, 11) orelse return error.ExpectedInnerDivider;
+    try std.testing.expect(horizontal_divider_cell.style.fg.eql(palette.color(.muted)));
+    try rendered.expectCellText(60, 12, ">");
+    try rendered.expectCellText(60, 13, "M");
+    const columns = fileColumns(60, maxStatsWidth(&files));
+    try rendered.expectCellText(60 + columns.stats_col, 13, "+");
+    const active_marker = rendered.surface.readCell(60, 12) orelse return error.ExpectedActivePaneMarker;
+    try std.testing.expect(active_marker.style.bold);
+    try std.testing.expect(active_marker.style.fg.eql(palette.color(.accent)));
+
+    try scrollFiles(&page_state, std.testing.allocator, .{ .width = 120, .height = 27 }, .right);
+    try std.testing.expectEqual(@as(usize, 1), page_state.interaction_state.files_horizontal_offset);
+    var scrolled: chasen.testing.TestSurface = undefined;
+    try scrolled.init(120, 27);
+    defer scrolled.deinit();
+    try view(.{ .page_state = &page_state, .palette = palette }, &scrolled.surface);
+    try scrolled.expectCellText(60, 13, "M");
+    try scrolled.expectCellText(62, 13, "r");
+    try scrolled.expectCellText(60 + columns.stats_col, 13, "+");
+
+    const blocks = [_]history_page.interaction.DetailBlock{.{
+        .label = "Message: ",
+        .value = "abcdefghijk",
+    }};
+    var wrapped: chasen.testing.TestSurface = undefined;
+    try wrapped.init(14, 3);
+    defer wrapped.deinit();
+    try drawDetailBlocks(&wrapped.surface, &blocks, .{}, false, palette);
+    try wrapped.expectCellText(9, 0, "a");
+    try wrapped.expectCellText(9, 1, "f");
+}
+
 test "History catalog renders selected rows at 80x24 and 120x32" {
     const allocator = std.testing.allocator;
     const head = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
@@ -796,7 +1277,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         var rendered: chasen.testing.TestSurface = undefined;
         try rendered.init(size.width, size.height);
         defer rendered.deinit();
-        try view(.{ .page_state = &page_state, .palette = palette }, &rendered.surface);
+        try viewPicker(.{ .page_state = &page_state, .palette = palette }, &rendered.surface, true);
         const snapshot = try rendered.snapshot(allocator);
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Branch main · HEAD 1111111") != null);
@@ -806,7 +1287,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         try std.testing.expect(std.mem.indexOf(u8, snapshot, " AM 1111111") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "›┃R 3333333") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "root subject") != null);
-        try rendered.expectCellText(2, 0, "B");
+        try rendered.expectCellText(2, 0, "H");
         const layout = CommitRowLayout.init(size.width);
         try rendered.expectCellText(layout.commit.col, 1, "1");
         try rendered.expectCellText(layout.date.col, 1, "2");
@@ -876,7 +1357,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     var detached_more: chasen.testing.TestSurface = undefined;
     try detached_more.init(80, 24);
     defer detached_more.deinit();
-    try view(.{ .page_state = &page_state, .palette = .default() }, &detached_more.surface);
+    try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &detached_more.surface, true);
     const detached_more_snapshot = try detached_more.snapshot(allocator);
     defer allocator.free(detached_more_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Detached HEAD 1111111") != null);
@@ -899,7 +1380,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     var appended: chasen.testing.TestSurface = undefined;
     try appended.init(80, 24);
     defer appended.deinit();
-    try view(.{ .page_state = &page_state, .palette = .default() }, &appended.surface);
+    try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &appended.surface, true);
     const appended_layout = CommitRowLayout.init(80);
     try appended.expectCellText(appended_layout.commit.col, 4, "4");
     try appended.expectCellText(appended_layout.date.col, 4, "1");
@@ -926,7 +1407,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     var changed: chasen.testing.TestSurface = undefined;
     try changed.init(120, 32);
     defer changed.deinit();
-    try view(.{ .page_state = &page_state, .palette = .default() }, &changed.surface);
+    try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &changed.surface, true);
     const changed_snapshot = try changed.snapshot(allocator);
     defer allocator.free(changed_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "Branch feature · HEAD 2222222") != null);
@@ -936,7 +1417,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     var capped: chasen.testing.TestSurface = undefined;
     try capped.init(120, 32);
     defer capped.deinit();
-    try view(.{ .page_state = &page_state, .palette = .default() }, &capped.surface);
+    try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &capped.surface, true);
     const capped_snapshot = try capped.snapshot(allocator);
     defer allocator.free(capped_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, capped_snapshot, "Limit: 2,000 commits loaded") != null);
@@ -954,7 +1435,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     var unborn: chasen.testing.TestSurface = undefined;
     try unborn.init(80, 24);
     defer unborn.deinit();
-    try view(.{ .page_state = &page_state, .palette = .default() }, &unborn.surface);
+    try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &unborn.surface, true);
     const unborn_snapshot = try unborn.snapshot(allocator);
     defer allocator.free(unborn_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "Branch future · Unborn") != null);
@@ -973,7 +1454,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     var failed: chasen.testing.TestSurface = undefined;
     try failed.init(80, 24);
     defer failed.deinit();
-    try view(.{ .page_state = &page_state, .palette = .default() }, &failed.surface);
+    try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &failed.surface, true);
     const failed_snapshot = try failed.snapshot(allocator);
     defer allocator.free(failed_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "History  broken @ 2222222") != null);
@@ -1132,75 +1613,4 @@ test "History fixed row fields clip ASCII wide and combining metadata without ov
     try std.testing.expect(std.mem.indexOf(u8, snapshot, &epoch_date) != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "author suffix") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "subject without refs") != null);
-}
-
-test "History commit detail reaches a 16 KiB ASCII wide combining document and copies it whole" {
-    const allocator = std.testing.allocator;
-    const oid = try git_history.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    const tail = "TAIL-猫-e\u{301}";
-    const subject = try allocator.alloc(u8, 16 * 1024);
-    @memset(subject, 's');
-    @memcpy(subject[subject.len - tail.len ..], tail);
-    const author = try allocator.dupe(u8, "Long Author");
-    const committed = try allocator.dupe(u8, "2024-09-01 12:35:23 +00:00");
-    const decorations = try allocator.dupe(u8, "HEAD -> main, tag: wide-猫");
-    const payload = try std.fmt.allocPrint(
-        allocator,
-        "Commit: {s}\nAuthor: {s}\nCommitted: {s}\nRefs: {s}\nSubject: {s}",
-        .{ oid.slice(), author, committed, decorations, subject },
-    );
-    var page_state: history_page.HistoryPageState = .{ .detail = .{ .open = .{
-        .snapshot = .{
-            .oid = oid,
-            .author = author,
-            .committed = committed,
-            .decorations = decorations,
-            .subject = subject,
-            .canonical_payload = payload,
-        },
-        .modal_instance_id = 1,
-    } } };
-    defer page_state.deinit(allocator);
-    var shell_status: app_state.StatusMessage = .{};
-    const context: ViewContext = .{
-        .page_state = &page_state,
-        .palette = .default(),
-        .shell_status = &shell_status,
-    };
-
-    const size: chasen.Size = .{ .width = 80, .height = 24 };
-    var rendered: chasen.testing.TestSurface = undefined;
-    try rendered.init(size.width, size.height);
-    defer rendered.deinit();
-    try viewCommitDetail(context, &rendered.surface);
-    const start = try rendered.snapshot(allocator);
-    defer allocator.free(start);
-    try std.testing.expect(std.mem.indexOf(u8, start, "Commit detail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, start, "Commit: 0123456789abcdef") != null);
-    try std.testing.expect(std.mem.indexOf(u8, start, "Rows 1-") != null);
-    try std.testing.expect(std.mem.indexOf(u8, start, "y: copy") != null);
-
-    shell_status.set("close History commit detail before switching pages", .{});
-    try viewCommitDetail(context, &rendered.surface);
-    const blocked = try rendered.snapshot(allocator);
-    defer allocator.free(blocked);
-    try std.testing.expect(std.mem.indexOf(u8, blocked, shell_status.text()) != null);
-    shell_status.clear();
-
-    const content_size = detailContentSize(size);
-    page_state.scrollDetail(.end, content_size);
-    try viewCommitDetail(context, &rendered.surface);
-    const end = try rendered.snapshot(allocator);
-    defer allocator.free(end);
-    try std.testing.expect(std.mem.indexOf(u8, end, "e\u{301}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, end, " of ") != null);
-    const copy = page_state.beginDetailCopy().?;
-    try std.testing.expectEqual(payload.len, copy.payload.len);
-    try std.testing.expectEqualStrings(payload, copy.payload);
-
-    page_state.clampDetailViewport(detailContentSize(.{ .width = 120, .height = 32 }));
-    try std.testing.expectEqual(
-        history_page.detailMaxOffset(payload, detailContentSize(.{ .width = 120, .height = 32 })),
-        page_state.openDetailConst().?.top_visual_row,
-    );
 }
