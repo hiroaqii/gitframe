@@ -422,6 +422,10 @@ pub const App = struct {
                 .repository_activation_id = self.pages.repository.activation_id,
                 .history_activation_id = self.pages.history.activation.next_activation_id,
                 .compare_activation_id = self.pages.compare.activation.next_activation_id,
+                .history_preview = if (self.pages.history.preview_state.currentCopyAuthority()) |authority| .{
+                    .selection_generation = authority.selection_generation,
+                    .copy_generation = authority.copy_generation,
+                } else null,
                 .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
                 .commit_panel_instance_id = self.localWorkflowView().commitPanelInstanceId(),
             },
@@ -1075,8 +1079,12 @@ pub const App = struct {
                 .catalog => |result_value| {
                     var result = result_value;
                     defer result.deinit(ctx.allocator());
-                    if (try self.historyCoordinator().finishCatalog(ctx.allocator(), &result) == .discarded)
-                        self.redraw_plan.requestSkip();
+                    const history = self.historyCoordinator();
+                    switch (try history.finishCatalog(ctx.allocator(), &result)) {
+                        .discarded => self.redraw_plan.requestSkip(),
+                        .changed => _ = try history.requestPreview(ctx),
+                        .failed => {},
+                    }
                 },
                 .diff => |result_value| {
                     var result = result_value;

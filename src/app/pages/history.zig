@@ -533,7 +533,7 @@ pub const HistoryPageState = struct {
             .cancel_draft => if (!self.returnToAccepted() and !self.draft.clearAnchor())
                 self.status.set("No previously selected diff", .{}),
             .unsupported_search => self.status.set("Commit search is not available in v1", .{}),
-            .load_diff, .open_picker, .focus_next, .focus_previous, .move_detail, .move_files, .scroll_files, .adjust_width, .common => unreachable,
+            .load_diff, .open_picker, .focus_next, .focus_previous, .move_detail, .move_files, .scroll_files, .adjust_width, .copy_detail, .common => unreachable,
             .owned_noop => {},
         }
         if (previous_cursor != self.catalog.cursor or previous_anchor != self.draft.anchor()) {
@@ -554,6 +554,7 @@ pub const HistoryPageState = struct {
     /// Resolve the current picker selection and update the preview queue. The
     /// caller owns task dispatch for a `.start_debounce` outcome.
     pub fn queueCurrentPreview(self: *HistoryPageState, allocator: std.mem.Allocator) ?preview.QueueOutcome {
+        if (self.current_view != .picker or self.catalog_hidden or self.load_state != .loaded) return null;
         const page_identity = self.activation.currentIdentity() orelse {
             self.preview_state.clearSelection(allocator);
             return null;
@@ -969,6 +970,15 @@ test "History completion adopts only an admitted initial presentation clock" {
     );
     try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
     try std.testing.expectEqual(@as(u64, 1), state.preview_state.catalog_instance);
+    try std.testing.expectEqual(
+        preview.QueueOutcome.start_debounce,
+        state.queueCurrentPreview(allocator).?,
+    );
+    const preview_key = state.preview_state.current_key.?;
+    state.current_view = .diff;
+    try std.testing.expect(state.queueCurrentPreview(allocator) == null);
+    try std.testing.expect(state.preview_state.current_key.?.eql(preview_key));
+    state.current_view = .picker;
 
     state.armCatalog(.{
         .identity = identity,
@@ -992,6 +1002,7 @@ test "History completion adopts only an admitted initial presentation clock" {
     );
     try std.testing.expectEqual(@as(?i64, 100), state.render_now_unix);
     try std.testing.expectEqual(@as(u64, 2), state.preview_state.catalog_instance);
+    try std.testing.expect(state.preview_state.current_key == null);
 
     state.armCatalog(.{
         .identity = identity,
@@ -1255,7 +1266,9 @@ test "History lifecycle reuses one context and preserves a valid draft across HE
     state.draft = .{ .range = 0 };
     const retained_subject = state.catalog.records.items[0].subject.ptr;
     _ = state.activation.activate(4, .unavailable, .unavailable, .unavailable);
+    try std.testing.expectEqual(preview.QueueOutcome.start_debounce, state.queueCurrentPreview(allocator).?);
     state.deactivate();
+    try std.testing.expect(state.preview_state.current_key == null);
 
     state.activate(allocator, 4, root_identity);
     const same_request = state.nextRequest().?;
@@ -1364,7 +1377,9 @@ test "History lifecycle reuses one context and preserves a valid draft across HE
     try std.testing.expect(state.draft.anchor() == null);
     try std.testing.expectEqualStrings("History changed; draft selection reset", state.status.text());
 
+    try std.testing.expectEqual(preview.QueueOutcome.start_debounce, state.queueCurrentPreview(allocator).?);
     state.requestReload(allocator);
+    try std.testing.expect(state.preview_state.current_key == null);
     const reload_probe_request = state.nextRequest().?;
     try std.testing.expectEqual(app_load.HistoryProbeReason.reload, reload_probe_request.probe);
     state.armCatalog(.{

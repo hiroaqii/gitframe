@@ -25,8 +25,24 @@ pub const ShellSurfaceOrigin = struct {
     instance_id: u64,
 };
 
+pub const HistoryPreviewAuthority = struct {
+    selection_generation: u64,
+    copy_generation: u64,
+
+    pub fn eql(left: HistoryPreviewAuthority, right: HistoryPreviewAuthority) bool {
+        return left.selection_generation == right.selection_generation and
+            left.copy_generation == right.copy_generation;
+    }
+};
+
+pub const HistoryPreviewOrigin = struct {
+    page: PageOrigin,
+    authority: HistoryPreviewAuthority,
+};
+
 pub const Origin = union(enum) {
     page: PageOrigin,
+    history_preview: HistoryPreviewOrigin,
     shell_surface: ShellSurfaceOrigin,
 };
 
@@ -45,6 +61,7 @@ pub const Snapshot = struct {
     repository_activation_id: u64,
     history_activation_id: u64 = 0,
     compare_activation_id: u64,
+    history_preview: ?HistoryPreviewAuthority = null,
     push_error_instance_id: ?u64,
     commit_panel_instance_id: ?u64,
 };
@@ -52,6 +69,13 @@ pub const Snapshot = struct {
 pub fn classify(origin: Origin, current: Snapshot) Liveness {
     return switch (origin) {
         .page => |captured| classifyPage(captured, current),
+        .history_preview => |captured| blk: {
+            const page_liveness = classifyPage(captured.page, current);
+            if (page_liveness == .stale) break :blk .stale;
+            const authority = current.history_preview orelse break :blk .stale;
+            if (!captured.authority.eql(authority)) break :blk .stale;
+            break :blk page_liveness;
+        },
         .shell_surface => |captured| blk: {
             const current_instance = switch (captured.surface) {
                 .push_error => current.push_error_instance_id,
@@ -105,6 +129,18 @@ test "repository selection inactive page accepts same-instance clipboard complet
         Liveness.live_inactive,
         classify(.{ .page = .{ .page_id = .config, .repo_epoch = 4, .activation_id = 999 } }, current),
     );
+
+    var history_current = current;
+    history_current.active_page = .history;
+    history_current.history_activation_id = 7;
+    history_current.history_preview = .{ .selection_generation = 3, .copy_generation = 2 };
+    const history_origin: Origin = .{ .history_preview = .{
+        .page = .{ .page_id = .history, .repo_epoch = 4, .activation_id = 7 },
+        .authority = .{ .selection_generation = 3, .copy_generation = 2 },
+    } };
+    try @import("std").testing.expectEqual(Liveness.live_active, classify(history_origin, history_current));
+    history_current.history_preview.?.selection_generation = 4;
+    try @import("std").testing.expectEqual(Liveness.stale, classify(history_origin, history_current));
 }
 
 test "reopened shell surface rejects prior clipboard completion" {

@@ -337,7 +337,7 @@ fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
     for (files[start..end], 0..) |file, visible_index| {
         const row: u16 = @intCast(visible_index);
         if (columns.status_width > 0) {
-            try drawClipped(&body, 0, row, file.statusBadge(), context.palette.boldStyle(.accent));
+            try drawClipped(&body, 0, row, file.statusBadge(), fileStatusStyle(file.status(), context.palette));
         }
         if (columns.path_width > 0) {
             const path = try history_page.preview.pathFieldAlloc(body.frameAllocator(), file.kind);
@@ -352,15 +352,46 @@ fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
             );
         }
         if (columns.stats_width > 0) {
-            try drawClipped(
-                &body,
-                columns.stats_col,
-                row,
-                try statsText(body.frameAllocator(), file.stats),
-                context.palette.style(.muted),
-            );
+            switch (file.stats) {
+                .text => |stats| {
+                    var stats_area = body.child(.{
+                        .col = columns.stats_col,
+                        .row = row,
+                        .width = columns.stats_width,
+                        .height = 1,
+                    });
+                    const added = try std.fmt.allocPrint(body.frameAllocator(), "+{d}", .{stats.added});
+                    const removed = try std.fmt.allocPrint(body.frameAllocator(), "-{d}", .{stats.removed});
+                    try drawClipped(&stats_area, 0, 0, added, .{ .fg = context.palette.color(.success), .bold = true });
+                    const removed_col: u16 = @intCast(@min(
+                        chasen.text.displayWidth(added) +| 1,
+                        std.math.maxInt(u16),
+                    ));
+                    if (removed_col > 0) try drawClipped(&stats_area, removed_col - 1, 0, " ", context.palette.style(.muted));
+                    try drawClipped(&stats_area, removed_col, 0, removed, .{ .fg = context.palette.color(.danger), .bold = true });
+                },
+                else => try drawClipped(
+                    &body,
+                    columns.stats_col,
+                    row,
+                    try statsText(body.frameAllocator(), file.stats),
+                    context.palette.style(.muted),
+                ),
+            }
         }
     }
+}
+
+fn fileStatusStyle(status: git_preview.FileStatus, palette: theme.Palette) chasen.TextStyle {
+    return .{
+        .fg = palette.color(switch (status) {
+            .modified, .type_changed => .prompt,
+            .added => .success,
+            .deleted => .danger,
+            .renamed => .accent,
+        }),
+        .bold = true,
+    };
 }
 
 fn drawPaneMessage(surface: *chasen.Surface, message: []const u8, palette: theme.Palette) !void {
@@ -412,15 +443,26 @@ fn phaseText(phase: history_page.preview.Phase) []const u8 {
         .idle => "Preview idle",
         .loading => "Loading preview…",
         .resolved => "Preview unavailable",
-        .terminal => "Preview unavailable",
+        .terminal => |admission| switch (admission) {
+            .malformed => "Preview malformed",
+            .unavailable => "Preview unavailable",
+            .too_large => "Preview too large",
+            .failed => "Preview failed",
+        },
     };
 }
 
 fn readyDetail(page: *const history_page.HistoryPageState) ?git_preview.Detail {
-    const accepted = page.preview_state.accepted orelse return null;
-    return switch (accepted.payload.detail) {
-        .ready => |detail| detail,
-        else => null,
+    const current = page.preview_state.current_key orelse return null;
+    if (page.preview_state.accepted) |accepted| {
+        if (accepted.key.eql(current)) return switch (accepted.payload.detail) {
+            .ready => |detail| detail,
+            else => null,
+        };
+    }
+    return switch (current.identity.selection) {
+        .single => null,
+        .range => |range| .{ .range = range },
     };
 }
 
@@ -539,8 +581,8 @@ const FileColumns = struct {
 };
 
 fn fileColumns(width: u16, requested_stats_width: u16) FileColumns {
-    const status_width = @min(width, 1);
-    const first_gap = @min(width -| status_width, 1);
+    const status_width: u16 = @min(width, 1);
+    const first_gap: u16 = @min(width -| status_width, 1);
     const remaining = width -| status_width -| first_gap;
     const stats_width = if (remaining >= 2) @min(requested_stats_width, remaining - 2) else 0;
     const stats_gap = if (stats_width > 0 and remaining > stats_width) @as(u16, 1) else 0;
@@ -1163,9 +1205,13 @@ test "History preview three pane renders focus structured detail and flat files"
             .files = .{ .ready = files[0..] },
         },
     };
+    page_state.preview_state.current_key = page_state.preview_state.accepted.?.key;
 
     var palette = theme.Palette.default();
     palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 10, 11, 12 } };
     var rendered: chasen.testing.TestSurface = undefined;
     try rendered.init(120, 27);
     defer rendered.deinit();
@@ -1187,10 +1233,32 @@ test "History preview three pane renders focus structured detail and flat files"
     try rendered.expectCellText(60, 12, ">");
     try rendered.expectCellText(60, 13, "M");
     const columns = fileColumns(60, maxStatsWidth(&files));
+    try rendered.expectCellText(62, 13, "s");
     try rendered.expectCellText(60 + columns.stats_col, 13, "+");
     const active_marker = rendered.surface.readCell(60, 12) orelse return error.ExpectedActivePaneMarker;
     try std.testing.expect(active_marker.style.bold);
     try std.testing.expect(active_marker.style.fg.eql(palette.color(.accent)));
+    const status_cell = rendered.surface.readCell(60, 13) orelse return error.ExpectedFileStatus;
+    try std.testing.expect(status_cell.style.bold);
+    try std.testing.expect(status_cell.style.fg.eql(palette.color(.prompt)));
+    const added_cell = rendered.surface.readCell(60 + columns.stats_col, 13) orelse return error.ExpectedAddedStats;
+    const removed_cell = rendered.surface.readCell(60 + columns.stats_col + 3, 13) orelse return error.ExpectedRemovedStats;
+    try std.testing.expect(added_cell.style.bold);
+    try std.testing.expect(added_cell.style.fg.eql(palette.color(.success)));
+    try std.testing.expect(removed_cell.style.bold);
+    try std.testing.expect(removed_cell.style.fg.eql(palette.color(.danger)));
+    const status_cases = [_]struct { status: git_preview.FileStatus, role: theme.Role }{
+        .{ .status = .modified, .role = .prompt },
+        .{ .status = .added, .role = .success },
+        .{ .status = .deleted, .role = .danger },
+        .{ .status = .renamed, .role = .accent },
+        .{ .status = .type_changed, .role = .prompt },
+    };
+    for (status_cases) |case| {
+        const style = fileStatusStyle(case.status, palette);
+        try std.testing.expect(style.bold);
+        try std.testing.expect(style.fg.eql(palette.color(case.role)));
+    }
 
     try scrollFiles(&page_state, std.testing.allocator, .{ .width = 120, .height = 27 }, .right);
     try std.testing.expectEqual(@as(usize, 1), page_state.interaction_state.files_horizontal_offset);
@@ -1212,6 +1280,17 @@ test "History preview three pane renders focus structured detail and flat files"
     try drawDetailBlocks(&wrapped.surface, &blocks, .{}, false, palette);
     try wrapped.expectCellText(9, 0, "a");
     try wrapped.expectCellText(9, 1, "f");
+
+    page_state.preview_state.accepted = null;
+    page_state.preview_state.phase = .loading;
+    var loading: chasen.testing.TestSurface = undefined;
+    try loading.init(120, 27);
+    defer loading.deinit();
+    try view(.{ .page_state = &page_state, .palette = palette }, &loading.surface);
+    const loading_snapshot = try loading.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(loading_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Count: 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Loading preview…") != null);
 }
 
 test "History catalog renders selected rows at 80x24 and 120x32" {

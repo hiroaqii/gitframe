@@ -133,6 +133,7 @@ test "selection input consumes default and custom document navigation only for l
 
     var overlap_config: keymap.Config = .{};
     overlap_config.set(.copy_current_line, .{ .plain_codepoint = 'x' });
+    overlap_config.set(.copy_history_detail, .{ .plain_codepoint = 'x' });
     overlap_config.set(.document_first, .{ .plain_codepoint = 'y' });
     try std.testing.expect(keymap.validateConfig(overlap_config));
     const overlap = keymap.Effective.fromConfig(overlap_config);

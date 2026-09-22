@@ -34,6 +34,7 @@ const repo_discovery = @import("../../repo/discovery.zig");
 const App = app_mod.App;
 const OverlayKind = app_state.OverlayKind;
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
+const HistoryPreviewDebounceTask = app_load.HistoryPreviewDebounceTask(app_message.Msg);
 const sidebar_header_rows: u16 = @import("../pages/changes/layout.zig").sidebar_header_rows;
 
 fn shellLayout(app: *const App) app_shell_layout.Layout {
@@ -1229,6 +1230,100 @@ test "History accepted diff runs one root interaction and transition sequence" {
     } };
     try app.update(.{ .switch_page = .config }, &ctx);
     try std.testing.expectEqual(page.Id.config, app.active_page);
+}
+
+test "History picker replaces preview immediately and fences detail clipboard completion" {
+    const allocator = std.testing.allocator;
+    const root_identity = @import("../../repo/root_capability.zig").Identity{ .device = 13, .inode = 17 };
+    const newest = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const oldest = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .history,
+        .pages = .{ .history = .{
+            .repo_epoch = 0,
+            .root_identity = root_identity,
+            .load_state = .loaded,
+        } },
+    };
+    defer app.pages.history.deinit(allocator);
+    defer app.shell_effects_state.deinit(allocator);
+
+    var catalog_page: git_history.Page = .{
+        .snapshot = .{ .object_format = .sha1, .head = newest, .display = .detached },
+        .records = try allocator.alloc(git_history.Record, 2),
+    };
+    catalog_page.records[0] = try historyRecordForRootTest(allocator, newest, 1, .{ .available = oldest }, "newest");
+    catalog_page.records[1] = try historyRecordForRootTest(allocator, oldest, 0, .true_root, "oldest");
+    defer catalog_page.deinit(allocator);
+    try app.pages.history.catalog.replace(allocator, &catalog_page);
+    _ = app.pages.history.activation.activate(0, .unavailable, .unavailable, .unavailable);
+    app.pages.history.draft = .{ .range = 1 };
+
+    try std.testing.expectEqual(
+        @import("../pages/history/preview.zig").QueueOutcome.start_debounce,
+        app.pages.history.queueCurrentPreview(allocator).?,
+    );
+    const initial_key = app.pages.history.preview_state.current_key.?;
+    const initial_range = initial_key.identity.selection.range;
+    try std.testing.expect(std.meta.eql(initial_range.basis, app.pages.history.beginDiffRequest().?.basis));
+    app.pages.history.preview_state.latest = null;
+    app.pages.history.preview_state.accepted = .{
+        .key = initial_key,
+        .payload = .{
+            .detail = .{ .ready = .{ .range = initial_range } },
+            .files = .{ .failed = .git_command },
+        },
+    };
+    app.pages.history.preview_state.payload_allocator = allocator;
+    app.pages.history.preview_state.phase = .resolved;
+
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer ctx.runtimeClearPendingEffectCopies();
+    try app.update(.{ .history = .move_next }, &ctx);
+    try std.testing.expect(app.pages.history.preview_state.phase == .loading);
+    try std.testing.expect(app.pages.history.preview_state.accepted == null);
+    try std.testing.expect(app.pages.history.preview_state.current_key.?.identity.selection == .single);
+    const tasks = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), tasks.len);
+    const debounce_task: *HistoryPreviewDebounceTask = @ptrCast(@alignCast(tasks[0].ctx));
+    HistoryPreviewDebounceTask.destroy(debounce_task, allocator);
+
+    try app.update(.{ .history = .copy_detail }, &ctx);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqualStrings("History commit detail is not ready", app.pages.history.status.text());
+
+    try app.update(.{ .history = .move_previous }, &ctx);
+    try std.testing.expect(app.pages.history.preview_state.phase == .loading);
+    try std.testing.expect(app.pages.history.preview_state.current_key.?.identity.selection == .range);
+    try app.update(.{ .history = .copy_detail }, &ctx);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        ctx._pending_clipboard_copies[0].text,
+        "Count: 2",
+    ) != null);
+    const stale_request_id = ctx._pending_clipboard_copies[0].request_id;
+
+    try app.update(.{ .history = .move_next }, &ctx);
+    app.pages.history.status.set("selection moved", .{});
+    try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+        .request_id = stale_request_id,
+        .outcome = .sent,
+    } } }, &ctx);
+    try std.testing.expectEqualStrings("selection moved", app.pages.history.status.text());
+
+    try app.update(.{ .history = .move_previous }, &ctx);
+    try app.update(.{ .history = .copy_detail }, &ctx);
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_clipboard_copies_len);
+    try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
+        .request_id = ctx._pending_clipboard_copies[1].request_id,
+        .outcome = .sent,
+    } } }, &ctx);
+    try std.testing.expectEqualStrings(
+        "clipboard copy sent: History range summary",
+        app.pages.history.status.text(),
+    );
 }
 
 test "help overlay opens and closes before normal shortcuts" {

@@ -37,6 +37,7 @@ pub const PublicAction = enum {
     page_up,
     page_down,
     copy_current_line,
+    copy_history_detail,
     copy_current_hunk,
 };
 
@@ -207,13 +208,18 @@ pub fn validateConfig(config: Config) bool {
             inline for (@typeInfo(PublicAction).@"enum".fields[(left_index + 1)..]) |right_field| {
                 const right_action: PublicAction = @enumFromInt(right_field.value);
                 if (effective.spec(right_action)) |right_spec| {
-                    if (left_spec.eql(right_spec)) return false;
+                    if (left_spec.eql(right_spec) and !allowedDuplicate(left_action, right_action)) return false;
                 }
             }
         }
     }
 
     return true;
+}
+
+fn allowedDuplicate(left: PublicAction, right: PublicAction) bool {
+    return (left == .copy_current_line and right == .copy_history_detail) or
+        (left == .copy_history_detail and right == .copy_current_line);
 }
 
 fn formatKeySpec(buffer: []u8, spec: KeySpec) []const u8 {
@@ -274,6 +280,7 @@ fn defaultSpec(action: PublicAction) ?KeySpec {
         .page_up => .{ .named = .page_up },
         .page_down => .{ .named = .page_down },
         .copy_current_line => .{ .plain_codepoint = 'y' },
+        .copy_history_detail => .{ .plain_codepoint = 'y' },
         .copy_current_hunk => shiftedAscii('y', 'Y'),
     };
 }
@@ -491,6 +498,7 @@ test "branch switch uses plain b and sidebar keeps shifted B" {
 test "copy actions use y and shifted Y by default" {
     const defaults: Effective = .{};
     try std.testing.expectEqual(PublicAction.copy_current_line, defaults.actionForKey(.{ .codepoint = 'y' }).?);
+    try std.testing.expect(defaults.spec(.copy_history_detail).?.eql(.{ .plain_codepoint = 'y' }));
     try std.testing.expectEqual(PublicAction.copy_current_hunk, defaults.actionForKey(.{ .codepoint = 'Y' }).?);
     try std.testing.expectEqual(PublicAction.copy_current_hunk, defaults.actionForKey(.{ .codepoint = 'y', .mods = .{ .shift = true } }).?);
 }
@@ -516,6 +524,15 @@ test "validateConfig rejects reserved and duplicate effective bindings" {
     var document_duplicate: Config = .{};
     document_duplicate.set(.fetch, .{ .ctrl = .d });
     try std.testing.expect(!validateConfig(document_duplicate));
+
+    var copy_pair: Config = .{};
+    copy_pair.set(.copy_current_line, .{ .plain_codepoint = 'x' });
+    copy_pair.set(.copy_history_detail, .{ .plain_codepoint = 'x' });
+    try std.testing.expect(validateConfig(copy_pair));
+
+    var unrelated_copy_duplicate: Config = .{};
+    unrelated_copy_duplicate.set(.copy_current_hunk, .{ .plain_codepoint = 'y' });
+    try std.testing.expect(!validateConfig(unrelated_copy_duplicate));
 
     try std.testing.expect(validateConfig(.{}));
 }

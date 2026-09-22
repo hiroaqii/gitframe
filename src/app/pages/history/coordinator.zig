@@ -102,7 +102,11 @@ pub const Controller = struct {
                 self.page_state.interaction_state.adjustWidth(self.body_size.width, action);
                 try history_view.reflowPreview(self.page_state, ctx.allocator(), self.body_size);
             },
-            else => self.page_state.applyInput(msg, self.body_size.height),
+            .copy_detail => return self.copyPreviewDetail(ctx.allocator()),
+            else => {
+                self.page_state.applyInput(msg, self.body_size.height);
+                _ = try self.requestPreview(ctx);
+            },
         }
         return .{};
     }
@@ -151,6 +155,7 @@ pub const Controller = struct {
         if (self.active_page != .history) return null;
         const outcome = self.page_state.queueCurrentPreview(ctx.allocator()) orelse return null;
         if (outcome == .start_debounce) try self.startPreviewDebounce(ctx);
+        if (outcome == .cache_hit) try self.reflowPreview(ctx.allocator());
         return outcome;
     }
 
@@ -159,7 +164,7 @@ pub const Controller = struct {
         ctx: *chasen.Ctx(app_message.Msg),
         finished: *app_load.HistoryPreviewFinished,
     ) !history_page.ApplyOutcome {
-        return switch (finished.*) {
+        const outcome: history_page.ApplyOutcome = switch (finished.*) {
             .debounce => |debounce| switch (self.page_state.preview_state.finishDebounce(
                 debounce.stamp,
                 debounce.result,
@@ -188,6 +193,8 @@ pub const Controller = struct {
                 },
             },
         };
+        if (outcome == .changed) try self.reflowPreview(ctx.allocator());
+        return outcome;
     }
 
     pub fn startPending(self: Controller, ctx: *chasen.Ctx(@import("../../message.zig").Msg)) !bool {
@@ -350,6 +357,57 @@ pub const Controller = struct {
             .effect_origin = self.pageOrigin(),
             .branch_unavailable_message = "branch switching is not available in History",
         };
+    }
+
+    fn copyPreviewDetail(self: Controller, allocator: std.mem.Allocator) UpdateOutcome {
+        const key = self.page_state.preview_state.current_key orelse {
+            self.page_state.status.set("History detail is unavailable", .{});
+            return .{};
+        };
+        const detail: @import("../../../git/history_preview.zig").Detail = switch (key.identity.selection) {
+            .range => |range| .{ .range = range },
+            .single => blk: {
+                const accepted = self.page_state.preview_state.accepted orelse {
+                    self.page_state.status.set("History commit detail is not ready", .{});
+                    return .{};
+                };
+                if (!accepted.key.eql(key)) {
+                    self.page_state.status.set("History commit detail is not ready", .{});
+                    return .{};
+                }
+                break :blk switch (accepted.payload.detail) {
+                    .ready => |ready| ready,
+                    else => {
+                        self.page_state.status.set("History commit detail is unavailable", .{});
+                        return .{};
+                    },
+                };
+            },
+        };
+        const text = history_page.preview.canonicalDetailAlloc(allocator, detail) catch {
+            self.page_state.status.set("History detail could not be copied", .{});
+            return .{};
+        };
+        const authority = self.page_state.preview_state.reserveCopyAuthority() orelse {
+            allocator.free(text);
+            self.page_state.status.set("History detail is unavailable", .{});
+            return .{};
+        };
+        return .{ .clipboard = .{
+            .origin = .{ .history_preview = .{
+                .page = self.pageOrigin(),
+                .authority = .{
+                    .selection_generation = authority.selection_generation,
+                    .copy_generation = authority.copy_generation,
+                },
+            } },
+            .label = switch (detail) {
+                .single => "History commit detail",
+                .range => "History range summary",
+            },
+            .text = text,
+            .owned_text = text,
+        } };
     }
 
     fn currentIdentity(self: Controller) ?app_page.RequestIdentity {

@@ -113,6 +113,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .page_up => .page_diff_up,
         .page_down => .page_diff_down,
         .copy_current_line => .copy_current_line,
+        .copy_history_detail => null,
         .copy_current_hunk => .copy_current_hunk,
         else => unreachable,
     };

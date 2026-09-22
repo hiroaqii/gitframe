@@ -36,6 +36,11 @@ pub const RequestKey = struct {
     }
 };
 
+pub const CopyAuthority = struct {
+    selection_generation: u64,
+    copy_generation: u64,
+};
+
 pub const LatestRequest = struct {
     key: RequestKey,
     request: git_history.SelectionRequest,
@@ -200,6 +205,7 @@ pub const State = struct {
     catalog_instance: u64 = 0,
     request_generation: u64 = 0,
     debounce_generation: u64 = 0,
+    copy_generation: u64 = 0,
     current_key: ?RequestKey = null,
     latest: ?LatestRequest = null,
     active: Active = .none,
@@ -411,6 +417,24 @@ pub const State = struct {
         return self.cache.payload_bytes;
     }
 
+    pub fn reserveCopyAuthority(self: *State) ?CopyAuthority {
+        const current = self.current_key orelse return null;
+        self.copy_generation +%= 1;
+        if (self.copy_generation == 0) self.copy_generation = 1;
+        return .{
+            .selection_generation = current.generation,
+            .copy_generation = self.copy_generation,
+        };
+    }
+
+    pub fn currentCopyAuthority(self: *const State) ?CopyAuthority {
+        const current = self.current_key orelse return null;
+        return .{
+            .selection_generation = current.generation,
+            .copy_generation = self.copy_generation,
+        };
+    }
+
     fn failLatestForStamp(
         self: *State,
         stamp: DebounceStamp,
@@ -513,19 +537,28 @@ pub fn canonicalDetailAlloc(allocator: std.mem.Allocator, detail: git_preview.De
     return out.toOwnedSlice();
 }
 
-/// Compose the already-finalized quoted-token codec into the changed-files
-/// path-field grammar without introducing a second escaping policy.
+/// Show ordinary paths directly and retain the quoted codec wherever raw
+/// text would be unsafe or collide with the rename framing.
 pub fn pathFieldAlloc(allocator: std.mem.Allocator, kind: git_preview.FileChangeKind) ![]u8 {
     return switch (kind) {
-        .modified, .added, .deleted, .type_changed => |path| path_key.quotedDisplayAlloc(allocator, path),
+        .modified, .added, .deleted, .type_changed => |path| pathTokenAlloc(allocator, path, false),
         .renamed => |rename| blk: {
-            const old = try path_key.quotedDisplayAlloc(allocator, rename.old);
+            const old = try pathTokenAlloc(allocator, rename.old, true);
             defer allocator.free(old);
-            const new = try path_key.quotedDisplayAlloc(allocator, rename.new);
+            const new = try pathTokenAlloc(allocator, rename.new, true);
             defer allocator.free(new);
             break :blk try std.fmt.allocPrint(allocator, "old {s} -> new {s}", .{ old, new });
         },
     };
+}
+
+fn pathTokenAlloc(allocator: std.mem.Allocator, path: []const u8, rename_framing: bool) ![]u8 {
+    if (path_key.isPlainDisplaySafe(path) and
+        (!rename_framing or std.mem.indexOf(u8, path, " -> ") == null))
+    {
+        return allocator.dupe(u8, path);
+    }
+    return path_key.quotedDisplayAlloc(allocator, path);
 }
 
 fn writeRefs(writer: *std.Io.Writer, refs: []const []const u8) !void {
@@ -681,9 +714,14 @@ test "History preview single-flight keeps only the latest inline request" {
     const identity_b = testCacheIdentity(request_b, 3);
 
     try std.testing.expectEqual(QueueOutcome.start_debounce, state.queue(allocator, identity_a, request_a));
+    const copy_a = state.reserveCopyAuthority().?;
+    try std.testing.expect(std.meta.eql(copy_a, state.currentCopyAuthority().?));
     const stamp = state.reserveDebounce().?;
     state.armDebounce(stamp);
     try std.testing.expectEqual(QueueOutcome.queued, state.queue(allocator, identity_b, request_b));
+    try std.testing.expect(copy_a.selection_generation != state.currentCopyAuthority().?.selection_generation);
+    const copy_b = state.reserveCopyAuthority().?;
+    try std.testing.expect(copy_b.copy_generation > copy_a.copy_generation);
     try std.testing.expectEqual(@as(usize, 1), state.activeCount());
     try std.testing.expectEqual(@as(usize, 1), state.latestCount());
 
@@ -735,6 +773,7 @@ test "History preview single-flight keeps only the latest inline request" {
     const stale_stamp = state.reserveDebounce().?;
     state.armDebounce(stale_stamp);
     state.catalogPublished(allocator);
+    try std.testing.expect(state.currentCopyAuthority() == null);
     var replacement_identity = identity_a;
     replacement_identity.catalog_instance = state.catalog_instance;
     try std.testing.expectEqual(QueueOutcome.queued, state.queue(allocator, replacement_identity, request_a));
@@ -922,6 +961,10 @@ test "History preview canonical detail is exact for single and range" {
 }
 
 test "History preview path field keeps quoted rename boundaries unique" {
+    const ordinary = try pathFieldAlloc(std.testing.allocator, .{ .modified = "src/topic.txt" });
+    defer std.testing.allocator.free(ordinary);
+    try std.testing.expectEqualStrings("src/topic.txt", ordinary);
+
     const single = try pathFieldAlloc(std.testing.allocator, .{ .modified = "src/a -> b\"\\\t\xff" });
     defer std.testing.allocator.free(single);
     try std.testing.expectEqualStrings("\"src/a -> b\\\"\\\\\\t\\xFF\"", single);
@@ -938,8 +981,8 @@ test "History preview path field keeps quoted rename boundaries unique" {
         .new = "b -> c\"\\\t\xff",
     } });
     defer std.testing.allocator.free(right_arrow);
-    try std.testing.expectEqualStrings("old \"a -> b\\\"\\\\\\t\\xFF\" -> new \"c\"", left_arrow);
-    try std.testing.expectEqualStrings("old \"a\" -> new \"b -> c\\\"\\\\\\t\\xFF\"", right_arrow);
+    try std.testing.expectEqualStrings("old \"a -> b\\\"\\\\\\t\\xFF\" -> new c", left_arrow);
+    try std.testing.expectEqualStrings("old a -> new \"b -> c\\\"\\\\\\t\\xFF\"", right_arrow);
     try std.testing.expect(!std.mem.eql(u8, left_arrow, right_arrow));
 }
 

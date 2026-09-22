@@ -70,6 +70,28 @@ pub fn displayPathLessThan(_: void, left: []const u8, right: []const u8) bool {
     }
 }
 
+/// Whether a raw path can be shown as one unquoted terminal-safe token.
+pub fn isPlainDisplaySafe(raw: []const u8) bool {
+    if (raw.len == 0 or raw[0] == ' ' or raw[raw.len - 1] == ' ') return false;
+
+    var index: usize = 0;
+    while (index < raw.len) {
+        const byte = raw[index];
+        if (byte == '\\' or byte == '"' or byte < 0x20 or byte == 0x7f) return false;
+        if (byte <= 0x7e) {
+            index += 1;
+            continue;
+        }
+        const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch return false;
+        const end = std.math.add(usize, index, @as(usize, sequence_len)) catch return false;
+        if (end > raw.len or !std.unicode.utf8ValidateSlice(raw[index..end])) return false;
+        const scalar = std.unicode.utf8Decode(raw[index..end]) catch return false;
+        if (scalar >= 0x80 and scalar <= 0x9f) return false;
+        index = end;
+    }
+    return true;
+}
+
 /// Allocate one collision-free quoted token for an arbitrary raw Git path.
 /// Framing quotes and backslash escapes are not part of the path identity.
 /// Valid printable UTF-8 is retained; controls and invalid bytes remain

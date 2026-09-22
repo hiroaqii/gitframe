@@ -40,6 +40,7 @@ pub const Msg = union(enum) {
     move_files: interaction.VerticalAction,
     scroll_files: interaction.HorizontalAction,
     adjust_width: interaction.WidthAction,
+    copy_detail,
     common: committed_diff_input.Msg,
     owned_noop,
 };
@@ -68,6 +69,9 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
         if (!context.common.search_mode and !context.common.file_search_mode and
             !key_input.hasCommandModifier(key) and key.codepoint == 'm') return .open_picker;
         return .{ .common = committed_diff_input.keyToMsg(context.common, key) orelse return null };
+    }
+    if (matches(context.keymap, .copy_history_detail, key)) {
+        return if (context.focus == .commit_detail) .copy_detail else .owned_noop;
     }
     if (key.matches(chasen.Key.enter, .{})) {
         if (context.more_row_selected) return .load_older;
@@ -173,14 +177,24 @@ test "History three pane input cycles focus and routes focused navigation" {
     try @import("std").testing.expectEqual(Msg{ .move_files = .last }, keyToMsg(files, .{ .codepoint = chasen.Key.end }).?);
     try @import("std").testing.expectEqual(Msg{ .scroll_files = .right }, keyToMsg(files, .{ .codepoint = 'l' }).?);
     try @import("std").testing.expectEqual(Msg.owned_noop, keyToMsg(files, .{ .codepoint = ' ' }).?);
+    try @import("std").testing.expectEqual(Msg.owned_noop, keyToMsg(files, .{ .codepoint = 'y' }).?);
+    try @import("std").testing.expectEqual(
+        Msg.copy_detail,
+        keyToMsg(.{ .picker_ready = true, .focus = .commit_detail }, .{ .codepoint = 'y' }).?,
+    );
     try @import("std").testing.expectEqual(Msg.load_diff, keyToMsg(files, .{ .codepoint = chasen.Key.enter }).?);
     try @import("std").testing.expect(keyToMsg(ready, .{ .codepoint = 'i' }) == null);
 
     var config: keymap.Config = .{};
     config.set(.increase_sidebar_width, .{ .plain_codepoint = 'z' });
+    config.set(.copy_history_detail, .{ .plain_codepoint = 'x' });
     const effective = keymap.Effective.fromConfig(config);
     try @import("std").testing.expectEqual(
         Msg{ .adjust_width = .increase },
         keyToMsg(.{ .loading = true, .keymap = effective }, .{ .codepoint = 'z' }).?,
+    );
+    try @import("std").testing.expectEqual(
+        Msg.copy_detail,
+        keyToMsg(.{ .picker_ready = true, .focus = .commit_detail, .keymap = effective }, .{ .codepoint = 'x' }).?,
     );
 }

@@ -462,7 +462,7 @@ pub const FooterStatusTarget = struct {
     }
 };
 
-const footer_hint_capacity: usize = 8;
+const footer_hint_capacity: usize = 9;
 
 const FooterHintPriority = enum {
     repository_switch,
@@ -1812,6 +1812,9 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                             .primary,
                         );
                     }
+                    if (history_input.picker_ready and history_input.focus == .commit_detail) {
+                        appendFooterAction(app, &result, key_buffers, .copy_history_detail, "copy detail", .primary);
+                    }
                     result.append(ui.key_hint.item("Tab/j/k", "focus/nav"), .focus);
                     resize_hint: {
                         if (result.len < footer_hint_capacity) {
@@ -2581,6 +2584,22 @@ test "History picker footer keeps the range action visible and explains an activ
         ui.key_hint.item("q", "quit"),
     });
 
+    history_state.draft = .single;
+    history_state.interaction_state.focus = .commit_detail;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("Space", "start range"),
+        ui.key_hint.item("Enter", "open diff"),
+        ui.key_hint.item("y", "copy detail"),
+        ui.key_hint.item("Tab/j/k", "focus/nav"),
+        ui.key_hint.item("[/]", "resize"),
+        ui.key_hint.item("r", "reload"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+        ui.key_hint.item("q", "quit"),
+    });
+
+    history_state.interaction_state.focus = .history;
     history_state.draft = .{ .range = 0 };
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
@@ -3179,6 +3198,9 @@ test "help popup uses effective document navigation labels and reaches its tail 
 
 test "History help explains every commit picker marker" {
     var harness: ShellViewTestHarness = .{};
+    var config: keymap.Config = .{};
+    config.set(.copy_history_detail, .{ .plain_codepoint = 'x' });
+    harness.keymap = keymap.Effective.fromConfig(config);
     var context = harness.context();
     context.active_page = .history;
 
@@ -3191,6 +3213,11 @@ test "History help explains every commit picker marker" {
 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Markers") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit · Date · Author · [Refs] Subject") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        snapshot,
+        "x                 copy commit detail / range summary",
+    ) != null);
     for ([_][]const u8{
         "range anchor",
         "commit included in the selected range",
@@ -3439,6 +3466,7 @@ const help_history_items = [_]HelpItem{
     .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last focused row" },
     .{ .key = .{ .text = "Space" }, .description = "start / clear a range from History focus" },
     .{ .key = .{ .text = "Enter" }, .description = "open selected diff / load older commits" },
+    .{ .key = .{ .action = .copy_history_detail }, .description = "copy commit detail / range summary" },
     .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize History pane" },
     .{ .key = .{ .text = "m" }, .description = "choose commits from an accepted diff" },
     .{ .key = .{ .action = .reload }, .description = "recheck and reload exact current HEAD" },

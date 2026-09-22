@@ -548,6 +548,26 @@ test "History committed diff text input precedes page shortcuts and picker key s
     normal.history.common.search_mode = false;
     try expectMsg(.{ .switch_page = .compare }, keyToMsg(normal, .{ .codepoint = '4' }).?);
     try expectMsg(.{ .history = .open_picker }, keyToMsg(normal, .{ .codepoint = 'm' }).?);
+    try expectMsg(
+        .{ .history = .{ .common = .copy_current_line } },
+        keyToMsg(normal, .{ .codepoint = 'y' }).?,
+    );
+    try expectMsg(
+        .{ .history = .copy_detail },
+        keyToMsg(.{ .active_page = .history, .history = .{
+            .picker_ready = true,
+            .focus = .commit_detail,
+        } }, .{ .codepoint = 'y' }).?,
+    );
+    try expectMsg(
+        .{ .history = .owned_noop },
+        keyToMsg(.{ .active_page = .history, .history = .{ .picker_ready = true } }, .{ .codepoint = 'y' }).?,
+    );
+    try expectMsg(.{ .changes = .copy_current_line }, keyToMsg(.{}, .{ .codepoint = 'y' }).?);
+    try expectMsg(
+        .{ .compare = .{ .common = .copy_current_line } },
+        keyToMsg(.{ .active_page = .compare }, .{ .codepoint = 'y' }).?,
+    );
 }
 
 test "History picker leaves i unclaimed so configured page routing wins" {
@@ -918,6 +938,7 @@ test "root selection preflight consumes document navigation only for live owners
 
     var overlap_config: keymap.Config = .{};
     overlap_config.set(.copy_current_line, .{ .plain_codepoint = 'x' });
+    overlap_config.set(.copy_history_detail, .{ .plain_codepoint = 'x' });
     overlap_config.set(.document_first, .{ .plain_codepoint = 'y' });
     const overlap = keymap.Effective.fromConfig(overlap_config);
     try std.testing.expectEqual(
