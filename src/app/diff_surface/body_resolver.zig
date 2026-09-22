@@ -114,8 +114,8 @@ pub const BodyResolver = struct {
     vtable: *const VTable,
 
     /// The seven conceptual entries are represented by eleven function
-    /// pointers because component 5 is the five-function parsed-body accessor
-    /// group fixed by issue #34's approved plan.
+    /// pointers because the parsed-body accessor is deliberately split into
+    /// five narrow queries.
     pub const VTable = struct {
         resolvedTarget: *const fn (ctx: *anyopaque) ResolvedTarget,
         hunkStagePresentation: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, file_index: usize) anyerror!diff_render.HunkStagePresentation,

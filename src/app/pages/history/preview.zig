@@ -471,7 +471,8 @@ pub fn summaryForRequest(request: git_history.SelectionRequest, selected_parent_
 }
 
 /// Allocate the width- and viewport-independent clipboard representation for
-/// one ready detail value. Clipboard dispatch remains an S6 responsibility.
+/// one ready detail value. This formatter owns no clipboard effect; callers
+/// decide whether and how to dispatch the returned payload.
 pub fn canonicalDetailAlloc(allocator: std.mem.Allocator, detail: git_preview.Detail) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();

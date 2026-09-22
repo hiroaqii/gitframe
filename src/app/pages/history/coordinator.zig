@@ -134,8 +134,8 @@ pub const Controller = struct {
         return outcome;
     }
 
-    /// S3 lifecycle entry point; selection input does not call this until the
-    /// dedicated integration slice.
+    /// Queue the current selection and start the preview debounce task when the
+    /// state machine requests one.
     pub fn requestPreview(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !?history_page.preview.QueueOutcome {
         if (self.active_page != .history) return null;
         const outcome = self.page_state.queueCurrentPreview(ctx.allocator()) orelse return null;

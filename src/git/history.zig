@@ -152,7 +152,8 @@ pub const SelectionIntent = union(enum) {
 };
 
 /// A validated picker request. It is neither an accepted selection nor an
-/// async task: S4 may re-resolve and pin it before starting materialization.
+/// async task. Consumers bind it to the current page and repository identity
+/// and revalidate its basis before asynchronous materialization.
 pub const SelectionRequest = struct {
     snapshot_head: ObjectId,
     intent: SelectionIntent,

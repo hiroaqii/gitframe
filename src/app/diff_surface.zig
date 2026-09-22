@@ -216,7 +216,8 @@ pub const ReadSurface = struct {
 /// bundle on demand, so no field moves and no long-lived aliasing exists. The
 /// two partial-lift members are narrowed on purpose: the surface sees a reload
 /// anchor and whether a live-drag deferred source apply is held, never the
-/// page's rich reload/deferred owners (issue #34 design, field table).
+/// page's richer reload and deferred-source owners. This keeps scheduling and
+/// ownership page-local instead of exposing them through the shared surface.
 /// Read-only consumers must narrow it with `readOnly` or construct a
 /// `ReadSurface` directly from a const page borrow.
 pub const DiffSurface = struct {

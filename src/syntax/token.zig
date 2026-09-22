@@ -241,7 +241,7 @@ test "neutral token scope mapping keeps existing roles" {
     try std.testing.expectEqual(TokenRole.function, roleFromScope("function.method"));
     try std.testing.expectEqual(TokenRole.constant, roleFromScope("constant.builtin"));
     try std.testing.expectEqual(TokenRole.punctuation, roleFromScope("punctuation.bracket"));
-    // Special-string classification remains explicitly outside Issue #98.
+    // Unrecognized special-string scopes intentionally use the base string role.
     try std.testing.expectEqual(TokenRole.string, roleFromScope("string.special.regex"));
 }
 

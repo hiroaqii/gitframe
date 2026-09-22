@@ -1,5 +1,4 @@
-//! Pure History three-pane interaction state. Live input and rendering are
-//! connected by later slices.
+//! History three-pane interaction state and pure layout/navigation transitions.
 
 const std = @import("std");
 const ui = @import("chasen_ui");

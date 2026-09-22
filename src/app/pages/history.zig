@@ -639,7 +639,8 @@ pub const HistoryPageState = struct {
         );
     }
 
-    /// S3 lifecycle entry point. Live cursor/input wiring remains in S6.
+    /// Resolve the current picker selection and update the preview queue. The
+    /// caller owns task dispatch for a `.start_debounce` outcome.
     pub fn queueCurrentPreview(self: *HistoryPageState, allocator: std.mem.Allocator) ?preview.QueueOutcome {
         const page_identity = self.activation.currentIdentity() orelse {
             self.preview_state.clearSelection(allocator);
