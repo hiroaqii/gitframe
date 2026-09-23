@@ -3212,14 +3212,13 @@ test "History help explains every commit picker marker" {
     defer std.testing.allocator.free(snapshot);
 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Markers") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit · Date · Author · [Refs] Subject") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit · Date · Author · Type · [Refs] Subject") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         snapshot,
         "x                 copy commit detail / range summary",
     ) != null);
     for ([_][]const u8{
-        "range anchor",
         "commit included in the selected range",
         "merge commit",
         "root commit",
@@ -3459,7 +3458,7 @@ const help_compare_items = [_]HelpItem{
 };
 
 const help_history_items = [_]HelpItem{
-    .{ .key = .{ .text = "Row" }, .description = "Commit · Date · Author · [Refs] Subject" },
+    .{ .key = .{ .text = "Row" }, .description = "Commit · Date · Author · Type · [Refs] Subject" },
     .{ .key = .{ .text = "Tab / Shift+Tab" }, .description = "cycle History / detail / files focus" },
     .{ .key = .{ .text = "↑/↓ j/k" }, .description = "navigate the focused pane" },
     .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "move one visible page" },
@@ -3475,7 +3474,6 @@ const help_history_items = [_]HelpItem{
 };
 
 const help_history_marker_items = [_]HelpItem{
-    .{ .key = .{ .text = history_view.PickerMarker.range_anchor }, .description = "range anchor" },
     .{ .key = .{ .text = history_view.PickerMarker.range_selected }, .description = "commit included in the selected range" },
     .{ .key = .{ .text = history_view.PickerMarker.merge }, .description = "merge commit" },
     .{ .key = .{ .text = history_view.PickerMarker.root }, .description = "root commit" },

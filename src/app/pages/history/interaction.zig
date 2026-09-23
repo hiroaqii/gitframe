@@ -3,6 +3,9 @@
 const std = @import("std");
 const ui = @import("chasen_ui");
 
+const default_left_width_numerator: u32 = 3;
+const default_left_width_denominator: u32 = 5;
+
 pub const Focus = enum {
     history,
     commit_detail,
@@ -201,7 +204,11 @@ pub const State = struct {
         if (total == 0) return .{ .left = 0, .divider = 0, .right = 0 };
         const divider: u16 = 1;
         const available = total - divider;
-        const preferred = self.preferred_left_width orelse available / 2;
+        const preferred = self.preferred_left_width orelse
+            @as(u16, @intCast(
+                (@as(u32, available) * default_left_width_numerator) /
+                    default_left_width_denominator,
+            ));
         const left = clampLeftWidth(total, preferred);
         return .{ .left = left, .divider = divider, .right = available - left };
     }
@@ -318,9 +325,9 @@ test "History interaction preserves a logical detail anchor across reflow" {
     try std.testing.expect(state.detail_anchor.source_byte_offset > 0 or state.detail_anchor.block_index > 0);
 }
 
-test "History interaction clamps width without overwriting the preference on resize" {
+test "History interaction uses a clamped 60/40 default without overwriting the preference on resize" {
     var state: State = .{};
-    try std.testing.expectEqual(OuterWidths{ .left = 59, .divider = 1, .right = 60 }, state.outerWidths(120));
+    try std.testing.expectEqual(OuterWidths{ .left = 71, .divider = 1, .right = 48 }, state.outerWidths(120));
     try std.testing.expectEqual(OuterWidths{ .left = 42, .divider = 1, .right = 47 }, state.outerWidths(90));
     for ([_]u16{ 0, 1, 2, 89 }) |width| {
         const parts = state.outerWidths(width);
@@ -328,11 +335,11 @@ test "History interaction clamps width without overwriting the preference on res
     }
 
     state.adjustWidth(120, .increase);
-    try std.testing.expectEqual(@as(?u16, 63), state.preferred_left_width);
+    try std.testing.expectEqual(@as(?u16, 72), state.preferred_left_width);
     state.adjustWidth(120, .decrease);
-    try std.testing.expectEqual(@as(?u16, 59), state.preferred_left_width);
+    try std.testing.expectEqual(@as(?u16, 68), state.preferred_left_width);
     state.adjustWidth(120, .increase);
     _ = state.outerWidths(64);
-    try std.testing.expectEqual(@as(?u16, 63), state.preferred_left_width);
-    try std.testing.expectEqual(OuterWidths{ .left = 63, .divider = 1, .right = 56 }, state.outerWidths(120));
+    try std.testing.expectEqual(@as(?u16, 72), state.preferred_left_width);
+    try std.testing.expectEqual(OuterWidths{ .left = 72, .divider = 1, .right = 47 }, state.outerWidths(120));
 }

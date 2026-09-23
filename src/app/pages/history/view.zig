@@ -20,11 +20,14 @@ const loaded_diff = @import("../../../loaded_diff.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const theme = @import("theme");
 
-const row_prefix_width: u16 = 4;
+const row_prefix_width: u16 = 2;
 const commit_width: u16 = 7;
 const date_width: u16 = 10;
-const author_width: u16 = 14;
+const author_width: u16 = 13;
 const column_gap: u16 = 2;
+const topology_width: u16 = 1;
+const topology_gap: u16 = 1;
+const right_pane_leading_padding: u16 = 1;
 
 const FieldLayout = struct {
     col: u16,
@@ -35,32 +38,33 @@ const CommitRowLayout = struct {
     commit: FieldLayout,
     date: FieldLayout,
     author: FieldLayout,
+    topology: FieldLayout,
     summary: FieldLayout,
 
     fn init(viewport_width: u16) CommitRowLayout {
         const commit_col = row_prefix_width;
         const date_col = commit_col + commit_width + column_gap;
         const author_col = date_col + date_width + column_gap;
-        const summary_col = author_col + author_width + column_gap;
+        const topology_col = author_col + author_width + topology_gap;
+        const summary_col = topology_col + topology_width + topology_gap;
         return .{
             .commit = .{ .col = commit_col, .width = commit_width },
             .date = .{ .col = date_col, .width = date_width },
             .author = .{ .col = author_col, .width = author_width },
+            .topology = .{ .col = topology_col, .width = topology_width },
             .summary = .{ .col = summary_col, .width = viewport_width -| summary_col },
         };
     }
 };
 
 pub const PickerMarker = struct {
-    pub const range_anchor = "A";
     pub const range_selected = "┃";
     pub const merge = "M";
     pub const root = "R";
     pub const unavailable_parent = "?";
 };
 
-pub const range_footer_text = "Range: " ++ PickerMarker.range_anchor ++
-    " anchor · " ++ PickerMarker.range_selected ++ " selected";
+pub const range_footer_text = "Range: " ++ PickerMarker.range_selected ++ " selected";
 
 pub const ViewContext = struct {
     page_state: *const history_page.HistoryPageState,
@@ -153,10 +157,11 @@ pub fn pickerLayout(size: chasen.Size, state: history_page.interaction.State) Pi
         .width = outer.divider,
         .height = size.height,
     };
+    const right_padding = @min(outer.right, right_pane_leading_padding);
     const right: chasen.Rect = .{
-        .col = outer.left +| outer.divider,
+        .col = outer.left +| outer.divider +| right_padding,
         .row = 0,
-        .width = outer.right,
+        .width = outer.right - right_padding,
         .height = size.height,
     };
     var right_parts: [3]chasen.Rect = undefined;
@@ -277,20 +282,26 @@ fn paneBodyRect(rect: chasen.Rect) chasen.Rect {
     };
 }
 
-fn drawPaneTitle(surface: *chasen.Surface, title: []const u8, active: bool, palette: theme.Palette) !void {
+fn drawPaneTitle(
+    surface: *chasen.Surface,
+    col: u16,
+    title: []const u8,
+    active: bool,
+    palette: theme.Palette,
+) !void {
     if (surface.size().height == 0) return;
     try drawClipped(
         surface,
+        col,
         0,
-        0,
-        try std.fmt.allocPrint(surface.frameAllocator(), "{s} {s}", .{ if (active) ">" else " ", title }),
+        title,
         if (active) palette.boldStyle(.accent) else palette.style(.muted),
     );
 }
 
 fn viewDetailPane(context: ViewContext, surface: *chasen.Surface) !void {
     const active = context.page_state.interaction_state.focus == .commit_detail;
-    try drawPaneTitle(surface, detailTitle(context.page_state), active, context.palette);
+    try drawPaneTitle(surface, 0, detailTitle(context.page_state), active, context.palette);
     if (surface.size().height <= 1) return;
     var body = surface.child(.{
         .col = 0,
@@ -314,7 +325,7 @@ fn viewDetailPane(context: ViewContext, surface: *chasen.Surface) !void {
 
 fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
     const active = context.page_state.interaction_state.focus == .changed_files;
-    try drawPaneTitle(surface, "Changed files", active, context.palette);
+    try drawPaneTitle(surface, 0, "Changed files", active, context.palette);
     if (surface.size().height <= 1) return;
     var body = surface.child(.{
         .col = 0,
@@ -664,7 +675,7 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
     const page = context.page_state;
-    try drawPaneTitle(surface, "History", pane_active, context.palette);
+    try drawPaneTitle(surface, row_prefix_width, "History", pane_active, context.palette);
 
     if (page.load_state == .no_repository) {
         drawState(surface, context.palette, "History", "History requires a repository", "R: switch repository");
@@ -724,7 +735,7 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
     if (page.catalog.records.items.len == 0) {
         if (size.height > 1) try drawClipped(
             surface,
-            2,
+            row_prefix_width,
             1,
             if (previous != null) "No commits yet  ·  r: reload  ·  Esc: previous diff" else "No commits yet  ·  r: reload",
             context.palette.style(.muted),
@@ -740,28 +751,26 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
         const focused = selected and pane_active;
         if (focused) fillSelectedRow(surface, row, context.palette.color(.pane_cursor_bg));
         if (index == page.catalog.records.items.len) {
-            const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s} … ", .{if (selected) "›" else " "});
-            try drawClipped(surface, 0, row, markers, catalogStyle(context.palette, .prompt, focused));
+            try drawClipped(surface, 0, row, if (selected) "›" else " ", catalogStyle(context.palette, .prompt, focused));
             const label = if (page.load_state == .loading) "Loading older commits…" else "Load 200 older commits…";
             try drawClipped(surface, row_prefix_width, row, label, catalogStyle(context.palette, .prompt, focused));
             continue;
         }
         const record = &page.catalog.records.items[index];
         const range_marker: ?[]const u8 = if (page.draft.anchor()) |anchor|
-            if (index == anchor)
-                PickerMarker.range_anchor
-            else if (page.draft.contains(page.catalog.cursor, index))
+            if (index == anchor or page.draft.contains(page.catalog.cursor, index))
                 PickerMarker.range_selected
             else
                 null
         else
             null;
-        const markers = try std.fmt.allocPrint(surface.frameAllocator(), "{s}{s}{s} ", .{
+        try drawClipped(
+            surface,
+            0,
+            row,
             if (selected) "›" else " ",
-            range_marker orelse " ",
-            topologyMarker(record),
-        });
-        try drawClipped(surface, 0, row, markers, catalogStyle(context.palette, if (focused) .accent else .info, focused));
+            catalogStyle(context.palette, if (focused) .accent else .info, focused),
+        );
         if (range_marker) |marker| try drawClipped(surface, 1, row, marker, rangeMarkerStyle(context.palette, focused));
         try drawCommitRow(surface, row, record, context.palette, focused);
     }
@@ -887,7 +896,7 @@ fn drawCatalogContext(
     pane_active: bool,
 ) !void {
     const size = surface.size();
-    if (size.width <= 2 or size.height == 0) return;
+    if (size.width <= row_prefix_width or size.height == 0) return;
     const allocator = surface.frameAllocator();
     const base = try std.fmt.allocPrint(
         allocator,
@@ -905,7 +914,7 @@ fn drawCatalogContext(
     }
 
     const position = try catalogPositionLabel(allocator, page);
-    const content_width: u16 = size.width -| 2;
+    const content_width: u16 = size.width - row_prefix_width;
     const left_text_width = chasen.text.displayWidth(left);
     const full_width = chasen.text.displayWidth(position.full);
     const compact_width = chasen.text.displayWidth(position.compact);
@@ -919,10 +928,10 @@ fn drawCatalogContext(
     if (right) |right_text| {
         const right_width = chasen.text.displayWidth(right_text);
         const right_col: u16 = size.width - @as(u16, @intCast(right_width));
-        const left_width = right_col -| column_gap -| 2;
+        const left_width = right_col -| column_gap -| row_prefix_width;
         try drawClippedField(
             surface,
-            2,
+            row_prefix_width,
             0,
             left_width,
             left,
@@ -934,7 +943,7 @@ fn drawCatalogContext(
 
     try drawClipped(
         surface,
-        2,
+        row_prefix_width,
         0,
         left,
         if (pane_active) palette.boldStyle(.accent) else palette.style(.muted),
@@ -1048,6 +1057,14 @@ fn drawCommitRow(
         record.author,
         catalogStyle(palette, .info, focused),
     );
+    try drawClippedField(
+        surface,
+        layout.topology.col,
+        row,
+        layout.topology.width,
+        topologyMarker(record),
+        catalogStyle(palette, if (focused) .accent else .info, focused),
+    );
     try drawSummaryFields(surface, row, layout.summary, record, palette, focused);
 }
 
@@ -1136,9 +1153,9 @@ fn drawClippedField(
 fn drawState(surface: *chasen.Surface, palette: theme.Palette, title: []const u8, body: []const u8, hint: []const u8) void {
     const size = surface.size();
     const row = size.height / 2;
-    drawClipped(surface, 2, row, title, palette.boldStyle(.accent)) catch {};
-    if (row + 1 < size.height) drawClipped(surface, 2, row + 1, body, palette.style(.muted)) catch {};
-    if (row + 2 < size.height) drawClipped(surface, 2, row + 2, hint, palette.style(.prompt)) catch {};
+    drawClipped(surface, row_prefix_width, row, title, palette.boldStyle(.accent)) catch {};
+    if (row + 1 < size.height) drawClipped(surface, row_prefix_width, row + 1, body, palette.style(.muted)) catch {};
+    if (row + 2 < size.height) drawClipped(surface, row_prefix_width, row + 2, hint, palette.style(.prompt)) catch {};
 }
 
 fn drawClipped(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, style: chasen.TextStyle) !void {
@@ -1151,11 +1168,11 @@ fn drawClipped(surface: *chasen.Surface, col: u16, row: u16, text: []const u8, s
 
 test "History preview three pane layout is exact and saturates a tiny body" {
     const layout = pickerLayout(.{ .width = 120, .height = 27 }, .{});
-    try std.testing.expectEqual(chasen.Rect{ .col = 0, .row = 0, .width = 59, .height = 27 }, layout.history);
-    try std.testing.expectEqual(chasen.Rect{ .col = 59, .row = 0, .width = 1, .height = 27 }, layout.outer_divider);
-    try std.testing.expectEqual(chasen.Rect{ .col = 60, .row = 0, .width = 60, .height = 11 }, layout.detail);
-    try std.testing.expectEqual(chasen.Rect{ .col = 60, .row = 11, .width = 60, .height = 1 }, layout.inner_divider);
-    try std.testing.expectEqual(chasen.Rect{ .col = 60, .row = 12, .width = 60, .height = 15 }, layout.files);
+    try std.testing.expectEqual(chasen.Rect{ .col = 0, .row = 0, .width = 71, .height = 27 }, layout.history);
+    try std.testing.expectEqual(chasen.Rect{ .col = 71, .row = 0, .width = 1, .height = 27 }, layout.outer_divider);
+    try std.testing.expectEqual(chasen.Rect{ .col = 73, .row = 0, .width = 47, .height = 11 }, layout.detail);
+    try std.testing.expectEqual(chasen.Rect{ .col = 73, .row = 11, .width = 47, .height = 1 }, layout.inner_divider);
+    try std.testing.expectEqual(chasen.Rect{ .col = 73, .row = 12, .width = 47, .height = 15 }, layout.files);
 
     const tiny = pickerLayout(.{ .width = 1, .height = 0 }, .{});
     for ([_]chasen.Rect{ tiny.history, tiny.outer_divider, tiny.detail, tiny.inner_divider, tiny.files }) |rect| {
@@ -1224,25 +1241,27 @@ test "History preview three pane renders focus structured detail and flat files"
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed files") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Count: 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/history/preview-with") != null);
-    try rendered.expectCellText(59, 0, "│");
-    const divider_cell = rendered.surface.readCell(59, 0) orelse return error.ExpectedOuterDivider;
+    const layout = pickerLayout(rendered.surface.size(), page_state.interaction_state);
+    try rendered.expectCellText(layout.outer_divider.col, 0, "│");
+    const divider_cell = rendered.surface.readCell(layout.outer_divider.col, 0) orelse return error.ExpectedOuterDivider;
     try std.testing.expect(divider_cell.style.fg.eql(palette.color(.muted)));
-    try rendered.expectCellText(60, 11, "─");
-    const horizontal_divider_cell = rendered.surface.readCell(60, 11) orelse return error.ExpectedInnerDivider;
+    try rendered.expectCellText(layout.inner_divider.col, layout.inner_divider.row, "─");
+    const horizontal_divider_cell = rendered.surface.readCell(layout.inner_divider.col, layout.inner_divider.row) orelse return error.ExpectedInnerDivider;
     try std.testing.expect(horizontal_divider_cell.style.fg.eql(palette.color(.muted)));
-    try rendered.expectCellText(60, 12, ">");
-    try rendered.expectCellText(60, 13, "M");
-    const columns = fileColumns(60, maxStatsWidth(&files));
-    try rendered.expectCellText(62, 13, "s");
-    try rendered.expectCellText(60 + columns.stats_col, 13, "+");
-    const active_marker = rendered.surface.readCell(60, 12) orelse return error.ExpectedActivePaneMarker;
-    try std.testing.expect(active_marker.style.bold);
-    try std.testing.expect(active_marker.style.fg.eql(palette.color(.accent)));
-    const status_cell = rendered.surface.readCell(60, 13) orelse return error.ExpectedFileStatus;
+    try rendered.expectCellText(layout.files.col, layout.files.row, "C");
+    const files_body = paneBodyRect(layout.files);
+    try rendered.expectCellText(files_body.col, files_body.row, "M");
+    const columns = fileColumns(files_body.width, maxStatsWidth(&files));
+    try rendered.expectCellText(files_body.col + columns.path_col, files_body.row, "s");
+    try rendered.expectCellText(files_body.col + columns.stats_col, files_body.row, "+");
+    const active_title = rendered.surface.readCell(layout.files.col, layout.files.row) orelse return error.ExpectedActivePaneTitle;
+    try std.testing.expect(active_title.style.bold);
+    try std.testing.expect(active_title.style.fg.eql(palette.color(.accent)));
+    const status_cell = rendered.surface.readCell(files_body.col, files_body.row) orelse return error.ExpectedFileStatus;
     try std.testing.expect(status_cell.style.bold);
     try std.testing.expect(status_cell.style.fg.eql(palette.color(.prompt)));
-    const added_cell = rendered.surface.readCell(60 + columns.stats_col, 13) orelse return error.ExpectedAddedStats;
-    const removed_cell = rendered.surface.readCell(60 + columns.stats_col + 3, 13) orelse return error.ExpectedRemovedStats;
+    const added_cell = rendered.surface.readCell(files_body.col + columns.stats_col, files_body.row) orelse return error.ExpectedAddedStats;
+    const removed_cell = rendered.surface.readCell(files_body.col + columns.stats_col + 3, files_body.row) orelse return error.ExpectedRemovedStats;
     try std.testing.expect(added_cell.style.bold);
     try std.testing.expect(added_cell.style.fg.eql(palette.color(.success)));
     try std.testing.expect(removed_cell.style.bold);
@@ -1266,9 +1285,9 @@ test "History preview three pane renders focus structured detail and flat files"
     try scrolled.init(120, 27);
     defer scrolled.deinit();
     try view(.{ .page_state = &page_state, .palette = palette }, &scrolled.surface);
-    try scrolled.expectCellText(60, 13, "M");
-    try scrolled.expectCellText(62, 13, "r");
-    try scrolled.expectCellText(60 + columns.stats_col, 13, "+");
+    try scrolled.expectCellText(files_body.col, files_body.row, "M");
+    try scrolled.expectCellText(files_body.col + columns.path_col, files_body.row, "r");
+    try scrolled.expectCellText(files_body.col + columns.stats_col, files_body.row, "+");
 
     const blocks = [_]history_page.interaction.DetailBlock{.{
         .label = "Message: ",
@@ -1381,10 +1400,9 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit 3 of 3 loaded") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "catalog head") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit   subject") == null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, " AM 1111111") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "›┃R 3333333") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "HiHistory") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "root subject") != null);
-        try rendered.expectCellText(2, 0, "H");
+        try rendered.expectCellText(row_prefix_width, 0, "H");
         const layout = CommitRowLayout.init(size.width);
         try rendered.expectCellText(layout.commit.col, 1, "1");
         try rendered.expectCellText(layout.date.col, 1, "2");
@@ -1396,6 +1414,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
             .{ .col = layout.commit.col, .role = .accent },
             .{ .col = layout.date.col, .role = .muted },
             .{ .col = layout.author.col, .role = .info },
+            .{ .col = layout.topology.col, .role = .info },
             .{ .col = layout.summary.col, .role = .prompt },
             .{ .col = layout.summary.col + refs_width + 1, .role = .foreground },
         }) |expected| {
@@ -1409,6 +1428,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
             .{ .col = layout.commit.col, .role = .accent },
             .{ .col = layout.date.col, .role = .muted },
             .{ .col = layout.author.col, .role = .info },
+            .{ .col = layout.topology.col, .role = .accent },
             .{ .col = layout.summary.col, .role = .prompt },
             .{ .col = layout.summary.col + selected_refs_width + 1, .role = .foreground },
         }) |expected| {
@@ -1419,27 +1439,23 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         }
         try std.testing.expect(rendered.surface.readCell(size.width - 1, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
-        const merge_marker = rendered.surface.readCell(2, 1) orelse return error.ExpectedTopologyMarker;
+        const merge_marker = rendered.surface.readCell(layout.topology.col, 1) orelse return error.ExpectedTopologyMarker;
         try std.testing.expectEqualStrings(PickerMarker.merge, merge_marker.char.grapheme);
         try std.testing.expect(merge_marker.style.fg.eql(palette.color(.info)));
         try std.testing.expect(!merge_marker.style.dim);
         try std.testing.expect(!merge_marker.style.bg.eql(palette.color(.pane_cursor_bg)));
-        const selected_root_marker = rendered.surface.readCell(2, 3) orelse return error.ExpectedTopologyMarker;
+        const selected_root_marker = rendered.surface.readCell(layout.topology.col, 3) orelse return error.ExpectedTopologyMarker;
         try std.testing.expectEqualStrings(PickerMarker.root, selected_root_marker.char.grapheme);
         try std.testing.expect(selected_root_marker.style.fg.eql(palette.color(.accent)));
         try std.testing.expect(!selected_root_marker.style.dim);
         try std.testing.expect(selected_root_marker.style.bg.eql(palette.color(.pane_cursor_bg)));
 
-        for ([_]struct { row: u16, marker: []const u8 }{
-            .{ .row = 1, .marker = PickerMarker.range_anchor },
-            .{ .row = 2, .marker = PickerMarker.range_selected },
-            .{ .row = 3, .marker = PickerMarker.range_selected },
-        }) |expected| {
-            const cell = rendered.surface.readCell(1, expected.row) orelse return error.ExpectedRangeMarker;
-            try std.testing.expectEqualStrings(expected.marker, cell.char.grapheme);
+        for ([_]u16{ 1, 2, 3 }) |row| {
+            const cell = rendered.surface.readCell(1, row) orelse return error.ExpectedRangeMarker;
+            try std.testing.expectEqualStrings(PickerMarker.range_selected, cell.char.grapheme);
             try std.testing.expect(cell.style.fg.eql(palette.color(.accent)));
             try std.testing.expect(cell.style.bold);
-            try std.testing.expectEqual(expected.row == 3, cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+            try std.testing.expectEqual(row == 3, cell.style.bg.eql(palette.color(.pane_cursor_bg)));
         }
         if (size.width == 120) {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ada Lovelace") != null);
