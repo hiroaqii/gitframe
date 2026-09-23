@@ -48,8 +48,8 @@ const help_header_rows: u16 = 2;
 const help_scroll_indicator_rows: u16 = 1;
 const commit_dialog_width: u16 = 80;
 const repo_picker_dialog_width: u16 = 80;
-const push_error_dialog_max_width: u16 = 90;
-const push_error_dialog_min_height: u16 = 16;
+const remote_error_dialog_max_width: u16 = 90;
+const remote_error_dialog_min_height: u16 = 16;
 const repo_picker_filter_input_col: u16 = 8;
 const repo_picker_path_input_col: u16 = 11;
 const repo_picker_list_label_col: u16 = 4;
@@ -115,7 +115,8 @@ pub const Context = struct {
     amend_confirmation: ?app_state.AmendConfirmation,
     push_confirmation: ?app_state.PushConfirmation,
     pull_confirmation: ?app_state.PullConfirmation,
-    push_error_message: ?[]const u8,
+    remote_error_operation: ?app_state.RemoteOperation,
+    remote_error_message: ?[]const u8,
     push_retry_target: ?*const app_state.PushRetryTarget,
     push_retry_inspecting: bool,
     branch_switch: *const app_state.BranchSwitchState,
@@ -190,8 +191,8 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.overlay.isSwitchBranch() and app.overlay.visibleOn(app.active_page)) {
         try viewBranchSwitchPopup(app, surface);
     }
-    if (app.overlay.isPushError() and app.overlay.visibleOn(app.active_page)) {
-        try viewPushError(app, surface);
+    if (app.overlay.isRemoteError() and app.overlay.visibleOn(app.active_page)) {
+        try viewRemoteError(app, surface);
     }
     if (app.active_page == .compare and app.compare.page.base_picker.open) {
         try compare_view.viewBasePicker(app.compare, surface);
@@ -1497,14 +1498,18 @@ fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
     return @min(selected -| half, max_start);
 }
 
-fn viewPushError(app: Context, surface: *chasen.Surface) !void {
-    const message = app.push_error_message orelse return;
-    const opts = pushErrorModalOptions(surface.size(), message);
+fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
+    const operation = app.remote_error_operation orelse return;
+    const message = app.remote_error_message orelse return;
+    const opts = remoteErrorModalOptions(surface.size(), message);
 
     const opts_with_title: ui.Modal.ViewOptions = .{
         .dialog_width = opts.dialog_width,
         .dialog_height = opts.dialog_height,
-        .title = "Push failed",
+        .title = switch (operation) {
+            .push => "Push failed",
+            .pull => "Pull failed",
+        },
         .backdrop = false,
         .border = .rounded,
         .title_style = app.theme.boldStyle(.danger),
@@ -1517,7 +1522,11 @@ fn viewPushError(app: Context, surface: *chasen.Surface) !void {
     const size = content.size();
 
     if (size.height > 0) {
-        try draw.copyClippedTextAt(&content, 0, 0, "Git push failed. Details:", app.theme.boldStyle(.danger));
+        const heading = switch (operation) {
+            .push => "Git push failed. Details:",
+            .pull => "Git pull failed. Details:",
+        };
+        try draw.copyClippedTextAt(&content, 0, 0, heading, app.theme.boldStyle(.danger));
     }
 
     if (size.height > 4) {
@@ -1527,23 +1536,24 @@ fn viewPushError(app: Context, surface: *chasen.Surface) !void {
             .width = size.width,
             .height = size.height - 4,
         });
-        _ = drawWrappedTextScrolled(&body, message, app.overlay.push_error_scroll, .{});
+        _ = drawWrappedTextScrolled(&body, message, app.overlay.remote_error_scroll, .{});
     }
 
     if (size.height > 0) {
-        const footer = pushErrorFooter(app.push_retry_inspecting, app.push_retry_target != null);
+        const footer = remoteErrorFooter(operation, app.push_retry_inspecting, app.push_retry_target != null);
         try draw.copyClippedTextAt(&content, 0, size.height - 1, footer, app.theme.style(.danger));
     }
 }
 
-fn pushErrorFooter(inspecting: bool, retry_available: bool) []const u8 {
+fn remoteErrorFooter(operation: app_state.RemoteOperation, inspecting: bool, retry_available: bool) []const u8 {
+    if (operation == .pull) return "y: copy  Enter/Esc/q: close";
     if (inspecting) return "checking push target...  y: copy  Enter/Esc/q: cancel";
     if (retry_available) return "i: interactive  y: copy  Enter/Esc/q: close";
     return "y: copy  Enter/Esc/q: close";
 }
 
-fn pushErrorModalOptions(size: chasen.Size, message: []const u8) struct { dialog_width: u16, dialog_height: u16 } {
-    const dialog_width = @min(size.width, push_error_dialog_max_width);
+fn remoteErrorModalOptions(size: chasen.Size, message: []const u8) struct { dialog_width: u16, dialog_height: u16 } {
+    const dialog_width = @min(size.width, remote_error_dialog_max_width);
     const content_width = if (dialog_width > 4) dialog_width - 4 else 0;
     const paragraph = ui.Paragraph.init(.{ .text = message });
     const body_rows = paragraph.lineCount(content_width);
@@ -1556,21 +1566,21 @@ fn pushErrorModalOptions(size: chasen.Size, message: []const u8) struct { dialog
     };
 }
 
-pub fn pushErrorVisibleRows(size: chasen.Size, message: ?[]const u8) u16 {
-    const content_size = pushErrorContentSize(size, message orelse "");
+pub fn remoteErrorVisibleRows(size: chasen.Size, message: ?[]const u8) u16 {
+    const content_size = remoteErrorContentSize(size, message orelse "");
     if (content_size.height <= 4) return 0;
     return content_size.height - 4;
 }
 
-pub fn pushErrorMaxScroll(size: chasen.Size, message: ?[]const u8) usize {
+pub fn remoteErrorMaxScroll(size: chasen.Size, message: ?[]const u8) usize {
     const text = message orelse "";
-    const content_size = pushErrorContentSize(size, text);
+    const content_size = remoteErrorContentSize(size, text);
     if (content_size.width == 0) return 0;
-    return paragraphMaxScroll(text, content_size.width, pushErrorVisibleRows(size, message));
+    return paragraphMaxScroll(text, content_size.width, remoteErrorVisibleRows(size, message));
 }
 
-fn pushErrorContentSize(size: chasen.Size, message: []const u8) chasen.Size {
-    const opts = pushErrorModalOptions(size, message);
+fn remoteErrorContentSize(size: chasen.Size, message: []const u8) chasen.Size {
+    const opts = remoteErrorModalOptions(size, message);
     return modalContentSizeForRect(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, .{
         .dialog_width = opts.dialog_width,
         .dialog_height = opts.dialog_height,
@@ -1578,7 +1588,7 @@ fn pushErrorContentSize(size: chasen.Size, message: []const u8) chasen.Size {
 }
 
 fn modalHeightForContent(size: chasen.Size, dialog_width: u16, desired_content_height: usize) u16 {
-    var candidate = @min(size.height, push_error_dialog_min_height);
+    var candidate = @min(size.height, remote_error_dialog_min_height);
     const overlay: chasen.Rect = .{ .col = 0, .row = 0, .width = size.width, .height = size.height };
     while (candidate < size.height) : (candidate += 1) {
         const content_size = modalContentSizeForRect(overlay, .{
@@ -2419,7 +2429,8 @@ const ShellViewTestHarness = struct {
             .amend_confirmation = null,
             .push_confirmation = self.push_confirmation,
             .pull_confirmation = null,
-            .push_error_message = null,
+            .remote_error_operation = null,
+            .remote_error_message = null,
             .push_retry_target = null,
             .push_retry_inspecting = false,
             .branch_switch = &self.branch_switch,
@@ -3229,7 +3240,7 @@ test "History help explains every commit picker marker" {
     }
 }
 
-test "push error paragraph viewport max scroll follows wrapped line count" {
+test "remote error paragraph viewport max scroll follows wrapped line count" {
     const text = "ab\n\nあいz\nabcdef";
     const width: u16 = 4;
     const visible_rows: u16 = 2;
@@ -3239,7 +3250,7 @@ test "push error paragraph viewport max scroll follows wrapped line count" {
     try std.testing.expectEqual(expected_rows - visible_rows, paragraphMaxScroll(text, width, visible_rows));
 }
 
-test "push error paragraph renderer stays in parity with Paragraph lineCount" {
+test "remote error paragraph renderer stays in parity with Paragraph lineCount" {
     const text = "ab\n\nあいz\nabcdef";
     const width: u16 = 4;
     const paragraph = ui.Paragraph.init(.{ .text = text });
@@ -3252,7 +3263,7 @@ test "push error paragraph renderer stays in parity with Paragraph lineCount" {
     try std.testing.expectEqual(expected_rows, drawWrappedTextScrolled(&ts.surface, text, 0, .{}));
 }
 
-test "push error paragraph renderer applies scroll offset" {
+test "remote error paragraph renderer applies scroll offset" {
     const text = "one\ntwo\nthree\nfour";
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(8, 3);
@@ -3264,20 +3275,22 @@ test "push error paragraph renderer applies scroll offset" {
     try ts.expectCellText(0, 2, "f");
 }
 
-test "push error footer advertises copy for every retry state at 120 columns" {
+test "remote error footer advertises copy and limits interactive action to push at 120 columns" {
     const Case = struct {
+        operation: app_state.RemoteOperation,
         inspecting: bool,
         retry_available: bool,
         expected: []const u8,
     };
-    const content_width = pushErrorContentSize(.{ .width = 120, .height = 24 }, "failure").width;
+    const content_width = remoteErrorContentSize(.{ .width = 120, .height = 24 }, "failure").width;
 
     for ([_]Case{
-        .{ .inspecting = true, .retry_available = true, .expected = "checking push target...  y: copy  Enter/Esc/q: cancel" },
-        .{ .inspecting = false, .retry_available = true, .expected = "i: interactive  y: copy  Enter/Esc/q: close" },
-        .{ .inspecting = false, .retry_available = false, .expected = "y: copy  Enter/Esc/q: close" },
+        .{ .operation = .push, .inspecting = true, .retry_available = true, .expected = "checking push target...  y: copy  Enter/Esc/q: cancel" },
+        .{ .operation = .push, .inspecting = false, .retry_available = true, .expected = "i: interactive  y: copy  Enter/Esc/q: close" },
+        .{ .operation = .push, .inspecting = false, .retry_available = false, .expected = "y: copy  Enter/Esc/q: close" },
+        .{ .operation = .pull, .inspecting = false, .retry_available = false, .expected = "y: copy  Enter/Esc/q: close" },
     }) |case| {
-        const footer = pushErrorFooter(case.inspecting, case.retry_available);
+        const footer = remoteErrorFooter(case.operation, case.inspecting, case.retry_available);
         try std.testing.expectEqualStrings(case.expected, footer);
         try std.testing.expect(footer.len <= @as(usize, content_width));
     }

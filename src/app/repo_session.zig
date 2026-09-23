@@ -1111,8 +1111,9 @@ test "workspace repository commitments advance one authoritative epoch" {
     try std.testing.expect(app.remote.branch_switch_load_pending == null);
     try std.testing.expect(!app.overlay.isSwitchBranch());
 
-    app.remote.push_error_message = try allocator.dupe(u8, "old repository push failure");
-    app.overlay.openPushError();
+    app.remote.remote_error_operation = .push;
+    app.remote.remote_error_message = try allocator.dupe(u8, "old repository push failure");
+    app.overlay.openRemoteError();
     const deferred_identity = app.pages.changes.activation.currentIdentity().?;
     app.pages.changes.deferred_source_apply = .{
         .finished = .{
@@ -1139,8 +1140,8 @@ test "workspace repository commitments advance one authoritative epoch" {
     try std.testing.expectEqual(CommitOutcome.changed, app.repoSession().commitWorkspaceIndex(allocator, 1));
     try std.testing.expectEqual(@as(u64, 1), app.repoSessionView().epoch());
     try std.testing.expectEqualStrings(roots.b, app.repoSessionView().activeRoot().?);
-    try std.testing.expect(app.remote.push_error_message == null);
-    try std.testing.expect(!app.overlay.isPushError());
+    try std.testing.expect(app.remote.remote_error_message == null);
+    try std.testing.expect(!app.overlay.isRemoteError());
     try std.testing.expect(app.pages.changes.deferred_source_apply == null);
     try std.testing.expect(app.pages.changes.deferred_projection_apply == null);
 

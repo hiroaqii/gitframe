@@ -7,6 +7,11 @@ const session_hunk_mark = @import("pages/changes/session_hunk_mark.zig");
 const page = @import("page.zig");
 const remote_request = @import("remote_request.zig");
 
+pub const RemoteOperation = enum {
+    push,
+    pull,
+};
+
 pub const OverlayKind = union(enum) {
     none,
     help,
@@ -15,14 +20,14 @@ pub const OverlayKind = union(enum) {
     push_branch,
     pull_branch,
     switch_branch,
-    push_error,
+    remote_error,
 };
 
 pub const OverlayMouseMode = enum {
     passthrough,
     block,
     scroll_help,
-    scroll_push_error,
+    scroll_remote_error,
 };
 
 /// App-owned modal/overlay state.
@@ -33,11 +38,11 @@ pub const OverlayState = struct {
     kind: OverlayKind = .none,
     owner_page: ?page.Id = null,
     help_scroll: usize = 0,
-    push_error_scroll: usize = 0,
-    /// Identifies one concrete push-error surface across close/reopen cycles.
+    remote_error_scroll: usize = 0,
+    /// Identifies one concrete remote-error surface across close/reopen cycles.
     /// Async results captured by an older surface must not present in a newer
     /// popup merely because both have the same overlay kind.
-    push_error_instance_id: u64 = 0,
+    remote_error_instance_id: u64 = 0,
 
     pub fn isHelp(self: OverlayState) bool {
         return self.kind == .help;
@@ -63,15 +68,15 @@ pub const OverlayState = struct {
         return self.kind == .switch_branch;
     }
 
-    pub fn isPushError(self: OverlayState) bool {
-        return self.kind == .push_error;
+    pub fn isRemoteError(self: OverlayState) bool {
+        return self.kind == .remote_error;
     }
 
     pub fn mouseMode(self: OverlayState) OverlayMouseMode {
         return switch (self.kind) {
             .none => .passthrough,
             .help => .scroll_help,
-            .push_error => .scroll_push_error,
+            .remote_error => .scroll_remote_error,
             .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch => .block,
         };
     }
@@ -111,12 +116,12 @@ pub const OverlayState = struct {
         self.owner_page = .changes;
     }
 
-    pub fn openPushError(self: *OverlayState) void {
-        self.push_error_instance_id +%= 1;
-        if (self.push_error_instance_id == 0) self.push_error_instance_id = 1;
-        self.kind = .push_error;
+    pub fn openRemoteError(self: *OverlayState) void {
+        self.remote_error_instance_id +%= 1;
+        if (self.remote_error_instance_id == 0) self.remote_error_instance_id = 1;
+        self.kind = .remote_error;
         self.owner_page = .changes;
-        self.push_error_scroll = 0;
+        self.remote_error_scroll = 0;
     }
 
     pub fn close(self: *OverlayState) void {

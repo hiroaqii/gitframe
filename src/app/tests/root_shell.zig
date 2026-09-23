@@ -1747,7 +1747,7 @@ test "help overlay wheel redraw changes once skips at edge and reverses" {
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }
 
-test "push error overlay wheel redraw changes once skips at edge and reverses" {
+test "remote error overlay wheel redraw changes once skips at edge and reverses" {
     const long_message =
         "line 1\nline 2\nline 3\nline 4\nline 5\n" ++
         "line 6\nline 7\nline 8\nline 9\nline 10\n";
@@ -1756,20 +1756,23 @@ test "push error overlay wheel redraw changes once skips at edge and reverses" {
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
         } },
         .terminal_size = .{ .width = 100, .height = 8 },
-        .remote_workflow = .{ .push_error_message = try std.testing.allocator.dupe(u8, long_message) },
+        .remote_workflow = .{
+            .remote_error_operation = .push,
+            .remote_error_message = try std.testing.allocator.dupe(u8, long_message),
+        },
     };
     defer app.remote_workflow.deinit(std.testing.allocator);
-    app.overlay.openPushError();
+    app.overlay.openRemoteError();
 
     var ctx: chasen.Ctx(App.Msg) = .{};
-    const max_scroll = app_view.pushErrorMaxScroll(layoutSize(&app), app.remote_workflow.push_error_message);
+    const max_scroll = app_view.remoteErrorMaxScroll(layoutSize(&app), app.remote_workflow.remote_error_message);
     try std.testing.expect(max_scroll > 0);
-    app.overlay.push_error_scroll = max_scroll - 1;
+    app.overlay.remote_error_scroll = max_scroll - 1;
     const content = app_shell_layout.contentRect(app.terminal_size);
-    const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedPushErrorWheelMessage;
-    try std.testing.expectEqual(App.Msg.push_error_scroll_down, msg);
+    const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedRemoteErrorWheelMessage;
+    try std.testing.expectEqual(App.Msg.remote_error_scroll_down, msg);
     try app.update(msg, &ctx);
-    try std.testing.expectEqual(max_scroll, app.overlay.push_error_scroll);
+    try std.testing.expectEqual(max_scroll, app.overlay.remote_error_scroll);
     try std.testing.expect(!ctx.redrawWasSuppressed());
 
     ctx.resetRedrawSuppressed();
@@ -1777,8 +1780,8 @@ test "push error overlay wheel redraw changes once skips at edge and reverses" {
     try std.testing.expect(ctx.redrawWasSuppressed());
 
     ctx.resetRedrawSuppressed();
-    try app.update(.push_error_scroll_up, &ctx);
-    try std.testing.expectEqual(max_scroll - 1, app.overlay.push_error_scroll);
+    try app.update(.remote_error_scroll_up, &ctx);
+    try std.testing.expectEqual(max_scroll - 1, app.overlay.remote_error_scroll);
     try std.testing.expect(!ctx.redrawWasSuppressed());
 
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
@@ -1803,22 +1806,25 @@ test "confirmation overlay blocks mouse clicks and wheels" {
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
-test "terminal resize clamps push error scroll" {
+test "terminal resize clamps remote error scroll" {
     const long_message =
         "line 1\nline 2\nline 3\nline 4\nline 5\n" ++
         "line 6\nline 7\nline 8\nline 9\nline 10\n";
     var app: App = .{
         .terminal_size = .{ .width = 40, .height = 8 },
-        .remote_workflow = .{ .push_error_message = try std.testing.allocator.dupe(u8, long_message) },
-        .overlay = .{ .kind = .push_error, .push_error_scroll = 99 },
+        .remote_workflow = .{
+            .remote_error_operation = .push,
+            .remote_error_message = try std.testing.allocator.dupe(u8, long_message),
+        },
+        .overlay = .{ .kind = .remote_error, .remote_error_scroll = 99 },
     };
     defer app.remote_workflow.deinit(std.testing.allocator);
 
     try app.update(.{ .terminal_resized = .{ .width = 100, .height = 12 } }, undefined);
 
     try std.testing.expectEqual(
-        app_view.pushErrorMaxScroll(layoutSize(&app), app.remote_workflow.push_error_message),
-        app.overlay.push_error_scroll,
+        app_view.remoteErrorMaxScroll(layoutSize(&app), app.remote_workflow.remote_error_message),
+        app.overlay.remote_error_scroll,
     );
 }
 

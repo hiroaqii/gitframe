@@ -16,7 +16,7 @@ pub const PageOrigin = struct {
 };
 
 pub const ShellSurface = enum {
-    push_error,
+    remote_error,
     commit_panel,
 };
 
@@ -62,7 +62,7 @@ pub const Snapshot = struct {
     history_activation_id: u64 = 0,
     compare_activation_id: u64,
     history_preview: ?HistoryPreviewAuthority = null,
-    push_error_instance_id: ?u64,
+    remote_error_instance_id: ?u64,
     commit_panel_instance_id: ?u64,
 };
 
@@ -78,7 +78,7 @@ pub fn classify(origin: Origin, current: Snapshot) Liveness {
         },
         .shell_surface => |captured| blk: {
             const current_instance = switch (captured.surface) {
-                .push_error => current.push_error_instance_id,
+                .remote_error => current.remote_error_instance_id,
                 .commit_panel => current.commit_panel_instance_id,
             };
             if (current_instance == null or current_instance.? != captured.instance_id) break :blk .stale;
@@ -106,7 +106,7 @@ test "repository selection inactive page accepts same-instance clipboard complet
         .changes_activation_id = 9,
         .repository_activation_id = 5,
         .compare_activation_id = 6,
-        .push_error_instance_id = null,
+        .remote_error_instance_id = null,
         .commit_panel_instance_id = null,
     };
     try @import("std").testing.expectEqual(
@@ -150,12 +150,12 @@ test "reopened shell surface rejects prior clipboard completion" {
         .changes_activation_id = 9,
         .repository_activation_id = 5,
         .compare_activation_id = 6,
-        .push_error_instance_id = 12,
+        .remote_error_instance_id = 12,
         .commit_panel_instance_id = 18,
     };
     try @import("std").testing.expectEqual(
         Liveness.live_active,
-        classify(.{ .shell_surface = .{ .surface = .push_error, .instance_id = 12 } }, current),
+        classify(.{ .shell_surface = .{ .surface = .remote_error, .instance_id = 12 } }, current),
     );
     try @import("std").testing.expectEqual(
         Liveness.live_active,
@@ -163,14 +163,14 @@ test "reopened shell surface rejects prior clipboard completion" {
     );
     try @import("std").testing.expectEqual(
         Liveness.stale,
-        classify(.{ .shell_surface = .{ .surface = .push_error, .instance_id = 11 } }, current),
+        classify(.{ .shell_surface = .{ .surface = .remote_error, .instance_id = 11 } }, current),
     );
     var missing = current;
-    missing.push_error_instance_id = null;
+    missing.remote_error_instance_id = null;
     missing.commit_panel_instance_id = null;
     try @import("std").testing.expectEqual(
         Liveness.stale,
-        classify(.{ .shell_surface = .{ .surface = .push_error, .instance_id = 12 } }, missing),
+        classify(.{ .shell_surface = .{ .surface = .remote_error, .instance_id = 12 } }, missing),
     );
     try @import("std").testing.expectEqual(
         Liveness.stale,

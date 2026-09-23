@@ -246,7 +246,7 @@ pub const App = struct {
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
                     self.overlay.isPushBranch() or self.overlay.isPullBranch(),
                 .branch_switch = self.overlay.isSwitchBranch(),
-                .push_error = self.overlay.isPushError(),
+                .remote_error = self.overlay.isRemoteError(),
                 .git_action = self.actionLifecycleView().hasPending(),
                 .foreground_command = self.remoteWorkflowView().hasForeground() or self.shellEffectsView().hasEditorForeground(),
                 .teardown = self.teardown_requested,
@@ -427,7 +427,7 @@ pub const App = struct {
                     .selection_generation = authority.selection_generation,
                     .copy_generation = authority.copy_generation,
                 } else null,
-                .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
+                .remote_error_instance_id = if (self.overlay.isRemoteError()) self.overlay.remote_error_instance_id else null,
                 .commit_panel_instance_id = self.localWorkflowView().commitPanelInstanceId(),
             },
             .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
@@ -607,7 +607,7 @@ pub const App = struct {
                     self.pages.repository.clampForBodySize(repository_body_size);
                 self.pages.history.catalog.clamp(@import("app/pages/history/catalog.zig").visibleRows(repository_body_size.height));
                 self.overlayScroll().clampHelp();
-                self.overlayScroll().clampPushError();
+                self.overlayScroll().clampRemoteError();
             },
             .load_finished => |finished| try self.finishLoadResult(ctx, finished),
             .action_finished => |finished| try self.finishActionResult(ctx, finished),
@@ -694,10 +694,10 @@ pub const App = struct {
             .help_scroll_down => if (!self.overlayScroll().scrollHelp(1)) self.redraw_plan.requestSkip(),
             .help_page_up => self.overlayScroll().pageHelp(-1),
             .help_page_down => self.overlayScroll().pageHelp(1),
-            .push_error_scroll_up => if (!self.overlayScroll().scrollPushError(-1)) self.redraw_plan.requestSkip(),
-            .push_error_scroll_down => if (!self.overlayScroll().scrollPushError(1)) self.redraw_plan.requestSkip(),
-            .push_error_page_up => self.overlayScroll().pagePushError(-1),
-            .push_error_page_down => self.overlayScroll().pagePushError(1),
+            .remote_error_scroll_up => if (!self.overlayScroll().scrollRemoteError(-1)) self.redraw_plan.requestSkip(),
+            .remote_error_scroll_down => if (!self.overlayScroll().scrollRemoteError(1)) self.redraw_plan.requestSkip(),
+            .remote_error_page_up => self.overlayScroll().pageRemoteError(-1),
+            .remote_error_page_down => self.overlayScroll().pageRemoteError(1),
             .copy_popup => self.copyPopup(ctx),
             .copy_footer_status => self.copyFooterStatus(ctx),
             .confirm_discard_file => try self.localWorkflow().confirmDiscardFile(ctx),
@@ -712,7 +712,7 @@ pub const App = struct {
             .branch_switch_move_next => self.remoteWorkflow().moveBranchSwitchSelection(1),
             .confirm_branch_switch => try self.remoteWorkflow().confirmBranchSwitch(ctx),
             .cancel_branch_switch => self.remoteWorkflow().clearBranchSwitch(ctx.allocator()),
-            .close_push_error => self.remoteWorkflow().clearPushError(ctx.allocator()),
+            .close_remote_error => self.remoteWorkflow().clearRemoteError(ctx.allocator()),
             .run_interactive_push => try self.remoteWorkflow().runInteractivePush(ctx),
             .reload => switch (self.active_page) {
                 .changes => {
@@ -1137,7 +1137,7 @@ pub const App = struct {
             .assist_commit_message => |result| self.localWorkflow().finishCommitMessageAssist(ctx.allocator(), result),
             .amend => |result| try self.applyLocalActionIntent(ctx, self.localWorkflow().finishAmend(ctx.allocator(), result)),
             .push => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPush(ctx.allocator(), result)),
-            .pull => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishPull(ctx.allocator(), result)),
+            .pull => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPull(ctx.allocator(), result)),
             .fetch => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishFetch(ctx.allocator(), result)),
             .switch_branch => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishSwitchBranch(ctx.allocator(), result)),
             .push_foreground => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPushForeground(ctx, result)),
@@ -1416,7 +1416,8 @@ pub const App = struct {
             .amend_confirmation = local.amendConfirmation(),
             .push_confirmation = remote.pushConfirmation(),
             .pull_confirmation = remote.pullConfirmation(),
-            .push_error_message = remote.pushErrorMessage(),
+            .remote_error_operation = remote.remoteErrorOperation(),
+            .remote_error_message = remote.remoteErrorMessage(),
             .push_retry_target = remote.pushRetryTarget(),
             .push_retry_inspecting = remote.pushRetryInspecting(),
             .branch_switch = remote.branchSwitch(),
@@ -1568,6 +1569,7 @@ pub const App = struct {
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
             .remote_action_cancelable = self.remoteWorkflowView().canCancel(self.actionLifecycleView().acceptedPending()),
+            .remote_error_interactive = self.remoteWorkflowView().pushRetryTarget() != null,
             .command_line_active = self.commandLineView() != null,
             .repository_command_available = self.repositoryCommandAvailable(),
             .keymap = self.keymap,
@@ -1606,7 +1608,7 @@ pub const App = struct {
             .overlay = &self.overlay,
             .content_size = self.shellLayout().contentSize(),
             .help_page = self.active_page,
-            .push_error_message = self.remoteWorkflowView().pushErrorMessage(),
+            .remote_error_message = self.remoteWorkflowView().remoteErrorMessage(),
         };
     }
 
@@ -1720,8 +1722,8 @@ pub const App = struct {
         };
         self.shellEffects().queueClipboard(ctx, .{
             .origin = .{ .shell_surface = .{
-                .surface = .push_error,
-                .instance_id = self.overlay.push_error_instance_id,
+                .surface = .remote_error,
+                .instance_id = self.overlay.remote_error_instance_id,
             } },
             .label = target.label,
             .text = target.text,
@@ -1757,10 +1759,14 @@ pub const App = struct {
     }
 
     fn popupCopyTarget(self: *const App) ?PopupCopyTarget {
-        if (self.overlay.isPushError()) {
-            const message = self.remoteWorkflowView().pushErrorMessage() orelse return null;
+        if (self.overlay.isRemoteError()) {
+            const operation = self.remoteWorkflowView().remoteErrorOperation() orelse return null;
+            const message = self.remoteWorkflowView().remoteErrorMessage() orelse return null;
             return .{
-                .label = "push error",
+                .label = switch (operation) {
+                    .push => "push error",
+                    .pull => "pull error",
+                },
                 .text = message,
             };
         }

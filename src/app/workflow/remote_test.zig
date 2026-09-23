@@ -141,7 +141,7 @@ const RemoteHarness = struct {
             .changes_activation_id = self.pages.changes.activation.next_activation_id,
             .repository_activation_id = 0,
             .compare_activation_id = 0,
-            .push_error_instance_id = if (self.overlay.isPushError()) self.overlay.push_error_instance_id else null,
+            .remote_error_instance_id = if (self.overlay.isRemoteError()) self.overlay.remote_error_instance_id else null,
             .commit_panel_instance_id = null,
         };
     }
@@ -208,27 +208,28 @@ const RemoteHarness = struct {
         self.remoteWorkflow().clearBranchSwitch(allocator);
     }
 
-    fn clearPushError(self: *RemoteHarness, allocator: std.mem.Allocator) void {
-        self.remoteWorkflow().clearPushError(allocator);
+    fn clearRemoteError(self: *RemoteHarness, allocator: std.mem.Allocator) void {
+        self.remoteWorkflow().clearRemoteError(allocator);
     }
 
     fn clearPushForeground(self: *RemoteHarness, allocator: std.mem.Allocator) void {
         workflow_remote.testing.clearForeground(&self.remote_workflow, allocator);
     }
 
-    fn setPushError(self: *RemoteHarness, allocator: std.mem.Allocator, message: []const u8) !void {
-        try workflow_remote.testing.setPushErrorWithRetry(self.remoteWorkflow(), allocator, message, null);
+    fn setRemoteError(self: *RemoteHarness, allocator: std.mem.Allocator, message: []const u8) !void {
+        try workflow_remote.testing.setRemoteErrorWithRetry(self.remoteWorkflow(), allocator, .push, message, null);
     }
 
-    fn setPushErrorWithRetry(
+    fn setRemoteErrorWithRetry(
         self: *RemoteHarness,
         allocator: std.mem.Allocator,
         message: []const u8,
         retry_target: ?app_state.PushRetryTarget,
     ) !void {
-        try workflow_remote.testing.setPushErrorWithRetry(
+        try workflow_remote.testing.setRemoteErrorWithRetry(
             self.remoteWorkflow(),
             allocator,
+            .push,
             message,
             retry_target,
         );
@@ -1182,7 +1183,7 @@ test "requestPush clears previous push error details" {
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
     defer app.pages.changes.branch_status.deinit();
     defer app.cancelPushConfirmation(std.testing.allocator);
-    defer app.clearPushError(std.testing.allocator);
+    defer app.clearRemoteError(std.testing.allocator);
 
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
@@ -1193,11 +1194,11 @@ test "requestPush clears previous push error details" {
     });
     try app.pages.changes.branch_status.replace(repo_root, &bundle);
     syncTestActivation(&app);
-    try app.setPushError(std.testing.allocator, "old push failure");
+    try app.setRemoteError(std.testing.allocator, "old push failure");
 
     try app.requestPush(std.testing.allocator);
 
-    try std.testing.expect(app.remote_workflow.push_error_message == null);
+    try std.testing.expect(app.remote_workflow.remote_error_message == null);
     try std.testing.expect(app.overlay.isPushBranch());
     try std.testing.expect(app.remote_workflow.push_confirmation != null);
 }
@@ -1499,7 +1500,7 @@ test "background remote task rejection and abandonment release owned authorities
         var app: RemoteHarness = .{ .allocator = allocator };
         _ = try installCurrentRepoForTest(&app, allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        defer app.clearPushError(allocator);
+        defer app.clearRemoteError(allocator);
         try installPushConfirmationForTest(&app, allocator);
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
 
@@ -1513,7 +1514,7 @@ test "background remote task rejection and abandonment release owned authorities
 
         try std.testing.expect(!app.actionLifecycleView().hasPending());
         try std.testing.expect(!app.remote_workflow.action_control.isActive(owner.generation));
-        try std.testing.expect(app.remote_workflow.push_error_message != null);
+        try std.testing.expect(app.remote_workflow.remote_error_message != null);
     }
 }
 
@@ -1548,7 +1549,7 @@ test "finishPush failed preserves retry target oid for interactive push" {
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
     const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
-    defer app.clearPushError(std.testing.allocator);
+    defer app.clearRemoteError(std.testing.allocator);
     const pending = beginAcceptedTestAction(&app, .push);
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
 
@@ -1578,7 +1579,7 @@ test "finishPush retires an exact action before dropping a mismatched operation 
     var app: RemoteHarness = .{ .allocator = allocator };
     const repo_root = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
+    defer app.clearRemoteError(allocator);
     const pending = beginAcceptedTestAction(&app, .push);
     app.pages.changes.status.set("unchanged", .{});
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
@@ -1610,7 +1611,7 @@ test "remote cancel terminal drops retry authority and requires reload before de
     var app: RemoteHarness = .{ .allocator = allocator };
     const repo_root = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
+    defer app.clearRemoteError(allocator);
     activateChanges(&app);
 
     const pending = beginAcceptedTestAction(&app, .push);
@@ -1644,7 +1645,7 @@ test "remote cancel terminal drops retry authority and requires reload before de
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(!controller.view().canceling());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.push_error_message.?, "outcome is unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, "outcome is unknown") != null);
 }
 
 test "remote timeout terminal drops retry authority and requires reload" {
@@ -1652,7 +1653,7 @@ test "remote timeout terminal drops retry authority and requires reload" {
     var app: RemoteHarness = .{ .allocator = allocator };
     const repo_root = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
+    defer app.clearRemoteError(allocator);
     activateChanges(&app);
 
     const pending = beginAcceptedTestAction(&app, .push);
@@ -1679,12 +1680,12 @@ test "remote timeout terminal drops retry authority and requires reload" {
     try std.testing.expect(!outcome.quit_after_terminal);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.push_error_message.?, "timed out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, "timed out") != null);
 }
 
-test "clearPushError frees retained retry target" {
+test "clearRemoteError frees retained retry target" {
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
-    try app.setPushErrorWithRetry(std.testing.allocator, "failed", .{
+    try app.setRemoteErrorWithRetry(std.testing.allocator, "failed", .{
         .repo_epoch = 0,
         .root_identity = .{ .device = 0, .inode = 0 },
         .mode = .upstream,
@@ -1695,16 +1696,16 @@ test "clearPushError frees retained retry target" {
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
     });
 
-    app.clearPushError(std.testing.allocator);
+    app.clearRemoteError(std.testing.allocator);
 
-    try std.testing.expect(app.remote_workflow.push_error_message == null);
+    try std.testing.expect(app.remote_workflow.remote_error_message == null);
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
 }
 
 test "runInteractivePush rejects while another action is pending" {
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
-    defer app.clearPushError(std.testing.allocator);
-    try app.setPushErrorWithRetry(std.testing.allocator, "failed", .{
+    defer app.clearRemoteError(std.testing.allocator);
+    try app.setRemoteErrorWithRetry(std.testing.allocator, "failed", .{
         .repo_epoch = 0,
         .root_identity = .{ .device = 0, .inode = 0 },
         .mode = .upstream,
@@ -1733,8 +1734,8 @@ test "push retry inspection rejects duplicate requests without losing task owner
     var app: RemoteHarness = .{ .allocator = allocator };
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
+    defer app.clearRemoteError(allocator);
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.runInteractivePush(&ctx);
@@ -1744,7 +1745,7 @@ test "push retry inspection rejects duplicate requests without losing task owner
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
     try std.testing.expectEqualStrings("push retry inspection already running", app.pages.changes.status.text());
 
-    app.clearPushError(allocator);
+    app.clearRemoteError(allocator);
     _ = try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
 }
 
@@ -1753,8 +1754,8 @@ test "push retry inspection spawn rollback restores the sole target" {
     var app: RemoteHarness = .{ .allocator = allocator };
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
+    defer app.clearRemoteError(allocator);
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{
         ._allocator = allocator,
         ._io = std.testing.io,
@@ -1774,10 +1775,10 @@ test "push retry rejects a stale root identity before inspection admission" {
     var app: RemoteHarness = .{ .allocator = allocator };
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
+    defer app.clearRemoteError(allocator);
     var target = try retryTargetForTest(&app, allocator, .{});
     target.root_identity.inode +%= 1;
-    try app.setPushErrorWithRetry(allocator, "failed", target);
+    try app.setRemoteErrorWithRetry(allocator, "failed", target);
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.runInteractivePush(&ctx);
@@ -1788,10 +1789,10 @@ test "push retry rejects a stale root identity before inspection admission" {
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("push retry unavailable: repository authority changed", app.pages.changes.status.text());
 
-    app.clearPushError(allocator);
+    app.clearRemoteError(allocator);
     var stale_epoch = try retryTargetForTest(&app, allocator, .{});
     stale_epoch.repo_epoch +%= 1;
-    try app.setPushErrorWithRetry(allocator, "failed", stale_epoch);
+    try app.setRemoteErrorWithRetry(allocator, "failed", stale_epoch);
     try app.runInteractivePush(&ctx);
 
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
@@ -1806,16 +1807,16 @@ test "closing push error invalidates an in-flight inspection result" {
     var app: RemoteHarness = .{ .allocator = allocator };
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.runInteractivePush(&ctx);
-    app.clearPushError(allocator);
+    app.clearRemoteError(allocator);
     try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expect(app.remote_workflow.push_error_message == null);
-    try std.testing.expect(!app.overlay.isPushError());
+    try std.testing.expect(app.remote_workflow.remote_error_message == null);
+    try std.testing.expect(!app.overlay.isRemoteError());
 }
 
 test "undelivered push inspection completion releases its returned target" {
@@ -1827,8 +1828,8 @@ test "undelivered push inspection completion releases its returned target" {
     var app: RemoteHarness = .{ .allocator = allocator, .env_map = &parent_environment };
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
+    defer app.clearRemoteError(allocator);
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.runInteractivePush(&ctx);
@@ -1848,9 +1849,9 @@ test "Changes reactivation discards an old push inspection completion" {
     var app: RemoteHarness = .{ .allocator = allocator };
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
+    defer app.clearRemoteError(allocator);
     activateChanges(&app);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.runInteractivePush(&ctx);
@@ -1861,8 +1862,8 @@ test "Changes reactivation discards an old push inspection completion" {
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expectEqualStrings("new Changes activation", app.pages.changes.status.text());
-    try std.testing.expect(app.remote_workflow.push_error_message == null);
-    try std.testing.expect(!app.overlay.isPushError());
+    try std.testing.expect(app.remote_workflow.remote_error_message == null);
+    try std.testing.expect(!app.overlay.isRemoteError());
 }
 
 test "push inspection completion requires exact generation origin target and repository identity" {
@@ -1870,8 +1871,8 @@ test "push inspection completion requires exact generation origin target and rep
     var app: RemoteHarness = .{ .allocator = allocator };
     _ = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
+    defer app.clearRemoteError(allocator);
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{}));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
 
     try app.runInteractivePush(&ctx);
@@ -1936,7 +1937,7 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.clearPushForeground(allocator);
     activateChanges(&app);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{
         .mode = .set_upstream,
         .oid = repo.oid,
     }));
@@ -1959,7 +1960,7 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     _ = parent_environment.swapRemove("HTTPS_PROXY");
     try app.update(inspection_msg, &ctx);
 
-    try std.testing.expect(app.remote_workflow.push_error_message == null);
+    try std.testing.expect(app.remote_workflow.remote_error_message == null);
     try std.testing.expect(app.remote_workflow.push_retry.state == .foreground);
     try std.testing.expectEqual(page.Id.changes, app.remote_workflow.push_retry.state.foreground.origin.page_id);
     try std.testing.expectEqual(app.repo_session.repo_epoch, app.remote_workflow.push_retry.state.foreground.origin.repo_epoch);
@@ -2071,7 +2072,7 @@ test "upstream finalization queue rejection publishes partial success once witho
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.overlay.isPushError());
+    try std.testing.expect(!app.overlay.isRemoteError());
     try expectRootCapabilityClosed(root_observer);
 }
 
@@ -2113,7 +2114,7 @@ test "upstream finalization runtime abandonment defers quit and discards retry a
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.overlay.isPushError());
+    try std.testing.expect(!app.overlay.isRemoteError());
     try expectRootCapabilityClosed(root_observer);
 }
 
@@ -2212,7 +2213,7 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
     var app: RemoteHarness = .{ .allocator = allocator, .env_map = &parent_environment };
     try installActiveRepoForTest(&app, allocator, repo.repo_root);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
+    defer app.clearRemoteError(allocator);
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = io };
     defer ctx.runtimeClearPendingEffectCopies();
 
@@ -2228,7 +2229,7 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
         .finished = done,
     });
 
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = repo.oid }));
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = repo.oid }));
 
     try app.runInteractivePush(&ctx);
     const Task = app_push_retry.InspectionTask(RemoteHarness.Msg);
@@ -2238,7 +2239,7 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
-    try std.testing.expect(app.overlay.isPushError());
+    try std.testing.expect(app.overlay.isRemoteError());
     const status = app.pages.changes.status.text();
     try std.testing.expectEqualStrings("warning: credential-bearing proxy was omitted; interactive push already queued", status);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
@@ -2265,8 +2266,8 @@ test "interactive push maps an invalid descriptor queue rejection without fallba
     var app: RemoteHarness = .{ .allocator = allocator, .env_map = &parent_environment };
     try installActiveRepoForTest(&app, allocator, repo.repo_root);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = repo.oid }));
+    defer app.clearRemoteError(allocator);
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = repo.oid }));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = io };
 
     try app.runInteractivePush(&ctx);
@@ -2308,9 +2309,9 @@ test "interactive push inspection warning survives a concurrent action admission
     var app: RemoteHarness = .{ .allocator = allocator, .env_map = &parent_environment };
     try installActiveRepoForTest(&app, allocator, repo.repo_root);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
+    defer app.clearRemoteError(allocator);
     defer action_lifecycle.testing.clear(&app.action_runtime);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = repo.oid }));
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = repo.oid }));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = io };
 
     try app.runInteractivePush(&ctx);
@@ -2347,8 +2348,8 @@ test "runInteractivePush stale snapshot does not queue foreground command" {
     var app: RemoteHarness = .{ .allocator = allocator };
     try installActiveRepoForTest(&app, allocator, repo.repo_root);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearPushError(allocator);
-    try app.setPushErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = "not-current" }));
+    defer app.clearRemoteError(allocator);
+    try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = "not-current" }));
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = io };
 
     try app.runInteractivePush(&ctx);

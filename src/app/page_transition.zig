@@ -24,7 +24,7 @@ pub const Blocker = enum {
     confirmation,
     branch_switch,
     compare_base_picker,
-    push_error,
+    remote_error,
     git_action,
     foreground_command,
     teardown,
@@ -51,7 +51,7 @@ pub const Blocker = enum {
             .confirmation => "finish confirmation before switching pages",
             .branch_switch => "finish branch switch before switching pages",
             .compare_base_picker => "close Compare base picker before switching pages",
-            .push_error => "close push error before switching pages",
+            .remote_error => "close remote error before switching pages",
             .git_action => "finish current git action before switching pages",
             .foreground_command => "finish foreground command before switching pages",
             .teardown => "application is shutting down",
@@ -80,7 +80,7 @@ pub const Snapshot = struct {
     confirmation: bool = false,
     branch_switch: bool = false,
     compare_base_picker: bool = false,
-    push_error: bool = false,
+    remote_error: bool = false,
     git_action: bool = false,
     foreground_command: bool = false,
     teardown: bool = false,
@@ -103,7 +103,7 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
     if (snapshot.confirmation) return .{ .blocked = .confirmation };
     if (snapshot.branch_switch) return .{ .blocked = .branch_switch };
     if (snapshot.compare_base_picker) return .{ .blocked = .compare_base_picker };
-    if (snapshot.push_error) return .{ .blocked = .push_error };
+    if (snapshot.remote_error) return .{ .blocked = .remote_error };
     if (snapshot.changes_search) return .{ .blocked = .changes_search };
     if (snapshot.changes_file_search) return .{ .blocked = .changes_file_search };
     if (snapshot.history_search) return .{ .blocked = .history_search };
@@ -161,7 +161,7 @@ test "every blocker prevents transitions between independent pages" {
         .{ .blocker = .confirmation, .snapshot = .{ .confirmation = true } },
         .{ .blocker = .branch_switch, .snapshot = .{ .branch_switch = true } },
         .{ .blocker = .compare_base_picker, .snapshot = .{ .compare_base_picker = true } },
-        .{ .blocker = .push_error, .snapshot = .{ .push_error = true } },
+        .{ .blocker = .remote_error, .snapshot = .{ .remote_error = true } },
         .{ .blocker = .git_action, .snapshot = .{ .git_action = true } },
         .{ .blocker = .foreground_command, .snapshot = .{ .foreground_command = true } },
         .{ .blocker = .teardown, .snapshot = .{ .teardown = true } },

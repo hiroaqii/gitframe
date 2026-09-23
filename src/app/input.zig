@@ -39,7 +39,8 @@ pub const KeyContext = struct {
     push_confirmation_mode: bool = false,
     pull_confirmation_mode: bool = false,
     branch_switch_mode: bool = false,
-    push_error_mode: bool = false,
+    remote_error_mode: bool = false,
+    remote_error_interactive: bool = false,
     remote_action_cancelable: bool = false,
     active_selection_gesture: bool = false,
     command_line_active: bool = false,
@@ -76,10 +77,10 @@ const Action = enum {
     help_scroll_down,
     help_page_up,
     help_page_down,
-    push_error_scroll_up,
-    push_error_scroll_down,
-    push_error_page_up,
-    push_error_page_down,
+    remote_error_scroll_up,
+    remote_error_scroll_down,
+    remote_error_page_up,
+    remote_error_page_down,
     copy_popup,
     confirm_discard_file,
     cancel_discard_file,
@@ -93,7 +94,7 @@ const Action = enum {
     branch_switch_move_next,
     confirm_branch_switch,
     cancel_branch_switch,
-    close_push_error,
+    close_remote_error,
     run_interactive_push,
 };
 
@@ -134,7 +135,7 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
         return .{ .compare = msg };
     }
     if (context.repo_picker_mode) return .{ .repo_picker_paste = text };
-    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.push_error_mode) return null;
+    if (context.help_mode or context.discard_confirmation_mode or context.amend_confirmation_mode or context.push_confirmation_mode or context.pull_confirmation_mode or context.branch_switch_mode or context.remote_error_mode) return null;
     if (context.commit_panel_mode) return .{ .commit_panel_paste = text };
     if (context.active_page == .history) {
         const msg = history_input.pasteToMsg(context.history, text) orelse return null;
@@ -179,7 +180,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(key);
     if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(key);
     if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
-    if (context.push_error_mode) return pushErrorKeyToMsg(key);
+    if (context.remote_error_mode) return remoteErrorKeyToMsg(key, context.remote_error_interactive);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
     if (context.active_page == .history and context.history.loading) {
         const routing_key = normalRoutingKey(key);
@@ -358,14 +359,14 @@ fn branchSwitchKeyToMsg(key: chasen.Key) ?app_message.Msg {
     return null;
 }
 
-fn pushErrorKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(.close_push_error);
-    if (key.codepoint == 'i' and !key_input.hasCommandModifier(key)) return actionToMsg(.run_interactive_push);
+fn remoteErrorKeyToMsg(key: chasen.Key, interactive: bool) ?app_message.Msg {
+    if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(.close_remote_error);
+    if (interactive and key.codepoint == 'i' and !key_input.hasCommandModifier(key)) return actionToMsg(.run_interactive_push);
     if (key.codepoint == 'y' and !key_input.hasCommandModifier(key)) return actionToMsg(.copy_popup);
-    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.push_error_scroll_up);
-    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.push_error_scroll_down);
-    if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(.push_error_page_up);
-    if (key.matches(chasen.Key.page_down, .{})) return actionToMsg(.push_error_page_down);
+    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.remote_error_scroll_up);
+    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.remote_error_scroll_down);
+    if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(.remote_error_page_up);
+    if (key.matches(chasen.Key.page_down, .{})) return actionToMsg(.remote_error_page_down);
     return null;
 }
 
@@ -459,10 +460,10 @@ fn actionToMsg(action: Action) app_message.Msg {
         .help_scroll_down => app_message.Msg.help_scroll_down,
         .help_page_up => app_message.Msg.help_page_up,
         .help_page_down => app_message.Msg.help_page_down,
-        .push_error_scroll_up => app_message.Msg.push_error_scroll_up,
-        .push_error_scroll_down => app_message.Msg.push_error_scroll_down,
-        .push_error_page_up => app_message.Msg.push_error_page_up,
-        .push_error_page_down => app_message.Msg.push_error_page_down,
+        .remote_error_scroll_up => app_message.Msg.remote_error_scroll_up,
+        .remote_error_scroll_down => app_message.Msg.remote_error_scroll_down,
+        .remote_error_page_up => app_message.Msg.remote_error_page_up,
+        .remote_error_page_down => app_message.Msg.remote_error_page_down,
         .copy_popup => app_message.Msg.copy_popup,
         .confirm_discard_file => app_message.Msg.confirm_discard_file,
         .cancel_discard_file => app_message.Msg.cancel_discard_file,
@@ -476,7 +477,7 @@ fn actionToMsg(action: Action) app_message.Msg {
         .branch_switch_move_next => app_message.Msg.branch_switch_move_next,
         .confirm_branch_switch => app_message.Msg.confirm_branch_switch,
         .cancel_branch_switch => app_message.Msg.cancel_branch_switch,
-        .close_push_error => app_message.Msg.close_push_error,
+        .close_remote_error => app_message.Msg.close_remote_error,
         .run_interactive_push => app_message.Msg.run_interactive_push,
     };
 }
@@ -1307,20 +1308,25 @@ test "remote cancel Escape takes priority while a background action is active" {
     );
 }
 
-test "keyToMsg maps push error modal keys" {
-    try std.testing.expectEqual(app_message.Msg.close_push_error, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.enter }).?);
-    try std.testing.expectEqual(app_message.Msg.close_push_error, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
-    try std.testing.expectEqual(app_message.Msg.close_push_error, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'q' }).?);
-    try std.testing.expectEqual(app_message.Msg.run_interactive_push, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'i' }).?);
-    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'c' }));
-    try std.testing.expectEqual(app_message.Msg.copy_popup, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'y' }).?);
-    try std.testing.expectEqual(app_message.Msg.push_error_scroll_up, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'k' }).?);
-    try std.testing.expectEqual(app_message.Msg.push_error_scroll_down, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'j' }).?);
-    try std.testing.expectEqual(app_message.Msg.push_error_scroll_up, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.up }).?);
-    try std.testing.expectEqual(app_message.Msg.push_error_scroll_down, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.down }).?);
-    try std.testing.expectEqual(app_message.Msg.push_error_page_up, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_up }).?);
-    try std.testing.expectEqual(app_message.Msg.push_error_page_down, keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = chasen.Key.page_down }).?);
-    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .push_error_mode = true }, .{ .codepoint = 'P' }));
+test "keyToMsg maps remote error modal keys and limits interactive retry to push" {
+    const context: KeyContext = .{ .remote_error_mode = true };
+    try std.testing.expectEqual(app_message.Msg.close_remote_error, keyToMsg(context, .{ .codepoint = chasen.Key.enter }).?);
+    try std.testing.expectEqual(app_message.Msg.close_remote_error, keyToMsg(context, .{ .codepoint = chasen.Key.escape }).?);
+    try std.testing.expectEqual(app_message.Msg.close_remote_error, keyToMsg(context, .{ .codepoint = 'q' }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(context, .{ .codepoint = 'i' }));
+    try std.testing.expectEqual(
+        app_message.Msg.run_interactive_push,
+        keyToMsg(.{ .remote_error_mode = true, .remote_error_interactive = true }, .{ .codepoint = 'i' }).?,
+    );
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(context, .{ .codepoint = 'c' }));
+    try std.testing.expectEqual(app_message.Msg.copy_popup, keyToMsg(context, .{ .codepoint = 'y' }).?);
+    try std.testing.expectEqual(app_message.Msg.remote_error_scroll_up, keyToMsg(context, .{ .codepoint = 'k' }).?);
+    try std.testing.expectEqual(app_message.Msg.remote_error_scroll_down, keyToMsg(context, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(app_message.Msg.remote_error_scroll_up, keyToMsg(context, .{ .codepoint = chasen.Key.up }).?);
+    try std.testing.expectEqual(app_message.Msg.remote_error_scroll_down, keyToMsg(context, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(app_message.Msg.remote_error_page_up, keyToMsg(context, .{ .codepoint = chasen.Key.page_up }).?);
+    try std.testing.expectEqual(app_message.Msg.remote_error_page_down, keyToMsg(context, .{ .codepoint = chasen.Key.page_down }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(context, .{ .codepoint = 'P' }));
 }
 
 test "keyToMsg keeps printable y as editable popup input" {

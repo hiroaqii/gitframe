@@ -48,8 +48,12 @@ pub const View = struct {
         return self.state.pull_confirmation;
     }
 
-    pub fn pushErrorMessage(self: View) ?[]const u8 {
-        return self.state.push_error_message;
+    pub fn remoteErrorOperation(self: View) ?app_state.RemoteOperation {
+        return self.state.remote_error_operation;
+    }
+
+    pub fn remoteErrorMessage(self: View) ?[]const u8 {
+        return self.state.remote_error_message;
     }
 
     pub fn pushRetryTarget(self: View) ?*const app_state.PushRetryTarget {
@@ -161,7 +165,7 @@ pub const Controller = struct {
 
         self.cancelPushConfirmation(allocator);
         self.cancelPullConfirmation(allocator);
-        self.clearPushError(allocator);
+        self.clearRemoteError(allocator);
 
         var proposal = try self.operations.view().ownPushProposal(allocator, repository_identity, target);
         var proposal_consumed = false;
@@ -274,7 +278,7 @@ pub const Controller = struct {
 
         self.cancelPushConfirmation(allocator);
         self.cancelPullConfirmation(allocator);
-        self.clearPushError(allocator);
+        self.clearRemoteError(allocator);
         var proposal = try self.operations.view().ownPullProposal(allocator, target);
         var proposal_consumed = false;
         defer if (!proposal_consumed) proposal.deinit(allocator);
@@ -451,7 +455,7 @@ pub const Controller = struct {
 
         self.cancelPushConfirmation(ctx.allocator());
         self.cancelPullConfirmation(ctx.allocator());
-        self.clearPushError(ctx.allocator());
+        self.clearRemoteError(ctx.allocator());
         self.clearBranchSwitch(ctx.allocator());
         self.state.branch_switch_load_generation +%= 1;
         const generation = self.state.branch_switch_load_generation;
@@ -559,8 +563,8 @@ pub const Controller = struct {
         self.clearBranchSwitch(ctx.allocator());
     }
 
-    pub fn clearPushError(self: Controller, allocator: std.mem.Allocator) void {
-        self.clearPushErrorPresentation(allocator);
+    pub fn clearRemoteError(self: Controller, allocator: std.mem.Allocator) void {
+        self.clearRemoteErrorPresentation(allocator);
         self.state.push_retry.state.deinit(allocator);
     }
 
@@ -600,7 +604,7 @@ pub const Controller = struct {
                 };
                 const presentation = try remoteFailurePresentationAlloc(allocator, .push, failure, result.result.warnings);
                 defer allocator.free(presentation);
-                try self.setPushErrorWithRetry(allocator, presentation, retry_target);
+                try self.setRemoteErrorWithRetry(allocator, .push, presentation, retry_target);
                 return .{
                     .reload = if (active_matches and remoteOutcomeUnknown(failure)) .source_and_aux else .none,
                     .quit_after_terminal = quit_after_terminal,
@@ -610,7 +614,7 @@ pub const Controller = struct {
         return .{ .quit_after_terminal = quit_after_terminal };
     }
 
-    pub fn finishPull(self: Controller, allocator: std.mem.Allocator, finished: app_actions.PullFinished) Outcome {
+    pub fn finishPull(self: Controller, allocator: std.mem.Allocator, finished: app_actions.PullFinished) !Outcome {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
@@ -628,7 +632,14 @@ pub const Controller = struct {
                 },
                 .already_up_to_date => self.setRemoteStatus(result.result.warnings, "already up to date", .{}),
             },
-            .failed => |failure| self.setRemoteFailureStatus(result.result.warnings, .pull, failure),
+            .failed => |failure| {
+                self.setRemoteFailureStatus(result.result.warnings, .pull, failure);
+                if (pullFailureHasDetails(failure)) {
+                    const presentation = try remoteFailurePresentationAlloc(allocator, .pull, failure, result.result.warnings);
+                    defer allocator.free(presentation);
+                    try self.setRemoteErrorWithRetry(allocator, .pull, presentation, null);
+                }
+            },
         }
         return .{
             .reload = if (active_matches) .source_and_aux else .none,
@@ -748,7 +759,7 @@ pub const Controller = struct {
         if (!self.remoteRequestMatches(result.identity)) return;
         const origin: effect_origin.Origin = .{ .page = result.origin };
         if (effect_origin.classify(origin, self.effect_snapshot) == .stale) {
-            self.clearPushErrorPresentation(ctx.allocator());
+            self.clearRemoteErrorPresentation(ctx.allocator());
             return;
         }
         switch (result.outcome) {
@@ -1026,28 +1037,37 @@ pub const Controller = struct {
         } };
         root = null;
         const foreground = &self.state.push_retry.state.foreground;
-        self.clearPushErrorPresentation(ctx.allocator());
+        self.clearRemoteErrorPresentation(ctx.allocator());
         self.setStatus("running interactive push: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
     }
 
-    fn setPushErrorWithRetry(self: Controller, allocator: std.mem.Allocator, message: []const u8, retry_target: ?app_state.PushRetryTarget) !void {
-        self.clearPushError(allocator);
-        self.state.push_error_message = try allocator.dupe(u8, message);
+    fn setRemoteErrorWithRetry(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        operation: app_state.RemoteOperation,
+        message: []const u8,
+        retry_target: ?app_state.PushRetryTarget,
+    ) !void {
+        std.debug.assert(operation == .push or retry_target == null);
+        self.clearRemoteError(allocator);
+        self.state.remote_error_message = try allocator.dupe(u8, message);
+        self.state.remote_error_operation = operation;
         if (retry_target) |target| self.state.push_retry.state = .{ .available = .{ .target = target } };
         self.operations.navigation.clearDiffSelection();
-        self.overlay.openPushError();
+        self.overlay.openRemoteError();
     }
 
-    fn clearPushErrorPresentation(self: Controller, allocator: std.mem.Allocator) void {
-        if (self.state.push_error_message) |message| allocator.free(message);
-        self.state.push_error_message = null;
-        if (self.overlay.isPushError()) self.overlay.close();
+    fn clearRemoteErrorPresentation(self: Controller, allocator: std.mem.Allocator) void {
+        if (self.state.remote_error_message) |message| allocator.free(message);
+        self.state.remote_error_operation = null;
+        self.state.remote_error_message = null;
+        if (self.overlay.isRemoteError()) self.overlay.close();
     }
 
     fn restorePushRetryTarget(self: Controller, allocator: std.mem.Allocator, target: app_state.PushRetryTarget) void {
         self.state.push_retry.restoreAvailable(allocator, target);
         self.operations.navigation.clearDiffSelection();
-        self.overlay.openPushError();
+        self.overlay.openRemoteError();
     }
 
     fn finishUpstreamPartial(
@@ -1211,6 +1231,10 @@ fn remoteOutcomeUnknown(failure: git_remote.RemoteFailure) bool {
     return failure == .canceled_outcome_unknown or failure == .timed_out_outcome_unknown;
 }
 
+fn pullFailureHasDetails(failure: git_remote.RemoteFailure) bool {
+    return failure == .ssh_public_key or failure == .authentication_required;
+}
+
 const RemotePresentationKind = enum { push, pull, fetch };
 
 fn remoteFailureMessage(kind: RemotePresentationKind, failure: git_remote.RemoteFailure) []const u8 {
@@ -1240,7 +1264,7 @@ fn remoteWarningMessage(warnings: git_remote.RemoteWarningSet) ?[]const u8 {
     return null;
 }
 
-const ssh_public_key_push_details =
+const ssh_public_key_details =
     \\SSH public-key authentication failed.
     \\
     \\Check in your terminal:
@@ -1258,8 +1282,15 @@ const ssh_public_key_push_details =
     \\
     \\3. If your key is already loaded, check:
     \\   - Public-key registration on the Git hosting service
-    \\   - Your account's push permission
+    \\   - Your account's access to the repository
     \\   - The host/key settings in ~/.ssh/config
+;
+
+const pull_authentication_required_details =
+    \\Authentication is required for pull.
+    \\
+    \\Configure a credential helper, or retry the pull in an external
+    \\terminal where Git can prompt for credentials.
 ;
 
 fn remoteFailurePresentationAlloc(
@@ -1268,10 +1299,14 @@ fn remoteFailurePresentationAlloc(
     failure: git_remote.RemoteFailure,
     warnings: git_remote.RemoteWarningSet,
 ) ![]u8 {
-    const message = if (kind == .push and failure == .ssh_public_key)
-        ssh_public_key_push_details
-    else
-        remoteFailureMessage(kind, failure);
+    const message = switch (failure) {
+        .ssh_public_key => ssh_public_key_details,
+        .authentication_required => if (kind == .pull)
+            pull_authentication_required_details
+        else
+            remoteFailureMessage(kind, failure),
+        else => remoteFailureMessage(kind, failure),
+    };
     if (remoteWarningMessage(warnings)) |warning| {
         return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, warning });
     }
@@ -1333,13 +1368,14 @@ fn pushRetryTargetFromFinished(allocator: std.mem.Allocator, finished: app_actio
 }
 
 pub const testing = if (builtin.is_test) struct {
-    pub fn setPushErrorWithRetry(
+    pub fn setRemoteErrorWithRetry(
         controller: Controller,
         allocator: std.mem.Allocator,
+        operation: app_state.RemoteOperation,
         message: []const u8,
         retry_target: ?app_state.PushRetryTarget,
     ) !void {
-        try controller.setPushErrorWithRetry(allocator, message, retry_target);
+        try controller.setRemoteErrorWithRetry(allocator, operation, message, retry_target);
     }
 
     pub fn clearForeground(state: *State, allocator: std.mem.Allocator) void {

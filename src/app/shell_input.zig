@@ -92,6 +92,7 @@ pub const View = struct {
     repo_picker_mode: bool,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode,
     remote_action_cancelable: bool = false,
+    remote_error_interactive: bool = false,
     command_line_active: bool = false,
     repository_command_available: bool = false,
     keymap: keymap.Effective,
@@ -123,7 +124,8 @@ pub const View = struct {
             .push_confirmation_mode = self.overlay.isPushBranch(),
             .pull_confirmation_mode = self.overlay.isPullBranch(),
             .branch_switch_mode = self.overlay.isSwitchBranch(),
-            .push_error_mode = self.overlay.isPushError(),
+            .remote_error_mode = self.overlay.isRemoteError(),
+            .remote_error_interactive = self.remote_error_interactive,
             .remote_action_cancelable = self.remote_action_cancelable,
             .active_selection_gesture = if (self.activeDiffSelectionOwner()) |selection| selection.active() else self.active_page == .repository and self.repository.page_state.activeMouseOwner(),
             .command_line_active = self.command_line_active,
@@ -212,9 +214,9 @@ pub const View = struct {
                 .wheel_down => .help_scroll_down,
                 else => null,
             },
-            .scroll_push_error => return switch (mouse.button) {
-                .wheel_up => .push_error_scroll_up,
-                .wheel_down => .push_error_scroll_down,
+            .scroll_remote_error => return switch (mouse.button) {
+                .wheel_up => .remote_error_scroll_up,
+                .wheel_down => .remote_error_scroll_down,
                 else => null,
             },
         }
@@ -423,7 +425,7 @@ pub const OverlayScrollController = struct {
     overlay: *app_state.OverlayState,
     content_size: chasen.Size,
     help_page: page.Id,
-    push_error_message: ?[]const u8,
+    remote_error_message: ?[]const u8,
 
     pub fn scrollHelp(self: OverlayScrollController, delta: isize) bool {
         const previous = self.overlay.help_scroll;
@@ -444,25 +446,25 @@ pub const OverlayScrollController = struct {
         );
     }
 
-    pub fn scrollPushError(self: OverlayScrollController, delta: isize) bool {
-        const previous = self.overlay.push_error_scroll;
-        self.overlay.push_error_scroll = applySignedScroll(self.overlay.push_error_scroll, delta);
-        self.clampPushError();
-        return previous != self.overlay.push_error_scroll;
+    pub fn scrollRemoteError(self: OverlayScrollController, delta: isize) bool {
+        const previous = self.overlay.remote_error_scroll;
+        self.overlay.remote_error_scroll = applySignedScroll(self.overlay.remote_error_scroll, delta);
+        self.clampRemoteError();
+        return previous != self.overlay.remote_error_scroll;
     }
 
-    pub fn pagePushError(self: OverlayScrollController, pages: isize) void {
-        const rows = @max(@as(usize, app_view.pushErrorVisibleRows(
+    pub fn pageRemoteError(self: OverlayScrollController, pages: isize) void {
+        const rows = @max(@as(usize, app_view.remoteErrorVisibleRows(
             self.content_size,
-            self.push_error_message,
+            self.remote_error_message,
         )), 1);
-        _ = self.scrollPushError(pageDelta(rows, pages));
+        _ = self.scrollRemoteError(pageDelta(rows, pages));
     }
 
-    pub fn clampPushError(self: OverlayScrollController) void {
-        self.overlay.push_error_scroll = @min(
-            self.overlay.push_error_scroll,
-            app_view.pushErrorMaxScroll(self.content_size, self.push_error_message),
+    pub fn clampRemoteError(self: OverlayScrollController) void {
+        self.overlay.remote_error_scroll = @min(
+            self.overlay.remote_error_scroll,
+            app_view.remoteErrorMaxScroll(self.content_size, self.remote_error_message),
         );
     }
 };
@@ -495,7 +497,7 @@ test "Repository Help scrolling stays bounded" {
         .overlay = &overlay,
         .content_size = size,
         .help_page = .repository,
-        .push_error_message = null,
+        .remote_error_message = null,
     };
 
     _ = controller.scrollHelp(1);

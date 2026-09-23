@@ -30,6 +30,7 @@ const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_source = @import("../../diff/source.zig");
 const git_branch_status = @import("../../git/branch_status.zig");
 const git_ops = @import("../git_ops.zig");
+const git_remote = @import("../../git/remote.zig");
 const git_status = @import("../../git/status.zig");
 const repo_discovery = @import("../../repo/discovery.zig");
 const repo_root_capability = @import("../../repo/root_capability.zig");
@@ -199,7 +200,7 @@ fn shellEffectOrigins(app: *const App) shell_effects.OriginContext {
             .changes_activation_id = app.pages.changes.activation.next_activation_id,
             .repository_activation_id = app.pages.repository.activation_id,
             .compare_activation_id = app.pages.compare.activation.next_activation_id,
-            .push_error_instance_id = if (app.overlay.isPushError()) app.overlay.push_error_instance_id else null,
+            .remote_error_instance_id = if (app.overlay.isRemoteError()) app.overlay.remote_error_instance_id else null,
             .commit_panel_instance_id = app.local_workflow.view().commitPanelInstanceId(),
         },
         .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
@@ -337,7 +338,7 @@ fn installInteractivePushRetryForFenceTest(
     oid: []const u8,
 ) !void {
     const repository = app.repo_session.view();
-    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(app), allocator, "failed", .{
+    try workflow_remote.testing.setRemoteErrorWithRetry(remoteWorkflow(app), allocator, .push, "failed", .{
         .repo_epoch = repository.epoch(),
         .root_identity = repository.activeIdentity().?,
         .mode = .set_upstream,
@@ -515,7 +516,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
         defer app.pages.changes.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        defer remoteWorkflow(&app).clearPushError(allocator);
+        defer remoteWorkflow(&app).clearRemoteError(allocator);
         try installInteractivePushRetryForFenceTest(
             &app,
             allocator,
@@ -559,7 +560,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
         defer app.pages.changes.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        defer remoteWorkflow(&app).clearPushError(allocator);
+        defer remoteWorkflow(&app).clearRemoteError(allocator);
         try installInteractivePushRetryForFenceTest(
             &app,
             allocator,
@@ -608,7 +609,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
         defer app.pages.changes.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        defer remoteWorkflow(&app).clearPushError(allocator);
+        defer remoteWorkflow(&app).clearRemoteError(allocator);
         try installInteractivePushRetryForFenceTest(
             &app,
             allocator,
@@ -819,15 +820,16 @@ test "repository selection clipboard queue failure retains page candidate" {
     try std.testing.expectEqualStrings("clipboard copy already queued", app.pages.repository.status.text());
 }
 
-test "copyPopup queues push error message text" {
+test "copyPopup queues remote error message text" {
     var app: App = .{
         .remote_workflow = .{
-            .push_error_message = try std.testing.allocator.dupe(u8, "  fatal\nline two  "),
+            .remote_error_operation = .push,
+            .remote_error_message = try std.testing.allocator.dupe(u8, "  fatal\nline two  "),
         },
     };
-    defer std.testing.allocator.free(app.remote_workflow.push_error_message.?);
+    defer std.testing.allocator.free(app.remote_workflow.remote_error_message.?);
     defer app.shell_effects_state.clipboard_copies.deinit(std.testing.allocator);
-    app.overlay.openPushError();
+    app.overlay.openRemoteError();
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
@@ -839,7 +841,7 @@ test "copyPopup queues push error message text" {
     try std.testing.expectEqualStrings("  fatal\nline two  ", entry.text);
     try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.Msg.clipboardFinished), entry.finished);
     const state = app.shell_effects_state.clipboard_copies.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
-    try std.testing.expectEqual(app.overlay.push_error_instance_id, state.origin.shell_surface.instance_id);
+    try std.testing.expectEqual(app.overlay.remote_error_instance_id, state.origin.shell_surface.instance_id);
 }
 
 test "copyPopup reports empty target outside copyable popup" {
@@ -1156,6 +1158,88 @@ test "finishPull reloads matching active repo after failure" {
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.load.pending != null);
     try std.testing.expectEqualStrings("pull failed: remote operation failed; retry in an external terminal", app.pages.changes.status.text());
+    try std.testing.expect(!app.overlay.isRemoteError());
+}
+
+test "classified pull authentication failures open copyable sanitized details" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+
+    for ([_]git_remote.RemoteFailure{ .ssh_public_key, .authentication_required }) |failure| {
+        var app: App = .{
+            .allocator = allocator,
+            .repo_session = .{
+                .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+            },
+        };
+        app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        defer app.repo_session.repo_state.deinit(allocator);
+        defer remoteWorkflow(&app).clearRemoteError(allocator);
+        defer app.shell_effects_state.clipboard_copies.deinit(allocator);
+        _ = activateChanges(&app);
+        const pending = beginAcceptedTestAction(&app, .pull);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+        defer ctx.runtimeClearPendingEffectCopies();
+
+        try app.update(.{ .action_finished = .{ .pull = .{
+            .pending = pending,
+            .identity = .{
+                .repo_epoch = app.repo_session.view().epoch(),
+                .root_identity = app.repo_session.view().activeIdentity().?,
+                .operation_generation = pending.generation,
+            },
+            .repo_root = try allocator.dupe(u8, roots.a),
+            .branch = try allocator.dupe(u8, "main"),
+            .remote = try allocator.dupe(u8, "origin"),
+            .remote_branch = try allocator.dupe(u8, "main"),
+            .oid = try allocator.dupe(u8, "abc123"),
+            .result = .{ .outcome = .{ .failed = failure } },
+        } } }, &ctx);
+
+        try std.testing.expect(app.overlay.isRemoteError());
+        try std.testing.expectEqual(app_state.RemoteOperation.pull, app.remote_workflow.remote_error_operation.?);
+        const details = app.remote_workflow.remote_error_message.?;
+        switch (failure) {
+            .ssh_public_key => {
+                try std.testing.expectEqualStrings(
+                    "pull failed: SSH public-key authentication failed; check ssh-agent and repository access",
+                    app.pages.changes.status.text(),
+                );
+                for ([_][]const u8{
+                    "ssh-add -l",
+                    "Public-key registration on the Git hosting service",
+                    "Your account's access to the repository",
+                    "The host/key settings in ~/.ssh/config",
+                }) |expected| try std.testing.expect(std.mem.indexOf(u8, details, expected) != null);
+                try std.testing.expect(app_view.remoteErrorMaxScroll(.{ .width = 120, .height = 24 }, details) > 0);
+            },
+            .authentication_required => {
+                try std.testing.expectEqualStrings(
+                    "pull failed: authentication is required; configure a credential helper or retry in an external terminal",
+                    app.pages.changes.status.text(),
+                );
+                try std.testing.expect(std.mem.indexOf(u8, details, "Authentication is required for pull.") != null);
+                try std.testing.expect(std.mem.indexOf(u8, details, "Configure a credential helper") != null);
+                try std.testing.expect(std.mem.indexOf(u8, details, "external") != null);
+            },
+            else => unreachable,
+        }
+
+        try app.update(.copy_popup, &ctx);
+        try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+        try std.testing.expectEqualStrings(details, ctx._pending_clipboard_copies[0].text);
+        for ([_][]const u8{
+            "Authorization: Bearer RAW-AUTH-CANARY",
+            "password=RAW-PASSWORD-CANARY",
+            "RAW-SSH-CANARY",
+        }) |canary| {
+            try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), canary) == null);
+            try std.testing.expect(std.mem.indexOf(u8, details, canary) == null);
+            try std.testing.expect(std.mem.indexOf(u8, ctx._pending_clipboard_copies[0].text, canary) == null);
+        }
+    }
 }
 
 test "sensitive diagnostic typed push failure publishes only fixed status overlay and clipboard text" {
@@ -1170,7 +1254,7 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer remoteWorkflow(&app).clearPushError(allocator);
+    defer remoteWorkflow(&app).clearRemoteError(allocator);
     defer app.shell_effects_state.clipboard_copies.deinit(allocator);
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .push);
@@ -1199,12 +1283,12 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(!app.remote_workflow.action_control.isActive(pending.generation));
-    try std.testing.expect(app.overlay.isPushError());
+    try std.testing.expect(app.overlay.isRemoteError());
     try std.testing.expectEqualStrings(
         "push failed: SSH public-key authentication failed; check ssh-agent and repository access",
         app.pages.changes.status.text(),
     );
-    const detail_message = app.remote_workflow.push_error_message.?;
+    const detail_message = app.remote_workflow.remote_error_message.?;
     for ([_][]const u8{
         "SSH public-key authentication failed.",
         "ssh-add -l",
@@ -1213,12 +1297,12 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
         "Example: ssh-add ~/.ssh/id_ed25519",
         "for example, ~/.ssh/id_rsa",
         "Public-key registration on the Git hosting service",
-        "Your account's push permission",
+        "Your account's access to the repository",
         "The host/key settings in ~/.ssh/config",
     }) |expected| {
         try std.testing.expect(std.mem.indexOf(u8, detail_message, expected) != null);
     }
-    try std.testing.expect(app_view.pushErrorMaxScroll(.{ .width = 120, .height = 24 }, detail_message) > 0);
+    try std.testing.expect(app_view.remoteErrorMaxScroll(.{ .width = 120, .height = 24 }, detail_message) > 0);
 
     try app.update(.copy_popup, &ctx);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
@@ -1232,7 +1316,7 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
     };
     for (canaries) |canary| {
         try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), canary) == null);
-        try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.push_error_message.?, canary) == null);
+        try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, canary) == null);
         try std.testing.expect(std.mem.indexOf(u8, ctx._pending_clipboard_copies[0].text, canary) == null);
     }
 }
@@ -1358,7 +1442,7 @@ test "repository supersession invalidates an in-flight push inspection" {
         .external_selection,
     ));
     _ = activateChanges(&app);
-    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
+    try workflow_remote.testing.setRemoteErrorWithRetry(remoteWorkflow(&app), allocator, .push, "failed", .{
         .repo_epoch = app.repo_session.view().epoch(),
         .root_identity = app.repo_session.view().activeIdentity().?,
         .mode = .upstream,
@@ -1382,7 +1466,7 @@ test "repository supersession invalidates an in-flight push inspection" {
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
-    try std.testing.expect(app.remote_workflow.push_error_message == null);
+    try std.testing.expect(app.remote_workflow.remote_error_message == null);
 }
 
 test "direct root quit remains allowed while push inspection is running" {
@@ -1392,8 +1476,8 @@ test "direct root quit remains allowed while push inspection is running" {
     var app = try mutationFenceRepoTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer remoteWorkflow(&app).clearPushError(allocator);
-    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
+    defer remoteWorkflow(&app).clearRemoteError(allocator);
+    try workflow_remote.testing.setRemoteErrorWithRetry(remoteWorkflow(&app), allocator, .push, "failed", .{
         .repo_epoch = app.repo_session.view().epoch(),
         .root_identity = app.repo_session.view().activeIdentity().?,
         .mode = .upstream,
@@ -1420,8 +1504,8 @@ test "push inspection surface blocks page switching until canceled" {
     var app = try mutationFenceRepoTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer remoteWorkflow(&app).clearPushError(allocator);
-    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
+    defer remoteWorkflow(&app).clearRemoteError(allocator);
+    try workflow_remote.testing.setRemoteErrorWithRetry(remoteWorkflow(&app), allocator, .push, "failed", .{
         .repo_epoch = app.repo_session.view().epoch(),
         .root_identity = app.repo_session.view().activeIdentity().?,
         .mode = .upstream,
@@ -1437,8 +1521,8 @@ test "push inspection surface blocks page switching until canceled" {
     try app.update(.{ .switch_page = .repository }, &ctx);
 
     try std.testing.expectEqual(page.Id.changes, app.active_page);
-    try std.testing.expectEqualStrings("close push error before switching pages", app.status.text());
-    remoteWorkflow(&app).clearPushError(allocator);
+    try std.testing.expectEqualStrings("close remote error before switching pages", app.status.text());
+    remoteWorkflow(&app).clearRemoteError(allocator);
     try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
 
     app.status.clear();
@@ -1500,8 +1584,8 @@ test "inactive Changes accepts push inspection diagnostic without redraw" {
     var app = try mutationFenceRepoTestApp(allocator, repo.repo_root);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    defer remoteWorkflow(&app).clearPushError(allocator);
-    try workflow_remote.testing.setPushErrorWithRetry(remoteWorkflow(&app), allocator, "failed", .{
+    defer remoteWorkflow(&app).clearRemoteError(allocator);
+    try workflow_remote.testing.setRemoteErrorWithRetry(remoteWorkflow(&app), allocator, .push, "failed", .{
         .repo_epoch = app.repo_session.view().epoch(),
         .root_identity = app.repo_session.view().activeIdentity().?,
         .mode = .set_upstream,
