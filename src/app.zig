@@ -35,6 +35,7 @@ const repository_coordinator = @import("app/pages/repository/coordinator.zig");
 const repository_layout = @import("app/pages/repository/layout.zig");
 const history_page = @import("app/pages/history.zig");
 const history_coordinator = @import("app/pages/history/coordinator.zig");
+const history_view = @import("app/pages/history/view.zig");
 const repo_session = @import("app/repo_session.zig");
 const app_state = @import("app/state.zig");
 const app_view = @import("app/view.zig");
@@ -1547,6 +1548,10 @@ pub const App = struct {
             },
             .history = .{
                 .key = history_key,
+                .picker_layout = if (history_key.diff_view)
+                    null
+                else
+                    history_view.pickerLayout(body_size, self.pages.history.interaction_state),
                 .selection_owner = &self.pages.history.diff.selection_owner,
                 .loaded = if (self.pages.history.current_view == .diff)
                     history_body_view.view.activeLoadedDiffConst()

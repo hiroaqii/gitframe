@@ -85,6 +85,7 @@ pub const Controller = struct {
             .open_picker => self.page_state.openPicker(ctx.allocator()),
             .focus_next => self.page_state.interaction_state.focusNext(),
             .focus_previous => self.page_state.interaction_state.focusPrevious(),
+            .focus_pane => |focus| self.page_state.interaction_state.focus = focus,
             .move_detail => |action| try history_view.moveDetail(
                 self.page_state,
                 ctx.allocator(),

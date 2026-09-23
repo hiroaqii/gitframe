@@ -23,6 +23,7 @@ const page = @import("page.zig");
 const repository_page = @import("pages/repository.zig");
 const repository_input = @import("pages/repository/input.zig");
 const repository_layout = @import("pages/repository/layout.zig");
+const history_view = @import("pages/history/view.zig");
 const changes_layout = @import("pages/changes/layout.zig");
 const changes_message = @import("pages/changes/message.zig");
 
@@ -71,6 +72,7 @@ pub const RepositoryContext = struct {
 
 pub const HistoryContext = struct {
     key: app_input.HistoryContext = .{},
+    picker_layout: ?history_view.PickerLayout = null,
     selection_owner: ?*const diff_selection.Owner = null,
     loaded: ?*const loaded_diff.LoadedDiff = null,
     selected_node: usize = 0,
@@ -285,7 +287,12 @@ pub const View = struct {
             };
         }
         if (self.active_page == .history) {
-            _ = self.bodyMousePoint(mouse) orelse return null;
+            const point = self.bodyMousePoint(mouse) orelse return null;
+            if (mouse.button == .left) {
+                const picker_layout = self.history.picker_layout orelse return null;
+                const focus = picker_layout.focusAt(point) orelse return null;
+                return .{ .history = .{ .focus_pane = focus } };
+            }
             return switch (self.history.key.focus) {
                 .history => if (self.history.key.loading or !self.history.key.picker_ready)
                     null
@@ -494,7 +501,7 @@ test "Repository Help scrolling stays bounded" {
     try std.testing.expectEqual(@as(usize, 0), overlay.help_scroll);
 }
 
-test "History routes committed diff and bounded picker wheel through the shell" {
+test "History routes committed diff and picker mouse input through the shell" {
     var overlay: app_state.OverlayState = .{};
     var selection_owner: diff_selection.Owner = .none;
     var repository_state: repository_page.RepositoryPageState = .{};
@@ -601,6 +608,42 @@ test "History routes committed diff and bounded picker wheel through the shell" 
         .picker_can_move_next = true,
     };
     picker_view.history.loaded = null;
+    const picker_layout = history_view.pickerLayout(layout.bodySize(), .{});
+    picker_view.history.picker_layout = picker_layout;
+    for ([_]struct { point: MousePoint, expected: app_message.Msg }{
+        .{
+            .point = .{ .col = picker_layout.history.col, .row = picker_layout.history.row },
+            .expected = .{ .history = .{ .focus_pane = .history } },
+        },
+        .{
+            .point = .{ .col = picker_layout.detail.col, .row = picker_layout.detail.row },
+            .expected = .{ .history = .{ .focus_pane = .commit_detail } },
+        },
+        .{
+            .point = .{ .col = picker_layout.files.col, .row = picker_layout.files.row },
+            .expected = .{ .history = .{ .focus_pane = .changed_files } },
+        },
+    }) |case| {
+        try std.testing.expectEqual(case.expected, picker_view.handleEvent(.{ .mouse = .{
+            .col = @intCast(layout.body.col + case.point.col),
+            .row = @intCast(layout.body.row + case.point.row),
+            .button = .left,
+            .mods = .{},
+            .type = .press,
+        } }).?);
+    }
+    for ([_]MousePoint{
+        .{ .col = picker_layout.outer_divider.col, .row = picker_layout.outer_divider.row },
+        .{ .col = picker_layout.inner_divider.col, .row = picker_layout.inner_divider.row },
+    }) |divider_point| {
+        try std.testing.expect(picker_view.handleEvent(.{ .mouse = .{
+            .col = @intCast(layout.body.col + divider_point.col),
+            .row = @intCast(layout.body.row + divider_point.row),
+            .button = .left,
+            .mods = .{},
+            .type = .press,
+        } }) == null);
+    }
     const picker_wheel_up = chasen.Event{ .mouse = .{
         .col = terminal_col,
         .row = terminal_row,

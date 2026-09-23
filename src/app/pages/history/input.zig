@@ -36,6 +36,7 @@ pub const Msg = union(enum) {
     open_picker,
     focus_next,
     focus_previous,
+    focus_pane: interaction.Focus,
     move_detail: interaction.VerticalAction,
     move_files: interaction.VerticalAction,
     scroll_files: interaction.HorizontalAction,

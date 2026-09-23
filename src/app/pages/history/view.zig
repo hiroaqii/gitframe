@@ -141,7 +141,26 @@ pub const PickerLayout = struct {
     detail: chasen.Rect,
     inner_divider: chasen.Rect,
     files: chasen.Rect,
+
+    pub fn focusAt(self: PickerLayout, point: diff_surface.MousePoint) ?history_page.interaction.Focus {
+        if (rectContains(self.history, point)) return .history;
+
+        const right_start = self.outer_divider.col +| self.outer_divider.width;
+        const right_end = self.detail.col +| self.detail.width;
+        if (point.col < right_start or point.col >= right_end) return null;
+        if (rowInRect(self.detail, point.row)) return .commit_detail;
+        if (rowInRect(self.files, point.row)) return .changed_files;
+        return null;
+    }
 };
+
+fn rectContains(rect: chasen.Rect, point: diff_surface.MousePoint) bool {
+    return point.col >= rect.col and point.col < rect.col +| rect.width and rowInRect(rect, point.row);
+}
+
+fn rowInRect(rect: chasen.Rect, row: u16) bool {
+    return row >= rect.row and row < rect.row +| rect.height;
+}
 
 pub fn pickerLayout(size: chasen.Size, state: history_page.interaction.State) PickerLayout {
     const outer = state.outerWidths(size.width);

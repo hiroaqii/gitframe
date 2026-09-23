@@ -533,7 +533,7 @@ pub const HistoryPageState = struct {
             .cancel_draft => if (!self.returnToAccepted() and !self.draft.clearAnchor())
                 self.status.set("No previously selected diff", .{}),
             .unsupported_search => self.status.set("Commit search is not available in v1", .{}),
-            .load_diff, .open_picker, .focus_next, .focus_previous, .move_detail, .move_files, .scroll_files, .adjust_width, .copy_detail, .common => unreachable,
+            .load_diff, .open_picker, .focus_next, .focus_previous, .focus_pane, .move_detail, .move_files, .scroll_files, .adjust_width, .copy_detail, .common => unreachable,
             .owned_noop => {},
         }
         if (previous_cursor != self.catalog.cursor or previous_anchor != self.draft.anchor()) {
