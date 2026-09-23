@@ -1809,11 +1809,18 @@ pub const BodyController = struct {
 
     pub fn pressDiffMouse(self: BodyController, point: diff_surface.MousePoint) void {
         self.controller.surface.viewer.focus = .diff;
-        if (self.view().diffHeaderMouseHit(point)) |hit| {
+        const body = self.view();
+        if (body.presentationCellHit(point)) |cell| switch (cell) {
+            .source => |source| if (body.selectedCoordinateAtOffset(source.source_offset)) |coordinate| {
+                self.controller.surface.viewer.diff_cursor = coordinate;
+            },
+            .card, .spacer => {},
+        };
+        if (body.diffHeaderMouseHit(point)) |hit| {
             self.controller.surface.selection_owner.* = .{ .diff_header = .{ .identity = hit.identity } };
             return;
         }
-        const hit = self.view().diffMouseHit(point) orelse {
+        const hit = body.diffMouseHit(point) orelse {
             self.controller.clearDiffSelection();
             return;
         };

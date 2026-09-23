@@ -579,13 +579,26 @@ test "changes mouse release retains candidate until explicit copy or clear" {
     }
 
     const retained_token = page.completed_selection.?.token;
-    page.selection_owner = .{ .diff = .{
-        .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
-        .content = .unified_diff,
-        .anchor = .{ .hunk_index = 0, .line_index = 0 },
-        .focus = .{ .hunk_index = 0, .line_index = 0 },
-        .moved = false,
-    } };
+    page.viewer.diff_scroll = 0;
+    page.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const raw = controller.navigation.view().rawDiffPaneGeometry().?;
+    const content_gutter = raw.width - diff_surface_navigation.contentWidth(raw.width);
+    const click_point = diff_surface.MousePoint{
+        .col = raw.col + content_gutter + diff_render.cursor_gutter_width + 2,
+        .row = diff_render.body_start_row + 2,
+    };
+    var press = try controller.apply(null, .{ .mouse_diff_press = click_point });
+    press.deinit(null);
+    try std.testing.expect(page.selection_owner.activeDiff() != null);
+    try std.testing.expect(page.completed_selection != null);
+    try std.testing.expect(page.completed_selection.?.token.eql(retained_token));
+    switch (page.viewer.diff_cursor) {
+        .hunk_line => |line| {
+            try std.testing.expectEqual(@as(usize, 0), line.hunk_index);
+            try std.testing.expectEqual(@as(usize, 1), line.line_index);
+        },
+        else => return error.ExpectedHunkLineCursor,
+    }
     var click = try controller.apply(std.testing.allocator, .{ .mouse_diff_release = null });
     defer click.deinit(std.testing.allocator);
     try std.testing.expect(click.command == null);
