@@ -861,9 +861,11 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
                     catalogStyle(context.palette, .prompt, focused),
                 );
             } else {
-                var enter_style = catalogStyle(context.palette, .accent, focused);
-                enter_style.bold = true;
-                try drawClipped(surface, row_prefix_width, row, "[Enter]", enter_style);
+                const enter_style = chasen.TextStyle{
+                    .fg = context.palette.color(.selection_action_fg),
+                    .bg = context.palette.color(.selection_action_bg),
+                };
+                try drawClipped(surface, row_prefix_width, row, " Enter ", enter_style);
                 try drawClipped(
                     surface,
                     row_prefix_width + 7,
@@ -1617,12 +1619,19 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     var detached_more: chasen.testing.TestSurface = undefined;
     try detached_more.init(80, 24);
     defer detached_more.deinit();
-    try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &detached_more.surface, true);
+    const detached_palette = theme.Palette.default();
+    try viewPicker(.{ .page_state = &page_state, .palette = detached_palette }, &detached_more.surface, true);
     const detached_more_snapshot = try detached_more.snapshot(allocator);
     defer allocator.free(detached_more_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Detached HEAD 1111111") != null);
     try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "3 commits loaded · more available") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Load 200 older commits…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Enter  Load 200 older commits…") != null);
+    const load_more_row: u16 = @intCast(1 + page_state.catalog.records.items.len);
+    for (row_prefix_width..row_prefix_width + 7) |col| {
+        const cell = detached_more.surface.readCell(@intCast(col), load_more_row) orelse return error.ExpectedLoadMoreControl;
+        try std.testing.expect(cell.style.fg.eql(detached_palette.color(.selection_action_fg)));
+        try std.testing.expect(cell.style.bg.eql(detached_palette.color(.selection_action_bg)));
+    }
 
     var older_page: git_history.Page = .{ .records = try allocator.alloc(git_history.Record, 1) };
     older_page.records[0] = .{

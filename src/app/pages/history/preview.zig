@@ -519,7 +519,7 @@ pub fn canonicalDetailAlloc(allocator: std.mem.Allocator, detail: git_preview.De
             try writeRefs(&out.writer, single.refs.tags);
             try out.writer.writeAll("\nRemotes: ");
             try writeRefs(&out.writer, single.refs.remote_branches);
-            try out.writer.writeAll("\nDiff: ");
+            try out.writer.writeAll("\nDiff base: ");
             try writeSingleBasis(&out.writer, single.summary);
             try out.writer.writeAll("\nMessage:\n");
             try out.writer.writeAll(single.message);
@@ -571,22 +571,14 @@ fn writeRefs(writer: *std.Io.Writer, refs: []const []const u8) !void {
 
 fn writeSingleBasis(writer: *std.Io.Writer, summary: git_preview.SingleSummary) !void {
     switch (summary.basis.before) {
-        .empty_tree => {
-            try writer.writeAll("empty tree (");
-            const empty = summary.basis.beforeOid();
-            try writer.print("{s}) -> {s}", .{ empty.slice(), summary.basis.after.slice() });
-        },
+        .empty_tree => try writer.writeAll("empty tree"),
         .commit => |before| if (summary.parent_count > 1)
-            try writer.print("parent 1/{d} {s} -> {s}", .{
+            try writer.print("parent 1/{d} {s}", .{
                 summary.parent_count,
                 before.slice(),
-                summary.basis.after.slice(),
             })
         else
-            try writer.print("first parent {s} -> {s}", .{
-                before.slice(),
-                summary.basis.after.slice(),
-            }),
+            try writer.print("parent {s}", .{before.slice()}),
     }
 }
 
@@ -969,10 +961,28 @@ test "History preview canonical detail is exact for single and range" {
             "Committer: C O M <commit@example.com>\n" ++
             "Committed: 1969-12-31 21:30:00 -0230\n" ++
             "Branches: main, release\nTags: v1\nRemotes: —\n" ++
-            "Diff: parent 1/2 1111111111111111111111111111111111111111 -> 2222222222222222222222222222222222222222\n" ++
+            "Diff base: parent 1/2 1111111111111111111111111111111111111111\n" ++
             "Message:\nsubject\n\nbody",
         single,
     );
+
+    var ordinary_basis: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer ordinary_basis.deinit();
+    var ordinary_summary = single_summary;
+    ordinary_summary.parent_count = 1;
+    try writeSingleBasis(&ordinary_basis.writer, ordinary_summary);
+    try std.testing.expectEqualStrings(
+        "parent 1111111111111111111111111111111111111111",
+        ordinary_basis.written(),
+    );
+
+    var root_basis: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer root_basis.deinit();
+    var root_summary = single_summary;
+    root_summary.parent_count = 0;
+    root_summary.basis.before = .empty_tree;
+    try writeSingleBasis(&root_basis.writer, root_summary);
+    try std.testing.expectEqualStrings("empty tree", root_basis.written());
 
     const range = try canonicalDetailAlloc(std.testing.allocator, .{ .range = .{
         .count = 3,
