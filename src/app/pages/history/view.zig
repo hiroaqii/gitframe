@@ -229,7 +229,7 @@ pub fn scrollFiles(
 ) !void {
     const files = readyFiles(page) orelse return;
     const body = paneBodyRect(pickerLayout(size, page.interaction_state).files);
-    const columns = fileColumns(body.width, maxStatsWidth(files));
+    const columns = fileColumns(body.width, maxStatsWidths(files).total());
     page.interaction_state.moveFilesHorizontal(
         try maxPathCells(allocator, files),
         columns.path_width,
@@ -254,7 +254,7 @@ pub fn reflowPreview(
 
     const files_body = paneBodyRect(layout.files);
     if (readyFiles(page)) |files| {
-        const columns = fileColumns(files_body.width, maxStatsWidth(files));
+        const columns = fileColumns(files_body.width, maxStatsWidths(files).total());
         page.interaction_state.clampFiles(
             files.len,
             files_body.height,
@@ -344,7 +344,21 @@ fn viewDetailPane(context: ViewContext, surface: *chasen.Surface) !void {
 
 fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
     const active = context.page_state.interaction_state.focus == .changed_files;
+    const ready_files = readyFiles(context.page_state);
     try drawPaneTitle(surface, 0, "Changed files", active, context.palette);
+    if (ready_files) |files| {
+        const count_col: u16 = @intCast(chasen.text.displayWidth("Changed files"));
+        if (count_col < surface.size().width) {
+            const count = try std.fmt.allocPrint(surface.frameAllocator(), " ({d})", .{files.len});
+            try drawClipped(
+                surface,
+                count_col,
+                0,
+                count,
+                context.palette.style(if (active) .accent else .muted),
+            );
+        }
+    }
     if (surface.size().height <= 1) return;
     var body = surface.child(.{
         .col = 0,
@@ -352,7 +366,7 @@ fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
         .width = surface.size().width,
         .height = surface.size().height - 1,
     });
-    const files = readyFiles(context.page_state) orelse {
+    const files = ready_files orelse {
         try drawPaneMessage(&body, filesStateText(context.page_state), context.palette);
         return;
     };
@@ -361,7 +375,8 @@ fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
         return;
     }
 
-    const columns = fileColumns(body.size().width, maxStatsWidth(files));
+    const stats_widths = maxStatsWidths(files);
+    const columns = fileColumns(body.size().width, stats_widths.total());
     const start = @min(context.page_state.interaction_state.files_vertical_offset, files.len);
     const end = @min(files.len, start +| @as(usize, body.size().height));
     for (files[start..end], 0..) |file, visible_index| {
@@ -382,32 +397,13 @@ fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
             );
         }
         if (columns.stats_width > 0) {
-            switch (file.stats) {
-                .text => |stats| {
-                    var stats_area = body.child(.{
-                        .col = columns.stats_col,
-                        .row = row,
-                        .width = columns.stats_width,
-                        .height = 1,
-                    });
-                    const added = try std.fmt.allocPrint(body.frameAllocator(), "+{d}", .{stats.added});
-                    const removed = try std.fmt.allocPrint(body.frameAllocator(), "-{d}", .{stats.removed});
-                    try drawClipped(&stats_area, 0, 0, added, .{ .fg = context.palette.color(.success), .bold = true });
-                    const removed_col: u16 = @intCast(@min(
-                        chasen.text.displayWidth(added) +| 1,
-                        std.math.maxInt(u16),
-                    ));
-                    if (removed_col > 0) try drawClipped(&stats_area, removed_col - 1, 0, " ", context.palette.style(.muted));
-                    try drawClipped(&stats_area, removed_col, 0, removed, .{ .fg = context.palette.color(.danger), .bold = true });
-                },
-                else => try drawClipped(
-                    &body,
-                    columns.stats_col,
-                    row,
-                    try statsText(body.frameAllocator(), file.stats),
-                    context.palette.style(.muted),
-                ),
-            }
+            var stats_area = body.child(.{
+                .col = columns.stats_col,
+                .row = row,
+                .width = columns.stats_width,
+                .height = 1,
+            });
+            try drawFileStats(&stats_area, file.stats, stats_widths, context.palette);
         }
     }
 }
@@ -614,9 +610,10 @@ fn fileColumns(width: u16, requested_stats_width: u16) FileColumns {
     const status_width: u16 = @min(width, 1);
     const first_gap: u16 = @min(width -| status_width, 1);
     const remaining = width -| status_width -| first_gap;
-    const stats_width = if (remaining >= 2) @min(requested_stats_width, remaining - 2) else 0;
+    const stats_width = if (remaining >= 4) @min(requested_stats_width, remaining - 3) else 0;
     const stats_gap = if (stats_width > 0 and remaining > stats_width) @as(u16, 1) else 0;
-    const path_width = remaining -| stats_gap -| stats_width;
+    const right_padding = @intFromBool(stats_width > 0);
+    const path_width = remaining -| stats_gap -| stats_width -| right_padding;
     const path_col = status_width +| first_gap;
     return .{
         .status_width = status_width,
@@ -627,19 +624,84 @@ fn fileColumns(width: u16, requested_stats_width: u16) FileColumns {
     };
 }
 
-fn maxStatsWidth(files: []const git_preview.FileChange) u16 {
-    var result: usize = 0;
-    for (files) |file| result = @max(result, statsTextWidth(file.stats));
-    return @intCast(@min(result, 43));
+const StatsWidths = struct {
+    added: u16 = 0,
+    removed: u16 = 0,
+    label: u16 = 0,
+
+    fn text(self: StatsWidths) u16 {
+        if (self.added == 0 or self.removed == 0) return 0;
+        return self.added +| 1 +| self.removed;
+    }
+
+    fn total(self: StatsWidths) u16 {
+        return @max(self.text(), self.label);
+    }
+};
+
+fn maxStatsWidths(files: []const git_preview.FileChange) StatsWidths {
+    var result: StatsWidths = .{};
+    for (files) |file| switch (file.stats) {
+        .text => |text| {
+            result.added = @max(result.added, @as(u16, @intCast(std.fmt.count("+{d}", .{text.added}))));
+            result.removed = @max(result.removed, @as(u16, @intCast(std.fmt.count("-{d}", .{text.removed}))));
+        },
+        .binary => result.label = @max(result.label, "binary".len),
+        .mode_only => result.label = @max(result.label, "mode".len),
+        .submodule => result.label = @max(result.label, "submodule".len),
+    };
+    return result;
 }
 
-fn statsTextWidth(stats: git_preview.StatsKind) usize {
-    return switch (stats) {
-        .text => |text| std.fmt.count("+{d} -{d}", .{ text.added, text.removed }),
-        .binary => "binary".len,
-        .mode_only => "mode".len,
-        .submodule => "submodule".len,
-    };
+fn drawFileStats(
+    surface: *chasen.Surface,
+    stats: git_preview.StatsKind,
+    widths: StatsWidths,
+    palette: theme.Palette,
+) !void {
+    if (surface.size().width == 0 or surface.size().height == 0) return;
+    switch (stats) {
+        .text => |text| {
+            const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{text.added});
+            const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{text.removed});
+            const added_width: u16 = @intCast(chasen.text.displayWidth(added));
+            const removed_width: u16 = @intCast(chasen.text.displayWidth(removed));
+            const text_width = widths.text();
+            if (text_width <= surface.size().width) {
+                const base = surface.size().width - text_width;
+                try drawClipped(
+                    surface,
+                    base + widths.added - added_width,
+                    0,
+                    added,
+                    .{ .fg = palette.color(.success), .bold = true },
+                );
+                try drawClipped(
+                    surface,
+                    base + widths.added + 1 + widths.removed - removed_width,
+                    0,
+                    removed,
+                    .{ .fg = palette.color(.danger), .bold = true },
+                );
+                return;
+            }
+
+            try drawClipped(surface, 0, 0, added, .{ .fg = palette.color(.success), .bold = true });
+            const removed_col = @min(added_width +| 1, surface.size().width);
+            if (removed_col < surface.size().width) try drawClipped(
+                surface,
+                removed_col,
+                0,
+                removed,
+                .{ .fg = palette.color(.danger), .bold = true },
+            );
+        },
+        else => {
+            const label = try statsText(surface.frameAllocator(), stats);
+            const label_width: u16 = @intCast(@min(chasen.text.displayWidth(label), surface.size().width));
+            try drawClipped(surface, surface.size().width - label_width, 0, label, palette.style(.muted));
+        },
+    }
 }
 
 fn statsText(allocator: std.mem.Allocator, stats: git_preview.StatsKind) ![]const u8 {
@@ -1234,14 +1296,24 @@ test "History preview three pane renders focus structured detail and flat files"
         .basis = .{ .object_format = .sha1, .before = .{ .commit = before }, .after = after },
     };
     const path = "src/history/preview-with-a-very-long-component-name-that-needs-horizontal-scrolling.zig";
-    var files = [_]git_preview.FileChange{.{
-        .kind = .{ .modified = @constCast(path) },
-        .old_mode = 0o100644,
-        .new_mode = 0o100644,
-        .old_oid = before,
-        .new_oid = after,
-        .stats = .{ .text = .{ .added = 3, .removed = 1 } },
-    }};
+    var files = [_]git_preview.FileChange{
+        .{
+            .kind = .{ .modified = @constCast(path) },
+            .old_mode = 0o100644,
+            .new_mode = 0o100644,
+            .old_oid = before,
+            .new_oid = after,
+            .stats = .{ .text = .{ .added = 3, .removed = 1 } },
+        },
+        .{
+            .kind = .{ .modified = @constCast("src/second.zig") },
+            .old_mode = 0o100644,
+            .new_mode = 0o100644,
+            .old_oid = before,
+            .new_oid = after,
+            .stats = .{ .text = .{ .added = 21, .removed = 30 } },
+        },
+    };
     var page_state: history_page.HistoryPageState = .{};
     defer {
         page_state.preview_state.accepted = null;
@@ -1280,7 +1352,7 @@ test "History preview three pane renders focus structured detail and flat files"
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "History") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Range summary") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed files (2)") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Count: 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/history/preview-with") != null);
     const layout = pickerLayout(rendered.surface.size(), page_state.interaction_state);
@@ -1293,17 +1365,24 @@ test "History preview three pane renders focus structured detail and flat files"
     try rendered.expectCellText(layout.files.col, layout.files.row, "C");
     const files_body = paneBodyRect(layout.files);
     try rendered.expectCellText(files_body.col, files_body.row, "M");
-    const columns = fileColumns(files_body.width, maxStatsWidth(&files));
+    const columns = fileColumns(files_body.width, maxStatsWidths(&files).total());
     try rendered.expectCellText(files_body.col + columns.path_col, files_body.row, "s");
-    try rendered.expectCellText(files_body.col + columns.stats_col, files_body.row, "+");
+    try rendered.expectCellText(files_body.col + columns.stats_col + 1, files_body.row, "+");
+    try rendered.expectCellText(files_body.col + columns.stats_col, files_body.row + 1, "+");
+    try rendered.expectCellText(files_body.col + columns.stats_col + 5, files_body.row, "-");
+    try rendered.expectCellText(files_body.col + columns.stats_col + 4, files_body.row + 1, "-");
+    try rendered.expectCellText(files_body.col + files_body.width - 1, files_body.row, " ");
+    try rendered.expectCellText(files_body.col + files_body.width - 1, files_body.row + 1, " ");
     const active_title = rendered.surface.readCell(layout.files.col, layout.files.row) orelse return error.ExpectedActivePaneTitle;
     try std.testing.expect(active_title.style.bold);
     try std.testing.expect(active_title.style.fg.eql(palette.color(.accent)));
+    const files_count = rendered.surface.readCell(layout.files.col + 14, layout.files.row) orelse return error.ExpectedFileCount;
+    try std.testing.expect(files_count.style.fg.eql(palette.color(.accent)));
     const status_cell = rendered.surface.readCell(files_body.col, files_body.row) orelse return error.ExpectedFileStatus;
     try std.testing.expect(status_cell.style.bold);
     try std.testing.expect(status_cell.style.fg.eql(palette.color(.prompt)));
-    const added_cell = rendered.surface.readCell(files_body.col + columns.stats_col, files_body.row) orelse return error.ExpectedAddedStats;
-    const removed_cell = rendered.surface.readCell(files_body.col + columns.stats_col + 3, files_body.row) orelse return error.ExpectedRemovedStats;
+    const added_cell = rendered.surface.readCell(files_body.col + columns.stats_col + 1, files_body.row) orelse return error.ExpectedAddedStats;
+    const removed_cell = rendered.surface.readCell(files_body.col + columns.stats_col + 5, files_body.row) orelse return error.ExpectedRemovedStats;
     try std.testing.expect(added_cell.style.bold);
     try std.testing.expect(added_cell.style.fg.eql(palette.color(.success)));
     try std.testing.expect(removed_cell.style.bold);
@@ -1329,7 +1408,7 @@ test "History preview three pane renders focus structured detail and flat files"
     try view(.{ .page_state = &page_state, .palette = palette }, &scrolled.surface);
     try scrolled.expectCellText(files_body.col, files_body.row, "M");
     try scrolled.expectCellText(files_body.col + columns.path_col, files_body.row, "r");
-    try scrolled.expectCellText(files_body.col + columns.stats_col, files_body.row, "+");
+    try scrolled.expectCellText(files_body.col + columns.stats_col + 1, files_body.row, "+");
 
     const blocks = [_]history_page.interaction.DetailBlock{.{
         .label = "Message: ",
