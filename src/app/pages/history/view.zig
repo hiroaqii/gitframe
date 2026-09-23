@@ -426,7 +426,7 @@ fn fileStatusStyle(status: git_preview.FileStatus, palette: theme.Palette) chase
 
 fn drawPaneMessage(surface: *chasen.Surface, message: []const u8, palette: theme.Palette) !void {
     if (surface.size().width == 0 or surface.size().height == 0) return;
-    try drawClipped(surface, @min(surface.size().width, 1), 0, message, palette.style(.muted));
+    try drawClipped(surface, 0, 0, message, palette.style(.muted));
 }
 
 fn detailTitle(page: *const history_page.HistoryPageState) []const u8 {
@@ -771,8 +771,26 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
         if (focused) fillSelectedRow(surface, row, context.palette.color(.pane_cursor_bg));
         if (index == page.catalog.records.items.len) {
             try drawClipped(surface, 0, row, if (selected) "›" else " ", catalogStyle(context.palette, .prompt, focused));
-            const label = if (page.load_state == .loading) "Loading older commits…" else "Load 200 older commits…";
-            try drawClipped(surface, row_prefix_width, row, label, catalogStyle(context.palette, .prompt, focused));
+            if (page.load_state == .loading) {
+                try drawClipped(
+                    surface,
+                    row_prefix_width,
+                    row,
+                    "Loading older commits…",
+                    catalogStyle(context.palette, .prompt, focused),
+                );
+            } else {
+                var enter_style = catalogStyle(context.palette, .accent, focused);
+                enter_style.bold = true;
+                try drawClipped(surface, row_prefix_width, row, "[Enter]", enter_style);
+                try drawClipped(
+                    surface,
+                    row_prefix_width + 7,
+                    row,
+                    " Load 200 older commits…",
+                    catalogStyle(context.palette, .prompt, focused),
+                );
+            }
             continue;
         }
         const record = &page.catalog.records.items[index];
