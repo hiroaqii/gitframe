@@ -81,6 +81,8 @@ pub const Page = struct {
     /// Present only for the initial request. Continuation requests borrow the
     /// already accepted page snapshot and cannot replace it.
     snapshot: ?Snapshot = null,
+    /// Exact first-parent history size when this is an initial page.
+    total_count: ?usize = null,
     records: []Record = &.{},
     continuation: ?ObjectId = null,
 
@@ -277,7 +279,10 @@ pub fn loadInitial(
         var owned = snapshot;
         owned.deinit(allocator);
     }
-    const head = snapshot.head orelse return .{ .loaded = .{ .snapshot = snapshot } };
+    const head = snapshot.head orelse return .{ .loaded = .{
+        .snapshot = snapshot,
+        .total_count = 0,
+    } };
 
     var page = switch (try loadPage(allocator, io, context, snapshot.object_format, head)) {
         .loaded => |value| value,
@@ -286,6 +291,13 @@ pub fn loadInitial(
             owned.deinit(allocator);
             return .{ .failure = failure };
         },
+    };
+    errdefer page.deinit(allocator);
+    page.total_count = count: {
+        const cursor = page.continuation orelse break :count page.records.len;
+        const remaining = try countFirstParent(allocator, io, context, cursor);
+        const tail_count = remaining orelse break :count null;
+        break :count std.math.add(usize, page.records.len, tail_count) catch null;
     };
     page.snapshot = snapshot;
     return .{ .loaded = page };
@@ -325,6 +337,31 @@ pub fn loadContinuation(
     };
     if (actual_format != expected_format) return .{ .failure = .object_format_drift };
     return loadPage(allocator, io, context, expected_format, cursor);
+}
+
+fn countFirstParent(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    start: ObjectId,
+) std.mem.Allocator.Error!?usize {
+    const argv = [_][]const u8{
+        strict_prefix[0], strict_prefix[1], strict_prefix[2], strict_prefix[3],
+        "rev-list",       "--first-parent", "--count",        start.slice(),
+    };
+    var result = try git_command.runCapturedBounded(allocator, io, context, .{
+        .argv = &argv,
+        .stdout_limit = .limited(32),
+        .stderr_limit = .limited(stderr_limit),
+    });
+    defer result.deinit(allocator);
+    const completed = switch (result) {
+        .completed => |value| value,
+        .stdout_limit_exceeded, .stderr_limit_exceeded, .failed => return null,
+    };
+    if (!exited(completed.term, 0)) return null;
+    const line = exactLine(completed.stdout) orelse return null;
+    return std.fmt.parseInt(usize, line, 10) catch null;
 }
 
 const FormatResult = union(enum) {
@@ -841,6 +878,7 @@ test "History exact catalog pages full topology and preserves shallow raw parent
         .failure => return error.ExpectedLoadedCatalog,
     };
     try std.testing.expectEqual(@as(usize, page_size), first_page.records.len);
+    try std.testing.expectEqual(@as(?usize, 205), first_page.total_count);
     try std.testing.expect(first_page.continuation != null);
     try std.testing.expectEqualStrings("commit 205", first_page.records[0].subject);
     try std.testing.expectEqualStrings("commit 6", first_page.records[page_size - 1].subject);
@@ -860,6 +898,7 @@ test "History exact catalog pages full topology and preserves shallow raw parent
         .failure => return error.ExpectedLoadedCatalog,
     };
     try std.testing.expectEqual(@as(usize, 5), older_page.records.len);
+    try std.testing.expectEqual(@as(?usize, null), older_page.total_count);
     try std.testing.expectEqualStrings("commit 5", older_page.records[0].subject);
     try std.testing.expectEqualStrings("commit 1", older_page.records[4].subject);
     try std.testing.expect(older_page.records[4].first_parent == .true_root);
@@ -873,6 +912,7 @@ test "History exact catalog pages full topology and preserves shallow raw parent
         .failure => return error.ExpectedLoadedCatalog,
     };
     try std.testing.expectEqual(@as(usize, 2), shallow_page.records.len);
+    try std.testing.expectEqual(@as(?usize, 2), shallow_page.total_count);
     try std.testing.expect(shallow_page.records[0].first_parent == .available);
     try std.testing.expect(shallow_page.records[1].first_parent == .missing);
     try std.testing.expect(shallow_page.continuation == null);
@@ -895,6 +935,7 @@ test "History exact catalog pages full topology and preserves shallow raw parent
     switch (unborn) {
         .loaded => |page| {
             try std.testing.expectEqual(@as(usize, 0), page.records.len);
+            try std.testing.expectEqual(@as(?usize, 0), page.total_count);
             try std.testing.expect(page.snapshot.?.head == null);
             try std.testing.expectEqualStrings("topic", page.snapshot.?.display.unborn);
         },

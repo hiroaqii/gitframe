@@ -6,6 +6,7 @@ const git_history = @import("../../../git/history.zig");
 
 pub const State = struct {
     snapshot: ?git_history.Snapshot = null,
+    total_count: ?usize = null,
     records: std.ArrayListUnmanaged(git_history.Record) = .empty,
     continuation: ?git_history.ObjectId = null,
     capped: bool = false,
@@ -49,6 +50,7 @@ pub const State = struct {
         const records = page.takeRecords();
         var replacement: State = .{
             .snapshot = snapshot,
+            .total_count = page.total_count,
             .records = .{ .items = records, .capacity = records.len },
             .continuation = page.continuation,
             .capped = records.len >= git_history.catalog_limit,

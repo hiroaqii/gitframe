@@ -933,7 +933,8 @@ fn drawCatalogContext(
     }
 
     const position = try catalogPositionLabel(allocator, page);
-    const content_width: u16 = size.width - row_prefix_width;
+    const right_padding: u16 = 1;
+    const content_width: u16 = size.width - row_prefix_width -| right_padding;
     const left_text_width = chasen.text.displayWidth(left);
     const full_width = chasen.text.displayWidth(position.full);
     const compact_width = chasen.text.displayWidth(position.compact);
@@ -946,7 +947,7 @@ fn drawCatalogContext(
 
     if (right) |right_text| {
         const right_width = chasen.text.displayWidth(right_text);
-        const right_col: u16 = size.width - @as(u16, @intCast(right_width));
+        const right_col: u16 = size.width - right_padding - @as(u16, @intCast(right_width));
         const left_width = right_col -| column_gap -| row_prefix_width;
         try drawClippedField(
             surface,
@@ -994,6 +995,10 @@ fn catalogPositionLabel(allocator: std.mem.Allocator, page: *const history_page.
         .compact = "0 loaded",
     };
     const position = @min(page.catalog.cursor, loaded - 1) + 1;
+    if (page.catalog.total_count) |total| return .{
+        .full = try std.fmt.allocPrint(allocator, "Commit {d} of {d}", .{ position, total }),
+        .compact = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ position, total }),
+    };
     return .{
         .full = try std.fmt.allocPrint(allocator, "Commit {d} of {d} loaded", .{ position, loaded }),
         .compact = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ position, loaded }),
@@ -1388,6 +1393,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
             .head = head,
             .display = .{ .branch = try allocator.dupe(u8, "main") },
         },
+        .total_count = 1024,
         .records = records,
     };
     defer page.deinit(allocator);
@@ -1416,7 +1422,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         const snapshot = try rendered.snapshot(allocator);
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Branch main · HEAD 1111111") != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit 3 of 3 loaded") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit 3 of 1024") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "catalog head") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit   subject") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "HiHistory") == null);
@@ -1427,6 +1433,8 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         try rendered.expectCellText(layout.date.col, 1, "2");
         try rendered.expectCellText(layout.author.col, 1, "A");
         try rendered.expectCellText(layout.summary.col, 1, "[");
+        try std.testing.expectEqualStrings("4", rendered.surface.readCell(size.width - 2, 0).?.char.grapheme);
+        try std.testing.expectEqualStrings(" ", rendered.surface.readCell(size.width - 1, 0).?.char.grapheme);
 
         const refs_width = chasen.text.displayWidth("[HEAD -> main]");
         for ([_]struct { col: u16, role: theme.Role }{
