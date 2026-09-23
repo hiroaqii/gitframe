@@ -45,11 +45,11 @@ pub const ContentAnchor = struct {
     source_byte_offset: usize = 0,
 };
 
-/// One labeled detail value. Continuation rows use the label's display width
-/// as their hanging indent; anchors always refer to bytes in `value`.
+/// One labeled detail value. Anchors always refer to bytes in `value`.
 pub const DetailBlock = struct {
     label: []const u8,
     value: []const u8,
+    indent_continuations: bool = true,
 };
 
 pub const DetailLayout = struct {
@@ -231,7 +231,10 @@ fn nextLineStart(block: DetailBlock, current: usize, width: u16) ?usize {
             block.value[current..logical_end],
             .{ .tab_width = 4 },
         ) catch unreachable;
-        const available = valueWidth(block.label, width);
+        const available = if (current == 0 or block.indent_continuations)
+            valueWidth(block.label, width)
+        else
+            @max(@as(usize, width), 1);
         var consumed_end: usize = 0;
         var consumed_cells: usize = 0;
         var tokens = projection.tokens();

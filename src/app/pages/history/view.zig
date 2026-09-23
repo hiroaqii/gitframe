@@ -337,7 +337,6 @@ fn viewDetailPane(context: ViewContext, surface: *chasen.Surface) !void {
         &body,
         projection.slice(),
         context.page_state.interaction_state.detail_anchor,
-        active,
         context.palette,
     );
 }
@@ -519,7 +518,11 @@ const DetailProjection = struct {
             if (expected == 10 and result.len == 9) {
                 const prefix = "Message:\n";
                 if (!std.mem.startsWith(u8, remaining, prefix)) return error.MalformedDetailPresentation;
-                result.blocks[result.len] = .{ .label = "Message: ", .value = remaining[prefix.len..] };
+                result.blocks[result.len] = .{
+                    .label = "Message: ",
+                    .value = remaining[prefix.len..],
+                    .indent_continuations = false,
+                };
                 remaining = "";
                 continue;
             }
@@ -550,7 +553,6 @@ fn drawDetailBlocks(
     surface: *chasen.Surface,
     blocks: []const history_page.interaction.DetailBlock,
     anchor: history_page.interaction.ContentAnchor,
-    active: bool,
     palette: theme.Palette,
 ) !void {
     var lines = (history_page.interaction.DetailLayout{
@@ -581,12 +583,16 @@ fn drawDetailBlocks(
                     0,
                     row,
                     block.label,
-                    if (active) palette.boldStyle(.accent) else palette.style(.prompt),
+                    palette.style(.prompt),
                 );
             }
+            const value_col = if (line.source_byte_offset == 0 or block.indent_continuations)
+                @min(label_width, surface.size().width -| 1)
+            else
+                0;
             try drawClipped(
                 surface,
-                @min(label_width, surface.size().width -| 1),
+                value_col,
                 row,
                 block.value[line.source_byte_offset..end],
                 chasen.TextStyle{},
@@ -1413,13 +1419,17 @@ test "History preview three pane renders focus structured detail and flat files"
     const blocks = [_]history_page.interaction.DetailBlock{.{
         .label = "Message: ",
         .value = "abcdefghijk",
+        .indent_continuations = false,
     }};
     var wrapped: chasen.testing.TestSurface = undefined;
     try wrapped.init(14, 3);
     defer wrapped.deinit();
-    try drawDetailBlocks(&wrapped.surface, &blocks, .{}, false, palette);
+    try drawDetailBlocks(&wrapped.surface, &blocks, .{}, palette);
     try wrapped.expectCellText(9, 0, "a");
-    try wrapped.expectCellText(9, 1, "f");
+    try wrapped.expectCellText(0, 1, "f");
+    const message_label = wrapped.surface.readCell(0, 0) orelse return error.ExpectedMessageLabel;
+    try std.testing.expect(message_label.style.fg.eql(palette.color(.prompt)));
+    try std.testing.expect(!message_label.style.bold);
 
     const completed = page_state.preview_state.accepted.?;
     page_state.preview_state.accepted = null;
