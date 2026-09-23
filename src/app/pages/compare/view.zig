@@ -15,7 +15,7 @@ const file_tree = @import("../../../file_tree.zig");
 const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const commit_time = @import("../../branch_commit_time.zig");
-const local_time = @import("../../../local_time.zig");
+const git_refs = @import("../../../git/refs.zig");
 
 pub const Context = struct {
     page: *const compare_page.ComparePageState,
@@ -94,7 +94,7 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     const opts: ui.Modal.ViewOptions = .{
         .dialog_width = @min(surface.size().width, 96),
         .dialog_height = @min(surface.size().height, 22),
-        .title = "Compare base",
+        .title = "Change comparison Base",
         .backdrop = false,
         .border = .rounded,
         .title_style = app.palette.boldStyle(.accent),
@@ -108,23 +108,31 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
     const size = content.size();
     if (size.height == 0) return;
     const footer_row = size.height - 1;
+    const legend_row = footer_row -| 1;
+    const body_end = legend_row;
     var next_row: u16 = 0;
     const list = picker.accepted;
     const visible_count = picker.visibleCount();
     const has_candidates = list != null and list.?.branches.len > 0 and visible_count > 0;
-    const show_detail = has_candidates and size.height >= 4;
-    const show_current = size.height >= if (show_detail) @as(u16, 5) else @as(u16, 4);
 
-    if (show_current) {
-        const current = if (app.page.basis) |basis|
-            try std.fmt.allocPrint(content.frameAllocator(), "Current base: {s}", .{basis.base.display_name})
-        else
-            "Current base: resolving default";
-        try draw.copyClippedTextAt(&content, 0, next_row, current, app.palette.style(.muted));
+    if (app.page.basis) |basis| {
+        if (next_row < body_end) {
+            const base = try std.fmt.allocPrint(content.frameAllocator(), "Base      {s}  merge destination", .{basis.base.display_name});
+            try draw.copyClippedTextAt(&content, 0, next_row, base, app.palette.style(.muted));
+            next_row += 1;
+        }
+        if (next_row < body_end) {
+            const head = try std.fmt.allocPrint(content.frameAllocator(), "Compare   {s}  current HEAD", .{basis.head_display});
+            try draw.copyClippedTextAt(&content, 0, next_row, head, app.palette.style(.muted));
+            next_row += 1;
+        }
+    } else if (next_row < body_end) {
+        try draw.copyClippedTextAt(&content, 0, next_row, "Current comparison unavailable", app.palette.style(.muted));
         next_row += 1;
     }
-    if (next_row < footer_row) {
-        const prefix = if (picker.input_mode == .query) "Filter: /" else "Filter: ";
+    if (next_row +| 1 < body_end) next_row += 1;
+    if (next_row < body_end) {
+        const prefix = if (picker.input_mode == .query) "Filter branches: /" else "Filter branches: ";
         try draw.copyClippedTextAt(&content, 0, next_row, prefix, app.palette.style(.prompt));
         const prefix_width = content.displayWidth(prefix);
         if (prefix_width < size.width) {
@@ -136,20 +144,23 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
         }
         next_row += 1;
     }
-    if (show_detail and next_row < footer_row) {
-        if (picker.selectedItem()) |item| {
-            const exact = local_time.formatExact(item.tip_committer_unix);
-            const detail = if (exact) |value|
-                try std.fmt.allocPrint(content.frameAllocator(), "last commit: {s}  {s}", .{ value.text(), item.full_ref })
-            else
-                try std.fmt.allocPrint(content.frameAllocator(), "last commit: unknown  {s}", .{item.full_ref});
-            try draw.copyClippedTextAt(&content, 0, next_row, detail, app.palette.style(.muted));
+    if (picker.selectedItem()) |item| {
+        if (next_row +| 1 < body_end) next_row += 1;
+        if (next_row < body_end) {
+            const candidate = try std.fmt.allocPrint(content.frameAllocator(), "Candidate {s}", .{item.name});
+            try draw.copyClippedTextAt(&content, 0, next_row, candidate, chasen.TextStyle{});
+            next_row += 1;
         }
-        next_row += 1;
+        if (next_row < body_end) {
+            const full_ref = try std.fmt.allocPrint(content.frameAllocator(), "Full ref  {s}", .{item.full_ref});
+            try draw.copyClippedTextAt(&content, 0, next_row, full_ref, app.palette.style(.muted));
+            next_row += 1;
+        }
     }
+    if (next_row +| 1 < body_end) next_row += 1;
 
     const list_start = next_row;
-    const rows = footer_row -| list_start;
+    const rows = body_end -| list_start;
     if (rows > 0) {
         if (picker.loading) {
             try draw.copyClippedTextAt(&content, 0, list_start, "Loading local and remote branches...", app.palette.style(.prompt));
@@ -171,16 +182,18 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
         if (source_index >= list.?.branches.len) continue;
         const item = list.?.branches[source_index];
         const focused = visible_index == selected;
+        const applied = if (app.page.basis) |basis| std.mem.eql(u8, item.full_ref, basis.base.full_ref) else false;
         const style = if (focused) app.palette.boldStyle(.accent) else chasen.TextStyle{};
         try draw.copyClippedTextAt(&content, 0, list_start + row, if (focused) ">" else " ", app.palette.style(.accent));
+        try draw.copyClippedTextAt(&content, 2, list_start + row, if (applied) "*" else " ", app.palette.boldStyle(.prompt));
         const relative = commit_time.formatRelative(item.tip_committer_unix, picker.render_now_unix);
         const time_field_width: u16 = @min(size.width, 14);
         const time_col = size.width - time_field_width;
         const relative_width = @min(content.displayWidth(relative.text()), time_field_width);
         try draw.copyClippedTextAt(&content, time_col + time_field_width - relative_width, list_start + row, relative.text(), if (focused) app.palette.boldStyle(.accent) else app.palette.style(.muted));
-        const branch_col: u16 = if (size.width >= 84) 11 else 2;
+        const branch_col: u16 = if (size.width >= 84) 13 else 4;
         if (size.width >= 84) {
-            try draw.copyClippedTextAt(&content, 2, list_start + row, if (item.kind == .local) "[local]" else "[remote]", app.palette.style(.muted));
+            try draw.copyClippedTextAt(&content, 4, list_start + row, if (item.kind == .local) "[local]" else "[remote]", app.palette.style(.muted));
         }
         const branch_end = time_col -| 1;
         if (branch_end > branch_col) {
@@ -188,10 +201,13 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
             try draw.copyClippedTextAt(&branch_surface, 0, 0, item.name, style);
         }
     }
+    if (legend_row < footer_row) {
+        try draw.copyClippedTextAt(&content, 0, legend_row, "* applied Base   > candidate", app.palette.style(.muted));
+    }
     const footer = if (picker.input_mode == .query)
-        "Type: filter  Up/Down: move  Tab: command  Esc: clear"
+        "Type: filter  Up/Down: move  Enter: use as Base  Tab: command  Esc: clear"
     else
-        "/: filter  j/k: move  Enter: compare  Esc: close";
+        "/: filter  j/k: move  Enter: use as Base  Esc: cancel";
     try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.palette.style(.accent));
 }
 
@@ -314,4 +330,137 @@ test "Compare empty state distinguishes commits from net file diff" {
     defer arena.deinit();
     const message = try emptyStateMessage(arena.allocator(), "main", 1);
     try std.testing.expectEqualStrings("No file changes against main", message.title);
+}
+
+test "Compare Base picker identifies accepted Base independently from candidate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var page: compare_page.ComparePageState = .{};
+    page.base_picker.open = true;
+    const branches = try allocator.alloc(git_refs.BranchListItem, 2);
+    branches[0] = .{
+        .full_ref = try allocator.dupe(u8, "refs/remotes/origin/main"),
+        .name = try allocator.dupe(u8, "origin/main"),
+        .kind = .remote_tracking,
+        .oid = try allocator.dupe(u8, "1111111111111111111111111111111111111111"),
+        .tip_committer_unix = 1_700_000_000,
+    };
+    branches[1] = .{
+        .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+        .name = try allocator.dupe(u8, "main"),
+        .kind = .local,
+        .oid = try allocator.dupe(u8, "2222222222222222222222222222222222222222"),
+        .tip_committer_unix = 1_699_000_000,
+    };
+    page.base_picker.accepted = .{ .branches = branches };
+    const labels = try allocator.alloc([]const u8, branches.len);
+    for (branches, 0..) |branch, index| labels[index] = branch.full_ref;
+    try page.base_picker.filter.apply(allocator, labels, "");
+    page.base_picker.render_now_unix = 1_700_000_100;
+    page.basis = .{
+        .base = .{
+            .full_ref = try allocator.dupe(u8, "refs/remotes/origin/main"),
+            .display_name = try allocator.dupe(u8, "origin/main"),
+            .kind = .remote_tracking,
+        },
+        .head_display = try allocator.dupe(u8, "feature/context"),
+        .target = .{ .object_format = .sha1, .base_oid = .{}, .head_oid = .{}, .diff_base_oid = .{} },
+        .ahead_count = 2,
+    };
+    page.base_target = .{
+        .full_ref = try allocator.dupe(u8, "refs/heads/main"),
+        .display_name = try allocator.dupe(u8, "main"),
+        .kind = .local,
+    };
+    const context: Context = .{
+        .page = &page,
+        .palette = .default(),
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = 120, .height = 32 },
+    };
+
+    var applied: chasen.testing.TestSurface = undefined;
+    try applied.init(120, 32);
+    defer applied.deinit();
+    try viewBasePicker(context, &applied.surface);
+    const applied_snapshot = try applied.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(applied_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Change comparison Base") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Base      origin/main  merge destination") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Compare   feature/context  current HEAD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Filter branches: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Candidate origin/main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Full ref  refs/remotes/origin/main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "> * [remote] origin/main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "* applied Base   > candidate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "/: filter  j/k: move  Enter: use as Base  Esc: cancel") != null);
+
+    page.base_picker.filter.list.focus.index = 1;
+    var candidate: chasen.testing.TestSurface = undefined;
+    try candidate.init(120, 32);
+    defer candidate.deinit();
+    try viewBasePicker(context, &candidate.surface);
+    const candidate_snapshot = try candidate.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(candidate_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, "Candidate main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, "Full ref  refs/heads/main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, "  * [remote] origin/main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, ">   [local]  main") != null);
+
+    page.base_picker.input_mode = .query;
+    var query: chasen.testing.TestSurface = undefined;
+    try query.init(120, 32);
+    defer query.deinit();
+    try viewBasePicker(context, &query.surface);
+    const query_snapshot = try query.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(query_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, query_snapshot, "Filter branches: /") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_snapshot, "Type: filter  Up/Down: move  Enter: use as Base  Tab: command  Esc: clear") != null);
+}
+
+test "Compare Base picker reports unavailable, loading, failure, and narrow states" {
+    var page: compare_page.ComparePageState = .{};
+    page.base_picker.open = true;
+    page.base_picker.loading = true;
+    const context: Context = .{
+        .page = &page,
+        .palette = .default(),
+        .repo_root = null,
+        .repo_epoch = 0,
+        .root_identity = null,
+        .layout = .{ .width = 120, .height = 32 },
+    };
+
+    var loading: chasen.testing.TestSurface = undefined;
+    try loading.init(120, 32);
+    defer loading.deinit();
+    try viewBasePicker(context, &loading.surface);
+    const loading_snapshot = try loading.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(loading_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Current comparison unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Loading local and remote branches...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Candidate") == null);
+    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Full ref") == null);
+
+    page.base_picker.loading = false;
+    page.base_picker.failure = .{ .static = "Could not load branches" };
+    var failed: chasen.testing.TestSurface = undefined;
+    try failed.init(120, 32);
+    defer failed.deinit();
+    try viewBasePicker(context, &failed.surface);
+    const failed_snapshot = try failed.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(failed_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "Could not load branches") != null);
+
+    page.base_picker.failure = null;
+    var narrow: chasen.testing.TestSurface = undefined;
+    try narrow.init(12, 5);
+    defer narrow.deinit();
+    try viewBasePicker(context, &narrow.surface);
+    const narrow_snapshot = try narrow.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(narrow_snapshot);
+    try std.testing.expect(narrow_snapshot.len > 0);
 }
