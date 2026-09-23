@@ -1531,14 +1531,15 @@ fn viewPushError(app: Context, surface: *chasen.Surface) !void {
     }
 
     if (size.height > 0) {
-        const footer = if (app.push_retry_inspecting)
-            "checking push target...    Enter/Esc/q: cancel"
-        else if (app.push_retry_target != null)
-            "i: interactive    Enter/Esc/q: close"
-        else
-            "Enter/Esc/q: close";
+        const footer = pushErrorFooter(app.push_retry_inspecting, app.push_retry_target != null);
         try draw.copyClippedTextAt(&content, 0, size.height - 1, footer, app.theme.style(.danger));
     }
+}
+
+fn pushErrorFooter(inspecting: bool, retry_available: bool) []const u8 {
+    if (inspecting) return "checking push target...  y: copy  Enter/Esc/q: cancel";
+    if (retry_available) return "i: interactive  y: copy  Enter/Esc/q: close";
+    return "y: copy  Enter/Esc/q: close";
 }
 
 fn pushErrorModalOptions(size: chasen.Size, message: []const u8) struct { dialog_width: u16, dialog_height: u16 } {
@@ -3261,6 +3262,25 @@ test "push error paragraph renderer applies scroll offset" {
     try ts.expectCellText(0, 0, "t");
     try ts.expectCellText(0, 1, "t");
     try ts.expectCellText(0, 2, "f");
+}
+
+test "push error footer advertises copy for every retry state at 120 columns" {
+    const Case = struct {
+        inspecting: bool,
+        retry_available: bool,
+        expected: []const u8,
+    };
+    const content_width = pushErrorContentSize(.{ .width = 120, .height = 24 }, "failure").width;
+
+    for ([_]Case{
+        .{ .inspecting = true, .retry_available = true, .expected = "checking push target...  y: copy  Enter/Esc/q: cancel" },
+        .{ .inspecting = false, .retry_available = true, .expected = "i: interactive  y: copy  Enter/Esc/q: close" },
+        .{ .inspecting = false, .retry_available = false, .expected = "y: copy  Enter/Esc/q: close" },
+    }) |case| {
+        const footer = pushErrorFooter(case.inspecting, case.retry_available);
+        try std.testing.expectEqualStrings(case.expected, footer);
+        try std.testing.expect(footer.len <= @as(usize, content_width));
+    }
 }
 
 test "push confirmation renders ahead behind for upstream push" {

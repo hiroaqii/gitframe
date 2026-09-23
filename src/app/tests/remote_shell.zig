@@ -12,6 +12,7 @@ const app_push_retry = @import("../push_retry.zig");
 const app_shell_layout = @import("../shell_layout.zig");
 const app_state = @import("../state.zig");
 const app_test_support = @import("../test_support.zig");
+const app_view = @import("../view.zig");
 const effect_origin = @import("../effect_origin.zig");
 const page = @import("../page.zig");
 const repo_session = @import("../repo_session.zig");
@@ -1192,20 +1193,36 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
         .result = .{
-            .outcome = .{ .failed = .authentication_required },
+            .outcome = .{ .failed = .ssh_public_key },
         },
     } } }, &ctx);
 
-    const fixed_message = "authentication is required; press i to continue in the native terminal";
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(!app.remote_workflow.action_control.isActive(pending.generation));
     try std.testing.expect(app.overlay.isPushError());
-    try std.testing.expectEqualStrings(fixed_message, app.remote_workflow.push_error_message.?);
-    try std.testing.expectEqualStrings("push failed: authentication is required; press i to continue in the native terminal", app.pages.changes.status.text());
+    try std.testing.expectEqualStrings(
+        "push failed: SSH public-key authentication failed; check ssh-agent and repository access",
+        app.pages.changes.status.text(),
+    );
+    const detail_message = app.remote_workflow.push_error_message.?;
+    for ([_][]const u8{
+        "SSH public-key authentication failed.",
+        "ssh-add -l",
+        "If ssh-agent cannot be reached",
+        "ssh-add <path-to-your-key>",
+        "Example: ssh-add ~/.ssh/id_ed25519",
+        "for example, ~/.ssh/id_rsa",
+        "Public-key registration on the Git hosting service",
+        "Your account's push permission",
+        "The host/key settings in ~/.ssh/config",
+    }) |expected| {
+        try std.testing.expect(std.mem.indexOf(u8, detail_message, expected) != null);
+    }
+    try std.testing.expect(app_view.pushErrorMaxScroll(.{ .width = 120, .height = 24 }, detail_message) > 0);
 
     try app.update(.copy_popup, &ctx);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings(fixed_message, ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqualStrings(detail_message, ctx._pending_clipboard_copies[0].text);
 
     const canaries = [_][]const u8{
         "https://alice:RAW-URL-CANARY@example.invalid/repo.git",

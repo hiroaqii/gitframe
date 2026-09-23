@@ -1240,13 +1240,38 @@ fn remoteWarningMessage(warnings: git_remote.RemoteWarningSet) ?[]const u8 {
     return null;
 }
 
+const ssh_public_key_push_details =
+    \\SSH public-key authentication failed.
+    \\
+    \\Check in your terminal:
+    \\
+    \\1. Check the keys loaded in ssh-agent:
+    \\     ssh-add -l
+    \\   If ssh-agent cannot be reached, check its setup
+    \\   in the shell used to start GitFrame.
+    \\
+    \\2. If the key you use is not loaded, add it:
+    \\     ssh-add <path-to-your-key>
+    \\     Example: ssh-add ~/.ssh/id_ed25519
+    \\   Replace the example path with your actual key path
+    \\   (for example, ~/.ssh/id_rsa).
+    \\
+    \\3. If your key is already loaded, check:
+    \\   - Public-key registration on the Git hosting service
+    \\   - Your account's push permission
+    \\   - The host/key settings in ~/.ssh/config
+;
+
 fn remoteFailurePresentationAlloc(
     allocator: std.mem.Allocator,
     kind: RemotePresentationKind,
     failure: git_remote.RemoteFailure,
     warnings: git_remote.RemoteWarningSet,
 ) ![]u8 {
-    const message = remoteFailureMessage(kind, failure);
+    const message = if (kind == .push and failure == .ssh_public_key)
+        ssh_public_key_push_details
+    else
+        remoteFailureMessage(kind, failure);
     if (remoteWarningMessage(warnings)) |warning| {
         return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, warning });
     }
