@@ -1588,7 +1588,7 @@ fn remoteErrorContentSize(size: chasen.Size, message: []const u8) chasen.Size {
 }
 
 fn modalHeightForContent(size: chasen.Size, dialog_width: u16, desired_content_height: usize) u16 {
-    var candidate = @min(size.height, remote_error_dialog_min_height);
+    var candidate: u16 = @min(size.height, remote_error_dialog_min_height);
     const overlay: chasen.Rect = .{ .col = 0, .row = 0, .width = size.width, .height = size.height };
     while (candidate < size.height) : (candidate += 1) {
         const content_size = modalContentSizeForRect(overlay, .{
@@ -3294,6 +3294,13 @@ test "remote error footer advertises copy and limits interactive action to push 
         try std.testing.expectEqualStrings(case.expected, footer);
         try std.testing.expect(footer.len <= @as(usize, content_width));
     }
+}
+
+test "remote error modal height grows past 31 rows" {
+    try std.testing.expectEqual(
+        @as(u16, 44),
+        modalHeightForContent(.{ .width = 33, .height = 46 }, 33, 40),
+    );
 }
 
 test "push confirmation renders ahead behind for upstream push" {
