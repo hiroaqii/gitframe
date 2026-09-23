@@ -523,6 +523,10 @@ pub const HistoryPageState = struct {
             .page_down => self.catalog.pageDown(body_height),
             .first => self.catalog.first(body_height),
             .last => self.catalog.last(body_height),
+            .select_row => |index| {
+                self.interaction_state.focus = .history;
+                self.catalog.select(index, body_height);
+            },
             .load_older => self.requestContinuation(),
             .cancel_load => self.cancelLoad(),
             .toggle_range => if (self.catalog.moreRowSelected()) {
@@ -880,6 +884,28 @@ fn selectionMatchesCatalog(
         .request => |candidate| std.meta.eql(candidate, request),
         .unavailable => false,
     };
+}
+
+test "History row selection focuses the catalog and resets preview scrolling" {
+    var records: [3]git_history.Record = undefined;
+    var state: HistoryPageState = .{
+        .catalog = .{ .records = .{ .items = &records, .capacity = records.len } },
+        .interaction_state = .{
+            .focus = .changed_files,
+            .detail_anchor = .{ .block_index = 1, .source_byte_offset = 3 },
+            .files_vertical_offset = 2,
+            .files_horizontal_offset = 4,
+        },
+    };
+
+    state.applyInput(.{ .select_row = 2 }, 24);
+
+    try std.testing.expectEqual(interaction.Focus.history, state.interaction_state.focus);
+    try std.testing.expectEqual(@as(usize, 2), state.catalog.cursor);
+    try std.testing.expectEqual(interaction.ContentAnchor{}, state.interaction_state.detail_anchor);
+    try std.testing.expectEqual(@as(usize, 0), state.interaction_state.files_vertical_offset);
+    try std.testing.expectEqual(@as(usize, 0), state.interaction_state.files_horizontal_offset);
+    state.catalog.records = .empty;
 }
 
 test "History preview lifecycle stays independent of catalog and diff pending" {

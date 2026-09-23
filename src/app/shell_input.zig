@@ -73,6 +73,8 @@ pub const RepositoryContext = struct {
 pub const HistoryContext = struct {
     key: app_input.HistoryContext = .{},
     picker_layout: ?history_view.PickerLayout = null,
+    picker_visible_start: usize = 0,
+    picker_visible_end: usize = 0,
     selection_owner: ?*const diff_selection.Owner = null,
     loaded: ?*const loaded_diff.LoadedDiff = null,
     selected_node: usize = 0,
@@ -291,6 +293,13 @@ pub const View = struct {
             if (mouse.button == .left) {
                 const picker_layout = self.history.picker_layout orelse return null;
                 const focus = picker_layout.focusAt(point) orelse return null;
+                if (focus == .history and !self.history.key.loading and self.history.key.picker_ready) {
+                    if (picker_layout.historyIndexAt(
+                        point,
+                        self.history.picker_visible_start,
+                        self.history.picker_visible_end,
+                    )) |index| return .{ .history = .{ .select_row = index } };
+                }
                 return .{ .history = .{ .focus_pane = focus } };
             }
             return switch (self.history.key.focus) {
@@ -610,6 +619,8 @@ test "History routes committed diff and picker mouse input through the shell" {
     picker_view.history.loaded = null;
     const picker_layout = history_view.pickerLayout(layout.bodySize(), .{});
     picker_view.history.picker_layout = picker_layout;
+    picker_view.history.picker_visible_start = 4;
+    picker_view.history.picker_visible_end = 7;
     for ([_]struct { point: MousePoint, expected: app_message.Msg }{
         .{
             .point = .{ .col = picker_layout.history.col, .row = picker_layout.history.row },
@@ -627,6 +638,19 @@ test "History routes committed diff and picker mouse input through the shell" {
         try std.testing.expectEqual(case.expected, picker_view.handleEvent(.{ .mouse = .{
             .col = @intCast(layout.body.col + case.point.col),
             .row = @intCast(layout.body.row + case.point.row),
+            .button = .left,
+            .mods = .{},
+            .type = .press,
+        } }).?);
+    }
+    for ([_]struct { row: u16, expected: app_message.Msg }{
+        .{ .row = 1, .expected = .{ .history = .{ .select_row = 4 } } },
+        .{ .row = 3, .expected = .{ .history = .{ .select_row = 6 } } },
+        .{ .row = 4, .expected = .{ .history = .{ .focus_pane = .history } } },
+    }) |case| {
+        try std.testing.expectEqual(case.expected, picker_view.handleEvent(.{ .mouse = .{
+            .col = @intCast(layout.body.col + picker_layout.history.col),
+            .row = @intCast(layout.body.row + picker_layout.history.row + case.row),
             .button = .left,
             .mods = .{},
             .type = .press,

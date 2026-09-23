@@ -152,6 +152,19 @@ pub const PickerLayout = struct {
         if (rowInRect(self.files, point.row)) return .changed_files;
         return null;
     }
+
+    pub fn historyIndexAt(
+        self: PickerLayout,
+        point: diff_surface.MousePoint,
+        visible_start: usize,
+        visible_end: usize,
+    ) ?usize {
+        if (!rectContains(self.history, point)) return null;
+        const local_row = point.row - self.history.row;
+        if (local_row == 0) return null;
+        const index = visible_start +| @as(usize, local_row - 1);
+        return if (index < visible_end) index else null;
+    }
 };
 
 fn rectContains(rect: chasen.Rect, point: diff_surface.MousePoint) bool {

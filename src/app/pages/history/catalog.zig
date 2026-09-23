@@ -104,6 +104,12 @@ pub const State = struct {
         self.keepCursorVisible(visibleRows(body_height));
     }
 
+    pub fn select(self: *State, index: usize, body_height: u16) void {
+        if (index >= self.rowCount()) return;
+        self.cursor = index;
+        self.keepCursorVisible(visibleRows(body_height));
+    }
+
     pub fn clamp(self: *State, rows: usize) void {
         const count = self.rowCount();
         self.cursor = if (count == 0) 0 else @min(self.cursor, count - 1);
@@ -172,6 +178,18 @@ test "History catalog navigation reuses Viewport keep-visible semantics" {
     try std.testing.expectEqual(@as(usize, 0), state.scroll);
     state.records = .empty;
     state.continuation = null;
+}
+
+test "History catalog selects one visible row by index" {
+    var records: [10]git_history.Record = undefined;
+    var state: State = .{ .records = .{ .items = &records, .capacity = records.len } };
+    state.select(6, 5);
+    try std.testing.expectEqual(@as(usize, 6), state.cursor);
+    try std.testing.expectEqual(@as(usize, 3), state.scroll);
+
+    state.select(10, 5);
+    try std.testing.expectEqual(@as(usize, 6), state.cursor);
+    state.records = .empty;
 }
 
 test "History catalog gives the removed column-label row back to the viewport" {

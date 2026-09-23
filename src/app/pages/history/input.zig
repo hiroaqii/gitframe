@@ -27,6 +27,7 @@ pub const Msg = union(enum) {
     page_down,
     first,
     last,
+    select_row: usize,
     load_older,
     cancel_load,
     toggle_range,

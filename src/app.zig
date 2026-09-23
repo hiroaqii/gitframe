@@ -1498,6 +1498,7 @@ pub const App = struct {
         const history_body_view = history_navigation_view.bodyView(&history_body_adapter);
         var history_key = self.pages.history.inputContext(self.keymap);
         history_key.common.side_by_side = history_navigation_view.view().effectiveDisplayMode() == .side_by_side;
+        const history_picker_range = self.pages.history.catalog.visibleRange(body_size.height);
         const changes_navigation_view = self.changesNavigationView();
         return .{
             .active_page = self.active_page,
@@ -1552,6 +1553,8 @@ pub const App = struct {
                     null
                 else
                     history_view.pickerLayout(body_size, self.pages.history.interaction_state),
+                .picker_visible_start = history_picker_range.start,
+                .picker_visible_end = history_picker_range.end,
                 .selection_owner = &self.pages.history.diff.selection_owner,
                 .loaded = if (self.pages.history.current_view == .diff)
                     history_body_view.view.activeLoadedDiffConst()
