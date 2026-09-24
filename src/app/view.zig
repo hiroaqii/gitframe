@@ -1800,8 +1800,10 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                 } else if (history.page_state.current_view == .diff) {
                     const footer = history.footer();
                     if (!footer.normal_action_hints_enabled) return result;
+                    appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
                     appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "select commits", .compare_base);
                 } else {
+                    appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
                     const range_active = history.page_state.draft.isRange();
                     if (history_input.more_row_selected) {
                         result.append(ui.key_hint.item("Enter", "load older"), .primary);
@@ -1833,6 +1835,7 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         .compare => {
             const footer = app.compare.footer();
             if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open) return result;
+            appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "change base", .compare_base);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
@@ -2480,6 +2483,7 @@ test "footer normal-mode hints match the decided page lists" {
     context.active_page = .compare;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("m", "change base"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2513,6 +2517,7 @@ test "footer normal-mode hints match the decided page lists" {
     };
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("Esc", "back to diff"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2538,6 +2543,7 @@ test "footer normal-mode hints match the decided page lists" {
     history_state.load_state = .loaded;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("m", "select commits"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2581,6 +2587,7 @@ test "History picker footer keeps diff actions and range state without the local
 
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("Enter", "open diff"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2590,6 +2597,7 @@ test "History picker footer keeps diff actions and range state without the local
     history_state.interaction_state.focus = .commit_detail;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("Enter", "open diff"),
         ui.key_hint.item("y", "copy detail"),
         ui.key_hint.item("R", "switch repo"),
@@ -2600,6 +2608,7 @@ test "History picker footer keeps diff actions and range state without the local
     history_state.draft = .{ .range = 0 };
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("Enter", "open range diff"),
         ui.key_hint.item("Esc", "cancel range"),
         ui.key_hint.item("R", "switch repo"),
@@ -3488,6 +3497,7 @@ const help_placeholder_sections = [_]HelpSection{
 };
 
 const help_compare_items = [_]HelpItem{
+    .{ .key = .{ .action = .branch_switch }, .description = "switch branch (checkout Current HEAD)" },
     .{ .key = .{ .text = "m" }, .description = "change comparison base" },
     .{ .key = .{ .action = .reload }, .description = "refresh comparison" },
     .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
@@ -3497,6 +3507,7 @@ const help_compare_items = [_]HelpItem{
 };
 
 const help_history_items = [_]HelpItem{
+    .{ .key = .{ .action = .branch_switch }, .description = "switch branch (keep accepted commit/range diff)" },
     .{ .key = .{ .text = "Row" }, .description = "Commit · Date · Author · Type · [Refs] Subject" },
     .{ .key = .{ .text = "Tab / Shift+Tab" }, .description = "cycle History / detail / files focus" },
     .{ .key = .{ .text = "↑/↓ j/k" }, .description = "navigate the focused pane" },

@@ -9,7 +9,6 @@ pub const Msg = union(enum) {
     shared: diff_surface.message.Msg,
     copy_current_line,
     copy_current_hunk,
-    branch_switch_unavailable,
 };
 
 pub const Context = struct {
@@ -102,7 +101,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .copy_current_line => .copy_current_line,
         .copy_history_detail => null,
         .copy_current_hunk => .copy_current_hunk,
-        .branch_switch => .branch_switch_unavailable,
+        .branch_switch,
         .page_changes,
         .page_repository,
         .page_compare,

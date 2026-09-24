@@ -1008,7 +1008,6 @@ test "committed context copies accepted bases side paths gaps and exact y bytes"
         var controller: Controller = .{
             .navigation = .{ .diff = &state, .activation = &activation, .status = &status, .current_target = null, .presentation_identity = case.identity, .repo_root = "/work/repo", .repo_epoch = 7, .root_identity = null, .source = source, .layout = .{ .width = 120, .height = 32 } },
             .effect_origin = .{ .page_id = case.page_id, .repo_epoch = 7, .activation_id = 1 },
-            .branch_unavailable_message = "unavailable",
         };
         controller.initializeAcceptedBody(allocator, null);
         const drag: diff_selection.DragSelection = .{

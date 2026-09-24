@@ -402,9 +402,13 @@ pub const App = struct {
             .branch_origin = switch (self.active_page) {
                 .changes => origins.changes(),
                 .repository => origins.repository(),
+                .history => origins.history(),
+                .compare => origins.compare(),
                 else => null,
             },
             .repository_status = &self.pages.repository.status,
+            .history_status = &self.pages.history.status,
+            .compare_status = &self.pages.compare.status,
             .effect_snapshot = origins.snapshot,
             .status = &self.pages.changes.status,
             .overlay = &self.overlay,
@@ -1179,6 +1183,8 @@ pub const App = struct {
         if (outcome.branch_reload) |reload| switch (reload) {
             .changes => |intent| try self.changesRead().applyEffectReload(ctx, intent),
             .repository => self.repositoryCoordinator().requestReload(.branch_switch),
+            .history => |succeeded| self.pages.history.branchSwitchFinished(ctx.allocator(), succeeded),
+            .compare => try self.compareCoordinator().branchSwitchFinished(ctx),
         };
         if (outcome.quit_after_terminal) {
             self.requestQuit(ctx);

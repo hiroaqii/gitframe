@@ -356,7 +356,6 @@ pub const Controller = struct {
         return .{
             .navigation = self.navigation(),
             .effect_origin = self.pageOrigin(),
-            .branch_unavailable_message = "branch switching is not available in History",
         };
     }
 

@@ -224,6 +224,21 @@ pub const HistoryPageState = struct {
             self.status.set("Cancel range selection before reloading", .{});
             return;
         }
+        self.beginRevalidation(allocator, .reload);
+    }
+
+    pub fn branchSwitchFinished(self: *HistoryPageState, allocator: std.mem.Allocator, succeeded: bool) void {
+        self.diff.selection_owner = .none;
+        if (self.activation.currentIdentity()) |identity| {
+            _ = self.activation.finishMember(identity, .source, if (self.accepted != null) .immutable else .unavailable);
+        }
+        if (succeeded and self.current_view == .picker) self.draft = .single;
+        // Failure rechecks HEAD even during a range draft, preserving that draft
+        // only when the activation probe finds the same branch context.
+        self.beginRevalidation(allocator, if (succeeded) .reload else .activation);
+    }
+
+    fn beginRevalidation(self: *HistoryPageState, allocator: std.mem.Allocator, reason: app_load.HistoryProbeReason) void {
         self.preview_state.invalidate(allocator);
         self.pending = null;
         self.needs_probe = null;
@@ -234,7 +249,7 @@ pub const HistoryPageState = struct {
             self.load_state = .no_repository;
             return;
         }
-        self.needs_probe = .reload;
+        self.needs_probe = reason;
         self.load_state = .loading;
         self.catalog_hidden = self.current_view == .picker;
         self.status.clear();
@@ -1894,4 +1909,57 @@ fn pickerTestRecord(
         .decorations = decorations,
         .subject = owned_subject,
     };
+}
+
+test "History branch switch resets picker only on success and preserves accepted range meaning" {
+    const allocator = std.testing.allocator;
+    const root_identity: root_capability.Identity = .{ .device = 31, .inode = 37 };
+    const old = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const parent = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const advanced = try git_history.ObjectId.parse(.sha1, "3333333333333333333333333333333333333333");
+    const cases = [_]struct { success: bool, branch: []const u8, policy: app_load.HistoryInitialPolicy }{
+        .{ .success = true, .branch = "feature", .policy = .reset },
+        .{ .success = false, .branch = "main", .policy = .preserve_draft },
+        .{ .success = false, .branch = "feature", .policy = .reset },
+    };
+    for (cases) |case| {
+        var state: HistoryPageState = .{ .repo_epoch = 4, .root_identity = root_identity, .load_state = .loaded };
+        defer state.deinit(allocator);
+        _ = state.activation.activate(4, .immutable, .unavailable, .unavailable);
+        const identity = state.activation.currentIdentity().?;
+        var original = try pickerPage(allocator, "main", &.{ old, parent });
+        defer original.deinit(allocator);
+        try state.catalog.replace(allocator, &original);
+        state.draft = .{ .range = 0 };
+        state.catalog.cursor = 1;
+        const accepted_request = state.selectionRequest().request;
+        state.accepted = try AcceptedSelection.init(allocator, accepted_request, &state.catalog.snapshot.?, state.catalog.records.items, 0);
+        _ = state.queueCurrentPreview(allocator);
+        state.armCatalog(.{ .identity = identity, .root_identity = root_identity, .generation = 1, .request = .{ .initial = .reset } });
+        state.branchSwitchFinished(allocator, case.success);
+        try std.testing.expect(state.pending == null);
+        try std.testing.expect(state.preview_state.current_key == null);
+        try std.testing.expectEqual(!case.success, state.draft.isRange());
+        const request = state.nextRequest().?;
+        try std.testing.expectEqual(if (case.success) app_load.HistoryProbeReason.reload else .activation, request.probe);
+        state.armCatalog(.{ .identity = identity, .root_identity = root_identity, .generation = 2, .request = request });
+        var probe: app_load.HistoryCatalogFinished = .{
+            .identity = identity,
+            .root_identity = root_identity,
+            .generation = 2,
+            .request = request,
+            .result = .{ .loaded = try pickerProbePage(allocator, advanced, case.branch) },
+        };
+        defer probe.deinit(allocator);
+        _ = try state.applyFinished(allocator, identity, root_identity, &probe);
+        try std.testing.expectEqual(case.policy, state.nextRequest().?.initial);
+        // The accepted range is an immutable selection, separate from the new picker draft.
+        state.current_view = .diff;
+        state.diff.viewer.diff_scroll = 7;
+        state.branchSwitchFinished(allocator, case.success);
+        try std.testing.expectEqual(CurrentView.diff, state.current_view);
+        try std.testing.expectEqualDeep(accepted_request, state.accepted.?.request);
+        try std.testing.expectEqual(@as(usize, 2), state.accepted.?.request.intent.commitCount());
+        try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll);
+    }
 }

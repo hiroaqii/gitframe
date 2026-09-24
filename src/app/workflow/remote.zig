@@ -99,6 +99,8 @@ pub const RedrawSink = struct {
 pub const BranchReload = union(enum) {
     changes: changes_action_fence.ReloadIntent,
     repository,
+    history: bool,
+    compare,
 };
 
 pub const Outcome = struct {
@@ -119,6 +121,8 @@ pub const Controller = struct {
     changes_origin: effect_origin.PageOrigin,
     branch_origin: ?effect_origin.PageOrigin,
     repository_status: *app_state.StatusMessage,
+    history_status: *app_state.StatusMessage,
+    compare_status: *app_state.StatusMessage,
     effect_snapshot: effect_origin.Snapshot,
     status: *app_state.StatusMessage,
     overlay: *app_state.OverlayState,
@@ -719,6 +723,8 @@ pub const Controller = struct {
         return .{ .branch_reload = switch (owner.origin.page_id) {
             .changes => .{ .changes = changes_reload },
             .repository => .repository,
+            .history => .{ .history = result.result == .ok },
+            .compare => .compare,
             else => unreachable,
         } };
     }
@@ -818,6 +824,8 @@ pub const Controller = struct {
         return switch (owner_page) {
             .changes => self.status,
             .repository => self.repository_status,
+            .history => self.history_status,
+            .compare => self.compare_status,
             else => unreachable,
         };
     }

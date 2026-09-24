@@ -206,12 +206,14 @@ fn shellEffectOrigins(app: *const App) shell_effects.OriginContext {
             .repo_epoch = repo_epoch,
             .changes_activation_id = app.pages.changes.activation.next_activation_id,
             .repository_activation_id = app.pages.repository.activation_id,
+            .history_activation_id = app.pages.history.activation.next_activation_id,
             .compare_activation_id = app.pages.compare.activation.next_activation_id,
             .remote_error_instance_id = if (app.overlay.isRemoteError()) app.overlay.remote_error_instance_id else null,
             .commit_panel_instance_id = app.local_workflow.view().commitPanelInstanceId(),
         },
         .changes_repo_epoch = if (changes_identity) |identity| identity.repo_epoch else repo_epoch,
         .repository_repo_epoch = app.pages.repository.repo_epoch,
+        .history_repo_epoch = app.pages.history.repo_epoch,
         .compare_repo_epoch = if (compare_identity) |identity| identity.repo_epoch else repo_epoch,
     };
 }
@@ -235,9 +237,13 @@ fn remoteWorkflow(app: *App) workflow_remote.Controller {
         .branch_origin = switch (app.active_page) {
             .changes => origins.changes(),
             .repository => origins.repository(),
+            .history => origins.history(),
+            .compare => origins.compare(),
             else => null,
         },
         .repository_status = &app.pages.repository.status,
+        .history_status = &app.pages.history.status,
+        .compare_status = &app.pages.compare.status,
         .effect_snapshot = origins.snapshot,
         .status = &app.pages.changes.status,
         .overlay = &app.overlay,
@@ -1903,4 +1909,168 @@ test "Repository branch switch terminals reload only their caller without activa
         try std.testing.expect(app.pages.repository.branch.freshness == .validating);
         if (!success) try std.testing.expect(app.overlay.isRemoteError());
     }
+}
+
+test "History and Compare branch switch terminals keep caller intent and retire old reads" {
+    const allocator = std.testing.allocator;
+    const git_history = @import("../../git/history.zig");
+    const history_page = @import("../pages/history.zig");
+    const before = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const selected = try git_history.ObjectId.parse(.sha1, "2222222222222222222222222222222222222222");
+    const new_head = try git_history.ObjectId.parse(.sha1, "3333333333333333333333333333333333333333");
+    const patch = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    for ([_]page.Id{ .history, .compare }) |owner| {
+        for ([_]bool{ true, false }) |success| {
+            var app: App = .{
+                .allocator = allocator,
+                .active_page = owner,
+                .terminal_size = .{ .width = 120, .height = 32 },
+                .repo_session = .{ .repo_epoch = 4, .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
+            };
+            app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+            defer app.repo_session.deinit(allocator);
+            defer app.pages.history.deinit(allocator);
+            defer app.pages.compare.deinit(allocator);
+            defer app.pages.changes.deinit(allocator);
+            defer app.remote_workflow.deinit(allocator);
+            const root_identity = app.repo_session.view().activeIdentity().?;
+            const history = &app.pages.history;
+            const compare = &app.pages.compare;
+            if (owner == .history) {
+                history.activate(allocator, 4, root_identity);
+                history.needs_initial = false;
+                history.load_state = .loaded;
+                history.accepted = .{
+                    .request = .{
+                        .snapshot_head = selected,
+                        .intent = .{ .single = .{ .index = 0, .oid = selected } },
+                        .basis = .{ .object_format = .sha1, .before = .{ .commit = before }, .after = selected },
+                    },
+                    .origin = .{ .branch = try allocator.dupe(u8, "main") },
+                    .selected_parent_count = 1,
+                };
+                history.current_view = .diff;
+                var bundle: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) };
+                defer bundle.deinit();
+                try history.diff.replaceDiffWithIdentity(allocator, 4, roots.a, root_identity, history_page.selection_source, history.currentPresentationIdentity().?, true, .none, &bundle);
+                _ = history.activation.finishMember(history.activation.currentIdentity().?, .source, .immutable);
+            } else {
+                _ = compare.activate(4);
+                const first = compare.beginRefresh().?;
+                var loaded = try branchCompareFinished(allocator, first.identity, first.generation, before, selected, patch);
+                defer loaded.deinit(allocator);
+                _ = try compare.applyLoadFinished(allocator, 4, roots.a, root_identity, &loaded);
+            }
+            var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+            defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+            defer ctx.runtimeClearPendingEffectCopies();
+            // The real root request captures these pages without a Changes activation.
+            try app.update(.request_branch_switch, &ctx);
+            try std.testing.expectEqual(owner, app.overlay.owner_page.?);
+            try std.testing.expectEqual(owner, app.remote_workflow.branch_switch.owner.?.origin.page_id);
+            try app.update(.cancel_branch_switch, &ctx);
+            clearPendingStatusAndDiffTasks(&ctx, allocator);
+
+            const diff = if (owner == .history) &history.diff else &compare.diff;
+            diff.viewer.selected_target = .{ .diff_file = 0 };
+            diff.viewer.diff_cursor = .{ .hunk_header = 0 };
+            diff.viewer.diff_scroll = 2;
+            const old_identity = if (owner == .history) history.activation.currentIdentity().? else compare.activation.currentIdentity().?;
+            if (owner == .history) {
+                history.armDiff(.{ .identity = old_identity, .root_identity = root_identity, .generation = 10, .request = history.accepted.?.request });
+            } else {
+                compare.refresh_generation = 10;
+                compare.replaceDeferredLoad(allocator, try branchCompareFinished(allocator, old_identity, 10, before, selected, patch));
+            }
+            const pending = beginAcceptedTestAction(&app, .switch_branch);
+            diff.selection_owner = .{ .diff = .{
+                .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "file.txt" } },
+                .content = .{ .source_side = .{ .side = .new } },
+                .anchor = .{ .hunk_index = 0, .line_index = 0 },
+                .focus = .{ .hunk_index = 0, .line_index = 0 },
+                .moved = true,
+            } };
+            try app.update(.{ .action_finished = .{ .switch_branch = .{
+                .pending = pending,
+                .repo_root = try allocator.dupe(u8, roots.a),
+                .old_branch = try allocator.dupe(u8, "main"),
+                .new_branch = try allocator.dupe(u8, "feature"),
+                .result = if (success) .ok else .{ .failed_static = "checkout refused" },
+            } } }, &ctx);
+            try std.testing.expectEqual(owner, app.active_page);
+            try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
+            try std.testing.expect(!app.action_runtime.view().hasPending());
+            try std.testing.expect(diff.selection_owner == .none);
+            if (!success) {
+                try std.testing.expectEqual(owner, app.overlay.owner_page.?);
+                try std.testing.expectEqualStrings("checkout refused", app.remote_workflow.remote_error_message.?);
+            }
+            if (owner == .history) {
+                try std.testing.expectEqual(history_page.CurrentView.diff, history.current_view);
+                try std.testing.expect(history.activation.state.satisfiesAction(.read_diff));
+                try std.testing.expect(history.accepted.?.request.basis.after.eql(&selected));
+                try std.testing.expect(history.accepted.?.request.basis.before.commit.eql(&before));
+                try std.testing.expectEqual(@as(usize, 2), diff.viewer.diff_scroll);
+                try std.testing.expectEqual(@as(usize, 0), diff.viewer.diff_cursor.hunk_header);
+                const probe = history.pending.?.catalog;
+                try std.testing.expectEqual(if (success) app_load.HistoryProbeReason.reload else .activation, probe.request.probe);
+                try app.update(.{ .load_finished = .{ .history = .{ .diff = .{
+                    .identity = old_identity,
+                    .root_identity = root_identity,
+                    .generation = 10,
+                    .request = history.accepted.?.request,
+                    .result = .{ .failed_static = "old diff" },
+                } } } }, &ctx);
+                try std.testing.expectEqual(probe.generation, history.pending.?.catalog.generation);
+                try app.update(.{ .load_finished = .{ .history = .{ .catalog = .{
+                    .identity = probe.identity,
+                    .root_identity = root_identity,
+                    .generation = probe.generation,
+                    .request = probe.request,
+                    .result = .{ .loaded = .{ .snapshot = .{ .object_format = .sha1, .head = new_head, .display = .{ .branch = try allocator.dupe(u8, "feature") } } } },
+                } } } }, &ctx);
+                try std.testing.expect(history.currentHeadContext().?.head.?.eql(&new_head));
+                try std.testing.expect(history.accepted.?.request.basis.after.eql(&selected));
+                try std.testing.expectEqual(history_page.CurrentView.diff, history.current_view);
+            } else {
+                try std.testing.expect(compare.deferred_load_apply == null);
+                try std.testing.expectEqualStrings("refs/heads/main", compare.base_target.?.full_ref);
+                try std.testing.expect(compare.refresh_generation > 10);
+                try std.testing.expect(compare.diff.reload_anchor != null);
+                const generation = compare.refresh_generation;
+                try app.update(.{ .load_finished = .{ .compare = .{ .source = try branchCompareFinished(allocator, old_identity, 10, before, selected, patch) } } }, &ctx);
+                try std.testing.expectEqual(generation, compare.refresh_generation);
+                try app.update(.{ .load_finished = .{ .compare = .{ .source = try branchCompareFinished(allocator, old_identity, generation, before, new_head, patch) } } }, &ctx);
+                try std.testing.expect(compare.basis.?.target.head_oid.eql(&new_head));
+                try std.testing.expectEqualStrings("refs/heads/main", compare.base_target.?.full_ref);
+                try std.testing.expect(compare.diff.reload_anchor == null);
+            }
+            if (!success) try std.testing.expect(app.overlay.isRemoteError());
+        }
+    }
+}
+
+fn branchCompareFinished(
+    allocator: std.mem.Allocator,
+    identity: page.RequestIdentity,
+    generation: u64,
+    base: @import("../../git/history.zig").ObjectId,
+    head: @import("../../git/history.zig").ObjectId,
+    patch: []const u8,
+) !app_load.CompareLoadFinished {
+    return .{
+        .identity = identity,
+        .generation = generation,
+        .result = .{ .loaded = .{
+            .basis = .{
+                .base = .{ .full_ref = try allocator.dupe(u8, "refs/heads/main"), .display_name = try allocator.dupe(u8, "main"), .kind = .local },
+                .head_display = try allocator.dupe(u8, "feature"),
+                .target = .{ .object_format = .sha1, .base_oid = base, .head_oid = head, .diff_base_oid = base },
+                .ahead_count = 1,
+            },
+            .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) },
+        } },
+    };
 }

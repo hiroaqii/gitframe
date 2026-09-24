@@ -95,16 +95,28 @@ pub const Controller = struct {
         return .{};
     }
 
+    pub fn branchSwitchFinished(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
+        self.page_state.diff.selection_owner = .none;
+        if (self.page_state.deferred_load_apply) |*deferred| deferred.deinit(ctx.allocator());
+        self.page_state.deferred_load_apply = null;
+        try self.refresh(ctx);
+    }
+
     pub fn refresh(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         const capability = self.repo.activeCapability() orelse {
             self.page_state.markNoRepository(ctx.allocator());
             return;
         };
-        const anchor = try self.navigationView().captureAnchor(ctx.allocator());
+        // Retire the old generation before fallible preparation, so a late
+        // result cannot restore the comparison from before checkout.
+        const request = self.page_state.beginRefresh() orelse return;
+        const anchor = self.navigationView().captureAnchor(ctx.allocator()) catch |err| {
+            self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not retain Compare viewport");
+            return err;
+        };
         self.page_state.diff.replaceReloadAnchor(ctx.allocator(), anchor);
         self.page_state.clearRefreshFailure(ctx.allocator());
 
-        const request = self.page_state.beginRefresh() orelse return;
         const task = ctx.allocator().create(CompareLoadTask) catch |err| {
             self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not allocate Compare load task");
             return err;
@@ -254,7 +266,6 @@ pub const Controller = struct {
         return .{
             .navigation = self.navigation(),
             .effect_origin = self.pageOrigin(),
-            .branch_unavailable_message = "branch switching is not available in Compare",
         };
     }
 

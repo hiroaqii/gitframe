@@ -43,17 +43,12 @@ pub const UpdateOutcome = struct {
 pub const Controller = struct {
     navigation: navigation.Controller,
     effect_origin: effect_origin.PageOrigin,
-    branch_unavailable_message: []const u8,
 
     pub fn update(self: Controller, allocator: std.mem.Allocator, msg: input.Msg) !UpdateOutcome {
         return switch (msg) {
             .shared => |shared_msg| self.updateShared(allocator, shared_msg),
             .copy_current_line => self.copyCurrentLine(allocator),
             .copy_current_hunk => self.copyCurrentHunk(allocator),
-            .branch_switch_unavailable => blk: {
-                self.navigation.status.set("{s}", .{self.branch_unavailable_message});
-                break :blk .{};
-            },
         };
     }
 

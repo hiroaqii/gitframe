@@ -195,11 +195,13 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(routing_key)) return app_message.Msg.enter_repo_picker;
     if (context.keymap.spec(.reload)) |spec| if (spec.matches(routing_key)) return app_message.Msg.reload;
 
-    if (context.active_page == .changes or context.active_page == .repository) {
+    if (context.active_page != .config) {
         if (context.keymap.spec(.branch_switch)) |spec| if (spec.matches(routing_key)) {
             const selection_owned = switch (context.active_page) {
                 .changes => context.changes.selection_owner != .none,
                 .repository => context.repository.selection_owner != .none,
+                .history => context.history.common.selection_owner != .none,
+                .compare => context.compare.common.selection_owner != .none,
                 else => unreachable,
             };
             if (selection_owned or context.active_selection_gesture) return null;
@@ -1461,7 +1463,7 @@ fn shiftedLowerOnly(lower: u21) chasen.Key {
 
 test "branch switch routing honors effective keys and existing input owners" {
     const b: chasen.Key = .{ .codepoint = 'b' };
-    for ([_]page.Id{ .changes, .repository }) |id| {
+    for ([_]page.Id{ .changes, .repository, .history, .compare }) |id| {
         try std.testing.expectEqual(app_message.Msg.request_branch_switch, keyToMsg(.{ .active_page = id }, b).?);
         try std.testing.expect(keyToMsg(.{ .active_page = id, .branch_switch_mode = true }, b) == null);
         try std.testing.expect(keyToMsg(.{ .active_page = id, .help_mode = true }, b) == null);
@@ -1483,6 +1485,47 @@ test "branch switch routing honors effective keys and existing input owners" {
         .active_page = .repository,
         .repository = .{ .retained_selection_action_available = true },
     }, b).?);
+    for ([_]bool{ false, true }) |diff_view| {
+        try std.testing.expectEqual(app_message.Msg.request_branch_switch, keyToMsg(.{
+            .active_page = .history,
+            .history = .{ .diff_view = diff_view },
+        }, b).?);
+    }
+    inline for (.{ .history, .compare }) |id| {
+        var context: KeyContext = .{ .active_page = id };
+        if (id == .history) context.history.diff_view = true;
+        const common = if (id == .history) &context.history.common else &context.compare.common;
+        common.search_mode = true;
+        const insert: app_message.Msg = if (id == .history)
+            .{ .history = .{ .common = .{ .shared = .{ .search_insert = 'b' } } } }
+        else
+            .{ .compare = .{ .common = .{ .shared = .{ .search_insert = 'b' } } } };
+        try std.testing.expectEqual(insert, keyToMsg(context, b).?);
+        common.search_mode = false;
+        common.file_search_mode = true;
+        try std.testing.expect(keyToMsg(context, b).? != .request_branch_switch);
+        common.file_search_mode = false;
+        inline for (.{ .keyboard_line, .mouse, .header }) |owner| {
+            common.selection_owner = owner;
+            try std.testing.expect(keyToMsg(context, b) == null);
+        }
+        common.selection_owner = .none;
+        context.active_selection_gesture = true;
+        try std.testing.expect(keyToMsg(context, b) == null);
+        context.active_selection_gesture = false;
+        common.retained_selection_action_available = true;
+        try std.testing.expectEqual(app_message.Msg.request_branch_switch, keyToMsg(context, b).?);
+        var config: keymap.Config = .{};
+        config.set(.branch_switch, .{ .plain_codepoint = 'z' });
+        context.keymap = .fromConfig(config);
+        common.keymap = context.keymap;
+        context.history.keymap = context.keymap;
+        try std.testing.expect(keyToMsg(context, b) == null);
+        try std.testing.expectEqual(app_message.Msg.request_branch_switch, keyToMsg(context, .{ .codepoint = 'z' }).?);
+    }
+    try std.testing.expectEqual(app_message.Msg{ .compare = .open_base_picker }, keyToMsg(.{ .active_page = .compare }, .{ .codepoint = 'm' }).?);
+    try std.testing.expect(keyToMsg(.{ .active_page = .compare, .compare = .{ .base_picker_open = true } }, b) == null);
+    try std.testing.expectEqual(app_message.Msg{ .history = .owned_noop }, keyToMsg(.{ .active_page = .history, .history = .{ .loading = true } }, b).?);
     var custom: keymap.Config = .{};
     custom.set(.branch_switch, .{ .plain_codepoint = ':' });
     const effective = keymap.Effective.fromConfig(custom);
@@ -1492,7 +1535,7 @@ test "branch switch routing honors effective keys and existing input owners" {
         .repository = .{ .keymap = effective },
         .repository_command_available = true,
     }, .{ .codepoint = ':' }).?);
-    for ([_]page.Id{ .history, .compare, .config }) |id| {
+    for ([_]page.Id{.config}) |id| {
         if (keyToMsg(.{ .active_page = id }, b)) |msg| try std.testing.expect(msg != .request_branch_switch);
     }
 }
