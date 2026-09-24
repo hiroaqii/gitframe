@@ -1139,7 +1139,7 @@ pub const App = struct {
             .push => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPush(ctx.allocator(), result)),
             .pull => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPull(ctx.allocator(), result)),
             .fetch => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishFetch(ctx.allocator(), result)),
-            .switch_branch => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishSwitchBranch(ctx.allocator(), result)),
+            .switch_branch => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishSwitchBranch(ctx.allocator(), result)),
             .push_foreground => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPushForeground(ctx, result)),
         }
     }
@@ -1768,6 +1768,7 @@ pub const App = struct {
                 .label = switch (operation) {
                     .push => "push error",
                     .pull => "pull error",
+                    .switch_branch => "branch switch error",
                 },
                 .text = message,
             };

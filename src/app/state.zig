@@ -7,9 +7,10 @@ const session_hunk_mark = @import("pages/changes/session_hunk_mark.zig");
 const page = @import("page.zig");
 const remote_request = @import("remote_request.zig");
 
-pub const RemoteOperation = enum {
+pub const GitErrorOperation = enum {
     push,
     pull,
+    switch_branch,
 };
 
 pub const OverlayKind = union(enum) {

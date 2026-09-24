@@ -115,7 +115,7 @@ pub const Context = struct {
     amend_confirmation: ?app_state.AmendConfirmation,
     push_confirmation: ?app_state.PushConfirmation,
     pull_confirmation: ?app_state.PullConfirmation,
-    remote_error_operation: ?app_state.RemoteOperation,
+    remote_error_operation: ?app_state.GitErrorOperation,
     remote_error_message: ?[]const u8,
     push_retry_target: ?*const app_state.PushRetryTarget,
     push_retry_inspecting: bool,
@@ -1403,12 +1403,17 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
 
     const subtitle = try std.fmt.allocPrint(content.frameAllocator(), "Current: {s}", .{state.current_branch});
     try draw.copyClippedTextAt(&content, 0, 0, subtitle, app.theme.style(.muted));
+    if (size.height > 2) {
+        var note_style = app.theme.style(.muted);
+        note_style.dim = true;
+        try draw.copyClippedTextAt(&content, 0, 2, "Carry uncommitted changes to target; abort if unsafe.", note_style);
+    }
     if (state.loading) {
-        if (size.height > 2) try draw.copyClippedTextAt(&content, 0, 2, "Loading local branches...", app.theme.style(.prompt));
+        if (size.height > 3) try draw.copyClippedTextAt(&content, 0, 3, "Loading local branches...", app.theme.style(.prompt));
         return;
     }
     if (state.branches.len == 0) {
-        if (size.height > 2) try draw.copyClippedTextAt(&content, 0, 2, "No local branches", app.theme.style(.muted));
+        if (size.height > 3) try draw.copyClippedTextAt(&content, 0, 3, "No local branches", app.theme.style(.muted));
         return;
     }
 
@@ -1424,7 +1429,7 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
     }
 
     const footer_rows_needed: u16 = 1;
-    const list_start: u16 = 2;
+    const list_start: u16 = 3;
     const list_rows: u16 = size.height -| (list_start + footer_rows_needed);
     const start = listWindowStart(selected, state.branches.len, list_rows);
     var row: u16 = 0;
@@ -1507,6 +1512,7 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
         .title = switch (operation) {
             .push => "Push failed",
             .pull => "Pull failed",
+            .switch_branch => "Branch switch failed",
         },
         .backdrop = false,
         .border = .rounded,
@@ -1523,6 +1529,7 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
         const heading = switch (operation) {
             .push => "Git push failed. Details:",
             .pull => "Git pull failed. Details:",
+            .switch_branch => "Git branch switch failed. Details:",
         };
         try draw.copyClippedTextAt(&content, 0, 0, heading, app.theme.boldStyle(.danger));
     }
@@ -1543,8 +1550,8 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
     }
 }
 
-fn remoteErrorFooter(operation: app_state.RemoteOperation, inspecting: bool, retry_available: bool) []const u8 {
-    if (operation == .pull) return "y: copy  Enter/Esc/q: close";
+fn remoteErrorFooter(operation: app_state.GitErrorOperation, inspecting: bool, retry_available: bool) []const u8 {
+    if (operation != .push) return "y: copy  Enter/Esc/q: close";
     if (inspecting) return "checking push target...  y: copy  Enter/Esc/q: cancel";
     if (retry_available) return "i: interactive  y: copy  Enter/Esc/q: close";
     return "y: copy  Enter/Esc/q: close";
@@ -3226,7 +3233,7 @@ test "remote error paragraph renderer applies scroll offset" {
 
 test "remote error footer advertises copy and limits interactive action to push at 120 columns" {
     const Case = struct {
-        operation: app_state.RemoteOperation,
+        operation: app_state.GitErrorOperation,
         inspecting: bool,
         retry_available: bool,
         expected: []const u8,
@@ -3238,11 +3245,34 @@ test "remote error footer advertises copy and limits interactive action to push 
         .{ .operation = .push, .inspecting = false, .retry_available = true, .expected = "i: interactive  y: copy  Enter/Esc/q: close" },
         .{ .operation = .push, .inspecting = false, .retry_available = false, .expected = "y: copy  Enter/Esc/q: close" },
         .{ .operation = .pull, .inspecting = false, .retry_available = false, .expected = "y: copy  Enter/Esc/q: close" },
+        .{ .operation = .switch_branch, .inspecting = false, .retry_available = false, .expected = "y: copy  Enter/Esc/q: close" },
     }) |case| {
         const footer = remoteErrorFooter(case.operation, case.inspecting, case.retry_available);
         try std.testing.expectEqualStrings(case.expected, footer);
         try std.testing.expect(footer.len <= @as(usize, content_width));
     }
+}
+
+test "branch switch error renders title footer and scrolled tail at 120x32" {
+    const message = "error: local changes would be overwritten:\n" ++
+        "    a-long-file-name-for-checking-the-wrapped-branch-switch-error-details.txt\n" ** 40 ++
+        "Aborting";
+    var app: ShellViewTestHarness = .{};
+    var context = app.context();
+    context.remote_error_operation = .switch_branch;
+    context.remote_error_message = message;
+    app.overlay.remote_error_scroll = remoteErrorMaxScroll(.{ .width = 120, .height = 32 }, message);
+    try std.testing.expect(app.overlay.remote_error_scroll > 0);
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(120, 32);
+    defer ts.deinit();
+    try viewRemoteError(context, &ts.surface);
+    const snapshot = try ts.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Branch switch failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Aborting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "y: copy  Enter/Esc/q: close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "interactive") == null);
 }
 
 test "remote error modal height grows past 31 rows" {
@@ -3354,7 +3384,7 @@ test "branch switch popup renders relative times and selected exact commit detai
     app.branch_switch.render_now_unix = now;
 
     var known: chasen.testing.TestSurface = undefined;
-    try known.init(80, 20);
+    try known.init(120, 32);
     defer known.deinit();
     try viewBranchSwitchPopup(app.context(), &known.surface);
     const known_snapshot = try known.snapshot(allocator);
@@ -3369,6 +3399,8 @@ test "branch switch popup renders relative times and selected exact commit detai
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "2h ago") != null);
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "3d ago") != null);
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "* main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "Carry uncommitted changes to target; abort if unsafe.") != null);
+    try std.testing.expect(known.surface.readCell(26, 11).?.style.dim);
 
     app.branch_switch.selected_index = 2;
     var unknown: chasen.testing.TestSurface = undefined;

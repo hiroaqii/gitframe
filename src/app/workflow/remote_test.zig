@@ -954,35 +954,31 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try std.testing.expectEqual(@as(usize, 16), rejected_ctx.takePendingTasks().len);
 }
 
-test "requestBranchSwitch rejects untracked-only status distinctly" {
-    var app: RemoteHarness = .{
-        .allocator = std.testing.allocator,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
-        },
-    };
+test "requestBranchSwitch opens picker with untracked-only status" {
+    const allocator = std.testing.allocator;
+    var app: RemoteHarness = .{ .allocator = allocator };
+    const repo_root = try installCurrentRepoForTest(&app, allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
     defer app.pages.changes.branch_status.deinit();
     defer app.pages.changes.git_status.deinit();
+    defer app.clearBranchSwitch(allocator);
 
-    var branch_bundle = try branchStatusBundleForTest(std.testing.allocator, .{
+    var branch_bundle = try branchStatusBundleForTest(allocator, .{
         .oid = "abc123",
         .branch = "main",
     });
-    try app.pages.changes.branch_status.replace("/repo", &branch_bundle);
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "?? new.txt\x00");
-    try app.pages.changes.git_status.replace("/repo", &status_bundle);
+    try app.pages.changes.branch_status.replace(repo_root, &branch_bundle);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "?? new.txt\x00");
+    try app.pages.changes.git_status.replace(repo_root, &status_bundle);
     syncTestActivation(&app);
 
-    var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
+    defer clearPendingBranchListTasks(&ctx, allocator);
     try app.requestBranchSwitch(&ctx);
 
-    try std.testing.expect(!app.overlay.isSwitchBranch());
-    try std.testing.expectEqualStrings("branch switch blocked: untracked files present", app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.overlay.isSwitchBranch());
+    try std.testing.expect(app.remote_workflow.branch_switch.loading);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
 }
 
 test "finishBranchListLoad ignores stale result and accepts matching generation" {

@@ -258,10 +258,6 @@ pub const BranchSwitchTargetResult = union(enum) {
     detached_head,
     branch_unavailable,
     branch_status_unavailable,
-    status_loading,
-    status_stale,
-    dirty_worktree,
-    untracked_files_present,
 };
 
 pub const StatusSnapshot = struct {
@@ -426,7 +422,7 @@ pub fn fetchTarget(ctx: RemoteActionContext) FetchTargetResult {
     } };
 }
 
-pub fn branchSwitchTarget(ctx: PullActionContext) BranchSwitchTargetResult {
+pub fn branchSwitchTarget(ctx: RemoteActionContext) BranchSwitchTargetResult {
     if (!diff_source.sourceAllowsStageProjection(ctx.source)) return .unavailable_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
     if (!ctx.branch_status.freshFor(repo_root)) return .loading_branch_status;
@@ -438,17 +434,6 @@ pub fn branchSwitchTarget(ctx: PullActionContext) BranchSwitchTargetResult {
         .unknown => return .branch_unavailable,
     };
     const oid = branch_status.oid orelse return .branch_status_unavailable;
-
-    // Branch switch has no conflict UI yet. The snapshot gate gives immediate
-    // feedback, while the backend repeats this check immediately before
-    // `git switch` because files can change after the popup opens.
-    if (ctx.status.loading) return .status_loading;
-    if (!ctx.status.isFreshFor(repo_root)) return .status_stale;
-    switch (pullWorktreeState(ctx.status.entries)) {
-        .clean => {},
-        .untracked_only => return .untracked_files_present,
-        .dirty => return .dirty_worktree,
-    }
 
     return .{ .ready = .{
         .repo_root = repo_root,
@@ -1123,77 +1108,41 @@ test "pullTarget rejects unsafe branch and worktree states" {
     }));
 }
 
-test "branchSwitchTarget rejects unsupported branch and worktree states" {
+test "branchSwitchTarget rejects unsupported branch states" {
     const ready_status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
     };
-    const clean_status: StatusSnapshot = .{ .repo_root = "/repo", .loading = false, .entries = &.{} };
 
     try std.testing.expectEqual(BranchSwitchTargetResult.unavailable_source, branchSwitchTarget(.{
         .source = .{ .range = "HEAD~1..HEAD" },
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = clean_status,
     }));
     try std.testing.expectEqual(BranchSwitchTargetResult.no_repo, branchSwitchTarget(.{
         .source = .unstaged,
         .repo_root = null,
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = clean_status,
     }));
     try std.testing.expectEqual(BranchSwitchTargetResult.loading_branch_status, branchSwitchTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = true, .status = ready_status },
-        .status = clean_status,
     }));
     try std.testing.expectEqual(BranchSwitchTargetResult.detached_head, branchSwitchTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{ .oid = "abc123", .head = .detached } },
-        .status = clean_status,
     }));
     try std.testing.expectEqual(BranchSwitchTargetResult.branch_status_unavailable, branchSwitchTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{ .head = .{ .branch = "feature" } } },
-        .status = clean_status,
     }));
-    try std.testing.expectEqual(BranchSwitchTargetResult.status_loading, branchSwitchTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = .{ .repo_root = "/repo", .loading = true, .entries = &.{} },
-    }));
-    try std.testing.expectEqual(BranchSwitchTargetResult.status_stale, branchSwitchTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = .{ .repo_root = "/other", .loading = false, .entries = &.{} },
-    }));
-
-    const staged = [_]git_status.StatusEntry{.{ .path = "src/app.zig", .raw = .{ 'M', ' ' }, .index = .modified, .worktree = .unmodified }};
-    try std.testing.expectEqual(BranchSwitchTargetResult.dirty_worktree, branchSwitchTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = .{ .repo_root = "/repo", .loading = false, .entries = &staged },
-    }));
-
-    const untracked = [_]git_status.StatusEntry{.{ .path = "new.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked }};
-    try std.testing.expectEqual(BranchSwitchTargetResult.untracked_files_present, branchSwitchTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = .{ .repo_root = "/repo", .loading = false, .entries = &untracked },
-    }));
-
     switch (branchSwitchTarget(.{
         .source = .cached,
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = clean_status,
     })) {
         .ready => |target| {
             try std.testing.expectEqualStrings("/repo", target.repo_root);

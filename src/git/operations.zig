@@ -244,10 +244,6 @@ fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, context: git_com
     if (!try verifyBranchOid(allocator, io, context, request.target_branch, request.target_oid)) {
         return .{ .failed_static = "branch list changed; reopen branch switch and try again" };
     }
-    if (!try verifyCleanWorktree(allocator, io, context)) {
-        return .{ .failed_static = "Worktree changed before branch switch; reload and resolve local changes first" };
-    }
-
     const argv = [_][]const u8{ "git", "switch", "--no-guess", request.target_branch };
     const result = try runCaptured(allocator, io, context, &argv, .limited(128 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git switch");
@@ -284,17 +280,6 @@ fn verifyBranchOid(allocator: std.mem.Allocator, io: std.Io, context: git_comman
         else => return false,
     }
     return std.mem.eql(u8, trimLineEnd(result.stdout), oid);
-}
-
-fn verifyCleanWorktree(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext) git_command.Error!bool {
-    const argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
-    const result = try runCaptured(allocator, io, context, &argv, .limited(4 * 1024), .limited(16 * 1024));
-    defer result.deinit(allocator);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return false,
-        else => return false,
-    }
-    return result.stdout.len == 0;
 }
 
 fn trimLineEnd(text: []const u8) []const u8 {
@@ -543,7 +528,7 @@ test "operations switch branch rejects changed target oid" {
     }
 }
 
-test "operations switch branch rejects dirty worktree" {
+test "operations switch branch carries staged unstaged and untracked changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -551,7 +536,10 @@ test "operations switch branch rejects dirty worktree" {
     defer fixture.deinit();
     var work = try tmp.dir.openDir(io, "work", .{});
     defer work.close(io);
-    try work.writeFile(io, .{ .sub_path = "README.md", .data = "dirty\n" });
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "staged\n" });
+    try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "unstaged\n" });
+    try work.writeFile(io, .{ .sub_path = "local.txt", .data = "untracked\n" });
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
     const result = try runOperation(std.testing.allocator, io, .{
@@ -559,9 +547,76 @@ test "operations switch branch rejects dirty worktree" {
         .kind = .{ .switch_branch = .{ .expected_branch = "main", .expected_oid = fixture.main_oid, .target_branch = "feature/topic", .target_oid = fixture.feature_oid } },
     });
     defer result.deinit(std.testing.allocator);
-    switch (result) {
-        .failed_static => |message| try std.testing.expectEqualStrings("Worktree changed before branch switch; reload and resolve local changes first", message),
-        else => return error.ExpectedSwitchDirtyFailure,
+    try std.testing.expect(result == .ok);
+    const current = try gitOutputAlloc(io, work, &.{ "git", "branch", "--show-current" });
+    defer std.testing.allocator.free(current);
+    try std.testing.expectEqualStrings("feature/topic", trimLineEnd(current));
+    const staged = try gitOutputAlloc(io, work, &.{ "git", "show", ":README.md" });
+    defer std.testing.allocator.free(staged);
+    try std.testing.expectEqualStrings("staged\n", staged);
+    const unstaged = try work.readFileAlloc(io, "README.md", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(unstaged);
+    try std.testing.expectEqualStrings("unstaged\n", unstaged);
+    const untracked = try work.readFileAlloc(io, "local.txt", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(untracked);
+    try std.testing.expectEqualStrings("untracked\n", untracked);
+    const status = try gitOutputAlloc(io, work, &.{ "git", "status", "--porcelain=v1" });
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("MM README.md\n?? local.txt\n", status);
+}
+
+test "operations switch branch preserves local state when Git refuses an overwrite" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ true, false }) |tracked| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const fixture = try setupBranchSwitchFixture(io, &tmp);
+        defer fixture.deinit();
+        var work = try tmp.dir.openDir(io, "work", .{});
+        defer work.close(io);
+        if (tracked) {
+            try runTestGit(io, &.{ "git", "switch", "feature/topic" }, work);
+            try work.writeFile(io, .{ .sub_path = "README.md", .data = "target\n" });
+            try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+            try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "target overlap" }, work);
+            try runTestGit(io, &.{ "git", "switch", "main" }, work);
+        }
+        const target_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/heads/feature/topic" });
+        defer allocator.free(target_oid);
+        const path = if (tracked) "README.md" else "FEATURE.md";
+        try work.writeFile(io, .{ .sub_path = path, .data = "local content\n" });
+        if (tracked) try runTestGit(io, &.{ "git", "add", "README.md" }, work);
+        const before_index = try gitOutputAlloc(io, work, &.{ "git", "write-tree" });
+        defer allocator.free(before_index);
+        const before_status = try gitOutputAlloc(io, work, &.{ "git", "status", "--porcelain=v1" });
+        defer allocator.free(before_status);
+        var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+        defer environment.deinit();
+        const result = try runOperation(allocator, io, .{
+            .context = .{ .cwd = work, .environment = &environment },
+            .kind = .{ .switch_branch = .{ .expected_branch = "main", .expected_oid = fixture.main_oid, .target_branch = "feature/topic", .target_oid = trimLineEnd(target_oid) } },
+        });
+        defer result.deinit(allocator);
+        switch (result) {
+            .failed => |message| {
+                try std.testing.expect(std.mem.indexOf(u8, message, "would be overwritten") != null);
+                try std.testing.expect(std.mem.indexOf(u8, message, path) != null);
+            },
+            else => return error.ExpectedGitOverwriteRefusal,
+        }
+        const current = try gitOutputAlloc(io, work, &.{ "git", "branch", "--show-current" });
+        defer allocator.free(current);
+        try std.testing.expectEqualStrings("main", trimLineEnd(current));
+        const after_index = try gitOutputAlloc(io, work, &.{ "git", "write-tree" });
+        defer allocator.free(after_index);
+        try std.testing.expectEqualStrings(before_index, after_index);
+        const after_status = try gitOutputAlloc(io, work, &.{ "git", "status", "--porcelain=v1" });
+        defer allocator.free(after_status);
+        try std.testing.expectEqualStrings(before_status, after_status);
+        const content = try work.readFileAlloc(io, path, allocator, .limited(1024));
+        defer allocator.free(content);
+        try std.testing.expectEqualStrings("local content\n", content);
     }
 }
 

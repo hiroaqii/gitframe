@@ -979,6 +979,72 @@ test "finishSwitchBranch success clears repo-local changes state and reloads mat
     try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
 }
 
+test "finishSwitchBranch failure owns full details and allows closing and reopening picker" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .terminal_size = .{ .width = 120, .height = 32 },
+        .repo_session = .{
+            .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
+        },
+    };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
+    defer app.remote_workflow.deinit(allocator);
+    defer app.shell_effects_state.clipboard_copies.deinit(allocator);
+    _ = activateChanges(&app);
+    try app.pages.changes.staged_hunks.addExact(allocator, roots.a, "a", testSessionHunkMarkKey(1, 0));
+    setDiffSearchQuery(&app, "needle");
+
+    const details = "error: Your local changes would be overwritten by checkout:\n" ++
+        "    a-long-local-path-that-must-remain-readable-in-the-error-dialog.txt\n" ** 40 ++
+        "Aborting\n";
+    app.pages.changes.search.query = app.pages.changes.search.input;
+    const pending = beginAcceptedTestAction(&app, .switch_branch);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer ctx.runtimeClearPendingEffectCopies();
+    try app.update(.{ .action_finished = .{ .switch_branch = .{
+        .pending = pending,
+        .repo_root = try allocator.dupe(u8, roots.a),
+        .old_branch = try allocator.dupe(u8, "main"),
+        .new_branch = try allocator.dupe(u8, "feature"),
+        .result = .{ .failed = try allocator.dupe(u8, details) },
+    } } }, &ctx);
+
+    try std.testing.expect(!app.action_runtime.view().hasPending());
+    try std.testing.expect(app.overlay.isRemoteError());
+    try std.testing.expect(!app.remote_workflow.branch_switch.hasState());
+    try std.testing.expectEqual(app_state.GitErrorOperation.switch_branch, app.remote_workflow.remote_error_operation.?);
+    try std.testing.expectEqualStrings(details, app.remote_workflow.remote_error_message.?);
+    try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.staged_hunks.items.items.len);
+    try std.testing.expectEqualStrings("needle", app.pages.changes.search.query.slice());
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    try app.update(.copy_popup, &ctx);
+    try std.testing.expectEqualStrings(details, ctx._pending_clipboard_copies[0].text);
+
+    const close = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.enter } }) orelse return error.ExpectedCloseError;
+    try app.update(close, &ctx);
+    try std.testing.expect(!app.overlay.isRemoteError());
+    try std.testing.expect(app.remote_workflow.remote_error_message == null);
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+
+    // Simulate the branch refresh; file status may still be pending when b reopens.
+    clearPendingStatusAndDiffTasks(&ctx, allocator);
+    var branch = try branchStatusBundleForRemoteRootTest(allocator, "abc123", "main", "origin/main");
+    try app.pages.changes.branch_status.replace(roots.a, &branch);
+    _ = app.pages.changes.activation.activate(app.repo_session.repo_epoch, .fresh, .pending, .fresh);
+    const reopen = app.handleEvent(.{ .key_press = .{ .codepoint = 'b' } }) orelse return error.ExpectedReopenPicker;
+    try app.update(reopen, &ctx);
+    try std.testing.expect(app.overlay.isSwitchBranch());
+    try std.testing.expect(app.remote_workflow.branch_switch.loading);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+}
+
 test "finishSwitchBranch success clears completed repo marks when active repo changed" {
     const allocator = std.testing.allocator;
     var repos = [_]repo_discovery.RepoEntry{
@@ -1199,7 +1265,7 @@ test "classified pull authentication failures open copyable sanitized details" {
         } } }, &ctx);
 
         try std.testing.expect(app.overlay.isRemoteError());
-        try std.testing.expectEqual(app_state.RemoteOperation.pull, app.remote_workflow.remote_error_operation.?);
+        try std.testing.expectEqual(app_state.GitErrorOperation.pull, app.remote_workflow.remote_error_operation.?);
         const details = app.remote_workflow.remote_error_message.?;
         switch (failure) {
             .ssh_public_key => {

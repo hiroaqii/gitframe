@@ -48,7 +48,7 @@ pub const View = struct {
         return self.state.pull_confirmation;
     }
 
-    pub fn remoteErrorOperation(self: View) ?app_state.RemoteOperation {
+    pub fn remoteErrorOperation(self: View) ?app_state.GitErrorOperation {
         return self.state.remote_error_operation;
     }
 
@@ -447,10 +447,6 @@ pub const Controller = struct {
             .detached_head => return self.reject("branch switch unavailable on detached HEAD"),
             .branch_unavailable => return self.reject("branch switch unavailable: branch is unknown"),
             .branch_status_unavailable => return self.reject("branch switch unavailable: branch status is incomplete"),
-            .status_loading => return self.reject("status is still loading"),
-            .status_stale => return self.reject("branch switch unavailable: status is stale"),
-            .dirty_worktree => return self.reject("branch switch blocked: commit, stage, or discard local changes first"),
-            .untracked_files_present => return self.reject("branch switch blocked: untracked files present"),
         };
 
         self.cancelPushConfirmation(ctx.allocator());
@@ -670,7 +666,7 @@ pub const Controller = struct {
         };
     }
 
-    pub fn finishSwitchBranch(self: Controller, allocator: std.mem.Allocator, finished: app_actions.SwitchBranchFinished) Outcome {
+    pub fn finishSwitchBranch(self: Controller, allocator: std.mem.Allocator, finished: app_actions.SwitchBranchFinished) !Outcome {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
@@ -688,8 +684,9 @@ pub const Controller = struct {
                 }
                 return .{ .reload = applied.reload };
             },
-            .failed, .failed_static => {
+            .failed, .failed_static => |message| {
                 _ = self.setActionFailureStatus("branch switch", result.result);
+                if (active_matches) try self.setRemoteErrorWithRetry(allocator, .switch_branch, message, null);
                 return .{ .reload = if (active_matches) .source_and_aux else .none };
             },
         }
@@ -1044,7 +1041,7 @@ pub const Controller = struct {
     fn setRemoteErrorWithRetry(
         self: Controller,
         allocator: std.mem.Allocator,
-        operation: app_state.RemoteOperation,
+        operation: app_state.GitErrorOperation,
         message: []const u8,
         retry_target: ?app_state.PushRetryTarget,
     ) !void {
@@ -1371,7 +1368,7 @@ pub const testing = if (builtin.is_test) struct {
     pub fn setRemoteErrorWithRetry(
         controller: Controller,
         allocator: std.mem.Allocator,
-        operation: app_state.RemoteOperation,
+        operation: app_state.GitErrorOperation,
         message: []const u8,
         retry_target: ?app_state.PushRetryTarget,
     ) !void {
