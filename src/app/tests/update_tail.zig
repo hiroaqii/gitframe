@@ -275,7 +275,7 @@ test "branch time pickers sample one real-clock snapshot at every non-skipped re
         .current_oid = &oid,
         .branches = &branches,
     };
-    app.overlay.openSwitchBranch();
+    app.overlay.openSwitchBranch(.changes);
     app.active_page = .changes;
     clock.seconds += 1;
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
@@ -319,7 +319,7 @@ test "branch time pickers fail closed for unavailable and zero-resolution real c
         .current_oid = &oid,
         .branches = &branches,
     };
-    app.overlay.openSwitchBranch();
+    app.overlay.openSwitchBranch(.changes);
     app.active_page = .changes;
     try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx);
     try std.testing.expect(app.remote_workflow.branch_switch.render_now_unix == null);

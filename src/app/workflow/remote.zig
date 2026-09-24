@@ -1,8 +1,9 @@
-//! Changes remote-operation workflow and foreground push ownership.
+//! Remote Git operations and shared branch-switch ownership.
 //!
 //! This controller owns push, pull, fetch, branch-switch, retry inspection,
 //! interactive-push, and upstream-finalization state. Changes supplies synchronous target
-//! and outcome ports; the root shell consumes typed reload intent. The module
+//! and outcome ports; branch switching captures its own caller and snapshot.
+//! The root shell consumes typed reload intent. The module
 //! never imports the root App, local workflow, read coordinator, or shell
 //! effects.
 
@@ -11,6 +12,7 @@ const builtin = @import("builtin");
 const chasen = @import("chasen");
 
 const app_actions = @import("../actions.zig");
+const diff_source = @import("../../diff/source.zig");
 const branch_commit_time = @import("../branch_commit_time.zig");
 const effect_origin = @import("../effect_origin.zig");
 const app_git_requests = @import("../git_requests.zig");
@@ -94,7 +96,13 @@ pub const RedrawSink = struct {
     }
 };
 
+pub const BranchReload = union(enum) {
+    changes: changes_action_fence.ReloadIntent,
+    repository,
+};
+
 pub const Outcome = struct {
+    branch_reload: ?BranchReload = null,
     reload: changes_action_fence.ReloadIntent = .none,
     cancel_local_confirmations: bool = false,
     quit_after_terminal: bool = false,
@@ -109,6 +117,8 @@ pub const Controller = struct {
     env_map: ?*std.process.Environ.Map,
     active_page: page.Id,
     changes_origin: effect_origin.PageOrigin,
+    branch_origin: ?effect_origin.PageOrigin,
+    repository_status: *app_state.StatusMessage,
     effect_snapshot: effect_origin.Snapshot,
     status: *app_state.StatusMessage,
     overlay: *app_state.OverlayState,
@@ -435,43 +445,45 @@ pub const Controller = struct {
     }
 
     pub fn requestBranchSwitch(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !Outcome {
+        const origin = self.branch_origin orelse return .{};
+        const status = self.branchStatus(origin.page_id);
         if (self.lifecycle.view().hasPending()) {
-            self.setStatus("another git action is running", .{});
+            status.set("another git action is running", .{});
             return .{};
         }
-        const target = switch (self.operations.view().branchSwitchTarget()) {
-            .ready => |target| target,
-            .unavailable_source => return self.reject("branch switch unavailable for this source"),
-            .no_repo => return self.reject("branch switch unavailable: no repository"),
-            .loading_branch_status => return self.reject("branch status is still loading"),
-            .detached_head => return self.reject("branch switch unavailable on detached HEAD"),
-            .branch_unavailable => return self.reject("branch switch unavailable: branch is unknown"),
-            .branch_status_unavailable => return self.reject("branch switch unavailable: branch status is incomplete"),
+        if (origin.page_id == .changes and !diff_source.sourceAllowsStageProjection(self.operations.view().source)) {
+            status.set("branch switch unavailable for this source", .{});
+            return .{};
+        }
+        const repo_root = self.repo.activeRoot() orelse {
+            status.set("branch switch unavailable: no repository", .{});
+            return .{};
         };
+        const identity = self.currentRepositoryIdentity() orelse {
+            status.set("branch switch unavailable: repository authority changed", .{});
+            return .{};
+        };
+        if (effect_origin.classify(.{ .page = origin }, self.effect_snapshot) != .live_active) return .{};
 
         self.cancelPushConfirmation(ctx.allocator());
         self.cancelPullConfirmation(ctx.allocator());
         self.clearRemoteError(ctx.allocator());
         self.clearBranchSwitch(ctx.allocator());
+        errdefer {
+            self.clearBranchSwitch(ctx.allocator());
+            status.set("could not start branch list task", .{});
+        }
         self.state.branch_switch_load_generation +%= 1;
         const generation = self.state.branch_switch_load_generation;
-
-        var proposal = try self.operations.view().ownBranchSwitchProposal(ctx.allocator(), target);
-        var proposal_consumed = false;
-        defer if (!proposal_consumed) proposal.deinit(ctx.allocator());
-        const owned = proposal.switch_branch;
         self.state.branch_switch = .{
-            .repo_root = owned.repo_root,
-            .current_branch = owned.branch,
-            .current_oid = owned.oid,
+            .owner = .{ .origin = origin, .root_identity = identity.root_identity },
+            .repo_root = try ctx.allocator().dupe(u8, repo_root),
             .generation = generation,
             .loading = true,
         };
-        proposal_consumed = true;
         self.state.branch_switch_load_pending = generation;
-        self.operations.navigation.clearDiffSelection();
-        self.overlay.openSwitchBranch();
-        errdefer self.clearBranchSwitch(ctx.allocator());
+        if (origin.page_id == .changes) self.operations.navigation.clearDiffSelection();
+        self.overlay.openSwitchBranch(origin.page_id);
 
         const capability = self.repo.activeCapability() orelse return error.RepositoryReadAuthorityClosed;
         var root = try capability.duplicate();
@@ -480,14 +492,14 @@ pub const Controller = struct {
         var environment = try git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map);
         var environment_consumed = false;
         errdefer if (!environment_consumed) environment.deinit();
-        const owned_repo_root = try ctx.allocator().dupe(u8, target.repo_root);
+        const owned_repo_root = try ctx.allocator().dupe(u8, repo_root);
         var repo_root_consumed = false;
         errdefer if (!repo_root_consumed) ctx.allocator().free(owned_repo_root);
         const task = try ctx.allocator().create(BranchListLoadTask);
         task.* = .{
-            .origin = .changes,
-            .repo_epoch = self.repo.epoch(),
-            .activation_id = self.changes_origin.activation_id,
+            .origin = origin.page_id,
+            .repo_epoch = origin.repo_epoch,
+            .activation_id = origin.activation_id,
             .repo_root = owned_repo_root,
             .root = root,
             .environment = environment,
@@ -518,18 +530,29 @@ pub const Controller = struct {
 
     pub fn confirmBranchSwitch(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         const branch_switch = &self.state.branch_switch;
-        if (!branch_switch.hasState()) return;
-        if (branch_switch.loading) return self.rejectVoid("branch list is still loading");
-        if (branch_switch.branches.len == 0) return self.rejectVoid("branch switch unavailable: no local branches");
-        if (self.lifecycle.view().hasPending()) return self.rejectVoid("another git action is running");
+        const owner = branch_switch.owner orelse return;
+        const status = self.branchStatus(owner.origin.page_id);
+        if (!self.branchOwnerMatches(owner) or self.repo.activeRoot() == null or
+            !std.mem.eql(u8, self.repo.activeRoot().?, branch_switch.repo_root))
+        {
+            if (effect_origin.classify(.{ .page = owner.origin }, self.effect_snapshot) != .stale)
+                status.set("branch switch unavailable: repository authority changed", .{});
+            self.clearBranchSwitch(ctx.allocator());
+            return;
+        }
+        if (branch_switch.loading) return status.set("branch list is still loading", .{});
+        if (branch_switch.branches.len == 0) return status.set("branch switch unavailable: no local branches", .{});
+        if (self.lifecycle.view().hasPending()) return status.set("another git action is running", .{});
 
         const selected = branch_switch.branches[branch_switch.selected_index];
         if (selected.current or std.mem.eql(u8, selected.name, branch_switch.current_branch)) {
-            self.setStatus("already on branch: {s}", .{branch_switch.current_branch});
+            status.set("already on branch: {s}", .{branch_switch.current_branch});
             self.clearBranchSwitch(ctx.allocator());
             return;
         }
 
+        // Allocation/preparation/spawn failures retain this valid picker for retry.
+        errdefer status.set("could not start branch switch task", .{});
         var request: app_git_requests.SwitchBranchRequest = .{
             .repo_root = &.{},
             .expected_branch = &.{},
@@ -543,19 +566,12 @@ pub const Controller = struct {
         request.expected_oid = try ctx.allocator().dupe(u8, branch_switch.current_oid);
         request.target_branch = try ctx.allocator().dupe(u8, selected.name);
         request.target_oid = try ctx.allocator().dupe(u8, selected.oid);
-        self.setStatus("switching branch: {s} -> {s}", .{ branch_switch.current_branch, selected.name });
         const prepared = self.lifecycle.prepare(.switch_branch);
-        const capability = self.repo.activeCapability() orelse {
-            self.lifecycle.rejectSpawn(prepared);
-            self.setStatus("branch switch unavailable: repository authority changed", .{});
-            return;
-        };
-        app_git_requests.startSwitchBranch(app_message.Msg, ctx, prepared.pending, &request, capability, self.env_map) catch |err| {
-            self.lifecycle.rejectSpawn(prepared);
-            self.setStatus("could not start branch switch task", .{});
-            return err;
-        };
+        errdefer self.lifecycle.rejectSpawn(prepared);
+        try app_git_requests.startSwitchBranch(app_message.Msg, ctx, prepared.pending, &request, self.repo.activeCapability().?, self.env_map);
         _ = self.lifecycle.acceptSpawn(ctx.allocator(), prepared);
+        self.state.branch_switch_pending = .{ .token = prepared.pending, .owner = owner };
+        status.set("switching branch: {s} -> {s}", .{ branch_switch.current_branch, selected.name });
         self.clearBranchSwitch(ctx.allocator());
     }
 
@@ -600,7 +616,7 @@ pub const Controller = struct {
                 };
                 const presentation = try remoteFailurePresentationAlloc(allocator, .push, failure, result.result.warnings);
                 defer allocator.free(presentation);
-                try self.setRemoteErrorWithRetry(allocator, .push, presentation, retry_target);
+                try self.setRemoteErrorWithRetry(allocator, .push, presentation, retry_target, .changes);
                 return .{
                     .reload = if (active_matches and remoteOutcomeUnknown(failure)) .source_and_aux else .none,
                     .quit_after_terminal = quit_after_terminal,
@@ -633,7 +649,7 @@ pub const Controller = struct {
                 if (pullFailureHasDetails(failure)) {
                     const presentation = try remoteFailurePresentationAlloc(allocator, .pull, failure, result.result.warnings);
                     defer allocator.free(presentation);
-                    try self.setRemoteErrorWithRetry(allocator, .pull, presentation, null);
+                    try self.setRemoteErrorWithRetry(allocator, .pull, presentation, null, .changes);
                 }
             },
         }
@@ -669,33 +685,55 @@ pub const Controller = struct {
     pub fn finishSwitchBranch(self: Controller, allocator: std.mem.Allocator, finished: app_actions.SwitchBranchFinished) !Outcome {
         var result = finished;
         defer result.deinit(allocator);
-        const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
-        const active_matches = terminal.target == .current_changes;
+        const pending = self.state.branch_switch_pending orelse return .{};
+        if (pending.token.generation != result.pending.generation or pending.token.kind != result.pending.kind) return .{};
+        _ = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
+        self.state.branch_switch_pending = null;
+        const owner = pending.owner;
+        const live = self.branchOwnerMatches(owner) and self.repo.activeRoot() != null and
+            std.mem.eql(u8, self.repo.activeRoot().?, result.repo_root);
+        var changes_reload: changes_action_fence.ReloadIntent = .source_and_aux;
         switch (result.result) {
             .ok => {
-                const applied = self.operations.applyAcceptedOutcome(allocator, .{ .switch_branch = .{ .repo_root = result.repo_root } }, active_matches);
-                if (active_matches) {
-                    self.setStatus("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
-                    if (applied.local_effect_failure != null) {
-                        self.setStatus("switched branch: {s} -> {s}; could not clear reviewed marks", .{ result.old_branch, result.new_branch });
-                    }
-                } else {
-                    self.setStatus("switched branch: {s}", .{result.repo_root});
+                // Repo-local marks belong to the completed checkout even when its
+                // page has expired. Only the live Changes caller resets its view.
+                const applied = self.operations.applyAcceptedOutcome(allocator, .{ .switch_branch = .{ .repo_root = result.repo_root } }, live and owner.origin.page_id == .changes);
+                changes_reload = applied.reload;
+                if (live) {
+                    const status = self.branchStatus(owner.origin.page_id);
+                    status.set("switched branch: {s} -> {s}", .{ result.old_branch, result.new_branch });
+                    if (applied.local_effect_failure != null)
+                        status.set("switched branch: {s} -> {s}; could not clear reviewed marks", .{ result.old_branch, result.new_branch });
                 }
-                return .{ .reload = applied.reload };
             },
             .failed, .failed_static => |message| {
-                _ = self.setActionFailureStatus("branch switch", result.result);
-                if (active_matches) try self.setRemoteErrorWithRetry(allocator, .switch_branch, message, null);
-                return .{ .reload = if (active_matches) .source_and_aux else .none };
+                if (live) {
+                    self.branchStatus(owner.origin.page_id).set("branch switch failed: {s}", .{git_ops.trimGitOutput(message)});
+                    // Failure to copy details must not prevent read revalidation.
+                    self.setRemoteErrorWithRetry(allocator, .switch_branch, message, null, owner.origin.page_id) catch {};
+                }
             },
         }
+        if (!live) return .{};
+        if (self.active_page != owner.origin.page_id) self.redraw.requestSkip();
+        return .{ .branch_reload = switch (owner.origin.page_id) {
+            .changes => .{ .changes = changes_reload },
+            .repository => .repository,
+            else => unreachable,
+        } };
     }
 
     pub fn finishBranchListLoad(self: Controller, allocator: std.mem.Allocator, finished: BranchListLoadFinished) !void {
         var result = finished;
         defer result.deinit(allocator);
-        if (result.repo_epoch != self.repo.epoch()) return;
+        const owner = self.state.branch_switch.owner orelse return;
+        const origin: effect_origin.PageOrigin = .{
+            .page_id = result.origin,
+            .repo_epoch = result.repo_epoch,
+            .activation_id = result.activation_id,
+        };
+        // Check the captured owner before consuming pending correlation.
+        if (!owner.origin.eql(origin)) return;
         switch (app_load_state.acceptBranchListResult(
             &self.state.branch_switch_load_pending,
             self.state.branch_switch.hasState(),
@@ -705,43 +743,83 @@ pub const Controller = struct {
             result.repo_root,
         )) {
             .accepted => {},
-            .no_pending,
-            .stale_pending_generation,
-            .missing_state,
-            .stale_state_generation,
-            .repo_mismatch,
-            => return,
+            else => return,
         }
-        const origin: effect_origin.Origin = .{ .page = .{
-            .page_id = result.origin,
-            .repo_epoch = result.repo_epoch,
-            .activation_id = result.activation_id,
-        } };
-        const live = effect_origin.classify(origin, self.effect_snapshot) != .stale;
+        if (!self.branchOwnerMatches(owner)) {
+            self.clearBranchSwitch(allocator);
+            return;
+        }
+        const status = self.branchStatus(origin.page_id);
+        errdefer {
+            status.set("could not retain branch list", .{});
+            self.clearBranchSwitch(allocator);
+        }
         switch (result.result) {
             .loaded => |list| {
+                // This read owns the current branch snapshot; it does not depend
+                // on any Changes activation or file/status read.
+                var oid: ?[]const u8 = null;
+                if (list.current) |current| for (list.branches) |branch| {
+                    if (branch.kind == .local and std.mem.eql(u8, branch.name, current)) {
+                        oid = branch.oid;
+                        break;
+                    }
+                };
+                const target = switch (git_ops.branchSwitchTarget(result.repo_root, .{
+                    .head = if (list.current) |current| .{ .branch = current } else .detached,
+                    .oid = oid,
+                })) {
+                    .ready => |target| target,
+                    .detached_head => {
+                        status.set("branch switch unavailable on detached HEAD", .{});
+                        self.clearBranchSwitch(allocator);
+                        return;
+                    },
+                    else => {
+                        status.set("branch switch unavailable: branch status is incomplete", .{});
+                        self.clearBranchSwitch(allocator);
+                        return;
+                    },
+                };
+                const current_branch = try allocator.dupe(u8, target.branch);
+                errdefer allocator.free(current_branch);
+                const current_oid = try allocator.dupe(u8, target.oid);
+                errdefer allocator.free(current_oid);
                 branch_commit_time.sortBranches(list.branches);
                 const branches = try copyBranchSwitchItems(allocator, list.branches);
-                errdefer deinitBranchSwitchItems(allocator, branches);
-                deinitBranchSwitchItems(allocator, self.state.branch_switch.branches);
-                self.state.branch_switch.branches = branches;
-                self.state.branch_switch.loading = false;
-                self.state.branch_switch.selected_index = branchSwitchInitialSelection(branches);
+                const state = &self.state.branch_switch;
+                allocator.free(state.current_branch);
+                allocator.free(state.current_oid);
+                deinitBranchSwitchItems(allocator, state.branches);
+                state.current_branch = current_branch;
+                state.current_oid = current_oid;
+                state.branches = branches;
+                state.loading = false;
+                state.selected_index = branchSwitchInitialSelection(branches);
             },
-            .failed => |message| {
-                if (live) self.setStatus("branch list load failed: {s}", .{git_ops.trimGitOutput(message)});
-                self.clearBranchSwitch(allocator);
-            },
-            .failed_static => |message| {
-                if (live) self.setStatus("branch list load failed: {s}", .{message});
+            .failed, .failed_static => |message| {
+                status.set("branch list load failed: {s}", .{git_ops.trimGitOutput(message)});
                 self.clearBranchSwitch(allocator);
             },
             .empty => {
-                if (live) self.setStatus("branch list load failed", .{});
+                status.set("branch list load failed", .{});
                 self.clearBranchSwitch(allocator);
             },
         }
         if (self.active_page != result.origin) self.redraw.requestSkip();
+    }
+
+    fn branchOwnerMatches(self: Controller, owner: app_state.BranchSwitchOwner) bool {
+        return effect_origin.classify(.{ .page = owner.origin }, self.effect_snapshot) != .stale and
+            self.repositoryMatches(.{ .repo_epoch = owner.origin.repo_epoch, .root_identity = owner.root_identity });
+    }
+
+    fn branchStatus(self: Controller, owner_page: page.Id) *app_state.StatusMessage {
+        return switch (owner_page) {
+            .changes => self.status,
+            .repository => self.repository_status,
+            else => unreachable,
+        };
     }
 
     pub fn finishPushInspection(self: Controller, ctx: *chasen.Ctx(app_message.Msg), finished: app_push_retry.Finished) !void {
@@ -1044,14 +1122,15 @@ pub const Controller = struct {
         operation: app_state.GitErrorOperation,
         message: []const u8,
         retry_target: ?app_state.PushRetryTarget,
+        owner_page: page.Id,
     ) !void {
         std.debug.assert(operation == .push or retry_target == null);
         self.clearRemoteError(allocator);
         self.state.remote_error_message = try allocator.dupe(u8, message);
         self.state.remote_error_operation = operation;
         if (retry_target) |target| self.state.push_retry.state = .{ .available = .{ .target = target } };
-        self.operations.navigation.clearDiffSelection();
-        self.overlay.openRemoteError();
+        if (owner_page == .changes) self.operations.navigation.clearDiffSelection();
+        self.overlay.openRemoteError(owner_page);
     }
 
     fn clearRemoteErrorPresentation(self: Controller, allocator: std.mem.Allocator) void {
@@ -1064,7 +1143,7 @@ pub const Controller = struct {
     fn restorePushRetryTarget(self: Controller, allocator: std.mem.Allocator, target: app_state.PushRetryTarget) void {
         self.state.push_retry.restoreAvailable(allocator, target);
         self.operations.navigation.clearDiffSelection();
-        self.overlay.openRemoteError();
+        self.overlay.openRemoteError(.changes);
     }
 
     fn finishUpstreamPartial(
@@ -1145,15 +1224,6 @@ pub const Controller = struct {
             .rejected => null,
             .accepted => |accepted| accepted,
         };
-    }
-
-    fn setActionFailureStatus(self: Controller, comptime prefix: []const u8, result: app_actions.FileActionTaskResult) bool {
-        switch (result) {
-            .ok => return false,
-            .failed => |message| self.setStatus(prefix ++ " failed: {s}", .{git_ops.trimGitOutput(message)}),
-            .failed_static => |message| self.setStatus(prefix ++ " failed: {s}", .{message}),
-        }
-        return true;
     }
 
     fn reject(self: Controller, message: []const u8) Outcome {
@@ -1372,7 +1442,7 @@ pub const testing = if (builtin.is_test) struct {
         message: []const u8,
         retry_target: ?app_state.PushRetryTarget,
     ) !void {
-        try controller.setRemoteErrorWithRetry(allocator, operation, message, retry_target);
+        try controller.setRemoteErrorWithRetry(allocator, operation, message, retry_target, .changes);
     }
 
     pub fn clearForeground(state: *State, allocator: std.mem.Allocator) void {

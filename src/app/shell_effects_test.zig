@@ -309,7 +309,7 @@ test "repository selection late clipboard completion cannot target a new page in
 test "closed shell surface discards clipboard completion presentation" {
     var app: ShellHarness = .{};
     defer app.shell_state.clipboard_copies.deinit(std.testing.allocator);
-    app.overlay.openRemoteError();
+    app.overlay.openRemoteError(.changes);
     const instance_id = app.overlay.remote_error_instance_id;
     app.overlay.close();
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 5, .{
@@ -331,7 +331,7 @@ test "closed shell surface discards clipboard completion presentation" {
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.redraw_plan = .{};
-    app.overlay.openRemoteError();
+    app.overlay.openRemoteError(.changes);
     try std.testing.expect(app.overlay.remote_error_instance_id != instance_id);
     _ = app.shellEffects().finishClipboard(.{ .request_id = .{ .id = 7 }, .outcome = .sent });
     try std.testing.expectEqualStrings("", app.status.text());
@@ -342,7 +342,7 @@ test "closed shell surface discards clipboard completion presentation" {
 test "live shell surface owns clipboard completion presentation" {
     var app: ShellHarness = .{};
     defer app.shell_state.clipboard_copies.deinit(std.testing.allocator);
-    app.overlay.openRemoteError();
+    app.overlay.openRemoteError(.changes);
     try app.shell_state.clipboard_copies.put(std.testing.allocator, 6, .{
         .origin = .{ .shell_surface = .{
             .surface = .remote_error,

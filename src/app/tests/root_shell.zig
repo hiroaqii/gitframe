@@ -1773,7 +1773,7 @@ test "remote error overlay wheel redraw changes once skips at edge and reverses"
         },
     };
     defer app.remote_workflow.deinit(std.testing.allocator);
-    app.overlay.openRemoteError();
+    app.overlay.openRemoteError(.changes);
 
     var ctx: chasen.Ctx(App.Msg) = .{};
     const max_scroll = app_view.remoteErrorMaxScroll(layoutSize(&app), app.remote_workflow.remote_error_message);

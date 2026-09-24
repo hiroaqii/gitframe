@@ -6,6 +6,7 @@ const content_selection = @import("diff_surface/selection.zig");
 const session_hunk_mark = @import("pages/changes/session_hunk_mark.zig");
 const page = @import("page.zig");
 const remote_request = @import("remote_request.zig");
+const effect_origin = @import("effect_origin.zig");
 
 pub const GitErrorOperation = enum {
     push,
@@ -112,16 +113,16 @@ pub const OverlayState = struct {
         self.owner_page = .changes;
     }
 
-    pub fn openSwitchBranch(self: *OverlayState) void {
+    pub fn openSwitchBranch(self: *OverlayState, owner_page: page.Id) void {
         self.kind = .switch_branch;
-        self.owner_page = .changes;
+        self.owner_page = owner_page;
     }
 
-    pub fn openRemoteError(self: *OverlayState) void {
+    pub fn openRemoteError(self: *OverlayState, owner_page: page.Id) void {
         self.remote_error_instance_id +%= 1;
         if (self.remote_error_instance_id == 0) self.remote_error_instance_id = 1;
         self.kind = .remote_error;
-        self.owner_page = .changes;
+        self.owner_page = owner_page;
         self.remote_error_scroll = 0;
     }
 
@@ -233,7 +234,13 @@ pub const BranchSwitchItem = struct {
     }
 };
 
+pub const BranchSwitchOwner = struct {
+    origin: effect_origin.PageOrigin,
+    root_identity: @import("../repo/root_capability.zig").Identity,
+};
+
 pub const BranchSwitchState = struct {
+    owner: ?BranchSwitchOwner = null,
     repo_root: []u8 = &.{},
     current_branch: []u8 = &.{},
     current_oid: []u8 = &.{},

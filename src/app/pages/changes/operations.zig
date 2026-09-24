@@ -122,19 +122,6 @@ pub const OwnedFetchProposal = struct {
     }
 };
 
-pub const OwnedBranchSwitchProposal = struct {
-    repo_root: []u8,
-    branch: []u8,
-    oid: []u8,
-
-    fn deinit(self: *OwnedBranchSwitchProposal, allocator: std.mem.Allocator) void {
-        allocator.free(self.repo_root);
-        allocator.free(self.branch);
-        allocator.free(self.oid);
-        self.* = undefined;
-    }
-};
-
 /// Immutable operation snapshots transferred from Changes to shell-owned UI or
 /// task orchestration. Shell code consumes one proposal or calls `deinit`; it
 /// never borrows Changes state while a confirmation or async operation is live.
@@ -147,7 +134,6 @@ pub const OwnedOperationProposal = union(enum) {
     push: OwnedPushProposal,
     pull: OwnedPullProposal,
     fetch: OwnedFetchProposal,
-    switch_branch: OwnedBranchSwitchProposal,
 
     pub fn deinit(self: *OwnedOperationProposal, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -330,21 +316,6 @@ pub const View = struct {
         });
     }
 
-    pub fn branchSwitchTarget(self: View) git_ops.BranchSwitchTargetResult {
-        const members = self.activationMembers();
-        const requirements = authority.Action.switch_branch.requirements();
-        return git_ops.branchSwitchTarget(.{
-            .source = self.source,
-            .repo_root = self.repo_root,
-            .branch_status = .{
-                .repo_root = self.page.branch_status.repo_root,
-                .loading = requirements.branch != .unused and members.branch == .pending,
-                .fresh = members.branch.satisfies(requirements.branch),
-                .status = self.page.branch_status.status,
-            },
-        });
-    }
-
     pub fn canOpenCommitPanel(self: View) bool {
         return diff_source.sourceAllowsStageProjection(self.source) and self.repo_root != null;
     }
@@ -407,18 +378,6 @@ pub const View = struct {
         return .{ .fetch = .{
             .repo_root = repo_root,
             .remote = try allocator.dupe(u8, target.remote),
-        } };
-    }
-
-    pub fn ownBranchSwitchProposal(_: View, allocator: std.mem.Allocator, target: git_ops.BranchSwitchTarget) !OwnedOperationProposal {
-        const repo_root = try allocator.dupe(u8, target.repo_root);
-        errdefer allocator.free(repo_root);
-        const branch = try allocator.dupe(u8, target.branch);
-        errdefer allocator.free(branch);
-        return .{ .switch_branch = .{
-            .repo_root = repo_root,
-            .branch = branch,
-            .oid = try allocator.dupe(u8, target.oid),
         } };
     }
 
@@ -1102,7 +1061,6 @@ test "mutation fence makes retained Changes operation targets inert" {
         .ready => {},
         else => return error.ExpectedReadyFetchTarget,
     }
-    try std.testing.expect(view.branchSwitchTarget() == .ready);
 
     const owner: app_actions.PendingAction = .{
         .generation = 41,
@@ -1126,7 +1084,6 @@ test "mutation fence makes retained Changes operation targets inert" {
     try std.testing.expect(view.pushTarget() == .loading_branch_status);
     try std.testing.expect(view.pullTarget() == .loading_branch_status);
     try std.testing.expect(view.fetchTarget() == .loading_branch_status);
-    try std.testing.expect(view.branchSwitchTarget() == .loading_branch_status);
 
     try std.testing.expect(page.repository_read_authority.reopenForMutation(owner));
     try std.testing.expect(view.activation().satisfiesAction(.stage_hunk));
@@ -1143,10 +1100,9 @@ test "mutation fence makes retained Changes operation targets inert" {
         .ready => {},
         else => return error.ExpectedRestoredFetchTarget,
     }
-    try std.testing.expect(view.branchSwitchTarget() == .ready);
 }
 
-test "branch switch ignores pending and stale file status while pull remains gated" {
+test "pull remains gated by pending and stale file status" {
     const allocator = std.testing.allocator;
     var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
@@ -1161,15 +1117,10 @@ test "branch switch ignores pending and stale file status while pull remains gat
     try page.branch_status.replace("/repo", &branch);
 
     page.status_load.pending = .{ .generation = 1 };
-    try std.testing.expect(testView(&page, .unstaged).branchSwitchTarget() == .ready);
     try std.testing.expect(testView(&page, .unstaged).pullTarget() == .status_loading);
     page.status_load.pending = null;
     page.status_load.freshness = .stale_refresh;
-    try std.testing.expect(testView(&page, .unstaged).branchSwitchTarget() == .ready);
     try std.testing.expect(testView(&page, .unstaged).pullTarget() == .status_stale);
-
-    page.branch_status_load.freshness = .stale_refresh;
-    try std.testing.expect(testView(&page, .unstaged).branchSwitchTarget() == .loading_branch_status);
 }
 
 test "stage target skips only fresh staged-only files" {

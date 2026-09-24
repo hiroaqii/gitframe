@@ -1070,11 +1070,18 @@ pub const RepositoryPageState = struct {
         self.needs_change_map_request = self.currentSource() != null;
     }
 
-    pub fn requestReload(self: *RepositoryPageState, has_repository: bool) void {
+    pub const ReloadCause = enum { manual, branch_switch };
+
+    pub fn requestReload(self: *RepositoryPageState, has_repository: bool, cause: ReloadCause) void {
         // The shared authority transition clears borrowed source storage and
         // preserves the semantic viewport across any projection change.
         if (self.selection_owner.activeSourceHeader() != null) self.cancelMouseOwner();
         self.path_history.retire(false);
+        if (cause == .branch_switch) {
+            // Pre-checkout reads cannot recover a failed successor request.
+            self.pending_generation = null;
+            self.branch.pending = null;
+        }
         self.branch.requestReload(
             self.active,
             self.repo_epoch,
@@ -3605,7 +3612,7 @@ test "repository explicit reload restores typed root and directory across outcom
     state.viewer.tree_hidden = true;
     state.viewer.focus = .source;
 
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     var unchanged_request = try state.prepareRequest(allocator, root.path, &root.capability);
     defer unchanged_request.deinit(allocator);
     var unchanged: repository_tasks.ManifestFinished = .{
@@ -3634,7 +3641,7 @@ test "repository explicit reload restores typed root and directory across outcom
         .{ .manifest_node = directory },
     ) orelse return error.ExpectedVisibleDirectory;
 
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     var changed_request = try state.prepareRequest(allocator, root.path, &root.capability);
     defer changed_request.deinit(allocator);
     var changed: repository_tasks.ManifestFinished = .{
@@ -4455,7 +4462,7 @@ test "repository keyboard line selection reload clears borrow and retains prior 
     _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
     try std.testing.expect(state.activeBorrowedSourceRange());
 
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     try std.testing.expect(!state.activeBorrowedSourceRange());
     try std.testing.expect(state.completed_selection != null);
     try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
@@ -5034,7 +5041,7 @@ test "repository source header bounds clone failure and retains exact unchanged 
     try std.testing.expectEqualStrings("Could not prepare file path copy", state.status.text());
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     try std.testing.expect(!state.activeMouseOwner());
 
     _ = state.applyNavigation(allocator, .{ .mouse_source_header_press = header_point }, size);
@@ -5499,7 +5506,7 @@ test "repository real reload updates status color and selected source" {
     const manifest_revision = state.manifest_revision;
 
     try work.writeFile(io, .{ .sub_path = "a.zig", .data = "const value = 2;\n" });
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     var reload_request = try state.prepareRequest(allocator, root_path, &capability);
     defer reload_request.deinit(allocator);
     var reload_finished = repository_tasks.ManifestFinished{
@@ -5740,7 +5747,7 @@ test "Repository path history schedules only selection reload and reactivation e
     try std.testing.expectEqualStrings("b.zig", state.selected_path.?);
     try std.testing.expect(state.path_history.needs_revalidation);
 
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     try std.testing.expect(!state.path_history.needs_revalidation);
     try std.testing.expect(state.path_history.terminal == .unavailable);
     state.deactivate();
@@ -7408,7 +7415,7 @@ test "repository transition incoming lifecycle keeps one destination owner" {
     try std.testing.expect(state.incomingIsPending());
     state.activate(4, identity);
     try std.testing.expect(state.incomingIsPending());
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     try std.testing.expect(state.incomingIsPending());
 
     _ = state.applyNavigation(allocator, .toggle_line_numbers, .{ .width = 80, .height = 10 });
@@ -8294,7 +8301,7 @@ test "repository file search focus clears borrowed intent on selection reload an
     try std.testing.expect(state.file_search_source_focus == .none);
 
     state.file_search_source_focus.awaitDocumentRequest(state.currentFileSearchFocusBasis().?);
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     try std.testing.expect(state.file_search_source_focus == .none);
     try std.testing.expect(state.pending_document_request == null);
 
@@ -8723,7 +8730,7 @@ test "repository transition manifest start failures close the owner" {
     const predecessor_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "predecessor.zig");
     state.generation = 13;
     state.pending_generation = 13;
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     state.markRequestPreparationFailed(error.OutOfMemory);
     try std.testing.expect(state.incoming == .awaiting_manifest);
     try std.testing.expectEqual(@as(?u64, 13), state.pending_generation);
@@ -8740,7 +8747,7 @@ test "repository transition manifest start failures close the owner" {
     try std.testing.expectEqual(predecessor_address, @intFromPtr(state.incoming.documentIntent().?.location.path.ptr));
 
     const missing_repository_address = try acceptIncomingFailureOwnerForTest(&state, allocator, "missing-repository.zig");
-    state.requestReload(false);
+    state.requestReload(false, .manual);
     try expectIncomingRequestFailureForTest(&state, missing_repository_address);
     try std.testing.expectEqual(LoadState.no_repository, state.load_state);
 }
@@ -8806,7 +8813,7 @@ test "repository transition manual reload rebinds one destination through manife
     state.pending_document_generation = 7;
     try std.testing.expect(state.incoming.bindDocumentGeneration(state.manifest_revision, "main.zig", 7));
 
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     try std.testing.expect(state.incoming == .awaiting_manifest);
     try std.testing.expectEqual(owned_address, @intFromPtr(state.incoming.manifestIntent().?.path.ptr));
     try std.testing.expect(state.pending_document_generation == null);
@@ -9370,12 +9377,12 @@ test "repository transition accepted source closes inconsistent document owner" 
 test "repository page owns reload state transitions" {
     var state: RepositoryPageState = .{};
     state.activate(1, null);
-    state.requestReload(false);
+    state.requestReload(false, .manual);
     try std.testing.expectEqual(LoadState.no_repository, state.load_state);
     try std.testing.expect(!state.needs_revalidation);
     try std.testing.expectEqualStrings("Repository required", state.status.text());
 
-    state.requestReload(true);
+    state.requestReload(true, .manual);
     try std.testing.expect(state.needs_revalidation);
     state.markRequestPreparationFailed(error.OutOfMemory);
     try std.testing.expectEqual(LoadState.failed, state.load_state);

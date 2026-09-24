@@ -84,7 +84,6 @@ pub const Msg = union(enum) {
     request_push,
     request_pull,
     request_fetch,
-    request_branch_switch,
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,

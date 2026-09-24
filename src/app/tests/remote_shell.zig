@@ -99,6 +99,13 @@ fn beginAcceptedTestAction(
     const pending = actionLifecycle(app).acceptSpawn(app.allocator.?, prepared).pending;
     switch (kind) {
         .pull, .fetch => app.remote_workflow.action_control.begin(pending.generation),
+        .switch_branch => app.remote_workflow.branch_switch_pending = .{
+            .token = pending,
+            .owner = .{
+                .origin = remoteWorkflow(app).branch_origin.?,
+                .root_identity = app.repo_session.view().activeIdentity() orelse test_action_root_identity,
+            },
+        },
         else => {},
     }
     return pending;
@@ -225,6 +232,12 @@ fn remoteWorkflow(app: *App) workflow_remote.Controller {
         .env_map = app.env_map,
         .active_page = app.active_page,
         .changes_origin = origins.changes(),
+        .branch_origin = switch (app.active_page) {
+            .changes => origins.changes(),
+            .repository => origins.repository(),
+            else => null,
+        },
+        .repository_status = &app.pages.repository.status,
         .effect_snapshot = origins.snapshot,
         .status = &app.pages.changes.status,
         .overlay = &app.overlay,
@@ -704,7 +717,7 @@ test "remote request preparation failures clear prior local confirmation" {
 
     try std.testing.expectError(
         error.TaskLimitExceeded,
-        failure_app.update(.{ .changes = .request_branch_switch }, &saturated_ctx),
+        failure_app.update(.request_branch_switch, &saturated_ctx),
     );
     try std.testing.expect(failure_app.local_workflow.discard_confirmation == null);
     try std.testing.expect(!failure_app.remote_workflow.branch_switch.hasState());
@@ -829,7 +842,7 @@ test "copyPopup queues remote error message text" {
     };
     defer std.testing.allocator.free(app.remote_workflow.remote_error_message.?);
     defer app.shell_effects_state.clipboard_copies.deinit(std.testing.allocator);
-    app.overlay.openRemoteError();
+    app.overlay.openRemoteError(.changes);
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
@@ -1087,7 +1100,7 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
     try std.testing.expect(!app.pages.changes.staged_hunks.containsExact("/repo", "a", old_key));
     try std.testing.expect(app.pages.changes.staged_hunks.containsExact("/other", "b", new_key));
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
-    try std.testing.expectEqualStrings("switched branch: /repo", app.pages.changes.status.text());
+    try std.testing.expectEqualStrings("", app.pages.changes.status.text());
 }
 
 test "finishPush does not reload a stale active repository" {
@@ -1804,4 +1817,90 @@ test "inactive Changes foreground completions retain diagnostics without effects
     try std.testing.expect(active_app.shell_effects_state.editor_foreground == null);
     try std.testing.expectEqualStrings("editor closed", active_app.pages.changes.status.text());
     try std.testing.expectEqual(@as(u8, 3), active_ctx._pending_tasks_with_len);
+}
+
+test "Repository branch switch terminals reload only their caller without activating Changes" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    for ([_]bool{ true, false }) |success| {
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .repository,
+            .terminal_size = .{ .width = 120, .height = 32 },
+            .repo_session = .{ .repo_epoch = 4, .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
+        };
+        app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        defer app.repo_session.repo_state.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
+        defer app.remote_workflow.deinit(allocator);
+        const root_identity = app.repo_session.view().activeIdentity().?;
+        app.pages.repository.activate(4, root_identity);
+        const identity: page.RequestIdentity = .{ .origin = .repository, .repo_epoch = 4, .activation_id = app.pages.repository.activation_id };
+        app.pages.repository.needs_revalidation = false;
+        app.pages.repository.generation = 8;
+        app.pages.repository.pending_generation = 8;
+        app.pages.repository.pending_document_generation = 17;
+        app.pages.repository.branch.needs_revalidation = false;
+        app.pages.repository.branch.generation = 7;
+        app.pages.repository.branch.pending = .{ .identity = identity, .root_identity = root_identity, .generation = 7 };
+        app.pages.changes.status.set("Changes retained", .{});
+        setDiffSearchQuery(&app, "needle");
+        app.pages.changes.search.query = app.pages.changes.search.input;
+        const pending = beginAcceptedTestAction(&app, .switch_branch);
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+        defer ctx.runtimeClearPendingEffectCopies();
+
+        try app.update(.{ .action_finished = .{ .switch_branch = .{
+            .pending = .{ .generation = pending.generation + 1, .kind = .switch_branch },
+            .repo_root = try allocator.dupe(u8, roots.a),
+            .old_branch = try allocator.dupe(u8, "main"),
+            .new_branch = try allocator.dupe(u8, "feature"),
+            .result = .{ .failed_static = "wrong token" },
+        } } }, &ctx);
+        try std.testing.expect(app.action_runtime.view().isAccepted(pending));
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+
+        try app.update(.{ .action_finished = .{ .switch_branch = .{
+            .pending = pending,
+            .repo_root = try allocator.dupe(u8, roots.a),
+            .old_branch = try allocator.dupe(u8, "main"),
+            .new_branch = try allocator.dupe(u8, "feature"),
+            .result = if (success) .ok else .{ .failed_static = "checkout refused; local changes retained" },
+        } } }, &ctx);
+        try std.testing.expect(!app.action_runtime.view().hasPending());
+        try std.testing.expect(app.remote_workflow.branch_switch_pending == null);
+        try std.testing.expect(app.pages.changes.repository_read_authority.mayStartRepositoryRead());
+        try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
+        try std.testing.expectEqual(page.Id.repository, app.active_page);
+        try std.testing.expectEqualStrings("Changes retained", app.pages.changes.status.text());
+        try std.testing.expectEqualStrings("needle", app.pages.changes.search.query.slice());
+        try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(?u64, 9), app.pages.repository.pending_generation);
+        try std.testing.expectEqual(@as(u64, 8), app.pages.repository.branch.pending.?.generation);
+        try std.testing.expect(app.pages.repository.pending_document_generation == null);
+        if (!success) {
+            try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
+            try std.testing.expectEqualStrings("checkout refused; local changes retained", app.remote_workflow.remote_error_message.?);
+        }
+        // Neither pre-checkout member may publish after the caller reload.
+        try app.update(.{ .repository = .{ .manifest_finished = .{
+            .identity = identity,
+            .root_identity = root_identity,
+            .generation = 8,
+            .result = .{ .failed_static = "old manifest failure" },
+        } } }, &ctx);
+        try app.update(.{ .repository = .{ .branch_finished = .{
+            .identity = identity,
+            .root_identity = root_identity,
+            .generation = 7,
+            .result = .{ .failed = .load_failed },
+        } } }, &ctx);
+        try std.testing.expectEqual(@as(?u64, 9), app.pages.repository.pending_generation);
+        try std.testing.expectEqual(@as(u64, 8), app.pages.repository.branch.pending.?.generation);
+        try std.testing.expect(app.pages.repository.branch.freshness == .validating);
+        if (!success) try std.testing.expect(app.overlay.isRemoteError());
+    }
 }

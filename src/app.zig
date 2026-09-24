@@ -399,6 +399,12 @@ pub const App = struct {
             .env_map = self.env_map,
             .active_page = self.active_page,
             .changes_origin = origins.changes(),
+            .branch_origin = switch (self.active_page) {
+                .changes => origins.changes(),
+                .repository => origins.repository(),
+                else => null,
+            },
+            .repository_status = &self.pages.repository.status,
             .effect_snapshot = origins.snapshot,
             .status = &self.pages.changes.status,
             .overlay = &self.overlay,
@@ -710,6 +716,7 @@ pub const App = struct {
             .cancel_pull => self.remoteWorkflow().cancelPullConfirmation(ctx.allocator()),
             .branch_switch_move_previous => self.remoteWorkflow().moveBranchSwitchSelection(-1),
             .branch_switch_move_next => self.remoteWorkflow().moveBranchSwitchSelection(1),
+            .request_branch_switch => try self.requestRemoteBranchSwitch(ctx),
             .confirm_branch_switch => try self.remoteWorkflow().confirmBranchSwitch(ctx),
             .cancel_branch_switch => self.remoteWorkflow().clearBranchSwitch(ctx.allocator()),
             .close_remote_error => self.remoteWorkflow().clearRemoteError(ctx.allocator()),
@@ -724,7 +731,7 @@ pub const App = struct {
                         },
                     }
                 },
-                .repository => self.repositoryCoordinator().requestReload(),
+                .repository => self.repositoryCoordinator().requestReload(.manual),
                 .history => self.historyCoordinator().refresh(self.allocator orelse ctx.allocator()),
                 .compare => try self.compareCoordinator().refresh(ctx),
                 .config => self.status.set("reload is not available on this page yet", .{}),
@@ -986,7 +993,6 @@ pub const App = struct {
             .request_push => try self.requestRemotePush(ctx),
             .request_pull => try self.requestRemotePull(ctx),
             .request_fetch => try self.remoteWorkflow().requestFetch(ctx),
-            .request_branch_switch => try self.requestRemoteBranchSwitch(ctx),
             .open_selected_file_in_editor => try self.openSelectedFileInEditor(ctx),
             .copy_current_line => self.copyCurrentLine(ctx),
             .copy_current_hunk => try self.copyCurrentHunk(ctx),
@@ -1170,6 +1176,10 @@ pub const App = struct {
         if (outcome.reload != .none) {
             try self.changesRead().applyEffectReload(ctx, outcome.reload);
         }
+        if (outcome.branch_reload) |reload| switch (reload) {
+            .changes => |intent| try self.changesRead().applyEffectReload(ctx, intent),
+            .repository => self.repositoryCoordinator().requestReload(.branch_switch),
+        };
         if (outcome.quit_after_terminal) {
             self.requestQuit(ctx);
         }

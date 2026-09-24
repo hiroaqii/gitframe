@@ -373,7 +373,7 @@ test "Repository page header unchanged branch completion redraws fresh terminal"
     try std.testing.expectEqualStrings("main", app.pages.repository.branch.snapshot.status.branchName().?);
     try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 
-    app.pages.repository.requestReload(true);
+    app.pages.repository.requestReload(true, .manual);
     app.pages.repository.needs_revalidation = false;
     var unchanged_request = try app.pages.repository.prepareBranchRequest(allocator, root_path, &app.repo_session.repo_state.root.?);
     defer unchanged_request.deinit(allocator);
@@ -387,7 +387,7 @@ test "Repository page header unchanged branch completion redraws fresh terminal"
     try std.testing.expect(app.pages.repository.branch.freshness == .fresh);
     try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 
-    app.pages.repository.requestReload(true);
+    app.pages.repository.requestReload(true, .manual);
     app.pages.repository.needs_revalidation = false;
     var inactive_request = try app.pages.repository.prepareBranchRequest(allocator, root_path, &app.repo_session.repo_state.root.?);
     defer inactive_request.deinit(allocator);

@@ -141,6 +141,7 @@ pub const Msg = union(enum) {
     cancel_pull,
     branch_switch_move_previous,
     branch_switch_move_next,
+    request_branch_switch,
     confirm_branch_switch,
     cancel_branch_switch,
     close_remote_error,

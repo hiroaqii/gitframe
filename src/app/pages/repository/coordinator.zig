@@ -169,8 +169,8 @@ pub const Controller = struct {
         };
     }
 
-    pub fn requestReload(self: Controller) void {
-        self.page_state.requestReload(self.repo.activeRoot() != null);
+    pub fn requestReload(self: Controller, cause: repository_page.RepositoryPageState.ReloadCause) void {
+        self.page_state.requestReload(self.repo.activeRoot() != null, cause);
     }
 
     /// Starts pending members in the established primary/auxiliary order.
@@ -189,11 +189,11 @@ pub const Controller = struct {
     fn maybeStartManifest(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !bool {
         if (self.active_page != .repository or !self.page_state.wantsManifestRequest()) return false;
         const repo_root = self.repo.activeRoot() orelse {
-            self.page_state.requestReload(false);
+            self.page_state.requestReload(false, .manual);
             return true;
         };
         const capability = self.repo.activeCapability() orelse {
-            self.page_state.requestReload(false);
+            self.page_state.requestReload(false, .manual);
             return true;
         };
 

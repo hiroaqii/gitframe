@@ -252,9 +252,6 @@ pub const FetchTargetResult = union(enum) {
 
 pub const BranchSwitchTargetResult = union(enum) {
     ready: BranchSwitchTarget,
-    unavailable_source,
-    no_repo,
-    loading_branch_status,
     detached_head,
     branch_unavailable,
     branch_status_unavailable,
@@ -422,12 +419,8 @@ pub fn fetchTarget(ctx: RemoteActionContext) FetchTargetResult {
     } };
 }
 
-pub fn branchSwitchTarget(ctx: RemoteActionContext) BranchSwitchTargetResult {
-    if (!diff_source.sourceAllowsStageProjection(ctx.source)) return .unavailable_source;
-    const repo_root = ctx.repo_root orelse return .no_repo;
-    if (!ctx.branch_status.freshFor(repo_root)) return .loading_branch_status;
-
-    const branch_status = ctx.branch_status.status;
+/// Validate the branch snapshot supplied by the picker read owner.
+pub fn branchSwitchTarget(repo_root: []const u8, branch_status: git_branch_status.BranchStatus) BranchSwitchTargetResult {
     const branch = switch (branch_status.head) {
         .branch => |name| name,
         .detached => return .detached_head,
@@ -1109,41 +1102,10 @@ test "pullTarget rejects unsafe branch and worktree states" {
 }
 
 test "branchSwitchTarget rejects unsupported branch states" {
-    const ready_status: git_branch_status.BranchStatus = .{
-        .oid = "abc123",
-        .head = .{ .branch = "feature" },
-    };
-
-    try std.testing.expectEqual(BranchSwitchTargetResult.unavailable_source, branchSwitchTarget(.{
-        .source = .{ .range = "HEAD~1..HEAD" },
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-    }));
-    try std.testing.expectEqual(BranchSwitchTargetResult.no_repo, branchSwitchTarget(.{
-        .source = .unstaged,
-        .repo_root = null,
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-    }));
-    try std.testing.expectEqual(BranchSwitchTargetResult.loading_branch_status, branchSwitchTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = true, .status = ready_status },
-    }));
-    try std.testing.expectEqual(BranchSwitchTargetResult.detached_head, branchSwitchTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{ .oid = "abc123", .head = .detached } },
-    }));
-    try std.testing.expectEqual(BranchSwitchTargetResult.branch_status_unavailable, branchSwitchTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{ .head = .{ .branch = "feature" } } },
-    }));
-    switch (branchSwitchTarget(.{
-        .source = .cached,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-    })) {
+    try std.testing.expectEqual(BranchSwitchTargetResult.detached_head, branchSwitchTarget("/repo", .{ .oid = "abc123", .head = .detached }));
+    try std.testing.expectEqual(BranchSwitchTargetResult.branch_unavailable, branchSwitchTarget("/repo", .{ .head = .unknown }));
+    try std.testing.expectEqual(BranchSwitchTargetResult.branch_status_unavailable, branchSwitchTarget("/repo", .{ .head = .{ .branch = "feature" } }));
+    switch (branchSwitchTarget("/repo", .{ .oid = "abc123", .head = .{ .branch = "feature" } })) {
         .ready => |target| {
             try std.testing.expectEqualStrings("/repo", target.repo_root);
             try std.testing.expectEqualStrings("feature", target.branch);

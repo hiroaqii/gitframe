@@ -1401,7 +1401,7 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
     const size = content.size();
     if (size.height == 0) return;
 
-    const subtitle = try std.fmt.allocPrint(content.frameAllocator(), "Current: {s}", .{state.current_branch});
+    const subtitle = try std.fmt.allocPrint(content.frameAllocator(), "Current: {s}", .{if (state.loading) "loading..." else state.current_branch});
     try draw.copyClippedTextAt(&content, 0, 0, subtitle, app.theme.style(.muted));
     if (size.height > 2) {
         var note_style = app.theme.style(.muted);
@@ -1779,11 +1779,13 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             const input = app.repository.page_state.inputContext(app.keymap);
             if (input.source_search_mode or
                 input.file_search_mode or
+                input.selection_owner != .none or
                 app.repository.page_state.retainedSourceSelection() != null)
             {
                 return result;
             }
 
+            appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
         },
@@ -2469,6 +2471,7 @@ test "footer normal-mode hints match the decided page lists" {
     context.active_page = .repository;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2630,6 +2633,7 @@ test "footer normal-mode hints follow state and local key ownership" {
     context.active_page = .repository;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2639,9 +2643,22 @@ test "footer normal-mode hints follow state and local key ownership" {
     context.active_page = .repository;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
+
+    harness.repository.selection_owner = .{ .source_header = .{ .identity = .{
+        .repo_epoch = 1,
+        .activation_id = 1,
+        .root_identity = .{ .device = 1, .inode = 1 },
+        .manifest_revision = 1,
+        .path = "src/main.zig",
+    } } };
+    context = harness.context();
+    context.active_page = .repository;
+    try std.testing.expectEqual(@as(usize, 0), footerHints(context, &key_buffers).len);
+    harness.repository.selection_owner = .none;
 
     harness.repository.viewer.tree_hidden = false;
     harness.changes.search.mode = true;
@@ -3522,6 +3539,7 @@ const help_repository_global_items = [_]HelpItem{
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .key = .{ .action = .help }, .description = "open / close help" },
     .{ .key = .{ .action = .reload }, .description = "force reload" },
+    .{ .key = .{ .action = .branch_switch }, .description = "switch branch" },
     .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
     .{ .key = .{ .text = "q" }, .description = "quit" },
 };

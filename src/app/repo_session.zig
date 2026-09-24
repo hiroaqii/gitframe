@@ -1102,7 +1102,7 @@ test "workspace repository commitments advance one authoritative epoch" {
         .loading = true,
     };
     app.remote.branch_switch_load_pending = 19;
-    app.overlay.openSwitchBranch();
+    app.overlay.openSwitchBranch(.changes);
     try std.testing.expectEqual(CommitOutcome.unchanged, app.repoSession().commitWorkspaceIndex(allocator, 0));
     try std.testing.expectEqual(@as(u64, 0), app.repoSessionView().epoch());
     try std.testing.expect(app.pages.changes.pending_reload == null);
@@ -1113,7 +1113,7 @@ test "workspace repository commitments advance one authoritative epoch" {
 
     app.remote.remote_error_operation = .push;
     app.remote.remote_error_message = try allocator.dupe(u8, "old repository push failure");
-    app.overlay.openRemoteError();
+    app.overlay.openRemoteError(.changes);
     const deferred_identity = app.pages.changes.activation.currentIdentity().?;
     app.pages.changes.deferred_source_apply = .{
         .finished = .{

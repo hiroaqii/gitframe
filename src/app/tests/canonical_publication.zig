@@ -1145,7 +1145,7 @@ test "repo picker capability rejection preserves Changes navigation and does not
         .loading = true,
     };
     app.remote_workflow.branch_switch_load_pending = 12;
-    app.overlay.openSwitchBranch();
+    app.overlay.openSwitchBranch(.changes);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer ctx.runtimeClearPendingEffectCopies();
     const generation = app.repo_session.repo_picker.beginPathDiscovery();

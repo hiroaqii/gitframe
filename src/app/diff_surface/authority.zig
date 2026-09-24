@@ -50,14 +50,13 @@ pub const Action = enum {
     push,
     pull,
     fetch,
-    switch_branch,
 
     pub fn requirements(self: Action) Requirements {
         return switch (self) {
             .read_diff => .{ .source = .readable },
             .stage_hunk, .unstage_hunk => .{ .source = .fresh, .status = .fresh },
             .stage_file, .unstage_file, .discard_file, .commit => .{ .source = .fresh, .status = .fresh },
-            .push, .fetch, .switch_branch => .{ .branch = .fresh },
+            .push, .fetch => .{ .branch = .fresh },
             .pull => .{ .status = .fresh, .branch = .fresh },
         };
     }
@@ -312,7 +311,7 @@ test "immutable source satisfies readable but not mutable authority" {
 test "action requirements do not globally couple auxiliary members" {
     try std.testing.expectEqual(
         Requirements{ .branch = .fresh },
-        Action.switch_branch.requirements(),
+        Action.fetch.requirements(),
     );
     try std.testing.expectEqual(
         Requirements{ .branch = .fresh },

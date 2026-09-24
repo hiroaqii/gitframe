@@ -59,11 +59,10 @@ pub fn acceptBranchListResult(
 ) BranchListAcceptance {
     const pending_generation = pending.* orelse return .no_pending;
     if (pending_generation != result_generation) return .stale_pending_generation;
-    pending.* = null;
-
     if (!state_has_value) return .missing_state;
     if (state_generation != result_generation) return .stale_state_generation;
     if (!std.mem.eql(u8, state_repo_root, result_repo_root)) return .repo_mismatch;
+    pending.* = null;
     return .accepted;
 }
 
@@ -278,21 +277,21 @@ test "acceptBranchListResult requires pending state generation and repo match" {
         BranchListAcceptance.missing_state,
         acceptBranchListResult(&pending, false, 2, "/repo", 2, "/repo"),
     );
-    try std.testing.expectEqual(@as(?u64, null), pending);
+    try std.testing.expectEqual(@as(?u64, 2), pending);
 
     pending = 3;
     try std.testing.expectEqual(
         BranchListAcceptance.stale_state_generation,
         acceptBranchListResult(&pending, true, 4, "/repo", 3, "/repo"),
     );
-    try std.testing.expectEqual(@as(?u64, null), pending);
+    try std.testing.expectEqual(@as(?u64, 3), pending);
 
     pending = 5;
     try std.testing.expectEqual(
         BranchListAcceptance.repo_mismatch,
         acceptBranchListResult(&pending, true, 5, "/repo", 5, "/other"),
     );
-    try std.testing.expectEqual(@as(?u64, null), pending);
+    try std.testing.expectEqual(@as(?u64, 5), pending);
 
     pending = 8;
     try std.testing.expectEqual(

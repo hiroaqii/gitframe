@@ -52,6 +52,7 @@ const RemoteHarness = struct {
 
     allocator: ?std.mem.Allocator = std.testing.allocator,
     active_page: page.Id = .changes,
+    repository_status: app_state.StatusMessage = .{},
     repo_session: repo_session.State = .{},
     pages: RemotePages = .{},
     config: struct { source: diff_source.SourceMode = .unstaged } = .{},
@@ -161,6 +162,15 @@ const RemoteHarness = struct {
                 .repo_epoch = self.repoSessionView().epoch(),
                 .activation_id = snapshot.changes_activation_id,
             },
+            .branch_origin = switch (self.active_page) {
+                .changes, .repository => .{
+                    .page_id = self.active_page,
+                    .repo_epoch = self.repoSessionView().epoch(),
+                    .activation_id = if (self.active_page == .changes) snapshot.changes_activation_id else snapshot.repository_activation_id,
+                },
+                else => null,
+            },
+            .repository_status = &self.repository_status,
             .effect_snapshot = snapshot,
             .status = &self.pages.changes.status,
             .overlay = &self.overlay,
@@ -409,7 +419,12 @@ fn branchListForTest(
         };
         initialized += 1;
     }
-    return .{ .loaded = .{ .branches = items } };
+    var current: ?[]u8 = null;
+    for (specs) |spec| if (spec.current) {
+        current = try allocator.dupe(u8, spec.name);
+        break;
+    };
+    return .{ .loaded = .{ .branches = items, .current = current } };
 }
 
 fn branchSwitchItemsForTest(
@@ -829,21 +844,13 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     var app: RemoteHarness = .{
         .allocator = allocator,
         .env_map = &parent_environment,
+        .active_page = .repository,
     };
     try installActiveRepoForTest(&app, allocator, slot_path);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.pages.changes.branch_status.deinit();
     defer app.pages.changes.git_status.deinit();
     defer app.clearBranchSwitch(allocator);
-
-    var branch_bundle = try branchStatusBundleForTest(allocator, .{
-        .oid = "abc123",
-        .branch = "main",
-    });
-    try app.pages.changes.branch_status.replace(slot_path, &branch_bundle);
-    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "");
-    try app.pages.changes.git_status.replace(slot_path, &status_bundle);
-    syncTestActivation(&app);
 
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
     defer clearPendingBranchListTasks(&ctx, allocator);
@@ -854,7 +861,9 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try std.testing.expect(app.remote_workflow.branch_switch.loading);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
     const task: *BranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0..ctx._pending_tasks_with_len][0].ctx));
-    try std.testing.expectEqual(page.Id.changes, task.origin);
+    try std.testing.expectEqual(page.Id.repository, task.origin);
+    try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
+    try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
     try std.testing.expectEqual(app.repo_session.repo_epoch, task.repo_epoch);
     try std.testing.expectEqual(app.pages.changes.activation.next_activation_id, task.activation_id);
     try std.testing.expectEqualStrings(slot_path, task.repo_root);
@@ -905,7 +914,29 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     // resolves to replacement B.
     finished_owned = false;
     try app.finishBranchListLoad(&ctx, finished);
+    const expected_oid = try allocator.dupe(u8, app.remote_workflow.branch_switch.current_oid);
+    defer allocator.free(expected_oid);
+    try std.testing.expect(expected_oid.len == 40);
+    const DummyConfirmTask = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) RemoteHarness.Msg {
+            return .quit;
+        }
+        fn failed(_: chasen.TaskFailure) RemoteHarness.Msg {
+            return .quit;
+        }
+    };
+    var saturated: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
+    for (0..16) |_| try saturated.task().spawn(.{ .run = DummyConfirmTask.run, .failed = DummyConfirmTask.failed });
+    try std.testing.expectError(error.TaskLimitExceeded, app.confirmBranchSwitch(&saturated));
+    try std.testing.expect(app.overlay.isSwitchBranch());
+    try std.testing.expect(!app.actionLifecycleView().hasPending());
+    try std.testing.expect(app.remote_workflow.branch_switch_pending == null);
+    try std.testing.expect(app.pages.changes.repository_read_authority.mayStartRepositoryRead());
+    try std.testing.expectEqualStrings(expected_oid, app.remote_workflow.branch_switch.current_oid);
+    _ = saturated.takePendingTasks();
+
     try app.confirmBranchSwitch(&ctx);
+    try std.testing.expectEqual(page.Id.repository, app.remote_workflow.branch_switch_pending.?.owner.origin.page_id);
     const switch_entries = ctx.takePendingTasksWith();
     try std.testing.expectEqual(@as(usize, 1), switch_entries.len);
     const SwitchTask = app_actions.SwitchBranchTask(RemoteHarness.Msg);
@@ -974,6 +1005,12 @@ test "requestBranchSwitch opens picker with untracked-only status" {
 
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
     defer clearPendingBranchListTasks(&ctx, allocator);
+    app.config.source = .{ .range = "HEAD~1..HEAD" };
+    try app.requestBranchSwitch(&ctx);
+    try std.testing.expect(!app.remote_workflow.branch_switch.hasState());
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqualStrings("branch switch unavailable for this source", app.pages.changes.status.text());
+    app.config.source = .unstaged;
     try app.requestBranchSwitch(&ctx);
 
     try std.testing.expect(app.overlay.isSwitchBranch());
@@ -981,139 +1018,99 @@ test "requestBranchSwitch opens picker with untracked-only status" {
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
 }
 
-test "finishBranchListLoad ignores stale result and accepts matching generation" {
-    var app: RemoteHarness = .{
-        .allocator = std.testing.allocator,
-        .remote_workflow = .{
-            .branch_switch = .{
-                .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
-                .current_branch = try std.testing.allocator.dupe(u8, "main"),
-                .current_oid = try std.testing.allocator.dupe(u8, "abc123"),
-                .generation = 3,
-                .loading = true,
-            },
-            .branch_switch_load_pending = 3,
-        },
-        .overlay = .{ .kind = .switch_branch },
+test "finishBranchListLoad correlates caller repository activation and generation" {
+    const allocator = std.testing.allocator;
+    var app: RemoteHarness = .{ .active_page = .repository };
+    const repo_root = try installCurrentRepoForTest(&app, allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.clearBranchSwitch(allocator);
+    const origin = app.remoteWorkflow().branch_origin.?;
+    app.remote_workflow.branch_switch = .{
+        .owner = .{ .origin = origin, .root_identity = app.repoSessionView().activeIdentity().? },
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .generation = 3,
+        .loading = true,
     };
-    defer app.clearBranchSwitch(std.testing.allocator);
+    app.remote_workflow.branch_switch_load_pending = 3;
+    app.overlay.openSwitchBranch(.repository);
+    var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
 
-    var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
-
+    const wrong = [_]struct { origin: page.Id = .repository, epoch: u64, activation: u64 = 0, generation: u64 = 3, root: []const u8 }{
+        .{ .epoch = origin.repo_epoch, .generation = 2, .root = repo_root },
+        .{ .epoch = origin.repo_epoch, .origin = .changes, .root = repo_root },
+        .{ .epoch = origin.repo_epoch + 1, .root = repo_root },
+        .{ .epoch = origin.repo_epoch, .activation = 1, .root = repo_root },
+        .{ .epoch = origin.repo_epoch, .root = "/different" },
+    };
+    for (wrong) |case| {
+        try app.finishBranchListLoad(&ctx, .{
+            .origin = case.origin,
+            .repo_epoch = case.epoch,
+            .activation_id = case.activation,
+            .generation = case.generation,
+            .repo_root = try allocator.dupe(u8, case.root),
+            .result = .{ .failed_static = "unrelated failure" },
+        });
+        try std.testing.expectEqual(@as(?u64, 3), app.remote_workflow.branch_switch_load_pending);
+        try std.testing.expect(app.remote_workflow.branch_switch.loading);
+        try std.testing.expectEqualStrings("", app.repository_status.text());
+    }
     try app.finishBranchListLoad(&ctx, .{
-        .origin = .changes,
-        .repo_epoch = 0,
-        .activation_id = 0,
-        .generation = 2,
-        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
-        .result = try branchListForTest(std.testing.allocator, &.{
-            .{ .name = "main", .oid = "abc123", .current = true, .tip_committer_unix = 100 },
-        }),
-    });
-    try std.testing.expect(app.remote_workflow.branch_switch.loading);
-    try std.testing.expectEqual(@as(usize, 0), app.remote_workflow.branch_switch.branches.len);
-
-    try app.finishBranchListLoad(&ctx, .{
-        .origin = .changes,
-        .repo_epoch = 0,
+        .origin = .repository,
+        .repo_epoch = origin.repo_epoch,
         .activation_id = 0,
         .generation = 3,
-        .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
-        .result = try branchListForTest(std.testing.allocator, &.{
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .result = try branchListForTest(allocator, &.{
             .{ .name = "main", .oid = "abc123", .current = true, .tip_committer_unix = 100 },
             .{ .name = "feature/older", .oid = "def456", .tip_committer_unix = 200 },
             .{ .name = "feature/newest", .oid = "fedcba", .tip_committer_unix = 300 },
             .{ .name = "feature/unknown", .oid = "456def" },
         }),
     });
-
-    try std.testing.expect(!app.remote_workflow.branch_switch.loading);
-    try std.testing.expectEqual(@as(usize, 4), app.remote_workflow.branch_switch.branches.len);
-    try std.testing.expectEqual(@as(usize, 0), app.remote_workflow.branch_switch.selected_index);
-    try std.testing.expectEqualStrings("feature/newest", app.remote_workflow.branch_switch.branches[0].name);
-    try std.testing.expectEqual(@as(?i64, 300), app.remote_workflow.branch_switch.branches[0].tip_committer_unix);
-    try std.testing.expectEqualStrings("feature/older", app.remote_workflow.branch_switch.branches[1].name);
-    try std.testing.expectEqualStrings("main", app.remote_workflow.branch_switch.branches[2].name);
-    try std.testing.expect(app.remote_workflow.branch_switch.branches[2].current);
-    try std.testing.expectEqualStrings("feature/unknown", app.remote_workflow.branch_switch.branches[3].name);
-    try std.testing.expect(app.remote_workflow.branch_switch.branches[3].tip_committer_unix == null);
+    const state = &app.remote_workflow.branch_switch;
+    try std.testing.expect(app.remote_workflow.branch_switch_load_pending == null);
+    try std.testing.expect(!state.loading);
+    try std.testing.expectEqualStrings("main", state.current_branch);
+    try std.testing.expectEqualStrings("abc123", state.current_oid);
+    try std.testing.expectEqual(@as(usize, 0), state.selected_index);
+    try std.testing.expectEqualStrings("feature/newest", state.branches[0].name);
+    try std.testing.expectEqualStrings("feature/older", state.branches[1].name);
+    try std.testing.expect(state.branches[2].current);
+    try std.testing.expect(state.branches[3].tip_committer_unix == null);
 }
 
-test "finishBranchListLoad rejects matching operation from stale repo epoch" {
+test "stale branch-list success cannot publish into reactivated Changes" {
     const allocator = std.testing.allocator;
-    var app: RemoteHarness = .{
-        .allocator = allocator,
-        .repo_session = .{
-            .repo_epoch = 4,
-        },
-        .remote_workflow = .{
-            .branch_switch = .{
-                .repo_root = try allocator.dupe(u8, "/repo"),
-                .current_branch = try allocator.dupe(u8, "main"),
-                .current_oid = try allocator.dupe(u8, "abc123"),
-                .generation = 3,
-                .loading = true,
-            },
-            .branch_switch_load_pending = 3,
-        },
-        .overlay = .{ .kind = .switch_branch },
-    };
+    var app: RemoteHarness = .{};
+    const repo_root = try installCurrentRepoForTest(&app, allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
     defer app.clearBranchSwitch(allocator);
-    app.pages.changes.status.set("retained", .{});
-    var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
-
-    try app.finishBranchListLoad(&ctx, .{
-        .origin = .changes,
-        .repo_epoch = 3,
-        .activation_id = 1,
+    const old = app.pages.changes.activation.activate(app.repo_session.repo_epoch, .fresh, .fresh, .fresh);
+    const origin = app.remoteWorkflow().branch_origin.?;
+    app.remote_workflow.branch_switch = .{
+        .owner = .{ .origin = origin, .root_identity = app.repoSessionView().activeIdentity().? },
+        .repo_root = try allocator.dupe(u8, repo_root),
         .generation = 3,
-        .repo_root = try allocator.dupe(u8, "/repo"),
-        .result = .{ .failed = try allocator.dupe(u8, "stale failure") },
-    });
-
-    try std.testing.expectEqual(@as(?u64, 3), app.remote_workflow.branch_switch_load_pending);
-    try std.testing.expect(app.remote_workflow.branch_switch.loading);
-    try std.testing.expectEqual(@as(usize, 0), app.remote_workflow.branch_switch.branches.len);
-    try std.testing.expectEqualStrings("retained", app.pages.changes.status.text());
-}
-
-test "stale branch-list diagnostic does not overwrite reactivated Changes" {
-    const allocator = std.testing.allocator;
-    var app: RemoteHarness = .{
-        .allocator = allocator,
-        .remote_workflow = .{
-            .branch_switch = .{
-                .repo_root = try allocator.dupe(u8, "/repo"),
-                .current_branch = try allocator.dupe(u8, "main"),
-                .current_oid = try allocator.dupe(u8, "abc123"),
-                .generation = 3,
-                .loading = true,
-            },
-            .branch_switch_load_pending = 3,
-        },
-        .overlay = .{ .kind = .switch_branch },
+        .loading = true,
     };
-    defer app.clearBranchSwitch(allocator);
-    const old_activation = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
-    const new_activation = app.pages.changes.activation.activate(0, .fresh, .fresh, .fresh);
-    try std.testing.expect(old_activation != new_activation);
+    app.remote_workflow.branch_switch_load_pending = 3;
+    app.overlay.openSwitchBranch(.changes);
+    _ = app.pages.changes.activation.activate(app.repo_session.repo_epoch, .fresh, .fresh, .fresh);
     app.pages.changes.status.set("new Changes diagnostic", .{});
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
-
     try app.finishBranchListLoad(&ctx, .{
         .origin = .changes,
-        .repo_epoch = 0,
-        .activation_id = old_activation,
+        .repo_epoch = origin.repo_epoch,
+        .activation_id = old,
         .generation = 3,
-        .repo_root = try allocator.dupe(u8, "/repo"),
-        .result = .{ .failed = try allocator.dupe(u8, "old operation failure") },
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .result = try branchListForTest(allocator, &.{.{ .name = "main", .oid = "abc", .current = true }}),
     });
-
     try std.testing.expect(app.remote_workflow.branch_switch_load_pending == null);
     try std.testing.expect(!app.remote_workflow.branch_switch.hasState());
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expectEqualStrings("new Changes diagnostic", app.pages.changes.status.text());
-    try std.testing.expect(!app.redraw_plan.resolvesToSkip());
 }
 
 test "confirmBranchSwitch treats current branch as no-op without clearing state" {
@@ -1131,6 +1128,14 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
             }),
         } },
         .overlay = .{ .kind = .switch_branch },
+    };
+    const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
+    defer app.repo_session.repo_state.deinit(std.testing.allocator);
+    std.testing.allocator.free(app.remote_workflow.branch_switch.repo_root);
+    app.remote_workflow.branch_switch.repo_root = try std.testing.allocator.dupe(u8, repo_root);
+    app.remote_workflow.branch_switch.owner = .{
+        .origin = app.remoteWorkflow().branch_origin.?,
+        .root_identity = app.repoSessionView().activeIdentity().?,
     };
     defer app.clearBranchSwitch(std.testing.allocator);
     defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
@@ -1162,13 +1167,17 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
         } },
         .overlay = .{ .kind = .switch_branch },
     };
+    missing_authority.remote_workflow.branch_switch.owner = .{
+        .origin = missing_authority.remoteWorkflow().branch_origin.?,
+        .root_identity = .{ .device = 0, .inode = 0 },
+    };
     defer missing_authority.clearBranchSwitch(std.testing.allocator);
     var missing_ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = std.testing.allocator };
 
     try missing_authority.confirmBranchSwitch(&missing_ctx);
 
     try std.testing.expectEqualStrings("branch switch unavailable: repository authority changed", missing_authority.pages.changes.status.text());
-    try std.testing.expect(missing_authority.remote_workflow.branch_switch.hasState());
+    try std.testing.expect(!missing_authority.remote_workflow.branch_switch.hasState());
     try std.testing.expectEqual(@as(u8, 0), missing_ctx._pending_tasks_with_len);
     try std.testing.expect(!missing_authority.actionLifecycleView().hasPending());
 }

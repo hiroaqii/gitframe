@@ -100,7 +100,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .push => .request_push,
         .pull => .request_pull,
         .fetch => .request_fetch,
-        .branch_switch => .request_branch_switch,
+        .branch_switch => null,
         .discard => .request_discard_selected_file,
         .toggle_display_mode => .toggle_display_mode,
         .toggle_line_numbers => .toggle_line_numbers,
@@ -214,7 +214,6 @@ test "sidebar visibility and width commands remain Changes-local" {
     try std.testing.expectEqual(Msg.toggle_focus, keyToMsg(.{}, .{ .codepoint = chasen.Key.tab }).?);
     try std.testing.expect(keyToMsg(.{ .sidebar_hidden = true }, .{ .codepoint = chasen.Key.tab }) == null);
     try std.testing.expectEqual(Msg.toggle_sidebar_visibility, keyToMsg(.{}, .{ .codepoint = 'b', .mods = .{ .shift = true } }).?);
-    try std.testing.expectEqual(Msg.request_branch_switch, keyToMsg(.{}, .{ .codepoint = 'b' }).?);
     try std.testing.expectEqual(Msg.decrease_sidebar_width, keyToMsg(.{}, .{ .codepoint = '<' }).?);
     try std.testing.expectEqual(Msg.increase_sidebar_width, keyToMsg(.{}, .{ .codepoint = '>' }).?);
 }

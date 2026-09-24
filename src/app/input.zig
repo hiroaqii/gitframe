@@ -195,6 +195,18 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(routing_key)) return app_message.Msg.enter_repo_picker;
     if (context.keymap.spec(.reload)) |spec| if (spec.matches(routing_key)) return app_message.Msg.reload;
 
+    if (context.active_page == .changes or context.active_page == .repository) {
+        if (context.keymap.spec(.branch_switch)) |spec| if (spec.matches(routing_key)) {
+            const selection_owned = switch (context.active_page) {
+                .changes => context.changes.selection_owner != .none,
+                .repository => context.repository.selection_owner != .none,
+                else => unreachable,
+            };
+            if (selection_owned or context.active_selection_gesture) return null;
+            return .request_branch_switch;
+        };
+    }
+
     // Repository configured actions claim the canonical logical key even
     // when their current precondition or page handler returns no message.
     // Only a truly unclaimed colon may open the local command session.
@@ -1445,4 +1457,42 @@ fn shiftedLowerOnly(lower: u21) chasen.Key {
         .codepoint = lower,
         .mods = .{ .shift = true },
     };
+}
+
+test "branch switch routing honors effective keys and existing input owners" {
+    const b: chasen.Key = .{ .codepoint = 'b' };
+    for ([_]page.Id{ .changes, .repository }) |id| {
+        try std.testing.expectEqual(app_message.Msg.request_branch_switch, keyToMsg(.{ .active_page = id }, b).?);
+        try std.testing.expect(keyToMsg(.{ .active_page = id, .branch_switch_mode = true }, b) == null);
+        try std.testing.expect(keyToMsg(.{ .active_page = id, .help_mode = true }, b) == null);
+    }
+    try std.testing.expectEqual(changesMsg(.{ .search_insert = 'b' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, b).?);
+    try std.testing.expectEqual(
+        app_message.Msg{ .repository = .{ .source_search_insert = 'b' } },
+        keyToMsg(.{ .active_page = .repository, .repository = .{ .source_search_mode = true } }, b).?,
+    );
+    try std.testing.expectEqual(
+        app_message.Msg{ .command_line = .{ .insert = 'b' } },
+        keyToMsg(.{ .active_page = .repository, .command_line_active = true }, b).?,
+    );
+    inline for (.{ .keyboard_line, .mouse, .header }) |owner| {
+        try std.testing.expect(keyToMsg(.{ .changes = .{ .selection_owner = owner } }, b) == null);
+        try std.testing.expect(keyToMsg(.{ .active_page = .repository, .repository = .{ .selection_owner = owner } }, b) == null);
+    }
+    try std.testing.expectEqual(app_message.Msg.request_branch_switch, keyToMsg(.{
+        .active_page = .repository,
+        .repository = .{ .retained_selection_action_available = true },
+    }, b).?);
+    var custom: keymap.Config = .{};
+    custom.set(.branch_switch, .{ .plain_codepoint = ':' });
+    const effective = keymap.Effective.fromConfig(custom);
+    try std.testing.expectEqual(app_message.Msg.request_branch_switch, keyToMsg(.{
+        .active_page = .repository,
+        .keymap = effective,
+        .repository = .{ .keymap = effective },
+        .repository_command_available = true,
+    }, .{ .codepoint = ':' }).?);
+    for ([_]page.Id{ .history, .compare, .config }) |id| {
+        if (keyToMsg(.{ .active_page = id }, b)) |msg| try std.testing.expect(msg != .request_branch_switch);
+    }
 }

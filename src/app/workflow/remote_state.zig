@@ -7,6 +7,7 @@ const std = @import("std");
 const app_push_retry = @import("../push_retry.zig");
 const remote_request = @import("../remote_request.zig");
 const app_state = @import("../state.zig");
+const app_actions = @import("../actions.zig");
 
 pub const State = struct {
     push_confirmation: ?app_state.PushConfirmation = null,
@@ -17,6 +18,10 @@ pub const State = struct {
     branch_switch: app_state.BranchSwitchState = .{},
     branch_switch_load_generation: u64 = 0,
     branch_switch_load_pending: ?u64 = null,
+    branch_switch_pending: ?struct {
+        token: app_actions.PendingAction,
+        owner: app_state.BranchSwitchOwner,
+    } = null,
     action_control: remote_request.RemoteActionControl = .{},
     canceling_generation: ?u64 = null,
     quit_after_remote_terminal: bool = false,
