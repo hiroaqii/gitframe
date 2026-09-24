@@ -242,6 +242,7 @@ fn activePageHeaderRemoteActions(app: Context) ?PageBarRemoteActions {
     if (app.active_page != .changes) return null;
     if (app.changes.page.search.mode or app.changes.page.file_search.mode) return null;
     switch (app.changes.page.load.state) {
+        .loaded => {},
         .empty => |reason| if (reason != .no_changes) return null,
         else => return null,
     }
@@ -381,18 +382,6 @@ fn drawPageBarMetadata(metadata: PageBarMetadata, palette: theme.Palette, surfac
     const metadata_width = context_right -| context_start;
     const stats_drawable = if (stats_text) |text| text.total_width <= metadata_width else false;
 
-    if (metadata.line_stats == null) if (metadata.remote_actions) |actions| if (pageBarRemoteActionText(surface, actions, metadata_width)) |text| {
-        const action_col = context_right - text.width;
-        draw.copyClippedTextAt(
-            surface,
-            action_col,
-            shell_layout.page_bar_label_row,
-            text.text,
-            palette.style(.muted),
-        ) catch {};
-        context_right = action_col -| 2;
-    };
-
     if (stats_drawable) {
         const text = stats_text.?;
         const stats_right = context_right;
@@ -413,6 +402,19 @@ fn drawPageBarMetadata(metadata: PageBarMetadata, palette: theme.Palette, surfac
         ) catch {};
         context_right = stats_col -| 2;
     }
+
+    // Keep diff totals at the right edge; remote hints use the remaining width.
+    if (metadata.remote_actions) |actions| if (pageBarRemoteActionText(surface, actions, context_right -| context_start)) |text| {
+        const action_col = context_right - text.width;
+        draw.copyClippedTextAt(
+            surface,
+            action_col,
+            shell_layout.page_bar_label_row,
+            text.text,
+            palette.style(.muted),
+        ) catch {};
+        context_right = action_col -| 2;
+    };
 
     const value = metadata.presentation orelse return;
     if (context_start >= context_right) return;
@@ -2784,21 +2786,33 @@ test "page bar renders repository context after tabs and omits it in compact mod
     try std.testing.expect(std.mem.indexOf(u8, compact_snapshot, "HEAD ") == null);
 }
 
-test "page bar hides remote actions while showing diff totals" {
-    const presentation: page_header.Presentation = .{ .head = .{ .branch = .{
-        .display_name = "main",
-        .upstream = .{ .ahead = 0 },
-        .freshness = .fresh,
-    } } };
+test "page bar shows remote actions alongside loaded Changes diff totals" {
+    const test_support = @import("test_support.zig");
+    var harness: ShellViewTestHarness = .{ .changes = .{
+        .load = test_support.loadState(test_support.loadedDiffOne()),
+        .branch_status = .{
+            .repo_root = "/repo",
+            .status = .{
+                .head = .{ .branch = "main" },
+                .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+                .ahead_behind = .{ .ahead = 2, .behind = 0 },
+            },
+        },
+        .branch_status_load = .{ .freshness = .fresh },
+    } };
+    defer harness.changes.load.clearCurrent(null);
+    var context = harness.context();
+    context.changes.repo_root = "/repo";
+    const actions = activePageHeaderRemoteActions(context) orelse return error.ExpectedRemoteActions;
     const palette: theme.Palette = .default();
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(120, shell_layout.page_bar_rows);
     defer ts.deinit();
 
     viewPageBar(.changes, false, .{
-        .presentation = presentation,
+        .presentation = activePageHeaderPresentation(context, ts.surface.frameAllocator()),
         .line_stats = .{ .added = 39, .removed = 710 },
-        .remote_actions = .{ .keymap = .{}, .push = true, .pull = true },
+        .remote_actions = actions,
     }, palette, &ts.surface);
 
     const stats_col = ts.surface.size().width - 1 - chasen.text.displayWidth("+39 -710");
@@ -2814,9 +2828,8 @@ test "page bar hides remote actions while showing diff totals" {
 
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD main ↑0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "P: push") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD main ↑2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "(P: push / U: pull)  +39 -710") != null);
 }
 
 test "History page bar keeps compact comparison complete with diff totals at 120 columns" {
@@ -2845,7 +2858,7 @@ test "History page bar keeps compact comparison complete with diff totals at 120
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "+39 -710") != null);
 }
 
-test "page bar shows remote actions only in the clean layout" {
+test "page bar shows remote actions without diff totals" {
     const presentation: page_header.Presentation = .{ .head = .{ .branch = .{
         .display_name = "main",
         .upstream = .{ .ahead = 0 },
