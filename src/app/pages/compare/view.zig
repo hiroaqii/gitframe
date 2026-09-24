@@ -16,6 +16,7 @@ const page_header = @import("../../page_header.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const commit_time = @import("../../branch_commit_time.zig");
 const git_refs = @import("../../../git/refs.zig");
+const local_time = @import("../../../local_time.zig");
 
 pub const Context = struct {
     page: *const compare_page.ComparePageState,
@@ -117,7 +118,7 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
 
     if (app.page.basis) |basis| {
         if (next_row < body_end) {
-            const base = try std.fmt.allocPrint(content.frameAllocator(), "Base      {s}  merge destination", .{basis.base.display_name});
+            const base = try std.fmt.allocPrint(content.frameAllocator(), "Current Base  {s}  merge destination", .{basis.base.display_name});
             try draw.copyClippedTextAt(&content, 0, next_row, base, app.palette.style(.muted));
             next_row += 1;
         }
@@ -145,7 +146,6 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
         next_row += 1;
     }
     if (picker.selectedItem()) |item| {
-        if (next_row +| 1 < body_end) next_row += 1;
         if (next_row < body_end) {
             const candidate = try std.fmt.allocPrint(content.frameAllocator(), "Candidate {s}", .{item.name});
             try draw.copyClippedTextAt(&content, 0, next_row, candidate, chasen.TextStyle{});
@@ -156,8 +156,16 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
             try draw.copyClippedTextAt(&content, 0, next_row, full_ref, app.palette.style(.muted));
             next_row += 1;
         }
+        if (next_row < body_end) {
+            const last_commit = if (local_time.formatExact(item.tip_committer_unix)) |timestamp|
+                try std.fmt.allocPrint(content.frameAllocator(), "last commit: {s}", .{timestamp.text()})
+            else
+                "last commit: unknown";
+            try draw.copyClippedTextAt(&content, 0, next_row, last_commit, app.palette.style(.muted));
+            next_row += 1;
+        }
+        if (next_row +| 1 < body_end) next_row += 1;
     }
-    if (next_row +| 1 < body_end) next_row += 1;
 
     const list_start = next_row;
     const rows = body_end -| list_start;
@@ -202,7 +210,7 @@ pub fn viewBasePicker(app: Context, surface: *chasen.Surface) !void {
         }
     }
     if (legend_row < footer_row) {
-        try draw.copyClippedTextAt(&content, 0, legend_row, "* applied Base   > candidate", app.palette.style(.muted));
+        try draw.copyClippedTextAt(&content, 0, legend_row, "* current Base   > candidate", app.palette.style(.muted));
     }
     const footer = if (picker.input_mode == .query)
         "Type: filter  Up/Down: move  Enter: use as Base  Tab: command  Esc: clear"
@@ -381,7 +389,6 @@ test "Compare Base picker identifies accepted Base independently from candidate"
         .root_identity = null,
         .layout = .{ .width = 120, .height = 32 },
     };
-
     var applied: chasen.testing.TestSurface = undefined;
     try applied.init(120, 32);
     defer applied.deinit();
@@ -389,13 +396,26 @@ test "Compare Base picker identifies accepted Base independently from candidate"
     const applied_snapshot = try applied.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(applied_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Change comparison Base") != null);
-    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Base      origin/main  merge destination") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Current Base  origin/main  merge destination") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Base      origin/main  merge destination") == null);
     try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Compare   feature/context  current HEAD") != null);
-    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Filter branches: ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Candidate origin/main") != null);
+    const applied_filter_offset = std.mem.indexOf(u8, applied_snapshot, "Filter branches: ").?;
+    const applied_filter_row = std.mem.count(u8, applied_snapshot[0..applied_filter_offset], "\n");
+    const applied_candidate_offset = std.mem.indexOf(u8, applied_snapshot, "Candidate origin/main").?;
+    const applied_candidate_row = std.mem.count(u8, applied_snapshot[0..applied_candidate_offset], "\n");
+    try std.testing.expectEqual(applied_filter_row + 1, applied_candidate_row);
     try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "Full ref  refs/remotes/origin/main") != null);
-    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "> * [remote] origin/main") != null);
-    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "* applied Base   > candidate") != null);
+    const applied_time = local_time.formatExact(branches[0].tip_committer_unix).?;
+    const applied_last_commit = try std.fmt.allocPrint(allocator, "last commit: {s}", .{applied_time.text()});
+    const applied_last_commit_offset = std.mem.indexOf(u8, applied_snapshot, applied_last_commit).?;
+    const applied_last_commit_row = std.mem.count(u8, applied_snapshot[0..applied_last_commit_offset], "\n");
+    const applied_relative = commit_time.formatRelative(branches[0].tip_committer_unix, page.base_picker.render_now_unix);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, applied_relative.text()) != null);
+    const applied_branch_offset = std.mem.indexOf(u8, applied_snapshot, "> * [remote] origin/main").?;
+    const applied_branch_row = std.mem.count(u8, applied_snapshot[0..applied_branch_offset], "\n");
+    try std.testing.expectEqual(applied_last_commit_row + 2, applied_branch_row);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "* current Base   > candidate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "* applied Base   > candidate") == null);
     try std.testing.expect(std.mem.indexOf(u8, applied_snapshot, "/: filter  j/k: move  Enter: use as Base  Esc: cancel") != null);
 
     page.base_picker.filter.list.focus.index = 1;
@@ -407,8 +427,22 @@ test "Compare Base picker identifies accepted Base independently from candidate"
     defer std.testing.allocator.free(candidate_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, "Candidate main") != null);
     try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, "Full ref  refs/heads/main") != null);
+    const candidate_time = local_time.formatExact(branches[1].tip_committer_unix).?;
+    const candidate_last_commit = try std.fmt.allocPrint(allocator, "last commit: {s}", .{candidate_time.text()});
+    try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, candidate_last_commit) != null);
+    const candidate_relative = commit_time.formatRelative(branches[1].tip_committer_unix, page.base_picker.render_now_unix);
+    try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, candidate_relative.text()) != null);
     try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, "  * [remote] origin/main") != null);
     try std.testing.expect(std.mem.indexOf(u8, candidate_snapshot, ">   [local]  main") != null);
+
+    branches[1].tip_committer_unix = null;
+    var unknown: chasen.testing.TestSurface = undefined;
+    try unknown.init(120, 32);
+    defer unknown.deinit();
+    try viewBasePicker(context, &unknown.surface);
+    const unknown_snapshot = try unknown.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(unknown_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_snapshot, "last commit: unknown") != null);
 
     page.base_picker.input_mode = .query;
     var query: chasen.testing.TestSurface = undefined;
@@ -433,7 +467,6 @@ test "Compare Base picker reports unavailable, loading, failure, and narrow stat
         .root_identity = null,
         .layout = .{ .width = 120, .height = 32 },
     };
-
     var loading: chasen.testing.TestSurface = undefined;
     try loading.init(120, 32);
     defer loading.deinit();
@@ -441,9 +474,14 @@ test "Compare Base picker reports unavailable, loading, failure, and narrow stat
     const loading_snapshot = try loading.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(loading_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Current comparison unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Loading local and remote branches...") != null);
+    const loading_filter_offset = std.mem.indexOf(u8, loading_snapshot, "Filter branches: ").?;
+    const loading_filter_row = std.mem.count(u8, loading_snapshot[0..loading_filter_offset], "\n");
+    const loading_status_offset = std.mem.indexOf(u8, loading_snapshot, "Loading local and remote branches...").?;
+    const loading_status_row = std.mem.count(u8, loading_snapshot[0..loading_status_offset], "\n");
+    try std.testing.expectEqual(loading_filter_row + 1, loading_status_row);
     try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Candidate") == null);
     try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Full ref") == null);
+    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "last commit:") == null);
 
     page.base_picker.loading = false;
     page.base_picker.failure = .{ .static = "Could not load branches" };
