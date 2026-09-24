@@ -456,7 +456,7 @@ pub const RepositoryPageState = struct {
             owner.free(anchor);
         }
         self.all_selection_anchor = null;
-        self.file_visibility = .changed;
+        self.file_visibility = .all;
         self.tree_projection = .{};
         const retained_tree_width = self.viewer.tree_width;
         const retained_tree_hidden = self.preferredTreeHidden();
@@ -3966,7 +3966,7 @@ test "repository replacement retains hidden preference behind temporary search r
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expect(!state.file_search.mode);
-    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expect(state.selected_path == null);
 }
 
@@ -5141,7 +5141,7 @@ test "repository changed filter allocation failure leaves mode and selection unc
     try std.testing.expectEqualStrings("Could not preserve All selection", state.status.text());
 }
 
-test "repository filter discoverability defaults new identity and preserves same identity mode" {
+test "repository filter discoverability defaults new identity to All and preserves same identity mode" {
     const allocator = std.testing.allocator;
     const identity = root_capability.Identity{ .device = 1, .inode = 2 };
     var state: RepositoryPageState = .{
@@ -5175,7 +5175,7 @@ test "repository filter discoverability defaults new identity and preserves same
     try std.testing.expectEqualStrings("clean.zig", state.selected_path.?);
 
     state.repositoryChanged(allocator, 5, .{ .device = 3, .inode = 4 });
-    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expect(state.all_selection_anchor == null);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
@@ -5186,10 +5186,10 @@ test "repository filter discoverability defaults new identity and preserves same
     try applyBundleStatusForTest(&replacement, " M next-change.zig\x00");
     try state.replaceBundle(allocator, &replacement);
     replacement_owned = false;
-    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
-    try std.testing.expectEqual(@as(usize, 1), state.bundle.?.tree.visible_len);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+    try std.testing.expectEqual(@as(usize, 2), state.bundle.?.tree.visible_len);
     try std.testing.expectEqualStrings("next-change.zig", state.selected_path.?);
-    try std.testing.expect(state.bundle.?.tree.filePath("next-clean.zig", .changed) == null);
+    try expectProjectedPathForTest(&state, 2, "next-clean.zig");
 }
 
 test "repository status-only completion preserves source and revisions" {
