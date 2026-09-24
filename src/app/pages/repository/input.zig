@@ -357,14 +357,14 @@ test "repository input uses configured changed-file filter binding" {
 }
 
 test "repository input routes configured tree width actions" {
-    try std.testing.expectEqual(TestMsg.decrease_tree_width, keyToMsg(TestMsg, .{}, .{ .codepoint = '[' }).?);
-    try std.testing.expectEqual(TestMsg.increase_tree_width, keyToMsg(TestMsg, .{}, .{ .codepoint = ']' }).?);
+    try std.testing.expectEqual(TestMsg.decrease_tree_width, keyToMsg(TestMsg, .{}, .{ .codepoint = '<' }).?);
+    try std.testing.expectEqual(TestMsg.increase_tree_width, keyToMsg(TestMsg, .{}, .{ .codepoint = '>' }).?);
 
     var config: keymap.Config = .{};
     config.set(.increase_sidebar_width, .{ .plain_codepoint = 'z' });
     const effective = keymap.Effective.fromConfig(config);
     try std.testing.expectEqual(TestMsg.increase_tree_width, keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = 'z' }).?);
-    try std.testing.expect(keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = ']' }) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = '>' }) == null);
 }
 
 test "repository input routes configured tree visibility and suppresses hidden focus toggles" {

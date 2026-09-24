@@ -1183,6 +1183,10 @@ test "keymap rejects removed file edges and accepts document navigation actions"
         \\half_page_down = "ctrl+d"
         \\page_backward = "ctrl+b"
         \\page_forward = "ctrl+f"
+        \\previous_file = "["
+        \\next_file = "]"
+        \\decrease_sidebar_width = "<"
+        \\increase_sidebar_width = ">"
     );
     try std.testing.expect(parsed.keymap.get(.document_first).?.eql(.{ .plain_codepoint = 'g' }));
     try std.testing.expect(parsed.keymap.get(.document_last).?.eql(.{ .shifted_ascii = .{ .lower = 'g', .upper = 'G' } }));
@@ -1190,6 +1194,9 @@ test "keymap rejects removed file edges and accepts document navigation actions"
     try std.testing.expect(parsed.keymap.get(.half_page_down).?.eql(.{ .ctrl = .d }));
     try std.testing.expect(parsed.keymap.get(.page_backward).?.eql(.{ .ctrl = .b }));
     try std.testing.expect(parsed.keymap.get(.page_forward).?.eql(.{ .ctrl = .f }));
+    try std.testing.expect(parsed.keymap.get(.previous_file).?.eql(.{ .plain_codepoint = '[' }));
+    try std.testing.expect(parsed.keymap.get(.next_file).?.eql(.{ .plain_codepoint = ']' }));
+    try std.testing.expect(keymap.validateConfig(parsed.keymap));
 }
 
 test "loadConfig accepts external action definitions" {

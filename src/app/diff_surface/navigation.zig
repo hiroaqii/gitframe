@@ -2021,6 +2021,51 @@ pub const BodyController = struct {
         return .moved;
     }
 
+    /// Body navigation follows eligible file nodes, independently of the tree
+    /// cursor, directory disclosure, and the currently loaded body content.
+    pub fn selectAdjacentFile(self: BodyController, cleanup: SelectionMappingCleanup, delta: i2) !void {
+        if (self.controller.surface.viewer.focus != .diff or self.controller.surface.selection_owner.* != .none) return;
+        const loaded = self.controller.activeLoadedDiff() orelse return;
+        const selected = self.controller.surface.viewer.selected_target orelse return;
+        const sidebar_target: context.SidebarTarget = switch (selected) {
+            .diff_file => |index| .{ .diff_file = index },
+            .status_only => |index| .{ .status_entry = index },
+        };
+        const origin = for (loaded.tree.nodes, 0..) |node, index| {
+            if (node.kind == .file and std.meta.eql(node.target, sidebar_target)) break index;
+        } else return;
+        const display = self.controller.surface.review_display;
+        if (!loaded.shouldIncludeFileNode(origin, display.hide_reviewed_files, display.changed_file_filter)) return;
+
+        var index = origin;
+        const destination = while (true) {
+            if (delta < 0) {
+                if (index == 0) return;
+                index -= 1;
+            } else {
+                index += 1;
+                if (index >= loaded.tree.nodes.len) return;
+            }
+            if (loaded.tree.nodes[index].kind == .file and
+                loaded.shouldIncludeFileNode(index, display.hide_reviewed_files, display.changed_file_filter)) break index;
+        };
+
+        // Finish the only fallible preparation before clearing any retained
+        // selection or search. The ordinary reveal then needs no allocation.
+        if (loaded.visibleRowOfNode(destination) == null) {
+            const allocator = self.controller.loadArenaAllocator() orelse return error.MissingVisibleNodeAllocator;
+            var prepared = try loaded.prepareVisibleNodeRebuild(allocator);
+            file_tree.expandAncestors(&loaded.collapsed_dirs, loaded.tree.nodes[destination].path);
+            prepared.commit(display.hide_reviewed_files, display.changed_file_filter);
+        }
+        self.controller.clearCompletedSelectionWithViewport(self.resolver, cleanup.allocator);
+        if (cleanup.residual_owner) |owner| owner.clear();
+        self.controller.clearSearch();
+        try self.revealAndSelectExactNode(cleanup, loaded, destination, self.controller.loadArenaAllocator());
+        self.resetDiffPosition();
+        self.controller.resetDiffHorizontalScroll();
+    }
+
     pub fn selectFileDelta(self: BodyController, cleanup: SelectionMappingCleanup, delta: i2) void {
         const loaded = self.controller.activeLoadedDiff() orelse return;
         if (loaded.tree.nodes.len == 0 or loaded.visibleNodeCount() == 0) return;

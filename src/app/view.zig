@@ -2536,7 +2536,7 @@ test "footer normal-mode hints match the decided page lists" {
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("Tab/j/k", "focus/nav"),
-        ui.key_hint.item("[/]", "resize"),
+        ui.key_hint.item("</>", "resize"),
         ui.key_hint.item("r", "reload"),
         ui.key_hint.item("Esc", "previous diff"),
         ui.key_hint.item("R", "switch repo"),
@@ -2594,7 +2594,7 @@ test "History picker footer keeps the range action visible and explains an activ
         ui.key_hint.item("Space", "start range"),
         ui.key_hint.item("Enter", "open diff"),
         ui.key_hint.item("Tab/j/k", "focus/nav"),
-        ui.key_hint.item("[/]", "resize"),
+        ui.key_hint.item("</>", "resize"),
         ui.key_hint.item("r", "reload"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2609,7 +2609,7 @@ test "History picker footer keeps the range action visible and explains an activ
         ui.key_hint.item("Enter", "open diff"),
         ui.key_hint.item("y", "copy detail"),
         ui.key_hint.item("Tab/j/k", "focus/nav"),
-        ui.key_hint.item("[/]", "resize"),
+        ui.key_hint.item("</>", "resize"),
         ui.key_hint.item("r", "reload"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2623,7 +2623,7 @@ test "History picker footer keeps the range action visible and explains an activ
         ui.key_hint.item("Space", "clear range"),
         ui.key_hint.item("Enter", "open range diff"),
         ui.key_hint.item("Tab/j/k", "focus/nav"),
-        ui.key_hint.item("[/]", "resize"),
+        ui.key_hint.item("</>", "resize"),
         ui.key_hint.item("Esc", "cancel range"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -3115,8 +3115,8 @@ test "diff Help copy vocabulary follows effective mode for Changes Compare and H
             var popup: chasen.testing.TestSurface = undefined;
             try popup.init(60, 2);
             defer popup.deinit();
-            try drawHelpItem(context, &popup.surface, 0, help_diff_navigation_items[13]);
-            try drawHelpItem(context, &popup.surface, 1, help_diff_navigation_items[14]);
+            try drawHelpItem(context, &popup.surface, 0, help_diff_navigation_items[14]);
+            try drawHelpItem(context, &popup.surface, 1, help_diff_navigation_items[15]);
             const snapshot = try popup.snapshot(std.testing.allocator);
             defer std.testing.allocator.free(snapshot);
 
@@ -3146,6 +3146,7 @@ test "help popup uses effective document navigation labels and reaches its tail 
     var config: keymap.Config = .{};
     config.set(.document_first, .{ .plain_codepoint = 'z' });
     config.set(.half_page_down, .{ .plain_codepoint = 'x' });
+    config.set(.next_file, .{ .plain_codepoint = 'm' });
     try std.testing.expect(keymap.validateConfig(config));
     harness.keymap = keymap.Effective.fromConfig(config);
     harness.overlay.openHelpForPage(.repository);
@@ -3190,13 +3191,16 @@ test "help popup uses effective document navigation labels and reaches its tail 
         try viewHelpPopup(context, &navigation.surface);
         const navigation_snapshot = try navigation.snapshot(std.testing.allocator);
         defer std.testing.allocator.free(navigation_snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, navigation_snapshot, "[ / m") != null);
         try std.testing.expect(std.mem.indexOf(u8, navigation_snapshot, "z / G") != null);
         try std.testing.expect(std.mem.indexOf(u8, navigation_snapshot, "Ctrl+u / x") != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            navigation_snapshot,
-            "Ctrl+b / Ctrl+f   page backward / forward",
-        ) != null);
+        harness.overlay.help_scroll += 1;
+        context = harness.context();
+        context.active_page = help_page;
+        try viewHelpPopup(context, &navigation.surface);
+        const next_snapshot = try navigation.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(next_snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, next_snapshot, "Ctrl+b / Ctrl+f   page backward / forward") != null);
 
         harness.overlay.help_scroll = helpMaxScroll(size, help_page);
         context = harness.context();
@@ -3599,6 +3603,7 @@ const help_sidebar_items = [_]HelpItem{
 };
 
 const help_diff_navigation_items = [_]HelpItem{
+    .{ .key = .{ .pair = .{ .left = .previous_file, .right = .next_file } }, .description = "previous / next file (diff focus)" },
     .{ .key = .{ .text = "↑/↓ j/k" }, .description = "scroll" },
     .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last source row" },
     .{ .key = .{ .pair = .{ .left = .half_page_up, .right = .half_page_down } }, .description = "half page up / down" },

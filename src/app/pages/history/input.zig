@@ -48,6 +48,16 @@ pub const Msg = union(enum) {
 };
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
+    if (!context.loading and !context.common.search_mode and !context.common.file_search_mode) {
+        if (context.keymap.actionForKey(key)) |action| {
+            if (action == .previous_file or action == .next_file) {
+                return if (context.diff_view)
+                    .{ .common = committed_diff_input.keyToMsg(context.common, key) orelse return .owned_noop }
+                else
+                    .owned_noop;
+            }
+        }
+    }
     if (!context.diff_view) {
         if (key.matches(chasen.Key.tab, .{ .shift = true })) return .focus_previous;
         if (key.matches(chasen.Key.tab, .{})) return .focus_next;
@@ -137,6 +147,23 @@ fn historyMove(action: interaction.VerticalAction) Msg {
 fn matches(effective: keymap.Effective, action: keymap.PublicAction, key: chasen.Key) bool {
     const spec = effective.spec(action) orelse return false;
     return spec.matches(key);
+}
+
+test "body file navigation custom keys cannot open History picker or alter its range" {
+    const testing = @import("std").testing;
+    var config: keymap.Config = .{};
+    config.set(.next_file, .{ .plain_codepoint = 'm' });
+    config.set(.previous_file, .{ .plain_codepoint = ' ' });
+    const effective = keymap.Effective.fromConfig(config);
+    try testing.expect(keymap.validateConfig(config));
+    for ([_]interaction.Focus{ .history, .commit_detail, .changed_files }) |focus| {
+        const context: Context = .{ .picker_ready = true, .focus = focus, .keymap = effective };
+        try testing.expectEqual(Msg.owned_noop, keyToMsg(context, .{ .codepoint = 'm' }).?);
+        try testing.expectEqual(Msg.owned_noop, keyToMsg(context, .{ .codepoint = ' ' }).?);
+    }
+    const diff: Context = .{ .diff_view = true, .keymap = effective, .common = .{ .focus = .diff, .keymap = effective } };
+    try testing.expectEqual(Msg{ .common = .{ .shared = .next_file } }, keyToMsg(diff, .{ .codepoint = 'm' }).?);
+    try testing.expectEqual(Msg{ .common = .{ .shared = .previous_file } }, keyToMsg(diff, .{ .codepoint = ' ' }).?);
 }
 
 test "History loading owns Escape and keeps editing input inert" {

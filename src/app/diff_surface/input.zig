@@ -184,6 +184,13 @@ test "keyboard side chooser owns side cancel and background keys" {
         selectionKeyToMsg(choosing, .{ .codepoint = chasen.Key.escape }).?,
     );
     try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(choosing, .{ .codepoint = 'j' }).?);
+    try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(choosing, .{ .codepoint = ']' }).?);
+    var config: keymap.Config = .{};
+    config.set(.next_file, .{ .plain_codepoint = 'm' });
+    try std.testing.expectEqual(message.Msg.selection_owned_noop, selectionKeyToMsg(.{
+        .selection_owner = .keyboard_side_choice,
+        .keymap = keymap.Effective.fromConfig(config),
+    }, .{ .codepoint = 'm' }).?);
 }
 
 test "mouse and header selection consume selection keys without acquiring keyboard authority" {

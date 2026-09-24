@@ -5,6 +5,7 @@ const chasen = @import("chasen");
 
 const app_mod = @import("../../app.zig");
 const app_actions = @import("../actions.zig");
+const app_changes_projection = @import("../changes_projection.zig");
 const app_commit_panel = @import("../commit_panel.zig");
 const app_load = @import("../load.zig");
 const app_message = @import("../message.zig");
@@ -18,6 +19,7 @@ const changes_reload = @import("../pages/changes/reload.zig");
 const changes_authority = @import("../diff_surface/authority.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_source = @import("../../diff/source.zig");
+const file_tree = @import("../../file_tree.zig");
 const git_ops = @import("../git_ops.zig");
 const git_status = @import("../../git/status.zig");
 const loaded_diff = @import("../../loaded_diff.zig");
@@ -29,6 +31,60 @@ const App = app_mod.App;
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
 const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
 const test_action_root_identity: repo_root_capability.Identity = .{ .device = 41, .inode = 73 };
+
+test "body file navigation advances past a pending request and rejects its late completion" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .target = .{ .status_entry = 0 }, .status = .added },
+        .{ .kind = .file, .name = "c", .path = "c", .depth = 0, .target = .{ .status_entry = 1 }, .status = .added },
+    };
+    var loaded = app_test_support.loadedDiffOne();
+    loaded.tree.nodes = &nodes;
+    var app: App = .{
+        .allocator = allocator,
+        .config = .{ .source = .unstaged },
+        .pages = .{ .changes = .{
+            .load = app_test_support.loadState(loaded),
+            .viewer = .{ .focus = .diff },
+        } },
+        .terminal_size = .{ .width = 120, .height = 32 },
+    };
+    defer app.pages.changes.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    app.repo_session.repo_state.discovery = try testSingleRepoDiscovery(allocator, roots.a);
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    activateChanges(&app);
+    var status = try git_status.StatusBundle.parseOwned(allocator, "?? b\x00?? c\x00");
+    try app.pages.changes.git_status.replace(roots.a, &status);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer ctx.runtimeClearPendingEffectCopies();
+
+    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx);
+    try std.testing.expectEqualStrings("b", app.pages.changes.changes_projection.pending.?.path_key);
+    const first = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), first.len);
+    var late_b = first[0].failed(first[0].ctx, .runtime_abandoned, allocator);
+    errdefer late_b.deinitUndelivered(allocator);
+    late_b.load_finished.changes.projection.result = .{ .ready = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(allocator, "b", "late B\n") } };
+
+    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx);
+    try std.testing.expectEqualStrings("c", app.pages.changes.changes_projection.pending.?.path_key);
+    const second = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    var ready_c = second[0].failed(second[0].ctx, .runtime_abandoned, allocator);
+    ready_c.load_finished.changes.projection.result = .{ .ready = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(allocator, "c", "current C\n") } };
+    try app.update(ready_c, &ctx);
+    try std.testing.expectEqualStrings("c", app.pages.changes.changes_projection.displayed.request().?.path_key);
+    try app.update(late_b, &ctx);
+    late_b = .quit;
+    try std.testing.expectEqualStrings("c", app.pages.changes.changes_projection.displayed.request().?.path_key);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_target.?.status_only);
+    try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+    try std.testing.expect(!app.pages.changes.changes_projection.hasPending());
+}
 
 fn activateChanges(app: *App) void {
     _ = app.pages.changes.activation.activate(

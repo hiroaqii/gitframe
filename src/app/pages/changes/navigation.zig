@@ -4424,6 +4424,113 @@ test "manual fold keeps hunk open when it contains active search match" {
     try std.testing.expectEqual(@as(?usize, 4), app.pages.changes.search.match_offset);
 }
 
+test "body file navigation preserves boundaries and resets only a successful move" {
+    const allocator = std.testing.allocator;
+    for ([_]diff_render.DisplayMode{ .unified, .side_by_side }) |mode| {
+        var files = app_test_support.files_two;
+        files[1].hunks = files[0].hunks;
+        var loaded = app_test_support.loadedDiffTwo();
+        loaded.document.files = &files;
+        var app = TestHarness.init(.{
+            .load = app_test_support.loadState(loaded),
+            .viewer = .{ .focus = .diff, .display_mode = mode },
+        }, .{ .width = 120, .height = 12 });
+        defer app.pages.changes.deinit(allocator);
+        setDiffSearchQuery(&app, "new");
+        setFileSearchInput(&app, "retained file filter");
+        app.changesNavigation().refreshSearchForSelectedFile(allocator);
+        const token = try installDisplayedCompletedSelection(&app, allocator);
+        app.pages.changes.viewer.diff_scroll = 3;
+        app.pages.changes.viewer.diff_horizontal_scroll = 7;
+        const before = app.view().displayNavigationSnapshot();
+        var adapter = app.controller().updateAdapter();
+        var boundary = try adapter.shared().apply(allocator, .previous_file);
+        defer boundary.deinit(allocator);
+        try std.testing.expect(!boundary.display_navigation_changed);
+        try std.testing.expectEqualDeep(before, app.view().displayNavigationSnapshot());
+        try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(token));
+        try std.testing.expectEqualStrings("new", app.pages.changes.search.query.slice());
+
+        var moved = try adapter.shared().apply(allocator, .next_file);
+        defer moved.deinit(allocator);
+        try std.testing.expect(moved.explicit_sidebar_selection_changed);
+        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+        try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
+        try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_horizontal_scroll);
+        try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
+        try std.testing.expectEqual(mode, app.pages.changes.viewer.display_mode);
+        try std.testing.expect(app.pages.changes.completed_selection == null);
+        try std.testing.expect(app.pages.changes.search.match == null);
+        try std.testing.expectEqualStrings("", app.pages.changes.search.query.slice());
+        try std.testing.expectEqualStrings("retained file filter", app.pages.changes.file_search.input.slice());
+
+        var last = try adapter.shared().apply(allocator, .next_file);
+        defer last.deinit(allocator);
+        try std.testing.expect(!last.display_navigation_changed);
+        var back = try adapter.shared().apply(allocator, .previous_file);
+        defer back.deinit(allocator);
+        try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
+    }
+}
+
+test "body file navigation follows filtered tree order through folds binary and status-only targets" {
+    const allocator = std.testing.allocator;
+    const files = app_test_support.files_two ++ app_test_support.files_binary_only;
+    const nodes = [_]file_tree.Node{
+        .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 }, .status = .modified },
+        .{ .kind = .directory, .name = "nested", .path = "nested", .depth = 0 },
+        .{ .kind = .file, .name = "added", .path = "nested/added", .depth = 1, .target = .{ .status_entry = 0 }, .status = .added },
+        .{ .kind = .file, .name = "b", .path = "nested/b", .depth = 1, .target = .{ .diff_file = 1 }, .status = .modified },
+        .{ .kind = .file, .name = "bin", .path = "nested/bin", .depth = 1, .target = .{ .diff_file = 2 }, .status = .binary },
+        .{ .kind = .directory, .name = "other", .path = "other", .depth = 0 },
+        .{ .kind = .file, .name = "last", .path = "last", .depth = 0, .target = .{ .status_entry = 1 }, .status = .modified },
+    };
+    var reviewed = [_]bool{ false, true, false };
+    var loaded = app_test_support.loadedDiffTwo();
+    loaded.document.files = &files;
+    loaded.file_text_eligibility = &.{ .selectable_utf8, .selectable_utf8, .selectable_utf8 };
+    loaded.tree.nodes = &nodes;
+    loaded.reviewed_files = &reviewed;
+    var app = TestHarness.init(.{
+        .load = app_test_support.loadStateWithArena(.init(allocator), loaded),
+        .viewer = .{ .focus = .diff, .selected_node = 5 },
+        .review_display = .{ .hide_reviewed_files = true, .changed_file_filter = .modified },
+    }, .{ .width = 120, .height = 32 });
+    defer app.pages.changes.deinit(allocator);
+    const active = app.changesNavigation().activeLoadedDiff().?;
+    const arena = app.changesNavigation().loadArenaAllocator().?;
+    try file_tree.collapse(arena, &active.collapsed_dirs, "nested");
+    try file_tree.collapse(arena, &active.collapsed_dirs, "other");
+    try active.rebuildVisibleNodes(arena, true, .modified);
+    var status = try git_status.StatusBundle.parseOwned(allocator, "?? nested/added\x00 M last\x00");
+    try app.pages.changes.git_status.replace("/repo", &status);
+    var adapter = app.controller().updateAdapter();
+    var filtered = try adapter.shared().apply(allocator, .next_file);
+    defer filtered.deinit(allocator);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 1 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(ChangedFileFilter.modified, app.pages.changes.review_display.changed_file_filter);
+    try std.testing.expect(file_tree.isCollapsed(&active.collapsed_dirs, "nested"));
+
+    app.pages.changes.review_display.changed_file_filter = .all;
+    try active.rebuildVisibleNodes(arena, true, .all);
+    var binary = try adapter.shared().apply(allocator, .previous_file);
+    defer binary.deinit(allocator);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 2 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(@as(usize, 4), app.pages.changes.viewer.selected_node);
+    try std.testing.expect(active.visibleRowOfNode(4) != null);
+    try std.testing.expect(!file_tree.isCollapsed(&active.collapsed_dirs, "nested"));
+    try std.testing.expect(file_tree.isCollapsed(&active.collapsed_dirs, "other"));
+    var status_only = try adapter.shared().apply(allocator, .next_file);
+    defer status_only.deinit(allocator);
+    try std.testing.expectEqual(context.SelectedTarget{ .status_only = 1 }, app.pages.changes.viewer.selected_target.?);
+    var back = try adapter.shared().apply(allocator, .previous_file);
+    defer back.deinit(allocator);
+    try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 2 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expectEqual(ChangedFileFilter.all, app.pages.changes.review_display.changed_file_filter);
+    try std.testing.expect(app.pages.changes.review_display.hide_reviewed_files);
+}
+
 test "file change resyncs retained search query to selected file" {
     var app: TestHarness = .{
         .pages = .{ .changes = .{

@@ -68,6 +68,8 @@ pub const Msg = union(enum) {
     select_previous_file,
     scroll_diff_down,
     select_next_file,
+    previous_file,
+    next_file,
     enter_search,
     select_next_search_match,
     select_next_hunk,

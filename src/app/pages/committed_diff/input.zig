@@ -92,6 +92,8 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .toggle_sidebar => shared(.toggle_sidebar_visibility),
         .decrease_sidebar_width => shared(.decrease_sidebar_width),
         .increase_sidebar_width => shared(.increase_sidebar_width),
+        .previous_file => shared(if (diff_focused) .previous_file else .selection_owned_noop),
+        .next_file => shared(if (diff_focused) .next_file else .selection_owned_noop),
         .changed_file_filter => shared(.cycle_changed_file_filter),
         .mark_reviewed => shared(.toggle_reviewed_file),
         .hide_reviewed => shared(.toggle_hide_reviewed_files),
@@ -128,4 +130,7 @@ test "committed diff input exposes shared display actions without write actions"
     const context: Context = .{ .focus = .diff };
     try @import("std").testing.expect(keyToMsg(context, .{ .codepoint = 'u' }).? == .shared);
     try @import("std").testing.expect(keyToMsg(context, .{ .codepoint = 'c' }) == null);
+    try @import("std").testing.expectEqual(Msg{ .shared = .previous_file }, keyToMsg(context, .{ .codepoint = '[' }).?);
+    try @import("std").testing.expectEqual(Msg{ .shared = .next_file }, keyToMsg(context, .{ .codepoint = ']' }).?);
+    try @import("std").testing.expectEqual(Msg{ .shared = .selection_owned_noop }, keyToMsg(.{}, .{ .codepoint = ']' }).?);
 }

@@ -117,7 +117,10 @@ pub const Controller = struct {
         const before = if (tracks_navigation) self.navigation.view().view.displayNavigationSnapshot() else undefined;
         const tracks_sidebar_selection = tracksExplicitSidebarSelection(msg);
         const sidebar_before = if (tracks_sidebar_selection) sidebarSelectionSnapshot(self.navigation) else undefined;
-        const viewport_anchor = self.navigation.captureSelectionViewportAnchor();
+        const viewport_anchor = if (msg == .previous_file or msg == .next_file)
+            null
+        else
+            self.navigation.captureSelectionViewportAnchor();
         const selected_target_before = self.navigation.controller.surface.viewer.selected_target;
         const requested_mode_before = self.navigation.controller.surface.viewer.display_mode;
         const source_rows_before = self.navigation.view().sourceDiffLineCount();
@@ -127,6 +130,8 @@ pub const Controller = struct {
         switch (msg) {
             .select_previous_file => self.navigation.selectFileDelta(mapping_cleanup orelse return error.MissingAllocator, -1),
             .select_next_file => self.navigation.selectFileDelta(mapping_cleanup orelse return error.MissingAllocator, 1),
+            .previous_file => try self.navigation.selectAdjacentFile(mapping_cleanup orelse return error.MissingAllocator, -1),
+            .next_file => try self.navigation.selectAdjacentFile(mapping_cleanup orelse return error.MissingAllocator, 1),
             .toggle_directory => try self.navigation.toggleSelectedDirectory(),
             .expand_directory => try self.navigation.expandSelectedDirectory(),
             .collapse_or_parent_directory => try self.navigation.collapseOrSelectParentDirectory(),
@@ -634,6 +639,8 @@ fn sidebarSelectionSnapshot(controller: navigation.BodyController) SidebarSelect
 
 fn tracksExplicitSidebarSelection(msg: message.Msg) bool {
     return switch (msg) {
+        .previous_file,
+        .next_file,
         .select_previous_file,
         .select_next_file,
         .select_first_file,
@@ -652,6 +659,8 @@ fn tracksExplicitSidebarSelection(msg: message.Msg) bool {
 
 fn tracksDisplayNavigation(msg: message.Msg) bool {
     return switch (msg) {
+        .previous_file,
+        .next_file,
         .select_previous_file,
         .select_next_file,
         .toggle_directory,

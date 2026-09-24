@@ -25,6 +25,8 @@ pub const PublicAction = enum {
     toggle_sidebar,
     decrease_sidebar_width,
     increase_sidebar_width,
+    previous_file,
+    next_file,
     changed_file_filter,
     mark_reviewed,
     hide_reviewed,
@@ -266,8 +268,10 @@ fn defaultSpec(action: PublicAction) ?KeySpec {
         .toggle_display_mode => .{ .plain_codepoint = 'u' },
         .toggle_line_numbers => shiftedAscii('l', 'L'),
         .toggle_sidebar => shiftedAscii('b', 'B'),
-        .decrease_sidebar_width => .{ .plain_codepoint = '[' },
-        .increase_sidebar_width => .{ .plain_codepoint = ']' },
+        .decrease_sidebar_width => .{ .plain_codepoint = '<' },
+        .increase_sidebar_width => .{ .plain_codepoint = '>' },
+        .previous_file => .{ .plain_codepoint = '[' },
+        .next_file => .{ .plain_codepoint = ']' },
         .changed_file_filter => shiftedAscii('f', 'F'),
         .mark_reviewed => .{ .plain_codepoint = 'v' },
         .hide_reviewed => shiftedAscii('h', 'H'),
@@ -524,6 +528,12 @@ test "validateConfig rejects reserved and duplicate effective bindings" {
     var document_duplicate: Config = .{};
     document_duplicate.set(.fetch, .{ .ctrl = .d });
     try std.testing.expect(!validateConfig(document_duplicate));
+
+    var file_duplicate: Config = .{};
+    file_duplicate.set(.next_file, .{ .plain_codepoint = '[' });
+    try std.testing.expect(!validateConfig(file_duplicate));
+    file_duplicate.set(.previous_file, .{ .plain_codepoint = 'm' });
+    try std.testing.expect(validateConfig(file_duplicate));
 
     var copy_pair: Config = .{};
     copy_pair.set(.copy_current_line, .{ .plain_codepoint = 'x' });

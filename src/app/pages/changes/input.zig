@@ -107,6 +107,8 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .toggle_sidebar => .toggle_sidebar_visibility,
         .decrease_sidebar_width => .decrease_sidebar_width,
         .increase_sidebar_width => .increase_sidebar_width,
+        .previous_file => if (diff_focused) .previous_file else .selection_owned_noop,
+        .next_file => if (diff_focused) .next_file else .selection_owned_noop,
         .changed_file_filter => .cycle_changed_file_filter,
         .mark_reviewed => .toggle_reviewed_file,
         .hide_reviewed => .toggle_hide_reviewed_files,
@@ -213,8 +215,16 @@ test "sidebar visibility and width commands remain Changes-local" {
     try std.testing.expect(keyToMsg(.{ .sidebar_hidden = true }, .{ .codepoint = chasen.Key.tab }) == null);
     try std.testing.expectEqual(Msg.toggle_sidebar_visibility, keyToMsg(.{}, .{ .codepoint = 'b', .mods = .{ .shift = true } }).?);
     try std.testing.expectEqual(Msg.request_branch_switch, keyToMsg(.{}, .{ .codepoint = 'b' }).?);
-    try std.testing.expectEqual(Msg.decrease_sidebar_width, keyToMsg(.{}, .{ .codepoint = '[' }).?);
-    try std.testing.expectEqual(Msg.increase_sidebar_width, keyToMsg(.{}, .{ .codepoint = ']' }).?);
+    try std.testing.expectEqual(Msg.decrease_sidebar_width, keyToMsg(.{}, .{ .codepoint = '<' }).?);
+    try std.testing.expectEqual(Msg.increase_sidebar_width, keyToMsg(.{}, .{ .codepoint = '>' }).?);
+}
+
+test "body file navigation keys are focus scoped and yield to search input" {
+    try std.testing.expectEqual(Msg.previous_file, keyToMsg(.{ .focus = .diff }, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(Msg.next_file, keyToMsg(.{ .focus = .diff }, .{ .codepoint = ']' }).?);
+    try std.testing.expectEqual(Msg.selection_owned_noop, keyToMsg(.{}, .{ .codepoint = ']' }).?);
+    try std.testing.expectEqual(Msg{ .search_insert = ']' }, keyToMsg(.{ .search_mode = true }, .{ .codepoint = ']' }).?);
+    try std.testing.expectEqual(Msg{ .file_search_insert = '[' }, keyToMsg(.{ .file_search_mode = true }, .{ .codepoint = '[' }).?);
 }
 
 test "search query disambiguates match and hunk navigation" {

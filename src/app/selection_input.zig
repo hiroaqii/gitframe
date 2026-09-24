@@ -35,7 +35,7 @@ pub const Context = struct {
 
 pub fn keyToCommand(context: Context, key: chasen.Key) ?Command {
     if (context.keymap.actionForKey(key)) |action| {
-        if (keymap.isDocumentNavigationAction(action)) {
+        if (keymap.isDocumentNavigationAction(action) or action == .previous_file or action == .next_file) {
             // Completed-only candidates do not own navigation, even when a
             // custom binding overlaps the retained y/a grammar below.
             return if (context.owner_kind != .none) .owned_noop else null;
@@ -133,13 +133,21 @@ test "selection input consumes default and custom document navigation only for l
     for ([_]OwnerKind{ .keyboard_line, .mouse, .header }) |owner| {
         try std.testing.expectEqual(Command.owned_noop, keyToCommand(.{ .owner_kind = owner }, .{ .codepoint = 'g' }).?);
         try std.testing.expectEqual(Command.owned_noop, keyToCommand(.{ .owner_kind = owner }, ctrl_d).?);
+        for ("[]") |key| {
+            try std.testing.expectEqual(Command.owned_noop, keyToCommand(.{ .owner_kind = owner }, .{ .codepoint = key }).?);
+        }
     }
     try std.testing.expect(keyToCommand(.{}, .{ .codepoint = 'g' }) == null);
     try std.testing.expect(keyToCommand(.{ .retained_action_available = true }, ctrl_d) == null);
 
     var config: keymap.Config = .{};
     config.set(.document_first, .{ .plain_codepoint = 'z' });
+    config.set(.next_file, .{ .plain_codepoint = 'm' });
     const custom = keymap.Effective.fromConfig(config);
+    for ([_]OwnerKind{ .keyboard_line, .mouse, .header }) |owner| {
+        try std.testing.expectEqual(Command.owned_noop, keyToCommand(.{ .owner_kind = owner, .keymap = custom }, .{ .codepoint = 'm' }).?);
+    }
+    try std.testing.expect(keyToCommand(.{ .retained_action_available = true, .keymap = custom }, .{ .codepoint = 'm' }) == null);
     try std.testing.expectEqual(
         Command.owned_noop,
         keyToCommand(.{ .owner_kind = .keyboard_line, .keymap = custom }, .{ .codepoint = 'z' }).?,

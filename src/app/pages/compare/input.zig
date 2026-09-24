@@ -70,6 +70,10 @@ test "Compare owns its base picker launch key" {
     const std = @import("std");
     const context: Context = .{};
     try std.testing.expectEqual(Msg.open_base_picker, keyToMsg(context, .{ .codepoint = 'm' }).?);
+    var config: @import("keymap").Config = .{};
+    config.set(.next_file, .{ .plain_codepoint = 'm' });
+    const custom: Context = .{ .common = .{ .keymap = .fromConfig(config) } };
+    try std.testing.expectEqual(Msg{ .common = .{ .shared = .selection_owned_noop } }, keyToMsg(custom, .{ .codepoint = 'm' }).?);
 }
 
 test "Compare base picker owns modal input" {
