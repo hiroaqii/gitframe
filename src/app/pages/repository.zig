@@ -168,6 +168,8 @@ pub const Msg = union(enum) {
     focus_tree,
     focus_source,
     toggle_focus,
+    previous_file,
+    next_file,
     tree_first,
     tree_last,
     toggle_tree_visibility,
@@ -294,6 +296,9 @@ pub const RepositoryPageState = struct {
     /// acceptance remains owned by `applyDocumentFinished`; this value only
     /// decides whether that accepted source may move focus.
     file_search_source_focus: repository_file_search_focus.State = .none,
+    /// A body-file switch retains source focus through loading/inert content.
+    /// This never grants source-document authority to other actions.
+    body_file_navigation_focus: bool = false,
     source_revision: u64 = 0,
     syntax_generation: u64 = 0,
     pending_syntax_generation: ?u64 = null,
@@ -381,6 +386,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn activate(self: *RepositoryPageState, repo_epoch: u64, identity: ?root_capability.Identity) void {
+        self.body_file_navigation_focus = false;
         self.clearFileSearchDocumentAuthority();
         self.clearLiveSelection();
         self.initialized = true;
@@ -416,6 +422,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn deactivate(self: *RepositoryPageState) void {
+        self.body_file_navigation_focus = false;
         self.file_search_source_focus.clear();
         self.clearLiveSelection();
         self.active = false;
@@ -429,6 +436,7 @@ pub const RepositoryPageState = struct {
         repo_epoch: u64,
         identity: ?root_capability.Identity,
     ) void {
+        self.body_file_navigation_focus = false;
         self.clearFileSearchDocumentAuthority();
         if (self.incoming != .none) {
             const owner = allocator orelse @panic("Repository incoming replacement requires an allocator");
@@ -494,6 +502,7 @@ pub const RepositoryPageState = struct {
         allocator: std.mem.Allocator,
         incoming: *page_link.RepositoryIncoming,
     ) void {
+        self.body_file_navigation_focus = false;
         self.incoming.accept(allocator, incoming);
     }
 
@@ -1516,6 +1525,7 @@ pub const RepositoryPageState = struct {
         // A newly accepted manifest does not yet provide a complete selected
         // source fingerprint, so it cannot prove candidate identity.
         self.clearCompletedSelection(allocator);
+        if (!optionalPathEql(previous_selected, selected)) self.body_file_navigation_focus = false;
         if (self.bundle) |*previous| previous.deinit(allocator);
         self.bundle = incoming.*;
         incoming.* = undefined;
@@ -1719,6 +1729,8 @@ pub const RepositoryPageState = struct {
         body_size: chasen.Size,
     ) RepositoryUpdate {
         var result: RepositoryUpdate = .{};
+        const file_navigation = msg == .previous_file or msg == .next_file;
+        if (file_navigation and (self.selection_owner != .none or self.source_search.mode or self.file_search.mode)) return result;
         var file_search_submitted = false;
         const wheel = switch (msg) {
             .wheel_up, .wheel_down, .mouse_source_wheel_up, .mouse_source_wheel_down => true,
@@ -1748,6 +1760,8 @@ pub const RepositoryPageState = struct {
         else
             null;
         switch (msg) {
+            .previous_file => self.selectAdjacentFile(allocator, -1, body_height),
+            .next_file => self.selectAdjacentFile(allocator, 1, body_height),
             .move_up => switch (self.viewer.focus) {
                 .source => if (source) |document| repository_navigation.moveSource(&self.viewer, document, -1, source_geometry.?),
                 .tree => if (!self.viewer.tree_hidden) self.moveCursor(-1, body_height),
@@ -1826,7 +1840,7 @@ pub const RepositoryPageState = struct {
             .focus_source => if (source != null) {
                 self.viewer.focus = .source;
             },
-            .toggle_focus => if (source != null and !self.viewer.tree_hidden) {
+            .toggle_focus => if ((source != null or self.viewer.focus == .source) and !self.viewer.tree_hidden) {
                 self.viewer.focus = if (self.viewer.focus == .tree) .source else .tree;
             },
             .toggle_tree_visibility => self.toggleTreeVisibility(body_size),
@@ -1906,7 +1920,9 @@ pub const RepositoryPageState = struct {
             self.invalidateSelectedDocument(allocator);
             self.path_history.invalidate(allocator, self.selected_path != null);
             result.selected_path_changed = true;
+            if (file_navigation) self.body_file_navigation_focus = true;
         }
+        if (self.viewer.focus == .tree) self.body_file_navigation_focus = false;
         if (file_search_submitted) self.commitFileSearchSourceFocus();
         if (keyboard_search_cursor) |cursor| if (self.viewer.source_cursor != cursor) {
             const document = self.currentSource();
@@ -1927,6 +1943,7 @@ pub const RepositoryPageState = struct {
     }
 
     fn invalidateSelectedDocument(self: *RepositoryPageState, allocator: std.mem.Allocator) void {
+        self.body_file_navigation_focus = false;
         self.clearFileSearchDocumentAuthority();
         self.clearLiveSelection();
         std.debug.assert(!self.activeBorrowedSourceRange());
@@ -2061,7 +2078,7 @@ pub const RepositoryPageState = struct {
     /// inert checkpoint. Input derives an effective focus too, but lifecycle
     /// reconciliation must never leave an invisible tree as the stored owner.
     fn reconcileNoSourceFocus(self: *RepositoryPageState) void {
-        if (self.currentSource() != null) return;
+        if (self.currentSource() != null or self.body_file_navigation_focus) return;
         self.viewer.focus = if (self.viewer.tree_hidden) .source else .tree;
     }
 
@@ -2071,7 +2088,7 @@ pub const RepositoryPageState = struct {
     ) repository_input.Context {
         const source_available = self.currentSource() != null;
         return .{
-            .focus = if (self.viewer.tree_hidden) .source else if (source_available) self.viewer.focus else .tree,
+            .focus = if (self.viewer.tree_hidden) .source else if (source_available or self.body_file_navigation_focus) self.viewer.focus else .tree,
             .source_available = source_available,
             .tree_hidden = self.viewer.tree_hidden,
             .source_search_mode = self.source_search.mode,
@@ -2241,6 +2258,35 @@ pub const RepositoryPageState = struct {
         } else {
             self.file_search_source_focus.clear();
         }
+    }
+
+    fn selectAdjacentFile(self: *RepositoryPageState, allocator: std.mem.Allocator, delta: i2, body_height: u16) void {
+        if (self.inputContext(.{}).focus != .source) return;
+        const bundle = if (self.bundle) |*bundle| bundle else return;
+        if (self.file_visibility == .changed and !bundle.status_available) return;
+        const selected = self.selected_path orelse return;
+        const tree = &bundle.tree;
+        const origin = tree.nodeIndexForPath(selected, self.file_visibility) orelse return;
+        if (tree.nodes[origin].kind != .file) return;
+
+        var index = origin;
+        const destination = while (true) {
+            if (delta < 0) {
+                if (index == 0) return;
+                index -= 1;
+            } else {
+                index += 1;
+                if (index >= tree.nodes.len) return;
+            }
+            const node = tree.nodes[index];
+            if (node.kind == .file and (self.file_visibility == .all or node.file_change != null)) break index;
+        };
+        const cursor = self.tree_projection.revealManifestNode(tree, self.file_visibility, destination) orelse return;
+        self.dismissIncoming(allocator);
+        self.viewer.tree_cursor = cursor;
+        self.viewer.focus = .source;
+        self.selectCursor();
+        self.clampScroll(body_height);
     }
 
     fn moveCursor(self: *RepositoryPageState, delta: isize, body_height: u16) void {
@@ -3223,6 +3269,9 @@ pub const RepositoryPageState = struct {
 
 fn navigationDismissesIncoming(msg: Msg) bool {
     return switch (msg) {
+        // File navigation dismisses only after resolving an actual destination.
+        .previous_file,
+        .next_file,
         .toggle_line_numbers,
         .toggle_tree_visibility,
         .decrease_tree_width,
@@ -7945,6 +7994,149 @@ fn fileSearchDocumentFinishedForTest(
         .path = try allocator.dupe(u8, request.path),
         .value = value,
     };
+}
+
+test "repository body file navigation follows filtered tree order and resets only on movement" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 80, .height = 12 };
+    var state = try selectionStateForTest(
+        "alpha/start.zig\x00beta/nested/clean.zig\x00gamma/changed.zig\x00zeta/last.zig\x00",
+        "needle with a long source line for scrolling\n" ** 40,
+    );
+    defer state.deinit(allocator);
+    try applyBundleStatusForTest(&state.bundle.?, " M alpha/start.zig\x00 M gamma/changed.zig\x00 M zeta/last.zig\x00");
+    state.viewer.focus = .source;
+    state.viewer.tree_cursor = 0; // The root cursor does not replace the body target.
+    state.viewer.source_cursor = 12;
+    state.viewer.source_vertical_scroll = 10;
+    state.viewer.source_horizontal_scroll = 20;
+    try state.source_search.query.insertSlice("needle");
+    state.source_search.match = state.currentSource().?.findNext("needle", null);
+    try installFirstLineCandidateForTest(&state, allocator);
+    const before = state.viewer;
+    const source_before = state.currentSource().?;
+    const candidate_before = state.completed_selection.?.text.ptr;
+    const edge = state.applyNavigation(allocator, .previous_file, size);
+    try std.testing.expect(!edge.selected_path_changed);
+    try std.testing.expectEqualDeep(before, state.viewer);
+    try std.testing.expectEqual(source_before, state.currentSource().?);
+    try std.testing.expectEqual(candidate_before, state.completed_selection.?.text.ptr);
+    try std.testing.expectEqualStrings("needle", state.source_search.query.slice());
+    try std.testing.expect(state.source_search.match != null);
+
+    const moved = state.applyNavigation(allocator, .next_file, size);
+    try std.testing.expect(moved.selected_path_changed);
+    try std.testing.expectEqualStrings("beta/nested/clean.zig", state.selected_path.?);
+    try expectProjectedPathForTest(&state, state.viewer.tree_cursor, state.selected_path.?);
+    const tree = &state.bundle.?.tree;
+    try std.testing.expect(tree.nodes[tree.nodeIndexForPath("beta", .all).?].expanded);
+    try std.testing.expect(tree.nodes[tree.nodeIndexForPath("beta/nested", .all).?].expanded);
+    try std.testing.expect(!tree.nodes[tree.nodeIndexForPath("gamma", .all).?].expanded);
+    try std.testing.expect(state.completed_selection == null);
+    try std.testing.expectEqual(@as(usize, 0), state.source_search.query.len);
+    try std.testing.expect(state.source_search.match == null);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);
+    try std.testing.expectEqual(repository_model.Focus.source, state.inputContext(.{}).focus);
+    try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
+
+    _ = state.applyNavigation(allocator, .previous_file, size);
+    _ = state.applyNavigation(allocator, .toggle_changed_filter, size);
+    _ = state.applyNavigation(allocator, .next_file, size);
+    try std.testing.expectEqualStrings("gamma/changed.zig", state.selected_path.?);
+    try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
+    try std.testing.expect(tree.nodes[tree.nodeIndexForPath("gamma", .all).?].expanded);
+    try std.testing.expect(!tree.nodes[tree.nodeIndexForPath("zeta", .all).?].expanded);
+    _ = state.applyNavigation(allocator, .next_file, size);
+    try std.testing.expectEqualStrings("zeta/last.zig", state.selected_path.?);
+    const last = state.viewer;
+    try std.testing.expect(!state.applyNavigation(allocator, .next_file, size).selected_path_changed);
+    try std.testing.expectEqualDeep(last, state.viewer);
+}
+
+test "repository body file navigation continues through pending binary and error without stale focus" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 80, .height = 12 };
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state = try selectionStateForTest("alpha.zig\x00beta.zig\x00charlie.bin\x00delta.txt\x00echo.zig\x00", "alpha\n");
+    defer state.deinit(allocator);
+    state.root_identity = root.capability.identity;
+    state.viewer.focus = .source;
+
+    _ = state.applyNavigation(allocator, repository_input.keyToMsg(Msg, state.inputContext(.{}), .{ .codepoint = ']' }).?, size);
+    var pending_b = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer pending_b.deinit(allocator);
+    try std.testing.expectEqualStrings("beta.zig", pending_b.path);
+    _ = state.applyNavigation(allocator, repository_input.keyToMsg(Msg, state.inputContext(.{}), .{ .codepoint = ']' }).?, size);
+    var pending_c = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer pending_c.deinit(allocator);
+    try std.testing.expectEqualStrings("charlie.bin", pending_c.path);
+    var binary = try fileSearchDocumentFinishedForTest(allocator, &pending_c, null);
+    defer binary.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &binary));
+    try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
+    try std.testing.expect(!state.inputContext(.{}).source_available);
+
+    var late_b = try fileSearchDocumentFinishedForTest(allocator, &pending_b, "late beta\n");
+    defer late_b.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &late_b));
+    try std.testing.expectEqualStrings("charlie.bin", state.selected_path.?);
+    try std.testing.expectEqual(repository_model.Focus.source, state.inputContext(.{}).focus);
+
+    _ = state.applyNavigation(allocator, repository_input.keyToMsg(Msg, state.inputContext(.{}), .{ .codepoint = ']' }).?, size);
+    var pending_d = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer pending_d.deinit(allocator);
+    var unreadable = try fileSearchDocumentFinishedForTest(allocator, &pending_d, null);
+    unreadable.value = .{ .inert = .unreadable };
+    defer unreadable.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &unreadable));
+    try std.testing.expectEqualStrings("delta.txt", state.selected_path.?);
+    try std.testing.expectEqual(repository_model.Focus.source, state.inputContext(.{}).focus);
+
+    _ = state.applyNavigation(allocator, repository_input.keyToMsg(Msg, state.inputContext(.{}), .{ .codepoint = ']' }).?, size);
+    var pending_e = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer pending_e.deinit(allocator);
+    _ = state.applyNavigation(allocator, repository_input.keyToMsg(Msg, state.inputContext(.{}), .{ .codepoint = chasen.Key.tab }).?, size);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.inputContext(.{}).focus);
+    var accepted = try fileSearchDocumentFinishedForTest(allocator, &pending_e, "echo\n");
+    defer accepted.deinit(allocator);
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &accepted));
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+    _ = state.applyNavigation(allocator, .toggle_focus, size);
+    _ = state.applyNavigation(allocator, .previous_file, size);
+    try std.testing.expectEqual(repository_model.Focus.source, state.inputContext(.{}).focus);
+    state.deactivate();
+    try std.testing.expectEqual(repository_model.Focus.tree, state.inputContext(.{}).focus);
+}
+
+test "repository body file navigation retains focus only for the same manifest target" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "alpha.zig\x00beta.zig\x00", "alpha.zig\x00", "" }) |paths| {
+        var state = try selectionStateForTest("alpha.zig\x00beta.zig\x00", "alpha\n");
+        defer state.deinit(allocator);
+        state.viewer.focus = .source;
+        _ = state.applyNavigation(allocator, .next_file, test_body_size);
+        try std.testing.expectEqualStrings("beta.zig", state.selected_path.?);
+        state.pending_generation = state.generation;
+        var finished: repository_tasks.ManifestFinished = .{
+            .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+            .root_identity = state.root_identity.?,
+            .generation = state.generation,
+            .result = .{ .loaded = try bundleForTest(paths) },
+        };
+        defer finished.deinit(allocator);
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &finished, test_body_size));
+        const same_target = std.mem.indexOf(u8, paths, "beta.zig") != null;
+        if (paths.len == 0) {
+            try std.testing.expect(state.selected_path == null);
+            try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
+        } else try std.testing.expectEqualStrings(if (same_target) "beta.zig" else "alpha.zig", state.selected_path.?);
+        try std.testing.expectEqual(
+            if (same_target) repository_model.Focus.source else .tree,
+            state.inputContext(.{}).focus,
+        );
+    }
 }
 
 test "repository file search focus uses an already accepted same-path source immediately" {

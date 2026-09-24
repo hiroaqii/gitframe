@@ -3150,7 +3150,7 @@ test "help popup uses effective document navigation labels and reaches its tail 
     try std.testing.expect(keymap.validateConfig(config));
     harness.keymap = keymap.Effective.fromConfig(config);
     harness.overlay.openHelpForPage(.repository);
-    const source_items_scroll = rowsForSections(help_repository_sections[0..2]) + 2;
+    const source_items_scroll = rowsForSections(help_repository_sections[0..2]) + 1;
     harness.overlay.help_scroll = source_items_scroll;
     var context = harness.context();
     context.active_page = .repository;
@@ -3161,9 +3161,16 @@ test "help popup uses effective document navigation labels and reaches its tail 
     try viewHelpPopup(context, &middle.surface);
     const middle_snapshot = try middle.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(middle_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, middle_snapshot, "[ / m") != null);
     try std.testing.expect(std.mem.indexOf(u8, middle_snapshot, "z / G") != null);
     try std.testing.expect(std.mem.indexOf(u8, middle_snapshot, "Ctrl+u / x") != null);
-    try std.testing.expect(std.mem.indexOf(u8, middle_snapshot, "Ctrl+b / Ctrl+f") != null);
+    harness.overlay.help_scroll += 1;
+    context = harness.context();
+    context.active_page = .repository;
+    try viewHelpPopup(context, &middle.surface);
+    const page_snapshot = try middle.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(page_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, page_snapshot, "Ctrl+b / Ctrl+f") != null);
 
     harness.overlay.help_scroll = max_scroll;
     context = harness.context();
@@ -3567,6 +3574,7 @@ const help_repository_tree_items = [_]HelpItem{
 };
 
 const help_repository_source_items = [_]HelpItem{
+    .{ .key = .{ .pair = .{ .left = .previous_file, .right = .next_file } }, .description = "previous / next file (source focus)" },
     .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move one source row" },
     .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last source row" },
     .{ .key = .{ .pair = .{ .left = .half_page_up, .right = .half_page_down } }, .description = "half page up / down" },

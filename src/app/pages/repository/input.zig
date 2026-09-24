@@ -44,7 +44,7 @@ pub fn keyToMsg(comptime Msg: type, context: Context, key: chasen.Key) ?Msg {
 
     if (key_input.matchesShiftedAscii(key, 'v', 'V')) return voidMsg(Msg, "begin_keyboard_line_selection");
 
-    if (key.matches(chasen.Key.tab, .{}) and context.source_available and !context.tree_hidden) return voidMsg(Msg, "toggle_focus");
+    if (key.matches(chasen.Key.tab, .{}) and (context.source_available or context.focus == .source) and !context.tree_hidden) return voidMsg(Msg, "toggle_focus");
     if (key.matches(chasen.Key.escape, .{}) and context.source_query_len > 0) return voidMsg(Msg, "clear_source_search");
     if (!context.tree_hidden and context.focus == .tree and (key.matches(chasen.Key.enter, .{}) or key.matches(' ', .{}))) return voidMsg(Msg, "toggle_directory");
     if (key.matches(chasen.Key.home, .{})) {
@@ -102,6 +102,8 @@ pub fn selectionKeyToMsg(comptime Msg: type, context: Context, key: chasen.Key) 
 fn publicActionToMsg(comptime Msg: type, context: Context, action: keymap.PublicAction) ?Msg {
     if (keymap.isDocumentNavigationAction(action)) return documentNavigationActionToMsg(Msg, context, action);
     return switch (action) {
+        .previous_file => if (context.focus == .source) voidMsg(Msg, "previous_file") else null,
+        .next_file => if (context.focus == .source) voidMsg(Msg, "next_file") else null,
         .search => if (context.source_available) voidMsg(Msg, "enter_source_search") else null,
         .file_search => voidMsg(Msg, "enter_file_search"),
         .changed_file_filter => voidMsg(Msg, "toggle_changed_filter"),
@@ -163,6 +165,8 @@ const TestMsg = union(enum) {
     begin_keyboard_line_selection,
     keyboard_line_selection_move: @import("../../direction.zig").Vertical,
     toggle_focus,
+    previous_file,
+    next_file,
     toggle_directory,
     move_up,
     move_down,
@@ -304,6 +308,33 @@ test "repository document navigation is source scoped and configurable" {
     const custom = keymap.Effective.fromConfig(config);
     try std.testing.expectEqual(TestMsg.half_page_down, keyToMsg(TestMsg, .{ .focus = .source, .source_available = true, .keymap = custom }, .{ .codepoint = 'z' }).?);
     try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, .{ .focus = .source, .source_available = true, .selection_owner = .mouse, .keymap = custom }, .{ .codepoint = 'z' }).?);
+}
+
+test "repository body file navigation keeps unavailable source focus and configured ownership" {
+    const source: Context = .{ .focus = .source };
+    try std.testing.expectEqual(TestMsg.previous_file, keyToMsg(TestMsg, source, .{ .codepoint = '[' }).?);
+    try std.testing.expectEqual(TestMsg.next_file, keyToMsg(TestMsg, source, .{ .codepoint = ']' }).?);
+    try std.testing.expectEqual(TestMsg.toggle_focus, keyToMsg(TestMsg, source, .{ .codepoint = chasen.Key.tab }).?);
+    try std.testing.expect(keyToMsg(TestMsg, source, .{ .codepoint = '/' }) == null);
+    try std.testing.expect(keyToMsg(TestMsg, source, .{ .codepoint = 'g' }) == null);
+    try std.testing.expect(keyToMsg(TestMsg, .{}, .{ .codepoint = chasen.Key.tab }) == null);
+    for ("[]") |key| {
+        try std.testing.expect(keyToMsg(TestMsg, .{ .source_available = true }, .{ .codepoint = key }) == null);
+    }
+
+    var config: keymap.Config = .{};
+    config.set(.next_file, .{ .plain_codepoint = 'm' });
+    config.set(.previous_file, .{ .named = .space });
+    try std.testing.expect(keymap.validateConfig(config));
+    const effective = keymap.Effective.fromConfig(config);
+    try std.testing.expectEqual(TestMsg.next_file, keyToMsg(TestMsg, .{ .focus = .source, .keymap = effective }, .{ .codepoint = 'm' }).?);
+    try std.testing.expectEqual(TestMsg.previous_file, keyToMsg(TestMsg, .{ .focus = .source, .keymap = effective }, .{ .codepoint = ' ' }).?);
+    try std.testing.expect(keyToMsg(TestMsg, .{ .keymap = effective }, .{ .codepoint = ' ' }) == null);
+    for ([_]selection_input.OwnerKind{ .mouse, .header, .keyboard_line }) |owner| {
+        try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, .{ .focus = .source, .selection_owner = owner, .keymap = effective }, .{ .codepoint = 'm' }).?);
+    }
+    try std.testing.expectEqual(TestMsg{ .source_search_insert = ']' }, keyToMsg(TestMsg, .{ .source_search_mode = true }, .{ .codepoint = ']' }).?);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = 'm' }, keyToMsg(TestMsg, .{ .file_search_mode = true, .keymap = effective }, .{ .codepoint = 'm' }).?);
 }
 
 test "repository source match keys are owned only by live selections" {
