@@ -646,9 +646,10 @@ test "History routes committed diff and picker mouse input through the shell" {
         } }).?);
     }
     for ([_]struct { row: u16, expected: app_message.Msg }{
-        .{ .row = 1, .expected = .{ .history = .{ .select_row = 4 } } },
-        .{ .row = 3, .expected = .{ .history = .{ .select_row = 6 } } },
-        .{ .row = 4, .expected = .{ .history = .{ .focus_pane = .history } } },
+        .{ .row = 1, .expected = .{ .history = .{ .focus_pane = .history } } },
+        .{ .row = 2, .expected = .{ .history = .{ .select_row = 4 } } },
+        .{ .row = 4, .expected = .{ .history = .{ .select_row = 6 } } },
+        .{ .row = 5, .expected = .{ .history = .{ .focus_pane = .history } } },
     }) |case| {
         try std.testing.expectEqual(case.expected, picker_view.handleEvent(.{ .mouse = .{
             .col = @intCast(layout.body.col + picker_layout.history.col),

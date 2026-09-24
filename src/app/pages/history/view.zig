@@ -16,6 +16,7 @@ const file_tree = @import("../../../file_tree.zig");
 const git_history = @import("../../../git/history.zig");
 const git_preview = @import("../../../git/history_preview.zig");
 const history_page = @import("../history.zig");
+const catalog = @import("catalog.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const theme = @import("theme");
@@ -83,7 +84,7 @@ pub const ViewContext = struct {
             .auto_reload_enabled = false,
             .selection_action_visible = navigation.bodyView(&resolver).retainedSelectionActionAvailable(),
         });
-        result.source_label = "commit history";
+        result.source_label = null;
         return result;
     }
 };
@@ -161,8 +162,8 @@ pub const PickerLayout = struct {
     ) ?usize {
         if (!rectContains(self.history, point)) return null;
         const local_row = point.row - self.history.row;
-        if (local_row == 0) return null;
-        const index = visible_start +| @as(usize, local_row - 1);
+        if (local_row < catalog.header_rows) return null;
+        const index = visible_start +| @as(usize, local_row - catalog.header_rows);
         return if (index < visible_end) index else null;
     }
 };
@@ -796,11 +797,11 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
             null;
         const hint = if (page.load_state == .failed)
             if (previous) |label|
-                try std.fmt.allocPrint(surface.frameAllocator(), "{s}  ·  r: retry  ·  Esc: previous diff", .{label})
+                try std.fmt.allocPrint(surface.frameAllocator(), "{s}  ·  r: retry  ·  Esc: back to diff", .{label})
             else
                 "r: retry"
         else if (previous) |label|
-            try std.fmt.allocPrint(surface.frameAllocator(), "{s}  ·  Esc: previous diff", .{label})
+            try std.fmt.allocPrint(surface.frameAllocator(), "{s}  ·  Esc: back to diff", .{label})
         else
             "Esc: cancel";
         drawState(surface, context.palette, title, message, hint);
@@ -811,7 +812,7 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
             const hint = if (page.accepted) |accepted|
                 try std.fmt.allocPrint(
                     surface.frameAllocator(),
-                    "{s}  ·  r: retry  ·  Esc: previous diff",
+                    "{s}  ·  r: retry  ·  Esc: back to diff",
                     .{try previousDiffLabel(surface.frameAllocator(), accepted)},
                 )
             else
@@ -833,19 +834,31 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
     try drawCatalogContext(surface, context.palette, page, snapshot, previous, pane_active);
 
     if (page.catalog.records.items.len == 0) {
-        if (size.height > 1) try drawClipped(
+        if (size.height > catalog.header_rows) try drawClipped(
             surface,
             row_prefix_width,
-            1,
-            if (previous != null) "No commits yet  ·  r: reload  ·  Esc: previous diff" else "No commits yet  ·  r: reload",
+            catalog.header_rows,
+            if (previous != null) "No commits yet  ·  r: reload  ·  Esc: back to diff" else "No commits yet  ·  r: reload",
             context.palette.style(.muted),
         );
         return;
     }
 
+    if (pane_active and page.load_state != .loading and !page.catalog.moreRowSelected()) {
+        var hint_style = context.palette.style(.muted);
+        hint_style.dim = true;
+        try drawClipped(
+            surface,
+            row_prefix_width,
+            1,
+            if (page.draft.isRange()) "Space: clear range" else "Space: start range",
+            hint_style,
+        );
+    }
+
     const range = page.catalog.visibleRange(size.height);
     for (range.start..range.end) |index| {
-        const row: u16 = @intCast(1 + index - range.start);
+        const row: u16 = @intCast(catalog.header_rows + index - range.start);
         if (row >= size.height) break;
         const selected = index == page.catalog.cursor;
         const focused = selected and pane_active;
@@ -1476,6 +1489,66 @@ test "History preview three pane renders focus structured detail and flat files"
     try std.testing.expectEqual(@as(usize, 0), page_state.interaction_state.files_horizontal_offset);
 }
 
+test "History range hint stays dim and fixed above commits only while usable" {
+    const oid = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    var records = [_]git_history.Record{.{
+        .oid = oid,
+        .parent_count = 0,
+        .first_parent = .true_root,
+        .author = @constCast("Author"),
+        .committer_unix = 0,
+        .decorations = @constCast(""),
+        .subject = @constCast("commit"),
+    }} ** 32;
+    var page_state: history_page.HistoryPageState = .{
+        .load_state = .loaded,
+        .catalog = .{
+            .snapshot = .{ .object_format = .sha1, .head = oid, .display = .detached },
+            .records = .{ .items = &records, .capacity = records.len },
+            .continuation = oid,
+        },
+    };
+    const palette = theme.Palette.default();
+    for ([_]struct {
+        focus: history_page.interaction.Focus = .history,
+        range: bool = false,
+        scroll: usize = 0,
+        loading: bool = false,
+        more: bool = false,
+        hint: ?[]const u8 = null,
+    }{
+        .{ .hint = "Space: start range" },
+        .{ .range = true, .scroll = 2, .hint = "Space: clear range" },
+        .{ .range = true, .scroll = 2, .focus = .commit_detail },
+        .{ .range = true, .scroll = 2, .focus = .changed_files },
+        .{ .loading = true },
+        .{ .range = true, .scroll = 3, .more = true },
+    }) |case| {
+        page_state.interaction_state.focus = case.focus;
+        page_state.draft = if (case.range) .{ .range = 0 } else .single;
+        page_state.catalog.scroll = case.scroll;
+        page_state.catalog.cursor = if (case.more) records.len else case.scroll;
+        page_state.load_state = if (case.loading) .loading else .loaded;
+        var rendered: chasen.testing.TestSurface = undefined;
+        try rendered.init(120, 32);
+        defer rendered.deinit();
+        try view(.{ .page_state = &page_state, .palette = palette }, &rendered.surface);
+        const snapshot = try rendered.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        if (case.hint) |hint| {
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, hint) != null);
+            try rendered.expectCellText(row_prefix_width, 1, "S");
+            const cell = rendered.surface.readCell(row_prefix_width, 1).?;
+            try std.testing.expect(cell.style.dim);
+            try std.testing.expect(cell.style.fg.eql(palette.color(.muted)));
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space:") == null);
+            try rendered.expectCellText(row_prefix_width, 1, " ");
+        }
+        try rendered.expectCellText(row_prefix_width, 2, "1");
+    }
+}
+
 test "History catalog renders selected rows at 80x24 and 120x32" {
     const allocator = std.testing.allocator;
     const head = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
@@ -1551,10 +1624,10 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "root subject") != null);
         try rendered.expectCellText(row_prefix_width, 0, "H");
         const layout = CommitRowLayout.init(size.width);
-        try rendered.expectCellText(layout.commit.col, 1, "1");
-        try rendered.expectCellText(layout.date.col, 1, "2");
-        try rendered.expectCellText(layout.author.col, 1, "A");
-        try rendered.expectCellText(layout.summary.col, 1, "[");
+        try rendered.expectCellText(layout.commit.col, 2, "1");
+        try rendered.expectCellText(layout.date.col, 2, "2");
+        try rendered.expectCellText(layout.author.col, 2, "A");
+        try rendered.expectCellText(layout.summary.col, 2, "[");
         try std.testing.expectEqualStrings("4", rendered.surface.readCell(size.width - 2, 0).?.char.grapheme);
         try std.testing.expectEqualStrings(" ", rendered.surface.readCell(size.width - 1, 0).?.char.grapheme);
 
@@ -1567,7 +1640,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
             .{ .col = layout.summary.col, .role = .prompt },
             .{ .col = layout.summary.col + refs_width + 1, .role = .foreground },
         }) |expected| {
-            const cell = rendered.surface.readCell(expected.col, 1) orelse return error.ExpectedHistoryField;
+            const cell = rendered.surface.readCell(expected.col, 2) orelse return error.ExpectedHistoryField;
             try std.testing.expect(cell.style.fg.eql(palette.color(expected.role)));
             try std.testing.expect(!cell.style.bg.eql(palette.color(.pane_cursor_bg)));
         }
@@ -1581,30 +1654,30 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
             .{ .col = layout.summary.col, .role = .prompt },
             .{ .col = layout.summary.col + selected_refs_width + 1, .role = .foreground },
         }) |expected| {
-            const cell = rendered.surface.readCell(expected.col, 3) orelse return error.ExpectedSelectedHistoryField;
+            const cell = rendered.surface.readCell(expected.col, 4) orelse return error.ExpectedSelectedHistoryField;
             try std.testing.expect(cell.style.fg.eql(palette.color(expected.role)));
             try std.testing.expect(cell.style.bg.eql(palette.color(.pane_cursor_bg)));
             try std.testing.expect(cell.style.bold);
         }
-        try std.testing.expect(rendered.surface.readCell(size.width - 1, 3).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+        try std.testing.expect(rendered.surface.readCell(size.width - 1, 4).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 
-        const merge_marker = rendered.surface.readCell(layout.topology.col, 1) orelse return error.ExpectedTopologyMarker;
+        const merge_marker = rendered.surface.readCell(layout.topology.col, 2) orelse return error.ExpectedTopologyMarker;
         try std.testing.expectEqualStrings(PickerMarker.merge, merge_marker.char.grapheme);
         try std.testing.expect(merge_marker.style.fg.eql(palette.color(.info)));
         try std.testing.expect(!merge_marker.style.dim);
         try std.testing.expect(!merge_marker.style.bg.eql(palette.color(.pane_cursor_bg)));
-        const selected_root_marker = rendered.surface.readCell(layout.topology.col, 3) orelse return error.ExpectedTopologyMarker;
+        const selected_root_marker = rendered.surface.readCell(layout.topology.col, 4) orelse return error.ExpectedTopologyMarker;
         try std.testing.expectEqualStrings(PickerMarker.root, selected_root_marker.char.grapheme);
         try std.testing.expect(selected_root_marker.style.fg.eql(palette.color(.accent)));
         try std.testing.expect(!selected_root_marker.style.dim);
         try std.testing.expect(selected_root_marker.style.bg.eql(palette.color(.pane_cursor_bg)));
 
-        for ([_]u16{ 1, 2, 3 }) |row| {
+        for ([_]u16{ 2, 3, 4 }) |row| {
             const cell = rendered.surface.readCell(1, row) orelse return error.ExpectedRangeMarker;
             try std.testing.expectEqualStrings(PickerMarker.range_selected, cell.char.grapheme);
             try std.testing.expect(cell.style.fg.eql(palette.color(.accent)));
             try std.testing.expect(cell.style.bold);
-            try std.testing.expectEqual(row == 3, cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+            try std.testing.expectEqual(row == 4, cell.style.bg.eql(palette.color(.pane_cursor_bg)));
         }
         if (size.width == 120) {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ada Lovelace") != null);
@@ -1626,7 +1699,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Detached HEAD 1111111") != null);
     try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "3 commits loaded · more available") != null);
     try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Enter  Load 200 older commits…") != null);
-    const load_more_row: u16 = @intCast(1 + page_state.catalog.records.items.len);
+    const load_more_row: u16 = @intCast(catalog.header_rows + page_state.catalog.records.items.len);
     for (row_prefix_width..row_prefix_width + 7) |col| {
         const cell = detached_more.surface.readCell(@intCast(col), load_more_row) orelse return error.ExpectedLoadMoreControl;
         try std.testing.expect(cell.style.fg.eql(detached_palette.color(.selection_action_fg)));
@@ -1651,10 +1724,10 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     defer appended.deinit();
     try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &appended.surface, true);
     const appended_layout = CommitRowLayout.init(80);
-    try appended.expectCellText(appended_layout.commit.col, 4, "4");
-    try appended.expectCellText(appended_layout.date.col, 4, "1");
-    try appended.expectCellText(appended_layout.author.col, 4, "界");
-    try appended.expectCellText(appended_layout.summary.col, 4, "[");
+    try appended.expectCellText(appended_layout.commit.col, 5, "4");
+    try appended.expectCellText(appended_layout.date.col, 5, "1");
+    try appended.expectCellText(appended_layout.author.col, 5, "界");
+    try appended.expectCellText(appended_layout.summary.col, 5, "[");
 
     page_state.accepted = .{
         .request = .{
@@ -1709,7 +1782,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     defer allocator.free(unborn_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "Branch future · Unborn") != null);
     try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "Previous diff: main @ 1111111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "r: reload  ·  Esc: previous diff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unborn_snapshot, "r: reload  ·  Esc: back to diff") != null);
 
     page_state.observed_context = .{
         .object_format = .sha1,
@@ -1730,7 +1803,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "History load failed: git_command_failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "Previous diff: main @ 1111111") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "r: retry") != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "Esc: previous diff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_snapshot, "Esc: back to diff") != null);
 }
 
 test "History accepted header keeps only count endpoints and current HEAD context" {

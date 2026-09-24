@@ -470,9 +470,7 @@ const FooterHintPriority = enum {
     primary,
     compare_base,
     help,
-    focus,
     secondary,
-    quit,
 };
 
 const FooterHints = struct {
@@ -632,7 +630,7 @@ fn projectFooter(
             .drop_priority = .source,
         });
         if (changes_footer.auto_reload_enabled) footer_segments.append(.{
-            .text = "auto",
+            .text = "auto-refresh",
             .style = app.theme.style(.staged),
             .drop_priority = .auto,
         });
@@ -746,9 +744,7 @@ fn projectFooterHints(
         .primary,
         .compare_base,
         .help,
-        .focus,
         .secondary,
-        .quit,
     };
     var selected = [_]bool{false} ** footer_hint_capacity;
     var selected_count: usize = 0;
@@ -1766,10 +1762,9 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             const footer = app.changes.footer();
             if (!footer.normal_action_hints_enabled) return result;
 
-            appendFooterAction(app, &result, key_buffers, .branch_switch, "branch", .primary);
+            appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
-            result.append(ui.key_hint.item("q", "quit"), .quit);
         },
         .repository => {
             const input = app.repository.page_state.inputContext(app.keymap);
@@ -1782,36 +1777,21 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
 
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
-            result.append(ui.key_hint.item("q", "quit"), .quit);
         },
         .history => {
             if (app.history) |history| {
                 const history_input = history.page_state.inputContext(app.keymap);
                 if (history.page_state.current_view == .picker and history_input.loading) {
                     result.append(
-                        ui.key_hint.item("Esc", if (history_input.return_to_accepted) "previous diff" else "cancel"),
+                        ui.key_hint.item("Esc", if (history_input.return_to_accepted) "back to diff" else "cancel"),
                         .primary,
                     );
                 } else if (history.page_state.current_view == .diff) {
                     const footer = history.footer();
                     if (!footer.normal_action_hints_enabled) return result;
-                    appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "commits", .compare_base);
+                    appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "select commits", .compare_base);
                 } else {
                     const range_active = history.page_state.draft.isRange();
-                    if (history_input.picker_ready) {
-                        result.append(
-                            ui.key_hint.item(
-                                "Space",
-                                if (range_active)
-                                    "clear range"
-                                else if (history_input.more_row_selected)
-                                    "select commit for range"
-                                else
-                                    "start range",
-                            ),
-                            .primary,
-                        );
-                    }
                     if (history_input.more_row_selected) {
                         result.append(ui.key_hint.item("Enter", "load older"), .primary);
                     } else if (history_input.picker_ready) {
@@ -1826,51 +1806,29 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                     if (history_input.picker_ready and history_input.focus == .commit_detail) {
                         appendFooterAction(app, &result, key_buffers, .copy_history_detail, "copy detail", .primary);
                     }
-                    result.append(ui.key_hint.item("Tab/j/k", "focus/nav"), .focus);
-                    resize_hint: {
-                        if (result.len < footer_hint_capacity) {
-                            var left_buffer: [16]u8 = undefined;
-                            var right_buffer: [16]u8 = undefined;
-                            if (app.keymap.display(.decrease_sidebar_width, &left_buffer)) |left| {
-                                if (app.keymap.display(.increase_sidebar_width, &right_buffer)) |right| {
-                                    const pair = std.fmt.bufPrint(
-                                        key_buffers[result.len][0..],
-                                        "{s}/{s}",
-                                        .{ left, right },
-                                    ) catch break :resize_hint;
-                                    result.append(ui.key_hint.item(pair, "resize"), .secondary);
-                                }
-                            }
-                        }
-                    }
-                    if (!range_active) {
-                        appendFooterAction(app, &result, key_buffers, .reload, "reload", .secondary);
-                    } else if (!history_input.return_to_accepted) {
+                    if (range_active and !history_input.return_to_accepted) {
                         result.append(ui.key_hint.item("Esc", "cancel range"), .secondary);
                     }
                 }
                 if (history.page_state.current_view == .picker and
                     history_input.return_to_accepted and !history_input.loading)
                 {
-                    result.append(ui.key_hint.item("Esc", "previous diff"), .primary);
+                    result.append(ui.key_hint.item("Esc", "back to diff"), .primary);
                 }
             }
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
-            result.append(ui.key_hint.item("q", "quit"), .quit);
         },
         .compare => {
             const footer = app.compare.footer();
             if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open) return result;
-            appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "base", .compare_base);
+            appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "change base", .compare_base);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
-            result.append(ui.key_hint.item("q", "quit"), .quit);
         },
         .config => {
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
-            result.append(ui.key_hint.item("q", "quit"), .quit);
         },
     }
     return result;
@@ -2325,19 +2283,20 @@ test "footer falls back to pending kind when status is empty" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "| push") != null);
 }
 
-test "footer labels enabled automatic reload as auto" {
-    var app: ShellViewTestHarness = .{};
+test "footer labels enabled automatic reload as auto-refresh" {
+    var app: ShellViewTestHarness = .{ .terminal_size = .{ .width = 120, .height = 32 } };
     app.changes.auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s };
 
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(80, 1);
+    try ts.init(120, 1);
     defer ts.deinit();
 
     viewFooter(app.context(), &ts.surface);
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "auto-refresh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "b: switch branch") != null);
 }
 
 test "changes file search keeps footer status but suppresses unreachable action hints" {
@@ -2492,10 +2451,9 @@ test "footer normal-mode hints match the decided page lists" {
     var context = harness.context();
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("b", "branch"),
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     context = harness.context();
@@ -2504,7 +2462,15 @@ test "footer normal-mode hints match the decided page lists" {
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
+    });
+
+    context = harness.context();
+    context.active_page = .compare;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("m", "change base"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
     });
 
     const accepted_oid = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
@@ -2535,22 +2501,17 @@ test "footer normal-mode hints match the decided page lists" {
     };
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("Tab/j/k", "focus/nav"),
-        ui.key_hint.item("</>", "resize"),
-        ui.key_hint.item("r", "reload"),
-        ui.key_hint.item("Esc", "previous diff"),
+        ui.key_hint.item("Esc", "back to diff"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     history_state.load_state = .loading;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("Esc", "previous diff"),
+        ui.key_hint.item("Esc", "back to diff"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     history_state.catalog_hidden = false;
@@ -2559,8 +2520,26 @@ test "footer normal-mode hints match the decided page lists" {
         ui.key_hint.item("Esc", "cancel"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
+
+    history_state.current_view = .diff;
+    history_state.load_state = .loaded;
+    hints = footerHints(context, &key_buffers);
+    try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("m", "select commits"),
+        ui.key_hint.item("R", "switch repo"),
+        ui.key_hint.item("?", "help"),
+    });
+    context.terminal_size = .{ .width = 120, .height = 32 };
+    var footer: chasen.testing.TestSurface = undefined;
+    try footer.init(120, 1);
+    defer footer.deinit();
+    viewFooter(context, &footer.surface);
+    const snapshot = try footer.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "m: select commits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit history") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "120x32") != null);
 
     context = harness.context();
     context.active_page = .config;
@@ -2568,11 +2547,10 @@ test "footer normal-mode hints match the decided page lists" {
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 }
 
-test "History picker footer keeps the range action visible and explains an active range" {
+test "History picker footer keeps diff actions and range state without the local Space hint" {
     const allocator = std.testing.allocator;
     var harness: ShellViewTestHarness = .{};
     var history_state: history_page.HistoryPageState = .{ .load_state = .loaded };
@@ -2591,43 +2569,29 @@ test "History picker footer keeps the range action visible and explains an activ
 
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("Space", "start range"),
         ui.key_hint.item("Enter", "open diff"),
-        ui.key_hint.item("Tab/j/k", "focus/nav"),
-        ui.key_hint.item("</>", "resize"),
-        ui.key_hint.item("r", "reload"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     history_state.draft = .single;
     history_state.interaction_state.focus = .commit_detail;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("Space", "start range"),
         ui.key_hint.item("Enter", "open diff"),
         ui.key_hint.item("y", "copy detail"),
-        ui.key_hint.item("Tab/j/k", "focus/nav"),
-        ui.key_hint.item("</>", "resize"),
-        ui.key_hint.item("r", "reload"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     history_state.interaction_state.focus = .history;
     history_state.draft = .{ .range = 0 };
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("Space", "clear range"),
         ui.key_hint.item("Enter", "open range diff"),
-        ui.key_hint.item("Tab/j/k", "focus/nav"),
-        ui.key_hint.item("</>", "resize"),
         ui.key_hint.item("Esc", "cancel range"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     var footer: chasen.testing.TestSurface = undefined;
@@ -2637,7 +2601,7 @@ test "History picker footer keeps the range action visible and explains an activ
     const snapshot = try footer.snapshot(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, history_view.range_footer_text) != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space: clear range") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space:") == null);
 }
 
 test "footer normal-mode hints follow state and local key ownership" {
@@ -2647,10 +2611,9 @@ test "footer normal-mode hints follow state and local key ownership" {
     harness.changes.viewer.sidebar_hidden = true;
     var hints = footerHints(harness.context(), &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("b", "branch"),
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     harness.changes.viewer.sidebar_hidden = false;
@@ -2660,7 +2623,6 @@ test "footer normal-mode hints follow state and local key ownership" {
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     harness.repository.viewer.tree_hidden = true;
@@ -2670,7 +2632,6 @@ test "footer normal-mode hints follow state and local key ownership" {
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
-        ui.key_hint.item("q", "quit"),
     });
 
     harness.repository.viewer.tree_hidden = false;
@@ -2683,13 +2644,11 @@ test "footer normal-mode hints follow state and local key ownership" {
 
 test "footer hint projection keeps priority items and original display order" {
     var hints: FooterHints = .{};
-    hints.append(ui.key_hint.item("Tab", "focus"), .focus);
     hints.append(ui.key_hint.item("Space", "stage"), .primary);
     hints.append(ui.key_hint.item("c", "commit"), .secondary);
-    hints.append(ui.key_hint.item("b", "branch"), .secondary);
+    hints.append(ui.key_hint.item("b", "switch branch"), .secondary);
     hints.append(ui.key_hint.item("R", "switch repo"), .repository_switch);
     hints.append(ui.key_hint.item("?", "help"), .help);
-    hints.append(ui.key_hint.item("q", "quit"), .quit);
 
     var projected = projectFooterHints(&hints, 37, .{});
     try expectProjectedFooterHintItems(&projected, &.{
@@ -2707,12 +2666,11 @@ test "footer hint projection keeps priority items and original display order" {
     try expectProjectedFooterHintItems(&projected, hints.slice());
 }
 
-test "committed-page footer retention is R then m while display order stays m R help q" {
+test "committed-page footer retention is R then m while display order stays m R help" {
     var hints: FooterHints = .{};
-    hints.append(ui.key_hint.item("m", "base"), .compare_base);
+    hints.append(ui.key_hint.item("m", "change base"), .compare_base);
     hints.append(ui.key_hint.item("R", "switch repo"), .repository_switch);
     hints.append(ui.key_hint.item("?", "help"), .help);
-    hints.append(ui.key_hint.item("q", "quit"), .quit);
     const opts: ui.key_hint.DrawOptions = .{};
     const separator_width = chasen.text.displayWidth(opts.separator);
     const r_width = ui.key_hint.width(hints.items[1..2], opts);
@@ -2723,7 +2681,7 @@ test "committed-page footer retention is R then m while display order stays m R 
 
     projected = projectFooterHints(&hints, r_width + m_width + separator_width, opts);
     try expectProjectedFooterHintItems(&projected, &.{
-        ui.key_hint.item("m", "base"),
+        ui.key_hint.item("m", "change base"),
         ui.key_hint.item("R", "switch repo"),
     });
 
@@ -3166,6 +3124,26 @@ test "help popup uses effective document navigation labels and reaches its tail 
     }
 }
 
+test "History and Compare help keep quit discoverable without footer hints" {
+    var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 120, .height = 32 } };
+    for ([_]page.Id{ .history, .compare }) |help_page| {
+        var context = harness.context();
+        context.active_page = help_page;
+
+        var popup: chasen.testing.TestSurface = undefined;
+        try popup.init(120, 32);
+        defer popup.deinit();
+        try viewHelpPopup(context, &popup.surface);
+        const snapshot = try popup.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "q                 quit") != null);
+        if (help_page == .compare) {
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "m                 change comparison base") != null);
+        }
+    }
+}
+
 test "History help explains every commit picker marker" {
     var harness: ShellViewTestHarness = .{};
     var config: keymap.Config = .{};
@@ -3448,11 +3426,12 @@ const help_placeholder_sections = [_]HelpSection{
 };
 
 const help_compare_items = [_]HelpItem{
-    .{ .key = .{ .text = "m" }, .description = "choose comparison base" },
+    .{ .key = .{ .text = "m" }, .description = "change comparison base" },
     .{ .key = .{ .action = .reload }, .description = "refresh comparison" },
     .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
+    .{ .key = .{ .text = "q" }, .description = "quit" },
 };
 
 const help_history_items = [_]HelpItem{
@@ -3465,10 +3444,11 @@ const help_history_items = [_]HelpItem{
     .{ .key = .{ .text = "Enter" }, .description = "open selected diff / load older commits" },
     .{ .key = .{ .action = .copy_history_detail }, .description = "copy commit detail / range summary" },
     .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize History pane" },
-    .{ .key = .{ .text = "m" }, .description = "choose commits from an accepted diff" },
+    .{ .key = .{ .text = "m" }, .description = "select commits from an accepted diff" },
     .{ .key = .{ .action = .reload }, .description = "recheck and reload exact current HEAD" },
     .{ .key = .{ .text = "/" }, .description = "search diff; commit search unavailable" },
     .{ .key = .{ .text = "Esc" }, .description = "cancel load/range or return to accepted diff" },
+    .{ .key = .{ .text = "q" }, .description = "quit" },
 };
 
 const help_history_marker_items = [_]HelpItem{

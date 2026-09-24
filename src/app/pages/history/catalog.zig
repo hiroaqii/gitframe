@@ -4,6 +4,9 @@ const std = @import("std");
 const ui = @import("chasen_ui");
 const git_history = @import("../../../git/history.zig");
 
+/// The catalog context and range hint stay above the scrolling commit list.
+pub const header_rows: u16 = 2;
+
 pub const State = struct {
     snapshot: ?git_history.Snapshot = null,
     total_count: ?usize = null,
@@ -139,10 +142,8 @@ pub const State = struct {
     }
 };
 
-/// The catalog context occupies row zero; every remaining row belongs to the
-/// scrolling list.
 pub fn visibleRows(body_height: u16) usize {
-    return body_height -| 1;
+    return body_height -| header_rows;
 }
 
 test "History catalog viewport includes only the load-more operation row" {
@@ -161,11 +162,11 @@ test "History catalog navigation reuses Viewport keep-visible semantics" {
     try std.testing.expect(!state.canMovePrevious());
     try std.testing.expect(state.canMoveNext());
     state.pageDown(5);
-    try std.testing.expectEqual(@as(usize, 4), state.cursor);
+    try std.testing.expectEqual(@as(usize, 3), state.cursor);
     try std.testing.expectEqual(@as(usize, 1), state.scroll);
     state.last(5);
     try std.testing.expectEqual(@as(usize, 9), state.cursor);
-    try std.testing.expectEqual(@as(usize, 6), state.scroll);
+    try std.testing.expectEqual(@as(usize, 7), state.scroll);
     try std.testing.expect(state.canMovePrevious());
     try std.testing.expect(!state.canMoveNext());
     state.continuation = try git_history.ObjectId.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
@@ -185,15 +186,15 @@ test "History catalog selects one visible row by index" {
     var state: State = .{ .records = .{ .items = &records, .capacity = records.len } };
     state.select(6, 5);
     try std.testing.expectEqual(@as(usize, 6), state.cursor);
-    try std.testing.expectEqual(@as(usize, 3), state.scroll);
+    try std.testing.expectEqual(@as(usize, 4), state.scroll);
 
     state.select(10, 5);
     try std.testing.expectEqual(@as(usize, 6), state.cursor);
     state.records = .empty;
 }
 
-test "History catalog gives the removed column-label row back to the viewport" {
+test "History catalog reserves context and range hint rows above the viewport" {
     try std.testing.expectEqual(@as(usize, 0), visibleRows(0));
     try std.testing.expectEqual(@as(usize, 0), visibleRows(1));
-    try std.testing.expectEqual(@as(usize, 23), visibleRows(24));
+    try std.testing.expectEqual(@as(usize, 30), visibleRows(32));
 }
