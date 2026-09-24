@@ -451,6 +451,7 @@ pub const State = struct {
             .selection_completion_policy = .retain_with_actions,
             .retained_selection_install_available = self.retainedSelectionInstallAvailableWithIdentity(presentation),
             .retained_selection_action_admitted = self.retainedSelectionAdmittedWithIdentity(presentation),
+            .context_copy_available = self.retainedSelectionInstallAvailableWithIdentity(presentation),
             .source = owner.source,
             .layout = owner.layout,
         };
@@ -482,6 +483,7 @@ pub const State = struct {
             .selection_completion_policy = .retain_with_actions,
             .retained_selection_install_available = self.retainedSelectionInstallAvailableWithIdentity(presentation),
             .retained_selection_action_admitted = self.retainedSelectionAdmittedWithIdentity(presentation),
+            .context_copy_available = self.retainedSelectionInstallAvailableWithIdentity(presentation),
             .source = owner.source,
             .layout = owner.layout,
         };

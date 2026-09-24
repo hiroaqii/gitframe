@@ -957,3 +957,124 @@ fn syncTestActivation(app: *TestApp) void {
         changes_authority.auxiliaryMember(app.pages.changes.branch_status_load),
     );
 }
+
+test "committed context copies accepted bases side paths gaps and exact y bytes" {
+    const committed_diff = @import("pages/committed_diff.zig");
+    const commit_diff = @import("../git/commit_diff.zig");
+    const Controller = @import("pages/committed_diff/coordinator.zig").Controller;
+    const selection_action = @import("selection_action.zig");
+    const Input = @import("pages/committed_diff/input.zig");
+    const app_load = @import("load.zig");
+    const diff_selection = @import("../diff/selection.zig");
+    const allocator = std.testing.allocator;
+    const before = try commit_diff.ObjectId.parse(.sha1, "1" ** 40);
+    const after = try commit_diff.ObjectId.parse(.sha1, "2" ** 40);
+    const base_tip = try commit_diff.ObjectId.parse(.sha1, "3" ** 40);
+    const root_after = try commit_diff.ObjectId.parse(.sha256, "a" ** 64);
+    const cases = [_]struct {
+        identity: committed_diff.PresentationIdentity,
+        page_id: page.Id,
+        side: diff_selection.Side,
+        character: bool = false,
+        root: bool = false,
+        lines: []const u8,
+        code: []const u8,
+    }{
+        .{ .identity = .{ .target = .{ .object_format = .sha1, .base_oid = base_tip, .diff_base_oid = before, .head_oid = after } }, .page_id = .compare, .side = .old, .lines = "42-44, 80-81", .code = "first\nold\nthird\nlater\nlast\n" },
+        .{ .identity = .{ .diff_basis = .{ .object_format = .sha1, .before = .{ .commit = before }, .after = after } }, .page_id = .history, .side = .new, .character = true, .lines = "53", .code = "e" },
+        .{ .identity = .{ .diff_basis = .{ .object_format = .sha256, .before = .empty_tree, .after = root_after } }, .page_id = .history, .side = .new, .root = true, .lines = "1-2", .code = "\troot  \nsecond\n" },
+    };
+    const rename_patch =
+        "diff --git a/old.zig b/new.zig\n" ++
+        "similarity index 70%\nrename from old.zig\nrename to new.zig\n" ++
+        "--- a/old.zig\n+++ b/new.zig\n" ++
+        "@@ -42,3 +52,3 @@\n first\n-old\n+new\n third\n" ++
+        "@@ -80,2 +90,2 @@\n later\n-last\n+tail\n";
+    const root_patch = "diff --git a/new.zig b/new.zig\nnew file mode 100644\n--- /dev/null\n+++ b/new.zig\n@@ -0,0 +1,2 @@\n+\troot  \n+second\n";
+
+    for (cases) |case| {
+        var state: committed_diff.State = .{};
+        defer state.deinit(allocator);
+        var activation = diff_surface.authority.Lifecycle.init(if (case.page_id == .compare) .compare else .history);
+        _ = activation.activate(7, .immutable, .unavailable, .unavailable);
+        var status: app_state.StatusMessage = .{};
+        const source: diff_source.SourceMode = .{ .range = @tagName(case.page_id) };
+        var bundle: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, if (case.root) root_patch else rename_patch) };
+        defer bundle.deinit();
+        try state.replaceDiffWithIdentity(allocator, 7, "/work/repo", null, source, case.identity, true, .none, &bundle);
+        state.viewer.display_mode = .side_by_side;
+        state.viewer.sidebar_hidden = true;
+        state.viewer.focus = .diff;
+        var controller: Controller = .{
+            .navigation = .{ .diff = &state, .activation = &activation, .status = &status, .current_target = null, .presentation_identity = case.identity, .repo_root = "/work/repo", .repo_epoch = 7, .root_identity = null, .source = source, .layout = .{ .width = 120, .height = 32 } },
+            .effect_origin = .{ .page_id = case.page_id, .repo_epoch = 7, .activation_id = 1 },
+            .branch_unavailable_message = "unavailable",
+        };
+        controller.initializeAcceptedBody(allocator, null);
+        const drag: diff_selection.DragSelection = .{
+            .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "new.zig" } },
+            .content = .{ .source_side = .{ .side = case.side, .mode = if (case.character) .character else .line } },
+            .origin = if (case.character) .mouse else .keyboard_line,
+            .anchor = if (case.character) .{ .hunk_index = 0, .line_index = 2, .leading = 1, .trailing = 2 } else .{ .hunk_index = 0, .line_index = 0 },
+            .focus = if (case.character) .{ .hunk_index = 0, .line_index = 2, .leading = 1, .trailing = 2 } else if (case.root) .{ .hunk_index = 0, .line_index = 1 } else .{ .hunk_index = 1, .line_index = 1 },
+            .selected_line_count = if (case.character) 1 else if (case.root) 2 else 5,
+            .moved = true,
+        };
+        var msg: Input.Msg = .{ .shared = .{ .selection_action = .copy_context } };
+        if (case.character) {
+            try std.testing.expect(state.installPinnedPresentationIdentity(case.identity));
+            const view = controller.navigation.view();
+            var resolver = view.resolver();
+            const body = view.bodyView(&resolver);
+            const loaded = body.view.activeLoadedDiffConst().?;
+            state.completed_selection = try diff_surface.selection.buildParsedFolded(allocator, body.currentContentToken().?, loaded.document.files[0], &.{}, state.selection_layout_revision, drag);
+            _ = selection_action.advanceGeneration(&state.selection_generation);
+            const raw = body.view.rawDiffPaneGeometry().?;
+            const presentation = body.selectionStatusPresentation().?;
+            const region = selection_action.statusLayout(.{ .col = 1, .width = raw.width - 1 }, presentation).copy_context.?;
+            msg = .{ .shared = .{ .mouse_diff_press = .{ .col = raw.col + region.col, .row = 1 } } };
+        } else state.selection_owner = .{ .diff = drag };
+        var outcome = try controller.update(allocator, msg);
+        defer outcome.deinit(allocator);
+        const effect = outcome.clipboard orelse return error.ExpectedContextCopy;
+        const plain = try state.completed_selection.?.clipboardText(allocator);
+        defer allocator.free(plain);
+        try std.testing.expectEqualStrings(case.code, plain);
+        const expected_before = if (case.root) commit_diff.canonicalEmptyTreeOid(.sha256) else before;
+        const expected_after = if (case.root) root_after else after;
+        const expected = try std.fmt.allocPrint(allocator, "Repository: /work/repo\nSurface: {s}\nBefore: {s}{s}\nAfter: {s}\nFile: {s}\nSide: {s}\nLines: {s}\n\nSelected code:\n```\n{s}\n```\n\nQuestion:\n", .{
+            if (case.page_id == .compare) "Compare" else "History", if (case.root) "empty-tree " else "", expected_before.slice(), expected_after.slice(), if (case.side == .old) "old.zig" else "new.zig", @tagName(case.side), case.lines, plain,
+        });
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, effect.text);
+        try std.testing.expectEqual(state.selection_generation, effect.selection_generation.?);
+        try std.testing.expect(state.selection_owner == .none);
+
+        if (case.page_id == .compare) {
+            try std.testing.checkAllAllocationFailures(allocator, struct {
+                fn check(owner: std.mem.Allocator, coordinator: Controller) !void {
+                    var result = try coordinator.update(owner, .{ .shared = .{ .selection_action = .copy_context } });
+                    defer result.deinit(owner);
+                    if (result.clipboard == null) {
+                        try std.testing.expect(coordinator.navigation.diff.completed_selection != null);
+                        try std.testing.expect(coordinator.navigation.diff.pinned_selection_basis != null);
+                        return error.OutOfMemory;
+                    }
+                }
+            }.check, .{controller});
+            var retry = try controller.update(allocator, .{ .shared = .{ .selection_action = .copy_context } });
+            defer retry.deinit(allocator);
+            try std.testing.expectEqualStrings(expected, retry.clipboard.?.text);
+            controller.navigation.repo_epoch += 1;
+        } else {
+            var changed = case.identity.diff_basis;
+            changed.before = .{ .commit = changed.after };
+            controller.navigation.presentation_identity = .{ .diff_basis = changed };
+        }
+        var stale = try controller.update(allocator, .{ .shared = .{ .selection_action = .copy_context } });
+        defer stale.deinit(allocator);
+        try std.testing.expect(stale.clipboard == null);
+        try std.testing.expect(state.completed_selection == null);
+        try std.testing.expect(state.pinned_selection_basis == null);
+    }
+}

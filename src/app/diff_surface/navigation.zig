@@ -493,8 +493,13 @@ pub const BodyView = struct {
         const active_keyboard = self.activeKeyboardSelectionPresentation();
         const presentation = active_keyboard orelse (self.retainedSelectionPresentation() orelse return null);
         var status = presentation.status();
+        if (self.contextCopyAvailable() and presentation.view.content == .source_side) status.actions = .source_context;
         if (self.view.effectiveDisplayMode() == .side_by_side and active_keyboard == null) status.side = .none;
         return status;
+    }
+
+    pub fn contextCopyAvailable(self: BodyView) bool {
+        return self.view.surface.context_copy_available and self.view.effectiveDisplayMode() == .side_by_side;
     }
 
     pub fn keyboardSideChoiceActive(self: BodyView) bool {

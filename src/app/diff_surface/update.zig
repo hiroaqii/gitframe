@@ -14,6 +14,7 @@ const selection_action = @import("../selection_action.zig");
 pub const SelectionCopy = struct {
     text: []u8,
     generation: u64,
+    kind: enum { code, context } = .code,
 };
 
 pub const Redraw = enum { default, skip };
@@ -420,8 +421,13 @@ pub const Controller = struct {
         result: *Update,
     ) void {
         // Source context is enabled by page owners, never by widget reuse.
-        if (action == .copy_context) return;
-        if (action == .copy and self.completeKeyboardSelection(allocator, result)) return;
+        if (action == .copy_context) {
+            if (!self.navigation.view().contextCopyAvailable()) return;
+            const owner = self.navigation.controller.surface.selection_owner;
+            if (owner.* != .none and (owner.activeDiff() == null or owner.activeDiff().?.origin != .keyboard_line)) return;
+        }
+        const kind: @FieldType(SelectionCopy, "kind") = if (action == .copy_context) .context else .code;
+        if ((action == .copy or action == .copy_context) and self.completeKeyboardSelection(allocator, result, kind)) return;
 
         const Adapter = struct {
             controller: Controller,
@@ -453,6 +459,7 @@ pub const Controller = struct {
             .copy => |text| result.effect = .{ .copy_diff_selection = .{
                 .text = text,
                 .generation = self.navigation.controller.surface.selection_generation.*,
+                .kind = kind,
             } },
             .cleared => result.retention_transition = .cleared,
             .authority_invalid => {
@@ -495,7 +502,7 @@ pub const Controller = struct {
         }
     }
 
-    fn completeKeyboardSelection(self: Controller, allocator: std.mem.Allocator, result: *Update) bool {
+    fn completeKeyboardSelection(self: Controller, allocator: std.mem.Allocator, result: *Update, kind: @FieldType(SelectionCopy, "kind")) bool {
         const drag = self.navigation.controller.surface.selection_owner.activeDiff() orelse return false;
         if (drag.origin != .keyboard_line) return false;
         if (self.navigation.controller.surface.selection_completion_policy == .retain_with_actions and
@@ -540,6 +547,7 @@ pub const Controller = struct {
         result.effect = .{ .copy_diff_selection = .{
             .text = clipboard,
             .generation = generation,
+            .kind = kind,
         } };
         return true;
     }

@@ -25,6 +25,7 @@ pub const Context = struct {
     side_by_side: bool = false,
     selection_owner: SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
+    context_copy_available: bool = false,
     keymap: keymap.Effective = .{},
 };
 
@@ -93,6 +94,7 @@ pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?message.Msg {
     const command = selection_input.keyToCommand(.{
         .owner_kind = neutralOwnerKind(context.selection_owner),
         .retained_action_available = context.retained_selection_action_available,
+        .context_copy_available = context.context_copy_available and context.side_by_side,
         .keymap = context.keymap,
     }, key) orelse return null;
     return switch (command) {

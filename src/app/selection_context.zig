@@ -2,12 +2,26 @@
 //! No source reads, Git resolution, or clipboard effects belong here.
 
 const std = @import("std");
+const commit_diff = @import("../git/commit_diff.zig");
+const diff_selection = @import("../diff/selection.zig");
+
+pub const LineRange = struct { first: u32, last: u32 };
 
 pub const Location = struct {
     repository_root: []const u8,
     path: []const u8,
     first_line: u32,
     last_line: u32,
+    surface: union(enum) {
+        repository,
+        committed: struct {
+            name: enum { compare, history },
+            basis: commit_diff.Basis,
+            side: diff_selection.Side,
+            /// The first interval is mandatory above; these retain later gaps.
+            following_ranges: []const LineRange = &.{},
+        },
+    } = .repository,
 };
 
 pub fn format(allocator: std.mem.Allocator, location: Location, code: []const u8) std.mem.Allocator.Error![]u8 {
@@ -20,10 +34,27 @@ pub fn format(allocator: std.mem.Allocator, location: Location, code: []const u8
 fn writeMarkdown(writer: *std.Io.Writer, location: Location, code: []const u8) std.Io.Writer.Error!void {
     try writer.writeAll("Repository: ");
     try writePath(writer, location.repository_root);
-    try writer.writeAll("\nSurface: Repository\nFile: ");
+    switch (location.surface) {
+        .repository => try writer.writeAll("\nSurface: Repository"),
+        .committed => |committed| {
+            try writer.print("\nSurface: {s}\nBefore: ", .{switch (committed.name) {
+                .compare => "Compare",
+                .history => "History",
+            }});
+            if (committed.basis.before == .empty_tree) try writer.writeAll("empty-tree ");
+            const before = committed.basis.beforeOid();
+            try writer.print("{s}\nAfter: {s}", .{ before.slice(), committed.basis.after.slice() });
+        },
+    }
+    try writer.writeAll("\nFile: ");
     try writePath(writer, location.path);
+    if (location.surface == .committed) try writer.print("\nSide: {s}", .{@tagName(location.surface.committed.side)});
     try writer.print("\nLines: {d}", .{location.first_line});
     if (location.last_line != location.first_line) try writer.print("-{d}", .{location.last_line});
+    if (location.surface == .committed) for (location.surface.committed.following_ranges) |range| {
+        try writer.print(", {d}", .{range.first});
+        if (range.last != range.first) try writer.print("-{d}", .{range.last});
+    };
     try writer.writeAll("\n\nSelected code:\n");
 
     var fence_length: usize = 3;

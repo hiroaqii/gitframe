@@ -912,6 +912,33 @@ test "repository context root routing respects owner and text input priority" {
     }, upper_y).?);
 }
 
+test "committed context root routing requires source capability and preserves owners" {
+    const upper_y: chasen.Key = .{ .codepoint = 'Y' };
+    var context: KeyContext = .{ .active_page = .compare, .compare = .{ .common = .{
+        .side_by_side = true,
+        .context_copy_available = true,
+        .selection_owner = .keyboard_line,
+    } } };
+    try expectMsg(.{ .compare = .{ .common = .{ .shared = .{ .selection_action = .copy_context } } } }, keyToMsg(context, upper_y).?);
+    context.compare.common.selection_owner = .mouse;
+    try expectMsg(.{ .compare = .{ .common = .{ .shared = .selection_owned_noop } } }, keyToMsg(context, upper_y).?);
+    context.compare.common.selection_owner = .none;
+    context.compare.common.retained_selection_action_available = true;
+    try expectMsg(.{ .compare = .{ .common = .{ .shared = .{ .selection_action = .copy_context } } } }, keyToMsg(context, upper_y).?);
+    context.compare.common.side_by_side = false;
+    try expectMsg(.{ .compare = .{ .common = .copy_current_hunk } }, keyToMsg(context, upper_y).?);
+    context.compare.common.side_by_side = true;
+    context.compare.common.selection_owner = .header;
+    try expectMsg(.{ .compare = .{ .common = .copy_current_hunk } }, keyToMsg(context, upper_y).?);
+    context.compare.common.search_mode = true;
+    try expectMsg(.{ .compare = .{ .common = .{ .shared = .{ .search_insert = 'Y' } } } }, keyToMsg(context, upper_y).?);
+    context.active_page = .history;
+    context.history = .{ .diff_view = true, .common = .{ .side_by_side = true, .context_copy_available = true, .selection_owner = .keyboard_line } };
+    try expectMsg(.{ .history = .{ .common = .{ .shared = .{ .selection_action = .copy_context } } } }, keyToMsg(context, upper_y).?);
+    context.history.diff_view = false;
+    try std.testing.expect(keyToMsg(context, upper_y) == null);
+}
+
 test "root selection preflight consumes document navigation only for live owners" {
     const keys = [_]chasen.Key{
         .{ .codepoint = 'g' },

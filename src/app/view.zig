@@ -2132,7 +2132,12 @@ fn drawHelpItem(app: Context, surface: *chasen.Surface, row: u16, item: HelpItem
     const description = switch (item.dynamic) {
         .none => item.description,
         .copy_line => if (effectiveHelpDiffMode(app) == .unified) "Copy diff" else "Copy line",
-        .copy_hunk => if (effectiveHelpDiffMode(app) == .unified) "Copy hunk diff" else "Copy hunk",
+        .copy_hunk => if (effectiveHelpDiffMode(app) == .unified)
+            "Copy hunk diff"
+        else if (app.active_page == .compare or app.active_page == .history)
+            "Copy context (selection) / hunk"
+        else
+            "Copy hunk",
     };
     var padding: [18]u8 = undefined;
     @memset(&padding, ' ');
@@ -3118,9 +3123,11 @@ test "diff Help copy vocabulary follows effective mode for Changes Compare and H
             if (canonical_mode == .unified) {
                 try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy diff") != null);
                 try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy hunk diff") != null);
+                try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy context") == null);
             } else {
                 try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy line") != null);
-                try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy hunk") != null);
+                const hunk_label = if (help_page == .changes) "Copy hunk" else "Copy context (selection) / hunk";
+                try std.testing.expect(std.mem.indexOf(u8, snapshot, hunk_label) != null);
                 try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy hunk diff") == null);
             }
         }

@@ -206,6 +206,7 @@ pub const ReadSurface = struct {
     selection_completion_policy: SelectionCompletionPolicy,
     retained_selection_install_available: bool = true,
     retained_selection_action_admitted: bool = true,
+    context_copy_available: bool = false,
     source: diff_source.SourceMode,
     layout: Layout,
 };
@@ -244,6 +245,7 @@ pub const DiffSurface = struct {
     selection_completion_policy: SelectionCompletionPolicy,
     retained_selection_install_available: bool = true,
     retained_selection_action_admitted: bool = true,
+    context_copy_available: bool = false,
     source: diff_source.SourceMode,
     layout: Layout,
 
@@ -273,6 +275,7 @@ pub const DiffSurface = struct {
             .selection_completion_policy = self.selection_completion_policy,
             .retained_selection_install_available = self.retained_selection_install_available,
             .retained_selection_action_admitted = self.retained_selection_action_admitted,
+            .context_copy_available = self.context_copy_available,
             .source = self.source,
             .layout = self.layout,
         };

@@ -771,6 +771,16 @@ test "Compare retained actions route keyboard and mouse through App after narrow
         "one\ntwo\nold\nfour\nlate one\n",
         ctx._pending_clipboard_copies[0].text,
     );
+    const context_key = app.handleEvent(.{ .key_press = .{ .codepoint = 'Y' } }) orelse
+        return error.ExpectedCompareContextKey;
+    try std.testing.expectEqual(
+        App.Msg{ .compare = .{ .common = .{ .shared = .{ .selection_action = .copy_context } } } },
+        context_key,
+    );
+    const context_click = app.handleEvent(try compareActionMouseEvent(&app, .copy_context)) orelse
+        return error.ExpectedCompareContextClick;
+    try std.testing.expect(context_click == .compare and context_click.compare == .common and
+        context_click.compare.common == .shared and context_click.compare.common.shared == .mouse_diff_press);
 
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
     app.pages.compare.diff.viewer.display_mode = .unified;

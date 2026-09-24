@@ -175,6 +175,7 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
     const retained_token = app.pages.compare.diff.completed_selection.?.token;
     const retained_pin = app.pages.compare.diff.pinned_selection_basis.?;
     const origin: effect_origin.Origin = .{ .page = app.shellEffects().compareOrigin() };
+    app.pages.compare.diff.selection_generation = 47;
 
     const outcomes = [_]app_message.ClipboardCopyOutcome{
         .sent,
@@ -184,12 +185,17 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
     for (outcomes, 20..) |outcome, request_id| {
         try app.shell_state.clipboard_copies.put(allocator, request_id, .{
             .origin = origin,
-            .label = "diff selection",
+            .label = "selection context",
+            .selection_generation = app.pages.compare.diff.selection_generation,
         });
-        _ = app.shellEffects().finishClipboard(.{
+        const completion = app.shellEffects().finishClipboard(.{
             .request_id = .{ .id = request_id },
             .outcome = outcome,
         });
+        if (outcome == .sent) {
+            try std.testing.expectEqual(page.Id.compare, completion.?.origin.page_id);
+            try std.testing.expectEqual(@as(u64, 47), completion.?.generation);
+        } else try std.testing.expect(completion == null);
         try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
         try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
     }

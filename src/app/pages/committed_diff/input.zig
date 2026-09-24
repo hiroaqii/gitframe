@@ -21,6 +21,7 @@ pub const Context = struct {
     side_by_side: bool = false,
     selection_owner: diff_surface.input.SelectionOwnerKind = .none,
     retained_selection_action_available: bool = false,
+    context_copy_available: bool = false,
     keymap: keymap.Effective = .{},
 
     fn shared(self: Context) diff_surface.input.Context {
@@ -30,6 +31,7 @@ pub const Context = struct {
             .side_by_side = self.side_by_side,
             .selection_owner = self.selection_owner,
             .retained_selection_action_available = self.retained_selection_action_available,
+            .context_copy_available = self.context_copy_available,
             .keymap = self.keymap,
         };
     }
