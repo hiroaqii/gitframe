@@ -11,6 +11,7 @@ const draw = @import("draw");
 
 pub const Action = enum {
     copy,
+    copy_context,
     clear,
 };
 
@@ -19,12 +20,14 @@ pub const Action = enum {
 /// a current-body action, not an operation on the retained candidate.
 pub const StatusAction = enum {
     copy,
+    copy_context,
     copy_hunk,
     clear,
 
     pub fn retained(self: StatusAction) ?Action {
         return switch (self) {
             .copy => .copy,
+            .copy_context => .copy_context,
             .clear => .clear,
             .copy_hunk => null,
         };
@@ -38,6 +41,7 @@ pub fn advanceGeneration(generation: *u64) u64 {
 }
 
 pub const copy_control_text = " y Copy ";
+pub const copy_context_control_text = " Y Copy context ";
 // Repository/source-selection tests and callers use this legacy name for the
 // source-mode controls. Unified diff panes select their own action labels.
 pub const controls_text = copy_control_text;
@@ -57,7 +61,7 @@ pub const StatusSide = enum {
 pub const StatusPresentation = struct {
     line_count: usize,
     side: StatusSide = .none,
-    actions: enum { source, unified_diff } = .source,
+    actions: enum { source, source_context, unified_diff } = .source,
 };
 
 const StatusVariant = enum {
@@ -71,11 +75,13 @@ pub const StatusLayout = struct {
     region: Region,
     copy: ?Region,
     copy_hunk: ?Region,
+    copy_context: ?Region,
     clear: ?Region,
 
     pub fn targetAt(self: StatusLayout, col: u16) ?StatusAction {
         if (self.copy) |region| if (region.contains(col)) return .copy;
         if (self.copy_hunk) |region| if (region.contains(col)) return .copy_hunk;
+        if (self.copy_context) |region| if (region.contains(col)) return .copy_context;
         if (self.clear) |region| if (region.contains(col)) return .clear;
         return null;
     }
@@ -89,19 +95,20 @@ pub fn statusLayout(region: Region, presentation: StatusPresentation) StatusLayo
         presentation,
     ));
     const copy_width: u16 = @intCast(chasen.text.displayWidth(copyControlText(presentation)));
-    const hunk_width: u16 = if (copyHunkControlText(presentation)) |text|
+    const secondary_width: u16 = if (secondaryControlText(presentation)) |text|
         @intCast(chasen.text.displayWidth(text))
     else
         0;
     const clear_width: u16 = @intCast(chasen.text.displayWidth(clear_control_text));
     const copy_col = region.col +| prefix_width;
     const hunk_col = copy_col +| copy_width +| 1;
-    const clear_col = if (hunk_width > 0) hunk_col +| hunk_width +| 1 else hunk_col;
+    const clear_col = if (secondary_width > 0) hunk_col +| secondary_width +| 1 else hunk_col;
     const end = region.col +| region.width;
     return .{
         .region = region,
         .copy = if (copy_col +| copy_width <= end) .{ .col = copy_col, .width = copy_width } else null,
-        .copy_hunk = if (hunk_width > 0 and hunk_col +| hunk_width <= end) .{ .col = hunk_col, .width = hunk_width } else null,
+        .copy_hunk = if (presentation.actions == .unified_diff and hunk_col +| secondary_width <= end) .{ .col = hunk_col, .width = secondary_width } else null,
+        .copy_context = if (presentation.actions == .source_context and hunk_col +| secondary_width <= end) .{ .col = hunk_col, .width = secondary_width } else null,
         .clear = if (clear_col +| clear_width <= end) .{ .col = clear_col, .width = clear_width } else null,
     };
 }
@@ -149,11 +156,11 @@ pub fn drawStatusLine(
         copyControlText(presentation),
         button_style,
     );
-    if (layout.copy_hunk) |target| try draw.copyClippedTextAt(
+    if (layout.copy_hunk orelse layout.copy_context) |target| try draw.copyClippedTextAt(
         &line_surface,
         target.col - effective_region.col,
         0,
-        copyHunkControlText(presentation).?,
+        secondaryControlText(presentation).?,
         button_style,
     );
     if (layout.clear) |target| try draw.copyClippedTextAt(
@@ -178,21 +185,22 @@ fn statusVariant(width: u16, presentation: StatusPresentation) StatusVariant {
 
 fn copyControlText(presentation: StatusPresentation) []const u8 {
     return switch (presentation.actions) {
-        .source => copy_control_text,
+        .source, .source_context => copy_control_text,
         .unified_diff => copy_diff_control_text,
     };
 }
 
-fn copyHunkControlText(presentation: StatusPresentation) ?[]const u8 {
+fn secondaryControlText(presentation: StatusPresentation) ?[]const u8 {
     return switch (presentation.actions) {
         .source => null,
+        .source_context => copy_context_control_text,
         .unified_diff => copy_hunk_diff_control_text,
     };
 }
 
 fn controlsWidth(presentation: StatusPresentation) usize {
     var width = chasen.text.displayWidth(copyControlText(presentation));
-    if (copyHunkControlText(presentation)) |text| width += 1 + chasen.text.displayWidth(text);
+    if (secondaryControlText(presentation)) |text| width += 1 + chasen.text.displayWidth(text);
     return width + 1 + chasen.text.displayWidth(clear_control_text);
 }
 
@@ -292,7 +300,7 @@ pub fn dispatch(
             adapter.clear(allocator);
             break :blk .cleared;
         },
-        .copy => .{ .copy = adapter.copy(allocator) catch |err| switch (err) {
+        .copy, .copy_context => .{ .copy = adapter.copy(allocator) catch |err| switch (err) {
             error.AuthorityInvalid => {
                 adapter.clear(allocator);
                 return .authority_invalid;
@@ -437,6 +445,31 @@ test "fixed selection status exposes complete actions from wide to narrow panes"
     const two_digits = statusLayout(.{ .col = 1, .width = 70 }, .{ .line_count = 10 });
     try std.testing.expectEqual(one_digit.copy.?.col, two_digits.copy.?.col);
     try std.testing.expectEqual(one_digit.clear.?.col, two_digits.clear.?.col);
+}
+
+test "selection action context status draws only complete matching click targets" {
+    const presentation: StatusPresentation = .{ .line_count = 2, .actions = .source_context };
+    for ([_]u16{ 8, 23, 37, 80, 120 }) |width| {
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(width, 1);
+        defer surface.deinit();
+        const region: Region = .{ .col = 0, .width = width };
+        const actions = statusLayout(region, presentation);
+        try drawStatusLine(&surface.surface, 0, region, presentation, .{}, .default, .default);
+        const snapshot = try surface.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expectEqual(actions.copy_context != null, std.mem.indexOf(u8, snapshot, "Y Copy context") != null);
+        try std.testing.expectEqual(actions.clear != null, std.mem.indexOf(u8, snapshot, "Esc Clear") != null);
+        try std.testing.expect(actions.copy_hunk == null);
+        if (actions.copy_context) |target| {
+            try std.testing.expectEqual(StatusAction.copy_context, actions.targetAt(target.col).?);
+            try std.testing.expectEqual(StatusAction.copy_context, actions.targetAt(target.col + target.width - 1).?);
+        }
+        if (width >= 37) {
+            try std.testing.expect(actions.copy_context != null);
+            try std.testing.expect(actions.clear != null);
+        }
+    }
 }
 
 test "fixed selection status never draws a partial mouse action" {

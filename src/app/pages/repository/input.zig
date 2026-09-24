@@ -85,12 +85,14 @@ pub fn selectionKeyToMsg(comptime Msg: type, context: Context, key: chasen.Key) 
     const command = selection_input.keyToCommand(.{
         .owner_kind = context.selection_owner,
         .retained_action_available = context.retained_selection_action_available,
+        .context_copy_available = true,
         .keymap = context.keymap,
     }, key) orelse return null;
     return switch (command) {
         .move_up => payload(Msg, "keyboard_line_selection_move", @import("../../direction.zig").Vertical.up),
         .move_down => payload(Msg, "keyboard_line_selection_move", @import("../../direction.zig").Vertical.down),
         .copy => payload(Msg, "selection_action", selection_action.Action.copy),
+        .copy_context => payload(Msg, "selection_action", selection_action.Action.copy_context),
         .clear => payload(Msg, "selection_action", selection_action.Action.clear),
         .ask => voidMsg(Msg, "selection_action_unavailable"),
         .owned_noop => voidMsg(Msg, "selection_owned_noop"),

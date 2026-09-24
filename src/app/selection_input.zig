@@ -20,6 +20,7 @@ pub const Command = enum {
     move_up,
     move_down,
     copy,
+    copy_context,
     clear,
     ask,
     owned_noop,
@@ -28,6 +29,7 @@ pub const Command = enum {
 pub const Context = struct {
     owner_kind: OwnerKind = .none,
     retained_action_available: bool = false,
+    context_copy_available: bool = false,
     keymap: keymap.Effective = .{},
 };
 
@@ -41,6 +43,7 @@ pub fn keyToCommand(context: Context, key: chasen.Key) ?Command {
     }
     const escape = key.matches(chasen.Key.escape, .{});
     const copy = key.matches('y', .{});
+    const copy_context = context.context_copy_available and key_input.matchesShiftedAscii(key, 'y', 'Y');
     const ask = key.matches('a', .{});
     const begin = key_input.matchesShiftedAscii(key, 'v', 'V');
     const up = key.matches('k', .{}) or key.matches(chasen.Key.up, .{});
@@ -52,6 +55,8 @@ pub fn keyToCommand(context: Context, key: chasen.Key) ?Command {
             .clear
         else if (copy)
             .copy
+        else if (copy_context)
+            .copy_context
         else if (ask)
             .ask
         else if (up)
@@ -64,7 +69,7 @@ pub fn keyToCommand(context: Context, key: chasen.Key) ?Command {
             null,
         .mouse, .header => if (escape)
             .clear
-        else if (copy or ask or begin or up or down or lateral)
+        else if (copy or ask or begin or up or down or lateral or (copy_context and context.owner_kind == .mouse))
             .owned_noop
         else
             null,
@@ -73,6 +78,8 @@ pub fn keyToCommand(context: Context, key: chasen.Key) ?Command {
                 .clear
             else if (copy)
                 .copy
+            else if (copy_context)
+                .copy_context
             else if (ask)
                 .ask
             else
@@ -100,6 +107,14 @@ test "selection input maps the complete owner command matrix" {
         .{ .context = .{ .owner_kind = .mouse }, .key = .{ .codepoint = chasen.Key.escape }, .expected = .clear },
         .{ .context = .{ .owner_kind = .header }, .key = .{ .codepoint = chasen.Key.down }, .expected = .owned_noop },
         .{ .context = .{ .owner_kind = .header }, .key = .{ .codepoint = chasen.Key.right }, .expected = null },
+        .{ .context = .{ .context_copy_available = true }, .key = .{ .codepoint = 'Y' }, .expected = null },
+        .{ .context = .{ .retained_action_available = true }, .key = .{ .codepoint = 'Y' }, .expected = null },
+        .{ .context = .{ .retained_action_available = true, .context_copy_available = true }, .key = .{ .codepoint = 'Y' }, .expected = .copy_context },
+        .{ .context = .{ .owner_kind = .keyboard_line, .context_copy_available = true }, .key = .{ .codepoint = 'y', .mods = .{ .shift = true } }, .expected = .copy_context },
+        .{ .context = .{ .owner_kind = .keyboard_line, .context_copy_available = true }, .key = .{ .codepoint = 'Y', .mods = .{ .ctrl = true } }, .expected = null },
+        .{ .context = .{ .owner_kind = .keyboard_line, .context_copy_available = true }, .key = .{ .codepoint = 'Y', .mods = .{ .alt = true } }, .expected = null },
+        .{ .context = .{ .owner_kind = .mouse, .context_copy_available = true }, .key = .{ .codepoint = 'Y' }, .expected = .owned_noop },
+        .{ .context = .{ .owner_kind = .header, .context_copy_available = true }, .key = .{ .codepoint = 'Y' }, .expected = null },
     };
     for (cases) |case| try std.testing.expectEqual(case.expected, keyToCommand(case.context, case.key));
 }

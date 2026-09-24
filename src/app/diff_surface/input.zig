@@ -99,6 +99,7 @@ pub fn selectionKeyToMsg(context: Context, key: chasen.Key) ?message.Msg {
         .move_up => .{ .keyboard_line_selection_move = .up },
         .move_down => .{ .keyboard_line_selection_move = .down },
         .copy => .{ .selection_action = .copy },
+        .copy_context => .{ .selection_action = .copy_context },
         .clear => .{ .selection_action = .clear },
         .ask => .selection_action_unavailable,
         .owned_noop => .selection_owned_noop,

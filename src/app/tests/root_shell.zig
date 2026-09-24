@@ -187,6 +187,7 @@ fn selectionActionMouseEvent(
     const region = switch (target) {
         .copy => action_layout.copy orelse return error.ExpectedCopyAction,
         .copy_hunk => action_layout.copy_hunk orelse return error.ExpectedCopyHunkAction,
+        .copy_context => action_layout.copy_context orelse return error.ExpectedCopyContextAction,
         .clear => action_layout.clear orelse return error.ExpectedClearAction,
     };
     const layout = shellLayout(app);

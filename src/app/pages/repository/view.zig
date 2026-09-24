@@ -190,7 +190,7 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     }
     if (state.selected_path) |path| {
         const selection_status: ?selection_action.StatusPresentation = if (state.sourceSelectionPresentation()) |selected|
-            .{ .line_count = selected.line_count }
+            .{ .line_count = selected.line_count, .actions = .source_context }
         else
             null;
         try drawSourceHeaderWithStatus(

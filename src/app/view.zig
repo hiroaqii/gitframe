@@ -3568,6 +3568,7 @@ const help_repository_source_items = [_]HelpItem{
     .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
     .{ .key = .{ .text = "V" }, .description = "begin line selection" },
     .{ .key = .{ .text = "y / Esc" }, .description = "copy / clear selection" },
+    .{ .key = .{ .text = "Y" }, .description = "copy selected code with context" },
 };
 
 const help_repository_sections = [_]HelpSection{

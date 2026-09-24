@@ -14,6 +14,7 @@ const git_command = @import("../../../git/command.zig");
 const repo_session = @import("../../repo_session.zig");
 const repository_page = @import("../repository.zig");
 const repository_tasks = @import("tasks.zig");
+const selection_context = @import("../../selection_context.zig");
 
 const ManifestTask = repository_tasks.ManifestTask(app_message.Msg);
 const BranchTask = repository_tasks.BranchTask(app_message.Msg);
@@ -114,12 +115,7 @@ pub const Controller = struct {
                 const redraw: Redraw = if (page_update.wheel_complete_noop) .skip else .default;
                 const command = page_update.takeCommand() orelse return .{ .redraw = redraw, .auto_scroll = auto_scroll };
                 return .{ .redraw = redraw, .auto_scroll = auto_scroll, .clipboard = switch (command) {
-                    .copy_source_selection => |copy| .{
-                        .origin = .{ .page = self.effectOrigin() },
-                        .label = "source selection",
-                        .text = copy.text,
-                        .selection_generation = copy.generation,
-                    },
+                    .copy_source_selection => |copy| self.selectionClipboard(ctx.allocator(), copy),
                     .copy_source_header_path => |text| .{
                         .origin = .{ .page = self.effectOrigin() },
                         .label = "file path",
@@ -128,6 +124,49 @@ pub const Controller = struct {
                 } };
             },
         }
+    }
+
+    fn selectionClipboard(
+        self: Controller,
+        allocator: std.mem.Allocator,
+        copy: repository_page.SelectionCopy,
+    ) ?ClipboardEffect {
+        if (copy.kind == .code) return .{
+            .origin = .{ .page = self.effectOrigin() },
+            .label = "source selection",
+            .text = copy.text,
+            .selection_generation = copy.generation,
+        };
+        defer allocator.free(copy.text);
+
+        const selected = self.page_state.retainedSourceSelection();
+        const root = self.repo.activeRoot();
+        const identity = self.repo.activeIdentity();
+        if (selected == null or root == null or identity == null or
+            copy.generation != self.page_state.selection_generation or
+            selected.?.token.repo_epoch != self.repo.epoch() or
+            !selected.?.token.root_identity.eql(identity.?))
+        {
+            _ = self.page_state.applyNavigation(allocator, .{ .selection_action = .clear }, self.body_size);
+            self.page_state.status.set("Source selection is no longer current", .{});
+            return null;
+        }
+
+        const text = selection_context.format(allocator, .{
+            .repository_root = root.?,
+            .path = selected.?.token.path,
+            .first_line = selected.?.source_start,
+            .last_line = selected.?.source_end,
+        }, copy.text) catch {
+            self.page_state.status.set("Could not prepare selection context; press Y to retry", .{});
+            return null;
+        };
+        return .{
+            .origin = .{ .page = self.effectOrigin() },
+            .label = "selection context",
+            .text = text,
+            .selection_generation = copy.generation,
+        };
     }
 
     pub fn requestReload(self: Controller) void {

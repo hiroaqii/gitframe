@@ -224,6 +224,7 @@ pub const Msg = union(enum) {
 pub const SelectionCopy = struct {
     text: []u8,
     generation: u64,
+    kind: enum { code, context } = .code,
 };
 
 pub const Command = union(enum) {
@@ -2787,7 +2788,7 @@ pub const RepositoryPageState = struct {
         if (point.row != repository_source_geometry.source_search_or_rule_row or geometry.width <= 1) return null;
         const layout = selection_action.statusLayout(
             .{ .col = 1, .width = geometry.width - 1 },
-            .{ .line_count = presentation.line_count },
+            .{ .line_count = presentation.line_count, .actions = .source_context },
         );
         return if (layout.targetAt(point.col)) |action|
             if (action.retained()) |retained| .{ .target = retained } else .inert
@@ -3111,6 +3112,7 @@ pub const RepositoryPageState = struct {
                 break :blk .{ .copy_source_selection = .{
                     .text = clipboard,
                     .generation = self.selection_generation,
+                    .kind = if (action == .copy_context) .context else .code,
                 } };
             },
             .cleared => blk: {
@@ -4111,6 +4113,91 @@ fn installFirstLineCandidateForTest(
     completed = undefined;
 }
 
+test "repository context copies keyboard and partial character payloads through one effect" {
+    const allocator = std.testing.allocator;
+    const size: chasen.Size = .{ .width = 120, .height = 30 };
+    const coordinator = @import("repository/coordinator.zig");
+    const messages = @import("../message.zig");
+    const session: @import("../repo_session.zig").State = .{};
+    for ([_]bool{ true, false }) |keyboard| {
+        var state = try selectionStateForTest("main.zig\x00", "zero\n\tfirst  \nsecond\n");
+        defer state.deinit(allocator);
+        state.viewer.focus = .source;
+        if (keyboard) {
+            state.viewer.source_cursor = 1;
+            _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
+            _ = state.applyNavigation(allocator, .{ .keyboard_line_selection_move = .down }, size);
+        } else {
+            var drag = repository_selection.DragSelection.init(state.currentContentToken().?, .character, .{
+                .line_index = 1,
+                .leading_byte = 1,
+                .trailing_byte = 2,
+            });
+            drag.update(.{ .line_index = 2, .leading_byte = 2, .trailing_byte = 3 });
+            state.completed_selection = try repository_selection.buildCompletedSelection(allocator, state.currentSource().?, drag);
+        }
+        var repo = session.view();
+        repo.epoch_value = state.repo_epoch;
+        repo.active_identity = state.root_identity;
+        repo.active_root = "/work/repo";
+        const controller: coordinator.Controller = .{ .page_state = &state, .active_page = .repository, .repo = repo, .body_size = size, .env_map = null };
+        var ctx: chasen.Ctx(messages.Msg) = .{ ._allocator = allocator };
+        var result = controller.update(&ctx, .{ .selection_action = .copy_context });
+        defer result.deinit(allocator);
+        const effect = result.clipboard orelse return error.ExpectedContextCopy;
+        try std.testing.expectEqualStrings("selection context", effect.label);
+        try std.testing.expectEqual(state.selection_generation, effect.selection_generation.?);
+        try std.testing.expect(!state.activeBorrowedSourceRange());
+        try std.testing.expect(state.completed_selection != null);
+        var plain = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+        defer plain.deinit(allocator);
+        const code = plain.command.?.copy_source_selection.text;
+        try std.testing.expectEqualStrings(if (keyboard) "\tfirst  \nsecond\n" else "first  \nsec", code);
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "Repository: /work/repo\nSurface: Repository\nFile: main.zig\nLines: 2-3\n\nSelected code:\n```\n{s}\n```\n\nQuestion:\n",
+            .{code},
+        );
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, effect.text);
+        try std.testing.expect(!state.clearCompletedSelectionAfterCopy(allocator, effect.selection_generation.? + 1));
+        try std.testing.expect(state.clearCompletedSelectionAfterCopy(allocator, effect.selection_generation.?));
+    }
+}
+
+test "repository context formatter failure retries and stale root clears without copying" {
+    const allocator = std.testing.allocator;
+    const coordinator = @import("repository/coordinator.zig");
+    const messages = @import("../message.zig");
+    const session: @import("../repo_session.zig").State = .{};
+    var state = try selectionStateForTest("main.zig\x00", "one\ntwo\n");
+    defer state.deinit(allocator);
+    try installFirstLineCandidateForTest(&state, allocator);
+    var repo = session.view();
+    repo.epoch_value = state.repo_epoch;
+    repo.active_identity = state.root_identity;
+    repo.active_root = "/work/repo";
+    var controller: coordinator.Controller = .{ .page_state = &state, .active_page = .repository, .repo = repo, .body_size = .{ .width = 120, .height = 30 }, .env_map = null };
+    // The raw clipboard duplicate succeeds; the formatter's first allocation fails.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    var ctx: chasen.Ctx(messages.Msg) = .{ ._allocator = failing.allocator() };
+    var failed = controller.update(&ctx, .{ .selection_action = .copy_context });
+    defer failed.deinit(failing.allocator());
+    try std.testing.expect(failed.clipboard == null);
+    try std.testing.expect(state.completed_selection != null);
+    try std.testing.expectEqualStrings("Could not prepare selection context; press Y to retry", state.status.text());
+    ctx._allocator = allocator;
+    var retried = controller.update(&ctx, .{ .selection_action = .copy_context });
+    defer retried.deinit(allocator);
+    try std.testing.expect(retried.clipboard != null);
+    controller.repo.active_identity.?.inode +%= 1;
+    var stale = controller.update(&ctx, .{ .selection_action = .copy_context });
+    defer stale.deinit(allocator);
+    try std.testing.expect(stale.clipboard == null);
+    try std.testing.expect(state.completed_selection == null);
+    try std.testing.expectEqualStrings("Source selection is no longer current", state.status.text());
+}
+
 test "repository keyboard line selection begins moves crosses and copies exact lines" {
     const allocator = std.testing.allocator;
     const size: chasen.Size = .{ .width = 60, .height = 6 };
@@ -4175,7 +4262,7 @@ test "repository keyboard line selection begins moves crosses and copies exact l
     const page_layout = repository_layout.bodyLayout(size, state.viewer.tree_width, state.viewer.tree_hidden);
     const action_layout = selection_action.statusLayout(
         .{ .col = 1, .width = page_layout.source_width - 1 },
-        .{ .line_count = state.sourceSelectionPresentation().?.line_count },
+        .{ .line_count = state.sourceSelectionPresentation().?.line_count, .actions = .source_context },
     );
     try std.testing.expectEqual(
         Msg{ .selection_action = .copy },
@@ -6668,7 +6755,7 @@ test "repository fixed status row shares wide narrow render geometry and dispatc
 
     const wide: chasen.Size = .{ .width = 80, .height = 8 };
     const wide_layout = repository_layout.bodyLayout(wide, state.viewer.tree_width, state.viewer.tree_hidden);
-    const status = selection_action.StatusPresentation{ .line_count = 1 };
+    const status = selection_action.StatusPresentation{ .line_count = 1, .actions = .source_context };
     const wide_actions = selection_action.statusLayout(
         .{ .col = 1, .width = wide_layout.source_width - 1 },
         status,
@@ -6700,6 +6787,14 @@ test "repository fixed status row shares wide narrow render geometry and dispatc
         }, .left, wide).?,
     );
 
+    try std.testing.expectEqual(
+        Msg{ .selection_action = .copy_context },
+        state.mouseToMsg(.{
+            .col = wide_layout.source_col + wide_actions.copy_context.?.col,
+            .row = repository_source_geometry.source_search_or_rule_row,
+        }, .left, wide).?,
+    );
+
     const minimum: chasen.Size = .{ .width = 43, .height = 8 };
     const minimum_layout = repository_layout.bodyLayout(minimum, state.viewer.tree_width, state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_layout.min_source_width, minimum_layout.source_width);
@@ -6708,12 +6803,14 @@ test "repository fixed status row shares wide narrow render geometry and dispatc
         status,
     );
     try std.testing.expectEqual(
-        Msg{ .selection_action = .clear },
+        Msg{ .selection_action = .copy },
         state.mouseToMsg(.{
-            .col = minimum_layout.source_col + minimum_actions.clear.?.col,
+            .col = minimum_layout.source_col + minimum_actions.copy.?.col,
             .row = repository_source_geometry.source_search_or_rule_row,
         }, .left, minimum).?,
     );
+    try std.testing.expect(minimum_actions.copy_context == null);
+    try std.testing.expect(minimum_actions.clear == null);
     try std.testing.expect(!state.activeMouseSourceRange());
 
     var copied = state.applyNavigation(allocator, .{ .selection_action = .copy }, wide);

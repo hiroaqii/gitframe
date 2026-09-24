@@ -883,6 +883,35 @@ test "root selection preflight routes Repository owners before configured action
     );
 }
 
+test "repository context root routing respects owner and text input priority" {
+    const upper_y: chasen.Key = .{ .codepoint = 'Y' };
+    for ([_]KeyContext{
+        .{ .active_page = .repository, .repository = .{ .selection_owner = .keyboard_line } },
+        .{ .active_page = .repository, .repository = .{ .retained_selection_action_available = true } },
+    }) |context| {
+        try expectMsg(.{ .repository = .{ .selection_action = .copy_context } }, keyToMsg(context, upper_y).?);
+    }
+    try expectMsg(.{ .repository = .selection_owned_noop }, keyToMsg(.{
+        .active_page = .repository,
+        .repository = .{ .selection_owner = .mouse },
+    }, upper_y).?);
+    try expectMsg(.{ .command_line = .owned_noop }, keyToMsg(.{ .active_page = .repository }, upper_y).?);
+    try expectMsg(.{ .command_line = .owned_noop }, keyToMsg(.{
+        .active_page = .repository,
+        .repository = .{ .selection_owner = .header },
+    }, upper_y).?);
+    try expectMsg(.{ .repository = .{ .source_search_insert = 'Y' } }, keyToMsg(.{
+        .active_page = .repository,
+        .repository = .{ .source_search_mode = true, .selection_owner = .keyboard_line },
+    }, upper_y).?);
+    try expectMsg(.{ .repo_picker_insert = 'Y' }, keyToMsg(.{
+        .active_page = .repository,
+        .repo_picker_mode = true,
+        .repo_picker_input_mode = .path_input,
+        .repository = .{ .selection_owner = .keyboard_line },
+    }, upper_y).?);
+}
+
 test "root selection preflight consumes document navigation only for live owners" {
     const keys = [_]chasen.Key{
         .{ .codepoint = 'g' },

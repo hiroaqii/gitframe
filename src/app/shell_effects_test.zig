@@ -276,6 +276,28 @@ test "repository selection late clipboard completion cannot target a new page in
     try std.testing.expectEqual(@as(usize, 0), app.shell_state.clipboard_copies.count());
     try std.testing.expectEqualStrings("", app.pages.repository.status.text());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
+
+    app.active_page = .repository;
+    app.pages.repository.active = true;
+    for ([_]app_message.ClipboardCopyOutcome{ .sent, .unsupported_runtime, .{ .write_failed = "BrokenPipe" } }) |outcome| {
+        var context_ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
+        defer context_ctx.runtimeClearPendingEffectCopies();
+        app.shellEffects().queueClipboard(&context_ctx, .{
+            .origin = .{ .page = app.shellEffects().repositoryOrigin() },
+            .label = "selection context",
+            .text = "Repository: /repo\nSurface: Repository\n",
+            .selection_generation = 12,
+        });
+        try std.testing.expectEqual(@as(u8, 1), context_ctx._pending_clipboard_copies_len);
+        const completion = app.shellEffects().finishClipboard(.{
+            .request_id = context_ctx._pending_clipboard_copies[0].request_id,
+            .outcome = outcome,
+        });
+        if (outcome == .sent) {
+            try std.testing.expectEqual(page.Id.repository, completion.?.origin.page_id);
+            try std.testing.expectEqual(@as(u64, 12), completion.?.generation);
+        } else try std.testing.expect(completion == null);
+    }
 }
 
 test "closed shell surface discards clipboard completion presentation" {

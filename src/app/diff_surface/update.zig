@@ -419,6 +419,8 @@ pub const Controller = struct {
         action: selection_action.Action,
         result: *Update,
     ) void {
+        // Source context is enabled by page owners, never by widget reuse.
+        if (action == .copy_context) return;
         if (action == .copy and self.completeKeyboardSelection(allocator, result)) return;
 
         const Adapter = struct {
@@ -472,7 +474,7 @@ pub const Controller = struct {
             return;
         }
         switch (action) {
-            .copy, .clear => unreachable,
+            .copy, .copy_context, .clear => unreachable,
             .copy_hunk => {},
         }
 
