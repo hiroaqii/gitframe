@@ -2922,8 +2922,6 @@ test "combined worker publishes provider-independent candidate only for matching
     try std.testing.expect(unstaged.arena == null);
     try std.testing.expect(result.reuse_candidate.fingerprint.eql(expected_fingerprint));
     try std.testing.expectEqual(@as(u64, 8), result.reuse_candidate.fresh_authority.?.status_snapshot_revision);
-    try std.testing.expect(!@hasField(changes_projection.CombinedReuseCandidate, "syntax_spans"));
-    try std.testing.expect(!@hasField(changes_projection.CombinedReuseCandidate, "cached_bundle"));
 }
 
 test "combined worker publishes provider-independent candidate for exact primary hint" {

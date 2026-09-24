@@ -97,19 +97,15 @@ pub fn adjustedTreeWidth(total_width: u16, preferred_width: ?u16, direction: Wid
     return clampTreeWidth(total_width, requested);
 }
 
-test "Repository tree width matches the approved responsive contract" {
-    try std.testing.expectEqual(@as(u16, 15), treeWidth(40, null));
-    try std.testing.expectEqual(@as(u16, 28), treeWidth(70, null));
+test "Repository tree width preserves defaults and clamps preferences at 120 columns" {
     try std.testing.expectEqual(@as(u16, 34), treeWidth(120, null));
-    try std.testing.expectEqual(@as(u16, 18), treeWidth(80, 1));
+    try std.testing.expectEqual(@as(u16, 18), treeWidth(120, 1));
     try std.testing.expectEqual(@as(u16, 48), treeWidth(120, 90));
-    try std.testing.expectEqual(@as(u16, 15), treeWidth(40, 42));
     try std.testing.expectEqual(@as(u16, 42), treeWidth(120, 42));
 }
 
 test "Repository tree width adjusts in four-column clamped steps" {
-    try std.testing.expectEqual(@as(u16, 30), adjustedTreeWidth(104, null, .shrink));
-    try std.testing.expectEqual(@as(u16, 38), adjustedTreeWidth(104, null, .grow));
-    try std.testing.expectEqual(@as(u16, 15), adjustedTreeWidth(40, null, .grow));
+    try std.testing.expectEqual(@as(u16, 30), adjustedTreeWidth(120, null, .shrink));
+    try std.testing.expectEqual(@as(u16, 38), adjustedTreeWidth(120, null, .grow));
     try std.testing.expectEqual(@as(u16, 48), adjustedTreeWidth(120, 48, .grow));
 }

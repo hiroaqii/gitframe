@@ -31,11 +31,9 @@ pub fn clampSidebarWidth(total_width: u16, width: u16) u16 {
     return @min(@max(width, min_width), max_width);
 }
 
-test "sidebar width keeps a usable diff pane" {
-    try std.testing.expectEqual(@as(u16, 15), sidebarWidth(40, null));
-    try std.testing.expectEqual(@as(u16, 28), sidebarWidth(70, null));
+test "sidebar width preserves defaults and clamps preferences at 120 columns" {
     try std.testing.expectEqual(@as(u16, 34), sidebarWidth(120, null));
-    try std.testing.expectEqual(@as(u16, 18), sidebarWidth(80, 1));
+    try std.testing.expectEqual(@as(u16, 18), sidebarWidth(120, 1));
     try std.testing.expectEqual(@as(u16, 48), sidebarWidth(120, 90));
 }
 

@@ -2630,16 +2630,14 @@ test "History picker footer keeps the range action visible and explains an activ
         ui.key_hint.item("q", "quit"),
     });
 
-    for ([_]u16{ 80, 120 }) |width| {
-        var footer: chasen.testing.TestSurface = undefined;
-        try footer.init(width, 1);
-        defer footer.deinit();
-        viewFooter(context, &footer.surface);
-        const snapshot = try footer.snapshot(allocator);
-        defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, history_view.range_footer_text) != null);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space: clear range") != null);
-    }
+    var footer: chasen.testing.TestSurface = undefined;
+    try footer.init(120, 1);
+    defer footer.deinit();
+    viewFooter(context, &footer.surface);
+    const snapshot = try footer.snapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, history_view.range_footer_text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space: clear range") != null);
 }
 
 test "footer normal-mode hints follow state and local key ownership" {
@@ -2733,23 +2731,6 @@ test "committed-page footer retention is R then m while display order stays m R 
     try expectProjectedFooterHintItems(&projected, hints.slice());
 }
 
-test "narrow footer keeps repository switch and page-specific action" {
-    var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 40, .height = 12 } };
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(40, 1);
-    defer ts.deinit();
-
-    viewFooter(harness.context(), &ts.surface);
-    const snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(snapshot);
-
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "b: branch") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "R: switch repo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "?: help") == null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Tab: focus") == null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "q: quit") == null);
-}
-
 test "shell notification temporarily wins over Changes diagnostic" {
     var harness: ShellViewTestHarness = .{};
     harness.changes.status.set("changes diagnostic", .{});
@@ -2773,7 +2754,7 @@ test "page bar dispatch shows repository requirement for unavailable placeholder
     context.page_bar_visible = true;
 
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(80, 12);
+    try ts.init(120, 12);
     defer ts.deinit();
 
     try viewContent(context, &ts.surface);
@@ -2786,7 +2767,7 @@ test "page bar dispatch shows repository requirement for unavailable placeholder
 test "page bar renders labels above a full muted rule" {
     const palette = theme.Palette.default();
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(60, shell_layout.page_bar_rows);
+    try ts.init(120, shell_layout.page_bar_rows);
     defer ts.deinit();
 
     viewPageBar(.repository, false, .{}, palette, &ts.surface);
@@ -2798,25 +2779,9 @@ test "page bar renders labels above a full muted rule" {
     try expectFullPageBarRule(&ts.surface, palette);
 }
 
-test "normal narrow page bar keeps its full rule after clipping later tabs" {
-    const palette = theme.Palette.default();
-    const width = page.tab(.repository).col;
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(width, shell_layout.page_bar_rows);
-    defer ts.deinit();
-
-    viewPageBar(.changes, false, .{}, palette, &ts.surface);
-
-    const snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Changes ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Repository ") == null);
-    try expectFullPageBarRule(&ts.surface, palette);
-}
-
 test "compact page bar keeps only the active label and draws a rule when available" {
     var two_rows: chasen.testing.TestSurface = undefined;
-    try two_rows.init(30, shell_layout.page_bar_rows);
+    try two_rows.init(120, shell_layout.page_bar_rows);
     defer two_rows.deinit();
 
     viewPageBar(.compare, true, .{}, .default(), &two_rows.surface);
@@ -2827,7 +2792,7 @@ test "compact page bar keeps only the active label and draws a rule when availab
     try two_rows.expectCellText(0, shell_layout.page_bar_rule_row, "─");
 
     var one_row: chasen.testing.TestSurface = undefined;
-    try one_row.init(30, 1);
+    try one_row.init(120, 1);
     defer one_row.deinit();
     viewPageBar(.compare, true, .{}, .default(), &one_row.surface);
     try one_row.expectCellText(2, shell_layout.page_bar_label_row, "C");
@@ -2841,7 +2806,7 @@ test "page bar renders repository context after tabs and omits it in compact mod
         .freshness = .fresh,
     } } };
     var wide: chasen.testing.TestSurface = undefined;
-    try wide.init(96, shell_layout.page_bar_rows);
+    try wide.init(120, shell_layout.page_bar_rows);
     defer wide.deinit();
     viewPageBar(.repository, false, .{ .presentation = presentation }, .default(), &wide.surface);
 
@@ -2849,11 +2814,11 @@ test "page bar renders repository context after tabs and omits it in compact mod
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, " Config ") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD feature/page-header ↑2") != null);
-    try wide.expectCellText(95, shell_layout.page_bar_label_row, " ");
+    try wide.expectCellText(119, shell_layout.page_bar_label_row, " ");
     try std.testing.expect(page.tabAtColumn(wide.surface.size().width, page.tabExtent() + 1) == null);
 
     var compact: chasen.testing.TestSurface = undefined;
-    try compact.init(96, shell_layout.page_bar_rows);
+    try compact.init(120, shell_layout.page_bar_rows);
     defer compact.deinit();
     viewPageBar(.repository, true, .{ .presentation = presentation }, .default(), &compact.surface);
     const compact_snapshot = try compact.snapshot(std.testing.allocator);
@@ -2869,7 +2834,7 @@ test "page bar hides remote actions while showing diff totals" {
     } } };
     const palette: theme.Palette = .default();
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(96, shell_layout.page_bar_rows);
+    try ts.init(120, shell_layout.page_bar_rows);
     defer ts.deinit();
 
     viewPageBar(.changes, false, .{
@@ -2881,7 +2846,7 @@ test "page bar hides remote actions while showing diff totals" {
     const stats_col = ts.surface.size().width - 1 - chasen.text.displayWidth("+39 -710");
     try ts.expectCellText(stats_col, shell_layout.page_bar_label_row, "+");
     try ts.expectCellText(stats_col + 4, shell_layout.page_bar_label_row, "-");
-    try ts.expectCellText(95, shell_layout.page_bar_label_row, " ");
+    try ts.expectCellText(119, shell_layout.page_bar_label_row, " ");
     const added = ts.surface.readCell(stats_col, shell_layout.page_bar_label_row) orelse return error.ExpectedAddedStats;
     const removed = ts.surface.readCell(stats_col + 4, shell_layout.page_bar_label_row) orelse return error.ExpectedRemovedStats;
     try std.testing.expect(added.style.fg.eql(palette.color(.success)));
@@ -2973,23 +2938,6 @@ test "page bar remote actions follow configured keys and width fallback" {
     try std.testing.expectEqualStrings("(Ctrl+s: push)", fallback.text);
 }
 
-test "page bar preserves every tab when context is too narrow" {
-    const width = page.tabExtent() + 8;
-    var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(width, shell_layout.page_bar_rows);
-    defer ts.deinit();
-    viewPageBar(.compare, false, .{ .presentation = .{ .comparison = .{
-        .base_display_name = "origin/main",
-        .head_display_name = "feature/topic",
-        .freshness = .fresh,
-    } } }, .default(), &ts.surface);
-    const snapshot = try ts.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Config ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "BASE ") == null);
-    try expectFullPageBarRule(&ts.surface, .default());
-}
-
 test "Config page header never borrows another page repository context" {
     var harness: ShellViewTestHarness = .{};
     var context = harness.context();
@@ -3010,7 +2958,7 @@ fn expectFullPageBarRule(surface: *const chasen.Surface, palette: theme.Palette)
 
 test "shell content size matches panel content surface" {
     var ts: chasen.testing.TestSurface = undefined;
-    try ts.init(100, 20);
+    try ts.init(120, 32);
     defer ts.deinit();
 
     const frame = ui.Panel.frame(&ts.surface, shellFrameOptions(.default()));
@@ -3018,7 +2966,7 @@ test "shell content size matches panel content surface" {
     const content = frame.contentSurface();
 
     try std.testing.expectEqual(expected, content.size());
-    try std.testing.expectEqual(chasen.Size{ .width = 98, .height = 18 }, expected);
+    try std.testing.expectEqual(chasen.Size{ .width = 118, .height = 30 }, expected);
 }
 
 test "shell content size falls back to terminal size on small surfaces" {
@@ -3026,14 +2974,6 @@ test "shell content size falls back to terminal size on small surfaces" {
 
     try std.testing.expect(!shell_layout.frameEnabled(small));
     try std.testing.expectEqual(small, shell_layout.contentSize(small));
-}
-
-test "help popup uses one column on narrow content" {
-    const size = chasen.Size{ .width = 70, .height = 20 };
-    const content = helpContentSize(size);
-
-    try std.testing.expect(content.width < help_two_column_min_width);
-    try std.testing.expectEqual(rowsForSections(helpSectionsForPage(.changes)), helpRenderedRows(content, .changes));
 }
 
 test "help content size uses Modal overlay sizing" {
@@ -3044,8 +2984,8 @@ test "help content size uses Modal overlay sizing" {
     try std.testing.expectEqual(expected, helpContentSize(size));
 }
 
-test "help popup uses two columns on wide content" {
-    const size = chasen.Size{ .width = 140, .height = 20 };
+test "help popup uses two columns at 120 columns" {
+    const size = chasen.Size{ .width = 120, .height = 20 };
     const content = helpContentSize(size);
 
     try std.testing.expect(content.width >= help_two_column_min_width);

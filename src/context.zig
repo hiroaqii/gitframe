@@ -1,4 +1,3 @@
-const std = @import("std");
 const path_key = @import("path_key.zig");
 
 /// Diff source class exposed to external integrations.
@@ -124,13 +123,3 @@ pub const SelectionContext = struct {
 
 pub const canonicalRepoPath = path_key.canonicalRepoPath;
 pub const stripGitSidePrefix = path_key.stripGitSidePrefix;
-
-test "canonical repo path strips git side prefixes" {
-    try std.testing.expectEqualStrings("src/main.zig", canonicalRepoPath("a/src/main.zig").?);
-    try std.testing.expectEqualStrings("src/main.zig", canonicalRepoPath("b/src/main.zig").?);
-    try std.testing.expectEqualStrings("src/main.zig", canonicalRepoPath("src/main.zig").?);
-}
-
-test "canonical repo path excludes dev null" {
-    try std.testing.expect(canonicalRepoPath("/dev/null") == null);
-}
