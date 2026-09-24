@@ -61,6 +61,7 @@ test "body file navigation advances past a pending request and rejects its late 
     try app.pages.changes.git_status.replace(roots.a, &status);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     defer ctx.runtimeClearPendingEffectCopies();
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
     try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx);
     try std.testing.expectEqualStrings("b", app.pages.changes.changes_projection.pending.?.path_key);
