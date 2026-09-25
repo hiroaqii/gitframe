@@ -50,12 +50,14 @@ pub fn build(b: *std.Build) void {
         },
     });
     const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
     build_options.addOption(bool, "syntax_provider_flow_syntax", provider_enabled);
     build_options.addOption(
         usize,
         "expected_package_root_test_count",
-        if (!provider_enabled and test_filters.len == 0) 1962 else 0,
+        if (!provider_enabled and test_filters.len == 0) 1964 else 0,
     );
+    const build_options_mod = build_options.createModule();
 
     const mod = mod: {
         const base_imports: [6]std.Build.Module.Import = .{
@@ -64,7 +66,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "draw", .module = draw_mod },
             .{ .name = "theme", .module = theme_mod },
             .{ .name = "keymap", .module = keymap_mod },
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = build_options_mod },
         };
         switch (syntax_provider) {
             .none => break :mod b.addModule("gitframe", .{
@@ -108,6 +110,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "gitframe", .module = mod },
                 .{ .name = "chasen", .module = chasen_dep.module("chasen") },
                 .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+                .{ .name = "build_options", .module = build_options_mod },
             },
         }),
         .use_llvm = if (target.result.os.tag == .linux) true else null,

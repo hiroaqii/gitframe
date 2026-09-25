@@ -21,6 +21,7 @@ pub const CliConfig = struct {
     source: SourceMode = .unstaged,
     auto_reload: AutoReloadOverride = .inherit,
     stats_summary: bool = false,
+    version: bool = false,
 
     pub fn sourceLabel(self: CliConfig) []const u8 {
         return switch (self.source) {
@@ -138,6 +139,8 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
             config.auto_reload = .disabled;
         } else if (std.mem.eql(u8, arg, "--stats-summary")) {
             config.stats_summary = true;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            config.version = true;
         } else if (std.mem.eql(u8, arg, "--range")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
@@ -237,6 +240,29 @@ test "parseArgs defaults to unstaged diff" {
     const config = try parseArgs(args[0..]);
 
     try std.testing.expect(config.source == .unstaged);
+    try std.testing.expect(!config.version);
+}
+
+test "parseArgs accepts version with remaining startup options" {
+    try std.testing.expect((try parseArgs(&.{ "gitframe", "--version" })).version);
+    const patch = try parseArgs(&.{ "gitframe", "--version", "--watch", "--stats-summary", "missing.patch" });
+    try std.testing.expect(patch.version and patch.stats_summary);
+    try std.testing.expect(patch.auto_reload == .enabled and patch.source == .patch_file);
+    const range = try parseArgs(&.{ "gitframe", "--range=HEAD..HEAD", "--no-watch", "--version" });
+    try std.testing.expect(range.version and range.auto_reload == .disabled and range.source == .range);
+}
+
+test "parseArgs validates all arguments before version output" {
+    const cases = [_]struct { args: []const []const u8, err: ParseArgsError }{
+        .{ .args = &.{ "gitframe", "--cached", "--version" }, .err = error.UnknownOption },
+        .{ .args = &.{ "gitframe", "--version", "--unknown" }, .err = error.UnknownOption },
+        .{ .args = &.{ "gitframe", "--version", "--range" }, .err = error.MissingOptionValue },
+        .{ .args = &.{ "gitframe", "--version", "--range=-bad" }, .err = error.InvalidRange },
+        .{ .args = &.{ "gitframe", "--version", "a.patch", "b.patch" }, .err = error.TooManyInputs },
+        .{ .args = &.{ "gitframe", "--version", "--range=HEAD..HEAD", "a.patch" }, .err = error.ConflictingSourceMode },
+        .{ .args = &.{ "gitframe", "--watch", "--version", "--no-watch" }, .err = error.ConflictingWatchOverride },
+    };
+    for (cases) |case| try std.testing.expectError(case.err, parseArgs(case.args));
 }
 
 test "parseArgs accepts watch mode" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const gitframe = @import("gitframe");
 const chasen = @import("chasen");
+const build_options = @import("build_options");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -15,6 +16,10 @@ pub fn main(init: std.process.Init) !void {
         try printCliError(init.io, err);
         return err;
     };
+    if (config.version) {
+        try printVersion(init.io);
+        return;
+    }
 
     var config_paths = try gitframe.config.resolvePaths(init.gpa, init.environ_map);
     defer config_paths.deinit(init.gpa);
@@ -198,6 +203,7 @@ fn printHelp(io: std.Io) !void {
         \\  --watch           Force-enable automatic reload
         \\  --no-watch        Disable automatic reload
         \\  --stats-summary   Print runtime timing summary after exit
+        \\  --version         Print version and exit
         \\  -h, --help        Show this help
         \\
         \\Default:
@@ -209,6 +215,13 @@ fn printHelp(io: std.Io) !void {
         \\  interval_seconds = 3  # accepted range: 1..60
         \\
     );
+    try stdout.flush();
+}
+
+fn printVersion(io: std.Io) !void {
+    var buffer: [128]u8 = undefined;
+    var stdout: std.Io.File.Writer = .initStreaming(.stdout(), io, &buffer);
+    try stdout.interface.print("gitframe {s}\n", .{build_options.version});
     try stdout.flush();
 }
 
@@ -280,8 +293,9 @@ fn printCliError(io: std.Io, err: gitframe.ParseArgsError) !void {
 }
 
 test "wantsHelp detects help flags" {
-    const args = [_][]const u8{ "gitframe", "--help" };
-    try std.testing.expect(wantsHelp(args[0..]));
+    try std.testing.expect(wantsHelp(&.{ "gitframe", "--help", "--version" }));
+    try std.testing.expect(wantsHelp(&.{ "gitframe", "--cached", "--version", "-h" }));
+    try std.testing.expect(!wantsHelp(&.{ "gitframe", "--version" }));
 }
 
 test "config startup borrows a successful result-owned config" {
