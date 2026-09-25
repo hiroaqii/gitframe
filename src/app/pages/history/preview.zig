@@ -513,11 +513,11 @@ pub fn canonicalDetailAlloc(allocator: std.mem.Allocator, detail: git_preview.De
                 single.committer.email,
             });
             try writeTimestamp(&out.writer, single.committed);
-            try out.writer.writeAll("\nBranches: ");
+            try out.writer.writeAll("\nBranch tips: ");
             try writeRefs(&out.writer, single.refs.local_branches);
             try out.writer.writeAll("\nTags: ");
             try writeRefs(&out.writer, single.refs.tags);
-            try out.writer.writeAll("\nRemotes: ");
+            try out.writer.writeAll("\nRemote tips: ");
             try writeRefs(&out.writer, single.refs.remote_branches);
             try out.writer.writeAll("\nDiff base: ");
             try writeSingleBasis(&out.writer, single.summary);
@@ -960,7 +960,7 @@ test "History preview canonical detail is exact for single and range" {
             "Authored: 1970-01-01 09:00:00 +0900\n" ++
             "Committer: C O M <commit@example.com>\n" ++
             "Committed: 1969-12-31 21:30:00 -0230\n" ++
-            "Branches: main, release\nTags: v1\nRemotes: —\n" ++
+            "Branch tips: main, release\nTags: v1\nRemote tips: —\n" ++
             "Diff base: parent 1/2 1111111111111111111111111111111111111111\n" ++
             "Message:\nsubject\n\nbody",
         single,
@@ -999,7 +999,7 @@ test "History preview canonical detail is exact for single and range" {
         range,
     );
     try std.testing.expect(std.mem.indexOf(u8, range, "Message") == null);
-    try std.testing.expect(std.mem.indexOf(u8, range, "Branches") == null);
+    try std.testing.expect(std.mem.indexOf(u8, range, "Branch tips") == null);
 }
 
 test "History preview path field keeps quoted rename boundaries unique" {
