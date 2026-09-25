@@ -1433,7 +1433,7 @@ fn viewCreateStash(app: Context, surface: *chasen.Surface) !void {
         .label_style = app.theme.style(.accent),
         .show_cursor = false,
     });
-    _ = content.borrowTextAt(6, 4, "Tracked + untracked; ignored files stay", app.theme.style(.muted));
+    _ = content.borrowTextAt(4, 4, "Tracked + untracked; ignored files stay", app.theme.style(.muted));
     const staged_radio = ui.Radio.init(.{
         .selected = has_staged and dialog.scope == .staged,
         .label = if (has_staged) "Staged changes only" else "Staged changes only (unavailable)",
@@ -1446,7 +1446,7 @@ fn viewCreateStash(app: Context, surface: *chasen.Surface) !void {
         .label_style = staged_style,
         .show_cursor = false,
     });
-    _ = content.borrowTextAt(6, 6, "Only staged changes; unstaged + untracked stay", app.theme.style(.muted));
+    _ = content.borrowTextAt(4, 6, "Only staged changes; unstaged + untracked stay", app.theme.style(.muted));
     if (size.height > 8) {
         var field_surface = content.child(.{ .col = 0, .row = 8, .width = size.width, .height = @min(2, size.height - 8) });
         const field = ui.FormField.init(.{ .label = if (dialog.focus == .message) "> Message (optional)" else "  Message (optional)" });
