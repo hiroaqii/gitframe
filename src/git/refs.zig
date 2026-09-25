@@ -43,6 +43,14 @@ pub const BranchListItem = struct {
     /// only for callers that explicitly request it; malformed Git output is an
     /// item-local unknown rather than a whole-list failure.
     tip_committer_unix: ?i64 = null,
+    worktree_path: ?[]u8 = null,
+
+    fn deinit(self: BranchListItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.full_ref);
+        allocator.free(self.name);
+        allocator.free(self.oid);
+        if (self.worktree_path) |path| allocator.free(path);
+    }
 };
 
 pub const BranchList = struct {
@@ -51,11 +59,7 @@ pub const BranchList = struct {
 
     pub fn deinit(self: *BranchList, allocator: std.mem.Allocator) void {
         if (self.current) |current| allocator.free(current);
-        for (self.branches) |item| {
-            allocator.free(item.full_ref);
-            allocator.free(item.name);
-            allocator.free(item.oid);
-        }
+        for (self.branches) |item| item.deinit(allocator);
         allocator.free(self.branches);
         self.* = .{};
     }
@@ -93,6 +97,7 @@ pub const BranchListRequest = struct {
     context: git_command.DirectoryContext,
     scope: BranchListScope,
     include_tip_committer_unix: bool = false,
+    include_worktree_path: bool = false,
 };
 
 pub fn loadBranchStatus(
@@ -176,10 +181,8 @@ fn loadBranchListWithLimit(
     const current_result = try runBranchCommand(allocator, io, request.context, &current_argv, .limited(4 * 1024));
     defer current_result.deinit(allocator);
 
-    // Keep one fixed record schema for both callers. The typed request only
-    // decides whether the timestamp fact is parsed/stored; it never changes
-    // ordering or adds another subprocess for the normal branch picker.
-    const format = "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(symref)%00%(committerdate:unix)%00";
+    const base_format = "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(symref)%00%(committerdate:unix)%00";
+    const format = if (request.include_worktree_path) base_format ++ "%(worktreepath)%00" else base_format;
     const local_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads" };
     const all_argv = [_][]const u8{ "git", "for-each-ref", format, "refs/heads", "refs/remotes" };
     const list_argv: []const []const u8 = switch (request.scope) {
@@ -189,11 +192,12 @@ fn loadBranchListWithLimit(
     const list_result = try runBranchCommand(allocator, io, request.context, list_argv, list_stdout_limit);
     defer list_result.deinit(allocator);
 
-    return branchListResultFromCommandResultsWithTipTime(
+    return branchListResultFromCommandResultsWithOptions(
         allocator,
         current_result,
         list_result,
         request.include_tip_committer_unix,
+        request.include_worktree_path,
     );
 }
 
@@ -216,14 +220,15 @@ fn branchListResultFromCommandResults(
     current_result: process_runner.Result,
     list_result: process_runner.Result,
 ) git_command.Error!BranchListLoadResult {
-    return branchListResultFromCommandResultsWithTipTime(allocator, current_result, list_result, false);
+    return branchListResultFromCommandResultsWithOptions(allocator, current_result, list_result, false, false);
 }
 
-fn branchListResultFromCommandResultsWithTipTime(
+fn branchListResultFromCommandResultsWithOptions(
     allocator: std.mem.Allocator,
     current_result: process_runner.Result,
     list_result: process_runner.Result,
     include_tip_committer_unix: bool,
+    include_worktree_path: bool,
 ) git_command.Error!BranchListLoadResult {
     var current: ?[]u8 = null;
     defer if (current) |owned| allocator.free(owned);
@@ -240,12 +245,8 @@ fn branchListResultFromCommandResultsWithTipTime(
     }
 
     var items: std.ArrayList(BranchListItem) = .empty;
-    errdefer {
-        for (items.items) |item| {
-            allocator.free(item.full_ref);
-            allocator.free(item.name);
-            allocator.free(item.oid);
-        }
+    defer {
+        for (items.items) |item| item.deinit(allocator);
         items.deinit(allocator);
     }
 
@@ -253,21 +254,28 @@ fn branchListResultFromCommandResultsWithTipTime(
     while (index < list_result.stdout.len) {
         skipBranchListRecordSeparators(list_result.stdout, &index);
         if (index >= list_result.stdout.len) break;
-        const full_ref_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const full_ref_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse return .{ .failed_static = "incomplete branch list" };
         const full_ref = list_result.stdout[index..full_ref_end];
         index = full_ref_end + 1;
-        const name_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const name_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse return .{ .failed_static = "incomplete branch list" };
         const name = list_result.stdout[index..name_end];
         index = name_end + 1;
-        const oid_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const oid_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse return .{ .failed_static = "incomplete branch list" };
         const oid = list_result.stdout[index..oid_end];
         index = oid_end + 1;
-        const symref_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const symref_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse return .{ .failed_static = "incomplete branch list" };
         const symref = list_result.stdout[index..symref_end];
         index = symref_end + 1;
-        const timestamp_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse break;
+        const timestamp_end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse return .{ .failed_static = "incomplete branch list" };
         const timestamp = list_result.stdout[index..timestamp_end];
         index = timestamp_end + 1;
+        const worktree_path: ?[]const u8 = if (include_worktree_path) blk: {
+            const end = std.mem.indexOfScalarPos(u8, list_result.stdout, index, 0) orelse return .{ .failed_static = "incomplete worktree mapping" };
+            const path = list_result.stdout[index..end];
+            index = end + 1;
+            if (path.len > 0 and !std.fs.path.isAbsolute(path)) return .{ .failed_static = "invalid worktree path" };
+            break :blk if (path.len == 0) null else path;
+        } else null;
         const tip_committer_unix: ?i64 = if (include_tip_committer_unix)
             std.fmt.parseInt(i64, timestamp, 10) catch null
         else
@@ -287,6 +295,12 @@ fn branchListResultFromCommandResultsWithTipTime(
             allocator.free(owned_name);
             return error.OutOfMemory;
         };
+        const owned_path = if (worktree_path) |path| allocator.dupe(u8, path) catch {
+            allocator.free(owned_full_ref);
+            allocator.free(owned_name);
+            allocator.free(owned_oid);
+            return error.OutOfMemory;
+        } else null;
         items.append(allocator, .{
             .full_ref = owned_full_ref,
             .name = owned_name,
@@ -294,10 +308,12 @@ fn branchListResultFromCommandResultsWithTipTime(
             .oid = owned_oid,
             .current = kind == .local and current != null and std.mem.eql(u8, current.?, name),
             .tip_committer_unix = tip_committer_unix,
+            .worktree_path = owned_path,
         }) catch {
             allocator.free(owned_full_ref);
             allocator.free(owned_name);
             allocator.free(owned_oid);
+            if (owned_path) |path| allocator.free(path);
             return error.OutOfMemory;
         };
     }
@@ -447,11 +463,12 @@ test "branch list typed tip time parses per item without reordering or whole-lis
         "refs/heads/alpha\x00alpha\x00def\x00\x00not-a-time\x00\n" ++
         "refs/remotes/origin/topic\x00origin/topic\x00123\x00\x001700000003\x00").*;
     var empty: [0]u8 = .{};
-    const result = try branchListResultFromCommandResultsWithTipTime(
+    const result = try branchListResultFromCommandResultsWithOptions(
         std.testing.allocator,
         .{ .term = .{ .exited = 0 }, .stdout = &current_stdout, .stderr = &empty },
         .{ .term = .{ .exited = 0 }, .stdout = &list_stdout, .stderr = &empty },
         true,
+        false,
     );
     defer result.deinit(std.testing.allocator);
 
@@ -500,6 +517,28 @@ test "refs loads local branch list without record separator newlines" {
     for (list.branches) |branch| {
         try std.testing.expect(std.mem.indexOfScalar(u8, branch.name, '\n') == null);
         try std.testing.expect(std.mem.indexOfScalar(u8, branch.name, '\r') == null);
+    }
+}
+
+test "branch list worktree metadata is owned and incomplete records fail closed" {
+    const allocator = std.testing.allocator;
+    const complete = "refs/heads/topic\x00topic\x00abc\x00\x001700000001\x00/trees/topic with space\x00\n";
+    for ([_][]const u8{ complete, complete ++ "refs/heads/free\x00free\x00def\x00\x001700000002\x00", complete ++ "refs/heads/bad\x00bad\x00def\x00\x001700000002\x00relative\x00" }, 0..) |data, index| {
+        const stdout = try allocator.dupe(u8, data);
+        defer allocator.free(stdout);
+        var empty: [0]u8 = .{};
+        const result = try branchListResultFromCommandResultsWithOptions(
+            allocator,
+            .{ .term = .{ .exited = 1 }, .stdout = &empty, .stderr = &empty },
+            .{ .term = .{ .exited = 0 }, .stdout = stdout, .stderr = &empty },
+            true,
+            true,
+        );
+        defer result.deinit(allocator);
+        if (index == 0) {
+            try std.testing.expectEqualStrings("/trees/topic with space", result.ok.branches[0].worktree_path.?);
+            try std.testing.expectEqual(@as(?i64, 1_700_000_001), result.ok.branches[0].tip_committer_unix);
+        } else try std.testing.expect(result == .failed_static);
     }
 }
 

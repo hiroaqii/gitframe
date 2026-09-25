@@ -1141,6 +1141,8 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
         .origin = app.remoteWorkflow().branch_origin.?,
         .root_identity = app.repoSessionView().activeIdentity().?,
     };
+    // Current always wins over the worktree marker, including main worktrees.
+    app.remote_workflow.branch_switch.branches[0].worktree_path = try std.testing.allocator.dupe(u8, repo_root);
     defer app.clearBranchSwitch(std.testing.allocator);
     defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
 
@@ -1184,6 +1186,104 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
     try std.testing.expect(!missing_authority.remote_workflow.branch_switch.hasState());
     try std.testing.expectEqual(@as(u8, 0), missing_ctx._pending_tasks_with_len);
     try std.testing.expect(!missing_authority.actionLifecycleView().hasPending());
+}
+
+test "worktree branch action owns its task and fences cancel reopen and stale completions" {
+    const allocator = std.testing.allocator;
+    const WorktreeTask = @import("../worktree_switch.zig").Task(app_message.Msg);
+    var app: RemoteHarness = .{ .active_page = .repository };
+    const root = try installCurrentRepoForTest(&app, allocator);
+    defer app.repo_session.deinit(allocator);
+    defer app.clearBranchSwitch(allocator);
+    const owner: app_state.BranchSwitchOwner = .{
+        .origin = app.remoteWorkflow().branch_origin.?,
+        .root_identity = app.repoSessionView().activeIdentity().?,
+    };
+    app.remote_workflow.branch_switch = .{
+        .owner = owner,
+        .repo_root = try allocator.dupe(u8, root),
+        .current_branch = try allocator.dupe(u8, "main"),
+        .current_oid = try allocator.dupe(u8, "abc"),
+        .generation = 8,
+        .branches = try branchSwitchItemsForTest(allocator, &.{
+            .{ .name = "linked", .oid = "def" },
+            .{ .name = "free", .oid = "abc" },
+        }),
+    };
+    app.remote_workflow.branch_switch.branches[0].worktree_path = try allocator.dupe(u8, "/linked");
+    app.overlay.openSwitchBranch(.repository);
+    var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
+    const Dummy = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) app_message.Msg {
+            return .quit;
+        }
+        fn failed(_: chasen.TaskFailure) app_message.Msg {
+            return .quit;
+        }
+    };
+    for (0..16) |_| try ctx.task().spawn(.{ .run = Dummy.run, .failed = Dummy.failed });
+    try std.testing.expectError(error.TaskLimitExceeded, app.confirmBranchSwitch(&ctx));
+    try std.testing.expect(!app.remote_workflow.branch_switch.worktree_pending);
+    try std.testing.expect(app.overlay.isSwitchBranch());
+    _ = ctx.takePendingTasks();
+
+    try app.confirmBranchSwitch(&ctx);
+    try app.confirmBranchSwitch(&ctx);
+    app.remoteWorkflow().moveBranchSwitchSelection(1);
+    try std.testing.expectEqual(@as(usize, 0), app.remote_workflow.branch_switch.selected_index);
+    try std.testing.expect(!app.actionLifecycleView().hasPending());
+    try std.testing.expect(app.remote_workflow.branch_switch_pending == null);
+    const entries = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    const task: *WorktreeTask = @ptrCast(@alignCast(entries[0].ctx));
+    const observer = task.source_root;
+    try std.testing.expectEqualStrings("linked", task.branch);
+    try std.testing.expectEqualStrings("/linked", task.path);
+    app.clearBranchSwitch(allocator);
+    var abandoned = entries[0].failed(entries[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+    try expectRootCapabilityClosed(observer);
+
+    // A newly opened picker rejects the old result as well as wrong page,
+    // activation, repository epoch and physical source identities.
+    app.remote_workflow.branch_switch = .{
+        .owner = owner,
+        .repo_root = try allocator.dupe(u8, root),
+        .generation = 9,
+        .worktree_pending = true,
+    };
+    app.overlay.openSwitchBranch(.repository);
+    for (0..5) |mismatch| {
+        var stale_owner = owner;
+        switch (mismatch) {
+            0 => {},
+            1 => stale_owner.origin.page_id = .changes,
+            2 => stale_owner.origin.activation_id +%= 1,
+            3 => stale_owner.origin.repo_epoch +%= 1,
+            4 => stale_owner.root_identity.inode +%= 1,
+            else => unreachable,
+        }
+        try std.testing.expect(app.remoteWorkflow().finishWorktreeSwitch(allocator, .{
+            .owner = stale_owner,
+            .generation = if (mismatch == 0) 8 else 9,
+            .result = .{ .ready = .{ .discovery = try testSingleRepoDiscovery(allocator, root), .root_identity = owner.root_identity } },
+        }) == null);
+        try std.testing.expect(app.remote_workflow.branch_switch.worktree_pending);
+    }
+    var delivered = app.remoteWorkflow().finishWorktreeSwitch(allocator, .{
+        .owner = owner,
+        .generation = 9,
+        .result = .{ .ready = .{ .discovery = try testSingleRepoDiscovery(allocator, root), .root_identity = owner.root_identity } },
+    }).?;
+    delivered.deinit(allocator);
+    try std.testing.expect(!app.overlay.isSwitchBranch());
+    // The runtime may discard a successful owned result during shutdown.
+    var undelivered = app_message.Msg.loadFinished(.{ .shell = .{ .worktree_switch = .{
+        .owner = owner,
+        .generation = 9,
+        .result = .{ .ready = .{ .discovery = try testSingleRepoDiscovery(allocator, root), .root_identity = owner.root_identity } },
+    } } });
+    undelivered.deinitUndelivered(allocator);
 }
 
 test "requestPush clears previous push error details" {

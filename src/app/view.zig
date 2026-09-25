@@ -1403,11 +1403,6 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
 
     const subtitle = try std.fmt.allocPrint(content.frameAllocator(), "Current: {s}", .{if (state.loading) "loading..." else state.current_branch});
     try draw.copyClippedTextAt(&content, 0, 0, subtitle, app.theme.style(.muted));
-    if (size.height > 2) {
-        var note_style = app.theme.style(.muted);
-        note_style.dim = true;
-        try draw.copyClippedTextAt(&content, 0, 2, "Carry uncommitted changes to target; abort if unsafe.", note_style);
-    }
     if (state.loading) {
         if (size.height > 3) try draw.copyClippedTextAt(&content, 0, 3, "Loading local branches...", app.theme.style(.prompt));
         return;
@@ -1418,6 +1413,25 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
     }
 
     const selected = @min(state.selected_index, state.branches.len - 1);
+    const action = state.branches[selected].action(state.current_branch);
+    if (size.height > 2) {
+        var note_style = app.theme.style(.muted);
+        note_style.dim = true;
+        const note = switch (action) {
+            .close => "Current branch; no changes.",
+            .checkout => "Carry uncommitted changes to target; abort if unsafe.",
+            .open_worktree => "Leave uncommitted changes here; open target worktree.",
+        };
+        try draw.copyClippedTextAt(&content, 0, 2, note, note_style);
+    }
+    if (size.height > 3) {
+        if (action == .open_worktree) {
+            try draw.copyClippedTextAt(&content, 0, 3, "Worktree: ", app.theme.style(.muted));
+            try draw.copyTailClippedTextAt(&content, 10, 3, state.branches[selected].worktree_path.?, app.theme.style(.muted));
+        } else {
+            try draw.copyClippedTextAt(&content, 0, 3, "@: open worktree (changes stay here)", app.theme.style(.muted));
+        }
+    }
     if (size.height >= 4) {
         const branch = state.branches[selected];
         const exact = local_time.formatExact(branch.tip_committer_unix);
@@ -1429,7 +1443,7 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
     }
 
     const footer_rows_needed: u16 = 1;
-    const list_start: u16 = 3;
+    const list_start: u16 = 4;
     const list_rows: u16 = size.height -| (list_start + footer_rows_needed);
     const start = listWindowStart(selected, state.branches.len, list_rows);
     var row: u16 = 0;
@@ -1438,7 +1452,7 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
         const branch = state.branches[index];
         const focused = index == selected;
         const marker: []const u8 = if (focused) ">" else " ";
-        const current: []const u8 = if (branch.current) "*" else " ";
+        const current: []const u8 = if (branch.current) "*" else if (branch.worktree_path != null) "@" else " ";
         if (size.width > 0) {
             try draw.copyClippedTextAt(&content, 0, list_start + row, marker, app.theme.style(.accent));
         }
@@ -1488,7 +1502,14 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
 
     if (size.height >= 2) {
         const hint_row = size.height - 1;
-        try draw.copyClippedTextAt(&content, 0, hint_row, "Enter: switch    Esc/q: cancel    j/k: move", app.theme.style(.accent));
+        const hint = if (state.worktree_pending)
+            "Checking worktree...    Esc/q: cancel"
+        else switch (action) {
+            .close => "Enter: close    Esc/q: cancel    j/k: move",
+            .checkout => "Enter: checkout    Esc/q: cancel    j/k: move",
+            .open_worktree => "Enter: open worktree    Esc/q: cancel    j/k: move",
+        };
+        try draw.copyClippedTextAt(&content, 0, hint_row, hint, app.theme.style(.accent));
     }
 }
 
@@ -3428,6 +3449,18 @@ test "branch switch popup renders relative times and selected exact commit detai
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "Carry uncommitted changes to target; abort if unsafe.") != null);
     try std.testing.expect(known.surface.readCell(26, 11).?.style.dim);
 
+    app.branch_switch.branches[0].worktree_path = try allocator.dupe(u8, "/workspace/linked tree");
+    var moving: chasen.testing.TestSurface = undefined;
+    try moving.init(120, 32);
+    defer moving.deinit();
+    try viewBranchSwitchPopup(app.context(), &moving.surface);
+    const moving_snapshot = try moving.snapshot(allocator);
+    defer allocator.free(moving_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, moving_snapshot, "@ feature/recent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, moving_snapshot, "Worktree: /workspace/linked tree") != null);
+    try std.testing.expect(std.mem.indexOf(u8, moving_snapshot, "Leave uncommitted changes here; open target worktree.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, moving_snapshot, "Enter: open worktree") != null);
+
     app.branch_switch.selected_index = 2;
     var unknown: chasen.testing.TestSurface = undefined;
     try unknown.init(80, 20);
@@ -3474,7 +3507,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
     .{ .key = .{ .action = .push }, .description = "push current branch" },
     .{ .key = .{ .action = .pull }, .description = "pull current branch" },
-    .{ .key = .{ .action = .branch_switch }, .description = "switch branch" },
+    .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
     .{ .key = .{ .action = .discard }, .description = "discard selected file changes" },
     .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
     .{ .key = .{ .text = "Home / End" }, .description = "first / last file" },
@@ -3497,7 +3530,7 @@ const help_placeholder_sections = [_]HelpSection{
 };
 
 const help_compare_items = [_]HelpItem{
-    .{ .key = .{ .action = .branch_switch }, .description = "switch branch (checkout Current HEAD)" },
+    .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
     .{ .key = .{ .text = "m" }, .description = "change comparison base" },
     .{ .key = .{ .action = .reload }, .description = "refresh comparison" },
     .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
@@ -3507,7 +3540,7 @@ const help_compare_items = [_]HelpItem{
 };
 
 const help_history_items = [_]HelpItem{
-    .{ .key = .{ .action = .branch_switch }, .description = "switch branch (keep accepted commit/range diff)" },
+    .{ .key = .{ .action = .branch_switch }, .description = "checkout keeps diff; open worktree resets it" },
     .{ .key = .{ .text = "Row" }, .description = "Commit · Date · Author · Type · [Refs] Subject" },
     .{ .key = .{ .text = "Tab / Shift+Tab" }, .description = "cycle History / detail / files focus" },
     .{ .key = .{ .text = "↑/↓ j/k" }, .description = "navigate the focused pane" },
@@ -3550,7 +3583,7 @@ const help_repository_global_items = [_]HelpItem{
     .{ .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .key = .{ .action = .help }, .description = "open / close help" },
     .{ .key = .{ .action = .reload }, .description = "force reload" },
-    .{ .key = .{ .action = .branch_switch }, .description = "switch branch" },
+    .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
     .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
     .{ .key = .{ .text = "q" }, .description = "quit" },
 };

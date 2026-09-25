@@ -33,6 +33,7 @@ const git_remote = @import("../../git/remote.zig");
 const git_command = @import("../../git/command.zig");
 const git_refs = @import("../../git/refs.zig");
 const root_capability = @import("../../repo/root_capability.zig");
+const worktree_switch = @import("../worktree_switch.zig");
 
 const BranchListLoadFinished = app_load.BranchListLoadFinished;
 const BranchListLoadTask = app_load.BranchListLoadTask(app_message.Msg);
@@ -519,7 +520,7 @@ pub const Controller = struct {
 
     pub fn moveBranchSwitchSelection(self: Controller, delta: isize) void {
         const branch_switch = &self.state.branch_switch;
-        if (!branch_switch.hasState() or branch_switch.loading or branch_switch.branches.len == 0) return;
+        if (!branch_switch.hasState() or branch_switch.loading or branch_switch.worktree_pending or branch_switch.branches.len == 0) return;
         branch_switch.selected_index = wrapIndex(branch_switch.selected_index, branch_switch.branches.len, delta);
     }
 
@@ -545,13 +546,35 @@ pub const Controller = struct {
             return;
         }
         if (branch_switch.loading) return status.set("branch list is still loading", .{});
+        if (branch_switch.worktree_pending) return status.set("checking target worktree...", .{});
         if (branch_switch.branches.len == 0) return status.set("branch switch unavailable: no local branches", .{});
         if (self.lifecycle.view().hasPending()) return status.set("another git action is running", .{});
 
         const selected = branch_switch.branches[branch_switch.selected_index];
-        if (selected.current or std.mem.eql(u8, selected.name, branch_switch.current_branch)) {
+        if (selected.action(branch_switch.current_branch) == .close) {
             status.set("already on branch: {s}", .{branch_switch.current_branch});
             self.clearBranchSwitch(ctx.allocator());
+            return;
+        }
+        if (selected.action(branch_switch.current_branch) == .open_worktree) {
+            errdefer status.set("could not start worktree check", .{});
+            const task = try worktree_switch.Task(app_message.Msg).create(
+                ctx.allocator(),
+                owner,
+                branch_switch.generation,
+                self.repo.activeCapability().?.*,
+                self.env_map,
+                selected.name,
+                selected.worktree_path.?,
+            );
+            errdefer task.destroy(ctx.allocator());
+            try ctx.task().spawnWith(.{
+                .ctx = task,
+                .run = worktree_switch.Task(app_message.Msg).run,
+                .failed = worktree_switch.Task(app_message.Msg).failed,
+            });
+            branch_switch.worktree_pending = true;
+            status.set("checking worktree for {s}...", .{selected.name});
             return;
         }
 
@@ -577,6 +600,29 @@ pub const Controller = struct {
         self.state.branch_switch_pending = .{ .token = prepared.pending, .owner = owner };
         status.set("switching branch: {s} -> {s}", .{ branch_switch.current_branch, selected.name });
         self.clearBranchSwitch(ctx.allocator());
+    }
+
+    pub fn finishWorktreeSwitch(self: Controller, allocator: std.mem.Allocator, finished: worktree_switch.Finished) ?worktree_switch.Validated {
+        var result = finished;
+        defer result.deinit(allocator);
+        const state = &self.state.branch_switch;
+        const owner = state.owner orelse return null;
+        if (!state.worktree_pending or state.generation != result.generation or
+            !owner.origin.eql(result.owner.origin) or !owner.root_identity.eql(result.owner.root_identity)) return null;
+        if (!self.branchOwnerMatches(owner)) {
+            self.clearBranchSwitch(allocator);
+            return null;
+        }
+        const status = self.branchStatus(owner.origin.page_id);
+        self.clearBranchSwitch(allocator);
+        switch (result.result) {
+            .ready => |ready| {
+                result.result = .{ .failed = "" };
+                return ready;
+            },
+            .failed => |message| status.set("Worktree switch failed: {s}", .{message}),
+        }
+        return null;
     }
 
     pub fn clearRemoteError(self: Controller, allocator: std.mem.Allocator) void {
@@ -820,7 +866,7 @@ pub const Controller = struct {
             self.repositoryMatches(.{ .repo_epoch = owner.origin.repo_epoch, .root_identity = owner.root_identity });
     }
 
-    fn branchStatus(self: Controller, owner_page: page.Id) *app_state.StatusMessage {
+    pub fn branchStatus(self: Controller, owner_page: page.Id) *app_state.StatusMessage {
         return switch (owner_page) {
             .changes => self.status,
             .repository => self.repository_status,
@@ -1402,6 +1448,7 @@ fn copyBranchSwitchItems(allocator: std.mem.Allocator, source: []const git_refs.
         };
         initialized += 1;
         items[index].oid = try allocator.dupe(u8, branch.oid);
+        if (branch.worktree_path) |path| items[index].worktree_path = try allocator.dupe(u8, path);
     }
     return items;
 }

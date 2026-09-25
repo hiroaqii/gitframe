@@ -1129,6 +1129,13 @@ pub const App = struct {
                     }
                 },
                 .branch_list => |result| try self.remoteWorkflow().finishBranchListLoad(ctx.allocator(), result),
+                .worktree_switch => |result| {
+                    if (self.remoteWorkflow().finishWorktreeSwitch(ctx.allocator(), result)) |validated| {
+                        const caller_status = self.remoteWorkflow().branchStatus(result.owner.origin.page_id);
+                        const outcome = try self.repoSession().commitWorktree(ctx, validated, caller_status);
+                        if (outcome == .changed) try self.applyRepoSessionCommit(ctx, outcome);
+                    }
+                },
             },
             .coordinator => |coordinator_result| switch (coordinator_result) {
                 .repo_discovery => |result| try self.finishChangesRepoDiscovery(ctx, result),

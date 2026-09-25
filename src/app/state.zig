@@ -226,10 +226,17 @@ pub const BranchSwitchItem = struct {
     oid: []u8,
     current: bool,
     tip_committer_unix: ?i64 = null,
+    worktree_path: ?[]u8 = null,
+
+    pub fn action(self: BranchSwitchItem, current_branch: []const u8) enum { close, checkout, open_worktree } {
+        if (self.current or std.mem.eql(u8, self.name, current_branch)) return .close;
+        return if (self.worktree_path != null) .open_worktree else .checkout;
+    }
 
     pub fn deinit(self: *BranchSwitchItem, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.oid);
+        if (self.worktree_path) |path| allocator.free(path);
         self.* = undefined;
     }
 };
@@ -246,6 +253,7 @@ pub const BranchSwitchState = struct {
     current_oid: []u8 = &.{},
     generation: u64 = 0,
     loading: bool = false,
+    worktree_pending: bool = false,
     selected_index: usize = 0,
     branches: []BranchSwitchItem = &.{},
     render_now_unix: ?i64 = null,

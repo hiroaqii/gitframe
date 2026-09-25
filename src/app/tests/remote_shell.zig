@@ -1911,6 +1911,158 @@ test "Repository branch switch terminals reload only their caller without activa
     }
 }
 
+test "worktree completion uses repository replacement from every branch picker caller" {
+    const allocator = std.testing.allocator;
+    const git_history = @import("../../git/history.zig");
+    const oid = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var destination = try repo_root_capability.RootCapability.openCanonical(roots.b);
+    defer destination.deinit();
+    for ([_]page.Id{ .changes, .repository, .history, .compare }) |caller| {
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = caller,
+            .terminal_size = .{ .width = 120, .height = 32 },
+            .repo_session = .{ .repo_epoch = 4, .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
+        };
+        app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        defer app.repo_session.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.pages.history.deinit(allocator);
+        defer app.pages.compare.deinit(allocator);
+        defer app.remote_workflow.deinit(allocator);
+        const source_identity = app.repo_session.view().activeIdentity().?;
+        _ = activateChanges(&app);
+        app.pages.repository.activate(4, source_identity);
+        app.pages.history.activate(allocator, 4, source_identity);
+        _ = app.pages.compare.activate(4);
+        app.pages.history.accepted = .{
+            .request = .{
+                .snapshot_head = oid,
+                .intent = .{ .single = .{ .index = 0, .oid = oid } },
+                .basis = .{ .object_format = .sha1, .before = .{ .commit = oid }, .after = oid },
+            },
+            .origin = .{ .branch = try allocator.dupe(u8, "main") },
+            .selected_parent_count = 1,
+        };
+        app.pages.history.current_view = .diff;
+        app.pages.compare.base_target = .{
+            .full_ref = try allocator.dupe(u8, "refs/heads/old-base"),
+            .display_name = try allocator.dupe(u8, "old-base"),
+            .kind = .local,
+        };
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+        defer ctx.runtimeClearPendingEffectCopies();
+        try app.update(.request_branch_switch, &ctx);
+        clearPendingStatusAndDiffTasks(&ctx, allocator);
+        const owner = app.remote_workflow.branch_switch.owner.?;
+        try std.testing.expectEqual(caller, owner.origin.page_id);
+        app.remote_workflow.branch_switch.loading = false;
+        app.remote_workflow.branch_switch.worktree_pending = true;
+        try app.update(.{ .load_finished = .{ .shell = .{ .worktree_switch = .{
+            .owner = owner,
+            .generation = app.remote_workflow.branch_switch.generation,
+            .result = .{ .ready = .{
+                .discovery = try testSingleRepoDiscovery(allocator, roots.b),
+                .root_identity = destination.identity,
+            } },
+        } } } }, &ctx);
+        try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
+        try std.testing.expectEqual(@as(u64, 5), app.repo_session.view().epoch());
+        try std.testing.expectEqual(caller, app.active_page);
+        try std.testing.expect(!app.overlay.isSwitchBranch());
+        try std.testing.expect(app.pages.history.accepted == null);
+        try std.testing.expect(app.pages.history.current_view == .picker);
+        try std.testing.expect(app.pages.compare.base_target == null);
+        try std.testing.expectEqualStrings(roots.b, app.repo_session.recent_repos.entries.items[0].path);
+        // Read failure after commitment stays at the destination.
+        for (ctx.takePendingTasksWith()) |entry| {
+            try app.update(entry.failed(entry.ctx, .runtime_abandoned, allocator), &ctx);
+        }
+        try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
+        try std.testing.expectEqual(caller, app.active_page);
+    }
+}
+
+test "worktree precommit rejections keep caller page diagnostics out of shell status" {
+    const allocator = std.testing.allocator;
+    const git_history = @import("../../git/history.zig");
+    const oid = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
+    const Failure = enum { busy, missing, replaced };
+    for ([_]Failure{ .busy, .missing, .replaced }) |failure| {
+        var roots = try TestRepoPair.init();
+        defer roots.deinit();
+        var target = try repo_root_capability.RootCapability.openCanonical(roots.b);
+        defer target.deinit();
+        var app: App = .{
+            .allocator = allocator,
+            .active_page = .history,
+            .repo_session = .{ .repo_epoch = 4, .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
+        };
+        app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+        defer app.repo_session.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
+        defer app.pages.repository.deinit(allocator);
+        defer app.pages.history.deinit(allocator);
+        defer app.pages.compare.deinit(allocator);
+        defer app.remote_workflow.deinit(allocator);
+        const source_identity = app.repo_session.view().activeIdentity().?;
+        const history = &app.pages.history;
+        history.activate(allocator, 4, source_identity);
+        history.needs_initial = false;
+        history.load_state = .loaded;
+        history.accepted = .{
+            .request = .{
+                .snapshot_head = oid,
+                .intent = .{ .single = .{ .index = 0, .oid = oid } },
+                .basis = .{ .object_format = .sha1, .before = .{ .commit = oid }, .after = oid },
+            },
+            .origin = .{ .branch = try allocator.dupe(u8, "main") },
+            .selected_parent_count = 1,
+        };
+        history.current_view = .diff;
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+        defer ctx.runtimeClearPendingEffectCopies();
+        try app.update(.request_branch_switch, &ctx);
+        clearPendingStatusAndDiffTasks(&ctx, allocator);
+        const owner = app.remote_workflow.branch_switch.owner.?;
+        app.remote_workflow.branch_switch.loading = false;
+        app.remote_workflow.branch_switch.worktree_pending = true;
+        if (failure == .busy) {
+            _ = beginAcceptedTestAction(&app, .stage_file);
+        } else {
+            try roots.tmp.dir.rename("b", roots.tmp.dir, "old-b", std.testing.io);
+            if (failure == .replaced) try roots.tmp.dir.createDir(std.testing.io, "b", .default_dir);
+        }
+        try app.update(.{ .load_finished = .{ .shell = .{ .worktree_switch = .{
+            .owner = owner,
+            .generation = app.remote_workflow.branch_switch.generation,
+            .result = .{ .ready = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.b), .root_identity = target.identity } },
+        } } } }, &ctx);
+        try std.testing.expectEqualStrings(roots.a, app.repo_session.view().activeRoot().?);
+        try std.testing.expect(source_identity.eql(app.repo_session.view().activeIdentity().?));
+        try std.testing.expectEqual(@as(u64, 4), app.repo_session.view().epoch());
+        try std.testing.expectEqual(page.Id.history, app.active_page);
+        try std.testing.expect(history.current_view == .diff);
+        try std.testing.expect(history.accepted.?.request.basis.after.eql(&oid));
+        try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
+        try std.testing.expect(!app.overlay.isSwitchBranch());
+        try std.testing.expect(app.remote_workflow.branch_switch_pending == null);
+        try std.testing.expectEqualStrings("", app.status.text());
+        const reason = switch (failure) {
+            .busy => "finish current git action",
+            .missing => "could not be opened safely",
+            .replaced => "target worktree changed",
+        };
+        try std.testing.expect(std.mem.indexOf(u8, history.status.text(), reason) != null);
+        try std.testing.expectEqual(app_state.VisibleStatusSource.page, app_state.resolveVisibleStatus(&app.status, &history.status).?.source);
+    }
+}
+
 test "History and Compare branch switch terminals keep caller intent and retire old reads" {
     const allocator = std.testing.allocator;
     const git_history = @import("../../git/history.zig");

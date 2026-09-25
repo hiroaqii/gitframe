@@ -26,6 +26,7 @@ const discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const repo_state = @import("../repo/state.zig");
 const remote_state = @import("workflow/remote_state.zig");
+const worktree_switch = @import("worktree_switch.zig");
 
 const PendingRecentPathDiscovery = struct {
     kind: repo_state.RecentKind,
@@ -260,9 +261,38 @@ pub const Controller = struct {
     ) !CommitOutcome {
         var prepared = self.prepareDiscovery(ctx.allocator(), result, active_index, origin) orelse return .rejected;
         defer prepared.deinit(ctx.allocator());
+        return self.rememberAndCommit(ctx, &prepared);
+    }
+
+    pub fn commitWorktree(
+        self: Controller,
+        ctx: *chasen.Ctx(app_message.Msg),
+        validated: worktree_switch.Validated,
+        caller_status: *app_state.StatusMessage,
+    ) !CommitOutcome {
+        if (self.action_pending) {
+            var rejected = validated;
+            rejected.deinit(ctx.allocator());
+            caller_status.set("Worktree switch failed: finish current git action before switching repos", .{});
+            return .rejected;
+        }
+        var prepared = self.prepareDiscovery(ctx.allocator(), validated.discovery, 0, .external_selection) orelse {
+            caller_status.set("Worktree switch failed: target worktree could not be opened safely", .{});
+            return .rejected;
+        };
+        defer prepared.deinit(ctx.allocator());
+        if (prepared.candidate == null or !prepared.candidate.?.identity.eql(validated.root_identity)) {
+            caller_status.set("Worktree switch failed: target worktree changed; reopen the branch list", .{});
+            return .rejected;
+        }
+        errdefer caller_status.set("Worktree switch failed: could not prepare repository replacement", .{});
+        return self.rememberAndCommit(ctx, &prepared);
+    }
+
+    fn rememberAndCommit(self: Controller, ctx: *chasen.Ctx(app_message.Msg), prepared: *PreparedDiscovery) !CommitOutcome {
         try self.state.recent_repos.rememberDiscovery(ctx.allocator(), prepared.result.?);
         self.persistRecent(ctx);
-        return self.commitPreparedDiscovery(ctx.allocator(), &prepared);
+        return self.commitPreparedDiscovery(ctx.allocator(), prepared);
     }
 
     fn prepareDiscovery(
@@ -1229,6 +1259,40 @@ test "repository capability commit failure leaves prior identity unchanged" {
     try std.testing.expectEqual(@as(u64, 1), app.repoSessionView().epoch());
     try std.testing.expectEqualStrings(roots.a, app.repoSessionView().activeRoot().?);
     try std.testing.expect(identity.eql(app.repoSessionView().activeIdentity().?));
+}
+
+test "worktree commitment rechecks physical destination and action admission before replacement" {
+    const allocator = std.testing.allocator;
+    var roots = try RepoSessionTestRepoPair.init();
+    defer roots.deinit();
+    var app: RepoSessionTestApp = .{ .allocator = allocator, .active_page = .repository };
+    defer app.repo_session.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.pages.compare.deinit(allocator);
+    _ = app.repoSession().commitDiscovery(allocator, try testRepoSessionSingleDiscovery(allocator, roots.a), 0, .external_selection);
+    const source_identity = app.repoSessionView().activeIdentity().?;
+    var target = try root_capability.RootCapability.openCanonical(roots.b);
+    defer target.deinit();
+    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var busy = app.repoSession();
+    busy.action_pending = true;
+    try std.testing.expectEqual(CommitOutcome.rejected, try busy.commitWorktree(&ctx, .{
+        .discovery = try testRepoSessionSingleDiscovery(allocator, roots.b),
+        .root_identity = target.identity,
+    }, &app.pages.repository.status));
+    try std.testing.expectEqualStrings(roots.a, app.repoSessionView().activeRoot().?);
+    try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
+    try roots.tmp.dir.rename("b", roots.tmp.dir, "old-b", std.testing.io);
+    try roots.tmp.dir.createDir(std.testing.io, "b", .default_dir);
+    try std.testing.expectEqual(CommitOutcome.rejected, try app.repoSession().commitWorktree(&ctx, .{
+        .discovery = try testRepoSessionSingleDiscovery(allocator, roots.b),
+        .root_identity = target.identity,
+    }, &app.pages.repository.status));
+    try std.testing.expect(source_identity.eql(app.repoSessionView().activeIdentity().?));
+    try std.testing.expectEqual(@as(u64, 1), app.repoSessionView().epoch());
+    try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
 }
 
 test "repo picker focuses active workspace repository" {

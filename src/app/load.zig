@@ -38,6 +38,7 @@ const repository_source = @import("../repository/source.zig");
 const history_preview = @import("pages/history/preview.zig");
 const source_syntax = @import("../syntax/source.zig");
 const source_syntax_runtime = @import("../syntax/source_runtime.zig");
+const worktree_switch = @import("worktree_switch.zig");
 const syntax_provider = @import("../syntax/provider_runtime.zig");
 
 const LoadRequest = diff_source.LoadRequest;
@@ -354,6 +355,7 @@ pub const CompareReadFinished = union(enum) {
 pub const ShellReadFinished = union(enum) {
     repo_path_discovery: RepoPathDiscoveryFinished,
     branch_list: BranchListLoadFinished,
+    worktree_switch: worktree_switch.Finished,
 
     pub fn deinit(self: *ShellReadFinished, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -1701,6 +1703,7 @@ pub fn runBranchListLoad(
         .context = context,
         .scope = .local,
         .include_tip_committer_unix = true,
+        .include_worktree_path = true,
     }) catch |err| {
         return .{
             .failed = std.fmt.allocPrint(allocator, "Branch list load failed: {s}", .{@errorName(err)}) catch
