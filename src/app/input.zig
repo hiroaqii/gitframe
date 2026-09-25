@@ -155,11 +155,12 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.stash_catalog) |catalog| {
         if (catalog.confirmation != null) {
-            if (key.matches(chasen.Key.escape, .{}) or key.matches('q', .{})) return .{ .stash = .cancel_apply };
-            if (key.matches(chasen.Key.enter, .{})) return .{ .stash = .confirm_apply };
+            if (key.matches(chasen.Key.escape, .{}) or key.matches('q', .{})) return .{ .stash = .cancel_selection };
+            if (key.matches(chasen.Key.enter, .{})) return .{ .stash = .confirm_selection };
         } else {
             if (key.matches(chasen.Key.escape, .{}) or key.matches('q', .{})) return .{ .stash = .close_list };
-            if (key.matches(' ', .{})) return .{ .stash = .request_apply };
+            if (key.matches(' ', .{})) return .{ .stash = .{ .request_selection = .apply } };
+            if (key.matches('d', .{})) return .{ .stash = .{ .request_selection = .drop } };
             if (key.matches('j', .{}) or key.matches(chasen.Key.down, .{})) return .{ .stash = .next };
             if (key.matches('k', .{}) or key.matches(chasen.Key.up, .{})) return .{ .stash = .previous };
             if (key.matches('g', .{})) return .{ .stash = .first };

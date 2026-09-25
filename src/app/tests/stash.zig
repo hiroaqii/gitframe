@@ -230,20 +230,20 @@ test "stash catalog owns routing and generations; apply cancellation and exact f
     try app.update(space, &ctx);
     const original_head = app.pages.changes.branch_status.status.oid;
     app.pages.changes.branch_status.status.oid = "different head";
-    try app.update(.{ .stash = .confirm_apply }, &ctx);
+    try app.update(.{ .stash = .confirm_selection }, &ctx);
     try std.testing.expectEqual(@as(usize, 0), ctx._pending_tasks_with_len);
     app.pages.changes.branch_status.status.oid = original_head;
     app.pages.changes.activation.state.active.members.status = .pending;
     app.pages.changes.activation.state.active.members.branch = .pending;
-    try app.update(.{ .stash = .confirm_apply }, &ctx);
+    try app.update(.{ .stash = .confirm_selection }, &ctx);
     try std.testing.expect(app.stash_workflow.catalog == null);
     try std.testing.expect(app.action_runtime.view().hasPending());
     try std.testing.expect(!app.pages.changes.repository_read_authority.mayStartRepositoryRead());
     const task = ctx.takePendingTasksWith()[0];
     const finished = task.failed(task.ctx, .runtime_abandoned, allocator);
-    const apply_result = finished.action_finished.apply_stash;
+    const apply_result = finished.action_finished.stash_selection;
     try std.testing.expectEqualStrings("saved message", apply_result.confirmation.message);
-    try app.update(.{ .action_finished = .{ .apply_stash = .{
+    try app.update(.{ .action_finished = .{ .stash_selection = .{
         .pending = .{ .kind = .apply_stash, .generation = apply_result.pending.generation + 1 },
         .confirmation = try apply_result.confirmation.clone(allocator),
         .result = .{ .operation = .ok },
@@ -255,4 +255,66 @@ test "stash catalog owns routing and generations; apply cancellation and exact f
     try std.testing.expectEqual(.apply_stash, app.remote_workflow.remote_error_operation.?);
     try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, "Stash retained") != null);
     try std.testing.expectEqual(@as(usize, 3), ctx._pending_tasks_with_len);
+}
+
+test "stash drop confirmation owns input and returns from error to the refreshed list" {
+    const allocator = std.testing.allocator;
+    var harness = try Harness.init();
+    defer harness.deinit();
+    const app = &harness.app;
+    var ctx: chasen.Ctx(message.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer clearTasks(&ctx);
+    try app.update(.{ .stash = .open_list }, &ctx);
+    try app.update(.{ .stash = .{ .request_selection = .drop } }, &ctx);
+    try std.testing.expect(app.stash_workflow.catalog.?.confirmation == null);
+    const load_task = ctx.takePendingTasksWith()[0];
+    var loaded = load_task.failed(load_task.ctx, .runtime_abandoned, allocator);
+    const bytes = try allocator.dupe(u8, "drop target");
+    const entries = try allocator.alloc(@import("../../git/stash.zig").Entry, 1);
+    entries[0] = .{ .selector = "stash@{0}", .oid = oid, .message = bytes, .created = 1000 };
+    loaded.load_finished.shell.stash_list.result = .{ .loaded = .{ .bytes = bytes, .entries = entries } };
+    try app.update(loaded, &ctx);
+    const d = chasen.Event{ .key_press = .{ .codepoint = 'd' } };
+    try app.update(app.handleEvent(d).?, &ctx);
+    try std.testing.expectEqual(.drop, app.stash_workflow.catalog.?.confirmation.?.action);
+    try std.testing.expect(app.handleEvent(.{ .key_press = .{ .codepoint = ' ' } }) == null);
+    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.escape } }).?, &ctx);
+    try std.testing.expect(app.stash_workflow.catalog.?.confirmation == null);
+    try std.testing.expectEqual(@as(usize, 0), ctx._pending_tasks_with_len);
+    try app.update(app.handleEvent(d).?, &ctx);
+    const enter = chasen.Event{ .key_press = .{ .codepoint = chasen.Key.enter } };
+    // Queue rejection keeps confirmation available, without acquiring a mutation fence.
+    ctx._pending_tasks_with_len = 16;
+    try app.update(app.handleEvent(enter).?, &ctx);
+    ctx._pending_tasks_with_len = 0;
+    try std.testing.expect(app.stash_workflow.catalog.?.confirmation != null);
+    try std.testing.expect(!app.action_runtime.view().hasPending());
+    try app.update(app.handleEvent(enter).?, &ctx);
+    const task = ctx.takePendingTasksWith()[0];
+    var finished = task.failed(task.ctx, .{ .start_failed = "fixture start failure" }, allocator);
+    const target = &finished.action_finished.stash_selection;
+    try std.testing.expectEqual(.drop_stash, target.pending.kind);
+    try app.update(.{ .action_finished = .{ .stash_selection = .{
+        .pending = .{ .kind = .drop_stash, .generation = target.pending.generation + 1 },
+        .confirmation = try target.confirmation.clone(allocator),
+        .result = .{ .operation = .ok },
+    } } }, &ctx);
+    try std.testing.expect(app.action_runtime.view().hasPending());
+    // A nonzero Git terminal with an actual empty refresh must not revive the old row.
+    target.result.operation = .{ .failed_static = "drop failed after external removal" };
+    target.result.refreshed_catalog = .{ .loaded = .{ .bytes = try allocator.dupe(u8, ""), .entries = try allocator.alloc(@import("../../git/stash.zig").Entry, 0) } };
+    try app.update(finished, &ctx);
+    try std.testing.expect(app.overlay.isRemoteError());
+    try std.testing.expect(app.handleEvent(d) == null);
+    try std.testing.expect(app.handleEvent(.{ .key_press = .{ .codepoint = ' ' } }) == null);
+    try std.testing.expectEqual(@as(usize, 3), ctx._pending_tasks_with_len);
+    try std.testing.expect(!app.action_runtime.view().hasPending());
+    try std.testing.expect(app.pages.changes.repository_read_authority.mayStartRepositoryRead());
+    try app.update(app.handleEvent(enter).?, &ctx);
+    try std.testing.expect(app.overlay.isStashes());
+    try std.testing.expectEqual(@as(usize, 0), app.stash_workflow.catalog.?.focus.len);
+    try std.testing.expectEqual(@as(usize, 0), app.stash_workflow.catalog.?.focus.index);
+    try app.update(app.handleEvent(d).?, &ctx);
+    try std.testing.expect(app.stash_workflow.catalog.?.confirmation == null);
+    try std.testing.expect(app.handleEvent(enter) == null);
 }

@@ -748,7 +748,11 @@ pub const App = struct {
             .request_branch_switch => try self.requestRemoteBranchSwitch(ctx),
             .confirm_branch_switch => try self.remoteWorkflow().confirmBranchSwitch(ctx),
             .cancel_branch_switch => self.remoteWorkflow().clearBranchSwitch(ctx.allocator()),
-            .close_remote_error => self.remoteWorkflow().clearRemoteError(ctx.allocator()),
+            .close_remote_error => {
+                const return_to_stashes = self.remote_workflow.remote_error_operation == .drop_stash;
+                self.remoteWorkflow().clearRemoteError(ctx.allocator());
+                if (return_to_stashes) self.stashWorkflow().restoreList(ctx.allocator());
+            },
             .run_interactive_push => try self.remoteWorkflow().runInteractivePush(ctx),
             .reload => switch (self.active_page) {
                 .changes => {
@@ -1194,13 +1198,13 @@ pub const App = struct {
                     try self.applyLocalActionIntent(ctx, outcome.intent);
                 }
             },
-            .apply_stash => |value| {
+            .stash_selection => |value| {
                 var result = value;
                 defer result.deinit(ctx.allocator());
-                if (self.stashWorkflow().finishApply(ctx.allocator(), &result)) |outcome| {
+                if (self.stashWorkflow().finishSelection(ctx.allocator(), &result)) |outcome| {
                     if (outcome.error_message) |detail| {
                         defer ctx.allocator().free(detail);
-                        self.remoteWorkflow().setRemoteErrorWithRetry(ctx.allocator(), .apply_stash, detail, null, .changes) catch {};
+                        self.remoteWorkflow().setRemoteErrorWithRetry(ctx.allocator(), if (result.confirmation.action == .apply) .apply_stash else .drop_stash, detail, null, .changes) catch {};
                     }
                     try self.applyLocalActionIntent(ctx, outcome.intent);
                 }
@@ -1493,7 +1497,7 @@ pub const App = struct {
             .push_retry_inspecting = remote.pushRetryInspecting(),
             .branch_switch = remote.branchSwitch(),
             .create_stash = self.stash_workflow.dialog(),
-            .stash_catalog = self.stash_workflow.list(),
+            .stash_catalog = if (self.overlay.isStashes()) self.stash_workflow.list() else null,
             .stash_target = self.changesOperations().stashTarget(true),
             .staged_summary = switch (self.changesOperations().commitSummary()) {
                 .unavailable => .unavailable,
@@ -1642,7 +1646,7 @@ pub const App = struct {
                 .sidebar_width = self.pages.history.diff.viewer.sidebar_width,
             },
             .create_stash = self.stash_workflow.dialog(),
-            .stash_catalog = self.stash_workflow.list(),
+            .stash_catalog = if (self.overlay.isStashes()) self.stash_workflow.list() else null,
             .commit_panel_mode = self.localWorkflowView().commitPanelOpen(),
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
@@ -1850,6 +1854,7 @@ pub const App = struct {
                     .switch_branch => "branch switch error",
                     .create_stash => "stash creation error",
                     .apply_stash => "stash apply error",
+                    .drop_stash => "stash drop error",
                 },
                 .text = message,
             };

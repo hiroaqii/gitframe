@@ -89,26 +89,39 @@ fn parseEntries(allocator: std.mem.Allocator, bytes: []const u8) ![]Entry {
     return entries.toOwnedSlice(allocator);
 }
 
-pub const ApplyRequest = struct {
+pub const SelectionAction = enum { apply, drop };
+
+pub const SelectionRequest = struct {
+    action: SelectionAction,
     branch: ?[]const u8,
     head_oid: []const u8,
     selector: []const u8,
     stash_oid: []const u8,
 };
 
-pub const ApplyResult = struct {
+pub const SelectionResult = struct {
     operation: operations.OperationResult,
-    /// A rejected selector brings back the fresh catalog, without another read or mutation.
-    refreshed_catalog: ?Catalog = null,
+    /// Apply returns a catalog on selector drift; drop always attempts a fresh read.
+    refreshed_catalog: ?ListResult = null,
 
-    pub fn deinit(self: *ApplyResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SelectionResult, allocator: std.mem.Allocator) void {
         self.operation.deinit(allocator);
         if (self.refreshed_catalog) |*catalog| catalog.deinit(allocator);
         self.* = undefined;
     }
 };
 
-pub fn apply(allocator: std.mem.Allocator, io: std.Io, context: command.DirectoryContext, request: ApplyRequest) !ApplyResult {
+pub fn performSelection(allocator: std.mem.Allocator, io: std.Io, context: command.DirectoryContext, request: SelectionRequest) SelectionResult {
+    var result = executeSelection(allocator, io, context, request) catch |err|
+        SelectionResult{ .operation = .{ .failed_static = @errorName(err) } };
+    if (request.action == .drop) {
+        if (result.refreshed_catalog) |*catalog| catalog.deinit(allocator);
+        result.refreshed_catalog = list(allocator, io, context) catch |err| .{ .failed_static = @errorName(err) };
+    }
+    return result;
+}
+
+fn executeSelection(allocator: std.mem.Allocator, io: std.Io, context: command.DirectoryContext, request: SelectionRequest) !SelectionResult {
     const current = try operations.readCurrentBranchOid(allocator, io, context, request.branch) orelse
         return .{ .operation = .{ .failed_static = "Branch changed; reload and reopen Stashes" } };
     defer allocator.free(current);
@@ -122,11 +135,14 @@ pub fn apply(allocator: std.mem.Allocator, io: std.Io, context: command.Director
     if (!matched) {
         const refreshed = catalog.loaded;
         catalog = .empty;
-        return .{ .operation = .{ .failed_static = "Selected stash changed; list reloaded. Select again." }, .refreshed_catalog = refreshed };
+        return .{ .operation = .{ .failed_static = "Selected stash changed; list reloaded. Select again." }, .refreshed_catalog = .{ .loaded = refreshed } };
     }
-    // Use immutable identity after validation. Never restore the index or remove the stash.
+    // Apply uses immutable identity. Drop accepts the external race between this check and Git.
     const result = try command.runCaptured(allocator, io, context, .{
-        .argv = &.{ "git", "-c", "stash.index=false", "stash", "apply", request.stash_oid },
+        .argv = if (request.action == .apply)
+            &.{ "git", "-c", "stash.index=false", "stash", "apply", request.stash_oid }
+        else
+            &.{ "git", "stash", "drop", request.selector },
         .stdout_limit = .limited(128 * 1024),
         .stderr_limit = .limited(256 * 1024),
     });
@@ -143,7 +159,7 @@ pub fn apply(allocator: std.mem.Allocator, io: std.Io, context: command.Director
     // Merge conflicts are reported on stdout, with an unsuccessful exit status.
     if (result.stdout.len > 0) return .{ .operation = .{ .failed = result.stdout } };
     allocator.free(result.stdout);
-    return .{ .operation = .{ .failed_static = "Git stash apply failed; inspect Changes for conflicts" } };
+    return .{ .operation = .{ .failed_static = if (request.action == .apply) "Git stash apply failed; inspect Changes for conflicts" else "Git stash drop failed; inspect Stashes" } };
 }
 
 pub const CreateRequest = struct {
@@ -440,18 +456,18 @@ test "stash list and apply pin selector identity, revalidate HEAD and disable in
     try std.testing.expectEqualStrings("stash@{0}", entry.selector);
     try std.testing.expectEqualStrings("On main: café message", entry.message);
     try std.testing.expect(entry.created > 0);
-    const request = ApplyRequest{ .branch = "main", .head_oid = std.mem.trimEnd(u8, head, "\n"), .selector = entry.selector, .stash_oid = entry.oid };
-    var applied = try apply(allocator, std.testing.io, repo.context(), request);
+    const request = SelectionRequest{ .action = .apply, .branch = "main", .head_oid = std.mem.trimEnd(u8, head, "\n"), .selector = entry.selector, .stash_oid = entry.oid };
+    var applied = performSelection(allocator, std.testing.io, repo.context(), request);
     defer applied.deinit(allocator);
     try std.testing.expect(applied.operation == .ok);
     const restored = try repo.output(&.{ "git", "status", "--porcelain=v1", "-uall" });
     defer allocator.free(restored);
     try std.testing.expectEqualStrings(" M mixed\n?? new\n", restored);
     try repo.git(&.{ "git", "stash", "push", "-u", "-m", "newer stash" });
-    var shifted = try apply(allocator, std.testing.io, repo.context(), request);
+    var shifted = performSelection(allocator, std.testing.io, repo.context(), request);
     defer shifted.deinit(allocator);
     try std.testing.expect(shifted.operation == .failed_static);
-    try std.testing.expectEqual(@as(usize, 2), shifted.refreshed_catalog.?.entries.len);
+    try std.testing.expectEqual(@as(usize, 2), shifted.refreshed_catalog.?.loaded.entries.len);
     const clean = try repo.output(&.{ "git", "status", "--porcelain=v1", "-uall" });
     defer allocator.free(clean);
     try std.testing.expectEqualStrings("", clean);
@@ -463,7 +479,7 @@ test "stash list and apply pin selector identity, revalidate HEAD and disable in
     var changed = request;
     changed.selector = updated.loaded.entries[0].selector;
     changed.stash_oid = updated.loaded.entries[0].oid;
-    var rejected = try apply(allocator, std.testing.io, repo.context(), changed);
+    var rejected = performSelection(allocator, std.testing.io, repo.context(), changed);
     defer rejected.deinit(allocator);
     try std.testing.expect(rejected.operation == .failed_static);
     const empty = try parseEntries(allocator, "");
@@ -486,7 +502,7 @@ test "stash apply conflict retains selected stash and actual conflicted worktree
     try repo.git(&.{ "git", "commit", "-m", "conflicting commit" });
     const head = try repo.output(&.{ "git", "rev-parse", "HEAD" });
     defer allocator.free(head);
-    var result = try apply(allocator, std.testing.io, repo.context(), .{ .branch = "main", .head_oid = std.mem.trimEnd(u8, head, "\n"), .selector = entry.selector, .stash_oid = entry.oid });
+    var result = performSelection(allocator, std.testing.io, repo.context(), .{ .action = .apply, .branch = "main", .head_oid = std.mem.trimEnd(u8, head, "\n"), .selector = entry.selector, .stash_oid = entry.oid });
     defer result.deinit(allocator);
     try std.testing.expect(result.operation == .failed);
     try std.testing.expect(std.mem.indexOf(u8, result.operation.failed, "CONFLICT") != null);
@@ -497,4 +513,75 @@ test "stash apply conflict retains selected stash and actual conflicted worktree
     defer retained.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), retained.loaded.entries.len);
     try std.testing.expectEqualStrings(entry.oid, retained.loaded.entries[0].oid);
+}
+
+test "stash drop validates selector identity and refreshes middle and last deletion without changing worktree" {
+    const allocator = std.testing.allocator;
+    var repo = try TestRepo.init();
+    defer repo.deinit();
+    const head = try repo.output(&.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head);
+    for ([_][]const u8{ "oldest", "middle", "newest" }) |name| {
+        try repo.write("mixed", name);
+        try repo.git(&.{ "git", "stash", "push", "-m", name });
+    }
+    try repo.write("mixed", "current worktree");
+    try repo.write("new", "untracked stays");
+    const before = try repo.output(&.{ "git", "status", "--porcelain=v1", "-uall" });
+    defer allocator.free(before);
+    var catalog = try list(allocator, std.testing.io, repo.context());
+    defer catalog.deinit(allocator);
+    const entries = catalog.loaded.entries;
+    var request = SelectionRequest{ .action = .drop, .branch = "main", .head_oid = std.mem.trimEnd(u8, head, "\n"), .selector = entries[1].selector, .stash_oid = entries[1].oid };
+    var removed = performSelection(allocator, std.testing.io, repo.context(), request);
+    defer removed.deinit(allocator);
+    try std.testing.expect(removed.operation == .ok);
+    try std.testing.expectEqual(@as(usize, 2), removed.refreshed_catalog.?.loaded.entries.len);
+    try std.testing.expectEqualStrings(entries[0].oid, removed.refreshed_catalog.?.loaded.entries[0].oid);
+    try std.testing.expectEqualStrings(entries[2].oid, removed.refreshed_catalog.?.loaded.entries[1].oid);
+    try repo.git(&.{ "git", "stash", "store", "-m", "external", entries[1].oid });
+    request.selector = entries[0].selector;
+    request.stash_oid = entries[0].oid;
+    var shifted = performSelection(allocator, std.testing.io, repo.context(), request);
+    defer shifted.deinit(allocator);
+    try std.testing.expect(shifted.operation == .failed_static);
+    try std.testing.expectEqual(@as(usize, 3), shifted.refreshed_catalog.?.loaded.entries.len);
+    try std.testing.expectEqualStrings(entries[1].oid, shifted.refreshed_catalog.?.loaded.entries[0].oid);
+    for (0..3) |i| {
+        var current = try list(allocator, std.testing.io, repo.context());
+        defer current.deinit(allocator);
+        request.selector = current.loaded.entries[0].selector;
+        request.stash_oid = current.loaded.entries[0].oid;
+        var result = performSelection(allocator, std.testing.io, repo.context(), request);
+        defer result.deinit(allocator);
+        try std.testing.expect(result.operation == .ok);
+        try std.testing.expectEqual(2 - i, result.refreshed_catalog.?.loaded.entries.len);
+    }
+    const after = try repo.output(&.{ "git", "status", "--porcelain=v1", "-uall" });
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    const content = try repo.tmp.dir.readFileAlloc(std.testing.io, "mixed", allocator, .limited(1024));
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("current worktree", content);
+}
+
+test "stash drop Git failure retains the entry and returns the actual catalog" {
+    const allocator = std.testing.allocator;
+    var repo = try TestRepo.init();
+    defer repo.deinit();
+    try repo.write("mixed", "saved");
+    try repo.git(&.{ "git", "stash", "push", "-m", "retained" });
+    const head = try repo.output(&.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head);
+    var catalog = try list(allocator, std.testing.io, repo.context());
+    defer catalog.deinit(allocator);
+    const entry = catalog.loaded.entries[0];
+    // Force an ordinary Git refusal only in this private fixture.
+    try repo.write(".git/refs/stash.lock", "fixture lock");
+    var result = performSelection(allocator, std.testing.io, repo.context(), .{ .action = .drop, .branch = "main", .head_oid = std.mem.trimEnd(u8, head, "\n"), .selector = entry.selector, .stash_oid = entry.oid });
+    defer result.deinit(allocator);
+    try std.testing.expect(result.operation == .failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.operation.failed, "lock") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.refreshed_catalog.?.loaded.entries.len);
+    try std.testing.expectEqualStrings(entry.oid, result.refreshed_catalog.?.loaded.entries[0].oid);
 }

@@ -45,9 +45,9 @@ pub const Msg = union(enum) {
     previous,
     next,
     first,
-    request_apply,
-    cancel_apply,
-    confirm_apply,
+    request_selection: @import("../git/stash.zig").SelectionAction,
+    cancel_selection,
+    confirm_selection,
     open,
     cancel,
     confirm,
@@ -59,27 +59,30 @@ pub const Msg = union(enum) {
     paste: []const u8,
 };
 
-pub const Apply = struct {
+pub const Selection = struct {
+    action: @import("../git/stash.zig").SelectionAction,
+    /// Display position after refresh, never mutation authority.
+    list_index: usize,
     snapshot: Snapshot,
     selector: []u8,
     oid: []u8,
     message: []u8,
 
-    pub fn init(allocator: std.mem.Allocator, snapshot: Snapshot, entry: @import("../git/stash.zig").Entry) !Apply {
+    pub fn init(allocator: std.mem.Allocator, snapshot: Snapshot, entry: @import("../git/stash.zig").Entry, action: @import("../git/stash.zig").SelectionAction, list_index: usize) !Selection {
         var owned_snapshot = try snapshot.clone(allocator);
         errdefer owned_snapshot.deinit(allocator);
         const selector = try allocator.dupe(u8, entry.selector);
         errdefer allocator.free(selector);
         const oid = try allocator.dupe(u8, entry.oid);
         errdefer allocator.free(oid);
-        return .{ .snapshot = owned_snapshot, .selector = selector, .oid = oid, .message = try allocator.dupe(u8, entry.message) };
+        return .{ .action = action, .list_index = list_index, .snapshot = owned_snapshot, .selector = selector, .oid = oid, .message = try allocator.dupe(u8, entry.message) };
     }
 
-    pub fn clone(self: Apply, allocator: std.mem.Allocator) !Apply {
-        return init(allocator, self.snapshot, .{ .selector = self.selector, .oid = self.oid, .message = self.message, .created = 0 });
+    pub fn clone(self: Selection, allocator: std.mem.Allocator) !Selection {
+        return init(allocator, self.snapshot, .{ .selector = self.selector, .oid = self.oid, .message = self.message, .created = 0 }, self.action, self.list_index);
     }
 
-    pub fn deinit(self: *Apply, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Selection, allocator: std.mem.Allocator) void {
         self.snapshot.deinit(allocator);
         allocator.free(self.selector);
         allocator.free(self.oid);
@@ -93,17 +96,17 @@ pub const Catalog = struct {
     pending: ?u64,
     result: @import("../git/stash.zig").ListResult = .empty,
     focus: ui.FocusList = .{},
-    confirmation: ?Apply = null,
+    confirmation: ?Selection = null,
     notice: ?[]const u8 = null,
 
     pub fn deinit(self: *Catalog, allocator: std.mem.Allocator) void {
         self.snapshot.deinit(allocator);
         self.result.deinit(allocator);
-        self.cancelApply(allocator);
+        self.cancelSelection(allocator);
         self.* = undefined;
     }
 
-    pub fn cancelApply(self: *Catalog, allocator: std.mem.Allocator) void {
+    pub fn cancelSelection(self: *Catalog, allocator: std.mem.Allocator) void {
         if (self.confirmation) |*confirmation| confirmation.deinit(allocator);
         self.confirmation = null;
     }

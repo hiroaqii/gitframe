@@ -33,7 +33,7 @@ pub const ActionFinished = union(enum) {
     fetch: actions.FetchFinished,
     switch_branch: actions.SwitchBranchFinished,
     create_stash: actions.CreateStashFinished,
-    apply_stash: actions.ApplyStashFinished,
+    stash_selection: actions.StashSelectionFinished,
     push_foreground: chasen.ForegroundCommandResult,
 
     pub fn deinit(self: *ActionFinished, allocator: std.mem.Allocator) void {

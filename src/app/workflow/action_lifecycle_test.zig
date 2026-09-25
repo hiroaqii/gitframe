@@ -56,6 +56,7 @@ test "action terminal coordinator accepts every exact launched action once" {
         .switch_branch,
         .create_stash,
         .apply_stash,
+        .drop_stash,
     };
     try std.testing.expectEqual(@typeInfo(app_actions.ActionKind).@"enum".fields.len, action_kinds.len);
 

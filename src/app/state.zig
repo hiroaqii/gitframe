@@ -16,6 +16,7 @@ pub const GitErrorOperation = enum {
     switch_branch,
     create_stash,
     apply_stash,
+    drop_stash,
 };
 
 pub const OverlayKind = union(enum) {

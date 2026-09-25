@@ -926,6 +926,7 @@ fn pendingActionFallbackLabel(kind: app_actions.ActionKind) []const u8 {
         .switch_branch => "switch",
         .create_stash => "stash",
         .apply_stash => "apply stash",
+        .drop_stash => "drop stash",
     };
 }
 
@@ -1330,12 +1331,12 @@ fn stashDisplay(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
 
 fn viewStashes(app: Context, surface: *chasen.Surface) !void {
     const catalog = app.stash_catalog orelse return;
-    const confirming = catalog.confirmation != null;
+    const dropping = if (catalog.confirmation) |confirmation| confirmation.action == .drop else false;
     const frame = ui.Modal.frame(surface, .{
         .dialog_width = 108,
         .dialog_height = 22,
         .padding = .{ .left = 2, .right = 2, .top = 1, .bottom = 1 },
-        .title = if (confirming) "Apply stash" else "Stashes",
+        .title = if (catalog.confirmation != null) (if (dropping) "Drop stash" else "Apply stash") else "Stashes",
         .backdrop = false,
         .border = .rounded,
         .title_style = app.theme.boldStyle(.accent),
@@ -1348,18 +1349,24 @@ fn viewStashes(app: Context, surface: *chasen.Surface) !void {
     const size = content.size();
     var branch_buffer: [96]u8 = undefined;
     if (catalog.confirmation) |confirmation| {
-        const identity = try std.fmt.allocPrint(allocator, "Apply {s} ({s})", .{ confirmation.selector, confirmation.oid[0..@min(12, confirmation.oid.len)] });
+        const identity = try std.fmt.allocPrint(allocator, "{s} {s} ({s})", .{ if (dropping) "Drop" else "Apply", confirmation.selector, confirmation.oid[0..@min(12, confirmation.oid.len)] });
         try draw.copyClippedTextAt(&content, 0, 0, identity, app.theme.boldStyle(.accent));
         try draw.copyClippedTextAt(&content, 0, 2, try stashDisplay(allocator, confirmation.message), app.theme.style(.accent));
-        const branch = try std.fmt.allocPrint(allocator, "To branch: {s}", .{try stashDisplay(allocator, confirmation.snapshot.branchLabel(&branch_buffer))});
+        const branch = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ if (dropping) "Current branch" else "To branch", try stashDisplay(allocator, confirmation.snapshot.branchLabel(&branch_buffer)) });
         try draw.copyClippedTextAt(&content, 0, 4, branch, app.theme.boldStyle(.prompt));
         const worktree = try std.fmt.allocPrint(allocator, "Worktree: {s}", .{try stashDisplay(allocator, confirmation.snapshot.repo_root)});
         var worktree_body = content.child(.{ .col = 0, .row = 6, .width = size.width, .height = @min(3, size.height -| 6) });
         _ = drawWrappedTextScrolled(&worktree_body, worktree, 0, app.theme.style(.muted));
-        _ = content.borrowTextAt(0, 9, "The stash will be retained.", app.theme.style(.accent));
-        _ = content.borrowTextAt(0, 10, "Staged / unstaged classification will not be restored.", app.theme.style(.muted));
-        _ = content.borrowTextAt(0, 12, "Conflicts may leave changes to resolve in this worktree.", app.theme.style(.muted));
-        _ = content.borrowTextAt(0, size.height -| 1, "Enter: apply   Esc/q: back", app.theme.style(.accent));
+        if (dropping) {
+            _ = content.borrowTextAt(0, 9, "Delete the saved changes in this stash?", app.theme.boldStyle(.danger));
+            _ = content.borrowTextAt(0, 10, "This removes the saved entry from the repository's stash list.", app.theme.style(.muted));
+            _ = content.borrowTextAt(0, 12, "Current worktree changes will not be applied or discarded.", app.theme.style(.muted));
+        } else {
+            _ = content.borrowTextAt(0, 9, "The stash will be retained.", app.theme.style(.accent));
+            _ = content.borrowTextAt(0, 10, "Staged / unstaged classification will not be restored.", app.theme.style(.muted));
+            _ = content.borrowTextAt(0, 12, "Conflicts may leave changes to resolve in this worktree.", app.theme.style(.muted));
+        }
+        _ = content.borrowTextAt(0, size.height -| 1, if (dropping) "Enter: drop   Esc/q: back" else "Enter: apply   Esc/q: back", app.theme.style(.accent));
         return;
     }
     const destination = if (app.stash_target) |target| target.branch orelse (std.fmt.bufPrint(&branch_buffer, "detached@{s}", .{target.oid[0..@min(12, target.oid.len)]}) catch "detached") else "unavailable; reload before applying";
@@ -1399,7 +1406,7 @@ fn viewStashes(app: Context, surface: *chasen.Surface) !void {
             list.view(&body, .{ .show_header = true, .row_style = app.theme.style(.muted), .focused_style = app.theme.boldStyle(.accent), .marker_style = app.theme.style(.accent), .header_style = app.theme.boldStyle(.prompt), .show_cursor = false });
         },
     }
-    _ = content.borrowTextAt(0, size.height -| 1, "Space: apply   j/k/↑/↓: select   g: first   Esc/q: close", app.theme.style(.accent));
+    _ = content.borrowTextAt(0, size.height -| 1, "Space: apply   d: drop   j/k/↑/↓: select   g: first   Esc/q: close", app.theme.style(.accent));
 }
 
 fn viewCreateStash(app: Context, surface: *chasen.Surface) !void {
@@ -1682,6 +1689,7 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
             .switch_branch => "Branch switch failed",
             .create_stash => "Stash creation failed",
             .apply_stash => "Stash apply failed",
+            .drop_stash => "Stash drop failed",
         },
         .backdrop = false,
         .border = .rounded,
@@ -1701,6 +1709,7 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
             .switch_branch => "Git branch switch failed. Details:",
             .create_stash => "Git stash failed. Details:",
             .apply_stash => "Git stash apply failed. Details:",
+            .drop_stash => "Git stash drop failed. Details:",
         };
         try draw.copyClippedTextAt(&content, 0, 0, heading, app.theme.boldStyle(.danger));
     }
@@ -3704,7 +3713,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .commit }, .description = "open commit panel" },
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
     .{ .key = .{ .action = .create_stash }, .description = "create stash (all / staged changes)" },
-    .{ .key = .{ .action = .stash_list }, .description = "list stashes / apply to current branch" },
+    .{ .key = .{ .action = .stash_list }, .description = "list stashes / apply or drop" },
     .{ .key = .{ .action = .push }, .description = "push current branch" },
     .{ .key = .{ .action = .pull }, .description = "pull current branch" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
