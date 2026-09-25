@@ -1911,6 +1911,102 @@ test "Repository branch switch terminals reload only their caller without activa
     }
 }
 
+test "branch switch filter routes text selection and cancellation through the shell" {
+    const allocator = std.testing.allocator;
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
+    };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
+    defer app.repo_session.deinit(allocator);
+    defer app.pages.changes.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
+    defer app.pages.history.deinit(allocator);
+    defer app.pages.compare.deinit(allocator);
+    defer app.remote_workflow.deinit(allocator);
+    app.pages.repository.activate(0, app.repo_session.view().activeIdentity().?);
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer ctx.runtimeClearPendingEffectCopies();
+    const Key = struct {
+        fn send(target: *App, context: *chasen.Ctx(App.Msg), codepoint: u21) !void {
+            try target.update(target.handleEvent(.{ .key_press = .{ .codepoint = codepoint } }) orelse return error.ExpectedPickerInput, context);
+        }
+    };
+    try Key.send(&app, &ctx, 'b');
+    try Key.send(&app, &ctx, '/');
+    try std.testing.expect(!app.remote_workflow.branch_switch.query_mode);
+    clearPendingStatusAndDiffTasks(&ctx, allocator);
+    const state = &app.remote_workflow.branch_switch;
+    state.loading = false;
+    app.remote_workflow.branch_switch_load_pending = null;
+    state.current_branch = try allocator.dupe(u8, "main");
+    state.current_oid = try allocator.dupe(u8, "abc");
+    state.branches = try allocator.alloc(app_state.BranchSwitchItem, 3);
+    for ([_][]const u8{ "main", "feature/qjk-one", "feature/qjk-two" }, state.branches, 0..) |name, *branch, index| {
+        branch.* = .{
+            .name = try allocator.dupe(u8, name),
+            .oid = try allocator.dupe(u8, "abc"),
+            .current = index == 0,
+        };
+    }
+    state.branches[2].worktree_path = try allocator.dupe(u8, roots.b);
+
+    try Key.send(&app, &ctx, '/');
+    for ("qjk") |codepoint| try Key.send(&app, &ctx, codepoint);
+    try std.testing.expectEqualStrings("qjk", state.query.slice());
+    try std.testing.expectEqual(@as(usize, 2), state.visibleCount());
+    try Key.send(&app, &ctx, chasen.Key.down);
+    try std.testing.expectEqualStrings("feature/qjk-two", state.selectedItem().?.name);
+    try Key.send(&app, &ctx, '/');
+    try std.testing.expectEqual(@as(usize, 0), state.visibleCount());
+    try Key.send(&app, &ctx, chasen.Key.enter);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(app.overlay.isSwitchBranch());
+    try Key.send(&app, &ctx, chasen.Key.backspace);
+    try std.testing.expectEqualStrings("qjk", state.query.slice());
+    try Key.send(&app, &ctx, chasen.Key.tab);
+    try std.testing.expect(!state.query_mode);
+    try Key.send(&app, &ctx, 'k');
+    try std.testing.expectEqualStrings("feature/qjk-two", state.selectedItem().?.name);
+    try Key.send(&app, &ctx, 'j');
+    try std.testing.expectEqualStrings("feature/qjk-one", state.selectedItem().?.name);
+    try Key.send(&app, &ctx, chasen.Key.escape);
+    try std.testing.expectEqual(@as(usize, 0), state.query.len);
+    try std.testing.expectEqual(@as(usize, 3), state.visibleCount());
+    try std.testing.expect(app.overlay.isSwitchBranch());
+
+    try Key.send(&app, &ctx, '/');
+    const shifted_q = app.handleEvent(.{ .key_press = .{ .codepoint = 'q', .shifted_codepoint = 'Q', .mods = .{ .shift = true } } }).?;
+    try app.update(shifted_q, &ctx);
+    for ("jk") |codepoint| try Key.send(&app, &ctx, codepoint);
+    try std.testing.expectEqualStrings("Qjk", state.query.slice());
+    try std.testing.expectEqual(@as(usize, 2), state.visibleCount());
+    try std.testing.expect(app.handleEvent(.{ .paste = "q" }) == null);
+    try Key.send(&app, &ctx, chasen.Key.down);
+    try Key.send(&app, &ctx, chasen.Key.enter);
+    try std.testing.expect(state.worktree_pending);
+    const entries = ctx.takePendingTasksWith();
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    const task: *@import("../worktree_switch.zig").Task(App.Msg) = @ptrCast(@alignCast(entries[0].ctx));
+    try std.testing.expectEqualStrings("feature/qjk-two", task.branch);
+    try std.testing.expectEqualStrings(roots.b, task.path);
+    try std.testing.expect(app.handleEvent(.{ .key_press = .{ .codepoint = 'j' } }) == null);
+    try Key.send(&app, &ctx, chasen.Key.escape);
+    try std.testing.expect(!app.overlay.isSwitchBranch());
+    try std.testing.expectEqual(@as(usize, 0), state.query.len);
+    var abandoned = entries[0].failed(entries[0].ctx, .runtime_abandoned, allocator);
+    abandoned.deinitUndelivered(allocator);
+    try Key.send(&app, &ctx, 'b');
+    try std.testing.expect(!state.query_mode);
+    try std.testing.expectEqual(@as(usize, 0), state.query.len);
+    try Key.send(&app, &ctx, 'q');
+    try std.testing.expect(!app.overlay.isSwitchBranch());
+}
+
 test "worktree completion uses repository replacement from every branch picker caller" {
     const allocator = std.testing.allocator;
     const git_history = @import("../../git/history.zig");

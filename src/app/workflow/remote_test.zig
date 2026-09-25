@@ -1117,7 +1117,7 @@ test "stale branch-list success cannot publish into reactivated Changes" {
     try std.testing.expectEqualStrings("new Changes diagnostic", app.pages.changes.status.text());
 }
 
-test "confirmBranchSwitch treats current branch as no-op without clearing state" {
+test "confirmBranchSwitch treats filtered current branch as no-op and keeps caller data" {
     var app: RemoteHarness = .{
         .allocator = std.testing.allocator,
         .remote_workflow = .{ .branch_switch = .{
@@ -1127,8 +1127,8 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
             .generation = 3,
             .loading = false,
             .branches = try branchSwitchItemsForTest(std.testing.allocator, &.{
-                .{ .name = "main", .oid = "abc123", .current = true },
                 .{ .name = "feature", .oid = "def456", .current = false },
+                .{ .name = "main", .oid = "abc123", .current = true },
             }),
         } },
         .overlay = .{ .kind = .switch_branch },
@@ -1142,7 +1142,8 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
         .root_identity = app.repoSessionView().activeIdentity().?,
     };
     // Current always wins over the worktree marker, including main worktrees.
-    app.remote_workflow.branch_switch.branches[0].worktree_path = try std.testing.allocator.dupe(u8, repo_root);
+    app.remote_workflow.branch_switch.branches[1].worktree_path = try std.testing.allocator.dupe(u8, repo_root);
+    try app.remote_workflow.branch_switch.editQuery(std.testing.allocator, .{ .insert = 'm' });
     defer app.clearBranchSwitch(std.testing.allocator);
     defer app.pages.changes.staged_hunks.deinit(std.testing.allocator);
 
@@ -1186,6 +1187,30 @@ test "confirmBranchSwitch treats current branch as no-op without clearing state"
     try std.testing.expect(!missing_authority.remote_workflow.branch_switch.hasState());
     try std.testing.expectEqual(@as(u8, 0), missing_ctx._pending_tasks_with_len);
     try std.testing.expect(!missing_authority.actionLifecycleView().hasPending());
+}
+
+test "branch switch filter allocation failure preserves query rows and selected target" {
+    const allocator = std.testing.allocator;
+    var state: app_state.BranchSwitchState = .{
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .branches = try branchSwitchItemsForTest(allocator, &.{
+            .{ .name = "main", .oid = "abc", .current = true },
+            .{ .name = "qjk-one", .oid = "def" },
+            .{ .name = "qjk-two", .oid = "fed" },
+        }),
+    };
+    defer state.deinit(allocator);
+    try state.editQuery(allocator, .enter);
+    try state.editQuery(allocator, .{ .insert = 'q' });
+    state.selected_index = 1;
+    const old_indexes = state.filter.source_indexes.ptr;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    try std.testing.expectError(error.OutOfMemory, state.editQuery(failing.allocator(), .{ .insert = 'j' }));
+    try std.testing.expectEqualStrings("q", state.query.slice());
+    try std.testing.expect(state.query_mode);
+    try std.testing.expectEqual(@as(usize, 2), state.visibleCount());
+    try std.testing.expectEqual(old_indexes, state.filter.source_indexes.ptr);
+    try std.testing.expectEqualStrings("qjk-two", state.selectedItem().?.name);
 }
 
 test "worktree branch action owns its task and fences cancel reopen and stale completions" {

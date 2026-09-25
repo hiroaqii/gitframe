@@ -520,8 +520,15 @@ pub const Controller = struct {
 
     pub fn moveBranchSwitchSelection(self: Controller, delta: isize) void {
         const branch_switch = &self.state.branch_switch;
-        if (!branch_switch.hasState() or branch_switch.loading or branch_switch.worktree_pending or branch_switch.branches.len == 0) return;
-        branch_switch.selected_index = wrapIndex(branch_switch.selected_index, branch_switch.branches.len, delta);
+        if (!branch_switch.hasState() or branch_switch.loading or branch_switch.worktree_pending or branch_switch.visibleCount() == 0) return;
+        branch_switch.selected_index = wrapIndex(branch_switch.selected_index, branch_switch.visibleCount(), delta);
+    }
+
+    pub fn editBranchSwitchQuery(self: Controller, allocator: std.mem.Allocator, edit: app_state.BranchSwitchState.QueryEdit) void {
+        self.state.branch_switch.editQuery(allocator, edit) catch {
+            if (self.state.branch_switch.owner) |owner|
+                self.branchStatus(owner.origin.page_id).set("could not update branch filter", .{});
+        };
     }
 
     pub fn prepareBranchSwitchModalRedraw(self: Controller, io: std.Io) void {
@@ -550,7 +557,7 @@ pub const Controller = struct {
         if (branch_switch.branches.len == 0) return status.set("branch switch unavailable: no local branches", .{});
         if (self.lifecycle.view().hasPending()) return status.set("another git action is running", .{});
 
-        const selected = branch_switch.branches[branch_switch.selected_index];
+        const selected = branch_switch.selectedItem() orelse return;
         if (selected.action(branch_switch.current_branch) == .close) {
             status.set("already on branch: {s}", .{branch_switch.current_branch});
             self.clearBranchSwitch(ctx.allocator());

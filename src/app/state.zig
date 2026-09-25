@@ -1,4 +1,6 @@
 const std = @import("std");
+const ui = @import("chasen_ui");
+const app_prompt = @import("prompt.zig");
 const git_branch_status = @import("../git/branch_status.zig");
 const git_push = @import("../git/push.zig");
 const loaded_diff = @import("../loaded_diff.zig");
@@ -247,6 +249,8 @@ pub const BranchSwitchOwner = struct {
 };
 
 pub const BranchSwitchState = struct {
+    pub const QueryEdit = union(enum) { enter, leave, clear, insert: u21, backspace };
+
     owner: ?BranchSwitchOwner = null,
     repo_root: []u8 = &.{},
     current_branch: []u8 = &.{},
@@ -256,9 +260,13 @@ pub const BranchSwitchState = struct {
     worktree_pending: bool = false,
     selected_index: usize = 0,
     branches: []BranchSwitchItem = &.{},
+    query: app_prompt.TextInput = .{},
+    query_mode: bool = false,
+    filter: ui.ListFilter = .{},
     render_now_unix: ?i64 = null,
 
     pub fn deinit(self: *BranchSwitchState, allocator: std.mem.Allocator) void {
+        self.filter.deinit(allocator);
         if (self.repo_root.len > 0) allocator.free(self.repo_root);
         if (self.current_branch.len > 0) allocator.free(self.current_branch);
         if (self.current_oid.len > 0) allocator.free(self.current_oid);
@@ -269,6 +277,53 @@ pub const BranchSwitchState = struct {
 
     pub fn hasState(self: BranchSwitchState) bool {
         return self.repo_root.len > 0;
+    }
+
+    pub fn visibleCount(self: *const BranchSwitchState) usize {
+        return if (self.query.len == 0) self.branches.len else self.filter.source_indexes.len;
+    }
+
+    pub fn sourceIndex(self: *const BranchSwitchState, visible_index: usize) ?usize {
+        // An empty query keeps the original list and its initial selection.
+        const index = if (self.query.len == 0) visible_index else self.filter.sourceIndex(visible_index) orelse return null;
+        return if (index < self.branches.len) index else null;
+    }
+
+    pub fn selectedItem(self: *const BranchSwitchState) ?*const BranchSwitchItem {
+        return &self.branches[self.sourceIndex(self.selected_index) orelse return null];
+    }
+
+    pub fn editQuery(self: *BranchSwitchState, allocator: std.mem.Allocator, edit: QueryEdit) !void {
+        if (!self.hasState() or self.loading or self.worktree_pending) return;
+        var next_query = self.query;
+        switch (edit) {
+            .enter => {
+                self.query_mode = true;
+                return;
+            },
+            .leave => {
+                self.query_mode = false;
+                return;
+            },
+            .clear => next_query = .{},
+            .insert => |codepoint| try next_query.insert(codepoint),
+            .backspace => next_query.backspace(),
+        }
+
+        var next_filter: ui.ListFilter = .{};
+        errdefer next_filter.deinit(allocator);
+        if (next_query.len > 0) {
+            const labels = try allocator.alloc([]const u8, self.branches.len);
+            defer allocator.free(labels);
+            for (self.branches, labels) |branch, *label| label.* = branch.name;
+            try next_filter.apply(allocator, labels, next_query.slice());
+        }
+        // Publish text, visible rows and selection together after allocation succeeds.
+        self.filter.deinit(allocator);
+        self.filter = next_filter;
+        self.query = next_query;
+        self.selected_index = 0;
+        if (edit == .clear) self.query_mode = false;
     }
 };
 

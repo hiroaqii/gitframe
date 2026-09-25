@@ -7,6 +7,7 @@ const app_commit_panel = @import("commit_panel.zig");
 const app_repo_picker = @import("repo_picker.zig");
 const app_actions = @import("actions.zig");
 const branch_commit_time = @import("branch_commit_time.zig");
+const branch_picker = @import("branch_picker.zig");
 const local_time = @import("../local_time.zig");
 const action_lifecycle = @import("workflow/action_lifecycle.zig");
 const app_state = @import("state.zig");
@@ -56,8 +57,6 @@ const repo_picker_list_label_col: u16 = 4;
 const commit_dialog_height: u16 = 22;
 const confirmation_dialog_width: u16 = 72;
 const confirmation_dialog_height: u16 = 9;
-const branch_switch_dialog_width: u16 = 72;
-const branch_switch_dialog_height: u16 = 18;
 
 const StateTone = enum {
     muted,
@@ -1385,72 +1384,75 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
     const state = app.branch_switch;
     if (!state.hasState()) return;
 
-    const opts: ui.Modal.ViewOptions = .{
-        .dialog_width = @min(surface.size().width, branch_switch_dialog_width),
-        .dialog_height = @min(surface.size().height, branch_switch_dialog_height),
-        .title = "Switch branch",
-        .backdrop = false,
-        .border = .rounded,
-        .title_style = app.theme.boldStyle(.accent),
-        .border_style = app.theme.style(.accent),
-    };
-    const frame = ui.Modal.frame(surface, opts) orelse return;
-    fillModalDialog(frame);
-    frame.view();
+    const frame = branch_picker.viewFrame(surface, app.theme, "Switch branch") orelse return;
     var content = frame.contentSurface();
     const size = content.size();
     if (size.height == 0) return;
+    const body_end = size.height -| branch_picker.footer_rows;
 
-    const subtitle = try std.fmt.allocPrint(content.frameAllocator(), "Current: {s}", .{if (state.loading) "loading..." else state.current_branch});
-    try draw.copyClippedTextAt(&content, 0, 0, subtitle, app.theme.style(.muted));
+    const subtitle = try std.fmt.allocPrint(content.frameAllocator(), "Current branch: {s}", .{if (state.loading) "loading..." else state.current_branch});
+    if (body_end > 0) try draw.copyClippedTextAt(&content, 0, 0, subtitle, app.theme.style(.muted));
     if (state.loading) {
-        if (size.height > 3) try draw.copyClippedTextAt(&content, 0, 3, "Loading local branches...", app.theme.style(.prompt));
+        if (body_end > 3) try draw.copyClippedTextAt(&content, 0, 3, "Loading local branches...", app.theme.style(.prompt));
         return;
     }
     if (state.branches.len == 0) {
-        if (size.height > 3) try draw.copyClippedTextAt(&content, 0, 3, "No local branches", app.theme.style(.muted));
+        if (body_end > 3) try draw.copyClippedTextAt(&content, 0, 3, "No local branches", app.theme.style(.muted));
         return;
     }
 
-    const selected = @min(state.selected_index, state.branches.len - 1);
-    const action = state.branches[selected].action(state.current_branch);
-    if (size.height > 2) {
-        var note_style = app.theme.style(.muted);
-        note_style.dim = true;
-        const note = switch (action) {
-            .close => "Current branch; no changes.",
-            .checkout => "Carry uncommitted changes to target; abort if unsafe.",
-            .open_worktree => "Leave uncommitted changes here; open target worktree.",
-        };
-        try draw.copyClippedTextAt(&content, 0, 2, note, note_style);
-    }
-    if (size.height > 3) {
-        if (action == .open_worktree) {
-            try draw.copyClippedTextAt(&content, 0, 3, "Worktree: ", app.theme.style(.muted));
-            try draw.copyTailClippedTextAt(&content, 10, 3, state.branches[selected].worktree_path.?, app.theme.style(.muted));
-        } else {
-            try draw.copyClippedTextAt(&content, 0, 3, "@: open worktree (changes stay here)", app.theme.style(.muted));
-        }
-    }
-    if (size.height >= 4) {
-        const branch = state.branches[selected];
-        const exact = local_time.formatExact(branch.tip_committer_unix);
-        const detail = if (exact) |value|
-            try std.fmt.allocPrint(content.frameAllocator(), "last commit: {s}", .{value.text()})
-        else
-            "last commit: unknown";
-        try draw.copyClippedTextAt(&content, 0, 1, detail, app.theme.style(.muted));
+    if (body_end > 2) {
+        try branch_picker.viewFilter(&content, 2, app.theme, .{
+            .query = state.query.slice(),
+            .query_mode = state.query_mode,
+            .show_cursor = !state.worktree_pending,
+        });
     }
 
-    const footer_rows_needed: u16 = 1;
-    const list_start: u16 = 4;
-    const list_rows: u16 = size.height -| (list_start + footer_rows_needed);
-    const start = listWindowStart(selected, state.branches.len, list_rows);
+    const selected_branch = state.selectedItem();
+    if (selected_branch) |branch| {
+        const action = branch.action(state.current_branch);
+        if (body_end > 3) {
+            var note_style = app.theme.style(.muted);
+            note_style.dim = true;
+            const note = switch (action) {
+                .close => "Current branch; no changes.",
+                .checkout => "Carry uncommitted changes to target; abort if unsafe.",
+                .open_worktree => "Leave uncommitted changes here; open target worktree.",
+            };
+            try draw.copyClippedTextAt(&content, 0, 3, note, note_style);
+        }
+        if (body_end > 4) {
+            if (action == .open_worktree) {
+                try draw.copyClippedTextAt(&content, 0, 4, "Worktree: ", app.theme.style(.muted));
+                try draw.copyTailClippedTextAt(&content, 10, 4, branch.worktree_path.?, app.theme.style(.muted));
+            } else {
+                try draw.copyClippedTextAt(&content, 0, 4, "@: open worktree (changes stay here)", app.theme.style(.muted));
+            }
+        }
+        if (body_end > 5) {
+            const exact = local_time.formatExact(branch.tip_committer_unix);
+            const detail = if (exact) |value|
+                try std.fmt.allocPrint(content.frameAllocator(), "last commit: {s}", .{value.text()})
+            else
+                "last commit: unknown";
+            try draw.copyClippedTextAt(&content, 0, 5, detail, app.theme.style(.muted));
+        }
+    }
+    const list_start: u16 = 7;
+    const list_rows: u16 = body_end -| list_start;
+    const visible_count = state.visibleCount();
+    const selected = state.selected_index;
+    const start = branch_picker.listWindowStart(selected, visible_count, list_rows);
+    if (visible_count == 0 and list_rows > 0) {
+        const message = try std.fmt.allocPrint(content.frameAllocator(), "No branches match \"{s}\"", .{state.query.slice()});
+        try draw.copyClippedTextAt(&content, 0, list_start, message, app.theme.style(.muted));
+    }
     var row: u16 = 0;
-    while (row < list_rows and start + row < state.branches.len) : (row += 1) {
-        const index = start + row;
-        const branch = state.branches[index];
-        const focused = index == selected;
+    while (row < list_rows and start + row < visible_count) : (row += 1) {
+        const visible_index = start + row;
+        const branch = state.branches[state.sourceIndex(visible_index) orelse continue];
+        const focused = visible_index == selected;
         const marker: []const u8 = if (focused) ">" else " ";
         const current: []const u8 = if (branch.current) "*" else if (branch.worktree_path != null) "@" else " ";
         if (size.width > 0) {
@@ -1462,7 +1464,7 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
                 2,
                 list_start + row,
                 current,
-                if (focused) app.theme.boldStyle(.accent) else app.theme.style(.muted),
+                if (branch.current) app.theme.boldStyle(.prompt) else if (focused) app.theme.boldStyle(.accent) else app.theme.style(.muted),
             );
         }
 
@@ -1502,24 +1504,22 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
 
     if (size.height >= 2) {
         const hint_row = size.height - 1;
+        const selection_hint = if (selected_branch) |branch| switch (branch.action(state.current_branch)) {
+            .close => "Enter: close  ",
+            .checkout => "Enter: checkout  ",
+            .open_worktree => "Enter: open worktree  ",
+        } else "";
         const hint = if (state.worktree_pending)
             "Checking worktree...    Esc/q: cancel"
-        else switch (action) {
-            .close => "Enter: close    Esc/q: cancel    j/k: move",
-            .checkout => "Enter: checkout    Esc/q: cancel    j/k: move",
-            .open_worktree => "Enter: open worktree    Esc/q: cancel    j/k: move",
-        };
+        else if (state.query_mode)
+            try std.fmt.allocPrint(content.frameAllocator(), "Type: filter  Up/Down: move  {s}Tab: command  Esc: clear", .{selection_hint})
+        else
+            try std.fmt.allocPrint(content.frameAllocator(), "/: filter  j/k: move  {s}{s}", .{
+                selection_hint,
+                if (state.query.len > 0) "Esc: clear  q: cancel" else "Esc/q: cancel",
+            });
         try draw.copyClippedTextAt(&content, 0, hint_row, hint, app.theme.style(.accent));
     }
-}
-
-fn listWindowStart(selected: usize, len: usize, rows: u16) usize {
-    if (rows == 0 or len == 0) return 0;
-    const visible: usize = @intCast(rows);
-    if (len <= visible) return 0;
-    const half = visible / 2;
-    const max_start = len - visible;
-    return @min(selected -| half, max_start);
 }
 
 fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
@@ -3443,11 +3443,15 @@ test "branch switch popup renders relative times and selected exact commit detai
     const detail_index = std.mem.indexOf(u8, known_snapshot, expected_detail).?;
     const branch_index = std.mem.indexOf(u8, known_snapshot, "feature/recent").?;
     try std.testing.expect(detail_index < branch_index);
+    try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "Current branch: main") != null);
+    try known.expectCellText(14, 8, " ");
+    try known.expectCellText(14, 9, "F");
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "2h ago") != null);
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "3d ago") != null);
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "* main") != null);
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "Carry uncommitted changes to target; abort if unsafe.") != null);
-    try std.testing.expect(known.surface.readCell(26, 11).?.style.dim);
+    try std.testing.expect(known.surface.readCell(14, 10).?.style.dim);
+    try std.testing.expectEqual(app.theme.boldStyle(.prompt), known.surface.readCell(16, 15).?.style);
 
     app.branch_switch.branches[0].worktree_path = try allocator.dupe(u8, "/workspace/linked tree");
     var moving: chasen.testing.TestSurface = undefined;
@@ -3469,6 +3473,44 @@ test "branch switch popup renders relative times and selected exact commit detai
     const unknown_snapshot = try unknown.snapshot(allocator);
     defer allocator.free(unknown_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, unknown_snapshot, "last commit: unknown") != null);
+
+    // Shrinking the dialog must clip details before the footer separator.
+    for ([_]u16{ 6, 7, 8, 9, 10, 11, 12 }) |height| {
+        var short: chasen.testing.TestSurface = undefined;
+        try short.init(80, height);
+        defer short.deinit();
+        try viewBranchSwitchPopup(app.context(), &short.surface);
+        const snapshot = try short.snapshot(allocator);
+        defer allocator.free(snapshot);
+        const footer_offset = std.mem.indexOf(u8, snapshot, "/: filter").?;
+        const footer_row: u16 = @intCast(std.mem.count(u8, snapshot[0..footer_offset], "\n"));
+        for (2..78) |col| try short.expectCellText(@intCast(col), footer_row - 1, " ");
+    }
+
+    try app.branch_switch.editQuery(allocator, .enter);
+    for ("MAIN") |codepoint| try app.branch_switch.editQuery(allocator, .{ .insert = codepoint });
+    var filtered: chasen.testing.TestSurface = undefined;
+    try filtered.init(120, 32);
+    defer filtered.deinit();
+    try viewBranchSwitchPopup(app.context(), &filtered.surface);
+    const filtered_snapshot = try filtered.snapshot(allocator);
+    defer allocator.free(filtered_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_snapshot, "Filter branches: /MAIN") != null);
+    try std.testing.expectEqual(@as(u16, 9), filtered.screen.cursor.row);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_snapshot, "> * main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_snapshot, "feature/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_snapshot, "Enter: close  Tab: command  Esc: clear") != null);
+    try std.testing.expectEqual(app.theme.boldStyle(.prompt), filtered.surface.readCell(16, 14).?.style);
+
+    try app.branch_switch.editQuery(allocator, .{ .insert = 'x' });
+    var unmatched: chasen.testing.TestSurface = undefined;
+    try unmatched.init(120, 32);
+    defer unmatched.deinit();
+    try viewBranchSwitchPopup(app.context(), &unmatched.surface);
+    const unmatched_snapshot = try unmatched.snapshot(allocator);
+    defer allocator.free(unmatched_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, unmatched_snapshot, "No branches match \"MAINx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unmatched_snapshot, "Enter:") == null);
 }
 
 const HelpItem = struct {

@@ -10,6 +10,7 @@ const keymap = @import("keymap");
 const app_message = @import("message.zig");
 const command_line = @import("command_line.zig");
 const key_input = @import("key_input.zig");
+const branch_picker = @import("branch_picker.zig");
 const app_prompt = @import("prompt.zig");
 const page = @import("page.zig");
 const changes_input = @import("pages/changes/input.zig");
@@ -39,6 +40,9 @@ pub const KeyContext = struct {
     push_confirmation_mode: bool = false,
     pull_confirmation_mode: bool = false,
     branch_switch_mode: bool = false,
+    branch_switch_query_mode: bool = false,
+    branch_switch_query_len: usize = 0,
+    branch_switch_pending: bool = false,
     remote_error_mode: bool = false,
     remote_error_interactive: bool = false,
     remote_action_cancelable: bool = false,
@@ -90,10 +94,6 @@ const Action = enum {
     cancel_push,
     confirm_pull,
     cancel_pull,
-    branch_switch_move_previous,
-    branch_switch_move_next,
-    confirm_branch_switch,
-    cancel_branch_switch,
     close_remote_error,
     run_interactive_push,
 };
@@ -179,7 +179,7 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.amend_confirmation_mode) return amendConfirmationKeyToMsg(key);
     if (context.push_confirmation_mode) return pushConfirmationKeyToMsg(key);
     if (context.pull_confirmation_mode) return pullConfirmationKeyToMsg(key);
-    if (context.branch_switch_mode) return branchSwitchKeyToMsg(key);
+    if (context.branch_switch_mode) return branchSwitchKeyToMsg(context, key);
     if (context.remote_error_mode) return remoteErrorKeyToMsg(key, context.remote_error_interactive);
     if (context.commit_panel_mode) return commitPanelKeyToMsg(key);
     if (context.active_page == .history and context.history.loading) {
@@ -365,12 +365,26 @@ fn pullConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
     return null;
 }
 
-fn branchSwitchKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_branch_switch);
-    if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_branch_switch);
-    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.branch_switch_move_previous);
-    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.branch_switch_move_next);
-    return null;
+fn branchSwitchKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
+    if (context.branch_switch_pending) {
+        if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return .cancel_branch_switch;
+        return null;
+    }
+    const action = branch_picker.keyToAction(.{
+        .query_mode = context.branch_switch_query_mode,
+        .query_len = context.branch_switch_query_len,
+    }, key) orelse return null;
+    return switch (action) {
+        .confirm => .confirm_branch_switch,
+        .cancel => .cancel_branch_switch,
+        .previous => .branch_switch_move_previous,
+        .next => .branch_switch_move_next,
+        .enter_query => .branch_switch_enter_query,
+        .leave_query => .branch_switch_leave_query,
+        .clear_query => .branch_switch_clear_query,
+        .insert => |codepoint| .{ .branch_switch_insert = codepoint },
+        .backspace => .branch_switch_backspace,
+    };
 }
 
 fn remoteErrorKeyToMsg(key: chasen.Key, interactive: bool) ?app_message.Msg {
@@ -487,10 +501,6 @@ fn actionToMsg(action: Action) app_message.Msg {
         .cancel_push => app_message.Msg.cancel_push,
         .confirm_pull => app_message.Msg.confirm_pull,
         .cancel_pull => app_message.Msg.cancel_pull,
-        .branch_switch_move_previous => app_message.Msg.branch_switch_move_previous,
-        .branch_switch_move_next => app_message.Msg.branch_switch_move_next,
-        .confirm_branch_switch => app_message.Msg.confirm_branch_switch,
-        .cancel_branch_switch => app_message.Msg.cancel_branch_switch,
         .close_remote_error => app_message.Msg.close_remote_error,
         .run_interactive_push => app_message.Msg.run_interactive_push,
     };
