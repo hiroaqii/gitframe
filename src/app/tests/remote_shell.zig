@@ -1290,7 +1290,7 @@ test "classified pull authentication failures open copyable sanitized details" {
                     "Your account's access to the repository",
                     "The host/key settings in ~/.ssh/config",
                 }) |expected| try std.testing.expect(std.mem.indexOf(u8, details, expected) != null);
-                try std.testing.expect(app_view.remoteErrorMaxScroll(.{ .width = 120, .height = 24 }, details) > 0);
+                try std.testing.expect(app_view.remoteErrorMaxScroll(.{ .width = 120, .height = 24 }, details, .pull) > 0);
             },
             .authentication_required => {
                 try std.testing.expectEqualStrings(
@@ -1379,7 +1379,7 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
     }) |expected| {
         try std.testing.expect(std.mem.indexOf(u8, detail_message, expected) != null);
     }
-    try std.testing.expect(app_view.remoteErrorMaxScroll(.{ .width = 120, .height = 24 }, detail_message) > 0);
+    try std.testing.expect(app_view.remoteErrorMaxScroll(.{ .width = 120, .height = 24 }, detail_message, .push) > 0);
 
     try app.update(.copy_popup, &ctx);
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);

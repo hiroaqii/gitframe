@@ -1768,7 +1768,7 @@ test "remote error overlay wheel redraw changes once skips at edge and reverses"
     app.overlay.openRemoteError(.changes);
 
     var ctx: chasen.Ctx(App.Msg) = .{};
-    const max_scroll = app_view.remoteErrorMaxScroll(layoutSize(&app), app.remote_workflow.remote_error_message);
+    const max_scroll = app_view.remoteErrorMaxScroll(layoutSize(&app), app.remote_workflow.remote_error_message, app.remote_workflow.remote_error_operation);
     try std.testing.expect(max_scroll > 0);
     app.overlay.remote_error_scroll = max_scroll - 1;
     const content = app_shell_layout.contentRect(app.terminal_size);
@@ -1826,7 +1826,7 @@ test "terminal resize clamps remote error scroll" {
     try app.update(.{ .terminal_resized = .{ .width = 100, .height = 12 } }, undefined);
 
     try std.testing.expectEqual(
-        app_view.remoteErrorMaxScroll(layoutSize(&app), app.remote_workflow.remote_error_message),
+        app_view.remoteErrorMaxScroll(layoutSize(&app), app.remote_workflow.remote_error_message, app.remote_workflow.remote_error_operation),
         app.overlay.remote_error_scroll,
     );
 }

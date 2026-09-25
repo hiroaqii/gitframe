@@ -1694,6 +1694,7 @@ pub const App = struct {
             .content_size = self.shellLayout().contentSize(),
             .help_page = self.active_page,
             .remote_error_message = self.remoteWorkflowView().remoteErrorMessage(),
+            .remote_error_operation = self.remoteWorkflowView().remoteErrorOperation(),
         };
     }
 

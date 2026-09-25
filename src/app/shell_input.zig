@@ -436,6 +436,7 @@ pub const OverlayScrollController = struct {
     content_size: chasen.Size,
     help_page: page.Id,
     remote_error_message: ?[]const u8,
+    remote_error_operation: ?app_state.GitErrorOperation = null,
 
     pub fn scrollHelp(self: OverlayScrollController, delta: isize) bool {
         const previous = self.overlay.help_scroll;
@@ -467,6 +468,7 @@ pub const OverlayScrollController = struct {
         const rows = @max(@as(usize, app_view.remoteErrorVisibleRows(
             self.content_size,
             self.remote_error_message,
+            self.remote_error_operation,
         )), 1);
         _ = self.scrollRemoteError(pageDelta(rows, pages));
     }
@@ -474,7 +476,7 @@ pub const OverlayScrollController = struct {
     pub fn clampRemoteError(self: OverlayScrollController) void {
         self.overlay.remote_error_scroll = @min(
             self.overlay.remote_error_scroll,
-            app_view.remoteErrorMaxScroll(self.content_size, self.remote_error_message),
+            app_view.remoteErrorMaxScroll(self.content_size, self.remote_error_message, self.remote_error_operation),
         );
     }
 };

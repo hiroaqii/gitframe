@@ -1677,8 +1677,8 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
 
 fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
     const operation = app.remote_error_operation orelse return;
-    const message = app.remote_error_message orelse return;
-    const opts = remoteErrorModalOptions(surface.size(), message);
+    const message = std.mem.trimEnd(u8, app.remote_error_message orelse return, "\r\n");
+    const opts = remoteErrorModalOptions(surface.size(), message, operation);
 
     const opts_with_title: ui.Modal.ViewOptions = .{
         .dialog_width = opts.dialog_width,
@@ -1714,19 +1714,32 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
         try draw.copyClippedTextAt(&content, 0, 0, heading, app.theme.boldStyle(.danger));
     }
 
-    if (size.height > 4) {
+    const reserved_rows: u16 = if (operation == .switch_branch) 6 else 4;
+    var drawn_rows: u16 = 0;
+    if (size.height > reserved_rows) {
         var body = content.child(.{
             .col = 0,
             .row = 2,
             .width = size.width,
-            .height = size.height - 4,
+            .height = size.height - reserved_rows,
         });
-        _ = drawWrappedTextScrolled(&body, message, app.overlay.remote_error_scroll, .{});
+        drawn_rows = @intCast(drawWrappedTextScrolled(&body, message, app.overlay.remote_error_scroll, .{}));
+    }
+
+    var footer_row = size.height -| 1;
+    if (operation == .switch_branch and size.height > reserved_rows) {
+        var key_buffer: [64]u8 = undefined;
+        if (app.keymap.display(.create_stash, &key_buffer)) |key| {
+            const hint = try std.fmt.allocPrint(content.frameAllocator(), "If local changes block switching: close, then use {s}: stash on Changes.", .{key});
+            const hint_row = 2 + drawn_rows + 1;
+            try draw.copyClippedTextAt(&content, 0, hint_row, hint, app.theme.style(.accent));
+            footer_row = hint_row + 2;
+        }
     }
 
     if (size.height > 0) {
         const footer = remoteErrorFooter(operation, app.push_retry_inspecting, app.push_retry_target != null);
-        try draw.copyClippedTextAt(&content, 0, size.height - 1, footer, app.theme.style(.danger));
+        try draw.copyClippedTextAt(&content, 0, footer_row, footer, app.theme.style(.danger));
     }
 }
 
@@ -1737,43 +1750,43 @@ fn remoteErrorFooter(operation: app_state.GitErrorOperation, inspecting: bool, r
     return "y: copy  Enter/Esc/q: close";
 }
 
-fn remoteErrorModalOptions(size: chasen.Size, message: []const u8) struct { dialog_width: u16, dialog_height: u16 } {
+fn remoteErrorModalOptions(size: chasen.Size, message: []const u8, operation: ?app_state.GitErrorOperation) struct { dialog_width: u16, dialog_height: u16 } {
     const dialog_width = @min(size.width, remote_error_dialog_max_width);
     const content_width = if (dialog_width > 4) dialog_width - 4 else 0;
-    const paragraph = ui.Paragraph.init(.{ .text = message });
+    const paragraph = ui.Paragraph.init(.{ .text = std.mem.trimEnd(u8, message, "\r\n") });
     const body_rows = paragraph.lineCount(content_width);
-    // Content rows outside the wrapped body: title, body gap, footer gap, footer.
-    const desired_content_height = body_rows + 4;
-    const desired_height = modalHeightForContent(size, dialog_width, desired_content_height);
+    // Heading + gap, body, gap, optional stash hint + gap, footer.
+    const desired_content_height = body_rows + @as(usize, if (operation == .switch_branch) 6 else 4);
+    const desired_height = modalHeightForContent(size, dialog_width, desired_content_height, if (operation == .switch_branch) 0 else remote_error_dialog_min_height);
     return .{
         .dialog_width = dialog_width,
         .dialog_height = @min(size.height, desired_height),
     };
 }
 
-pub fn remoteErrorVisibleRows(size: chasen.Size, message: ?[]const u8) u16 {
-    const content_size = remoteErrorContentSize(size, message orelse "");
-    if (content_size.height <= 4) return 0;
-    return content_size.height - 4;
+pub fn remoteErrorVisibleRows(size: chasen.Size, message: ?[]const u8, operation: ?app_state.GitErrorOperation) u16 {
+    const content_size = remoteErrorContentSize(size, message orelse "", operation);
+    const reserved_rows: u16 = if (operation == .switch_branch) 6 else 4;
+    return content_size.height -| reserved_rows;
 }
 
-pub fn remoteErrorMaxScroll(size: chasen.Size, message: ?[]const u8) usize {
-    const text = message orelse "";
-    const content_size = remoteErrorContentSize(size, text);
+pub fn remoteErrorMaxScroll(size: chasen.Size, message: ?[]const u8, operation: ?app_state.GitErrorOperation) usize {
+    const text = std.mem.trimEnd(u8, message orelse "", "\r\n");
+    const content_size = remoteErrorContentSize(size, text, operation);
     if (content_size.width == 0) return 0;
-    return paragraphMaxScroll(text, content_size.width, remoteErrorVisibleRows(size, message));
+    return paragraphMaxScroll(text, content_size.width, remoteErrorVisibleRows(size, message, operation));
 }
 
-fn remoteErrorContentSize(size: chasen.Size, message: []const u8) chasen.Size {
-    const opts = remoteErrorModalOptions(size, message);
+fn remoteErrorContentSize(size: chasen.Size, message: []const u8, operation: ?app_state.GitErrorOperation) chasen.Size {
+    const opts = remoteErrorModalOptions(size, message, operation);
     return modalContentSizeForRect(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, .{
         .dialog_width = opts.dialog_width,
         .dialog_height = opts.dialog_height,
     });
 }
 
-fn modalHeightForContent(size: chasen.Size, dialog_width: u16, desired_content_height: usize) u16 {
-    var candidate: u16 = @min(size.height, remote_error_dialog_min_height);
+fn modalHeightForContent(size: chasen.Size, dialog_width: u16, desired_content_height: usize, min_height: u16) u16 {
+    var candidate: u16 = @min(size.height, min_height);
     const overlay: chasen.Rect = .{ .col = 0, .row = 0, .width = size.width, .height = size.height };
     while (candidate < size.height) : (candidate += 1) {
         const content_size = modalContentSizeForRect(overlay, .{
@@ -3450,7 +3463,7 @@ test "remote error footer advertises copy and limits interactive action to push 
         retry_available: bool,
         expected: []const u8,
     };
-    const content_width = remoteErrorContentSize(.{ .width = 120, .height = 24 }, "failure").width;
+    const content_width = remoteErrorContentSize(.{ .width = 120, .height = 24 }, "failure", null).width;
 
     for ([_]Case{
         .{ .operation = .push, .inspecting = true, .retry_available = true, .expected = "checking push target...  y: copy  Enter/Esc/q: cancel" },
@@ -3473,7 +3486,7 @@ test "branch switch error renders title footer and scrolled tail at 120x32" {
     var context = app.context();
     context.remote_error_operation = .switch_branch;
     context.remote_error_message = message;
-    app.overlay.remote_error_scroll = remoteErrorMaxScroll(.{ .width = 120, .height = 32 }, message);
+    app.overlay.remote_error_scroll = remoteErrorMaxScroll(.{ .width = 120, .height = 32 }, message, .switch_branch);
     try std.testing.expect(app.overlay.remote_error_scroll > 0);
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(120, 32);
@@ -3490,7 +3503,7 @@ test "branch switch error renders title footer and scrolled tail at 120x32" {
 test "remote error modal height grows past 31 rows" {
     try std.testing.expectEqual(
         @as(u16, 44),
-        modalHeightForContent(.{ .width = 33, .height = 46 }, 33, 40),
+        modalHeightForContent(.{ .width = 33, .height = 46 }, 33, 40, remote_error_dialog_min_height),
     );
 }
 
