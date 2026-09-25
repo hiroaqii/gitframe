@@ -19,6 +19,7 @@ pub const PublicAction = enum {
     pull,
     fetch,
     branch_switch,
+    create_stash,
     discard,
     toggle_display_mode,
     toggle_line_numbers,
@@ -264,6 +265,7 @@ fn defaultSpec(action: PublicAction) ?KeySpec {
         .pull => shiftedAscii('u', 'U'),
         .fetch => null,
         .branch_switch => .{ .plain_codepoint = 'b' },
+        .create_stash => .{ .plain_codepoint = 's' },
         .discard => shiftedAscii('d', 'D'),
         .toggle_display_mode => .{ .plain_codepoint = 'u' },
         .toggle_line_numbers => shiftedAscii('l', 'L'),
@@ -311,7 +313,6 @@ fn isReserved(spec: KeySpec) bool {
         .{ .plain_codepoint = 'n' },
         .{ .plain_codepoint = 'p' },
         .{ .plain_codepoint = 'q' },
-        .{ .plain_codepoint = 's' },
         .{ .plain_codepoint = 'a' },
         shiftedAscii('j', 'J'),
         shiftedAscii('k', 'K'),
@@ -509,7 +510,7 @@ test "copy actions use y and shifted Y by default" {
 
 test "validateConfig rejects reserved and duplicate effective bindings" {
     var reserved: Config = .{};
-    reserved.set(.commit, .{ .plain_codepoint = 's' });
+    reserved.set(.commit, .{ .plain_codepoint = 'q' });
     try std.testing.expect(!validateConfig(reserved));
 
     var duplicate: Config = .{};

@@ -34,6 +34,8 @@ pub fn pasteToMsg(context: Context, text: []const u8) ?Msg {
 
 pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (context.base_picker_open) return basePickerKeyToMsg(context, key);
+    if (!context.common.search_mode and !context.common.file_search_mode and
+        context.common.keymap.actionForKey(key) == .create_stash) return null;
     if (committed_diff_input.keyToMsg(context.common, key)) |msg| return .{ .common = msg };
     if (!key_input.hasCommandModifier(key) and key.codepoint == 'm') return .open_base_picker;
     return null;

@@ -120,6 +120,8 @@ pub const Context = struct {
     push_retry_inspecting: bool,
     branch_switch: *const app_state.BranchSwitchState,
     staged_summary: app_commit_panel.StagedSummary,
+    create_stash: ?*const @import("stash.zig").Create = null,
+    stash_target: ?@import("pages/changes/operations.zig").StashTarget = null,
 };
 
 pub fn view(app: Context, surface: *chasen.Surface) !void {
@@ -192,6 +194,9 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     }
     if (app.overlay.isRemoteError() and app.overlay.visibleOn(app.active_page)) {
         try viewRemoteError(app, surface);
+    }
+    if (app.overlay.isCreateStash() and app.overlay.visibleOn(app.active_page)) {
+        try viewCreateStash(app, surface);
     }
     if (app.active_page == .compare and app.compare.page.base_picker.open) {
         try compare_view.viewBasePicker(app.compare, surface);
@@ -917,6 +922,7 @@ fn pendingActionFallbackLabel(kind: app_actions.ActionKind) []const u8 {
         .pull => "pull",
         .fetch => "fetch",
         .switch_branch => "switch",
+        .create_stash => "stash",
     };
 }
 
@@ -1314,6 +1320,64 @@ fn viewAmendConfirmation(app: Context, surface: *chasen.Surface) !void {
     }
 }
 
+fn viewCreateStash(app: Context, surface: *chasen.Surface) !void {
+    const dialog = app.create_stash orelse return;
+    const frame = ui.Modal.frame(surface, .{
+        .dialog_width = 84,
+        .dialog_height = 17,
+        .padding = .{ .left = 2, .right = 2, .top = 1, .bottom = 1 },
+        .title = "Create stash",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = app.theme.boldStyle(.accent),
+        .border_style = app.theme.style(.accent),
+    }) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
+    const size = content.size();
+    var branch_buffer: [96]u8 = undefined;
+    const branch = try std.fmt.allocPrint(content.frameAllocator(), "Branch: {s}", .{dialog.snapshot.branchLabel(&branch_buffer)});
+    try draw.copyClippedTextAt(&content, 0, 0, branch, app.theme.boldStyle(.accent));
+    const target = app.stash_target;
+    const target_matches = if (target) |value| dialog.snapshot.matchesTarget(value.branch, value.oid) else false;
+    const has_staged = target_matches and target.?.has_staged;
+    _ = content.borrowTextAt(0, 2, if (dialog.focus == .scope) "> Scope" else "  Scope", app.theme.boldStyle(.prompt));
+    const all_radio = ui.Radio.init(.{ .selected = dialog.scope == .all, .label = "All changes" });
+    var all_surface = content.child(.{ .col = 2, .row = 3, .width = size.width -| 2, .height = 1 });
+    all_radio.view(&all_surface, .{
+        .style = app.theme.style(.accent),
+        .selected_style = app.theme.style(.accent),
+        .label_style = app.theme.style(.accent),
+        .show_cursor = false,
+    });
+    _ = content.borrowTextAt(6, 4, "Tracked + untracked; ignored files stay", app.theme.style(.muted));
+    const staged_radio = ui.Radio.init(.{
+        .selected = has_staged and dialog.scope == .staged,
+        .label = if (has_staged) "Staged changes only" else "Staged changes only (unavailable)",
+    });
+    var staged_surface = content.child(.{ .col = 2, .row = 5, .width = size.width -| 2, .height = 1 });
+    const staged_style = app.theme.style(if (has_staged) .accent else .muted);
+    staged_radio.view(&staged_surface, .{
+        .style = staged_style,
+        .selected_style = staged_style,
+        .label_style = staged_style,
+        .show_cursor = false,
+    });
+    _ = content.borrowTextAt(6, 6, "Only staged changes; unstaged + untracked stay", app.theme.style(.muted));
+    if (size.height > 8) {
+        var field_surface = content.child(.{ .col = 0, .row = 8, .width = size.width, .height = @min(2, size.height - 8) });
+        const field = ui.FormField.init(.{ .label = if (dialog.focus == .message) "> Message (optional)" else "  Message (optional)" });
+        const opts: ui.FormField.ViewOptions = .{ .label_style = app.theme.boldStyle(.prompt) };
+        field.view(&field_surface, opts);
+        var input_surface = field_surface.child(field.contentRect(&field_surface, opts));
+        dialog.message.view(&input_surface, .{ .style = app.theme.style(.accent), .placeholder_style = app.theme.style(.muted), .show_cursor = dialog.focus == .message });
+    }
+    const available = target_matches and (if (dialog.scope == .all) target.?.has_all else has_staged);
+    _ = content.borrowTextAt(0, 11, if (!target_matches) "Target changed or unavailable; cancel and reload" else if (!available) "No changes in selected scope" else "Saved changes are not restored automatically", app.theme.style(if (available) .muted else .danger));
+    _ = content.borrowTextAt(0, 12, if (available) "Enter: create   Tab: field   \xe2\x86\x91/\xe2\x86\x93: scope   Esc: cancel" else "Tab: field   \xe2\x86\x91/\xe2\x86\x93: scope   Esc: cancel", app.theme.style(.accent));
+}
+
 fn viewPushConfirmation(app: Context, surface: *chasen.Surface) !void {
     const confirmation = app.push_confirmation orelse return;
     const opts: ui.Modal.ViewOptions = .{
@@ -1534,6 +1598,7 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
             .push => "Push failed",
             .pull => "Pull failed",
             .switch_branch => "Branch switch failed",
+            .create_stash => "Stash creation failed",
         },
         .backdrop = false,
         .border = .rounded,
@@ -1551,6 +1616,7 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
             .push => "Git push failed. Details:",
             .pull => "Git pull failed. Details:",
             .switch_branch => "Git branch switch failed. Details:",
+            .create_stash => "Git stash failed. Details:",
         };
         try draw.copyClippedTextAt(&content, 0, 0, heading, app.theme.boldStyle(.danger));
     }
@@ -1792,6 +1858,7 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             const footer = app.changes.footer();
             if (!footer.normal_action_hints_enabled) return result;
 
+            appendFooterAction(app, &result, key_buffers, .create_stash, "stash", .primary);
             appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
@@ -2486,6 +2553,7 @@ test "footer normal-mode hints match the decided page lists" {
     var context = harness.context();
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("s", "stash"),
         ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2653,6 +2721,7 @@ test "footer normal-mode hints follow state and local key ownership" {
     harness.changes.viewer.sidebar_hidden = true;
     var hints = footerHints(harness.context(), &key_buffers);
     try expectFooterHintItems(&hints, &.{
+        ui.key_hint.item("s", "stash"),
         ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -3547,6 +3616,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
     .{ .key = .{ .action = .commit }, .description = "open commit panel" },
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
+    .{ .key = .{ .action = .create_stash }, .description = "create stash (all / staged changes)" },
     .{ .key = .{ .action = .push }, .description = "push current branch" },
     .{ .key = .{ .action = .pull }, .description = "pull current branch" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },

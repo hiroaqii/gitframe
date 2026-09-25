@@ -74,7 +74,7 @@ pub fn keyToMsg(context: Context, key: chasen.Key) ?Msg {
     if (context.diff_view) {
         if (!context.common.search_mode and !context.common.file_search_mode) {
             if (context.common.keymap.actionForKey(key)) |action| switch (action) {
-                .mark_reviewed, .hide_reviewed => return .owned_noop,
+                .mark_reviewed, .hide_reviewed, .create_stash => return .owned_noop,
                 else => {},
             };
         }

@@ -11,6 +11,8 @@ const process_runner = @import("../process/runner.zig");
 const root_capability = @import("../repo/root_capability.zig");
 const context_export = @import("../context_export.zig");
 const remote_request = @import("remote_request.zig");
+const app_stash = @import("stash.zig");
+const git_stash = @import("../git/stash.zig");
 
 /// Git operation categories that can become App-facing actions.
 ///
@@ -29,6 +31,7 @@ pub const ActionKind = enum {
     pull,
     fetch,
     switch_branch,
+    create_stash,
 
     /// Whether an already-running background read must be discarded while
     /// this action is pending. Keep this exhaustive: adding an action must
@@ -48,6 +51,7 @@ pub const ActionKind = enum {
             .pull,
             .fetch,
             .switch_branch,
+            .create_stash,
             => true,
         };
     }
@@ -57,6 +61,56 @@ pub const PendingAction = struct {
     generation: u64,
     kind: ActionKind,
 };
+
+pub const CreateStashFinished = struct {
+    pending: PendingAction,
+    snapshot: app_stash.Snapshot,
+    scope: git_stash.Scope,
+    result: git_stash.CreateResult,
+
+    pub fn deinit(self: *CreateStashFinished, allocator: std.mem.Allocator) void {
+        self.snapshot.deinit(allocator);
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn CreateStashTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        snapshot: app_stash.Snapshot,
+        scope: git_stash.Scope,
+        message: []u8,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const result = git_stash.create(allocator, io, .{ .cwd = task.root.dir(), .environment = &task.environment }, .{
+                .branch = task.snapshot.branch,
+                .oid = task.snapshot.oid,
+                .scope = task.scope,
+                .message = task.message,
+            }) catch |err| git_stash.CreateResult{ .operation = .{ .failed_static = @errorName(err) } };
+            return task.finish(allocator, result);
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .operation = .{ .failed_static = taskFailureMessage(failure) } });
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_stash.CreateResult) Msg {
+            defer {
+                allocator.free(task.message);
+                task.environment.deinit();
+                task.root.deinit();
+                allocator.destroy(task);
+            }
+            return Msg.actionFinished(.{ .create_stash = .{ .pending = task.pending, .snapshot = task.snapshot, .scope = task.scope, .result = result } });
+        }
+    };
+}
 
 test "ActionKind background acceptance policy distinguishes reads from mutations" {
     try std.testing.expect(!ActionKind.assist_commit_message.blocksBackgroundAcceptance());

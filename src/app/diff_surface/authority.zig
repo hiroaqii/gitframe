@@ -50,6 +50,7 @@ pub const Action = enum {
     push,
     pull,
     fetch,
+    create_stash,
 
     pub fn requirements(self: Action) Requirements {
         return switch (self) {
@@ -57,7 +58,7 @@ pub const Action = enum {
             .stage_hunk, .unstage_hunk => .{ .source = .fresh, .status = .fresh },
             .stage_file, .unstage_file, .discard_file, .commit => .{ .source = .fresh, .status = .fresh },
             .push, .fetch => .{ .branch = .fresh },
-            .pull => .{ .status = .fresh, .branch = .fresh },
+            .pull, .create_stash => .{ .status = .fresh, .branch = .fresh },
         };
     }
 };

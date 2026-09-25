@@ -164,6 +164,7 @@ pub const AcceptedActionOutcome = union(enum) {
     },
     commit: struct { repo_root: []const u8 },
     switch_branch: struct { repo_root: []const u8 },
+    create_stash: struct { repo_root: []const u8 },
 };
 
 pub const OutcomeApply = struct {
@@ -183,6 +184,14 @@ pub const CommitSummary = union(enum) {
     unavailable,
     loading_or_stale,
     ready: struct { count: usize },
+};
+
+pub const StashTarget = struct {
+    repo_root: []const u8,
+    branch: ?[]const u8,
+    oid: []const u8,
+    has_all: bool,
+    has_staged: bool,
 };
 
 pub const View = struct {
@@ -332,6 +341,31 @@ pub const View = struct {
             if (entry.isStaged()) count += 1;
         }
         return .{ .ready = .{ .count = count } };
+    }
+
+    pub fn stashTarget(self: View, allow_refreshing: bool) ?StashTarget {
+        if (!diff_source.sourceAllowsStageProjection(self.source)) return null;
+        const active = self.activation();
+        if (!active.satisfiesAction(.create_stash)) {
+            if (!allow_refreshing) return null;
+            const members = active.members() orelse return null;
+            // An open dialog keeps its last-good inputs during ordinary reloads.
+            // The worker revalidates the branch and scope before any mutation.
+            if (members.status != .fresh and members.status != .pending) return null;
+            if (members.branch != .fresh and members.branch != .pending) return null;
+        }
+        const root = self.repo_root orelse return null;
+        if (!std.mem.eql(u8, root, self.page.git_status.repo_root orelse return null)) return null;
+        if (!std.mem.eql(u8, root, self.page.branch_status.repo_root orelse return null)) return null;
+        const branch = self.page.branch_status.status;
+        if (branch.head == .unknown) return null;
+        return .{
+            .repo_root = root,
+            .branch = branch.branchName(),
+            .oid = branch.oid orelse return null,
+            .has_all = @import("../../../git/stash.zig").hasChanges(self.page.git_status.document, .all),
+            .has_staged = @import("../../../git/stash.zig").hasChanges(self.page.git_status.document, .staged),
+        };
     }
 
     pub fn ownDiscardProposal(_: View, allocator: std.mem.Allocator, target: git_ops.DiscardTarget) !OwnedOperationProposal {
@@ -694,6 +728,11 @@ pub const Controller = struct {
         active_repo_matches: bool,
     ) OutcomeApply {
         return switch (outcome) {
+            .create_stash => |value| blk: {
+                self.page.staged_hunks.clearRepo(allocator, value.repo_root);
+                if (active_repo_matches) self.navigation.clearActionCursor(allocator);
+                break :blk .{ .reload = if (active_repo_matches) .source_and_aux else .none };
+            },
             .stage_file => blk: {
                 if (!active_repo_matches) break :blk .{};
                 break :blk .{ .reload = .source_and_aux };

@@ -42,6 +42,7 @@ const app_view = @import("app/view.zig");
 const action_lifecycle = @import("app/workflow/action_lifecycle.zig");
 const workflow_local = @import("app/workflow/local.zig");
 const workflow_remote = @import("app/workflow/remote.zig");
+const workflow_stash = @import("app/workflow/stash.zig");
 const shell_effects = @import("app/shell_effects.zig");
 const context = @import("context.zig");
 const config_mod = @import("config.zig");
@@ -130,6 +131,7 @@ pub const App = struct {
     status: app_state.StatusMessage = .{},
     local_workflow: workflow_local.LocalState = .{},
     remote_workflow: workflow_remote.State = .{},
+    stash_workflow: workflow_stash.State = .{},
     overlay: app_state.OverlayState = .{},
     shell_effects_state: shell_effects.State = .{},
     drag_auto_scroll: drag_auto_scroll.State = .{},
@@ -166,6 +168,7 @@ pub const App = struct {
         self.repo_session.deinit(deinit_ctx.allocator);
         self.local_workflow.deinit(deinit_ctx.allocator);
         self.remote_workflow.deinit(deinit_ctx.allocator);
+        self.stash_workflow.deinit(deinit_ctx.allocator);
         self.shell_effects_state.deinit(deinit_ctx.allocator);
     }
 
@@ -185,7 +188,7 @@ pub const App = struct {
             .source = self.config.source,
             .home = home,
             .env_map = self.env_map,
-            .action_pending = self.actionLifecycleView().hasPending(),
+            .action_pending = self.actionLifecycleView().hasPending() or self.overlay.isCreateStash(),
             .changes = self.changesRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
             .history = .{ .page = &self.pages.history },
@@ -244,7 +247,7 @@ pub const App = struct {
                 .help = self.overlay.isHelp(),
                 .commit_input = self.localWorkflowView().commitPanelOpen(),
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
-                    self.overlay.isPushBranch() or self.overlay.isPullBranch(),
+                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isCreateStash(),
                 .branch_switch = self.overlay.isSwitchBranch(),
                 .remote_error = self.overlay.isRemoteError(),
                 .git_action = self.actionLifecycleView().hasPending(),
@@ -379,6 +382,23 @@ pub const App = struct {
             .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
             .user_config = &self.user_config,
+            .status = &self.pages.changes.status,
+            .overlay = &self.overlay,
+        };
+    }
+
+    fn stashWorkflow(self: *App) workflow_stash.Controller {
+        return .{
+            .state = &self.stash_workflow,
+            .lifecycle = self.actionLifecycle(),
+            .operations = self.changesOperationController(),
+            .repo = self.repoSessionView(),
+            .current_changes_root = self.currentChangesActionRoot(),
+            .may_open = self.active_page == .changes and
+                !self.localWorkflowView().commitPanelOpen() and !self.repoSessionView().picker().model.mode and
+                !self.pages.changes.search.mode and !self.pages.changes.file_search.mode and
+                self.pages.changes.selection_owner == .none,
+            .env_map = self.env_map,
             .status = &self.pages.changes.status,
             .overlay = &self.overlay,
         };
@@ -631,6 +651,7 @@ pub const App = struct {
             .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
             .history => |history_msg| _ = try self.updateHistory(ctx, history_msg),
             .command_line => |command_msg| self.updateCommandLine(command_msg),
+            .stash => |stash_msg| try self.stashWorkflow().update(ctx, stash_msg),
             .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
             .mouse_selection_release => |continuation| try self.updateMouseSelectionRelease(ctx, continuation),
             .drag_auto_scroll_tick => |generation| try self.updateDragAutoScrollTick(ctx, generation),
@@ -1161,6 +1182,17 @@ pub const App = struct {
             .pull => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPull(ctx.allocator(), result)),
             .fetch => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishFetch(ctx.allocator(), result)),
             .switch_branch => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishSwitchBranch(ctx.allocator(), result)),
+            .create_stash => |value| {
+                var result = value;
+                defer result.deinit(ctx.allocator());
+                if (self.stashWorkflow().finish(ctx.allocator(), &result)) |outcome| {
+                    if (outcome.error_message) |detail| {
+                        defer ctx.allocator().free(detail);
+                        self.remoteWorkflow().setRemoteErrorWithRetry(ctx.allocator(), .create_stash, detail, null, .changes) catch {};
+                    }
+                    try self.applyLocalActionIntent(ctx, outcome.intent);
+                }
+            },
             .push_foreground => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPushForeground(ctx, result)),
         }
     }
@@ -1448,6 +1480,8 @@ pub const App = struct {
             .push_retry_target = remote.pushRetryTarget(),
             .push_retry_inspecting = remote.pushRetryInspecting(),
             .branch_switch = remote.branchSwitch(),
+            .create_stash = self.stash_workflow.dialog(),
+            .stash_target = self.changesOperations().stashTarget(true),
             .staged_summary = switch (self.changesOperations().commitSummary()) {
                 .unavailable => .unavailable,
                 .loading_or_stale => .loading_or_stale,
@@ -1594,6 +1628,7 @@ pub const App = struct {
                 .sidebar_hidden = self.pages.history.diff.viewer.sidebar_hidden,
                 .sidebar_width = self.pages.history.diff.viewer.sidebar_width,
             },
+            .create_stash = self.stash_workflow.dialog(),
             .commit_panel_mode = self.localWorkflowView().commitPanelOpen(),
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
@@ -1799,6 +1834,7 @@ pub const App = struct {
                     .push => "push error",
                     .pull => "pull error",
                     .switch_branch => "branch switch error",
+                    .create_stash => "stash creation error",
                 },
                 .text = message,
             };

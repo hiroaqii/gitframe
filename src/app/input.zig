@@ -31,6 +31,7 @@ pub const KeyContext = struct {
     compare: CompareContext = .{},
     repository: repository_input.Context = .{},
     history: HistoryContext = .{},
+    create_stash: ?*const @import("stash.zig").Create = null,
     commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode = .list,
@@ -111,6 +112,7 @@ pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
 }
 
 fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
+    if (context.create_stash != null) return .{ .stash = .{ .paste = text } };
     if (context.command_line_active) return .{ .command_line = if (text.len > 0 and std.unicode.utf8ValidateSlice(text))
         .{ .paste = text }
     else
@@ -149,6 +151,16 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 }
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
+    if (context.create_stash) |dialog| {
+        if (key.matches(chasen.Key.escape, .{})) return .{ .stash = .cancel };
+        if (key.matches(chasen.Key.enter, .{})) return .{ .stash = .confirm };
+        if (key.matches(chasen.Key.tab, .{})) return .{ .stash = .tab };
+        if (dialog.focus == .scope) {
+            if (key.matches(chasen.Key.up, .{})) return .{ .stash = .scope_previous };
+            if (key.matches(chasen.Key.down, .{})) return .{ .stash = .scope_next };
+        } else if (dialog.message.handleEvent(.{ .key_press = key })) |msg| return .{ .stash = .{ .text = msg } };
+        return null;
+    }
     if (context.command_line_active) return .{ .command_line = commandLineKeyToMsg(key) };
     if (context.remote_action_cancelable and key.matches(chasen.Key.escape, .{}))
         return app_message.Msg.cancel_remote_action;
@@ -195,6 +207,12 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.keymap.spec(.repo_picker)) |spec| if (spec.matches(routing_key)) return app_message.Msg.enter_repo_picker;
     if (context.keymap.spec(.reload)) |spec| if (spec.matches(routing_key)) return app_message.Msg.reload;
 
+    if (context.active_page == .changes) {
+        if (context.keymap.spec(.create_stash)) |spec| if (spec.matches(routing_key)) {
+            if (context.changes.selection_owner != .none or context.active_selection_gesture) return null;
+            return .{ .stash = .open };
+        };
+    }
     if (context.active_page != .config) {
         if (context.keymap.spec(.branch_switch)) |spec| if (spec.matches(routing_key)) {
             const selection_owned = switch (context.active_page) {

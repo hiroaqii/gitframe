@@ -1177,7 +1177,7 @@ pub const Controller = struct {
         self.setStatus("running interactive push: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch });
     }
 
-    fn setRemoteErrorWithRetry(
+    pub fn setRemoteErrorWithRetry(
         self: Controller,
         allocator: std.mem.Allocator,
         operation: app_state.GitErrorOperation,

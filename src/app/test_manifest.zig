@@ -20,6 +20,7 @@ pub fn include() void {
     _ = @import("tests/page_transition.zig");
     _ = @import("tests/canonical_publication.zig");
     _ = @import("tests/local_workflow.zig");
+    _ = @import("tests/stash.zig");
     _ = @import("tests/remote_shell.zig");
     _ = @import("tests/root_shell.zig");
     _ = @import("tests/root_view.zig");

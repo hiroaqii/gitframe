@@ -249,24 +249,31 @@ fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, context: git_com
     return operationResultFromGitCommand(allocator, result, "git switch");
 }
 
-fn verifyCurrentBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, branch: []const u8, oid: []const u8) git_command.Error!bool {
+fn verifyCurrentBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, branch: ?[]const u8, oid: []const u8) git_command.Error!bool {
+    const current = try readCurrentBranchOid(allocator, io, context, branch) orelse return false;
+    defer allocator.free(current);
+    return std.mem.eql(u8, current, oid);
+}
+
+/// Returns an owned live HEAD only while the requested branch is current.
+pub fn readCurrentBranchOid(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, branch: ?[]const u8) git_command.Error!?[]u8 {
     const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
     const branch_result = try runCaptured(allocator, io, context, &branch_argv, .limited(4 * 1024), .limited(16 * 1024));
     defer branch_result.deinit(allocator);
     switch (branch_result.term) {
-        .exited => |code| if (code != 0) return false,
-        else => return false,
+        .exited => |code| if (code != (if (branch != null) @as(u8, 0) else @as(u8, 1))) return null,
+        else => return null,
     }
-    if (!std.mem.eql(u8, trimLineEnd(branch_result.stdout), branch)) return false;
+    if (branch) |name| if (!std.mem.eql(u8, trimLineEnd(branch_result.stdout), name)) return null;
 
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
     const oid_result = try runCaptured(allocator, io, context, &oid_argv, .limited(4 * 1024), .limited(16 * 1024));
     defer oid_result.deinit(allocator);
     switch (oid_result.term) {
-        .exited => |code| if (code != 0) return false,
-        else => return false,
+        .exited => |code| if (code != 0) return null,
+        else => return null,
     }
-    return std.mem.eql(u8, trimLineEnd(oid_result.stdout), oid);
+    return try allocator.dupe(u8, trimLineEnd(oid_result.stdout));
 }
 
 fn verifyBranchOid(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, branch: []const u8, oid: []const u8) git_command.Error!bool {

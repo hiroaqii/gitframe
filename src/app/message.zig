@@ -32,6 +32,7 @@ pub const ActionFinished = union(enum) {
     pull: actions.PullFinished,
     fetch: actions.FetchFinished,
     switch_branch: actions.SwitchBranchFinished,
+    create_stash: actions.CreateStashFinished,
     push_foreground: chasen.ForegroundCommandResult,
 
     pub fn deinit(self: *ActionFinished, allocator: std.mem.Allocator) void {
@@ -86,6 +87,7 @@ pub const Msg = union(enum) {
     repository: repository_page.Msg,
     history: history_page.Msg,
     command_line: command_line.Msg,
+    stash: @import("stash.zig").Msg,
     mouse_selection_drag: MouseSelectionContinuation,
     mouse_selection_release: MouseSelectionContinuation,
     drag_auto_scroll_tick: u64,

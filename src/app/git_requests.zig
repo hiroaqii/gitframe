@@ -20,6 +20,21 @@ const git_command = @import("../git/command.zig");
 const process_runner = @import("../process/runner.zig");
 const root_capability = @import("../repo/root_capability.zig");
 
+pub fn startCreateStash(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, dialog: *const @import("stash.zig").Create, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
+    requireKind(pending, .create_stash);
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    errdefer authority.deinit();
+    var snapshot = try dialog.snapshot.clone(ctx.allocator());
+    errdefer snapshot.deinit(ctx.allocator());
+    const message = try dialog.gitMessage(ctx.allocator());
+    errdefer ctx.allocator().free(message);
+    const Task = actions.CreateStashTask(Msg);
+    const task = try ctx.allocator().create(Task);
+    errdefer ctx.allocator().destroy(task);
+    task.* = .{ .pending = pending, .snapshot = snapshot, .scope = dialog.scope, .message = message, .root = authority.root, .environment = authority.environment };
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+}
+
 pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.StageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     requireKind(pending, .stage_file);
 
