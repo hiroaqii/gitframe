@@ -1057,7 +1057,7 @@ pub const View = struct {
         return request.matchesDisplayIdentity(
             repo_root,
             path_key,
-            projectionSourceKind(self.source),
+            .unstaged,
             self.page.source_session_revision,
         );
     }
@@ -1124,9 +1124,8 @@ pub const View = struct {
 
     fn hunkStagePresentationForFileDirect(self: View, allocator: std.mem.Allocator, file: diff_parser.FileDiff) !diff_render.HunkStagePresentation {
         switch (self.source) {
-            .cached => return .all_staged,
             .unstaged => {},
-            .stdin, .pager, .patch_file, .range, .no_index => return .all_unstaged,
+            .patch_file, .range => return .all_unstaged,
         }
         if (file.hunks.len == 0) return .all_unstaged;
         const repo_root = self.repo_root orelse return .all_unstaged;
@@ -1982,13 +1981,6 @@ pub fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?u
 
 pub fn nearestVisibleFileNode(loaded: *const LoadedDiff, visible_row: usize) ?usize {
     return diff_surface.navigation.nearestVisibleFileNode(loaded, visible_row);
-}
-
-fn projectionSourceKind(source: diff_source.SourceMode) changes_projection.SourceKind {
-    return switch (source) {
-        .cached => .cached,
-        else => .unstaged,
-    };
 }
 
 const SelectionRegion = diff_surface.SelectionRegion;
@@ -4839,11 +4831,8 @@ test "changes transition exact lookup rejects non-current repository sources" {
     defer app.clearLoadedDiff();
 
     const unsupported = [_]diff_source.SourceMode{
-        .stdin,
-        .{ .pager = "external diff" },
         .{ .patch_file = "change.patch" },
         .{ .range = "HEAD~1..HEAD" },
-        .{ .no_index = .{ .left = "left", .right = "right" } },
     };
     for (unsupported) |source| {
         app.source = source;
@@ -4853,12 +4842,6 @@ test "changes transition exact lookup rejects non-current repository sources" {
         );
         try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     }
-
-    app.source = .cached;
-    try expectExactPathReady(
-        app.changesNavigation().exactPathTarget(exactChangesIntent(&app, "src/a")),
-        1,
-    );
 }
 
 test "changes transition exact lookup skips colliding directories before files" {
@@ -5906,10 +5889,6 @@ test "hunk stage presentation classifies direct source authority" {
 
     const unstaged = try app.changesNavigationView().hunkStagePresentation(std.testing.allocator, 0);
     try std.testing.expect(unstaged == .all_unstaged);
-
-    app.source = .cached;
-    const cached = try app.changesNavigationView().hunkStagePresentation(std.testing.allocator, 0);
-    try std.testing.expect(cached == .all_staged);
 
     app.source = .{ .range = "HEAD~1..HEAD" };
     const historical = try app.changesNavigationView().hunkStagePresentation(std.testing.allocator, 0);

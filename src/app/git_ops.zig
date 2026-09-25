@@ -941,7 +941,7 @@ test "pushTarget rejects unsafe or incomplete branch states" {
     };
 
     try std.testing.expectEqual(PushTargetResult.unavailable_source, pushTarget(.{
-        .source = .stdin,
+        .source = .{ .patch_file = "change.patch" },
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
     }));
@@ -1038,7 +1038,7 @@ test "pullTarget rejects unsafe branch and worktree states" {
     const clean_status: StatusSnapshot = .{ .repo_root = "/repo", .loading = false, .entries = &.{} };
 
     try std.testing.expectEqual(PullTargetResult.unavailable_source, pullTarget(.{
-        .source = .stdin,
+        .source = .{ .patch_file = "change.patch" },
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
         .status = clean_status,
@@ -1123,7 +1123,7 @@ test "fetchTarget rejects unsafe or unsupported branch states" {
     };
 
     try std.testing.expectEqual(FetchTargetResult.unavailable_source, fetchTarget(.{
-        .source = .stdin,
+        .source = .{ .patch_file = "change.patch" },
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
     }));

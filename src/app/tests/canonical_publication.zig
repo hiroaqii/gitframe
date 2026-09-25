@@ -69,15 +69,7 @@ const reordered_action_refresh_diff =
 ;
 
 fn activateChanges(app: *App) u64 {
-    const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        switch (app.pages.changes.load.state) {
-            .loaded, .empty => .immutable,
-            .loading => .pending,
-            .failed => .failed,
-            .idle => .pending,
-        }
-    else
-        .pending;
+    const source_member: changes_authority.MemberFreshness = .pending;
     const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and
         app.repo_session.view().activeRoot() != null) .pending else .unavailable;
     return app.pages.changes.activation.activate(
@@ -224,9 +216,7 @@ fn promoteTestActionCursor(app: *App, action_generation: u64) !void {
 }
 
 fn syncTestActivation(app: *App) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending
@@ -525,7 +515,7 @@ test "Changes mutation read fence drains old production reads without publicatio
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .auto_reload = .init(.enabled, .{}),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         } },
     };
@@ -791,7 +781,7 @@ test "background branch completion during repository action is discarded and rel
     });
     try app.pages.changes.branch_status.replace("/repo", &current);
 
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .branch));
     const generation = app.pages.changes.branch_status_load.prepare(true);
@@ -1468,7 +1458,7 @@ test "inactive Changes failure stays page scoped and skips redraw" {
 test "manual reload queues revalidation without superseding an action cursor pair" {
     var app: App = .{
         .allocator = std.testing.allocator,
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
     };
     _ = activateChanges(&app);
     defer changesNavigation(&app).clearActionCursor(std.testing.allocator);
@@ -1932,7 +1922,7 @@ test "background status completion during repository action is discarded and rel
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M old.zig\x00");
     try app.pages.changes.git_status.replace("/repo", &current);
 
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .status));
     const generation = app.pages.changes.status_load.prepare(true);
@@ -1970,7 +1960,7 @@ test "background source completion during repository action is discarded and rel
     defer changesReload(&app).clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     app.pages.changes.auto_reload.acceptSource(accepted);
     syncTestActivation(&app);
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
@@ -2025,7 +2015,7 @@ test "deferred background source is discarded when a repository action starts" {
     defer changesReload(&app).clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
@@ -2065,7 +2055,7 @@ test "empty watch result defers during selection and focus loss applies it" {
     defer changesReload(&app).clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
@@ -2149,7 +2139,7 @@ pub fn canonicalPublicationTestApp(
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -2202,7 +2192,7 @@ fn canonicalPublicationPrimaryTestApp(
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, repo_root) },
         },
         .pages = .{ .changes = .{
-            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -2266,7 +2256,7 @@ fn ordinaryPrimaryPublicationTestApp(
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,

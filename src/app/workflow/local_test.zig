@@ -200,8 +200,7 @@ const LocalHarness = struct {
 
     fn currentChangesActionRoot(self: *const LocalHarness) ?[]const u8 {
         if (self.active_page != .changes or
-            self.pages.changes.activation.currentIdentity() == null or
-            diff_source.sourceIsOneShotInput(self.config.source)) return null;
+            self.pages.changes.activation.currentIdentity() == null) return null;
         return self.repoSessionView().activeRoot();
     }
 
@@ -305,9 +304,7 @@ fn activateTestChanges(app: *LocalHarness) void {
 }
 
 fn syncTestActivation(app: *LocalHarness) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending
@@ -1187,37 +1184,6 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
     }
 }
 
-test "selectedHunkUnstageTarget supports cached source without session mark" {
-    var app: LocalHarness = .{
-        .pages = .{ .changes = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{ .diff_cursor = .{ .hunk_header = 0 } },
-        } },
-        .allocator = std.testing.allocator,
-        .terminal_size = .{ .width = 100, .height = 40 },
-        .config = .{ .source = .cached },
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = .{
-                .label = "repo",
-                .display_path = "/repo",
-                .canonical_root = "/repo",
-            } } },
-        },
-    };
-    acceptTestSource(&app);
-
-    switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
-        .ready => |target| {
-            defer std.testing.allocator.free(target.patch);
-            try std.testing.expectEqual(SessionHunkMarkMutation.none, target.session_mark_mutation);
-            try std.testing.expectEqualStrings("/repo", target.repo_root);
-            try std.testing.expectEqualStrings("a", target.path);
-            try std.testing.expectEqual(@as(usize, 0), target.hunk_index);
-        },
-        else => return error.ExpectedCachedHunkUnstageTarget,
-    }
-}
-
 test "projected hunk actions route through original cached and unstaged origins" {
     var app: LocalHarness = .{
         .pages = .{ .changes = .{
@@ -1477,7 +1443,7 @@ test "hunk action none effect reloads status without removing a session mark" {
     try std.testing.expect(app.pages.changes.status_load.isPending());
 }
 
-test "cached source hunk unstage reload decision travels with task result" {
+test "cached projection hunk unstage reload decision travels with task result" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();

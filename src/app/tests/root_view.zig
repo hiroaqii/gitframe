@@ -131,9 +131,7 @@ fn retainedCompareAppForViewTest(
 }
 
 fn syncTestActivation(app: *App) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending
@@ -460,7 +458,7 @@ test "clean empty state omits fetch hint when unbound or target is not ready" {
     try app_test_support.expectSnapshotNotContains(&ts_not_ready, "Ctrl+s to fetch");
 }
 
-test "clean empty stdin source does not advertise remote actions" {
+test "clean empty patch source does not advertise remote actions" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(120, 18);
     defer ts.deinit();
@@ -472,7 +470,7 @@ test "clean empty stdin source does not advertise remote actions" {
             .load = .{ .state = .{ .empty = .no_changes } },
         } },
         .terminal_size = .{ .width = 120, .height = 18 },
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .keymap = keymap.Effective.fromConfig(fetch_config),
         .repo_session = .{
             .repo_state = .{ .discovery = .{ .single_repo = .{

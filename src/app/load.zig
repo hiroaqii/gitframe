@@ -52,14 +52,13 @@ const generated_oversized_message = std.fmt.comptimePrint(
     .{selected_document.max_text_mib},
 );
 
-/// Task-owned authority for the three source families. Display `repo_root`
+/// Task-owned authority for the repository or file sources. Display `repo_root`
 /// bytes remain in `LoadRequest` for result/context data only.
 pub const LoadAuthority = union(enum) {
     repository: struct {
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
     },
-    non_repository: git_command.LocalGitEnvironment,
     none,
 
     pub fn initRepository(
@@ -75,20 +74,12 @@ pub const LoadAuthority = union(enum) {
         } };
     }
 
-    pub fn initNonRepository(
-        allocator: std.mem.Allocator,
-        parent_environment: ?*const std.process.Environ.Map,
-    ) !LoadAuthority {
-        return .{ .non_repository = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment) };
-    }
-
     pub fn deinit(self: *LoadAuthority) void {
         switch (self.*) {
             .repository => |*repository| {
                 repository.environment.deinit();
                 repository.root.deinit();
             },
-            .non_repository => |*environment| environment.deinit(),
             .none => {},
         }
         self.* = .none;
@@ -100,7 +91,6 @@ pub const LoadAuthority = union(enum) {
                 .cwd = repository.root.dir(),
                 .environment = &repository.environment,
             } },
-            .non_repository => |*environment| .{ .non_repository = environment },
             .none => .none,
         };
     }
@@ -2069,7 +2059,7 @@ fn initSynchronousLoadAuthority(
     allocator: std.mem.Allocator,
 ) !LoadAuthority {
     return switch (request.source) {
-        .unstaged, .cached, .range => blk: {
+        .unstaged, .range => blk: {
             const repo_root = request.repo_root orelse return error.MissingRepoRoot;
             var root = try root_capability.RootCapability.openCanonical(repo_root);
             errdefer root.deinit();
@@ -2078,8 +2068,7 @@ fn initSynchronousLoadAuthority(
                 .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment),
             } };
         },
-        .no_index => LoadAuthority.initNonRepository(allocator, parent_environment),
-        .stdin, .pager, .patch_file => .none,
+        .patch_file => .none,
     };
 }
 

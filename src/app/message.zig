@@ -299,7 +299,7 @@ test "undelivered repo and projection loads release owned payloads" {
         "/repo",
         "src/app.zig",
         .generated_added_file,
-        .cached,
+        .unstaged,
         3,
         4,
     );

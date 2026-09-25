@@ -11,27 +11,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var config = gitframe.parseArgs(args) catch |err| {
+    const config = gitframe.parseArgs(args) catch |err| {
         try printCliError(init.io, err);
         return err;
     };
-    var owns_config_source = false;
-    defer if (owns_config_source) gitframe.freeSource(init.gpa, config.source);
-    if (config.source == .pager) {
-        config.source = gitframe.preparePagerSource(init.gpa, init.io) catch |err| {
-            try printLoadError(init.io, err);
-            return err;
-        } orelse return;
-        owns_config_source = true;
-    }
-
-    if (config.export_context) {
-        exportContext(init.io, init.gpa, init.environ_map, config) catch |err| {
-            try printLoadError(init.io, err);
-            return err;
-        };
-        return;
-    }
 
     var config_paths = try gitframe.config.resolvePaths(init.gpa, init.environ_map);
     defer config_paths.deinit(init.gpa);
@@ -211,40 +194,21 @@ fn printHelp(io: std.Io) !void {
         \\  gitframe [options] [patch-file]
         \\
         \\Options:
-        \\  --cached          Show staged changes
-        \\  --stdin           Read unified diff from stdin
-        \\  --pager           Read Git pager input from stdin and strip ANSI color
-        \\  --difftool L R    Compare two paths using git diff --no-index
         \\  --range <range>   Show a commit range, for example main...HEAD
-        \\  --watch           Force-enable automatic reload for reloadable sources
+        \\  --watch           Force-enable automatic reload
         \\  --no-watch        Disable automatic reload
         \\  --stats-summary   Print runtime timing summary after exit
-        \\  --export-context  Print initial selection context JSON and exit
         \\  -h, --help        Show this help
         \\
         \\Default:
-        \\  gitframe          Show unstaged changes and reload automatically every 3 seconds
+        \\  gitframe          Show staged and unstaged changes; reload every 3 seconds
         \\
         \\Config:
         \\  [reload]
         \\  auto = true
         \\  interval_seconds = 3  # accepted range: 1..60
-        \\  stdin and pager input remain one-shot even when auto reload is enabled
         \\
     );
-    try stdout.flush();
-}
-
-fn exportContext(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    env_map: ?*const std.process.Environ.Map,
-    config: gitframe.CliConfig,
-) !void {
-    var buffer: [4096]u8 = undefined;
-    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
-    const stdout = &stdout_file_writer.interface;
-    try gitframe.exportInitialSelectionContextJson(allocator, io, env_map, config, stdout);
     try stdout.flush();
 }
 
@@ -300,14 +264,6 @@ fn printStatsSummary(io: std.Io, summary: StatsSummary) !void {
         nsToUs(summary.max_view_ns),
         nsToUs(summary.max_render_ns),
     });
-    try stderr.flush();
-}
-
-fn printLoadError(io: std.Io, err: anyerror) !void {
-    var buffer: [512]u8 = undefined;
-    var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), io, &buffer);
-    const stderr = &stderr_file_writer.interface;
-    try stderr.print("gitframe: {s}\n", .{@errorName(err)});
     try stderr.flush();
 }
 

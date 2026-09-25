@@ -378,15 +378,7 @@ test "repo switch clears pending reload anchor" {
 }
 
 fn activateChanges(app: *App) u64 {
-    const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        switch (app.pages.changes.load.state) {
-            .loaded, .empty => .immutable,
-            .loading => .pending,
-            .failed => .failed,
-            .idle => .pending,
-        }
-    else
-        .pending;
+    const source_member: changes_authority.MemberFreshness = .pending;
     const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
     return app.pages.changes.activation.activate(
         app.repo_session.view().epoch(),
@@ -531,7 +523,7 @@ fn expectCompareInactiveCompletionOrder(order: CompareInactiveCompletionOrder) !
     var app: App = .{
         .allocator = allocator,
         .active_page = .compare,
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
     };
     defer app.pages.compare.deinit(allocator);
@@ -639,7 +631,7 @@ test "repository activation and manual reload route to page-owned manifest tasks
     defer roots.deinit();
     var app: App = .{
         .allocator = std.testing.allocator,
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .repo_session = .{
             .repo_state = .{ .discovery = .{ .single_repo = .{
                 .label = "repo",
@@ -1565,9 +1557,7 @@ fn acceptTestSource(app: *App) void {
 }
 
 fn syncTestActivation(app: *App) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending

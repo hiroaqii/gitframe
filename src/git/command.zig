@@ -65,11 +65,6 @@ pub const StdinOptions = struct {
     stderr_limit: std.Io.Limit,
 };
 
-pub const NonRepositoryCwd = union(enum) {
-    inherit,
-    dir: std.Io.Dir,
-};
-
 pub fn runCaptured(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -132,27 +127,6 @@ pub fn runWithStdinBounded(
         .stdout_limit = options.stdout_limit,
         .stderr_limit = options.stderr_limit,
     });
-}
-
-/// Captured helper for an explicitly non-repository command such as external
-/// file-pair `git diff --no-index`. Repository paths are intentionally absent.
-pub fn runNonRepositoryCaptured(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cwd: NonRepositoryCwd,
-    environment: *const LocalGitEnvironment,
-    options: CapturedOptions,
-) Error!process_runner.Result {
-    return process_runner.runCaptured(allocator, io, .{
-        .argv = options.argv,
-        .cwd = switch (cwd) {
-            .inherit => .inherit,
-            .dir => |dir| .{ .dir = dir },
-        },
-        .environ_map = environment.borrow(),
-        .stdout_limit = options.stdout_limit,
-        .stderr_limit = options.stderr_limit,
-    }) catch |err| return fromRunnerError(err);
 }
 
 /// Translate runner mechanics without importing domain result vocabulary.

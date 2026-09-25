@@ -75,14 +75,7 @@ pub const Controller = struct {
     ) void {
         self.page.status.clear();
         if (active) {
-            const source_member: authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(source))
-                switch (self.page.load.state) {
-                    .loaded, .empty => .immutable,
-                    .loading, .idle => .pending,
-                    .failed => .failed,
-                }
-            else
-                .pending;
+            const source_member: authority.MemberFreshness = .pending;
             const auxiliary: authority.MemberFreshness = if (diff_source.sourceRequiresRepo(source) and root_available)
                 .pending
             else

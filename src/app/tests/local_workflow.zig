@@ -187,9 +187,7 @@ fn finishUnstageHunkForTest(
 }
 
 fn syncTestActivation(app: *App) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending

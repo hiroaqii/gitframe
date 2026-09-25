@@ -76,7 +76,6 @@ const DiffLoadStartOptions = struct {
 const ClosedAuthorityConsequence = enum { queue_revalidation, drop };
 
 const ReloadStart = enum {
-    one_shot_source,
     authority_closed,
     needs_repo_discovery,
     no_repo_root,
@@ -192,7 +191,6 @@ pub const Controller = struct {
 
     pub fn requestRevalidation(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         if (self.active_page != .changes) return;
-        if (diff_source.sourceIsOneShotInput(self.source)) return;
         self.page_state.activation.queueRevalidation();
         if (self.readBusy()) return;
         try self.startRevalidation(ctx);
@@ -217,10 +215,6 @@ pub const Controller = struct {
     pub fn maybeStartQueuedRevalidation(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !bool {
         if (self.active_page != .changes or self.readBusy()) return false;
         if (!self.page_state.activation.hasQueuedFullRevalidation()) return false;
-        if (diff_source.sourceIsOneShotInput(self.source)) {
-            self.page_state.activation.discardTerminalRevalidation();
-            return false;
-        }
         self.startRevalidation(ctx) catch {};
         return true;
     }
@@ -335,7 +329,6 @@ pub const Controller = struct {
         options: DiffLoadStartOptions,
         closed_authority: ClosedAuthorityConsequence,
     ) !ReloadStart {
-        if (diff_source.sourceIsOneShotInput(self.source)) return .one_shot_source;
         if (!self.fence.mayStartRepositoryRead()) {
             switch (closed_authority) {
                 .queue_revalidation => self.page_state.activation.queueRevalidation(),
@@ -372,7 +365,7 @@ pub const Controller = struct {
             .{ .clear_visible_state = true, .kind = .manual },
             .queue_revalidation,
         )) {
-            .one_shot_source, .authority_closed => self.redraw.requestSkip(),
+            .authority_closed => self.redraw.requestSkip(),
             .needs_repo_discovery => try self.startRepoDiscovery(ctx, null),
             .no_repo_root => self.reloadOwner().replaceMissingRepository(ctx.allocator()),
             .source_started => {},
@@ -584,12 +577,11 @@ pub const Controller = struct {
         source: diff_source.SourceMode,
     ) !app_load.LoadAuthority {
         return switch (source) {
-            .unstaged, .cached, .range => blk: {
+            .unstaged, .range => blk: {
                 const capability = self.repo.activeCapability() orelse return error.RepositoryReadAuthorityClosed;
                 break :blk try app_load.LoadAuthority.initRepository(allocator, capability.*, self.env_map);
             },
-            .no_index => app_load.LoadAuthority.initNonRepository(allocator, self.env_map),
-            .stdin, .pager, .patch_file => .none,
+            .patch_file => .none,
         };
     }
 
@@ -845,14 +837,6 @@ pub const Controller = struct {
             .action_cursor_generation = action_cursor_generation,
         }, .queue_revalidation) catch return .rejected_start;
         switch (outcome) {
-            .one_shot_source => {
-                if (action_cursor_generation) |generation| {
-                    _ = self.page_state.action_cursor.clearMatchingAction(ctx.allocator(), generation);
-                }
-                self.page_state.activation.discardTerminalRevalidation();
-                self.redraw.requestSkip();
-                return .unsupported;
-            },
             .authority_closed => {
                 if (action_cursor_generation) |generation| {
                     _ = self.page_state.action_cursor.clearMatchingAction(ctx.allocator(), generation);
@@ -955,7 +939,7 @@ pub const Controller = struct {
             .clear_visible_state = self.page_state.load.state == .idle,
             .kind = .action_result,
         }, .queue_revalidation)) {
-            .one_shot_source, .authority_closed, .no_repo_root => self.redraw.requestSkip(),
+            .authority_closed, .no_repo_root => self.redraw.requestSkip(),
             .needs_repo_discovery => try self.startRepoDiscovery(ctx, null),
             .source_started => {},
         }
@@ -967,7 +951,6 @@ pub const Controller = struct {
             return;
         }
         if (!self.page_state.auto_reload.enabled()) return;
-        if (diff_source.sourceIsOneShotInput(self.source)) return;
         if (!self.fence.mayStartRepositoryRead()) {
             self.redraw.requestSkip();
             return;
@@ -1011,7 +994,7 @@ pub const Controller = struct {
                 .background_cycle_id = cycle_id,
             }, .drop)) {
                 .no_repo_root, .source_started => {},
-                .one_shot_source, .authority_closed, .needs_repo_discovery => unreachable,
+                .authority_closed, .needs_repo_discovery => unreachable,
             }
             self.page_state.auto_reload.discardEmptyCycle(cycle_id);
         }

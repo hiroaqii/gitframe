@@ -67,14 +67,11 @@ pub fn footer(args: FooterArgs) FooterView {
         .sidebar_hidden = args.surface.viewer.sidebar_hidden,
         .auto_reload_enabled = args.auto_reload_enabled,
         .source_label = sourceFooterLabel(args.surface.source),
-        .activation = activationPresentation(args.surface.activation, args.surface.source),
+        .activation = activationPresentation(args.surface.activation),
     };
 }
 
-pub fn activationPresentation(activation: *const diff_surface.authority.Lifecycle, source: diff_source.SourceMode) ?ActivationPresentation {
-    // Accepted one-shot input is immutable on re-entry and must never pretend
-    // that stdin/pager is being read a second time.
-    if (diff_source.sourceIsOneShotInput(source)) return null;
+pub fn activationPresentation(activation: *const diff_surface.authority.Lifecycle) ?ActivationPresentation {
     return switch (activation.state) {
         .inactive => null,
         .active => |active| blk: {
@@ -108,12 +105,8 @@ pub fn pageHeaderLineStats(surface: diff_surface.ReadSurface) ?file_tree.Stats {
 pub fn sourceFooterLabel(source: diff_source.SourceMode) ?[]const u8 {
     return switch (source) {
         .unstaged => null,
-        .cached => "staged",
-        .stdin => "stdin",
-        .pager => "pager",
         .patch_file => "patch",
         .range => |range| range,
-        .no_index => "difftool",
     };
 }
 

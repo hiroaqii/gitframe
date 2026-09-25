@@ -55,12 +55,12 @@ test "selectionContext returns null for unresolved status-only target" {
             .load = test_support.loadState(test_support.loadedDiffOne()),
             .viewer = .{ .selected_target = .{ .status_only = 2 } },
         } },
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
     };
 
     const selection = app.selectionContext();
     try std.testing.expect(selection.repo_root == null);
-    try std.testing.expectEqual(context.SourceKind.stdin, selection.source.kind);
+    try std.testing.expectEqual(context.SourceKind.patch_file, selection.source.kind);
     try std.testing.expect(selection.selected == null);
 }
 
@@ -92,20 +92,6 @@ test "selectionContext resolves status-only target without loaded diff" {
     try std.testing.expectEqualStrings("src/new.zig", status_selection.path_key.?);
 }
 
-test "selectionContext keeps no-index source paths" {
-    const app: App = .{
-        .config = .{ .source = .{ .no_index = .{ .left = "before.zig", .right = "after.zig" } } },
-    };
-
-    const selection = app.selectionContext();
-    try std.testing.expectEqual(context.SourceKind.no_index, selection.source.kind);
-    try std.testing.expectEqualStrings("difftool", selection.source.label);
-    try std.testing.expect(selection.source.detail == null);
-    try std.testing.expectEqualStrings("before.zig", selection.source.left_path.?);
-    try std.testing.expectEqualStrings("after.zig", selection.source.right_path.?);
-    try std.testing.expect(selection.selected == null);
-}
-
 test "selectionContext returns null selected without a target" {
     const app: App = .{
         .pages = .{ .changes = .{
@@ -117,7 +103,7 @@ test "selectionContext returns null selected without a target" {
     const selection = app.selectionContext();
     try std.testing.expect(selection.repo_root == null);
     try std.testing.expectEqual(context.SourceKind.unstaged, selection.source.kind);
-    try std.testing.expectEqualStrings("unstaged changes", selection.source.label);
+    try std.testing.expectEqualStrings("working tree changes", selection.source.label);
     try std.testing.expect(selection.selected == null);
 }
 test "quit waits for pending git action" {

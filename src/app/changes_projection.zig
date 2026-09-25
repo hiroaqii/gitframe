@@ -27,7 +27,6 @@ pub const Kind = enum {
 
 pub const SourceKind = enum {
     unstaged,
-    cached,
     other,
 };
 
@@ -1387,7 +1386,7 @@ test "projection read epoch participates in request semantic identity" {
     try std.testing.expect(!request.matchesBorrowed(.{ .value = 32 }, "/repo", "src/main.zig", .cached_diff, .unstaged, 10, 20));
     try std.testing.expect(request.matchesDisplayIdentity("/repo", "src/main.zig", .unstaged, 10));
     try std.testing.expect(!request.matchesBorrowed(current, "/repo", "src/main.zig", .generated_added_file, .unstaged, 10, 20));
-    try std.testing.expect(!request.matchesBorrowed(current, "/repo", "src/main.zig", .cached_diff, .cached, 10, 20));
+    try std.testing.expect(!request.matchesBorrowed(current, "/repo", "src/main.zig", .cached_diff, .other, 10, 20));
     try std.testing.expect(!request.matchesBorrowed(current, "/repo", "src/main.zig", .cached_diff, .unstaged, 11, 20));
     try std.testing.expect(!request.matchesBorrowed(current, "/other", "src/main.zig", .cached_diff, .unstaged, 10, 20));
 }

@@ -4,21 +4,11 @@ const git_read = @import("../git/read.zig");
 
 /// User-selected source for the raw unified diff text.
 ///
-/// Terminal mode can read all variants directly. Browser mode can later reuse
-/// the same shape while swapping the backend behind it.
+/// Working-tree Changes, a patch file, or a committed range.
 pub const SourceMode = union(enum) {
     unstaged,
-    cached,
-    stdin,
-    pager: []const u8,
     patch_file: []const u8,
     range: []const u8,
-    no_index: PathPair,
-};
-
-pub const PathPair = struct {
-    left: []const u8,
-    right: []const u8,
 };
 
 pub const AutoReloadOverride = enum {
@@ -31,17 +21,12 @@ pub const CliConfig = struct {
     source: SourceMode = .unstaged,
     auto_reload: AutoReloadOverride = .inherit,
     stats_summary: bool = false,
-    export_context: bool = false,
 
     pub fn sourceLabel(self: CliConfig) []const u8 {
         return switch (self.source) {
-            .unstaged => "unstaged changes",
-            .cached => "staged changes",
-            .stdin => "stdin diff",
-            .pager => "pager diff",
+            .unstaged => "working tree changes",
             .patch_file => |path| path,
             .range => |range| range,
-            .no_index => "difftool",
         };
     }
 };
@@ -49,8 +34,7 @@ pub const CliConfig = struct {
 /// Concrete load request used by backends.
 ///
 /// `source` answers "what diff should be read"; `repo_root` answers "where a
-/// Git command should run". Raw text sources such as stdin and patch files can
-/// leave `repo_root` null because they do not execute Git.
+/// Git command should run". Patch files can leave `repo_root` null because they do not execute Git.
 pub const LoadRequest = struct {
     source: SourceMode,
     repo_root: ?[]const u8 = null,
@@ -66,64 +50,43 @@ pub const LoadRequest = struct {
 
 pub fn sourceRequiresRepo(source: SourceMode) bool {
     return switch (source) {
-        .unstaged, .cached, .range => true,
-        .stdin, .pager, .patch_file, .no_index => false,
-    };
-}
-
-pub fn sourceUsesGitCommand(source: SourceMode) bool {
-    return switch (source) {
-        .unstaged, .cached, .range, .no_index => true,
-        .stdin, .pager, .patch_file => false,
-    };
-}
-
-pub fn sourceIsOneShotInput(source: SourceMode) bool {
-    return switch (source) {
-        .stdin, .pager => true,
-        .unstaged, .cached, .patch_file, .range, .no_index => false,
-    };
-}
-
-pub fn sourceSupportsWatch(source: SourceMode) bool {
-    return switch (source) {
-        .unstaged, .cached, .range, .patch_file, .no_index => true,
-        .stdin, .pager => false,
+        .unstaged, .range => true,
+        .patch_file => false,
     };
 }
 
 pub fn sourceAllowsStageAction(source: SourceMode) bool {
     return switch (source) {
         .unstaged => true,
-        .cached, .stdin, .pager, .patch_file, .range, .no_index => false,
+        .patch_file, .range => false,
     };
 }
 
 pub fn sourceAllowsUnstageAction(source: SourceMode) bool {
     return switch (source) {
-        .unstaged, .cached => true,
-        .stdin, .pager, .patch_file, .range, .no_index => false,
+        .unstaged => true,
+        .patch_file, .range => false,
     };
 }
 
 pub fn sourceAllowsDiscardAction(source: SourceMode) bool {
     return switch (source) {
         .unstaged => true,
-        .cached, .stdin, .pager, .patch_file, .range, .no_index => false,
+        .patch_file, .range => false,
     };
 }
 
 pub fn sourceAllowsStageProjection(source: SourceMode) bool {
     return switch (source) {
-        .unstaged, .cached => true,
-        .stdin, .pager, .patch_file, .range, .no_index => false,
+        .unstaged => true,
+        .patch_file, .range => false,
     };
 }
 
 pub fn sourceAllowsEditorAction(source: SourceMode) bool {
     return switch (source) {
-        .unstaged, .cached => true,
-        .stdin, .pager, .patch_file, .range, .no_index => false,
+        .unstaged => true,
+        .patch_file, .range => false,
     };
 }
 
@@ -132,8 +95,8 @@ pub fn sourceAllowsEditorAction(source: SourceMode) bool {
 /// the current working-tree surface, so `range` remains intentionally false.
 pub fn sourceAllowsRepositoryLink(source: SourceMode) bool {
     return switch (source) {
-        .unstaged, .cached => true,
-        .stdin, .pager, .patch_file, .range, .no_index => false,
+        .unstaged => true,
+        .patch_file, .range => false,
     };
 }
 
@@ -144,7 +107,6 @@ pub const ParseArgsError = error{
     TooManyInputs,
     ConflictingSourceMode,
     ConflictingWatchOverride,
-    UnsupportedWatchSource,
 };
 
 pub const LoadError = git_command.Error || error{
@@ -158,7 +120,6 @@ pub const LoadResult = git_read.LoadResult;
 /// keep the corresponding descriptor/environment alive in their task.
 pub const LoadContext = union(enum) {
     repository: git_command.DirectoryContext,
-    non_repository: *const git_command.LocalGitEnvironment,
     none,
 };
 
@@ -169,19 +130,7 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--cached")) {
-            try setSourceMode(&config, .cached);
-        } else if (std.mem.eql(u8, arg, "--stdin")) {
-            try setSourceMode(&config, .stdin);
-        } else if (std.mem.eql(u8, arg, "--pager")) {
-            try setSourceMode(&config, .{ .pager = "" });
-        } else if (std.mem.eql(u8, arg, "--difftool")) {
-            if (index + 2 >= args.len) return error.MissingOptionValue;
-            const left = args[index + 1];
-            const right = args[index + 2];
-            try setSourceMode(&config, .{ .no_index = .{ .left = left, .right = right } });
-            index += 2;
-        } else if (std.mem.eql(u8, arg, "--watch")) {
+        if (std.mem.eql(u8, arg, "--watch")) {
             if (config.auto_reload == .disabled) return error.ConflictingWatchOverride;
             config.auto_reload = .enabled;
         } else if (std.mem.eql(u8, arg, "--no-watch")) {
@@ -189,8 +138,6 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
             config.auto_reload = .disabled;
         } else if (std.mem.eql(u8, arg, "--stats-summary")) {
             config.stats_summary = true;
-        } else if (std.mem.eql(u8, arg, "--export-context")) {
-            config.export_context = true;
         } else if (std.mem.eql(u8, arg, "--range")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
@@ -210,8 +157,6 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
         }
     }
 
-    if (config.auto_reload == .enabled and !sourceSupportsWatch(config.source)) return error.UnsupportedWatchSource;
-
     return config;
 }
 
@@ -227,21 +172,9 @@ fn setSourceMode(config: *CliConfig, source: SourceMode) ParseArgsError!void {
 pub fn cloneSource(allocator: std.mem.Allocator, source: SourceMode) std.mem.Allocator.Error!SourceMode {
     return switch (source) {
         .unstaged => .unstaged,
-        .cached => .cached,
-        .stdin => .stdin,
-        .pager => |bytes| .{ .pager = try allocator.dupe(u8, bytes) },
         .patch_file => |path| .{ .patch_file = try allocator.dupe(u8, path) },
         .range => |range| .{ .range = try allocator.dupe(u8, range) },
-        .no_index => |paths| .{ .no_index = try clonePathPair(allocator, paths) },
     };
-}
-
-fn clonePathPair(allocator: std.mem.Allocator, paths: PathPair) std.mem.Allocator.Error!PathPair {
-    const left = try allocator.dupe(u8, paths.left);
-    errdefer allocator.free(left);
-
-    const right = try allocator.dupe(u8, paths.right);
-    return .{ .left = left, .right = right };
 }
 
 pub fn cloneLoadRequest(allocator: std.mem.Allocator, request: LoadRequest) std.mem.Allocator.Error!LoadRequest {
@@ -256,13 +189,8 @@ pub fn cloneLoadRequest(allocator: std.mem.Allocator, request: LoadRequest) std.
 
 pub fn freeSource(allocator: std.mem.Allocator, source: SourceMode) void {
     switch (source) {
-        .pager => |bytes| allocator.free(bytes),
         .patch_file => |path| allocator.free(path),
         .range => |range| allocator.free(range),
-        .no_index => |paths| {
-            allocator.free(paths.left);
-            allocator.free(paths.right);
-        },
         else => {},
     }
 }
@@ -274,96 +202,26 @@ pub fn freeLoadRequest(allocator: std.mem.Allocator, request: LoadRequest) void 
 
 /// Convenience entry point for terminal mode.
 ///
-/// Raw sources are read locally here. Git-command sources are converted to a
-/// git_backend request so the backend boundary never needs to model stdin or
-/// patch-file input.
+/// Patch files are read locally; repository sources use the Git backend.
 pub fn load(allocator: std.mem.Allocator, io: std.Io, request: LoadRequest, context: LoadContext) LoadError!LoadResult {
     return switch (request.source) {
         .patch_file => |path| .{ .ok = readPatchFile(allocator, io, path) catch |err| return mapReadError(err) },
-        .stdin => .{ .ok = readStdin(allocator, io) catch |err| return mapReadError(err) },
-        .pager => |bytes| .{ .ok = allocator.dupe(u8, bytes) catch |err| return mapReadError(err) },
-        .unstaged, .cached, .range => git_read.loadDiff(allocator, io, try gitDiffRequest(request, context)),
-        .no_index => |paths| git_read.loadNoIndexDiff(allocator, io, .{
-            .environment = switch (context) {
-                .non_repository => |environment| environment,
-                else => return error.MissingRepoRoot,
+        .unstaged, .range => git_read.loadDiff(allocator, io, .{
+            .context = switch (context) {
+                .repository => |repository| repository,
+                .none => return error.MissingRepoRoot,
             },
-            .left = paths.left,
-            .right = paths.right,
+            .kind = switch (request.source) {
+                .unstaged => .unstaged,
+                .range => |range| .{ .range = range },
+                .patch_file => unreachable,
+            },
         }),
-    };
-}
-
-fn gitDiffRequest(request: LoadRequest, context: LoadContext) LoadError!git_read.GitDiffRequest {
-    return .{
-        .context = switch (context) {
-            .repository => |repository| repository,
-            else => return error.MissingRepoRoot,
-        },
-        .kind = switch (request.source) {
-            .unstaged => .unstaged,
-            .cached => .cached,
-            .range => |range| .{ .range = range },
-            .no_index => unreachable,
-            .stdin, .pager, .patch_file => unreachable,
-        },
     };
 }
 
 fn readPatchFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(git_read.max_diff_bytes));
-}
-
-fn readStdin(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    var buffer: [4096]u8 = undefined;
-    var reader = std.Io.File.stdin().readerStreaming(io, &buffer);
-    return try reader.interface.allocRemaining(allocator, .limited(git_read.max_diff_bytes));
-}
-
-pub fn preparePagerSource(allocator: std.mem.Allocator, io: std.Io) LoadError!?SourceMode {
-    const raw = readStdin(allocator, io) catch |err| return mapReadError(err);
-    defer allocator.free(raw);
-
-    const stripped = stripAnsiAlloc(allocator, raw) catch |err| return mapReadError(err);
-    errdefer allocator.free(stripped);
-
-    if (std.mem.trim(u8, stripped, " \t\r\n").len == 0) {
-        allocator.free(stripped);
-        return null;
-    }
-
-    return .{ .pager = stripped };
-}
-
-pub fn stripAnsiAlloc(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var index: usize = 0;
-    while (index < text.len) {
-        if (text[index] == 0x1b) {
-            const next = index + 1;
-            if (next < text.len and text[next] == '[') {
-                index = skipCsi(text, next + 1);
-                continue;
-            }
-            index += 1;
-            continue;
-        }
-        try out.append(allocator, text[index]);
-        index += 1;
-    }
-
-    return out.toOwnedSlice(allocator);
-}
-
-fn skipCsi(text: []const u8, start: usize) usize {
-    var index = start;
-    while (index < text.len) : (index += 1) {
-        const byte = text[index];
-        if (byte >= 0x40 and byte <= 0x7e) return index + 1;
-    }
-    return text.len;
 }
 
 fn mapReadError(err: anyerror) LoadError {
@@ -379,54 +237,6 @@ test "parseArgs defaults to unstaged diff" {
     const config = try parseArgs(args[0..]);
 
     try std.testing.expect(config.source == .unstaged);
-}
-
-test "parseArgs accepts cached mode" {
-    const args = [_][]const u8{ "gitframe", "--cached" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .cached);
-}
-
-test "parseArgs accepts stdin mode" {
-    const args = [_][]const u8{ "gitframe", "--stdin" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .stdin);
-}
-
-test "parseArgs accepts pager mode" {
-    const args = [_][]const u8{ "gitframe", "--pager" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .pager);
-    try std.testing.expectEqualStrings("", config.source.pager);
-}
-
-test "parseArgs accepts difftool mode" {
-    const args = [_][]const u8{ "gitframe", "--difftool", "left.txt", "right.txt" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .no_index);
-    try std.testing.expectEqualStrings("left.txt", config.source.no_index.left);
-    try std.testing.expectEqualStrings("right.txt", config.source.no_index.right);
-}
-
-test "parseArgs accepts option-like difftool paths" {
-    const args = [_][]const u8{ "gitframe", "--difftool", "--left", "--right" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.source == .no_index);
-    try std.testing.expectEqualStrings("--left", config.source.no_index.left);
-    try std.testing.expectEqualStrings("--right", config.source.no_index.right);
-}
-
-test "parseArgs rejects missing difftool paths" {
-    const missing_both = [_][]const u8{ "gitframe", "--difftool" };
-    try std.testing.expectError(error.MissingOptionValue, parseArgs(missing_both[0..]));
-
-    const missing_right = [_][]const u8{ "gitframe", "--difftool", "left.txt" };
-    try std.testing.expectError(error.MissingOptionValue, parseArgs(missing_right[0..]));
 }
 
 test "parseArgs accepts watch mode" {
@@ -463,49 +273,9 @@ test "parseArgs accepts stats summary mode" {
     try std.testing.expect(config.stats_summary);
 }
 
-test "parseArgs accepts context export mode" {
-    const args = [_][]const u8{ "gitframe", "--export-context", "--cached" };
-    const config = try parseArgs(args[0..]);
-
-    try std.testing.expect(config.export_context);
-    try std.testing.expect(config.source == .cached);
-}
-
 test "parseArgs rejects removed review mode" {
     const args = [_][]const u8{ "gitframe", "--review" };
     try std.testing.expectError(error.UnknownOption, parseArgs(args[0..]));
-}
-
-test "parseArgs rejects watch with stdin" {
-    const args = [_][]const u8{ "gitframe", "--stdin", "--watch" };
-    try std.testing.expectError(error.UnsupportedWatchSource, parseArgs(args[0..]));
-}
-
-test "parseArgs rejects watch with pager" {
-    const args = [_][]const u8{ "gitframe", "--pager", "--watch" };
-    try std.testing.expectError(error.UnsupportedWatchSource, parseArgs(args[0..]));
-}
-
-test "parseArgs allows inherited and explicitly disabled auto reload for one-shot sources" {
-    const inherited_args = [_][]const u8{ "gitframe", "--stdin" };
-    const inherited = try parseArgs(inherited_args[0..]);
-    try std.testing.expectEqual(AutoReloadOverride.inherit, inherited.auto_reload);
-
-    const disabled_args = [_][]const u8{ "gitframe", "--stdin", "--no-watch" };
-    const disabled = try parseArgs(disabled_args[0..]);
-    try std.testing.expectEqual(AutoReloadOverride.disabled, disabled.auto_reload);
-}
-
-test "parseArgs accepts watch with difftool" {
-    const args = [_][]const u8{ "gitframe", "--watch", "--difftool", "left.txt", "right.txt" };
-    const config = try parseArgs(args[0..]);
-    try std.testing.expect(config.source == .no_index);
-    try std.testing.expectEqual(AutoReloadOverride.enabled, config.auto_reload);
-
-    const trailing = [_][]const u8{ "gitframe", "--difftool", "left.txt", "right.txt", "--watch" };
-    const trailing_config = try parseArgs(trailing[0..]);
-    try std.testing.expect(trailing_config.source == .no_index);
-    try std.testing.expectEqual(AutoReloadOverride.enabled, trailing_config.auto_reload);
 }
 
 test "parseArgs accepts range option" {
@@ -533,20 +303,8 @@ test "parseArgs accepts patch file path" {
 }
 
 test "parseArgs rejects conflicting source modes" {
-    const stdin_and_file = [_][]const u8{ "gitframe", "--stdin", "change.diff" };
-    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(stdin_and_file[0..]));
-
-    const stdin_and_pager = [_][]const u8{ "gitframe", "--stdin", "--pager" };
-    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(stdin_and_pager[0..]));
-
-    const cached_and_difftool = [_][]const u8{ "gitframe", "--cached", "--difftool", "left", "right" };
-    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(cached_and_difftool[0..]));
-
-    const cached_and_range = [_][]const u8{ "gitframe", "--cached", "--range", "main...HEAD" };
-    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(cached_and_range[0..]));
-
-    const range_and_stdin = [_][]const u8{ "gitframe", "--range=main...HEAD", "--stdin" };
-    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(range_and_stdin[0..]));
+    const args = [_][]const u8{ "gitframe", "--range", "main...HEAD", "change.diff" };
+    try std.testing.expectError(error.ConflictingSourceMode, parseArgs(args[0..]));
 }
 
 test "cloneSource duplicates payload source modes" {
@@ -558,96 +316,34 @@ test "cloneSource duplicates payload source modes" {
     try std.testing.expectEqualStrings("main...HEAD", source.range);
 }
 
-test "cloneSource duplicates pager payload" {
-    const allocator = std.testing.allocator;
-    const source = try cloneSource(allocator, .{ .pager = "diff --git a/a b/a\n" });
-    defer freeSource(allocator, source);
-
-    try std.testing.expect(source == .pager);
-    try std.testing.expectEqualStrings("diff --git a/a b/a\n", source.pager);
-}
-
-test "cloneSource duplicates difftool paths" {
-    const allocator = std.testing.allocator;
-    const source = try cloneSource(allocator, .{ .no_index = .{ .left = "left.txt", .right = "right.txt" } });
-    defer freeSource(allocator, source);
-
-    try std.testing.expect(source == .no_index);
-    try std.testing.expectEqualStrings("left.txt", source.no_index.left);
-    try std.testing.expectEqualStrings("right.txt", source.no_index.right);
-}
-
 test "LoadRequest identifies sources that require a repo root" {
     try std.testing.expect((LoadRequest{ .source = .unstaged }).requiresRepo());
-    try std.testing.expect((LoadRequest{ .source = .cached }).requiresRepo());
     try std.testing.expect((LoadRequest{ .source = .{ .range = "main...HEAD" } }).requiresRepo());
 
-    try std.testing.expect(!(LoadRequest{ .source = .stdin }).requiresRepo());
-    try std.testing.expect(!(LoadRequest{ .source = .{ .pager = "diff" } }).requiresRepo());
     try std.testing.expect(!(LoadRequest{ .source = .{ .patch_file = "change.diff" } }).requiresRepo());
-    try std.testing.expect(!(LoadRequest{ .source = .{ .no_index = .{ .left = "left", .right = "right" } } }).requiresRepo());
 }
 
-test "sourceUsesGitCommand separates command and raw sources" {
-    try std.testing.expect(sourceUsesGitCommand(.unstaged));
-    try std.testing.expect(sourceUsesGitCommand(.cached));
-    try std.testing.expect(sourceUsesGitCommand(.{ .range = "main...HEAD" }));
-    try std.testing.expect(sourceUsesGitCommand(.{ .no_index = .{ .left = "left", .right = "right" } }));
-    try std.testing.expect(!sourceUsesGitCommand(.stdin));
-    try std.testing.expect(!sourceUsesGitCommand(.{ .pager = "diff" }));
-    try std.testing.expect(!sourceUsesGitCommand(.{ .patch_file = "change.diff" }));
-}
-
-test "sourceIsOneShotInput identifies stdin and pager" {
-    try std.testing.expect(sourceIsOneShotInput(.stdin));
-    try std.testing.expect(sourceIsOneShotInput(.{ .pager = "diff" }));
-    try std.testing.expect(!sourceIsOneShotInput(.unstaged));
-    try std.testing.expect(!sourceIsOneShotInput(.cached));
-    try std.testing.expect(!sourceIsOneShotInput(.{ .range = "main...HEAD" }));
-    try std.testing.expect(!sourceIsOneShotInput(.{ .patch_file = "change.diff" }));
-    try std.testing.expect(!sourceIsOneShotInput(.{ .no_index = .{ .left = "left", .right = "right" } }));
-}
-
-test "sourceSupportsWatch rejects only one-shot sources" {
-    try std.testing.expect(sourceSupportsWatch(.unstaged));
-    try std.testing.expect(sourceSupportsWatch(.cached));
-    try std.testing.expect(sourceSupportsWatch(.{ .range = "main...HEAD" }));
-    try std.testing.expect(sourceSupportsWatch(.{ .patch_file = "change.diff" }));
-    try std.testing.expect(!sourceSupportsWatch(.stdin));
-    try std.testing.expect(!sourceSupportsWatch(.{ .pager = "diff" }));
-    try std.testing.expect(sourceSupportsWatch(.{ .no_index = .{ .left = "left", .right = "right" } }));
-}
-
-test "stage action is narrower than stage projection" {
+test "working tree source supports actions and stage projection" {
     try std.testing.expect(sourceAllowsStageAction(.unstaged));
-    try std.testing.expect(!sourceAllowsStageAction(.cached));
     try std.testing.expect(!sourceAllowsStageAction(.{ .range = "main...HEAD" }));
 
     try std.testing.expect(sourceAllowsUnstageAction(.unstaged));
-    try std.testing.expect(sourceAllowsUnstageAction(.cached));
     try std.testing.expect(!sourceAllowsUnstageAction(.{ .range = "main...HEAD" }));
 
     try std.testing.expect(sourceAllowsDiscardAction(.unstaged));
-    try std.testing.expect(!sourceAllowsDiscardAction(.cached));
     try std.testing.expect(!sourceAllowsDiscardAction(.{ .range = "main...HEAD" }));
 
     try std.testing.expect(sourceAllowsStageProjection(.unstaged));
-    try std.testing.expect(sourceAllowsStageProjection(.cached));
     try std.testing.expect(!sourceAllowsStageProjection(.{ .range = "main...HEAD" }));
 
     try std.testing.expect(sourceAllowsEditorAction(.unstaged));
-    try std.testing.expect(sourceAllowsEditorAction(.cached));
     try std.testing.expect(!sourceAllowsEditorAction(.{ .range = "main...HEAD" }));
 }
 
 test "repository link accepts only current repository Changes sources" {
     try std.testing.expect(sourceAllowsRepositoryLink(.unstaged));
-    try std.testing.expect(sourceAllowsRepositoryLink(.cached));
-    try std.testing.expect(!sourceAllowsRepositoryLink(.stdin));
-    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .pager = "pager" }));
     try std.testing.expect(!sourceAllowsRepositoryLink(.{ .patch_file = "change.patch" }));
     try std.testing.expect(!sourceAllowsRepositoryLink(.{ .range = "HEAD~1..HEAD" }));
-    try std.testing.expect(!sourceAllowsRepositoryLink(.{ .no_index = .{ .left = "a", .right = "b" } }));
 }
 
 test "cloneLoadRequest duplicates source payload and repo root" {
@@ -670,26 +366,8 @@ test "load requires repo root before routing git sources to backend" {
     }, .none));
 }
 
-test "stripAnsiAlloc removes common CSI color sequences" {
-    const allocator = std.testing.allocator;
-    const stripped = try stripAnsiAlloc(allocator, "\x1b[31mdiff --git a/a b/a\x1b[0m\n\x1b[m");
-    defer allocator.free(stripped);
-
-    try std.testing.expectEqualStrings("diff --git a/a b/a\n", stripped);
-}
-
-test "stripAnsiAlloc removes multi-parameter CSI sequences" {
-    const allocator = std.testing.allocator;
-    const stripped = try stripAnsiAlloc(allocator, "\x1b[1;32m+added\x1b[39;49m");
-    defer allocator.free(stripped);
-
-    try std.testing.expectEqualStrings("+added", stripped);
-}
-
-test "stripAnsiAlloc drops incomplete escape sequences safely" {
-    const allocator = std.testing.allocator;
-    const stripped = try stripAnsiAlloc(allocator, "line\n\x1b[31");
-    defer allocator.free(stripped);
-
-    try std.testing.expectEqualStrings("line\n", stripped);
+test "parseArgs rejects removed startup options" {
+    for ([_][]const u8{ "--stdin", "--pager", "--difftool", "--export-context", "--cached" }) |option| {
+        try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "gitframe", option }));
+    }
 }

@@ -1893,7 +1893,7 @@ pub const Controller = struct {
         _ = self.page.activation.finishMember(
             deferred.finished.identity,
             .source,
-            self.acceptedSourceMember(),
+            .fresh,
         );
         if (source_completion) |completion| {
             _ = self.page.action_cursor.finishCompletion(completion, true);
@@ -2015,7 +2015,7 @@ pub const Controller = struct {
         _ = self.page.activation.finishMember(
             deferred.finished.identity,
             .source,
-            self.acceptedSourceMember(),
+            .fresh,
         );
         if (source_completion) |completion| {
             _ = self.page.action_cursor.finishCompletion(completion, true);
@@ -3479,7 +3479,7 @@ pub const Controller = struct {
         _ = self.page.activation.finishMember(
             deferred.finished.identity,
             .source,
-            self.acceptedSourceMember(),
+            .fresh,
         );
         if (source_completion) |completion| {
             _ = self.page.action_cursor.finishCompletion(completion, true);
@@ -3913,12 +3913,12 @@ pub const Controller = struct {
                     acceptance_restore = null;
                 }
                 outcome.recovered_failure = self.acceptSourceFingerprint(content_fingerprint.Fingerprint.init(""));
-                _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
+                _ = self.page.activation.finishMember(finished.identity, .source, .fresh);
                 can_project_status = true;
             },
             .unchanged => |fingerprint| {
                 outcome.recovered_failure = self.acceptSourceFingerprint(fingerprint);
-                _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
+                _ = self.page.activation.finishMember(finished.identity, .source, .fresh);
                 outcome.redraw = .skip_unless_recovered_failure_cleared;
                 return outcome;
             },
@@ -3932,7 +3932,7 @@ pub const Controller = struct {
                 switch (load_state.watchReloadRebuildDecision(consumed_pending_is_watch, current_loaded != null, texts_equal)) {
                     .skip_rebuild_identical_text => {
                         outcome.recovered_failure = self.acceptSourceFingerprint(bundle.fingerprint);
-                        _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
+                        _ = self.page.activation.finishMember(finished.identity, .source, .fresh);
                         const prefer_first = !had_loaded_before and !had_action_cursor;
                         if (prefer_first and self.page.status_load.isPending()) {
                             self.page.pending_initial_first_visible_selection = true;
@@ -3959,7 +3959,7 @@ pub const Controller = struct {
                     acceptance_restore = null;
                 }
                 outcome.recovered_failure = self.acceptSourceFingerprint(bundle.fingerprint);
-                _ = self.page.activation.finishMember(finished.identity, .source, self.acceptedSourceMember());
+                _ = self.page.activation.finishMember(finished.identity, .source, .fresh);
 
                 const active_loaded = self.navigation.activeLoadedDiff().?;
                 const restored_from_anchor = if (self.page.pending_display_navigation_restore) |*restore|
@@ -4050,10 +4050,6 @@ pub const Controller = struct {
         return kind == .watch or
             (kind == .action_result and self.page.action_cursor.hasOwner() and
                 !self.page.action_cursor.hasRestoreAuthority());
-    }
-
-    fn acceptedSourceMember(self: Controller) authority.MemberFreshness {
-        return if (diff_source.sourceIsOneShotInput(self.source)) .immutable else .fresh;
     }
 
     pub fn restoreDisplayedNavigation(
@@ -4311,15 +4307,14 @@ pub const Controller = struct {
 pub fn sourceKind(source: diff_source.SourceMode) changes_projection.SourceKind {
     return switch (source) {
         .unstaged => .unstaged,
-        .cached => .cached,
-        .stdin, .pager, .patch_file, .range, .no_index => .other,
+        .patch_file, .range => .other,
     };
 }
 
 fn sourceIsUnstaged(source: diff_source.SourceMode) bool {
     return switch (source) {
         .unstaged => true,
-        .cached, .stdin, .pager, .patch_file, .range, .no_index => false,
+        .patch_file, .range => false,
     };
 }
 
@@ -5386,7 +5381,7 @@ test "repository read completion admission requires current open epoch and cycle
     var page: changes_page.ChangesPageState = .{};
     defer page.deinit(std.testing.allocator);
     page.repository_read_authority.epoch = .{ .value = 11 };
-    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    page.auto_reload = .init(.inherit, .{});
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
@@ -5462,7 +5457,7 @@ test "mutation read fence closes one exact owner and preserves read drain owners
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer page.deinit(allocator);
-    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    page.auto_reload = .init(.inherit, .{});
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
     const identity = page.activation.currentIdentity().?;
@@ -5718,7 +5713,7 @@ test "mutation read fence retains deferred source until production apply drains 
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer page.deinit(allocator);
-    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    page.auto_reload = .init(.inherit, .{});
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
     const old_epoch = page.repository_read_authority.epoch;
@@ -6086,7 +6081,7 @@ test "superseded repository read status terminal drains without publication" {
     defer page.deinit(allocator);
     var initial = try git_status.StatusBundle.parseOwned(allocator, "M  retained.zig\x00");
     try page.git_status.replace("/repo", &initial);
-    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    page.auto_reload = .init(.inherit, .{});
     const cycle_id = page.auto_reload.beginCycle().?;
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
@@ -10526,7 +10521,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
 
     var blocked_page: changes_page.ChangesPageState = .{};
     defer blocked_page.deinit(allocator);
-    blocked_page.auto_reload = .init(.inherit, .{}, .unstaged);
+    blocked_page.auto_reload = .init(.inherit, .{});
     const blocked_cycle = blocked_page.auto_reload.beginCycle().?;
     try std.testing.expect(blocked_page.auto_reload.markMemberStarted(blocked_cycle, .source));
     try std.testing.expect(blocked_page.auto_reload.moveMember(blocked_cycle, .source, .deferred_source_apply));
@@ -10552,7 +10547,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
 
     var accepted_page: changes_page.ChangesPageState = .{};
     defer accepted_page.deinit(allocator);
-    accepted_page.auto_reload = .init(.inherit, .{}, .unstaged);
+    accepted_page.auto_reload = .init(.inherit, .{});
     const accepted_cycle = accepted_page.auto_reload.beginCycle().?;
     try std.testing.expect(accepted_page.auto_reload.markMemberStarted(accepted_cycle, .source));
     try std.testing.expect(accepted_page.auto_reload.moveMember(accepted_cycle, .source, .deferred_source_apply));
@@ -10609,7 +10604,7 @@ test "superseded deferred source retires exact ownership without publication" {
         .loaded => |*session| session.loaded.text.ptr,
         else => unreachable,
     };
-    page.auto_reload = .init(.inherit, .{}, .unstaged);
+    page.auto_reload = .init(.inherit, .{});
     const cycle_id = page.auto_reload.beginCycle().?;
     try std.testing.expect(page.auto_reload.markMemberStarted(cycle_id, .source));
     try std.testing.expect(page.auto_reload.moveMember(cycle_id, .source, .deferred_source_apply));

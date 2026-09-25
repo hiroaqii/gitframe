@@ -234,12 +234,8 @@ pub const View = struct {
         const repo_root = self.repo_root orelse "";
         return switch (self.surface.source) {
             .unstaged => std.fmt.allocPrint(allocator, "{s}\x1funstaged", .{repo_root}),
-            .cached => std.fmt.allocPrint(allocator, "{s}\x1fcached", .{repo_root}),
             .range => |range| std.fmt.allocPrint(allocator, "{s}\x1frange\x1f{s}", .{ repo_root, range }),
             .patch_file => |path| std.fmt.allocPrint(allocator, "{s}\x1fpatch\x1f{s}", .{ repo_root, path }),
-            .stdin => std.fmt.allocPrint(allocator, "{s}\x1fstdin", .{repo_root}),
-            .pager => std.fmt.allocPrint(allocator, "{s}\x1fpager", .{repo_root}),
-            .no_index => |paths| std.fmt.allocPrint(allocator, "{s}\x1fno-index\x1f{s}\x1f{s}", .{ repo_root, paths.left, paths.right }),
         };
     }
 

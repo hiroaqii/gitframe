@@ -127,15 +127,7 @@ fn changesActionFence(app: *App) changes_action_fence.Controller {
 }
 
 fn activateChanges(app: *App) u64 {
-    const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        switch (app.pages.changes.load.state) {
-            .loaded, .empty => .immutable,
-            .loading => .pending,
-            .failed => .failed,
-            .idle => .pending,
-        }
-    else
-        .pending;
+    const source_member: changes_authority.MemberFreshness = .pending;
     const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
     return app.pages.changes.activation.activate(app.repo_session.view().epoch(), source_member, auxiliary, auxiliary);
 }
@@ -219,7 +211,7 @@ fn shellEffectOrigins(app: *const App) shell_effects.OriginContext {
 }
 
 fn currentChangesActionRoot(app: *const App) ?[]const u8 {
-    if (app.active_page != .changes or app.pages.changes.activation.currentIdentity() == null or diff_source.sourceIsOneShotInput(app.config.source)) return null;
+    if (app.active_page != .changes or app.pages.changes.activation.currentIdentity() == null) return null;
     return app.repo_session.view().activeRoot();
 }
 

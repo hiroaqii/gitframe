@@ -661,7 +661,7 @@ test "changes repository transition no context bypasses identity and retains bro
 
     var app: TestApp = .{
         .allocator = allocator,
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .pages = .{
             .changes = .{ .load = app_test_support.loadState(app_test_support.loadedDiffOne()) },
             .repository = .{
@@ -942,9 +942,7 @@ fn acceptTestSource(app: *TestApp) void {
 }
 
 fn syncTestActivation(app: *TestApp) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending

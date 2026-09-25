@@ -68,7 +68,6 @@ pub const RepositoryFileStatusLoadResult = union(enum) {
 
 pub const GitDiffKind = union(enum) {
     unstaged,
-    cached,
     file: FileDiffRequest,
     range: []const u8,
 };
@@ -86,12 +85,6 @@ pub const FileDiffRequest = struct {
 pub const GitDiffRequest = struct {
     context: git_command.DirectoryContext,
     kind: GitDiffKind,
-};
-
-pub const NoIndexDiffRequest = struct {
-    environment: *const git_command.LocalGitEnvironment,
-    left: []const u8,
-    right: []const u8,
 };
 
 pub const ReadOrigin = enum {
@@ -490,7 +483,6 @@ fn validObjectId(oid: []const u8) bool {
 }
 
 const git_diff_unstaged = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
-const git_diff_cached = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
 const foreground_status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
 const background_status_argv = [_][]const u8{ "git", "--no-optional-locks", "status", "--porcelain=v1", "-z", "-uall" };
 const repository_manifest_argv = [_][]const u8{
@@ -515,39 +507,9 @@ const repository_file_status_argv = [_][]const u8{
 pub fn loadDiff(allocator: std.mem.Allocator, io: std.Io, request: GitDiffRequest) git_command.Error!LoadResult {
     return switch (request.kind) {
         .unstaged => loadGitDiff(allocator, io, request.context, &git_diff_unstaged),
-        .cached => loadGitDiff(allocator, io, request.context, &git_diff_cached),
         .file => |file| loadGitFileDiff(allocator, io, request.context, file),
         .range => |range| loadGitDiffRange(allocator, io, request.context, range),
     };
-}
-
-pub fn loadNoIndexDiff(allocator: std.mem.Allocator, io: std.Io, request: NoIndexDiffRequest) git_command.Error!LoadResult {
-    const argv = [_][]const u8{
-        "git",
-        "diff",
-        "--no-index",
-        "--no-color",
-        "--no-ext-diff",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        "--",
-        request.left,
-        request.right,
-    };
-    const result = try git_command.runNonRepositoryCaptured(allocator, io, .inherit, request.environment, .{
-        .argv = &argv,
-        .stdout_limit = .limited(max_diff_bytes),
-        .stderr_limit = .limited(256 * 1024),
-    });
-
-    if (isNoIndexSuccess(result.term, result.stdout.len)) {
-        allocator.free(result.stderr);
-        return .{ .ok = result.stdout };
-    }
-    allocator.free(result.stdout);
-    if (result.stderr.len > 0) return .{ .failed = result.stderr };
-    allocator.free(result.stderr);
-    return .{ .failed = std.fmt.allocPrint(allocator, "git diff --no-index failed: {any}", .{result.term}) catch return error.OutOfMemory };
 }
 
 pub fn loadStatus(allocator: std.mem.Allocator, io: std.Io, request: GitStatusRequest) git_command.Error!StatusLoadResult {
@@ -717,13 +679,6 @@ fn repositoryManifestArgv() []const []const u8 {
 
 fn repositoryFileStatusArgv() []const []const u8 {
     return &repository_file_status_argv;
-}
-
-fn isNoIndexSuccess(term: std.process.Child.Term, stdout_len: usize) bool {
-    return switch (term) {
-        .exited => |code| code == 0 or (code == 1 and stdout_len > 0),
-        else => false,
-    };
 }
 
 fn testingLocalGitEnvironment(allocator: std.mem.Allocator) !git_command.LocalGitEnvironment {
@@ -1131,14 +1086,6 @@ test "GitDiffRequest cannot represent raw input sources" {
 
     try std.testing.expectEqual(std.Io.Dir.cwd().handle, request.context.cwd.handle);
     try std.testing.expect(request.kind == .unstaged);
-}
-
-test "no-index diff treats exit one as success only with diff output" {
-    try std.testing.expect(isNoIndexSuccess(.{ .exited = 0 }, 0));
-    try std.testing.expect(isNoIndexSuccess(.{ .exited = 1 }, 1));
-    try std.testing.expect(!isNoIndexSuccess(.{ .exited = 1 }, 0));
-    try std.testing.expect(!isNoIndexSuccess(.{ .exited = 2 }, 1));
-    try std.testing.expect(!isNoIndexSuccess(.{ .unknown = 9 }, 1));
 }
 
 fn runTestGitWithDates(

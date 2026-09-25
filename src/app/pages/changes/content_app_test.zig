@@ -38,9 +38,7 @@ fn changesContent(app: *const App) changes_content.View {
 
 fn acceptTestSource(app: *App) void {
     app.pages.changes.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("test source"));
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending
@@ -81,7 +79,7 @@ test "selectedEditorTarget accepts status-only file rows" {
                 .selected_target = .{ .status_only = 0 },
             },
         } },
-        .config = .{ .source = .cached },
+        .config = .{ .source = .unstaged },
         .repo_session = .{
             .repo_state = .{ .discovery = .{ .single_repo = .{
                 .label = "repo",
@@ -114,7 +112,7 @@ test "selectedEditorTarget rejects deleted and historical sources" {
                 .selected_target = .{ .diff_file = 1 },
             },
         } },
-        .config = .{ .source = .cached },
+        .config = .{ .source = .unstaged },
         .repo_session = .{
             .repo_state = .{ .discovery = .{ .single_repo = .{
                 .label = "repo",

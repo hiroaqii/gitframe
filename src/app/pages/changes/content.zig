@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const app_load = if (builtin.is_test) @import("../../load.zig") else struct {};
 const app_page = if (builtin.is_test) @import("../../page.zig") else struct {};
 const app_state = if (builtin.is_test) @import("../../state.zig") else struct {};
 const page_link = @import("../../page_link.zig");
@@ -84,11 +85,7 @@ pub const View = struct {
         return switch (displayed_body) {
             .primary => |primary| self.parsedRepositoryTarget(
                 primary.loaded.document.files[primary.file_index],
-                switch (self.source) {
-                    .unstaged => .worktree,
-                    .cached => .cached,
-                    else => unreachable,
-                },
+                .worktree,
                 repo_root,
             ),
             .cached => |bundle| self.parsedRepositoryTarget(bundle.loaded.document.files[0], .cached, repo_root),
@@ -643,7 +640,7 @@ test "Changes repository target reads accepted primary body without editor fallb
     try std.testing.expect(view.repositoryTarget() == .no_context);
 }
 
-test "Changes cached target requires fresh exact status with no worktree change" {
+test "Changes cached projection target requires fresh exact status with no worktree change" {
     const allocator = std.testing.allocator;
     var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
@@ -658,7 +655,22 @@ test "Changes cached target requires fresh exact status with no worktree change"
 
     var clean_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
     try page.git_status.replace("/repo", &clean_status);
-    const view = changesContentTestView(&page, .cached);
+    page.viewer.selected_target = .{ .status_only = 0 };
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
+            allocator,
+            app_page.RequestIdentity.changes(4, 1),
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            0,
+            0,
+        ),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_support.diff_one) },
+    });
+    const view = changesContentTestView(&page, .unstaged);
     try expectRepositoryLocation(view.repositoryTarget(), "a", 1);
 
     var changed_status = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");

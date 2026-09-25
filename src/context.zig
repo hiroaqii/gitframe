@@ -3,16 +3,11 @@ const path_key = @import("path_key.zig");
 /// Diff source class exposed to external integrations.
 ///
 /// This deliberately mirrors the user-visible source modes without importing
-/// the CLI module, keeping context export usable from tests and browser-facing
-/// code that do not need terminal argument parsing.
+/// the CLI module, keeping selection context independent of argument parsing.
 pub const SourceKind = enum {
     unstaged,
-    cached,
-    stdin,
-    pager,
     patch_file,
     range,
-    no_index,
 };
 
 /// Borrowed description of the active source.
@@ -23,8 +18,6 @@ pub const SourceContext = struct {
     kind: SourceKind,
     label: []const u8,
     detail: ?[]const u8 = null,
-    left_path: ?[]const u8 = null,
-    right_path: ?[]const u8 = null,
 };
 
 /// Canonical repo-relative path used to connect diff files, status entries,

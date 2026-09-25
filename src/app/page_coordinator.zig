@@ -57,15 +57,7 @@ pub const Controller = struct {
     shell_blockers: ShellBlockers,
 
     pub fn activateChanges(self: Controller) u64 {
-        const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(self.source))
-            switch (self.changes.load.state) {
-                .loaded, .empty => .immutable,
-                .loading => .pending,
-                .failed => .failed,
-                .idle => .pending,
-            }
-        else
-            .pending;
+        const source_member: changes_authority.MemberFreshness = .pending;
         const has_repo = self.repo.activeRoot() != null;
         const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(self.source) and has_repo)
             .pending

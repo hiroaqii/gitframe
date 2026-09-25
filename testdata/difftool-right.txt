@@ -1,4 +1,0 @@
-first line
-new value
-shared line
-added line

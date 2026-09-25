@@ -416,7 +416,7 @@ pub const View = struct {
         const hunk_index = self.navigation.selectedHunkIndex() orelse return .no_hunk;
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
 
-        if (sourceIsCached(self.source) or cached_authority) {
+        if (cached_authority) {
             return if (can_unstage) .{ .operation = .unstage } else .unavailable_source;
         }
 
@@ -505,8 +505,7 @@ pub const View = struct {
         if (file.hunks.len == 0 or hunk_index >= file.hunks.len) return .no_hunk;
         if (file.is_binary) return .binary_unsupported;
         if (diff_file.status(file) != .modified or diff_file.hasModeChange(file)) return .unsupported_file_state;
-        const cached_hunk = sourceIsCached(self.source) or cached_authority;
-        const mark_key = if (cached_hunk)
+        const mark_key = if (cached_authority)
             null
         else
             self.sessionHunkMarkKey(hunk_index) orelse return .stale_source;
@@ -531,7 +530,7 @@ pub const View = struct {
             .hunk_index = hunk_index,
             .patch = patch,
             .session_mark_mutation = if (mark_key) |key| .{ .remove = key } else .none,
-            .reload_after_success = cached_hunk,
+            .reload_after_success = cached_authority,
         } };
     }
 
@@ -758,13 +757,6 @@ pub const Controller = struct {
         };
     }
 };
-
-fn sourceIsCached(source: diff_source.SourceMode) bool {
-    return switch (source) {
-        .cached => true,
-        else => false,
-    };
-}
 
 fn clonePushProposal(
     allocator: std.mem.Allocator,
@@ -1159,7 +1151,7 @@ test "stage target skips only fresh staged-only files" {
     var other = try @import("../../../git/status.zig").StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
     try page.git_status.replace("/other", &other);
     try std.testing.expect(testView(&page, .unstaged).stageTarget() == .ready);
-    try std.testing.expect(testView(&page, .cached).stageTarget() == .unavailable_source);
+    try std.testing.expect(testView(&page, .{ .patch_file = "change.patch" }).stageTarget() == .unavailable_source);
 }
 
 test "retained staged-only read epoch authority builds unstage patch and becomes inert when superseded" {
@@ -1285,7 +1277,7 @@ test "retained staged-only read epoch authority builds unstage patch and becomes
     try std.testing.expect(view.selectedHunkUnstageTarget(allocator) == .stale_status);
 }
 
-test "ordinary cached source hunk unstage keeps source and status reload membership" {
+test "cached projection hunk unstage keeps source and status reload membership" {
     const allocator = std.testing.allocator;
     var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
@@ -1297,10 +1289,25 @@ test "ordinary cached source hunk unstage keeps source and status reload members
     try page.git_status.replace("/repo", &status);
     page.status_load.markSuccess();
 
-    const view = testView(&page, .cached);
+    page.viewer.selected_target = .{ .status_only = 0 };
+    page.changes_projection.installReady(.{
+        .request = try changes_projection.testing.cloneRequest(
+            allocator,
+            app_page.RequestIdentity.changes(0, 1),
+            1,
+            "/repo",
+            "a",
+            .cached_diff,
+            .unstaged,
+            0,
+            0,
+        ),
+        .value = .{ .cached_diff = try app_load.buildLoadedBundle(allocator, test_support.diff_one) },
+    });
+    const view = testView(&page, .unstaged);
     const target = switch (view.selectedHunkUnstageTarget(allocator)) {
         .ready => |target| target,
-        else => return error.ExpectedCachedPrimaryUnstageTarget,
+        else => return error.ExpectedCachedProjectionUnstageTarget,
     };
     defer allocator.free(target.patch);
     try std.testing.expectEqual(git_ops.SessionHunkMarkMutation.none, target.session_mark_mutation);
@@ -1348,9 +1355,6 @@ test "stage toggle resolves file operation from fresh status" {
         },
         else => return error.ExpectedToggleConflict,
     }
-    var cached = try @import("../../../git/status.zig").StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
-    try page.git_status.replace("/repo", &cached);
-    try std.testing.expectEqual(git_ops.ToggleStageTargetResult{ .operation = .unstage }, testView(&page, .cached).toggleStageTarget());
     try std.testing.expect(testView(&page, .{ .range = "main...HEAD" }).toggleStageTarget() == .unavailable_source);
 }
 
@@ -1404,7 +1408,6 @@ test "unstage target requires fresh staged status" {
     var staged = try @import("../../../git/status.zig").StatusBundle.parseOwned(std.testing.allocator, "A  src/added.zig\x00");
     try page.git_status.replace("/repo", &staged);
     try std.testing.expect(testView(&page, .unstaged).unstageTarget() == .ready);
-    try std.testing.expect(testView(&page, .cached).unstageTarget() == .ready);
     page.status_load.pending = .{ .generation = 1 };
     try std.testing.expect(testView(&page, .unstaged).unstageTarget() == .stale_status);
     page.status_load.pending = null;
@@ -1453,7 +1456,6 @@ test "hunk toggle resolves source and session staged state" {
     try std.testing.expect(unstage_target.session_mark_mutation == .remove);
     try std.testing.expect(unstage_target.session_mark_mutation.remove.eql(key));
 
-    try std.testing.expectEqual(git_ops.ToggleHunkTargetResult{ .operation = .unstage }, testView(&page, .cached).selectedHunkToggleOperation());
     try std.testing.expect(testView(&page, .{ .range = "main...HEAD" }).selectedHunkToggleOperation() == .unavailable_source);
 }
 

@@ -132,8 +132,7 @@ const RemoteHarness = struct {
 
     fn currentChangesActionRoot(self: *const RemoteHarness) ?[]const u8 {
         if (self.active_page != .changes or
-            self.pages.changes.activation.currentIdentity() == null or
-            diff_source.sourceIsOneShotInput(self.config.source)) return null;
+            self.pages.changes.activation.currentIdentity() == null) return null;
         return self.repoSessionView().activeRoot();
     }
 
@@ -336,9 +335,7 @@ fn finishTestAction(
 }
 
 fn syncTestActivation(app: *RemoteHarness) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending

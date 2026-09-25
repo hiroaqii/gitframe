@@ -120,15 +120,7 @@ fn changesReload(app: *App) changes_reload.Controller {
 }
 
 fn activateChanges(app: *App) u64 {
-    const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        switch (app.pages.changes.load.state) {
-            .loaded, .empty => .immutable,
-            .loading => .pending,
-            .failed => .failed,
-            .idle => .pending,
-        }
-    else
-        .pending;
+    const source_member: changes_authority.MemberFreshness = .pending;
     const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
     return app.pages.changes.activation.activate(app.repo_session.view().epoch(), source_member, auxiliary, auxiliary);
 }
@@ -1531,7 +1523,7 @@ test "mouse wheel scrolls the pane under the pointer" {
 test "wheel redraw reaches root for meaningful sidebar transition complete noop and reverse" {
     var app: App = .{
         .allocator = std.testing.allocator,
-        .config = .{ .source = .{ .no_index = .{ .left = "left", .right = "right" } } },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffTwo()),
             .viewer = .{ .focus = .diff, .selected_target = .{ .diff_file = 0 }, .selected_node = 0 },
@@ -1572,7 +1564,7 @@ test "wheel redraw reaches root for meaningful sidebar transition complete noop 
 }
 
 test "wheel redraw reaches root for semantic vertical and horizontal edges" {
-    const source: diff_source.SourceMode = .{ .no_index = .{ .left = "left", .right = "right" } };
+    const source: diff_source.SourceMode = .{ .patch_file = "change.patch" };
     var vertical: App = .{
         .allocator = std.testing.allocator,
         .config = .{ .source = source },
@@ -2131,10 +2123,10 @@ test "focus loss terminates selection without a deferred result" {
         .pages = .{ .changes = .{
             .selection_owner = .{ .diff_header = .{ .identity = .{ .kind = .loaded_file, .path_key = "a" } } },
         } },
-        .config = .{ .source = .{ .no_index = .{ .left = "left", .right = "right" } } },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
     };
     _ = activateChanges(&app);
-    app.pages.changes.auto_reload = .init(.inherit, .{}, app.config.source);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
     defer ctx.runtimeClearPendingEffectCopies();
     app.drag_auto_scroll.active = .{

@@ -145,7 +145,7 @@ pub const App = struct {
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
         self.local_workflow = workflow_local.LocalState.init(ctx.allocator());
-        self.pages.changes.init(self.config.auto_reload, self.user_config.reload, self.config.source);
+        self.pages.changes.init(self.config.auto_reload, self.user_config.reload);
         _ = self.pageCoordinator().activateChanges();
         if (self.pages.changes.auto_reload.enabled()) {
             try ctx.timer().every(auto_reload_timer_id, self.pages.changes.auto_reload.interval_ns, .auto_reload_tick);
@@ -466,8 +466,7 @@ pub const App = struct {
 
     fn currentChangesActionRoot(self: *const App) ?[]const u8 {
         if (self.active_page != .changes or
-            self.pages.changes.activation.currentIdentity() == null or
-            diff_source.sourceIsOneShotInput(self.config.source)) return null;
+            self.pages.changes.activation.currentIdentity() == null) return null;
         return self.repoSessionView().activeRoot();
     }
 
@@ -1836,16 +1835,6 @@ pub const App = struct {
 
     fn setChangesStatus(self: *App, comptime fmt: []const u8, args: anytype) void {
         self.pages.changes.status.set(fmt, args);
-    }
-
-    pub fn exportInitialSelectionContextJson(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        parent_environment: ?*const std.process.Environ.Map,
-        config: CliConfig,
-        writer: *std.Io.Writer,
-    ) !void {
-        return initial_selection.exportContextJson(allocator, io, parent_environment, config, writer);
     }
 
     /// Applies only the shell effects authorized by a completed repository

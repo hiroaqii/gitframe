@@ -151,20 +151,17 @@ fn headPresentation(
     } };
 }
 
-fn activationPresentation(changes: *const changes_page.ChangesPageState, source: diff_source.SourceMode) ?ActivationPresentation {
-    return diff_surface_view.activationPresentation(&changes.activation, source);
+fn activationPresentation(changes: *const changes_page.ChangesPageState) ?ActivationPresentation {
+    return diff_surface_view.activationPresentation(&changes.activation);
 }
 
-test "reloadable activation reports validating and stale while one-shot input stays immutable" {
+test "activation reports validating and stale" {
     var changes: changes_page.ChangesPageState = .{};
     _ = changes.activation.activate(1, .pending, .pending, .pending);
-    try std.testing.expectEqual(ActivationPresentation.validating, activationPresentation(&changes, .unstaged).?);
+    try std.testing.expectEqual(ActivationPresentation.validating, activationPresentation(&changes).?);
 
     changes.activation.state.active.members = .{ .source = .fresh, .status = .failed, .branch = .fresh };
-    try std.testing.expectEqual(ActivationPresentation.stale, activationPresentation(&changes, .unstaged).?);
-
-    try std.testing.expect(activationPresentation(&changes, .stdin) == null);
-    try std.testing.expect(activationPresentation(&changes, .{ .pager = "" }) == null);
+    try std.testing.expectEqual(ActivationPresentation.stale, activationPresentation(&changes).?);
 }
 
 pub fn view(app: Context, surface: *chasen.Surface) !void {

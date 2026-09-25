@@ -51,15 +51,7 @@ const RepositorySyntaxTask = repository_tasks.SyntaxTask(app_message.Msg);
 const RepositoryChangeMapTask = repository_tasks.ChangeMapTask(app_message.Msg);
 
 fn activateChanges(app: *App) u64 {
-    const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        switch (app.pages.changes.load.state) {
-            .loaded, .empty => .immutable,
-            .loading => .pending,
-            .failed => .failed,
-            .idle => .pending,
-        }
-    else
-        .pending;
+    const source_member: changes_authority.MemberFreshness = .pending;
     const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(app.config.source) and app.repo_session.view().activeRoot() != null) .pending else .unavailable;
     return app.pages.changes.activation.activate(
         app.repo_session.view().epoch(),
@@ -75,7 +67,7 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     defer roots.deinit();
     var app: App = .{
         .allocator = allocator,
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .pages = .{ .changes = .{ .viewer = .{ .diff_scroll = 17 } } },
         .repo_session = .{
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
@@ -249,12 +241,15 @@ test "Repository active pointer owner blocks wheel redraw until release" {
 
 test "keyboard and page bar mouse share the page switch transition" {
     var app: App = .{
-        .config = .{ .source = .stdin },
+        .allocator = std.testing.allocator,
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .terminal_size = .{ .width = 100, .height = 20 },
         .pages = .{ .changes = .{ .load = .{ .state = .{ .empty = .no_changes } } } },
     };
+    defer app.pages.changes.deinit(std.testing.allocator);
     _ = activateChanges(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
 
     const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }) orelse return error.ExpectedPageSwitch;
     try std.testing.expectEqual(App.Msg{ .switch_page = .repository }, keyboard);
@@ -279,13 +274,13 @@ test "keyboard and page bar mouse share the page switch transition" {
     try std.testing.expectEqual(App.Msg{ .switch_page = .changes }, mouse);
     try app.update(mouse, &ctx);
     try std.testing.expectEqual(page.Id.changes, app.active_page);
-    try std.testing.expect(app.pages.changes.activation.state.satisfiesAction(.read_diff));
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expect(!app.pages.changes.activation.state.satisfiesAction(.read_diff));
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
 }
 
 test "page key 4 activates Compare without replacing retained Changes state" {
     var app: App = .{
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
             .viewer = .{ .diff_scroll = 11 },
@@ -683,7 +678,7 @@ test "changes repository transition common switch consumes pending and unavailab
             .repo_session = .{
                 .repo_epoch = 7,
             },
-            .config = .{ .source = .stdin },
+            .config = .{ .source = .{ .patch_file = "change.patch" } },
             .pages = .{
                 .changes = .{
                     .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -717,6 +712,7 @@ test "changes repository transition common switch consumes pending and unavailab
         );
         app.pages.repository.acceptIncoming(allocator, &incoming);
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
         try app.update(.{ .switch_page = .changes }, &ctx);
 
@@ -726,7 +722,7 @@ test "changes repository transition common switch consumes pending and unavailab
         try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
         try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
         try std.testing.expectEqualStrings("Repository has no resolved file to open in Changes", app.status.text());
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
     }
 }
 
@@ -1149,9 +1145,7 @@ fn acceptTestSource(app: *App) void {
 }
 
 fn syncTestActivation(app: *App) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending

@@ -108,15 +108,7 @@ const ChangesActivationHarness = struct {
     source: diff_source.SourceMode,
 
     fn activateChanges(self: ChangesActivationHarness) u64 {
-        const source_member: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(self.source))
-            switch (self.changes.load.state) {
-                .loaded, .empty => .immutable,
-                .loading => .pending,
-                .failed => .failed,
-                .idle => .pending,
-            }
-        else
-            .pending;
+        const source_member: changes_authority.MemberFreshness = .pending;
         const auxiliary: changes_authority.MemberFreshness = if (diff_source.sourceRequiresRepo(self.source) and self.repo.activeRoot() != null)
             .pending
         else
@@ -328,7 +320,6 @@ fn actionTargetsCurrentChanges(
 ) bool {
     return app.active_page == .changes and
         app.pages.changes.activation.currentIdentity() != null and
-        !diff_source.sourceIsOneShotInput(app.config.source) and
         app.repoSessionView().activeRootMatches(repo_root);
 }
 
@@ -575,7 +566,7 @@ fn canonicalPublicationTestApp(
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -628,7 +619,7 @@ fn canonicalPublicationPrimaryTestApp(
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, repo_root) },
         },
         .pages = .{ .changes = .{
-            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -692,7 +683,7 @@ fn ordinaryPrimaryPublicationTestApp(
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}, .unstaged),
+            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -1614,9 +1605,7 @@ fn addCurrentTestSessionHunkMark(
 }
 
 fn syncTestActivation(app: *ReadHarness) void {
-    const source: changes_authority.MemberFreshness = if (diff_source.sourceIsOneShotInput(app.config.source))
-        .immutable
-    else if (app.pages.changes.auto_reload.sourceIsActionable())
+    const source: changes_authority.MemberFreshness = if (app.pages.changes.auto_reload.sourceIsActionable())
         .fresh
     else if (app.pages.changes.load.hasPending())
         .pending
@@ -2155,7 +2144,7 @@ test "Changes revalidation startup retries repository discovery after detached t
     try std.testing.expect(retry_task.environment.borrow().get("gIt_retry_selector") == null);
 }
 
-test "Changes revalidation startup discards inactive and one-shot terminal fallback" {
+test "Changes revalidation startup discards inactive terminal fallback" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
     defer roots.deinit();
@@ -2178,33 +2167,10 @@ test "Changes revalidation startup discards inactive and one-shot terminal fallb
         null,
     ));
 
-    var one_shot = try mutationFenceRepoTestApp(allocator, roots.a);
-    defer one_shot.pages.changes.deinit(allocator);
-    defer one_shot.repo_session.repo_state.deinit(allocator);
-    one_shot.config.source = .stdin;
-    one_shot.pages.changes.activation.deactivate();
-    _ = one_shot.pageCoordinator().activateChanges();
-    const one_shot_pending = one_shot.actionLifecycle().prepare(.stage_file).pending;
-    one_shot.acceptActionLaunch(one_shot_pending);
-    const one_shot_fence_closed =
-        !one_shot.pages.changes.repository_read_authority.mayStartRepositoryRead();
-    var one_shot_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator };
-    try std.testing.expect(try finishTestAction(
-        &one_shot,
-        &one_shot_ctx,
-        one_shot_pending,
-        roots.a,
-        null,
-    ));
-
     try std.testing.expect(inactive_fence_closed);
     try std.testing.expect(!inactive.action_runtime.view().hasPending());
     try std.testing.expect(inactive.pages.changes.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expectEqual(@as(u8, 0), inactive_ctx._pending_tasks_with_len);
-    try std.testing.expect(one_shot_fence_closed);
-    try std.testing.expect(!one_shot.action_runtime.view().hasPending());
-    try std.testing.expect(one_shot.pages.changes.repository_read_authority.mayStartRepositoryRead());
-    try std.testing.expectEqual(@as(u8, 0), one_shot_ctx._pending_tasks_with_len);
 }
 
 test "Changes revalidation startup retains both intents after status-only rejection" {
@@ -2453,7 +2419,7 @@ test "action refresh closes source rejection after its already-started status me
     defer roots.deinit();
     var app: ReadHarness = .{
         .allocator = allocator,
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
         .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
@@ -2649,7 +2615,7 @@ test "Changes page header identical branch recovery redraws fresh terminal" {
     try app.pages.changes.branch_status.replace("/repo", &current);
     const root_ptr = app.pages.changes.branch_status.repo_root.?.ptr;
 
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .branch));
     const generation = app.pages.changes.branch_status_load.prepare(true);
@@ -2806,7 +2772,7 @@ test "combined projection target is requested for mixed modified unstaged files"
     try std.testing.expectEqualStrings("/repo", target.repo_root);
     try std.testing.expectEqualStrings("a", target.path_key);
 
-    app.config.source = .cached;
+    app.config.source = .{ .patch_file = "change.patch" };
     try std.testing.expect(app.changesReloadView().projectionTarget() == null);
 }
 
@@ -4388,7 +4354,7 @@ test "fresh empty status consumes pending display restore at raw terminal" {
         .request = displayed_request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expectEqual(@as(u64, 1), cycle_id);
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .status));
@@ -5181,7 +5147,7 @@ test "background status failure retains display snapshot and marks action freshn
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a.zig\x00");
     try app.pages.changes.git_status.replace("/repo", &current);
 
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .status));
     const generation = app.pages.changes.status_load.prepare(true);
@@ -5231,7 +5197,7 @@ test "finishDiffLoad frees stale loaded bundle" {
 
 test "auto reload tick skips while auxiliary cycle members or mouse selection are pending" {
     var app: ReadHarness = .{};
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     app.pages.changes.status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
     var status_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = std.testing.allocator };
     try app.changesRead().autoReloadTick(&status_ctx);
@@ -5731,7 +5697,7 @@ test "diff task start failure invalidates accepted source and next watch cannot 
             .load = app_test_support.loadState(current),
         } },
         .allocator = std.testing.allocator,
-        .config = .{ .source = .stdin },
+        .config = .{ .source = .{ .patch_file = "change.patch" } },
     };
     _ = app.pageCoordinator().activateChanges();
     defer app.changesReload().clearPendingReload(std.testing.allocator);
@@ -5823,7 +5789,7 @@ test "changed watch result arriving during mouse selection defers apply until re
     defer app.changesReload().clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
@@ -5874,7 +5840,7 @@ test "deferred changed watch captures navigation when selection ends" {
     defer app.changesReload().clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{}, .unstaged);
+    app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);

@@ -24,7 +24,7 @@ pub const Store = struct {
         file: diff_parser.FileDiff,
         reviewed: bool,
     ) !void {
-        // Raw stdin/patch inputs have no stable repo identity. Keep their
+        // Patch inputs have no stable repo identity. Keep their
         // reviewed state in the active bool cache only, not in this store.
         if (repo_root == null) return;
         const key = try keyAlloc(allocator, repo_root.?, file) orelse return;

@@ -1,3 +1,0 @@
-first line
-old value
-shared line

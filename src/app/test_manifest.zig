@@ -5,7 +5,6 @@ pub fn include() void {
     _ = @import("../app.zig");
     _ = @import("../app_test.zig");
     _ = @import("effect_origin.zig");
-    _ = @import("initial_selection.zig");
     _ = @import("load_test.zig");
     _ = @import("message.zig");
     _ = @import("shell_effects_test.zig");

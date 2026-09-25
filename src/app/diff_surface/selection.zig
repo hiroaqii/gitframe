@@ -22,24 +22,19 @@ const review_tab_width: usize = 4;
 
 pub const SourceBasis = struct {
     kind: std.meta.Tag(diff_source.SourceMode),
-    parameter_a: Fingerprint,
-    parameter_b: Fingerprint,
+    parameter: Fingerprint,
 
     pub fn init(source: diff_source.SourceMode) SourceBasis {
         const empty = Fingerprint.init("");
         return switch (source) {
-            .unstaged => .{ .kind = .unstaged, .parameter_a = empty, .parameter_b = empty },
-            .cached => .{ .kind = .cached, .parameter_a = empty, .parameter_b = empty },
-            .stdin => .{ .kind = .stdin, .parameter_a = empty, .parameter_b = empty },
-            .pager => |value| .{ .kind = .pager, .parameter_a = Fingerprint.init(value), .parameter_b = empty },
-            .patch_file => |value| .{ .kind = .patch_file, .parameter_a = Fingerprint.init(value), .parameter_b = empty },
-            .range => |value| .{ .kind = .range, .parameter_a = Fingerprint.init(value), .parameter_b = empty },
-            .no_index => |paths| .{ .kind = .no_index, .parameter_a = Fingerprint.init(paths.left), .parameter_b = Fingerprint.init(paths.right) },
+            .unstaged => .{ .kind = .unstaged, .parameter = empty },
+            .patch_file => |value| .{ .kind = .patch_file, .parameter = Fingerprint.init(value) },
+            .range => |value| .{ .kind = .range, .parameter = Fingerprint.init(value) },
         };
     }
 
     pub fn eql(self: SourceBasis, other: SourceBasis) bool {
-        return self.kind == other.kind and self.parameter_a.eql(other.parameter_a) and self.parameter_b.eql(other.parameter_b);
+        return self.kind == other.kind and self.parameter.eql(other.parameter);
     }
 };
 

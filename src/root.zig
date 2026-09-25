@@ -7,13 +7,10 @@ pub const theme = @import("theme");
 const diff_source = @import("diff/source.zig");
 
 pub const App = app.App;
-pub const exportInitialSelectionContextJson = app.App.exportInitialSelectionContextJson;
 
 pub const CliConfig = diff_source.CliConfig;
 pub const ParseArgsError = diff_source.ParseArgsError;
 pub const parseArgs = diff_source.parseArgs;
-pub const freeSource = diff_source.freeSource;
-pub const preparePagerSource = diff_source.preparePagerSource;
 
 test {
     @import("app/test_manifest.zig").include();

@@ -237,9 +237,8 @@ pub const ChangesPageState = struct {
         self: *ChangesPageState,
         cli: diff_source.AutoReloadOverride,
         user: config.ReloadConfig,
-        source: diff_source.SourceMode,
     ) void {
-        self.auto_reload = .init(cli, user, source);
+        self.auto_reload = .init(cli, user);
     }
 
     pub fn advanceSelectionLayoutRevision(self: *ChangesPageState) void {
@@ -394,7 +393,7 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     try std.testing.expectEqual(diff_surface.Layout{ .width = 80, .height = 24 }, surface.layout);
 
     const const_state: *const ChangesPageState = &state;
-    const read_surface = const_state.readSurface(.cached, .{ .width = 96, .height = 31 });
+    const read_surface = const_state.readSurface(.unstaged, .{ .width = 96, .height = 31 });
     try std.testing.expectEqual(&state.activation, read_surface.activation);
     try std.testing.expectEqual(&state.status, read_surface.status);
     try std.testing.expectEqual(&state.load, read_surface.load);
@@ -413,7 +412,7 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     try std.testing.expectEqual(&state.pending_initial_first_visible_selection, read_surface.pending_initial_first_visible_selection);
     try std.testing.expect(read_surface.reload_anchor == null);
     try std.testing.expect(!read_surface.live_drag_deferred_source);
-    try std.testing.expectEqual(diff_source.SourceMode.cached, read_surface.source);
+    try std.testing.expectEqual(diff_source.SourceMode.unstaged, read_surface.source);
     try std.testing.expectEqual(diff_surface.Layout{ .width = 96, .height = 31 }, read_surface.layout);
 
     const narrowed = surface.readOnly();
@@ -484,7 +483,7 @@ test "ChangesPageState initializes reload policy and owns lifecycle cleanup" {
     const allocator = std.testing.allocator;
     var state: ChangesPageState = .{};
     errdefer state.deinit(allocator);
-    state.init(.inherit, .{}, .unstaged);
+    state.init(.inherit, .{});
     try std.testing.expect(state.auto_reload.enabled());
     try std.testing.expect(state.repository_read_authority.mayStartRepositoryRead());
 
