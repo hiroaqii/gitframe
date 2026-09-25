@@ -32,6 +32,7 @@ pub const KeyContext = struct {
     repository: repository_input.Context = .{},
     history: HistoryContext = .{},
     create_stash: ?*const @import("stash.zig").Create = null,
+    stash_catalog: ?*const @import("stash.zig").Catalog = null,
     commit_panel_mode: bool = false,
     repo_picker_mode: bool = false,
     repo_picker_input_mode: app_prompt.RepoPickerInputMode = .list,
@@ -112,6 +113,7 @@ pub fn eventToMsg(context: KeyContext, event: chasen.Event) ?app_message.Msg {
 }
 
 fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
+    if (context.stash_catalog != null) return null;
     if (context.create_stash != null) return .{ .stash = .{ .paste = text } };
     if (context.command_line_active) return .{ .command_line = if (text.len > 0 and std.unicode.utf8ValidateSlice(text))
         .{ .paste = text }
@@ -151,6 +153,19 @@ fn pasteToMsg(context: KeyContext, text: []const u8) ?app_message.Msg {
 }
 
 pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
+    if (context.stash_catalog) |catalog| {
+        if (catalog.confirmation != null) {
+            if (key.matches(chasen.Key.escape, .{}) or key.matches('q', .{})) return .{ .stash = .cancel_apply };
+            if (key.matches(chasen.Key.enter, .{})) return .{ .stash = .confirm_apply };
+        } else {
+            if (key.matches(chasen.Key.escape, .{}) or key.matches('q', .{})) return .{ .stash = .close_list };
+            if (key.matches(' ', .{})) return .{ .stash = .request_apply };
+            if (key.matches('j', .{}) or key.matches(chasen.Key.down, .{})) return .{ .stash = .next };
+            if (key.matches('k', .{}) or key.matches(chasen.Key.up, .{})) return .{ .stash = .previous };
+            if (key.matches('g', .{})) return .{ .stash = .first };
+        }
+        return null;
+    }
     if (context.create_stash) |dialog| {
         if (key.matches(chasen.Key.escape, .{})) return .{ .stash = .cancel };
         if (key.matches(chasen.Key.enter, .{})) return .{ .stash = .confirm };
@@ -208,6 +223,10 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.keymap.spec(.reload)) |spec| if (spec.matches(routing_key)) return app_message.Msg.reload;
 
     if (context.active_page == .changes) {
+        if (context.keymap.spec(.stash_list)) |spec| if (spec.matches(routing_key)) {
+            if (context.changes.selection_owner != .none or context.active_selection_gesture) return null;
+            return .{ .stash = .open_list };
+        };
         if (context.keymap.spec(.create_stash)) |spec| if (spec.matches(routing_key)) {
             if (context.changes.selection_owner != .none or context.active_selection_gesture) return null;
             return .{ .stash = .open };

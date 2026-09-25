@@ -13,6 +13,139 @@ pub const Scope = enum {
     }
 };
 
+pub const Entry = struct {
+    selector: []const u8,
+    oid: []const u8,
+    created: i64,
+    message: []const u8,
+};
+
+/// Entries borrow the owned command output. Display escaping never changes identity.
+pub const Catalog = struct {
+    bytes: []u8,
+    entries: []Entry,
+
+    pub fn deinit(self: *Catalog, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+pub const ListResult = union(enum) {
+    empty,
+    loaded: Catalog,
+    failed: []u8,
+    failed_static: []const u8,
+
+    pub fn deinit(self: *ListResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .loaded => |*catalog| catalog.deinit(allocator),
+            .failed => |detail| allocator.free(detail),
+            .empty, .failed_static => {},
+        }
+        self.* = .empty;
+    }
+};
+
+pub fn list(allocator: std.mem.Allocator, io: std.Io, context: command.DirectoryContext) !ListResult {
+    const result = try command.runCaptured(allocator, io, context, .{
+        .argv = &.{ "git", "stash", "list", "--no-color", "--encoding=UTF-8", "--format=%gd%x00%H%x00%ct%x00%gs", "-z" },
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    if (result.term != .exited or result.term.exited != 0) {
+        allocator.free(result.stdout);
+        if (result.stderr.len > 0) return .{ .failed = result.stderr };
+        allocator.free(result.stderr);
+        return .{ .failed_static = "Could not read Stashes; close and reopen the list" };
+    }
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+    return .{ .loaded = .{ .bytes = result.stdout, .entries = try parseEntries(allocator, result.stdout) } };
+}
+
+fn parseEntries(allocator: std.mem.Allocator, bytes: []const u8) ![]Entry {
+    var entries: std.ArrayList(Entry) = .empty;
+    errdefer entries.deinit(allocator);
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        var fields: [4][]const u8 = undefined;
+        for (&fields) |*field| {
+            const end = std.mem.indexOfScalar(u8, remaining, 0) orelse return error.InvalidStashCatalog;
+            field.* = remaining[0..end];
+            remaining = remaining[end + 1 ..];
+        }
+        const selector = fields[0];
+        if (!std.mem.startsWith(u8, selector, "stash@{") or !std.mem.endsWith(u8, selector, "}") or selector.len < 9)
+            return error.InvalidStashCatalog;
+        const index = std.fmt.parseInt(usize, selector[7 .. selector.len - 1], 10) catch return error.InvalidStashCatalog;
+        if (index != entries.items.len) return error.InvalidStashCatalog;
+        if (fields[1].len != 40 and fields[1].len != 64) return error.InvalidStashCatalog;
+        for (fields[1]) |c| if (!std.ascii.isHex(c)) return error.InvalidStashCatalog;
+        const created = std.fmt.parseInt(i64, fields[2], 10) catch return error.InvalidStashCatalog;
+        try entries.append(allocator, .{ .selector = selector, .oid = fields[1], .created = created, .message = fields[3] });
+    }
+    return entries.toOwnedSlice(allocator);
+}
+
+pub const ApplyRequest = struct {
+    branch: ?[]const u8,
+    head_oid: []const u8,
+    selector: []const u8,
+    stash_oid: []const u8,
+};
+
+pub const ApplyResult = struct {
+    operation: operations.OperationResult,
+    /// A rejected selector brings back the fresh catalog, without another read or mutation.
+    refreshed_catalog: ?Catalog = null,
+
+    pub fn deinit(self: *ApplyResult, allocator: std.mem.Allocator) void {
+        self.operation.deinit(allocator);
+        if (self.refreshed_catalog) |*catalog| catalog.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn apply(allocator: std.mem.Allocator, io: std.Io, context: command.DirectoryContext, request: ApplyRequest) !ApplyResult {
+    const current = try operations.readCurrentBranchOid(allocator, io, context, request.branch) orelse
+        return .{ .operation = .{ .failed_static = "Branch changed; reload and reopen Stashes" } };
+    defer allocator.free(current);
+    if (!std.mem.eql(u8, current, request.head_oid)) return .{ .operation = .{ .failed_static = "HEAD changed; reload and reopen Stashes" } };
+    var catalog = try list(allocator, io, context);
+    defer catalog.deinit(allocator);
+    if (catalog != .loaded) return .{ .operation = .{ .failed_static = "Could not revalidate selected stash; reopen Stashes" } };
+    const matched = for (catalog.loaded.entries) |entry| {
+        if (std.mem.eql(u8, entry.selector, request.selector)) break std.mem.eql(u8, entry.oid, request.stash_oid);
+    } else false;
+    if (!matched) {
+        const refreshed = catalog.loaded;
+        catalog = .empty;
+        return .{ .operation = .{ .failed_static = "Selected stash changed; list reloaded. Select again." }, .refreshed_catalog = refreshed };
+    }
+    // Use immutable identity after validation. Never restore the index or remove the stash.
+    const result = try command.runCaptured(allocator, io, context, .{
+        .argv = &.{ "git", "-c", "stash.index=false", "stash", "apply", request.stash_oid },
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    if (result.term == .exited and result.term.exited == 0) {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+        return .{ .operation = .ok };
+    }
+    if (result.stderr.len > 0) {
+        allocator.free(result.stdout);
+        return .{ .operation = .{ .failed = result.stderr } };
+    }
+    allocator.free(result.stderr);
+    // Merge conflicts are reported on stdout, with an unsuccessful exit status.
+    if (result.stdout.len > 0) return .{ .operation = .{ .failed = result.stdout } };
+    allocator.free(result.stdout);
+    return .{ .operation = .{ .failed_static = "Git stash apply failed; inspect Changes for conflicts" } };
+}
+
 pub const CreateRequest = struct {
     branch: ?[]const u8,
     oid: []const u8,
@@ -285,4 +418,83 @@ test "stash staged cleanup failure retains the new stash and never becomes succe
     const saved = try repo.output(&.{ "git", "show", "stash:mixed" });
     defer allocator.free(saved);
     try std.testing.expectEqualStrings("staged replacement\n", saved);
+}
+
+test "stash list and apply pin selector identity, revalidate HEAD and disable index restoration" {
+    const allocator = std.testing.allocator;
+    var repo = try TestRepo.init();
+    defer repo.deinit();
+    const head = try repo.output(&.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head);
+    try repo.write("mixed", "saved tracked\n");
+    try repo.git(&.{ "git", "add", "mixed" });
+    try repo.write("new", "saved untracked\n");
+    try repo.git(&.{ "git", "stash", "push", "-u", "-m", "café\tmessage" });
+    try repo.git(&.{ "git", "config", "stash.index", "true" });
+    try repo.git(&.{ "git", "config", "log.date", "iso" });
+    var catalog = try list(allocator, std.testing.io, repo.context());
+    defer catalog.deinit(allocator);
+    try std.testing.expect(catalog == .loaded);
+    try std.testing.expectEqual(@as(usize, 1), catalog.loaded.entries.len);
+    const entry = catalog.loaded.entries[0];
+    try std.testing.expectEqualStrings("stash@{0}", entry.selector);
+    try std.testing.expectEqualStrings("On main: café message", entry.message);
+    try std.testing.expect(entry.created > 0);
+    const request = ApplyRequest{ .branch = "main", .head_oid = std.mem.trimEnd(u8, head, "\n"), .selector = entry.selector, .stash_oid = entry.oid };
+    var applied = try apply(allocator, std.testing.io, repo.context(), request);
+    defer applied.deinit(allocator);
+    try std.testing.expect(applied.operation == .ok);
+    const restored = try repo.output(&.{ "git", "status", "--porcelain=v1", "-uall" });
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings(" M mixed\n?? new\n", restored);
+    try repo.git(&.{ "git", "stash", "push", "-u", "-m", "newer stash" });
+    var shifted = try apply(allocator, std.testing.io, repo.context(), request);
+    defer shifted.deinit(allocator);
+    try std.testing.expect(shifted.operation == .failed_static);
+    try std.testing.expectEqual(@as(usize, 2), shifted.refreshed_catalog.?.entries.len);
+    const clean = try repo.output(&.{ "git", "status", "--porcelain=v1", "-uall" });
+    defer allocator.free(clean);
+    try std.testing.expectEqualStrings("", clean);
+    var updated = try list(allocator, std.testing.io, repo.context());
+    defer updated.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), updated.loaded.entries.len);
+    try std.testing.expectEqualStrings(entry.oid, updated.loaded.entries[1].oid);
+    try repo.git(&.{ "git", "commit", "--allow-empty", "-m", "advanced" });
+    var changed = request;
+    changed.selector = updated.loaded.entries[0].selector;
+    changed.stash_oid = updated.loaded.entries[0].oid;
+    var rejected = try apply(allocator, std.testing.io, repo.context(), changed);
+    defer rejected.deinit(allocator);
+    try std.testing.expect(rejected.operation == .failed_static);
+    const empty = try parseEntries(allocator, "");
+    defer allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectError(error.InvalidStashCatalog, parseEntries(allocator, "stash@{0}\x00incomplete"));
+}
+
+test "stash apply conflict retains selected stash and actual conflicted worktree" {
+    const allocator = std.testing.allocator;
+    var repo = try TestRepo.init();
+    defer repo.deinit();
+    try repo.write("mixed", "saved version\n");
+    try repo.git(&.{ "git", "stash", "push", "-m", "conflict" });
+    var catalog = try list(allocator, std.testing.io, repo.context());
+    defer catalog.deinit(allocator);
+    const entry = catalog.loaded.entries[0];
+    try repo.write("mixed", "current version\n");
+    try repo.git(&.{ "git", "add", "mixed" });
+    try repo.git(&.{ "git", "commit", "-m", "conflicting commit" });
+    const head = try repo.output(&.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(head);
+    var result = try apply(allocator, std.testing.io, repo.context(), .{ .branch = "main", .head_oid = std.mem.trimEnd(u8, head, "\n"), .selector = entry.selector, .stash_oid = entry.oid });
+    defer result.deinit(allocator);
+    try std.testing.expect(result.operation == .failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.operation.failed, "CONFLICT") != null);
+    const actual = try repo.output(&.{ "git", "status", "--porcelain=v1" });
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings("UU mixed\n", actual);
+    var retained = try list(allocator, std.testing.io, repo.context());
+    defer retained.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), retained.loaded.entries.len);
+    try std.testing.expectEqualStrings(entry.oid, retained.loaded.entries[0].oid);
 }

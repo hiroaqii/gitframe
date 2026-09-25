@@ -15,6 +15,7 @@ pub const GitErrorOperation = enum {
     pull,
     switch_branch,
     create_stash,
+    apply_stash,
 };
 
 pub const OverlayKind = union(enum) {
@@ -27,6 +28,7 @@ pub const OverlayKind = union(enum) {
     switch_branch,
     remote_error,
     create_stash,
+    stashes,
 };
 
 pub const OverlayMouseMode = enum {
@@ -87,12 +89,21 @@ pub const OverlayState = struct {
         self.owner_page = .changes;
     }
 
+    pub fn isStashes(self: OverlayState) bool {
+        return self.kind == .stashes;
+    }
+
+    pub fn openStashes(self: *OverlayState) void {
+        self.kind = .stashes;
+        self.owner_page = .changes;
+    }
+
     pub fn mouseMode(self: OverlayState) OverlayMouseMode {
         return switch (self.kind) {
             .none => .passthrough,
             .help => .scroll_help,
             .remote_error => .scroll_remote_error,
-            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch, .create_stash => .block,
+            .discard_file, .amend_commit, .push_branch, .pull_branch, .switch_branch, .create_stash, .stashes => .block,
         };
     }
 

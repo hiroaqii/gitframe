@@ -10,10 +10,19 @@ const state = @import("../state.zig");
 const operations = @import("../pages/changes/operations.zig");
 const repo_session = @import("../repo_session.zig");
 const lifecycle = @import("action_lifecycle.zig");
+const load = @import("../load.zig");
+const load_state = @import("../load_state.zig");
+const git_command = @import("../../git/command.zig");
 const local = @import("local.zig");
 
 pub const State = struct {
     create: ?stash.Create = null,
+    catalog: ?stash.Catalog = null,
+    load_generation: u64 = 0,
+
+    pub fn list(self: *const State) ?*const stash.Catalog {
+        return if (self.catalog) |*value| value else null;
+    }
 
     pub fn dialog(self: *const State) ?*const stash.Create {
         return if (self.create) |*value| value else null;
@@ -21,7 +30,9 @@ pub const State = struct {
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         if (self.create) |*value| value.deinit(allocator);
-        self.* = .{};
+        if (self.catalog) |*value| value.deinit(allocator);
+        // Closing/reopening a dialog must not admit an earlier in-flight read.
+        self.* = .{ .load_generation = self.load_generation };
     }
 };
 
@@ -43,6 +54,19 @@ pub const Controller = struct {
 
     pub fn update(self: Controller, ctx: *chasen.Ctx(message.Msg), msg: stash.Msg) !void {
         switch (msg) {
+            .open_list => try self.openList(ctx),
+            .close_list => self.cancel(ctx.allocator()),
+            .request_apply => try self.requestApply(ctx.allocator()),
+            .confirm_apply => try self.confirmApply(ctx),
+            .cancel_apply => if (self.state.catalog) |*catalog| catalog.cancelApply(ctx.allocator()),
+            .previous, .next, .first => if (self.state.catalog) |*catalog| {
+                if (catalog.confirmation == null) switch (msg) {
+                    .previous => catalog.focus.movePrev(),
+                    .next => catalog.focus.moveNext(),
+                    .first => catalog.focus.index = 0,
+                    else => unreachable,
+                };
+            },
             .open => try self.open(ctx.allocator()),
             .cancel => self.cancel(ctx.allocator()),
             .confirm => try self.confirm(ctx),
@@ -93,7 +117,7 @@ pub const Controller = struct {
 
     fn cancel(self: Controller, allocator: std.mem.Allocator) void {
         self.state.deinit(allocator);
-        if (self.overlay.isCreateStash()) self.overlay.close();
+        if (self.overlay.isCreateStash() or self.overlay.isStashes()) self.overlay.close();
     }
 
     fn confirm(self: Controller, ctx: *chasen.Ctx(message.Msg)) !void {
@@ -124,6 +148,125 @@ pub const Controller = struct {
         self.cancel(ctx.allocator());
     }
 
+    fn currentSnapshot(self: Controller, allocator: std.mem.Allocator) !?stash.Snapshot {
+        const target = self.operations.view().stashTarget(true) orelse return null;
+        const identity = self.repo.activeIdentity() orelse return null;
+        return try stash.Snapshot.init(allocator, target.repo_root, self.repo.epoch(), identity, target.branch, target.oid);
+    }
+
+    fn openList(self: Controller, ctx: *chasen.Ctx(message.Msg)) !void {
+        if (!self.may_open or self.overlay.kind != .none or self.lifecycle.view().hasPending()) return;
+        const root = self.repo.activeCapability() orelse return;
+        var snapshot = try self.currentSnapshot(ctx.allocator()) orelse {
+            self.status.set("Stashes unavailable: reload a known HEAD first", .{});
+            return;
+        };
+        errdefer snapshot.deinit(ctx.allocator());
+        var owned_root = try root.duplicate();
+        errdefer owned_root.deinit();
+        var environment = try git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map);
+        errdefer environment.deinit();
+        var owned_snapshot = try snapshot.clone(ctx.allocator());
+        errdefer owned_snapshot.deinit(ctx.allocator());
+        const Task = load.StashListLoadTask(message.Msg);
+        const task = try ctx.allocator().create(Task);
+        errdefer ctx.allocator().destroy(task);
+        const generation = self.state.load_generation + 1;
+        task.* = .{ .snapshot = owned_snapshot, .generation = generation, .root = owned_root, .environment = environment };
+        try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+        self.state.deinit(ctx.allocator());
+        self.state.load_generation = generation;
+        self.state.catalog = .{ .snapshot = snapshot, .pending = generation };
+        self.overlay.openStashes();
+    }
+
+    pub fn finishList(self: Controller, allocator: std.mem.Allocator, value: load.StashListLoadFinished) void {
+        var result = value;
+        defer result.deinit(allocator);
+        if (!self.overlay.isStashes() or !self.matchesRepo(result.snapshot)) return;
+        const catalog = if (self.state.catalog) |*catalog| catalog else return;
+        if (load_state.acceptBranchListResult(&catalog.pending, true, self.state.load_generation, catalog.snapshot.repo_root, result.generation, result.snapshot.repo_root) != .accepted) return;
+        catalog.result.deinit(allocator);
+        catalog.result = result.result;
+        result.result = .empty;
+        catalog.focus = .{ .len = if (catalog.result == .loaded) catalog.result.loaded.entries.len else 0 };
+    }
+
+    fn requestApply(self: Controller, allocator: std.mem.Allocator) !void {
+        if (!self.overlay.isStashes() or self.lifecycle.view().hasPending()) return;
+        const catalog = if (self.state.catalog) |*value| value else return;
+        if (catalog.confirmation != null or catalog.pending != null or catalog.result != .loaded or catalog.focus.len == 0) return;
+        if (!self.matchesRepo(catalog.snapshot)) return;
+        var snapshot = try self.currentSnapshot(allocator) orelse {
+            self.status.set("Apply unavailable: reload the current branch first", .{});
+            return;
+        };
+        defer snapshot.deinit(allocator);
+        catalog.confirmation = try stash.Apply.init(allocator, snapshot, catalog.result.loaded.entries[catalog.focus.index]);
+    }
+
+    fn confirmApply(self: Controller, ctx: *chasen.Ctx(message.Msg)) !void {
+        if (!self.overlay.isStashes() or self.lifecycle.view().hasPending()) return;
+        const catalog = self.state.list() orelse return;
+        const confirmation = if (catalog.confirmation) |*value| value else return;
+        const target = self.operations.view().stashTarget(true) orelse {
+            self.status.set("Apply target unavailable; cancel and reload", .{});
+            return;
+        };
+        if (!self.matchesRepo(confirmation.snapshot) or !confirmation.snapshot.matchesTarget(target.branch, target.oid) or !std.mem.eql(u8, confirmation.snapshot.oid, target.oid)) {
+            self.status.set("Apply target changed; cancel and reopen confirmation", .{});
+            return;
+        }
+        const root = self.repo.activeCapability() orelse return;
+        const prepared = self.lifecycle.prepare(.apply_stash);
+        requests.startApplyStash(message.Msg, ctx, prepared.pending, confirmation, root, self.env_map) catch |err| {
+            self.lifecycle.rejectSpawn(prepared);
+            self.status.set("could not start apply task: {s}", .{@errorName(err)});
+            return;
+        };
+        _ = self.lifecycle.acceptSpawn(ctx.allocator(), prepared);
+        self.status.set("applying {s}; stash will be retained", .{confirmation.selector});
+        self.cancel(ctx.allocator());
+    }
+
+    pub fn finishApply(self: Controller, allocator: std.mem.Allocator, finished: *actions.ApplyStashFinished) ?Finish {
+        const snapshot = finished.confirmation.snapshot;
+        const same_repo = self.matchesRepo(snapshot);
+        const terminal = switch (self.lifecycle.finishExact(allocator, finished.pending, snapshot.repo_root, if (same_repo) self.current_changes_root else null)) {
+            .rejected => return null,
+            .accepted => |accepted| accepted,
+        };
+        const active = terminal.target == .current_changes;
+        const applied = if (same_repo) self.operations.applyAcceptedOutcome(allocator, .{ .stash = .{ .repo_root = snapshot.repo_root } }, active) else operations.OutcomeApply{};
+        var outcome = Finish{ .intent = .{ .pending = finished.pending, .active_matches = active, .reload = applied.reload } };
+        if (!active) return outcome;
+        if (finished.result.refreshed_catalog) |refreshed| {
+            const owned_snapshot = snapshot.clone(allocator) catch null;
+            if (owned_snapshot) |owned| {
+                self.state.deinit(allocator);
+                self.state.catalog = .{
+                    .snapshot = owned,
+                    .pending = null,
+                    .result = .{ .loaded = refreshed },
+                    .focus = .{ .len = refreshed.entries.len },
+                    .notice = "Selected stash changed; list reloaded. Select again.",
+                };
+                finished.result.refreshed_catalog = null;
+                self.overlay.openStashes();
+                self.status.set("selected stash changed; list reloaded", .{});
+                return outcome;
+            }
+        }
+        switch (finished.result.operation) {
+            .ok => self.status.set("stash applied; stash retained", .{}),
+            .failed, .failed_static => |detail| {
+                self.status.set("stash apply failed; stash retained", .{});
+                outcome.error_message = std.fmt.allocPrint(allocator, "{s}\n\nStash retained. Changes will be reloaded.\nReopen Stashes to reload the list before retrying.", .{detail}) catch null;
+            },
+        }
+        return outcome;
+    }
+
     fn matchesRepo(self: Controller, snapshot: stash.Snapshot) bool {
         const identity = self.repo.activeIdentity() orelse return false;
         const root = self.repo.activeRoot() orelse return false;
@@ -138,7 +281,7 @@ pub const Controller = struct {
             .accepted => |accepted| accepted,
         };
         const active = terminal.target == .current_changes;
-        const applied = if (same_repo) self.operations.applyAcceptedOutcome(allocator, .{ .create_stash = .{ .repo_root = finished.snapshot.repo_root } }, active) else operations.OutcomeApply{};
+        const applied = if (same_repo) self.operations.applyAcceptedOutcome(allocator, .{ .stash = .{ .repo_root = finished.snapshot.repo_root } }, active) else operations.OutcomeApply{};
         var outcome = Finish{ .intent = .{ .pending = finished.pending, .active_matches = active, .reload = applied.reload } };
         if (!active) return outcome;
         const saved: ?[]const u8 = finished.result.saved_oid;

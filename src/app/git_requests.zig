@@ -35,6 +35,19 @@ pub fn startCreateStash(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
+pub fn startApplyStash(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, confirmation: *const @import("stash.zig").Apply, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
+    requireKind(pending, .apply_stash);
+    var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
+    errdefer authority.deinit();
+    var owned = try confirmation.clone(ctx.allocator());
+    errdefer owned.deinit(ctx.allocator());
+    const Task = actions.ApplyStashTask(Msg);
+    const task = try ctx.allocator().create(Task);
+    errdefer ctx.allocator().destroy(task);
+    task.* = .{ .pending = pending, .confirmation = owned, .root = authority.root, .environment = authority.environment };
+    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+}
+
 pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.StageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     requireKind(pending, .stage_file);
 

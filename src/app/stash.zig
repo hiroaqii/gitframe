@@ -40,6 +40,14 @@ pub const Snapshot = struct {
 };
 
 pub const Msg = union(enum) {
+    open_list,
+    close_list,
+    previous,
+    next,
+    first,
+    request_apply,
+    cancel_apply,
+    confirm_apply,
     open,
     cancel,
     confirm,
@@ -49,6 +57,56 @@ pub const Msg = union(enum) {
     text: ui.TextInput.Msg,
     /// Borrowed event bytes, consumed only by synchronous App.update.
     paste: []const u8,
+};
+
+pub const Apply = struct {
+    snapshot: Snapshot,
+    selector: []u8,
+    oid: []u8,
+    message: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, snapshot: Snapshot, entry: @import("../git/stash.zig").Entry) !Apply {
+        var owned_snapshot = try snapshot.clone(allocator);
+        errdefer owned_snapshot.deinit(allocator);
+        const selector = try allocator.dupe(u8, entry.selector);
+        errdefer allocator.free(selector);
+        const oid = try allocator.dupe(u8, entry.oid);
+        errdefer allocator.free(oid);
+        return .{ .snapshot = owned_snapshot, .selector = selector, .oid = oid, .message = try allocator.dupe(u8, entry.message) };
+    }
+
+    pub fn clone(self: Apply, allocator: std.mem.Allocator) !Apply {
+        return init(allocator, self.snapshot, .{ .selector = self.selector, .oid = self.oid, .message = self.message, .created = 0 });
+    }
+
+    pub fn deinit(self: *Apply, allocator: std.mem.Allocator) void {
+        self.snapshot.deinit(allocator);
+        allocator.free(self.selector);
+        allocator.free(self.oid);
+        allocator.free(self.message);
+        self.* = undefined;
+    }
+};
+
+pub const Catalog = struct {
+    snapshot: Snapshot,
+    pending: ?u64,
+    result: @import("../git/stash.zig").ListResult = .empty,
+    focus: ui.FocusList = .{},
+    confirmation: ?Apply = null,
+    notice: ?[]const u8 = null,
+
+    pub fn deinit(self: *Catalog, allocator: std.mem.Allocator) void {
+        self.snapshot.deinit(allocator);
+        self.result.deinit(allocator);
+        self.cancelApply(allocator);
+        self.* = undefined;
+    }
+
+    pub fn cancelApply(self: *Catalog, allocator: std.mem.Allocator) void {
+        if (self.confirmation) |*confirmation| confirmation.deinit(allocator);
+        self.confirmation = null;
+    }
 };
 
 pub const Create = struct {

@@ -121,6 +121,7 @@ pub const Context = struct {
     branch_switch: *const app_state.BranchSwitchState,
     staged_summary: app_commit_panel.StagedSummary,
     create_stash: ?*const @import("stash.zig").Create = null,
+    stash_catalog: ?*const @import("stash.zig").Catalog = null,
     stash_target: ?@import("pages/changes/operations.zig").StashTarget = null,
 };
 
@@ -195,6 +196,7 @@ fn viewContent(app: Context, surface: *chasen.Surface) !void {
     if (app.overlay.isRemoteError() and app.overlay.visibleOn(app.active_page)) {
         try viewRemoteError(app, surface);
     }
+    if (app.overlay.isStashes() and app.overlay.visibleOn(app.active_page)) try viewStashes(app, surface);
     if (app.overlay.isCreateStash() and app.overlay.visibleOn(app.active_page)) {
         try viewCreateStash(app, surface);
     }
@@ -923,6 +925,7 @@ fn pendingActionFallbackLabel(kind: app_actions.ActionKind) []const u8 {
         .fetch => "fetch",
         .switch_branch => "switch",
         .create_stash => "stash",
+        .apply_stash => "apply stash",
     };
 }
 
@@ -1320,6 +1323,85 @@ fn viewAmendConfirmation(app: Context, surface: *chasen.Surface) !void {
     }
 }
 
+fn stashDisplay(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const path_key = @import("../path_key.zig");
+    return if (path_key.isPlainDisplaySafe(raw)) raw else try path_key.quotedDisplayAlloc(allocator, raw);
+}
+
+fn viewStashes(app: Context, surface: *chasen.Surface) !void {
+    const catalog = app.stash_catalog orelse return;
+    const confirming = catalog.confirmation != null;
+    const frame = ui.Modal.frame(surface, .{
+        .dialog_width = 108,
+        .dialog_height = 22,
+        .padding = .{ .left = 2, .right = 2, .top = 1, .bottom = 1 },
+        .title = if (confirming) "Apply stash" else "Stashes",
+        .backdrop = false,
+        .border = .rounded,
+        .title_style = app.theme.boldStyle(.accent),
+        .border_style = app.theme.style(.accent),
+    }) orelse return;
+    fillModalDialog(frame);
+    frame.view();
+    var content = frame.contentSurface();
+    const allocator = content.frameAllocator();
+    const size = content.size();
+    var branch_buffer: [96]u8 = undefined;
+    if (catalog.confirmation) |confirmation| {
+        const identity = try std.fmt.allocPrint(allocator, "Apply {s} ({s})", .{ confirmation.selector, confirmation.oid[0..@min(12, confirmation.oid.len)] });
+        try draw.copyClippedTextAt(&content, 0, 0, identity, app.theme.boldStyle(.accent));
+        try draw.copyClippedTextAt(&content, 0, 2, try stashDisplay(allocator, confirmation.message), app.theme.style(.accent));
+        const branch = try std.fmt.allocPrint(allocator, "To branch: {s}", .{try stashDisplay(allocator, confirmation.snapshot.branchLabel(&branch_buffer))});
+        try draw.copyClippedTextAt(&content, 0, 4, branch, app.theme.boldStyle(.prompt));
+        const worktree = try std.fmt.allocPrint(allocator, "Worktree: {s}", .{try stashDisplay(allocator, confirmation.snapshot.repo_root)});
+        var worktree_body = content.child(.{ .col = 0, .row = 6, .width = size.width, .height = @min(3, size.height -| 6) });
+        _ = drawWrappedTextScrolled(&worktree_body, worktree, 0, app.theme.style(.muted));
+        _ = content.borrowTextAt(0, 9, "The stash will be retained.", app.theme.style(.accent));
+        _ = content.borrowTextAt(0, 10, "Staged / unstaged classification will not be restored.", app.theme.style(.muted));
+        _ = content.borrowTextAt(0, 12, "Conflicts may leave changes to resolve in this worktree.", app.theme.style(.muted));
+        _ = content.borrowTextAt(0, size.height -| 1, "Enter: apply   Esc/q: back", app.theme.style(.accent));
+        return;
+    }
+    const destination = if (app.stash_target) |target| target.branch orelse (std.fmt.bufPrint(&branch_buffer, "detached@{s}", .{target.oid[0..@min(12, target.oid.len)]}) catch "detached") else "unavailable; reload before applying";
+    const header = try std.fmt.allocPrint(allocator, "Apply to current branch: {s}", .{try stashDisplay(allocator, destination)});
+    try draw.copyClippedTextAt(&content, 0, 0, header, app.theme.boldStyle(.accent));
+    if (catalog.notice) |notice| try draw.copyClippedTextAt(&content, 0, 1, notice, app.theme.style(.danger));
+    if (catalog.pending != null) {
+        _ = content.borrowTextAt(0, 3, "Loading stashes...", app.theme.style(.muted));
+    } else switch (catalog.result) {
+        .empty => {},
+        .failed, .failed_static => |detail| {
+            try draw.copyClippedTextAt(&content, 0, 3, try stashDisplay(allocator, detail), app.theme.style(.danger));
+            _ = content.borrowTextAt(0, 5, "Close and reopen Stashes to retry.", app.theme.style(.muted));
+        },
+        .loaded => |loaded| if (loaded.entries.len == 0) {
+            _ = content.borrowTextAt(0, 3, "No stashes", app.theme.style(.muted));
+        } else {
+            const columns = [_]ui.ColumnList.Column{
+                .{ .header = "Stash", .width = .{ .fixed = 12 } },
+                .{ .header = "Created (local)", .width = .{ .fixed = 23 } },
+                .{ .header = "Message", .width = .flex },
+            };
+            const rows = try allocator.alloc(ui.ColumnList.Row, loaded.entries.len);
+            const cells = try allocator.alloc([3]ui.ColumnList.Cell, loaded.entries.len);
+            for (loaded.entries, rows, cells) |entry, *row, *values| {
+                const minute = local_time.formatMinute(entry.created);
+                values.* = .{
+                    .{ .text = entry.selector },
+                    .{ .text = if (minute) |value| try allocator.dupe(u8, value.text()) else "unknown" },
+                    .{ .text = try stashDisplay(allocator, entry.message) },
+                };
+                row.* = values;
+            }
+            var list = ui.ColumnList.init(.{ .columns = &columns, .rows = rows });
+            list.focus = catalog.focus;
+            var body = content.child(.{ .col = 0, .row = 2, .width = size.width, .height = size.height -| 4 });
+            list.view(&body, .{ .show_header = true, .row_style = app.theme.style(.muted), .focused_style = app.theme.boldStyle(.accent), .marker_style = app.theme.style(.accent), .header_style = app.theme.boldStyle(.prompt), .show_cursor = false });
+        },
+    }
+    _ = content.borrowTextAt(0, size.height -| 1, "Space: apply   j/k/↑/↓: select   g: first   Esc/q: close", app.theme.style(.accent));
+}
+
 fn viewCreateStash(app: Context, surface: *chasen.Surface) !void {
     const dialog = app.create_stash orelse return;
     const frame = ui.Modal.frame(surface, .{
@@ -1599,6 +1681,7 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
             .pull => "Pull failed",
             .switch_branch => "Branch switch failed",
             .create_stash => "Stash creation failed",
+            .apply_stash => "Stash apply failed",
         },
         .backdrop = false,
         .border = .rounded,
@@ -1617,6 +1700,7 @@ fn viewRemoteError(app: Context, surface: *chasen.Surface) !void {
             .pull => "Git pull failed. Details:",
             .switch_branch => "Git branch switch failed. Details:",
             .create_stash => "Git stash failed. Details:",
+            .apply_stash => "Git stash apply failed. Details:",
         };
         try draw.copyClippedTextAt(&content, 0, 0, heading, app.theme.boldStyle(.danger));
     }
@@ -1859,6 +1943,7 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             if (!footer.normal_action_hints_enabled) return result;
 
             appendFooterAction(app, &result, key_buffers, .create_stash, "stash", .primary);
+            appendFooterAction(app, &result, key_buffers, .stash_list, "stashes", .primary);
             appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
@@ -2554,6 +2639,7 @@ test "footer normal-mode hints match the decided page lists" {
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("s", "stash"),
+        ui.key_hint.item("S", "stashes"),
         ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2722,6 +2808,7 @@ test "footer normal-mode hints follow state and local key ownership" {
     var hints = footerHints(harness.context(), &key_buffers);
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("s", "stash"),
+        ui.key_hint.item("S", "stashes"),
         ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -3617,6 +3704,7 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .commit }, .description = "open commit panel" },
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
     .{ .key = .{ .action = .create_stash }, .description = "create stash (all / staged changes)" },
+    .{ .key = .{ .action = .stash_list }, .description = "list stashes / apply to current branch" },
     .{ .key = .{ .action = .push }, .description = "push current branch" },
     .{ .key = .{ .action = .pull }, .description = "pull current branch" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },

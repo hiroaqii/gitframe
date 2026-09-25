@@ -100,7 +100,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .push => .request_push,
         .pull => .request_pull,
         .fetch => .request_fetch,
-        .branch_switch, .create_stash => null,
+        .branch_switch, .create_stash, .stash_list => null,
         .discard => .request_discard_selected_file,
         .toggle_display_mode => .toggle_display_mode,
         .toggle_line_numbers => .toggle_line_numbers,

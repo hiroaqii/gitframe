@@ -164,7 +164,7 @@ pub const AcceptedActionOutcome = union(enum) {
     },
     commit: struct { repo_root: []const u8 },
     switch_branch: struct { repo_root: []const u8 },
-    create_stash: struct { repo_root: []const u8 },
+    stash: struct { repo_root: []const u8 },
 };
 
 pub const OutcomeApply = struct {
@@ -728,7 +728,7 @@ pub const Controller = struct {
         active_repo_matches: bool,
     ) OutcomeApply {
         return switch (outcome) {
-            .create_stash => |value| blk: {
+            .stash => |value| blk: {
                 self.page.staged_hunks.clearRepo(allocator, value.repo_root);
                 if (active_repo_matches) self.navigation.clearActionCursor(allocator);
                 break :blk .{ .reload = if (active_repo_matches) .source_and_aux else .none };

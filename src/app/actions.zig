@@ -32,6 +32,7 @@ pub const ActionKind = enum {
     fetch,
     switch_branch,
     create_stash,
+    apply_stash,
 
     /// Whether an already-running background read must be discarded while
     /// this action is pending. Keep this exhaustive: adding an action must
@@ -52,6 +53,7 @@ pub const ActionKind = enum {
             .fetch,
             .switch_branch,
             .create_stash,
+            .apply_stash,
             => true,
         };
     }
@@ -108,6 +110,53 @@ pub fn CreateStashTask(comptime Msg: type) type {
                 allocator.destroy(task);
             }
             return Msg.actionFinished(.{ .create_stash = .{ .pending = task.pending, .snapshot = task.snapshot, .scope = task.scope, .result = result } });
+        }
+    };
+}
+
+pub const ApplyStashFinished = struct {
+    pending: PendingAction,
+    confirmation: app_stash.Apply,
+    result: git_stash.ApplyResult,
+
+    pub fn deinit(self: *ApplyStashFinished, allocator: std.mem.Allocator) void {
+        self.confirmation.deinit(allocator);
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn ApplyStashTask(comptime Msg: type) type {
+    return struct {
+        pending: PendingAction,
+        confirmation: app_stash.Apply,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const target = task.confirmation;
+            const result = git_stash.apply(allocator, io, .{ .cwd = task.root.dir(), .environment = &task.environment }, .{
+                .branch = target.snapshot.branch,
+                .head_oid = target.snapshot.oid,
+                .selector = target.selector,
+                .stash_oid = target.oid,
+            }) catch |err| git_stash.ApplyResult{ .operation = .{ .failed_static = @errorName(err) } };
+            return task.finish(allocator, result);
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .operation = .{ .failed_static = taskFailureMessage(failure) } });
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_stash.ApplyResult) Msg {
+            defer {
+                task.environment.deinit();
+                task.root.deinit();
+                allocator.destroy(task);
+            }
+            return Msg.actionFinished(.{ .apply_stash = .{ .pending = task.pending, .confirmation = task.confirmation, .result = result } });
         }
     };
 }

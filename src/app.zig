@@ -188,7 +188,7 @@ pub const App = struct {
             .source = self.config.source,
             .home = home,
             .env_map = self.env_map,
-            .action_pending = self.actionLifecycleView().hasPending() or self.overlay.isCreateStash(),
+            .action_pending = self.actionLifecycleView().hasPending() or self.overlay.isCreateStash() or self.overlay.isStashes(),
             .changes = self.changesRead().repositorySessionPort(),
             .repository = .{ .page = &self.pages.repository },
             .history = .{ .page = &self.pages.history },
@@ -247,7 +247,7 @@ pub const App = struct {
                 .help = self.overlay.isHelp(),
                 .commit_input = self.localWorkflowView().commitPanelOpen(),
                 .confirmation = self.overlay.isDiscardFile() or self.overlay.isAmendCommit() or
-                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isCreateStash(),
+                    self.overlay.isPushBranch() or self.overlay.isPullBranch() or self.overlay.isCreateStash() or self.overlay.isStashes(),
                 .branch_switch = self.overlay.isSwitchBranch(),
                 .remote_error = self.overlay.isRemoteError(),
                 .git_action = self.actionLifecycleView().hasPending(),
@@ -1154,6 +1154,7 @@ pub const App = struct {
                     }
                 },
                 .branch_list => |result| try self.remoteWorkflow().finishBranchListLoad(ctx.allocator(), result),
+                .stash_list => |result| self.stashWorkflow().finishList(ctx.allocator(), result),
                 .worktree_switch => |result| {
                     if (self.remoteWorkflow().finishWorktreeSwitch(ctx.allocator(), result)) |validated| {
                         const caller_status = self.remoteWorkflow().branchStatus(result.owner.origin.page_id);
@@ -1189,6 +1190,17 @@ pub const App = struct {
                     if (outcome.error_message) |detail| {
                         defer ctx.allocator().free(detail);
                         self.remoteWorkflow().setRemoteErrorWithRetry(ctx.allocator(), .create_stash, detail, null, .changes) catch {};
+                    }
+                    try self.applyLocalActionIntent(ctx, outcome.intent);
+                }
+            },
+            .apply_stash => |value| {
+                var result = value;
+                defer result.deinit(ctx.allocator());
+                if (self.stashWorkflow().finishApply(ctx.allocator(), &result)) |outcome| {
+                    if (outcome.error_message) |detail| {
+                        defer ctx.allocator().free(detail);
+                        self.remoteWorkflow().setRemoteErrorWithRetry(ctx.allocator(), .apply_stash, detail, null, .changes) catch {};
                     }
                     try self.applyLocalActionIntent(ctx, outcome.intent);
                 }
@@ -1481,6 +1493,7 @@ pub const App = struct {
             .push_retry_inspecting = remote.pushRetryInspecting(),
             .branch_switch = remote.branchSwitch(),
             .create_stash = self.stash_workflow.dialog(),
+            .stash_catalog = self.stash_workflow.list(),
             .stash_target = self.changesOperations().stashTarget(true),
             .staged_summary = switch (self.changesOperations().commitSummary()) {
                 .unavailable => .unavailable,
@@ -1629,6 +1642,7 @@ pub const App = struct {
                 .sidebar_width = self.pages.history.diff.viewer.sidebar_width,
             },
             .create_stash = self.stash_workflow.dialog(),
+            .stash_catalog = self.stash_workflow.list(),
             .commit_panel_mode = self.localWorkflowView().commitPanelOpen(),
             .repo_picker_mode = picker.model.mode,
             .repo_picker_input_mode = picker.model.input_mode,
@@ -1835,6 +1849,7 @@ pub const App = struct {
                     .pull => "pull error",
                     .switch_branch => "branch switch error",
                     .create_stash => "stash creation error",
+                    .apply_stash => "stash apply error",
                 },
                 .text = message,
             };

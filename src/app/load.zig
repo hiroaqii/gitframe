@@ -345,6 +345,7 @@ pub const CompareReadFinished = union(enum) {
 pub const ShellReadFinished = union(enum) {
     repo_path_discovery: RepoPathDiscoveryFinished,
     branch_list: BranchListLoadFinished,
+    stash_list: StashListLoadFinished,
     worktree_switch: worktree_switch.Finished,
 
     pub fn deinit(self: *ShellReadFinished, allocator: std.mem.Allocator) void {
@@ -847,6 +848,48 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
             };
             task.repo_root = &.{};
             return Msg.loadFinished(.{ .changes = .{ .branch_status = finished } });
+        }
+    };
+}
+
+pub const StashListLoadFinished = struct {
+    snapshot: @import("stash.zig").Snapshot,
+    generation: u64,
+    result: @import("../git/stash.zig").ListResult,
+
+    pub fn deinit(self: *StashListLoadFinished, allocator: std.mem.Allocator) void {
+        self.snapshot.deinit(allocator);
+        self.result.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn StashListLoadTask(comptime Msg: type) type {
+    return struct {
+        snapshot: @import("stash.zig").Snapshot,
+        generation: u64,
+        root: root_capability.RootCapability,
+        environment: git_command.LocalGitEnvironment,
+
+        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const result = @import("../git/stash.zig").list(allocator, io, .{ .cwd = task.root.dir(), .environment = &task.environment }) catch |err|
+                @import("../git/stash.zig").ListResult{ .failed_static = @errorName(err) };
+            return task.finish(allocator, result);
+        }
+
+        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
+            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        fn finish(task: *@This(), allocator: std.mem.Allocator, result: @import("../git/stash.zig").ListResult) Msg {
+            defer {
+                task.environment.deinit();
+                task.root.deinit();
+                allocator.destroy(task);
+            }
+            return Msg.loadFinished(.{ .shell = .{ .stash_list = .{ .snapshot = task.snapshot, .generation = task.generation, .result = result } } });
         }
     };
 }

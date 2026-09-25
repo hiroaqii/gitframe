@@ -15,19 +15,25 @@ const oid = "0123456789012345678901234567890123456789";
 test "stash routing respects effective binding and existing input owners" {
     const s: chasen.Key = .{ .codepoint = 's' };
     try std.testing.expect(input.keyToMsg(.{}, s).?.stash == .open);
+    const capital_s: chasen.Key = .{ .codepoint = 'S' };
+    try std.testing.expect(input.keyToMsg(.{}, capital_s).?.stash == .open_list);
+    try std.testing.expect((input.keyToMsg(.{}, .{ .codepoint = 's', .mods = .{ .shift = true } }) orelse return error.TestUnexpectedResult).stash == .open_list);
     for ([_]input.KeyContext{
         .{ .active_page = .repository },               .{ .active_page = .history },                           .{ .active_page = .compare },          .{ .active_page = .config },
         .{ .help_mode = true },                        .{ .branch_switch_mode = true },                        .{ .remote_error_mode = true },        .{ .changes = .{ .search_mode = true } },
         .{ .changes = .{ .file_search_mode = true } }, .{ .changes = .{ .selection_owner = .keyboard_line } }, .{ .active_selection_gesture = true }, .{ .commit_panel_mode = true },
     }) |context| {
         if (input.keyToMsg(context, s)) |msg| try std.testing.expect(msg != .stash);
+        if (input.keyToMsg(context, capital_s)) |msg| try std.testing.expect(msg != .stash);
     }
     var config: keymap.Config = .{};
     config.set(.create_stash, .{ .plain_codepoint = ',' });
     config.set(.commit, .{ .plain_codepoint = 's' });
+    config.set(.stash_list, .{ .plain_codepoint = ';' });
     try std.testing.expect(keymap.validateConfig(config));
     const effective = keymap.Effective.fromConfig(config);
     try std.testing.expect(input.keyToMsg(.{ .keymap = effective }, .{ .codepoint = ',' }).?.stash == .open);
+    try std.testing.expect(input.keyToMsg(.{ .keymap = effective }, .{ .codepoint = ';' }).?.stash == .open_list);
     try std.testing.expect(input.keyToMsg(.{ .keymap = effective, .changes = .{ .keymap = effective } }, s).? != .stash);
 }
 
@@ -186,4 +192,67 @@ test "stash queued task owns its snapshot after dialog close and cleans undelive
     try std.testing.expectEqualStrings(oid, task.snapshot.oid);
     var msg = tasks[0].failed(tasks[0].ctx, .runtime_abandoned, allocator);
     msg.deinitUndelivered(allocator);
+}
+
+test "stash catalog owns routing and generations; apply cancellation and exact failure reload" {
+    const allocator = std.testing.allocator;
+    var harness = try Harness.init();
+    defer harness.deinit();
+    const app = &harness.app;
+    var ctx: chasen.Ctx(message.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    defer clearTasks(&ctx);
+    try app.update(.{ .stash = .open_list }, &ctx);
+    const old_task = ctx.takePendingTasksWith()[0];
+    const generation = app.stash_workflow.load_generation;
+    try app.update(.{ .stash = .close_list }, &ctx);
+    try app.update(.{ .stash = .open_list }, &ctx);
+    const current_task = ctx.takePendingTasksWith()[0];
+    try app.update(old_task.failed(old_task.ctx, .runtime_abandoned, allocator), &ctx);
+    try std.testing.expectEqual(generation + 1, app.stash_workflow.catalog.?.pending.?);
+    var loaded = current_task.failed(current_task.ctx, .runtime_abandoned, allocator);
+    const bytes = try allocator.dupe(u8, "saved message");
+    const entries = try allocator.alloc(@import("../../git/stash.zig").Entry, 1);
+    entries[0] = .{ .selector = "stash@{0}", .oid = oid, .message = bytes, .created = 1000 };
+    loaded.load_finished.shell.stash_list.result = .{ .loaded = .{ .bytes = bytes, .entries = entries } };
+    try app.update(loaded, &ctx);
+    const catalog = app.stash_workflow.list().?;
+    try std.testing.expect(catalog.pending == null);
+    try std.testing.expect(input.keyToMsg(.{ .stash_catalog = catalog }, .{ .codepoint = chasen.Key.enter }) == null);
+    try std.testing.expect(input.keyToMsg(.{ .stash_catalog = catalog }, .{ .codepoint = 's' }) == null);
+    try std.testing.expect(input.eventToMsg(.{ .stash_catalog = catalog, .command_line_active = true }, .{ .paste = "ignored" }) == null);
+    const space = input.keyToMsg(.{ .stash_catalog = catalog }, .{ .codepoint = ' ' }).?;
+    try app.update(space, &ctx);
+    try std.testing.expectEqualStrings("stash@{0}", catalog.confirmation.?.selector);
+    try std.testing.expect(input.keyToMsg(.{ .stash_catalog = catalog }, .{ .codepoint = ' ' }) == null);
+    try app.update(input.keyToMsg(.{ .stash_catalog = catalog }, .{ .codepoint = 'q' }).?, &ctx);
+    try std.testing.expect(catalog.confirmation == null);
+    try std.testing.expectEqual(@as(usize, 0), ctx._pending_tasks_with_len);
+    try app.update(space, &ctx);
+    const original_head = app.pages.changes.branch_status.status.oid;
+    app.pages.changes.branch_status.status.oid = "different head";
+    try app.update(.{ .stash = .confirm_apply }, &ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx._pending_tasks_with_len);
+    app.pages.changes.branch_status.status.oid = original_head;
+    app.pages.changes.activation.state.active.members.status = .pending;
+    app.pages.changes.activation.state.active.members.branch = .pending;
+    try app.update(.{ .stash = .confirm_apply }, &ctx);
+    try std.testing.expect(app.stash_workflow.catalog == null);
+    try std.testing.expect(app.action_runtime.view().hasPending());
+    try std.testing.expect(!app.pages.changes.repository_read_authority.mayStartRepositoryRead());
+    const task = ctx.takePendingTasksWith()[0];
+    const finished = task.failed(task.ctx, .runtime_abandoned, allocator);
+    const apply_result = finished.action_finished.apply_stash;
+    try std.testing.expectEqualStrings("saved message", apply_result.confirmation.message);
+    try app.update(.{ .action_finished = .{ .apply_stash = .{
+        .pending = .{ .kind = .apply_stash, .generation = apply_result.pending.generation + 1 },
+        .confirmation = try apply_result.confirmation.clone(allocator),
+        .result = .{ .operation = .ok },
+    } } }, &ctx);
+    try std.testing.expect(app.action_runtime.view().hasPending());
+    try app.update(finished, &ctx);
+    try std.testing.expect(!app.action_runtime.view().hasPending());
+    try std.testing.expect(app.overlay.isRemoteError());
+    try std.testing.expectEqual(.apply_stash, app.remote_workflow.remote_error_operation.?);
+    try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, "Stash retained") != null);
+    try std.testing.expectEqual(@as(usize, 3), ctx._pending_tasks_with_len);
 }
