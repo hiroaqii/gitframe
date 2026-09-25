@@ -1413,25 +1413,6 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
     };
 }
 
-pub fn runStatusLoad(
-    repo_root: []const u8,
-    parent_environment: ?*const std.process.Environ.Map,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-) StatusLoadTaskResult {
-    var root = root_capability.RootCapability.openCanonical(repo_root) catch |err| return .{
-        .failed = std.fmt.allocPrint(allocator, "Status load failed: {s}", .{@errorName(err)}) catch
-            return .{ .failed_static = "Status load failed: OutOfMemory" },
-    };
-    defer root.deinit();
-    var environment = git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment) catch |err| return .{
-        .failed = std.fmt.allocPrint(allocator, "Status load failed: {s}", .{@errorName(err)}) catch
-            return .{ .failed_static = "Status load failed: OutOfMemory" },
-    };
-    defer environment.deinit();
-    return runStatusLoadWithOrigin(repo_root, .{ .cwd = root.dir(), .environment = &environment }, .foreground, allocator, io);
-}
-
 pub fn runStatusLoadWithOrigin(
     _: []const u8,
     context: git_command.DirectoryContext,
@@ -2026,49 +2007,6 @@ fn compareLoadError(allocator: std.mem.Allocator, prefix: []const u8, err: anyer
     return .{
         .failed = std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, @errorName(err) }) catch
             return .{ .failed_static = "Compare load failed: OutOfMemory" },
-    };
-}
-
-pub fn runLoad(
-    request: LoadRequest,
-    parent_environment: ?*const std.process.Environ.Map,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-) DiffLoadTaskResult {
-    return runLoadExpected(request, null, parent_environment, allocator, io);
-}
-
-pub fn runLoadExpected(
-    request: LoadRequest,
-    expected_fingerprint: ?content_fingerprint.Fingerprint,
-    parent_environment: ?*const std.process.Environ.Map,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-) DiffLoadTaskResult {
-    var authority = initSynchronousLoadAuthority(request, parent_environment, allocator) catch |err| return .{
-        .failed = std.fmt.allocPrint(allocator, "Diff load failed: {s}", .{@errorName(err)}) catch
-            return .{ .failed_static = "Diff load failed: OutOfMemory" },
-    };
-    defer authority.deinit();
-    return runLoadExpectedWithContext(request, authority.borrowed(), expected_fingerprint, allocator, io);
-}
-
-fn initSynchronousLoadAuthority(
-    request: LoadRequest,
-    parent_environment: ?*const std.process.Environ.Map,
-    allocator: std.mem.Allocator,
-) !LoadAuthority {
-    return switch (request.source) {
-        .unstaged, .range => blk: {
-            const repo_root = request.repo_root orelse return error.MissingRepoRoot;
-            var root = try root_capability.RootCapability.openCanonical(repo_root);
-            errdefer root.deinit();
-            break :blk .{ .repository = .{
-                .root = root,
-                .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, parent_environment),
-            } };
-        },
-        .patch_file => .none,
     };
 }
 
@@ -3365,10 +3303,10 @@ test "expected raw fingerprint returns unchanged before diff parsing" {
     defer std.testing.allocator.free(path);
 
     const expected = content_fingerprint.Fingerprint.init(bytes);
-    var result = runLoadExpected(
+    var result = runLoadExpectedWithContext(
         .{ .source = .{ .patch_file = path } },
+        .none,
         expected,
-        null,
         std.testing.allocator,
         std.testing.io,
     );
@@ -3636,7 +3574,7 @@ test "collectUntrackedStatusLineStats consumes max-files budget for failed reads
     try std.testing.expect(stats_map.get("valid.txt") == null);
 }
 
-test "runStatusLoad preserves clean repository snapshot" {
+test "runStatusLoadWithOrigin preserves clean repository snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3645,7 +3583,9 @@ test "runStatusLoad preserves clean repository snapshot" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    var result = runStatusLoad(repo_root, null, std.testing.allocator, io);
+    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
+    defer environment.deinit();
+    var result = runStatusLoadWithOrigin(repo_root, .{ .cwd = tmp.dir, .environment = &environment }, .foreground, std.testing.allocator, io);
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
@@ -3654,7 +3594,7 @@ test "runStatusLoad preserves clean repository snapshot" {
     }
 }
 
-test "runStatusLoad attaches line stats for staged and untracked added files" {
+test "runStatusLoadWithOrigin attaches line stats for staged and untracked added files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3668,7 +3608,9 @@ test "runStatusLoad attaches line stats for staged and untracked added files" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    var result = runStatusLoad(repo_root, null, std.testing.allocator, io);
+    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
+    defer environment.deinit();
+    var result = runStatusLoadWithOrigin(repo_root, .{ .cwd = tmp.dir, .environment = &environment }, .foreground, std.testing.allocator, io);
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
@@ -3685,7 +3627,7 @@ test "runStatusLoad attaches line stats for staged and untracked added files" {
     }
 }
 
-test "runStatusLoad keys staged rename stats by current path" {
+test "runStatusLoadWithOrigin keys staged rename stats by current path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3699,7 +3641,9 @@ test "runStatusLoad keys staged rename stats by current path" {
     const repo_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo_root);
 
-    var result = runStatusLoad(repo_root, null, std.testing.allocator, io);
+    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
+    defer environment.deinit();
+    var result = runStatusLoadWithOrigin(repo_root, .{ .cwd = tmp.dir, .environment = &environment }, .foreground, std.testing.allocator, io);
     defer result.deinit(std.testing.allocator);
 
     switch (result) {
