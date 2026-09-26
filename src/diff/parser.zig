@@ -43,9 +43,9 @@ pub const FileDiff = struct {
 };
 
 pub const Hunk = struct {
-    /// The complete borrowed `@@ ... @@` line as it appeared in the input.
-    /// Keeping this distinct from `section` lets copy actions reproduce a
-    /// syntactically valid unified hunk without reconstructing its ranges.
+    /// The complete `@@ ... @@` line. The parser borrows the input bytes;
+    /// display projections own a replacement when they normalize coordinates.
+    /// Copy actions use this header, so its ranges must agree with the fields.
     header: []const u8 = "",
     old_start: u32,
     old_count: u32,

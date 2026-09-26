@@ -1243,6 +1243,7 @@ test "History picker replaces preview immediately and fences detail clipboard co
     var app: App = .{
         .allocator = allocator,
         .active_page = .history,
+        .terminal_size = .{ .width = 80, .height = 24 },
         .pages = .{ .history = .{
             .repo_epoch = 0,
             .root_identity = root_identity,
@@ -1283,7 +1284,29 @@ test "History picker replaces preview immediately and fences detail clipboard co
 
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer ctx.runtimeClearPendingEffectCopies();
-    try app.update(.{ .history = .move_next }, &ctx);
+    const layout = shellLayout(&app);
+    const picker = @import("../pages/history/view.zig").pickerLayout(layout.bodySize(), app.pages.history.interaction_state);
+    const detail_wheel = app.handleEvent(app_test_support.mouseEvent(
+        layout.body.col + picker.detail.col,
+        layout.body.row + picker.detail.row,
+        .wheel_down,
+    )).?;
+    try std.testing.expectEqual(App.Msg{ .history = .{ .move_detail = .row_next } }, detail_wheel);
+    try app.update(detail_wheel, &ctx);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.history.catalog.cursor);
+    try std.testing.expect(app.pages.history.preview_state.phase == .resolved);
+    try std.testing.expect(app.pages.history.preview_state.accepted != null);
+
+    app.pages.history.interaction_state.focus = .commit_detail;
+    const history_wheel = app.handleEvent(app_test_support.mouseEvent(
+        layout.body.col + picker.history.col,
+        layout.body.row + picker.history.row,
+        .wheel_down,
+    )).?;
+    try std.testing.expectEqual(App.Msg{ .history = .move_next }, history_wheel);
+    try app.update(history_wheel, &ctx);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.history.catalog.cursor);
+    try std.testing.expectEqual(@import("../pages/history/interaction.zig").Focus.commit_detail, app.pages.history.interaction_state.focus);
     try std.testing.expect(app.pages.history.preview_state.phase == .loading);
     try std.testing.expect(app.pages.history.preview_state.accepted == null);
     try std.testing.expect(app.pages.history.preview_state.current_key.?.identity.selection == .single);
@@ -2084,38 +2107,50 @@ test "direct nested Changes message uses the same update owner as keyboard input
     try std.testing.expectEqual(direct.pages.changes.viewer.focus, keyboard.pages.changes.viewer.focus);
 }
 
-test "normal and help commit keys use the same nested Changes adapter" {
+test "normal and help commit keys open the panel only on Changes" {
     const repo: repo_discovery.RepoEntry = .{
         .label = "repo",
         .display_path = "/repo",
         .canonical_root = "/repo",
     };
-    var normal: App = .{
-        .allocator = std.testing.allocator,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = repo } },
-        },
-    };
-    var help: App = .{
-        .allocator = std.testing.allocator,
-        .repo_session = .{
-            .repo_state = .{ .discovery = .{ .single_repo = repo } },
-        },
-    };
-    help.overlay.openHelpForPage(.changes);
-    var normal_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    var help_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-
-    const normal_msg = normal.handleEvent(.{ .key_press = .{ .codepoint = 'c' } }) orelse return error.ExpectedChangesMessage;
-    const help_msg = help.handleEvent(.{ .key_press = .{ .codepoint = 'c' } }) orelse return error.ExpectedChangesMessage;
-    try std.testing.expectEqual(App.Msg{ .changes = .enter_commit_panel }, normal_msg);
-    try std.testing.expectEqual(normal_msg, help_msg);
-
-    try normal.update(normal_msg, &normal_ctx);
-    try help.update(help_msg, &help_ctx);
-    try std.testing.expect(normal.local_workflow.commit_panel.is_open);
-    try std.testing.expect(help.local_workflow.commit_panel.is_open);
-    try std.testing.expect(!help.overlay.isHelp());
+    for ([_]page.Id{ .changes, .repository, .history, .compare, .config }) |active_page| {
+        for ([_]bool{ false, true }) |help_open| {
+            for ([_]bool{ false, true }) |remapped| {
+                var app: App = .{
+                    .allocator = std.testing.allocator,
+                    .active_page = active_page,
+                    .repo_session = .{
+                        .repo_state = .{ .discovery = .{ .single_repo = repo } },
+                    },
+                };
+                if (remapped) {
+                    var config: keymap.Config = .{};
+                    config.set(.commit, .{ .ctrl = .s });
+                    app.keymap = .fromConfig(config);
+                }
+                if (help_open) app.overlay.openHelpForPage(active_page);
+                var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+                const key: chasen.Key = if (remapped)
+                    .{ .codepoint = 's', .mods = .{ .ctrl = true } }
+                else
+                    .{ .codepoint = 'c' };
+                const msg = app.handleEvent(.{ .key_press = key });
+                if (active_page == .changes) {
+                    try std.testing.expectEqual(App.Msg{ .changes = .enter_commit_panel }, msg.?);
+                    try app.update(msg.?, &ctx);
+                    try std.testing.expect(app.local_workflow.commit_panel.is_open);
+                    try std.testing.expect(!app.overlay.isHelp());
+                } else {
+                    if (active_page == .repository and !help_open) {
+                        try std.testing.expectEqual(App.Msg{ .command_line = .owned_noop }, msg.?);
+                        try app.update(msg.?, &ctx);
+                    } else try std.testing.expect(msg == null);
+                    try std.testing.expect(!app.local_workflow.commit_panel.is_open);
+                    try std.testing.expectEqual(help_open, app.overlay.isHelp());
+                }
+            }
+        }
+    }
 }
 
 test "focus loss terminates selection without a deferred result" {

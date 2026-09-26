@@ -302,9 +302,9 @@ pub const View = struct {
         }
         if (self.active_page == .history) {
             const point = self.bodyMousePoint(mouse) orelse return null;
+            const picker_layout = self.history.picker_layout orelse return null;
+            const focus = picker_layout.focusAt(point) orelse return null;
             if (mouse.button == .left) {
-                const picker_layout = self.history.picker_layout orelse return null;
-                const focus = picker_layout.focusAt(point) orelse return null;
                 if (focus == .history and !self.history.key.loading and self.history.key.picker_ready) {
                     if (picker_layout.historyIndexAt(
                         point,
@@ -314,7 +314,7 @@ pub const View = struct {
                 }
                 return .{ .history = .{ .focus_pane = focus } };
             }
-            return switch (self.history.key.focus) {
+            return switch (focus) {
                 .history => if (self.history.key.loading or !self.history.key.picker_ready)
                     null
                 else switch (mouse.button) {
@@ -683,6 +683,30 @@ test "History routes committed diff and picker mouse input through the shell" {
             .type = .press,
         } }) == null);
     }
+    for ([_]@TypeOf(picker_view.history.key.focus){ .history, .commit_detail, .changed_files }) |keyboard_focus| {
+        picker_view.history.key.focus = keyboard_focus;
+        picker_view.history.key.picker_can_move_previous = true;
+        for ([_]struct { point: MousePoint, up: ?app_message.Msg, down: ?app_message.Msg }{
+            .{ .point = .{ .col = picker_layout.history.col, .row = picker_layout.history.row }, .up = .{ .history = .move_previous }, .down = .{ .history = .move_next } },
+            .{ .point = .{ .col = picker_layout.detail.col, .row = picker_layout.detail.row }, .up = .{ .history = .{ .move_detail = .row_previous } }, .down = .{ .history = .{ .move_detail = .row_next } } },
+            .{ .point = .{ .col = picker_layout.files.col, .row = picker_layout.files.row }, .up = .{ .history = .{ .move_files = .row_previous } }, .down = .{ .history = .{ .move_files = .row_next } } },
+            .{ .point = .{ .col = picker_layout.outer_divider.col, .row = picker_layout.outer_divider.row }, .up = null, .down = null },
+            .{ .point = .{ .col = picker_layout.inner_divider.col, .row = picker_layout.inner_divider.row }, .up = null, .down = null },
+            .{ .point = .{ .col = layout.body.width, .row = 0 }, .up = null, .down = null },
+        }) |case| {
+            var wheel: chasen.Event = .{ .mouse = .{
+                .col = @intCast(layout.body.col + case.point.col),
+                .row = @intCast(layout.body.row + case.point.row),
+                .button = .wheel_up,
+                .mods = .{},
+                .type = .press,
+            } };
+            try std.testing.expectEqualDeep(case.up, picker_view.handleEvent(wheel));
+            wheel.mouse.button = .wheel_down;
+            try std.testing.expectEqualDeep(case.down, picker_view.handleEvent(wheel));
+        }
+    }
+    picker_view.history.key.picker_can_move_previous = false;
     const picker_wheel_up = chasen.Event{ .mouse = .{
         .col = terminal_col,
         .row = terminal_row,
@@ -711,21 +735,21 @@ test "History routes committed diff and picker mouse input through the shell" {
     );
     try std.testing.expect(picker_view.handleEvent(picker_wheel_down) == null);
 
-    var detail_view = picker_view;
-    detail_view.history.key.focus = .commit_detail;
-    try std.testing.expectEqual(
-        app_message.Msg{ .history = .{ .move_detail = .row_next } },
-        detail_view.handleEvent(picker_wheel_down).?,
-    );
-    detail_view.history.key.focus = .changed_files;
-    try std.testing.expectEqual(
-        app_message.Msg{ .history = .{ .move_files = .row_previous } },
-        detail_view.handleEvent(picker_wheel_up).?,
-    );
+    picker_view.history.key.loading = true;
+    try std.testing.expect(picker_view.handleEvent(picker_wheel_up) == null);
+    picker_view.history.key.loading = false;
+    picker_view.history.key.picker_ready = false;
+    try std.testing.expect(picker_view.handleEvent(picker_wheel_up) == null);
+    picker_view.history.key.picker_ready = true;
+    overlay.openDiscardFile();
+    try std.testing.expect(picker_view.handleEvent(picker_wheel_up) == null);
+    overlay.openHelpForPage(.history);
+    try std.testing.expectEqual(app_message.Msg.help_scroll_up, picker_view.handleEvent(picker_wheel_up).?);
+    overlay.close();
     const compare_tab = page.tab(.compare);
     try std.testing.expectEqual(
         app_message.Msg{ .switch_page = .compare },
-        detail_view.handleEvent(.{ .mouse = .{
+        picker_view.handleEvent(.{ .mouse = .{
             .col = @intCast(layout.content.col + compare_tab.col),
             .row = @intCast(layout.content.row + app_shell_layout.page_bar_label_row),
             .button = .left,

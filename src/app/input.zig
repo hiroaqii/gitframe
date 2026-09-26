@@ -346,8 +346,8 @@ fn repoPickerKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
             if (key.codepoint == 'p' and !key_input.hasCommandModifier(key)) return actionToMsg(.repo_picker_enter_path_input);
             if (key.codepoint == 'b' and !key_input.hasCommandModifier(key)) return actionToMsg(.repo_picker_back);
             if (key.codepoint == 'd' and !key_input.hasCommandModifier(key)) return actionToMsg(.repo_picker_remove_recent);
-            if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.repo_picker_move_previous);
-            if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.repo_picker_move_next);
+            if (key.matches(chasen.Key.up, .{}) or (key.codepoint == 'k' and !key_input.hasCommandModifier(key))) return actionToMsg(.repo_picker_move_previous);
+            if (key.matches(chasen.Key.down, .{}) or (key.codepoint == 'j' and !key_input.hasCommandModifier(key))) return actionToMsg(.repo_picker_move_next);
         },
         .filter => {
             if (key.matches(chasen.Key.backspace, .{})) return actionToMsg(.repo_picker_backspace);
@@ -372,40 +372,42 @@ fn helpKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.keymap.spec(.help)) |spec| {
         if (spec.matches(key)) return actionToMsg(.close_help);
     }
-    if (context.keymap.spec(.commit)) |spec| {
-        if (spec.matches(key)) return translateChangesMsg(.enter_commit_panel);
+    if (context.active_page == .changes) {
+        if (context.keymap.spec(.commit)) |spec| {
+            if (spec.matches(key)) return translateChangesMsg(.enter_commit_panel);
+        }
     }
     if (helpActionForKey(key)) |action| return actionToMsg(action);
     return null;
 }
 
 fn discardConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_discard_file);
+    if (key.matches(chasen.Key.escape, .{}) or (key.codepoint == 'q' and !key_input.hasCommandModifier(key))) return actionToMsg(.cancel_discard_file);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_discard_file);
     return null;
 }
 
 fn amendConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_amend);
+    if (key.matches(chasen.Key.escape, .{}) or (key.codepoint == 'q' and !key_input.hasCommandModifier(key))) return actionToMsg(.cancel_amend);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_amend);
     return null;
 }
 
 fn pushConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_push);
+    if (key.matches(chasen.Key.escape, .{}) or (key.codepoint == 'q' and !key_input.hasCommandModifier(key))) return actionToMsg(.cancel_push);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_push);
     return null;
 }
 
 fn pullConfirmationKeyToMsg(key: chasen.Key) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return actionToMsg(.cancel_pull);
+    if (key.matches(chasen.Key.escape, .{}) or (key.codepoint == 'q' and !key_input.hasCommandModifier(key))) return actionToMsg(.cancel_pull);
     if (key.matches(chasen.Key.enter, .{})) return actionToMsg(.confirm_pull);
     return null;
 }
 
 fn branchSwitchKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
     if (context.branch_switch_pending) {
-        if (key.matches(chasen.Key.escape, .{}) or key.codepoint == 'q') return .cancel_branch_switch;
+        if (key.matches(chasen.Key.escape, .{}) or (key.codepoint == 'q' and !key_input.hasCommandModifier(key))) return .cancel_branch_switch;
         return null;
     }
     const action = branch_picker.keyToAction(.{
@@ -426,11 +428,11 @@ fn branchSwitchKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
 }
 
 fn remoteErrorKeyToMsg(key: chasen.Key, interactive: bool) ?app_message.Msg {
-    if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or key.codepoint == 'q') return actionToMsg(.close_remote_error);
+    if (key.matches(chasen.Key.escape, .{}) or key.matches(chasen.Key.enter, .{}) or (key.codepoint == 'q' and !key_input.hasCommandModifier(key))) return actionToMsg(.close_remote_error);
     if (interactive and key.codepoint == 'i' and !key_input.hasCommandModifier(key)) return actionToMsg(.run_interactive_push);
     if (key.codepoint == 'y' and !key_input.hasCommandModifier(key)) return actionToMsg(.copy_popup);
-    if (key.matches(chasen.Key.up, .{}) or key.codepoint == 'k') return actionToMsg(.remote_error_scroll_up);
-    if (key.matches(chasen.Key.down, .{}) or key.codepoint == 'j') return actionToMsg(.remote_error_scroll_down);
+    if (key.matches(chasen.Key.up, .{}) or (key.codepoint == 'k' and !key_input.hasCommandModifier(key))) return actionToMsg(.remote_error_scroll_up);
+    if (key.matches(chasen.Key.down, .{}) or (key.codepoint == 'j' and !key_input.hasCommandModifier(key))) return actionToMsg(.remote_error_scroll_down);
     if (key.matches(chasen.Key.page_up, .{})) return actionToMsg(.remote_error_page_up);
     if (key.matches(chasen.Key.page_down, .{})) return actionToMsg(.remote_error_page_down);
     return null;
@@ -1483,10 +1485,31 @@ test "keyToMsg opens and closes help outside prompt modes" {
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'x' }));
 }
 
-test "keyToMsg ignores command modifiers for help overlay printable shortcuts" {
-    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'q', .mods = .{ .ctrl = true } }));
-    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'k', .mods = .{ .alt = true } }));
-    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .help_mode = true }, .{ .codepoint = 'j', .mods = .{ .super = true } }));
+test "keyToMsg modal printable shortcuts reject command modifiers" {
+    const cases = [_]struct { context: KeyContext, key: u21, expected: app_message.Msg }{
+        .{ .context = .{ .discard_confirmation_mode = true }, .key = 'q', .expected = .cancel_discard_file },
+        .{ .context = .{ .amend_confirmation_mode = true }, .key = 'q', .expected = .cancel_amend },
+        .{ .context = .{ .push_confirmation_mode = true }, .key = 'q', .expected = .cancel_push },
+        .{ .context = .{ .pull_confirmation_mode = true }, .key = 'q', .expected = .cancel_pull },
+        .{ .context = .{ .branch_switch_mode = true, .branch_switch_pending = true }, .key = 'q', .expected = .cancel_branch_switch },
+        .{ .context = .{ .remote_error_mode = true }, .key = 'q', .expected = .close_remote_error },
+        .{ .context = .{ .remote_error_mode = true }, .key = 'j', .expected = .remote_error_scroll_down },
+        .{ .context = .{ .remote_error_mode = true }, .key = 'k', .expected = .remote_error_scroll_up },
+        .{ .context = .{ .repo_picker_mode = true }, .key = 'q', .expected = .close_repo_picker },
+        .{ .context = .{ .repo_picker_mode = true }, .key = 'j', .expected = .repo_picker_move_next },
+        .{ .context = .{ .repo_picker_mode = true }, .key = 'k', .expected = .repo_picker_move_previous },
+        .{ .context = .{ .help_mode = true }, .key = 'q', .expected = .close_help },
+        .{ .context = .{ .help_mode = true }, .key = 'j', .expected = .help_scroll_down },
+        .{ .context = .{ .help_mode = true }, .key = 'k', .expected = .help_scroll_up },
+    };
+    for (cases) |case| {
+        try expectMsg(case.expected, keyToMsg(case.context, .{ .codepoint = case.key }).?);
+        inline for (.{ "ctrl", "alt", "super", "hyper", "meta" }) |modifier| {
+            var key: chasen.Key = .{ .codepoint = case.key };
+            @field(key.mods, modifier) = true;
+            try std.testing.expect(keyToMsg(case.context, key) == null);
+        }
+    }
 }
 
 test "keyToMsg keeps prompt modes above help overlay" {

@@ -9556,6 +9556,93 @@ test "final staged hunk unstage removes primary combined authority without repla
     try std.testing.expectEqualStrings(original_clipboard, accepted_clipboard);
 }
 
+test "combined unified copy uses display coordinates while Git actions keep component patches" {
+    const allocator = std.testing.allocator;
+    const cached_patch =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -6,6 +6,7 @@ line 5
+        \\ line 6
+        \\ line 7
+        \\ line 8
+        \\+inserted
+        \\ line 9
+        \\ line 10
+        \\ line 11
+        \\
+    ;
+    const unstaged_patch =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -38,7 +38,7 @@ line 36
+        \\ line 37
+        \\ line 38
+        \\ line 39
+        \\-line 40
+        \\+changed
+        \\ line 41
+        \\ line 42
+        \\ line 43
+        \\
+    ;
+    var page: changes_page.ChangesPageState = .{
+        .load = try testPrimaryLoadState(allocator, unstaged_patch),
+        .viewer = .{ .selected_target = .{ .diff_file = 0 }, .display_mode = .unified },
+    };
+    defer page.deinit(allocator);
+    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
+    try page.git_status.replace("/repo", &status_bundle);
+    page.status_load.markSuccess();
+    _ = page.activation.activate(0, .fresh, .fresh, .fresh);
+    page.auto_reload.acceptSource(content_fingerprint.Fingerprint.init(unstaged_patch));
+    var status_message = @import("../../state.zig").StatusMessage{};
+    const controller = testController(&page, &status_message, .unstaged);
+    try applyTestCombinedBundle(controller, allocator, 1, 0, try testCombinedBundle(
+        allocator,
+        1,
+        0,
+        cached_patch,
+        unstaged_patch,
+    ));
+    page.viewer.diff_cursor = .{ .hunk_header = 1 };
+    const nav_view = controller.navigation.view();
+    try std.testing.expect(nav_view.displayedChangesBody() == .combined);
+    const displayed_hunk = nav_view.displayedDiffFile().?.hunks[1];
+    try std.testing.expectEqual(@as(u32, 37), displayed_hunk.old_start);
+    try std.testing.expectEqual(@as(u32, 38), displayed_hunk.new_start);
+    const content: @import("content.zig").View = .{
+        .page = &page,
+        .navigation = nav_view,
+        .source = .unstaged,
+        .repo_root = "/repo",
+    };
+    var copied = try content.selectedHunkCopyText(allocator);
+    defer copied.deinit(allocator);
+    try std.testing.expect(copied == .ready);
+    try std.testing.expectEqualStrings(
+        "@@ -37,7 +38,7 @@ line 36\n line 37\n line 38\n line 39\n-line 40\n+changed\n line 41\n line 42\n line 43\n",
+        copied.ready,
+    );
+    const operations: changes_operations.View = .{
+        .page = &page,
+        .navigation = nav_view,
+        .source = .unstaged,
+        .repo_root = "/repo",
+        .activation_state = page.activation.state,
+    };
+    const stage = operations.selectedHunkStageTarget(allocator);
+    try std.testing.expect(stage == .ready);
+    defer allocator.free(stage.ready.patch);
+    try std.testing.expectEqualStrings(unstaged_patch, stage.ready.patch);
+    page.viewer.diff_cursor = .{ .hunk_header = 0 };
+    const unstage = operations.selectedHunkUnstageTarget(allocator);
+    try std.testing.expect(unstage == .ready);
+    defer allocator.free(unstage.ready.patch);
+    try std.testing.expectEqualStrings(cached_patch, unstage.ready.patch);
+}
+
 test "session-staged hunk projected unstage removes exact mark before next toggle" {
     const allocator = std.testing.allocator;
     var page: changes_page.ChangesPageState = .{

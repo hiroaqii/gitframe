@@ -133,9 +133,12 @@ pub fn buildWithAllocators(
     errdefer authority_allocator.free(action_origins);
 
     var initialized_hunks: usize = 0;
-    errdefer for (hunks[0..initialized_hunks]) |hunk| presentation_allocator.free(hunk.lines);
+    errdefer for (hunks[0..initialized_hunks]) |hunk| {
+        presentation_allocator.free(hunk.header);
+        presentation_allocator.free(hunk.lines);
+    };
 
-    // Projected hunk and line values belong to the presentation allocator
+    // Projected hunk headers and line values belong to the presentation allocator
     // because their coordinates are normalized from HEAD directly to the
     // working tree.
     // Text and section slices remain borrowed from the retained component
@@ -319,6 +322,20 @@ fn normalizeCandidateHunk(
     }
 
     try validateProjectedHunk(normalized);
+    // Copy and selection consumers read the header bytes; rendering reads the
+    // numeric ranges. Keep both in display coordinates, leaving the component
+    // hunk used by action authority untouched.
+    normalized.header = if (normalized.old_start == candidate.hunk.old_start and normalized.new_start == candidate.hunk.new_start)
+        try allocator.dupe(u8, candidate.hunk.header)
+    else
+        try std.fmt.allocPrint(allocator, "@@ -{d},{d} +{d},{d} @@{s}{s}", .{
+            normalized.old_start,
+            normalized.old_count,
+            normalized.new_start,
+            normalized.new_count,
+            if (normalized.section.len == 0) "" else " ",
+            normalized.section,
+        });
     return normalized;
 }
 
@@ -1127,6 +1144,9 @@ test "hunk projection keeps presentation and authority in separate allocation do
     );
 
     try std.testing.expect(pointerInBuffer(projection.presentation.file.hunks.ptr, &presentation_storage));
+    for (projection.presentation.file.hunks) |hunk| {
+        try std.testing.expect(pointerInBuffer(hunk.header.ptr, &presentation_storage));
+    }
     try std.testing.expect(pointerInBuffer(projection.presentation.presentation_syntax_origins.ptr, &presentation_storage));
     try std.testing.expect(!pointerInBuffer(projection.presentation.file.hunks.ptr, &authority_storage));
     try std.testing.expect(pointerInBuffer(projection.authority.hunk_stage_states.ptr, &authority_storage));
@@ -1197,6 +1217,7 @@ test "hunk projection keeps later HEAD and worktree coordinates stable across st
         const later = projection.presentation.file.hunks[1];
         try std.testing.expectEqual(@as(u32, 20), later.old_start);
         try std.testing.expectEqual(@as(u32, 21), later.new_start);
+        try std.testing.expectEqualStrings("@@ -20,1 +21,1 @@", later.header);
         try std.testing.expectEqual(@as(?u32, 20), later.lines[0].old_line);
         try std.testing.expectEqual(@as(?u32, 21), later.lines[1].new_line);
         try expectRenderedHunkHeader(projection, .unified, 1, 20, 21);
@@ -1306,6 +1327,7 @@ test "hunk projection normalizes zero-count headers after non-zero prior deltas"
     const cached_deletion = first.presentation.file.hunks[1];
     try std.testing.expectEqual(@as(u32, 0), cached_deletion.new_count);
     try std.testing.expectEqual(@as(u32, 20), cached_deletion.new_start);
+    try std.testing.expectEqualStrings("@@ -20,1 +20,0 @@", cached_deletion.header);
 
     var second_cached_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer second_cached_arena.deinit();
@@ -1334,6 +1356,7 @@ test "hunk projection normalizes zero-count headers after non-zero prior deltas"
     const unstaged_insertion = second.presentation.file.hunks[1];
     try std.testing.expectEqual(@as(u32, 0), unstaged_insertion.old_count);
     try std.testing.expectEqual(@as(u32, 19), unstaged_insertion.old_start);
+    try std.testing.expectEqualStrings("@@ -19,0 +21,1 @@", unstaged_insertion.header);
 }
 
 test "hunk projection zero-count header mapping preserves Git side bias" {

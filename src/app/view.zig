@@ -3333,8 +3333,13 @@ test "help preserves configured keys and aligned wrapped descriptions while scro
     }
 }
 
-test "diff Help copy vocabulary follows effective mode for Changes Compare and History" {
+test "diff Help copy keys and vocabulary follow the keymap and effective mode" {
     var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 160, .height = 40 } };
+    var config: keymap.Config = .{};
+    config.set(.copy_current_line, .{ .ctrl = .s });
+    config.set(.copy_current_hunk, .{ .ctrl = .enter });
+    try std.testing.expect(keymap.validateConfig(config));
+    harness.keymap = .fromConfig(config);
     var history: history_page.HistoryPageState = .{};
     harness.changes.viewer.sidebar_hidden = true;
     harness.compare.diff.viewer.sidebar_hidden = true;
@@ -3384,6 +3389,37 @@ test "diff Help copy vocabulary follows effective mode for Changes Compare and H
             _ = try drawHelpItem(helpContext(context), context.theme, &popup.surface, 1, 0, help_diff_items[2]);
             const snapshot = try popup.snapshot(std.testing.allocator);
             defer std.testing.allocator.free(snapshot);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ctrl+s") != null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ctrl+Enter") != null);
+
+            const app_input = @import("input.zig");
+            const input_context: app_input.KeyContext = .{
+                .active_page = help_page,
+                .keymap = harness.keymap,
+                .changes = .{ .focus = .diff, .keymap = harness.keymap },
+                .compare = .{ .common = .{ .focus = .diff, .keymap = harness.keymap } },
+                .history = .{ .diff_view = true, .common = .{ .focus = .diff, .keymap = harness.keymap } },
+            };
+            const msg = @import("message.zig").Msg;
+            for ([_]struct { key: u21, expected: msg }{
+                .{ .key = 's', .expected = switch (help_page) {
+                    .changes => .{ .changes = .copy_current_line },
+                    .compare => .{ .compare = .{ .common = .copy_current_line } },
+                    .history => .{ .history = .{ .common = .copy_current_line } },
+                    else => unreachable,
+                } },
+                .{ .key = chasen.Key.enter, .expected = switch (help_page) {
+                    .changes => .{ .changes = .copy_current_hunk },
+                    .compare => .{ .compare = .{ .common = .copy_current_hunk } },
+                    .history => .{ .history = .{ .common = .copy_current_hunk } },
+                    else => unreachable,
+                } },
+            }) |binding| {
+                try std.testing.expectEqual(binding.expected, app_input.keyToMsg(input_context, .{
+                    .codepoint = binding.key,
+                    .mods = .{ .ctrl = true },
+                }).?);
+            }
 
             if (canonical_mode == .unified) {
                 try std.testing.expect(std.mem.indexOf(u8, snapshot, "Copy diff") != null);
@@ -4017,8 +4053,8 @@ const help_sidebar_items = [_]HelpItem{
 
 const help_diff_items = [_]HelpItem{
     .{ .key = .{ .text = "V" }, .description = "begin line selection" },
-    .{ .key = .{ .text = "y" }, .description = "", .dynamic = .copy_line },
-    .{ .key = .{ .text = "Y" }, .description = "", .dynamic = .copy_hunk },
+    .{ .key = .{ .action = .copy_current_line }, .description = "", .dynamic = .copy_line },
+    .{ .key = .{ .action = .copy_current_hunk }, .description = "", .dynamic = .copy_hunk },
     .{ .key = .{ .action = .search }, .description = "search diff" },
     .{ .key = .{ .action = .toggle_display_mode }, .description = "unified / side-by-side" },
     .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
