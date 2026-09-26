@@ -370,6 +370,19 @@ fn viewFilesPane(context: ViewContext, surface: *chasen.Surface) !void {
                 count,
                 context.palette.style(if (active) .accent else .muted),
             );
+            var totals: git_preview.TextStats = .{ .added = 0, .removed = 0 };
+            for (files) |file| switch (file.stats) {
+                .text => |text| {
+                    totals.added +|= text.added;
+                    totals.removed +|= text.removed;
+                },
+                .binary, .mode_only, .submodule => {},
+            };
+            const added = try std.fmt.allocPrint(surface.frameAllocator(), " +{d}", .{totals.added});
+            const removed = try std.fmt.allocPrint(surface.frameAllocator(), " -{d}", .{totals.removed});
+            const added_col = count_col + @as(u16, @intCast(count.len));
+            try drawClipped(surface, added_col, 0, added, context.palette.boldStyle(.success));
+            try drawClipped(surface, added_col + @as(u16, @intCast(added.len)), 0, removed, context.palette.boldStyle(.danger));
         }
     }
     if (surface.size().height <= 1) return;
@@ -1386,7 +1399,7 @@ test "History preview three pane renders focus structured detail and flat files"
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "History") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Range summary") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed files (2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed files (2) +24 -31") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Count: 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "src/history/preview-with") != null);
     const layout = pickerLayout(rendered.surface.size(), page_state.interaction_state);
@@ -1412,6 +1425,10 @@ test "History preview three pane renders focus structured detail and flat files"
     try std.testing.expect(active_title.style.fg.eql(palette.color(.accent)));
     const files_count = rendered.surface.readCell(layout.files.col + 14, layout.files.row) orelse return error.ExpectedFileCount;
     try std.testing.expect(files_count.style.fg.eql(palette.color(.accent)));
+    const added_total = rendered.surface.readCell(layout.files.col + 18, layout.files.row) orelse return error.ExpectedAddedTotal;
+    const removed_total = rendered.surface.readCell(layout.files.col + 22, layout.files.row) orelse return error.ExpectedRemovedTotal;
+    try std.testing.expect(added_total.style.eql(palette.boldStyle(.success)));
+    try std.testing.expect(removed_total.style.eql(palette.boldStyle(.danger)));
     const status_cell = rendered.surface.readCell(files_body.col, files_body.row) orelse return error.ExpectedFileStatus;
     try std.testing.expect(status_cell.style.bold);
     try std.testing.expect(status_cell.style.fg.eql(palette.color(.prompt)));
@@ -1470,6 +1487,7 @@ test "History preview three pane renders focus structured detail and flat files"
     defer std.testing.allocator.free(loading_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Count: 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "Loading preview…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loading_snapshot, "+24 -31") == null);
 
     // A resize can land while the reader is active. The later completion uses
     // the current geometry, preserving the visible range-summary position and
@@ -1487,6 +1505,13 @@ test "History preview three pane renders focus structured detail and flat files"
     try std.testing.expectEqual(resized_anchor, page_state.interaction_state.detail_anchor);
     try std.testing.expectEqual(@as(usize, 0), page_state.interaction_state.files_vertical_offset);
     try std.testing.expectEqual(@as(usize, 0), page_state.interaction_state.files_horizontal_offset);
+
+    files[0].stats = .binary;
+    rendered.surface.clearAll();
+    try view(.{ .page_state = &page_state, .palette = palette }, &rendered.surface);
+    const binary_snapshot = try rendered.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(binary_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, binary_snapshot, "Changed files (2) +21 -30") != null);
 }
 
 test "History range hint stays dim and fixed above commits only while usable" {

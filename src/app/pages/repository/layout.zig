@@ -22,8 +22,8 @@ pub const BodyLayout = struct {
     tree_visible: bool,
     source_col: u16,
     source_width: u16,
-    /// Row 0 is reserved for compact tree status. The Files mode heading is on
-    /// row 1, and projected root/tree navigation begins at row 2.
+    /// Row 0 shows the total file count. The Files mode heading is on row 1,
+    /// and projected root/tree navigation begins at row 2.
     header_rows: u16 = 2,
 
     pub fn treeRows(self: BodyLayout, body_height: u16) u16 {

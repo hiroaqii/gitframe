@@ -380,8 +380,8 @@ fn viewEmptySidebarChrome(surface: *chasen.Surface, args: ViewArgs) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    try drawSidebarDetailRow(surface, 0, args.state, args.file_filter_binding, args.palette);
     try drawSidebarSummary(surface, 0, 0, args.palette);
+    try drawSidebarDetailRow(surface, 1, args.state, args.file_filter_binding, args.palette);
     try drawEmptySidebarRoot(surface, args.repo_root, args.palette);
 }
 
@@ -1052,11 +1052,11 @@ fn drawFileSearchInput(surface: *chasen.Surface, col: u16, row: u16, text: []con
 
 pub fn drawSidebarSummary(surface: *chasen.Surface, file_count: usize, hunk_count: usize, palette: theme.Palette) !void {
     const size = surface.size();
-    if (size.width == 0 or size.height <= 1) return;
+    if (size.width == 0 or size.height == 0) return;
 
     const stats_col: u16 = 1;
     if (stats_col < size.width) {
-        _ = try surface.printAt(stats_col, 1, palette.style(.muted), "{d} files / {d} hunks", .{ file_count, hunk_count });
+        _ = try surface.printAt(stats_col, 0, palette.style(.muted), "{d} files / {d} hunks", .{ file_count, hunk_count });
     }
 }
 
@@ -1094,6 +1094,7 @@ test "sidebar summary omits Files label and empty state keeps repository root" {
 
     try drawSidebarSummary(&surface.surface, 0, 0, palette);
     try drawEmptySidebarRoot(&surface.surface, "/work/gitframe", palette);
+    try surface.expectCellText(1, 0, "0");
 
     const snapshot = try surface.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -1127,9 +1128,8 @@ pub fn viewSidebar(
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
 
-    try drawSidebarDetailRow(surface, 0, state, filter_binding, palette);
-
     try drawSidebarSummary(surface, loaded.document.files.len, loaded.document.totalHunks(), palette);
+    try drawSidebarDetailRow(surface, 1, state, filter_binding, palette);
 
     if (size.height <= layout.sidebar_header_rows) return;
     if (loaded.visibleNodeCount() == 0) {

@@ -783,11 +783,12 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
     defer ts.deinit();
 
     const selected_row = changes_layout.sidebar_header_rows;
-    const summary_row = changes_layout.sidebar_header_rows - 1;
+    const summary_row = 0;
     try viewSidebar(testContext(&page, palette, 80, 9), &ts.surface, page.load.state.loaded.loaded);
     try ts.expectCellText(2, changes_layout.sidebar_header_rows, "A");
     try ts.expectCellText(2, changes_layout.sidebar_header_rows + 1, "D");
     try ts.expectCellText(1, summary_row, "2");
+    try ts.expectCellText(1, 1, "F");
     const active_badge = ts.surface.readCell(2, selected_row) orelse return error.ExpectedActiveBadge;
     const active_path = ts.surface.readCell(6, selected_row) orelse return error.ExpectedActivePath;
     const active_trailing = ts.surface.readCell(33, selected_row) orelse return error.ExpectedActiveTrailingCell;

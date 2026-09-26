@@ -125,6 +125,9 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
     const tree = &state.bundle.?.tree;
     if (layout.tree_visible) {
         var left = surface.child(.{ .col = 0, .row = 0, .width = layout.tree_width, .height = size.height });
+        if (layout.tree_width > 1) {
+            _ = try left.printAt(1, 0, context.palette.style(.muted), "{d} files", .{state.bundle.?.document.paths.len});
+        }
         const mode_header: []const u8 = if (state.file_visibility == .changed) "Files [changed]" else "Files [all]";
         var key_buffer: [16]u8 = undefined;
         var header_buffer: [64]u8 = undefined;
@@ -2361,6 +2364,7 @@ test "repository empty root renders without disclosure and mouse activation is i
     try expanded_surface.init(full_size.width, full_size.height);
     defer expanded_surface.deinit();
     try view(.{ .page_state = &state, .palette = .default(), .repo_root = "/work/empty-repo" }, &expanded_surface.surface);
+    try expanded_surface.expectCellText(1, 0, "0");
     try expanded_surface.expectCellText(0, 1, " ");
     try expanded_surface.expectCellText(1, 1, "F");
     try expanded_surface.expectCellText(2, 1, "i");
@@ -2370,6 +2374,7 @@ test "repository empty root renders without disclosure and mouse activation is i
     const expanded_snapshot = try expanded_surface.snapshot(allocator);
     defer allocator.free(expanded_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "0 files") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "empty-repo") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "▾ empty-repo") == null);
     try std.testing.expect(std.mem.indexOf(u8, expanded_snapshot, "Repository has no") != null);
@@ -2867,6 +2872,8 @@ test "repository filter discoverability header follows effective keymap and clip
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Files [changed]  (F: toggle") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 files") != null);
+        try test_surface.expectCellText(1, 0, "2");
         try test_surface.expectCellText(27, 1, "e");
         const mode_cell = test_surface.surface.readCell(1, 1) orelse return error.ExpectedFilterModeCell;
         const shortcut_cell = test_surface.surface.readCell(19, 1) orelse return error.ExpectedFilterShortcutCell;
