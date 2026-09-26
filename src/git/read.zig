@@ -542,7 +542,7 @@ pub fn loadRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, reques
 pub fn loadTrackedNumstat(allocator: std.mem.Allocator, io: std.Io, request: TrackedNumstatRequest) git_command.Error!TrackedNumstatResult {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.append(allocator, "git");
+    try argv.appendSlice(allocator, &git_command.literal_pathspec_prefix);
     try argv.append(allocator, "diff");
     if (request.staged) try argv.append(allocator, "--cached");
     try argv.append(allocator, "--no-renames");
@@ -602,11 +602,11 @@ fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, context: git_comma
 fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, request: FileDiffRequest) git_command.Error!LoadResult {
     return switch (request.base) {
         .unstaged => {
-            const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
+            const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
             return loadGitDiff(allocator, io, context, &argv);
         },
         .cached => {
-            const argv = [_][]const u8{ "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
+            const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
             return loadGitDiff(allocator, io, context, &argv);
         },
     };

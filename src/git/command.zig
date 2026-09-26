@@ -7,6 +7,10 @@
 const std = @import("std");
 const process_runner = @import("../process/runner.zig");
 
+/// Commands whose path operands are repository identities, not pathspec queries.
+/// Keep `--` before the operands as well: it terminates command options.
+pub const literal_pathspec_prefix = [_][]const u8{ "git", "--literal-pathspecs" };
+
 pub const Error = error{
     StreamTooLong,
     OutOfMemory,

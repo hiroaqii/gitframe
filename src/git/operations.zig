@@ -175,31 +175,31 @@ fn runWithStdinDetailed(
 }
 
 fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, path: []const u8) git_command.Error!OperationResult {
-    const argv = [_][]const u8{ "git", "add", "--", path };
+    const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "add", "--", path };
     const result = try runCaptured(allocator, io, context, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git add");
 }
 
 fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, path: []const u8) git_command.Error!OperationResult {
-    const argv = [_][]const u8{ "git", "restore", "--staged", "--", path };
+    const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "restore", "--staged", "--", path };
     const result = try runCaptured(allocator, io, context, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git restore --staged");
 }
 
 fn runGitAddAll(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext) git_command.Error!OperationResult {
-    const argv = [_][]const u8{ "git", "add", "--all", "--", "." };
+    const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "add", "--all", "--", "." };
     const result = try runCaptured(allocator, io, context, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git add --all");
 }
 
 fn runGitUnstageAll(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext) git_command.Error!OperationResult {
-    const argv = [_][]const u8{ "git", "restore", "--staged", "--", "." };
+    const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "restore", "--staged", "--", "." };
     const result = try runCaptured(allocator, io, context, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git restore --staged");
 }
 
 fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, path: []const u8) git_command.Error!OperationResult {
-    const argv = [_][]const u8{ "git", "restore", "--", path };
+    const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "restore", "--", path };
     const result = try runCaptured(allocator, io, context, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git restore");
 }
@@ -442,6 +442,86 @@ test "stdin admission Git mapping keeps writer error with zero-exit warning" {
             try std.testing.expect(std.mem.indexOf(u8, message, "warning: partial input") != null);
         },
         else => return error.ExpectedGitStdinFailure,
+    }
+}
+
+test "literal path operations and reads preserve unselected index and worktree bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const read = @import("read.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    const names = [_][]const u8{ "choice*.txt", ":(glob)*.txt", "space name.txt", "-leading.txt", "question?.txt", "bracket[ab].txt" };
+    for (names ++ .{"choice-other.txt"}) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "base\n" });
+    try runTestGit(io, &.{ "git", "add", "--all" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, tmp.dir);
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+
+    for (names) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "selected\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "choice-other.txt", .data = "CANARY staged\n" });
+        for ([_]read.FileDiffBase{ .unstaged, .cached }) |base| {
+            if (base == .cached) {
+                const stage = try runOperation(allocator, io, .{ .context = context, .kind = .{ .stage_file = name } });
+                defer stage.deinit(allocator);
+                try std.testing.expect(stage == .ok);
+                const index_names = try gitOutputAlloc(io, tmp.dir, &.{ "git", "diff", "--cached", "--name-only", "-z" });
+                defer allocator.free(index_names);
+                const expected_names = try std.fmt.allocPrint(allocator, "{s}\x00", .{name});
+                defer allocator.free(expected_names);
+                try std.testing.expectEqualStrings(expected_names, index_names);
+                try runTestGit(io, &.{ "git", "add", "--", "choice-other.txt" }, tmp.dir);
+            }
+            const diff = try read.loadDiff(allocator, io, .{ .context = context, .kind = .{ .file = .{ .base = base, .path = name } } });
+            defer diff.deinit(allocator);
+            try std.testing.expect(diff == .ok);
+            try std.testing.expect(std.mem.indexOf(u8, diff.ok, "+selected\n") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diff.ok, "CANARY") == null);
+            const stats = try read.loadTrackedNumstat(allocator, io, .{ .context = context, .paths = &.{name}, .staged = base == .cached });
+            defer stats.deinit(allocator);
+            try std.testing.expect(stats == .ok);
+            const expected_stats = try std.fmt.allocPrint(allocator, "1\t1\t{s}\x00", .{name});
+            defer allocator.free(expected_stats);
+            try std.testing.expectEqualStrings(expected_stats, stats.ok);
+        }
+
+        const unstage = try runOperation(allocator, io, .{ .context = context, .kind = .{ .unstage_file = name } });
+        defer unstage.deinit(allocator);
+        try std.testing.expect(unstage == .ok);
+        const staged_names = try gitOutputAlloc(io, tmp.dir, &.{ "git", "diff", "--cached", "--name-only", "-z" });
+        defer allocator.free(staged_names);
+        try std.testing.expectEqualStrings("choice-other.txt\x00", staged_names);
+        try tmp.dir.writeFile(io, .{ .sub_path = "choice-other.txt", .data = "CANARY unstaged\n" });
+
+        const status = try read.loadStatus(allocator, io, .{ .context = context });
+        defer status.deinit(allocator);
+        try std.testing.expect(status == .ok);
+        var bundle = try @import("status.zig").StatusBundle.parseOwned(allocator, status.ok);
+        defer bundle.deinit();
+        const target = @import("../app/git_ops.zig").discardTarget(.{
+            .source = .unstaged,
+            .repo_root = "/fixture",
+            .action_target = .{ .path = name, .kind = .file },
+            .status = .{ .repo_root = "/fixture", .loading = false, .entries = bundle.document.entries },
+        });
+        try std.testing.expect(target == .ready);
+        const discard = try runOperation(allocator, io, .{ .context = context, .kind = .{ .discard_file = target.ready.path } });
+        defer discard.deinit(allocator);
+        try std.testing.expect(discard == .ok);
+        const selected_bytes = try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024));
+        defer allocator.free(selected_bytes);
+        try std.testing.expectEqualStrings("base\n", selected_bytes);
+        const canary_bytes = try tmp.dir.readFileAlloc(io, "choice-other.txt", allocator, .limited(1024));
+        defer allocator.free(canary_bytes);
+        try std.testing.expectEqualStrings("CANARY unstaged\n", canary_bytes);
+        const canary_index = try gitOutputAlloc(io, tmp.dir, &.{ "git", "show", ":choice-other.txt" });
+        defer allocator.free(canary_index);
+        try std.testing.expectEqualStrings("CANARY staged\n", canary_index);
+
+        try runTestGit(io, &.{ "git", "restore", "--staged", "--worktree", "--", "choice-other.txt" }, tmp.dir);
     }
 }
 
