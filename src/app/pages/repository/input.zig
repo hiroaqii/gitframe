@@ -102,6 +102,10 @@ pub fn selectionKeyToMsg(comptime Msg: type, context: Context, key: chasen.Key) 
 fn publicActionToMsg(comptime Msg: type, context: Context, action: keymap.PublicAction) ?Msg {
     if (keymap.isDocumentNavigationAction(action)) return documentNavigationActionToMsg(Msg, context, action);
     return switch (action) {
+        .open_editor => if (context.selection_owner == .none)
+            voidMsg(Msg, "open_selected_file_in_editor")
+        else
+            voidMsg(Msg, "selection_owned_noop"),
         .previous_file => if (context.focus == .source) voidMsg(Msg, "previous_file") else null,
         .next_file => if (context.focus == .source) voidMsg(Msg, "next_file") else null,
         .search => if (context.source_available) voidMsg(Msg, "enter_source_search") else null,
@@ -159,6 +163,7 @@ fn payload(comptime Msg: type, comptime field: []const u8, value: anytype) Msg {
 }
 
 const TestMsg = union(enum) {
+    open_selected_file_in_editor,
     selection_action: selection_action.Action,
     selection_owned_noop,
     selection_action_unavailable,

@@ -228,19 +228,22 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         .command_line,
         => true,
         .repository => |repository_msg| switch (repository_msg) {
-            .manifest_finished, .branch_finished, .path_history_finished => true,
+            .manifest_finished, .branch_finished, .path_history_finished, .document_finished, .syntax_finished, .change_map_finished => true,
             else => false,
         },
         else => false,
     };
 }
 
-test "Repository path history completion preserves root diagnostics while navigation does not" {
+test "Repository read completions preserve root diagnostics while navigation does not" {
     // Root classification runs before page admission, so one exact variant
     // must cover later-known, unavailable, and stale completion outcomes.
     try std.testing.expect(keepsEphemeralStatus(.{
         .repository = .{ .path_history_finished = undefined },
     }));
+    try std.testing.expect(keepsEphemeralStatus(.{ .repository = .{ .document_finished = undefined } }));
+    try std.testing.expect(keepsEphemeralStatus(.{ .repository = .{ .syntax_finished = undefined } }));
+    try std.testing.expect(keepsEphemeralStatus(.{ .repository = .{ .change_map_finished = undefined } }));
     try std.testing.expect(!keepsEphemeralStatus(.{ .repository = .move_down }));
     try std.testing.expect(!keepsEphemeralStatus(.{ .repository = .{ .source_search_insert = 'x' } }));
 }

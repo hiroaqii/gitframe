@@ -3960,6 +3960,7 @@ const help_compare_sections = [_]HelpSection{
 
 const help_repository_global_items = help_common_global_actions ++ [_]HelpItem{
     .{ .key = .{ .action = .reload }, .description = "force reload" },
+    .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
     help_group_separator,
 } ++ help_common_global_navigation;

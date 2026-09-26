@@ -19,6 +19,8 @@ const git_command = @import("../../git/command.zig");
 const git_read = @import("../../git/read.zig");
 const process_runner = @import("../../process/runner.zig");
 const root_capability = @import("../../repo/root_capability.zig");
+const editor = @import("../../editor.zig");
+const file_access = @import("../../repository/file_access.zig");
 const selected_document = @import("../../repository/document.zig");
 const source_document = @import("../../repository/source.zig");
 const repository_change_map = @import("../../repository/change_map.zig");
@@ -140,6 +142,7 @@ pub const ChangeDecoration = union(enum) {
 };
 
 pub const Msg = union(enum) {
+    open_selected_file_in_editor,
     manifest_finished: repository_tasks.ManifestFinished,
     branch_finished: repository_branch.Finished,
     path_history_finished: repository_path_history.Finished,
@@ -1070,15 +1073,15 @@ pub const RepositoryPageState = struct {
         self.needs_change_map_request = self.currentSource() != null;
     }
 
-    pub const ReloadCause = enum { manual, branch_switch };
+    pub const ReloadCause = enum { manual, branch_switch, editor };
 
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool, cause: ReloadCause) void {
         // The shared authority transition clears borrowed source storage and
         // preserves the semantic viewport across any projection change.
         if (self.selection_owner.activeSourceHeader() != null) self.cancelMouseOwner();
         self.path_history.retire(false);
-        if (cause == .branch_switch) {
-            // Pre-checkout reads cannot recover a failed successor request.
+        if (cause != .manual) {
+            // Reads started before an external operation cannot publish afterward.
             self.pending_generation = null;
             self.branch.pending = null;
         }
@@ -1952,7 +1955,7 @@ pub const RepositoryPageState = struct {
                 };
                 self.refreshFileSearch();
             },
-            .manifest_finished, .branch_finished, .path_history_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
+            .open_selected_file_in_editor, .manifest_finished, .branch_finished, .path_history_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
         }
         if (!optionalPathEql(previous, self.selected_path)) {
             self.invalidateSelectedDocument(allocator);
@@ -2023,6 +2026,53 @@ pub const RepositoryPageState = struct {
     fn requireDocumentRevalidation(self: *RepositoryPageState) void {
         self.invalidateDisplayedDocumentAuthority();
         self.needs_document_revalidation = self.selected_path != null;
+    }
+
+    pub fn editorTarget(
+        self: *const RepositoryPageState,
+        io: std.Io,
+        repo_root: ?[]const u8,
+        capability: ?*const root_capability.RootCapability,
+    ) editor.TargetResult {
+        const root = repo_root orelse return .no_repo;
+        const cap = capability orelse return .no_repo;
+        if (!self.active or self.root_identity == null or !self.root_identity.?.eql(cap.identity)) return .stale_source;
+        const source_focused = self.viewer.tree_hidden or self.viewer.focus == .source;
+        const path = if (source_focused) blk: {
+            // A pending contextual jump may still display the previous file.
+            if (self.incoming != .none) return .unavailable_source;
+            break :blk self.selected_path orelse return .no_path;
+        } else blk: {
+            const bundle = if (self.bundle) |*value| value else return .no_path;
+            const selected = self.tree_projection.cursorIdentity(&bundle.tree, self.viewer.tree_cursor) orelse return .no_path;
+            switch (selected) {
+                .repo_root => return .directory_unsupported,
+                .manifest_node => |node| {
+                    if (node.kind != .file) return .directory_unsupported;
+                    break :blk node.path;
+                },
+            }
+        };
+
+        // Check the current file kind without rereading its contents or treating
+        // a routine background refresh as a change to the selected path.
+        var parent = file_access.openParent(cap.dir(), path, io) catch return .unavailable_source;
+        defer parent.deinit(io);
+        const stat = parent.dir.statFile(io, parent.name, .{ .follow_symlinks = false }) catch |err| return switch (err) {
+            error.FileNotFound, error.NotDir => .deleted_file,
+            else => .unavailable_source,
+        };
+        switch (stat.kind) {
+            .file => {},
+            .sym_link => return .symlink_unsupported,
+            .directory => return .directory_unsupported,
+            else => return .unavailable_source,
+        }
+        const line: u32 = if (source_focused and self.currentSource() != null)
+            @intCast(@min(self.viewer.source_cursor, self.currentSource().?.rowCount() - 1) + 1)
+        else
+            1;
+        return .{ .ready = .{ .repo_root = root, .path = path, .line = line } };
     }
 
     fn currentSource(self: *const RepositoryPageState) ?*const source_document.Document {
@@ -5603,6 +5653,61 @@ const TestRoot = struct {
         self.* = undefined;
     }
 };
+
+test "Repository editor target follows focus and checks the current file kind" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    try root.tmp.dir.createDir(io, "dir", .default_dir);
+    try root.tmp.dir.writeFile(io, .{ .sub_path = "file name.zig", .data = "one\ntwo\nthree\n" });
+    var state: RepositoryPageState = .{
+        .active = true,
+        .root_identity = root.capability.identity,
+        .bundle = try bundleForTest("dir/a.zig\x00file name.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    state.selected_path = state.bundle.?.tree.filePath("file name.zig", .all).?;
+    state.viewer.tree_cursor = state.projectedCursorForPath(&state.bundle.?.tree, state.selected_path.?).?;
+    const bytes = try allocator.dupe(u8, "one\ntwo\nthree\n");
+    state.displayed_document = .{
+        .path = try allocator.dupe(u8, state.selected_path.?),
+        .manifest_revision = state.manifest_revision,
+        .authority = .accepted,
+        .value = .{ .source = try source_document.Document.initOwned(allocator, bytes, .init(bytes)) },
+    };
+    state.viewer.source_cursor = 2;
+    const tree_target = state.editorTarget(io, root.path, &root.capability).ready;
+    try std.testing.expectEqualStrings(root.path, tree_target.repo_root);
+    try std.testing.expectEqualStrings("file name.zig", tree_target.path);
+    try std.testing.expectEqual(@as(?u32, 1), tree_target.line);
+
+    state.viewer.focus = .source;
+    try std.testing.expectEqual(@as(?u32, 3), state.editorTarget(io, root.path, &root.capability).ready.line);
+    // Routine refreshes do not make opening the selected worktree path stale.
+    state.pending_generation = 1;
+    state.pending_document_generation = 2;
+    state.displayed_document.?.authority = .revalidation_required;
+    try std.testing.expectEqualStrings("file name.zig", state.editorTarget(io, root.path, &root.capability).ready.path);
+
+    // A root/directory tree row must not reuse the retained source selection.
+    state.viewer.focus = .tree;
+    state.viewer.tree_cursor = 0;
+    try std.testing.expect(state.editorTarget(io, root.path, &root.capability) == .directory_unsupported);
+    state.viewer.tree_cursor = 1;
+    try std.testing.expect(state.editorTarget(io, root.path, &root.capability) == .directory_unsupported);
+    state.viewer.tree_hidden = true;
+    try std.testing.expectEqual(@as(?u32, 3), state.editorTarget(io, root.path, &root.capability).ready.line);
+
+    try root.tmp.dir.deleteFile(io, "file name.zig");
+    try std.testing.expect(state.editorTarget(io, root.path, &root.capability) == .deleted_file);
+    try root.tmp.dir.symLink(io, "dir/a.zig", "file name.zig", .{});
+    try std.testing.expect(state.editorTarget(io, root.path, &root.capability) == .symlink_unsupported);
+    try std.testing.expect(state.editorTarget(io, null, null) == .no_repo);
+    state.active = false;
+    try std.testing.expect(state.editorTarget(io, root.path, &root.capability) == .stale_source);
+}
 
 test "Repository branch terminal does not mutate the primary page status" {
     var root = try TestRoot.init();

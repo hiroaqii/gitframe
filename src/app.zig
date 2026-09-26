@@ -644,7 +644,7 @@ pub const App = struct {
             .shell_effect_finished => |finished| try self.finishShellEffect(ctx, finished),
             .changes => |changes_msg| _ = try self.updateChanges(ctx, changes_msg),
             .compare => |compare_msg| _ = try self.updateCompare(ctx, compare_msg),
-            .repository => |repository_msg| _ = self.updateRepository(ctx, repository_msg),
+            .repository => |repository_msg| _ = try self.updateRepository(ctx, repository_msg),
             .history => |history_msg| _ = try self.updateHistory(ctx, history_msg),
             .command_line => |command_msg| self.updateCommandLine(command_msg),
             .stash => |stash_msg| try self.stashWorkflow().update(ctx, stash_msg),
@@ -849,7 +849,7 @@ pub const App = struct {
             },
             .repository => |point| blk: {
                 if (self.active_page != .repository) break :blk .repository;
-                _ = self.updateRepository(ctx, .{ .mouse_owner_drag = point });
+                _ = try self.updateRepository(ctx, .{ .mouse_owner_drag = point });
                 break :blk .repository;
             },
         };
@@ -879,7 +879,7 @@ pub const App = struct {
                 if (self.active_page == .history) _ = try self.updateHistory(ctx, .{ .common = .{ .shared = .{ .mouse_diff_release = point } } });
             },
             .repository => |point| {
-                if (self.active_page == .repository) _ = self.updateRepository(ctx, .{ .mouse_owner_release = point });
+                if (self.active_page == .repository) _ = try self.updateRepository(ctx, .{ .mouse_owner_release = point });
             },
         }
     }
@@ -915,7 +915,7 @@ pub const App = struct {
                     self.pages.repository.viewer.tree_width,
                     self.pages.repository.viewer.tree_hidden,
                 ) orelse break :blk null;
-                break :blk self.updateRepository(ctx, .{ .mouse_source_auto_scroll_step = .{
+                break :blk try self.updateRepository(ctx, .{ .mouse_source_auto_scroll_step = .{
                     .direction = active.intent.direction,
                     .endpoint = .{ .col = source_point.col, .row = source_point.row },
                 } });
@@ -1081,9 +1081,15 @@ pub const App = struct {
         self: *App,
         ctx: *chasen.Ctx(Msg),
         msg: repository_page.Msg,
-    ) ?drag_auto_scroll.StepOutcome {
+    ) !?drag_auto_scroll.StepOutcome {
         var outcome = self.repositoryCoordinator().update(ctx, msg);
         defer outcome.deinit(ctx.allocator());
+        if (outcome.editor_target) |target| try self.shellEffects().requestEditor(
+            ctx,
+            target,
+            self.actionLifecycleView().hasPending(),
+            self.shellEffects().repositoryOrigin(),
+        );
         const auto_scroll = outcome.auto_scroll;
         if (outcome.redraw == .skip) self.redraw_plan.requestSkip();
         if (outcome.takeClipboard()) |taken| {
@@ -1211,8 +1217,10 @@ pub const App = struct {
         finished: ShellEffectFinishedMsg,
     ) !void {
         switch (finished) {
-            .editor => |result| if (self.shellEffects().finishEditor(result) == .reload_changes) {
-                try self.changesRead().reloadAfterEditor(ctx);
+            .editor => |result| switch (self.shellEffects().finishEditor(result)) {
+                .none => {},
+                .reload_changes => try self.changesRead().reloadAfterEditor(ctx),
+                .reload_repository => self.repositoryCoordinator().requestReload(.editor),
             },
             .clipboard => |result| if (self.shellEffects().finishClipboard(result)) |completion| {
                 self.finishSelectionCopy(ctx.allocator(), completion);

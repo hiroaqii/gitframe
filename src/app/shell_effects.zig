@@ -12,7 +12,6 @@ const chasen = @import("chasen");
 const app_message = @import("message.zig");
 const app_state = @import("state.zig");
 const effect_origin = @import("effect_origin.zig");
-const changes_content = @import("pages/changes/content.zig");
 const config_mod = @import("../config.zig");
 const editor = @import("../editor.zig");
 
@@ -131,6 +130,7 @@ pub const CopyRequest = struct {
 pub const EditorFinishOutcome = enum {
     none,
     reload_changes,
+    reload_repository,
 };
 
 pub const Controller = struct {
@@ -164,35 +164,39 @@ pub const Controller = struct {
     pub fn requestEditor(
         self: Controller,
         ctx: *chasen.Ctx(app_message.Msg),
-        target_result: changes_content.EditorTargetResult,
+        target_result: editor.TargetResult,
         action_busy: bool,
         origin: effect_origin.PageOrigin,
     ) !void {
         if (action_busy) {
-            self.diagnostics.changes.set("finish current git action before opening editor", .{});
+            self.setEffectStatus(.{ .page = origin }, "finish current git action before opening editor", .{});
             return;
         }
 
         const target = switch (target_result) {
             .ready => |target| target,
             .unavailable_source, .no_repo => {
-                self.diagnostics.changes.set("editor unavailable for this source", .{});
+                self.setEffectStatus(.{ .page = origin }, "editor unavailable for this source", .{});
                 return;
             },
             .no_path => {
-                self.diagnostics.changes.set("no file selected", .{});
+                self.setEffectStatus(.{ .page = origin }, "no file selected", .{});
                 return;
             },
             .stale_source => {
-                self.diagnostics.changes.set("source is stale; press r to reload", .{});
+                self.setEffectStatus(.{ .page = origin }, "source is stale; press r to reload", .{});
                 return;
             },
             .directory_unsupported => {
-                self.diagnostics.changes.set("directories cannot be opened in editor", .{});
+                self.setEffectStatus(.{ .page = origin }, "directories cannot be opened in editor", .{});
+                return;
+            },
+            .symlink_unsupported => {
+                self.setEffectStatus(.{ .page = origin }, "symbolic links cannot be opened in editor", .{});
                 return;
             },
             .deleted_file => {
-                self.diagnostics.changes.set("deleted files cannot be opened", .{});
+                self.setEffectStatus(.{ .page = origin }, "deleted files cannot be opened", .{});
                 return;
             },
         };
@@ -205,7 +209,7 @@ pub const Controller = struct {
         }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.EmptyArgv => {
-                self.diagnostics.changes.set("editor command is empty", .{});
+                self.setEffectStatus(.{ .page = origin }, "editor command is empty", .{});
                 return;
             },
             error.NoEditorFound => {
@@ -213,13 +217,13 @@ pub const Controller = struct {
                 return;
             },
             error.MissingPathPlaceholder, error.UnknownPlaceholder, error.TooManyArguments => {
-                self.diagnostics.changes.set("editor config invalid: {s}", .{@errorName(err)});
+                self.setEffectStatus(.{ .page = origin }, "editor config invalid: {s}", .{@errorName(err)});
                 return;
             },
         };
         defer argv.deinit(ctx.allocator());
         if (argv.argv.len == 0) {
-            self.diagnostics.changes.set("editor command is empty", .{});
+            self.setEffectStatus(.{ .page = origin }, "editor command is empty", .{});
             return;
         }
 
@@ -230,11 +234,11 @@ pub const Controller = struct {
             .finished = app_message.Msg.editorFinished,
         }) catch |err| switch (err) {
             error.ForegroundCommandLimitExceeded => {
-                self.diagnostics.changes.set("editor command already queued", .{});
+                self.setEffectStatus(.{ .page = origin }, "editor command already queued", .{});
                 return;
             },
             error.ForegroundCommandEmptyArgv => {
-                self.diagnostics.changes.set("editor command is empty", .{});
+                self.setEffectStatus(.{ .page = origin }, "editor command is empty", .{});
                 return;
             },
             error.ForegroundCommandCwdUnsupported,
@@ -243,7 +247,7 @@ pub const Controller = struct {
             error.ForegroundCommandSystemFdQuotaExceeded,
             error.ForegroundCommandDuplicateCwdFailed,
             => {
-                self.diagnostics.changes.set("editor command could not be queued", .{});
+                self.setEffectStatus(.{ .page = origin }, "editor command could not be queued", .{});
                 return;
             },
             error.OutOfMemory => return err,
@@ -252,7 +256,7 @@ pub const Controller = struct {
             .request_id = request_id,
             .origin = origin,
         };
-        self.diagnostics.changes.set("opening editor: {s}", .{target.path});
+        self.setEffectStatus(.{ .page = origin }, "opening editor: {s}", .{target.path});
     }
 
     pub fn finishEditor(
@@ -286,7 +290,11 @@ pub const Controller = struct {
             self.redraw.requestSkip();
             return .none;
         }
-        return if (foreground.origin.page_id == .changes) .reload_changes else .none;
+        return switch (foreground.origin.page_id) {
+            .changes => .reload_changes,
+            .repository => .reload_repository,
+            else => .none,
+        };
     }
 
     pub fn queueClipboard(

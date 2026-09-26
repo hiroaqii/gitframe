@@ -15,6 +15,7 @@ const repo_session = @import("../../repo_session.zig");
 const repository_page = @import("../repository.zig");
 const repository_tasks = @import("tasks.zig");
 const selection_context = @import("../../selection_context.zig");
+const editor = @import("../../../editor.zig");
 
 const ManifestTask = repository_tasks.ManifestTask(app_message.Msg);
 const BranchTask = repository_tasks.BranchTask(app_message.Msg);
@@ -44,6 +45,7 @@ pub const UpdateOutcome = struct {
     redraw: Redraw = .default,
     clipboard: ?ClipboardEffect = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
+    editor_target: ?editor.TargetResult = null,
 
     pub fn deinit(self: *UpdateOutcome, allocator: std.mem.Allocator) void {
         if (self.clipboard) |*effect| effect.deinit(allocator);
@@ -70,6 +72,13 @@ pub const Controller = struct {
         msg: repository_page.Msg,
     ) UpdateOutcome {
         switch (msg) {
+            .open_selected_file_in_editor => {
+                if (self.active_page != .repository) return .{ .redraw = .skip };
+                return .{ .editor_target = if (self.page_state.repo_epoch != self.repo.epoch())
+                    .stale_source
+                else
+                    self.page_state.editorTarget(ctx.io(), self.repo.activeRoot(), self.repo.activeCapability()) };
+            },
             .manifest_finished => |finished| {
                 var owned = finished;
                 defer owned.deinit(ctx.allocator());

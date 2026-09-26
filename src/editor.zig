@@ -22,6 +22,18 @@ pub const Target = struct {
     column: ?u32 = null,
 };
 
+/// Borrowed page-selected target, consumed synchronously when queuing an editor.
+pub const TargetResult = union(enum) {
+    ready: Target,
+    unavailable_source,
+    no_repo,
+    no_path,
+    directory_unsupported,
+    symlink_unsupported,
+    deleted_file,
+    stale_source,
+};
+
 pub const BuildResult = struct {
     argv: []const []const u8 = &.{},
     owned_args: []?[]u8 = &.{},

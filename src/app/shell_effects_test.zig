@@ -449,6 +449,35 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     }
 
+    // Repository uses the same queue but owns diagnostics and completion reloads.
+    {
+        var app: ShellHarness = .{ .active_page = .repository, .env_map = &env };
+        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
+        defer ctx.runtimeClearPendingEffectCopies();
+        const origin = app.shellEffects().repositoryOrigin();
+        try app.shellEffects().requestEditor(&ctx, .directory_unsupported, false, origin);
+        try std.testing.expectEqualStrings("directories cannot be opened in editor", app.pages.repository.status.text());
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
+        try app.shellEffects().requestEditor(&ctx, ready, true, origin);
+        try std.testing.expectEqualStrings("finish current git action before opening editor", app.pages.repository.status.text());
+        app.user_config.editor.argv[0] = "nvim";
+        app.user_config.editor.argv[1] = "+{line}";
+        app.user_config.editor.argv[2] = "{path}";
+        app.user_config.editor.argv_len = 3;
+        try app.shellEffects().requestEditor(&ctx, ready, false, origin);
+        const entry = ctx._pending_foreground_commands[0];
+        try std.testing.expectEqualStrings("+42", entry.argv[1]);
+        try std.testing.expectEqualStrings("src/main.zig", entry.argv[2]);
+        try std.testing.expectEqualStrings("opening editor: src/main.zig", app.pages.repository.status.text());
+        try std.testing.expectEqual(shell_effects.EditorFinishOutcome.reload_repository, app.shellEffects().finishEditor(.{
+            .request_id = entry.request_id,
+            .outcome = .{ .spawn_failed = "FileNotFound" },
+        }));
+        try std.testing.expectEqualStrings("editor spawn failed: FileNotFound", app.pages.repository.status.text());
+        try std.testing.expect(app.shell_state.editor_foreground == null);
+        try std.testing.expectEqualStrings("", app.pages.changes.status.text());
+    }
+
     // Queue saturation is diagnosed without committing editor correlation.
     {
         var app: ShellHarness = .{ .env_map = &env };

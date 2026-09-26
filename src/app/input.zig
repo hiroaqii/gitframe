@@ -645,6 +645,32 @@ test "History picker leaves i unclaimed so configured page routing wins" {
     }, .{ .codepoint = 'i' }) == null);
 }
 
+test "Repository editor key follows page bindings and yields to input owners" {
+    const key: chasen.Key = .{ .codepoint = 'e' };
+    const context: KeyContext = .{ .active_page = .repository };
+    try expectMsg(.{ .repository = .open_selected_file_in_editor }, keyToMsg(context, key).?);
+    var owned = context;
+    owned.repository.source_search_mode = true;
+    try expectMsg(.{ .repository = .{ .source_search_insert = 'e' } }, keyToMsg(owned, key).?);
+    owned.repository.source_search_mode = false;
+    owned.repository.file_search_mode = true;
+    try expectMsg(.{ .repository = .{ .file_search_insert = 'e' } }, keyToMsg(owned, key).?);
+    owned.repository.file_search_mode = false;
+    owned.repository.selection_owner = .keyboard_line;
+    try expectMsg(.{ .repository = .selection_owned_noop }, keyToMsg(owned, key).?);
+    owned = context;
+    owned.help_mode = true;
+    try std.testing.expect(keyToMsg(owned, key) == null);
+
+    var config: keymap.Config = .{};
+    config.set(.open_editor, .{ .plain_codepoint = 'E' });
+    var remapped = context;
+    remapped.keymap = keymap.Effective.fromConfig(config);
+    remapped.repository.keymap = remapped.keymap;
+    try std.testing.expect(keyToMsg(remapped, key) == null);
+    try expectMsg(.{ .repository = .open_selected_file_in_editor }, keyToMsg(remapped, .{ .codepoint = 'E' }).?);
+}
+
 test "command line owns key and paste input before every normal route" {
     const context: KeyContext = .{
         .active_page = .repository,
@@ -695,7 +721,7 @@ test "repository logical colon preserves configured claims before command open" 
     );
 
     var unsupported_config: keymap.Config = .{};
-    unsupported_config.set(.open_editor, .{ .plain_codepoint = ':' });
+    unsupported_config.set(.commit, .{ .plain_codepoint = ':' });
     const unsupported_keymap = keymap.Effective.fromConfig(unsupported_config);
     for (keys) |key| try expectMsg(
         .{ .command_line = .owned_noop },

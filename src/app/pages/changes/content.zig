@@ -23,21 +23,7 @@ const diff_view_model = @import("../../../diff/view_model.zig");
 const git_status = @import("../../../git/status.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
-pub const EditorTarget = struct {
-    repo_root: []const u8,
-    path: []const u8,
-    line: ?u32,
-};
-
-pub const EditorTargetResult = union(enum) {
-    ready: EditorTarget,
-    unavailable_source,
-    no_repo,
-    no_path,
-    directory_unsupported,
-    deleted_file,
-    stale_source,
-};
+pub const EditorTargetResult = @import("../../../editor.zig").TargetResult;
 
 pub const HunkCopyResult = diff_surface.content.HunkCopyResult;
 pub const LineCopyResult = diff_surface.content.LineCopyResult;
