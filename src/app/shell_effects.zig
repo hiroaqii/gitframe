@@ -233,6 +233,7 @@ pub const Controller = struct {
             .environment = .inherit,
             .finished = app_message.Msg.editorFinished,
         }) catch |err| switch (err) {
+            error.ForegroundCommandRuntimeStopped => return,
             error.ForegroundCommandLimitExceeded => {
                 self.setEffectStatus(.{ .page = origin }, "editor command already queued", .{});
                 return;
@@ -282,8 +283,9 @@ pub const Controller = struct {
                 }
             },
             .signaled => |signal| self.setEffectStatus(origin, "editor signal: {d}", .{signal}),
-            .spawn_failed => |err| self.setEffectStatus(origin, "editor spawn failed: {s}", .{err}),
-            .wait_failed => |err| self.setEffectStatus(origin, "editor wait failed: {s}", .{err}),
+            .stopped => |signal| self.setEffectStatus(origin, "editor stopped and terminated: {d}", .{signal}),
+            .failed => |failure| self.setEffectStatus(origin, "editor {s} failed: {s}", .{ @tagName(failure.stage), failure.error_name }),
+            .runtime_abandoned => return .none,
         }
 
         if (liveness == .live_inactive) {

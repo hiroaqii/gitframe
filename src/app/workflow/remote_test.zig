@@ -2560,8 +2560,11 @@ test "interactive push foreground terminals publish proxy warning once for both 
         .{ .mode = .upstream, .outcome = .{ .exited = 0 }, .expected = "warning: credential-bearing proxy was omitted; pushed interactively: main -> origin/main" },
         .{ .mode = .set_upstream, .outcome = .{ .exited = 3 }, .expected = "warning: credential-bearing proxy was omitted; interactive push exited: 3" },
         .{ .mode = .upstream, .outcome = .{ .signaled = 2 }, .expected = "warning: credential-bearing proxy was omitted; interactive push signal: 2" },
-        .{ .mode = .set_upstream, .outcome = .{ .spawn_failed = "SPAWN-CANARY" }, .expected = "warning: credential-bearing proxy was omitted; interactive push spawn failed: SPAWN-CANARY" },
-        .{ .mode = .upstream, .outcome = .{ .wait_failed = "WAIT-CANARY" }, .expected = "warning: credential-bearing proxy was omitted; interactive push wait failed: WAIT-CANARY" },
+        .{ .mode = .set_upstream, .outcome = .{ .stopped = 20 }, .expected = "warning: credential-bearing proxy was omitted; interactive push stopped and terminated: 20" },
+        .{ .mode = .upstream, .outcome = .{ .failed = .{ .stage = .handoff, .error_name = "HANDOFF-CANARY" } }, .expected = "warning: credential-bearing proxy was omitted; interactive push handoff failed: HANDOFF-CANARY" },
+        .{ .mode = .set_upstream, .outcome = .runtime_abandoned, .expected = "" },
+        .{ .mode = .set_upstream, .outcome = .{ .failed = .{ .stage = .spawn, .error_name = "SPAWN-CANARY" } }, .expected = "warning: credential-bearing proxy was omitted; interactive push spawn failed: SPAWN-CANARY" },
+        .{ .mode = .upstream, .outcome = .{ .failed = .{ .stage = .wait, .error_name = "WAIT-CANARY" } }, .expected = "warning: credential-bearing proxy was omitted; interactive push wait failed: WAIT-CANARY" },
     };
 
     for (cases, 0..) |case, index| {
@@ -2577,14 +2580,17 @@ test "interactive push foreground terminals publish proxy warning once for both 
         const foreground_root_observer = app.remote_workflow.push_retry.state.foreground.root;
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
 
-        try app.finishPushForeground(&ctx, .{
+        const completion = try app.remoteWorkflow().finishPushForeground(&ctx, .{
             .request_id = .{ .id = index + 1 },
             .outcome = case.outcome,
         });
 
         const status = app.pages.changes.status.text();
+        try std.testing.expectEqual(@as(@TypeOf(completion.reload), if (case.outcome == .runtime_abandoned) .none else .source_and_aux), completion.reload);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expect(app.overlay.kind == .none);
         try std.testing.expectEqualStrings(case.expected, status);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
+        try std.testing.expectEqual(@as(usize, if (case.outcome == .runtime_abandoned) 0 else 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
         try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
         try std.testing.expect(!app.actionLifecycleView().hasPending());
         try expectRootCapabilityClosed(foreground_root_observer);

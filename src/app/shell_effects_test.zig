@@ -471,7 +471,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         try std.testing.expectEqualStrings("opening editor: src/main.zig", app.pages.repository.status.text());
         try std.testing.expectEqual(shell_effects.EditorFinishOutcome.reload_repository, app.shellEffects().finishEditor(.{
             .request_id = entry.request_id,
-            .outcome = .{ .spawn_failed = "FileNotFound" },
+            .outcome = .{ .failed = .{ .stage = .spawn, .error_name = "FileNotFound" } },
         }));
         try std.testing.expectEqualStrings("editor spawn failed: FileNotFound", app.pages.repository.status.text());
         try std.testing.expect(app.shell_state.editor_foreground == null);
@@ -605,6 +605,45 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         );
         try std.testing.expectEqualStrings("", app.pages.changes.status.text());
         try std.testing.expect(app.redraw_plan.resolvesToSkip());
+    }
+
+    // New terminals retain origin routing and consume correlation exactly once.
+    for ([_]struct {
+        outcome: chasen.ForegroundCommandOutcome,
+        expected: []const u8,
+    }{
+        .{ .outcome = .{ .stopped = 20 }, .expected = "editor stopped and terminated: 20" },
+        .{ .outcome = .{ .failed = .{ .stage = .handoff, .error_name = "NotForeground" } }, .expected = "editor handoff failed: NotForeground" },
+        .{ .outcome = .runtime_abandoned, .expected = "unchanged" },
+    }) |case| {
+        var app: ShellHarness = .{ .active_page = .repository, .env_map = &env };
+        app.pages.repository.status.set("unchanged", .{});
+        app.shell_state.editor_foreground = .{
+            .request_id = .{ .id = 89 },
+            .origin = app.shellEffects().repositoryOrigin(),
+        };
+        const result: chasen.ForegroundCommandResult = .{
+            .request_id = .{ .id = 89 },
+            .outcome = case.outcome,
+        };
+        try std.testing.expectEqual(
+            if (case.outcome == .runtime_abandoned) shell_effects.EditorFinishOutcome.none else .reload_repository,
+            app.shellEffects().finishEditor(result),
+        );
+        try std.testing.expect(app.shell_state.editor_foreground == null);
+        try std.testing.expectEqualStrings(case.expected, app.pages.repository.status.text());
+        try std.testing.expectEqualStrings("", app.pages.changes.status.text());
+        try std.testing.expectEqual(shell_effects.EditorFinishOutcome.none, app.shellEffects().finishEditor(result));
+    }
+    {
+        var app: ShellHarness = .{ .env_map = &env };
+        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
+        ctx.quit();
+        app.pages.changes.status.set("closing", .{});
+        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin());
+        try std.testing.expectEqualStrings("closing", app.pages.changes.status.text());
+        try std.testing.expect(app.shell_state.editor_foreground == null);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     }
 
     // Owner teardown releases the clipboard map and clears editor identity.

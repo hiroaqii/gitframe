@@ -1018,8 +1018,9 @@ pub const Controller = struct {
                 if (active_matches) self.setForegroundStatus(foreground.warnings, "pushed interactively: {s} -> {s}/{s}", .{ foreground.target.branch, foreground.target.remote, foreground.target.remote_branch }) else self.setForegroundStatus(foreground.warnings, "pushed interactively: {s}", .{foreground.target.repo_root});
             } else if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push exited: {d}", .{code}) else self.setForegroundStatus(foreground.warnings, "interactive push exited for {s}: {d}", .{ foreground.target.repo_root, code }),
             .signaled => |signal| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push signal: {d}", .{signal}) else self.setForegroundStatus(foreground.warnings, "interactive push signal for {s}: {d}", .{ foreground.target.repo_root, signal }),
-            .spawn_failed => |err| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push spawn failed: {s}", .{err}) else self.setForegroundStatus(foreground.warnings, "interactive push spawn failed for {s}: {s}", .{ foreground.target.repo_root, err }),
-            .wait_failed => |err| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push wait failed: {s}", .{err}) else self.setForegroundStatus(foreground.warnings, "interactive push wait failed for {s}: {s}", .{ foreground.target.repo_root, err }),
+            .stopped => |signal| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push stopped and terminated: {d}", .{signal}) else self.setForegroundStatus(foreground.warnings, "interactive push stopped and terminated for {s}: {d}", .{ foreground.target.repo_root, signal }),
+            .failed => |failure| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push {s} failed: {s}", .{ @tagName(failure.stage), failure.error_name }) else self.setForegroundStatus(foreground.warnings, "interactive push {s} failed for {s}: {s}", .{ @tagName(failure.stage), foreground.target.repo_root, failure.error_name }),
+            .runtime_abandoned => return .{},
         }
         if (liveness == .live_inactive) {
             self.redraw.requestSkip();
@@ -1147,6 +1148,7 @@ pub const Controller = struct {
             self.lifecycle.rejectSpawn(prepared);
             self.restorePushRetryTarget(ctx.allocator(), target.take());
             switch (err) {
+                error.ForegroundCommandRuntimeStopped => {},
                 error.ForegroundCommandLimitExceeded => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push already queued", .{}),
                 error.ForegroundCommandEmptyArgv => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push command is empty", .{}),
                 error.ForegroundCommandCwdUnsupported => self.setForegroundStatus(prepared_push.environment.warnings, "interactive push unavailable on this platform", .{}),

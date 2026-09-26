@@ -433,8 +433,17 @@ test "undelivered plain root message is a no-op" {
     var editor = Msg.editorFinished(foreground);
     try std.testing.expectEqual(@as(u64, 17), editor.shell_effect_finished.editor.request_id.id);
     editor.deinitUndelivered(std.testing.allocator);
-    const push = Msg.pushForegroundFinished(foreground);
+    var push = Msg.pushForegroundFinished(foreground);
     try std.testing.expectEqual(@as(u64, 17), push.action_finished.push_foreground.request_id.id);
+    push.deinitUndelivered(std.testing.allocator);
+    const abandoned: chasen.ForegroundCommandResult = .{
+        .request_id = .{ .id = 18 },
+        .outcome = .runtime_abandoned,
+    };
+    var abandoned_editor = Msg.editorFinished(abandoned);
+    var abandoned_push = Msg.pushForegroundFinished(abandoned);
+    abandoned_editor.deinitUndelivered(std.testing.allocator);
+    abandoned_push.deinitUndelivered(std.testing.allocator);
     var clipboard = Msg.clipboardFinished(.{
         .request_id = .{ .id = 23 },
         .outcome = .unsupported_runtime,
