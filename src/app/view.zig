@@ -41,12 +41,11 @@ const content_fingerprint = if (builtin.is_test) @import("../content_fingerprint
 /// App state, projects it to terminal surfaces, and keeps layout constants
 /// shared with tests through small public helpers.
 const shell_frame_border = ui.Panel.Border.rounded;
-const help_dialog_max_width: u16 = 108;
-const help_dialog_max_height: u16 = 40;
+const help_dialog_max_width: u16 = 120;
+const help_dialog_max_height: u16 = 38;
 const help_two_column_min_width: u16 = 96;
 const help_column_gap: u16 = 2;
-const help_header_rows: u16 = 2;
-const help_scroll_indicator_rows: u16 = 1;
+const help_footer_rows: u16 = 1;
 const commit_dialog_width: u16 = 80;
 const repo_picker_dialog_width: u16 = 80;
 const remote_error_dialog_max_width: u16 = 90;
@@ -1964,8 +1963,6 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             const footer = app.changes.footer();
             if (!footer.normal_action_hints_enabled) return result;
 
-            appendFooterAction(app, &result, key_buffers, .create_stash, "stash", .primary);
-            appendFooterAction(app, &result, key_buffers, .stash_list, "stashes", .primary);
             appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
@@ -1992,13 +1989,12 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                         ui.key_hint.item("Esc", if (history_input.return_to_accepted) "back to diff" else "cancel"),
                         .primary,
                     );
+                    return result;
                 } else if (history.page_state.current_view == .diff) {
                     const footer = history.footer();
                     if (!footer.normal_action_hints_enabled) return result;
-                    appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
                     appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "select commits", .compare_base);
                 } else {
-                    appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
                     const range_active = history.page_state.draft.isRange();
                     if (history_input.more_row_selected) {
                         result.append(ui.key_hint.item("Enter", "load older"), .primary);
@@ -2023,6 +2019,7 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
                 {
                     result.append(ui.key_hint.item("Esc", "back to diff"), .primary);
                 }
+                appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             }
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
@@ -2030,8 +2027,8 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
         .compare => {
             const footer = app.compare.footer();
             if (!footer.normal_action_hints_enabled or app.compare.page.base_picker.open) return result;
-            appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             appendUnclaimedFooterItem(app, &result, .{ .codepoint = 'm' }, "m", "change base", .compare_base);
+            appendFooterAction(app, &result, key_buffers, .branch_switch, "switch branch", .primary);
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
         },
@@ -2083,24 +2080,20 @@ fn viewHelpPopup(app: Context, surface: *chasen.Surface) !void {
     var content = frame.contentSurface();
     const size = content.size();
 
-    _ = content.borrowTextAt(0, 0, "GitFrame shortcuts", .{ .bold = true });
-    if (size.height <= 2) return;
-
-    const body = helpBodyLayout(size, app.active_page);
-    const total_rows = helpRenderedRows(size, app.active_page);
-    const max_scroll = helpMaxScrollForContentSize(size, app.active_page);
+    const help = helpContext(app);
+    const body = helpBodyLayout(size, help);
+    const total_rows = helpRenderedRows(size, help);
+    const max_scroll = helpMaxScrollForContentSize(size, help);
     const scroll = @min(app.overlay.help_scroll, max_scroll);
 
-    if (body.overflow) {
-        drawHelpScrollIndicator(&content, scroll, body.visible_rows, total_rows, app.theme) catch {};
-    }
+    try drawHelpFooter(&content, scroll, body.visible_rows, total_rows, body.overflow, app.theme);
 
     if (body.visible_rows == 0) return;
 
     if (!helpUsesTwoColumns(size, app.active_page)) {
         var list = content.child(.{
             .col = 0,
-            .row = help_header_rows,
+            .row = 0,
             .width = size.width,
             .height = body.visible_rows,
         });
@@ -2114,19 +2107,20 @@ fn viewHelpPopup(app: Context, surface: *chasen.Surface) !void {
 
     var left = content.child(.{
         .col = 0,
-        .row = help_header_rows,
+        .row = 0,
         .width = left_width,
         .height = body.visible_rows,
     });
     var right = content.child(.{
         .col = right_col,
-        .row = help_header_rows,
+        .row = 0,
         .width = right_width,
         .height = body.visible_rows,
     });
 
-    try drawHelpSections(app, &left, &help_left_sections, scroll);
-    try drawHelpSections(app, &right, &help_right_sections, scroll);
+    const columns = helpColumnsForPage(app.active_page);
+    try drawHelpSections(app, &left, columns.left, scroll);
+    try drawHelpSections(app, &right, columns.right, scroll);
 }
 
 fn fillModalDialog(frame: ui.Modal.Frame) void {
@@ -2147,7 +2141,7 @@ const HelpBodyLayout = struct {
 fn helpModalOptions(size: chasen.Size, palette: theme.Palette) ui.Modal.ViewOptions {
     return .{
         .dialog_width = @min(size.width, help_dialog_max_width),
-        .dialog_height = @min(size.height, help_dialog_max_height),
+        .dialog_height = @min(size.height -| 2, help_dialog_max_height),
         .title = "Shortcuts",
         .backdrop = false,
         .border = .rounded,
@@ -2166,42 +2160,63 @@ fn modalContentSizeForRect(overlay_rect: chasen.Rect, opts: ui.Modal.ViewOptions
     return .{ .width = content_rect.width, .height = content_rect.height };
 }
 
-fn helpBodyLayout(size: chasen.Size, help_page: page.Id) HelpBodyLayout {
-    if (size.height <= help_header_rows) return .{ .visible_rows = 0, .overflow = helpRenderedRows(size, help_page) > 0 };
+pub const HelpContext = struct {
+    page: page.Id,
+    keymap: keymap.Effective = .{},
+    diff_mode: diff_render.DisplayMode = .unified,
+};
 
-    const total_rows = helpRenderedRows(size, help_page);
-    const initial_rows = size.height - help_header_rows;
-    if (total_rows <= @as(usize, initial_rows)) return .{ .visible_rows = initial_rows, .overflow = false };
+pub fn helpContext(app: Context) HelpContext {
+    return .{ .page = app.active_page, .keymap = app.keymap, .diff_mode = effectiveHelpDiffMode(app) };
+}
 
+fn helpBodyLayout(size: chasen.Size, help: HelpContext) HelpBodyLayout {
+    const visible_rows = size.height -| help_footer_rows;
     return .{
-        .visible_rows = if (initial_rows > help_scroll_indicator_rows) initial_rows - help_scroll_indicator_rows else 0,
-        .overflow = true,
+        .visible_rows = visible_rows,
+        .overflow = helpRenderedRows(size, help) > visible_rows,
     };
 }
 
-pub fn helpVisibleRows(size: chasen.Size, help_page: page.Id) u16 {
-    return helpBodyLayout(helpContentSize(size), help_page).visible_rows;
+pub fn helpVisibleRows(size: chasen.Size, help: HelpContext) u16 {
+    return helpBodyLayout(helpContentSize(size), help).visible_rows;
 }
 
-pub fn helpMaxScroll(size: chasen.Size, help_page: page.Id) usize {
-    return helpMaxScrollForContentSize(helpContentSize(size), help_page);
+pub fn helpMaxScroll(size: chasen.Size, help: HelpContext) usize {
+    return helpMaxScrollForContentSize(helpContentSize(size), help);
 }
 
-fn helpMaxScrollForContentSize(content_size: chasen.Size, help_page: page.Id) usize {
-    const body = helpBodyLayout(content_size, help_page);
-    const total_rows = helpRenderedRows(content_size, help_page);
-    const visible_rows: usize = body.visible_rows;
-    if (total_rows <= visible_rows) return 0;
-    return total_rows - visible_rows;
+fn helpMaxScrollForContentSize(content_size: chasen.Size, help: HelpContext) usize {
+    const body = helpBodyLayout(content_size, help);
+    return helpRenderedRows(content_size, help) -| body.visible_rows;
 }
 
-pub fn helpRenderedRows(size: chasen.Size, help_page: page.Id) usize {
-    if (!helpUsesTwoColumns(size, help_page)) return rowsForSections(helpSectionsForPage(help_page));
-    return @max(rowsForSections(&help_left_sections), rowsForSections(&help_right_sections));
+pub fn helpRenderedRows(size: chasen.Size, help: HelpContext) usize {
+    if (!helpUsesTwoColumns(size, help.page)) return rowsForSections(help, size.width, helpSectionsForPage(help.page));
+    const columns = helpColumnsForPage(help.page);
+    const left_width = (size.width - help_column_gap) / 2;
+    const right_width = size.width - help_column_gap - left_width;
+    return @max(rowsForSections(help, left_width, columns.left), rowsForSections(help, right_width, columns.right));
 }
 
 fn helpUsesTwoColumns(size: chasen.Size, help_page: page.Id) bool {
-    return help_page == .changes and size.width >= help_two_column_min_width;
+    return size.width >= help_two_column_min_width and helpColumnsForPage(help_page).right.len > 0;
+}
+
+fn helpColumnsForPage(help_page: page.Id) struct { left: []const HelpSection, right: []const HelpSection } {
+    return switch (help_page) {
+        .changes => .{ .left = &help_left_sections, .right = &help_right_sections },
+        .repository => .{
+            .left = &.{ help_repository_sections[0], help_repository_sections[2] },
+            .right = help_repository_sections[1..2],
+        },
+        .history => .{
+            .left = &.{ help_history_sections[0], help_history_sections[2] },
+            .right = &.{ help_history_sections[1], help_history_sections[3] },
+        },
+        .compare => .{ .left = help_compare_sections[0..2], .right = help_compare_sections[2..] },
+        .config => .{ .left = &help_placeholder_sections, .right = &.{} },
+    };
 }
 
 fn helpSectionsForPage(help_page: page.Id) []const HelpSection {
@@ -2214,106 +2229,113 @@ fn helpSectionsForPage(help_page: page.Id) []const HelpSection {
     };
 }
 
-fn rowsForSections(sections: []const HelpSection) usize {
+fn rowsForSections(help: HelpContext, width: u16, sections: []const HelpSection) usize {
     var rows: usize = 0;
+    var key_buffer: [40]u8 = undefined;
     for (sections, 0..) |section, index| {
-        rows += 1 + section.items.len;
+        rows += 1;
+        for (section.items) |item| {
+            const layout = helpItemLayout(help, width, item, &key_buffer) orelse continue;
+            rows += layout.rows;
+        }
         if (index + 1 < sections.len) rows += 1;
     }
     return rows;
 }
 
 fn drawHelpSections(app: Context, surface: *chasen.Surface, sections: []const HelpSection, scroll: usize) !void {
-    const height: usize = surface.size().height;
+    const end = scroll + surface.size().height;
+    const help = helpContext(app);
     var source_row: usize = 0;
-    var drawn_rows: usize = 0;
-
     for (sections, 0..) |section, section_index| {
-        if (drawn_rows >= height) return;
-        try drawHelpLine(app, surface, scroll, source_row, &drawn_rows, .section_title, section.title, .{ .key = .{ .text = "" }, .description = "" });
+        if (source_row >= end) return;
+        if (source_row >= scroll) {
+            try draw.copyClippedTextAt(surface, 0, @intCast(source_row - scroll), section.title, app.theme.boldStyle(.prompt));
+        }
         source_row += 1;
-
         for (section.items) |item| {
-            if (drawn_rows >= height) return;
-            try drawHelpLine(app, surface, scroll, source_row, &drawn_rows, .item, "", item);
-            source_row += 1;
+            if (source_row >= end) return;
+            source_row += try drawHelpItem(help, app.theme, surface, source_row, scroll, item);
         }
-
-        if (section_index + 1 < sections.len) {
-            if (drawn_rows >= height) return;
-            try drawHelpLine(app, surface, scroll, source_row, &drawn_rows, .blank, "", .{ .key = .{ .text = "" }, .description = "" });
-            source_row += 1;
-        }
+        if (section_index + 1 < sections.len) source_row += 1;
     }
 }
 
-const HelpLineKind = enum {
-    section_title,
-    item,
-    blank,
+const HelpItemLayout = struct {
+    key: []const u8,
+    description: []const u8,
+    description_col: u16,
+    description_row: usize,
+    rows: usize,
 };
 
-fn drawHelpLine(
-    app: Context,
-    surface: *chasen.Surface,
-    scroll: usize,
-    source_row: usize,
-    drawn_rows: *usize,
-    kind: HelpLineKind,
-    first: []const u8,
-    item: HelpItem,
-) !void {
-    if (source_row < scroll) return;
-    const row_offset = source_row - scroll;
-    if (row_offset >= surface.size().height) return;
-
-    const row: u16 = @intCast(row_offset);
-    switch (kind) {
-        .section_title => try draw.copyClippedTextAt(surface, 0, row, first, app.theme.boldStyle(.prompt)),
-        .item => try drawHelpItem(app, surface, row, item),
-        .blank => {},
-    }
-    drawn_rows.* = row_offset + 1;
-}
-
-fn drawHelpItem(app: Context, surface: *chasen.Surface, row: u16, item: HelpItem) !void {
-    if (surface.size().width == 0) return;
-    const desired_key_width: u16 = switch (app.active_page) {
-        .changes, .repository, .history, .compare => 18,
-        .config => 12,
-    };
-    const key_width: u16 = @min(desired_key_width, surface.size().width);
-    var key_buffer: [16]u8 = undefined;
+fn helpItemLayout(help: HelpContext, width: u16, item: HelpItem, key_buffer: *[40]u8) ?HelpItemLayout {
+    if (width == 0) return null;
     var left_buffer: [16]u8 = undefined;
     var right_buffer: [16]u8 = undefined;
-    var pair_buffer: [40]u8 = undefined;
     const key = switch (item.key) {
         .text => |text| text,
-        .action => |action| app.keymap.display(action, key_buffer[0..]) orelse return,
+        .action => |action| help.keymap.display(action, key_buffer) orelse return null,
         .pair => |pair| blk: {
-            const left = app.keymap.display(pair.left, left_buffer[0..]) orelse return;
-            const right = app.keymap.display(pair.right, right_buffer[0..]) orelse return;
-            break :blk std.fmt.bufPrint(pair_buffer[0..], "{s} / {s}", .{ left, right }) catch left;
+            const left = help.keymap.display(pair.left, &left_buffer) orelse return null;
+            const right = help.keymap.display(pair.right, &right_buffer) orelse return null;
+            break :blk std.fmt.bufPrint(key_buffer, "{s} / {s}", .{ left, right }) catch return null;
         },
     };
     const description = switch (item.dynamic) {
         .none => item.description,
-        .copy_line => if (effectiveHelpDiffMode(app) == .unified) "Copy diff" else "Copy line",
-        .copy_hunk => if (effectiveHelpDiffMode(app) == .unified)
+        .copy_line => if (help.diff_mode == .unified) "Copy diff" else "Copy line",
+        .copy_hunk => if (help.diff_mode == .unified)
             "Copy hunk diff"
-        else if (app.active_page == .compare or app.active_page == .history)
+        else if (help.page == .compare or help.page == .history)
             "Copy context (selection) / hunk"
         else
             "Copy hunk",
     };
-    var padding: [18]u8 = undefined;
-    @memset(&padding, ' ');
-    const key_cells = @min(chasen.text.displayWidth(key), key_width);
-    const delimiter = padding[0 .. key_width - key_cells];
-    _ = try ui.key_hint.draw(surface, 0, row, &.{ui.key_hint.item(key, description)}, .{
-        .key_style = .{ .bold = true },
-        .delimiter = delimiter,
+    if (key.len == 0 and description.len == 0) return .{
+        .key = key,
+        .description = description,
+        .description_col = 0,
+        .description_row = 0,
+        .rows = 1,
+    };
+    const preferred_col = @max(@as(u16, if (help.page == .config) 12 else 18), chasen.text.displayWidth(key) +| 1);
+    // On very narrow surfaces, keep the full key above its description.
+    const description_col: u16 = if (preferred_col < width) preferred_col else 0;
+    const description_row = if (description_col == 0) ui.Paragraph.init(.{ .text = key }).lineCount(width) else 0;
+    return .{
+        .key = key,
+        .description = description,
+        .description_col = description_col,
+        .description_row = description_row,
+        .rows = description_row + ui.Paragraph.init(.{ .text = description }).lineCount(width - description_col),
+    };
+}
+
+fn drawHelpItem(help: HelpContext, palette: theme.Palette, surface: *chasen.Surface, source_row: usize, scroll: usize, item: HelpItem) !usize {
+    var key_buffer: [40]u8 = undefined;
+    const layout = helpItemLayout(help, surface.size().width, item, &key_buffer) orelse return 0;
+    if (source_row + layout.rows <= scroll or source_row >= scroll + surface.size().height) return layout.rows;
+    const key = try surface.frameAllocator().dupe(u8, layout.key);
+    drawHelpParagraph(surface, 0, source_row, scroll, key, helpKeyStyle(palette, item.kind));
+    drawHelpParagraph(surface, layout.description_col, source_row + layout.description_row, scroll, layout.description, .{});
+    return layout.rows;
+}
+
+fn drawHelpParagraph(surface: *chasen.Surface, col: u16, source_row: usize, scroll: usize, text: []const u8, style: chasen.TextStyle) void {
+    const size = surface.size();
+    if (col >= size.width or source_row >= scroll + size.height) return;
+    const rows = ui.Paragraph.init(.{ .text = text }).lineCount(size.width - col);
+    const skipped = scroll -| source_row;
+    if (skipped >= rows) return;
+    const row: u16 = @intCast(source_row -| scroll);
+    var body = surface.child(.{
+        .col = col,
+        .row = row,
+        .width = size.width - col,
+        .height = @intCast(@min(rows - skipped, size.height - row)),
     });
+    _ = drawWrappedTextScrolled(&body, text, skipped, style);
 }
 
 fn effectiveHelpDiffMode(app: Context) diff_render.DisplayMode {
@@ -2332,6 +2354,37 @@ fn effectiveHelpDiffMode(app: Context) diff_render.DisplayMode {
             .unified,
         .repository, .config => .unified,
     };
+}
+
+fn helpKeyStyle(palette: theme.Palette, kind: HelpItemKind) chasen.TextStyle {
+    return switch (kind) {
+        .action => palette.boldStyle(.accent),
+        .navigation => palette.boldStyle(.pane_command_fg),
+        .information => .{},
+    };
+}
+
+fn drawHelpFooter(surface: *chasen.Surface, scroll: usize, visible_rows: u16, total_rows: usize, overflow: bool, palette: theme.Palette) !void {
+    const size = surface.size();
+    if (size.height == 0 or size.width == 0) return;
+    const legend_width = chasen.text.displayWidth("Actions / Navigation");
+    var indicator_col: u16 = 0;
+    if (size.width >= legend_width) {
+        const row = size.height - 1;
+        try draw.copyClippedTextAt(surface, 0, row, "Actions", helpKeyStyle(palette, .action));
+        try draw.copyClippedTextAt(surface, 7, row, " / ", palette.style(.muted));
+        try draw.copyClippedTextAt(surface, 10, row, "Navigation", helpKeyStyle(palette, .navigation));
+        indicator_col = legend_width + 2;
+    }
+    if (overflow and indicator_col < size.width) {
+        var indicator = surface.child(.{
+            .col = indicator_col,
+            .row = size.height - 1,
+            .width = size.width - indicator_col,
+            .height = 1,
+        });
+        try drawHelpScrollIndicator(&indicator, scroll, visible_rows, total_rows, palette);
+    }
 }
 
 fn drawHelpScrollIndicator(surface: *chasen.Surface, scroll: usize, visible_rows: u16, total_rows: usize, palette: theme.Palette) !void {
@@ -2660,8 +2713,6 @@ test "footer normal-mode hints match the decided page lists" {
     var context = harness.context();
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("s", "stash"),
-        ui.key_hint.item("S", "stashes"),
         ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -2680,8 +2731,8 @@ test "footer normal-mode hints match the decided page lists" {
     context.active_page = .compare;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("m", "change base"),
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2714,8 +2765,8 @@ test "footer normal-mode hints match the decided page lists" {
     };
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("Esc", "back to diff"),
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2724,24 +2775,20 @@ test "footer normal-mode hints match the decided page lists" {
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("Esc", "back to diff"),
-        ui.key_hint.item("R", "switch repo"),
-        ui.key_hint.item("?", "help"),
     });
 
     history_state.catalog_hidden = false;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
         ui.key_hint.item("Esc", "cancel"),
-        ui.key_hint.item("R", "switch repo"),
-        ui.key_hint.item("?", "help"),
     });
 
     history_state.current_view = .diff;
     history_state.load_state = .loaded;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("m", "select commits"),
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2784,8 +2831,8 @@ test "History picker footer keeps diff actions and range state without the local
 
     var hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("Enter", "open diff"),
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2794,9 +2841,9 @@ test "History picker footer keeps diff actions and range state without the local
     history_state.interaction_state.focus = .commit_detail;
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("Enter", "open diff"),
         ui.key_hint.item("y", "copy detail"),
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2805,9 +2852,9 @@ test "History picker footer keeps diff actions and range state without the local
     history_state.draft = .{ .range = 0 };
     hints = footerHints(context, &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("Enter", "open range diff"),
         ui.key_hint.item("Esc", "cancel range"),
+        ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
@@ -2829,8 +2876,6 @@ test "footer normal-mode hints follow state and local key ownership" {
     harness.changes.viewer.sidebar_hidden = true;
     var hints = footerHints(harness.context(), &key_buffers);
     try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("s", "stash"),
-        ui.key_hint.item("S", "stashes"),
         ui.key_hint.item("b", "switch branch"),
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
@@ -3184,31 +3229,108 @@ test "help content size uses Modal overlay sizing" {
     const opts = helpModalOptions(size, .default());
     const expected = modalContentSizeForRect(.{ .col = 0, .row = 0, .width = size.width, .height = size.height }, opts);
 
+    try std.testing.expectEqual(@as(u16, 18), opts.dialog_height);
     try std.testing.expectEqual(expected, helpContentSize(size));
 }
 
-test "help popup uses two columns at 120 columns" {
-    const size = chasen.Size{ .width = 120, .height = 20 };
+test "help popup uses two columns at 120 columns and one at 80 columns" {
+    const size = chasen.Size{ .width = 120, .height = 32 };
     const content = helpContentSize(size);
+    var harness: ShellViewTestHarness = .{ .terminal_size = size };
 
     try std.testing.expect(content.width >= help_two_column_min_width);
-    try std.testing.expectEqual(@max(rowsForSections(&help_left_sections), rowsForSections(&help_right_sections)), helpRenderedRows(content, .changes));
+    for ([_]page.Id{ .changes, .repository, .history, .compare }) |help_page| {
+        try std.testing.expect(helpUsesTwoColumns(content, help_page));
+        try std.testing.expect(!helpUsesTwoColumns(helpContentSize(.{ .width = 80, .height = 32 }), help_page));
+        const columns = helpColumnsForPage(help_page);
+        try std.testing.expectEqual(@max(rowsForSections(.{ .page = help_page }, (content.width - help_column_gap) / 2, columns.left), rowsForSections(.{ .page = help_page }, (content.width - help_column_gap) / 2, columns.right)), helpRenderedRows(content, .{ .page = help_page }));
+
+        var context = harness.context();
+        context.active_page = help_page;
+        var popup: chasen.testing.TestSurface = undefined;
+        try popup.init(size.width, size.height);
+        defer popup.deinit();
+        try viewHelpPopup(context, &popup.surface);
+        const snapshot = try popup.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Actions / Navigation") != null);
+        const popup_content = ui.Modal.frame(&popup.surface, helpModalOptions(size, harness.theme)).?.contentSurface();
+        const legend_row = popup_content.size().height - 1;
+        try std.testing.expectEqual(harness.theme.boldStyle(.accent), popup_content.readCell(0, legend_row).?.style);
+        try std.testing.expectEqual(harness.theme.boldStyle(.pane_command_fg), popup_content.readCell(10, legend_row).?.style);
+        var lines = std.mem.splitScalar(u8, snapshot, '\n');
+        var found_columns = false;
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, columns.left[0].title) == null) continue;
+            try std.testing.expect(std.mem.indexOf(u8, line, columns.right[0].title) != null);
+            found_columns = true;
+            break;
+        }
+        try std.testing.expect(found_columns);
+    }
+    try std.testing.expect(!helpUsesTwoColumns(content, .config));
 }
 
-test "help popup reserves indicator row only when content overflows" {
+test "help popup reserves a footer row for its legend and scroll status" {
     const roomy = chasen.Size{ .width = 140, .height = 48 };
     const cramped = chasen.Size{ .width = 140, .height = 10 };
 
-    try std.testing.expectEqual(@as(usize, 0), helpMaxScroll(roomy, .changes));
-    try std.testing.expect(helpMaxScroll(cramped, .changes) > 0);
-    try std.testing.expect(helpVisibleRows(cramped, .changes) < helpContentSize(cramped).height - help_header_rows);
+    try std.testing.expectEqual(@as(usize, 0), helpMaxScroll(roomy, .{ .page = .changes }));
+    try std.testing.expectEqual(helpContentSize(roomy).height - 1, helpVisibleRows(roomy, .{ .page = .changes }));
+    try std.testing.expect(helpMaxScroll(cramped, .{ .page = .changes }) > 0);
+    try std.testing.expect(helpVisibleRows(cramped, .{ .page = .changes }) < helpContentSize(cramped).height);
 }
 
 test "help popup max scroll helper separates outer and content sizes" {
     const outer = chasen.Size{ .width = 140, .height = 10 };
     const content = helpContentSize(outer);
 
-    try std.testing.expectEqual(helpMaxScrollForContentSize(content, .changes), helpMaxScroll(outer, .changes));
+    try std.testing.expectEqual(helpMaxScrollForContentSize(content, .{ .page = .changes }), helpMaxScroll(outer, .{ .page = .changes }));
+}
+
+test "help preserves configured keys and aligned wrapped descriptions while scrolling" {
+    var harness: ShellViewTestHarness = .{};
+    var config: keymap.Config = .{};
+    config.set(.search, .{ .ctrl = .s });
+    harness.keymap = .fromConfig(config);
+    const context = harness.context();
+    const sections = [_]HelpSection{.{ .title = "Help", .items = &.{
+        .{ .key = .{ .action = .search }, .description = "previous search match when query is active" },
+        help_group_separator,
+        .{ .kind = .navigation, .key = .{ .text = "j" }, .description = "scroll" },
+    } }};
+    for ([_]struct { width: u16, rows: u16, continuation: []const u8 }{
+        .{ .width = 51, .rows = 5, .continuation = "is active" },
+        .{ .width = 28, .rows = 8, .continuation = "earch matc" },
+    }) |case| {
+        try std.testing.expectEqual(case.rows, rowsForSections(helpContext(context), case.width, &sections));
+        var full: chasen.testing.TestSurface = undefined;
+        try full.init(case.width, case.rows);
+        defer full.deinit();
+        try drawHelpSections(context, &full.surface, &sections, 0);
+        const snapshot = try full.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ctrl+s            previous") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "...") == null);
+        try full.expectCellText(0, 2, " ");
+        try full.expectCellText(18, case.rows - 2, " ");
+        try full.expectCellText(0, case.rows - 1, "j");
+        try full.expectCellText(18, case.rows - 1, "s");
+        try std.testing.expectEqual(context.theme.boldStyle(.accent), full.surface.readCell(0, 1).?.style);
+        try std.testing.expectEqual(chasen.TextStyle{}, full.surface.readCell(18, 1).?.style);
+        try std.testing.expectEqual(context.theme.boldStyle(.pane_command_fg), full.surface.readCell(0, case.rows - 1).?.style);
+
+        var scrolled: chasen.testing.TestSurface = undefined;
+        try scrolled.init(case.width, 2);
+        defer scrolled.deinit();
+        try drawHelpSections(context, &scrolled.surface, &sections, 2);
+        const scrolled_snapshot = try scrolled.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(scrolled_snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, scrolled_snapshot, case.continuation) != null);
+        try std.testing.expect(std.mem.indexOf(u8, scrolled_snapshot, "Ctrl+s") == null);
+        try scrolled.expectCellText(0, 0, " ");
+        try scrolled.expectCellText(18, 0, case.continuation[0..1]);
+    }
 }
 
 test "diff Help copy vocabulary follows effective mode for Changes Compare and History" {
@@ -3258,8 +3380,8 @@ test "diff Help copy vocabulary follows effective mode for Changes Compare and H
             var popup: chasen.testing.TestSurface = undefined;
             try popup.init(60, 2);
             defer popup.deinit();
-            try drawHelpItem(context, &popup.surface, 0, help_diff_navigation_items[14]);
-            try drawHelpItem(context, &popup.surface, 1, help_diff_navigation_items[15]);
+            _ = try drawHelpItem(helpContext(context), context.theme, &popup.surface, 0, 0, help_diff_items[1]);
+            _ = try drawHelpItem(helpContext(context), context.theme, &popup.surface, 1, 0, help_diff_items[2]);
             const snapshot = try popup.snapshot(std.testing.allocator);
             defer std.testing.allocator.free(snapshot);
 
@@ -3281,8 +3403,8 @@ test "help popup uses effective document navigation labels and reaches its tail 
     const size = chasen.Size{ .width = 80, .height = 12 };
     const content = helpContentSize(size);
     try std.testing.expect(!helpUsesTwoColumns(content, .repository));
-    try std.testing.expectEqual(rowsForSections(&help_repository_sections), helpRenderedRows(content, .repository));
-    const max_scroll = helpMaxScroll(size, .repository);
+    try std.testing.expectEqual(rowsForSections(.{ .page = .repository }, content.width, &help_repository_sections), helpRenderedRows(content, .{ .page = .repository }));
+    const max_scroll = helpMaxScroll(size, .{ .page = .repository });
     try std.testing.expect(max_scroll > 0);
 
     var harness: ShellViewTestHarness = .{ .terminal_size = size };
@@ -3293,7 +3415,9 @@ test "help popup uses effective document navigation labels and reaches its tail 
     try std.testing.expect(keymap.validateConfig(config));
     harness.keymap = keymap.Effective.fromConfig(config);
     harness.overlay.openHelpForPage(.repository);
-    const source_items_scroll = rowsForSections(help_repository_sections[0..2]) + 1;
+    const source_help: HelpContext = .{ .page = .repository, .keymap = harness.keymap };
+    const source_items_scroll = rowsForSections(source_help, content.width, help_repository_sections[0..1]) + 1 +
+        rowsForSections(source_help, content.width, &.{.{ .title = "Source", .items = help_repository_source_items[0..6] }});
     harness.overlay.help_scroll = source_items_scroll;
     var context = harness.context();
     context.active_page = .repository;
@@ -3324,14 +3448,16 @@ test "help popup uses effective document navigation labels and reaches its tail 
     try viewHelpPopup(context, &tail.surface);
     const tail_snapshot = try tail.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(tail_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "Mouse") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "wheel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "Config page") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "switch repository") != null);
 
-    for ([_]page.Id{ .changes, .compare }) |help_page| {
+    for ([_]page.Id{ .changes, .compare, .history }) |help_page| {
         harness.overlay.openHelpForPage(help_page);
         const sections = helpSectionsForPage(help_page);
-        const shared_section_index: usize = if (help_page == .changes) 2 else 1;
-        harness.overlay.help_scroll = rowsForSections(sections[0..shared_section_index]) + 1;
+        const shared_section_index: usize = if (help_page == .compare) 2 else 3;
+        const diff_help: HelpContext = .{ .page = help_page, .keymap = harness.keymap };
+        harness.overlay.help_scroll = rowsForSections(diff_help, content.width, sections[0..shared_section_index]) + 1 +
+            rowsForSections(diff_help, content.width, &.{.{ .title = "Diff", .items = help_diff_items[0..8] }});
         context = harness.context();
         context.active_page = help_page;
 
@@ -3352,7 +3478,7 @@ test "help popup uses effective document navigation labels and reaches its tail 
         defer std.testing.allocator.free(next_snapshot);
         try std.testing.expect(std.mem.indexOf(u8, next_snapshot, "Ctrl+b / Ctrl+f   page backward / forward") != null);
 
-        harness.overlay.help_scroll = helpMaxScroll(size, help_page);
+        harness.overlay.help_scroll = helpMaxScroll(size, .{ .page = help_page, .keymap = harness.keymap });
         context = harness.context();
         context.active_page = help_page;
         var page_tail: chasen.testing.TestSurface = undefined;
@@ -3361,17 +3487,15 @@ test "help popup uses effective document navigation labels and reaches its tail 
         try viewHelpPopup(context, &page_tail.surface);
         const page_tail_snapshot = try page_tail.snapshot(std.testing.allocator);
         defer std.testing.allocator.free(page_tail_snapshot);
-        if (help_page == .changes) {
-            try std.testing.expect(std.mem.indexOf(u8, page_tail_snapshot, "Mouse") != null);
-        } else {
-            try std.testing.expect(std.mem.indexOf(u8, page_tail_snapshot, "previous search match") != null);
-        }
+        try std.testing.expect(std.mem.indexOf(u8, page_tail_snapshot, "previous search match") != null);
+        try std.testing.expect(std.mem.indexOf(u8, page_tail_snapshot, "next / previous hunk") != null);
     }
 }
 
-test "History and Compare help keep quit discoverable without footer hints" {
+test "page help puts local shortcuts before Global navigation and quit" {
     var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 120, .height = 32 } };
-    for ([_]page.Id{ .history, .compare }) |help_page| {
+    for ([_]page.Id{ .repository, .history, .compare, .config }) |help_page| {
+        harness.overlay.openHelpForPage(help_page);
         var context = harness.context();
         context.active_page = help_page;
 
@@ -3382,9 +3506,22 @@ test "History and Compare help keep quit discoverable without footer hints" {
         const snapshot = try popup.snapshot(std.testing.allocator);
         defer std.testing.allocator.free(snapshot);
 
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "q                 quit") != null);
         if (help_page == .compare) {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "m                 change comparison base") != null);
+        }
+
+        const sections = helpColumnsForPage(help_page).left;
+        for (sections, 0..) |section, index| {
+            if (!std.mem.eql(u8, section.title, "Global")) continue;
+            try std.testing.expect(if (help_page == .config) index == 0 else index > 0);
+            harness.overlay.help_scroll = if (index == 0) 0 else rowsForSections(helpContext(context), if (help_page == .config) helpContentSize(harness.terminal_size).width else (helpContentSize(harness.terminal_size).width - help_column_gap) / 2, sections[0..index]) + 1;
+            break;
+        }
+        try viewHelpPopup(context, &popup.surface);
+        const global_snapshot = try popup.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(global_snapshot);
+        for ([_][]const u8{ "Global", "Changes page", "Repository page", "History page", "Compare page", "Config page", "switch repository", "open / close help", "quit" }) |label| {
+            try std.testing.expect(std.mem.indexOf(u8, global_snapshot, label) != null);
         }
     }
 }
@@ -3398,21 +3535,21 @@ test "History help explains every commit picker marker" {
     context.active_page = .history;
 
     var popup: chasen.testing.TestSurface = undefined;
-    try popup.init(100, 40);
+    try popup.init(120, 32);
     defer popup.deinit();
     try viewHelpPopup(context, &popup.surface);
     const snapshot = try popup.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Markers") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit · Date · Author · Type · [Refs] Subject") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit markers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "OID Date Author Type Refs Subject") == null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         snapshot,
-        "x                 copy commit detail / range summary",
+        "x                 copy commit / range detail",
     ) != null);
     for ([_][]const u8{
-        "commit included in the selected range",
+        "commit in selected range",
         "merge commit",
         "root commit",
         "first parent unavailable",
@@ -3691,7 +3828,10 @@ test "branch switch popup renders relative times and selected exact commit detai
     try std.testing.expect(std.mem.indexOf(u8, unmatched_snapshot, "Enter:") == null);
 }
 
+const HelpItemKind = enum { action, navigation, information };
+
 const HelpItem = struct {
+    kind: HelpItemKind = .action,
     key: HelpKey,
     description: []const u8,
     dynamic: enum { none, copy_line, copy_hunk } = .none,
@@ -3711,18 +3851,11 @@ const HelpSection = struct {
     items: []const HelpItem,
 };
 
-const help_global_items = [_]HelpItem{
-    .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
-    .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
-    .{ .key = .{ .action = .page_history }, .description = "History page" },
-    .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
-    .{ .key = .{ .action = .page_config }, .description = "Config page" },
-    .{ .key = .{ .text = "Tab" }, .description = "focus sidebar / diff" },
-    .{ .key = .{ .action = .help }, .description = "open / close help" },
-    .{ .key = .{ .text = "q" }, .description = "quit" },
-    .{ .key = .{ .action = .toggle_sidebar }, .description = "show / hide sidebar" },
-    .{ .key = .{ .action = .reload }, .description = "force reload (auto by default; --no-watch disables)" },
-    .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
+const help_group_separator: HelpItem = .{ .kind = .information, .key = .{ .text = "" }, .description = "" };
+
+const help_git_command_items = [_]HelpItem{
+    .{ .key = .{ .text = "Space (file tree)" }, .description = "stage / unstage file or dir" },
+    .{ .key = .{ .text = "Space (diff)" }, .description = "stage / unstage hunk" },
     .{ .key = .{ .action = .commit }, .description = "open commit panel" },
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
     .{ .key = .{ .action = .create_stash }, .description = "create stash (all / staged changes)" },
@@ -3731,177 +3864,191 @@ const help_global_items = [_]HelpItem{
     .{ .key = .{ .action = .pull }, .description = "pull current branch" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
     .{ .key = .{ .action = .discard }, .description = "discard selected file changes" },
-    .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
-    .{ .key = .{ .text = "Home / End" }, .description = "first / last file" },
 };
 
-const help_placeholder_items = [_]HelpItem{
-    .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
-    .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
-    .{ .key = .{ .action = .page_history }, .description = "History page" },
-    .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
-    .{ .key = .{ .action = .page_config }, .description = "Config page" },
-    .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
-    .{ .key = .{ .action = .reload }, .description = "reload (not available on this page yet)" },
-    .{ .key = .{ .action = .help }, .description = "close help" },
+const help_global_items = [_]HelpItem{
+    .{ .key = .{ .action = .help }, .description = "open / close help" },
+    .{ .key = .{ .text = "q" }, .description = "quit" },
+    .{ .key = .{ .action = .toggle_sidebar }, .description = "show / hide file tree" },
+    .{ .key = .{ .action = .reload }, .description = "force reload (auto by default; --no-watch disables)" },
+    .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
+    help_group_separator,
+    .{ .kind = .navigation, .key = .{ .action = .page_changes }, .description = "Changes page" },
+    .{ .kind = .navigation, .key = .{ .action = .page_repository }, .description = "Repository page" },
+    .{ .kind = .navigation, .key = .{ .action = .page_history }, .description = "History page" },
+    .{ .kind = .navigation, .key = .{ .action = .page_compare }, .description = "Compare page" },
+    .{ .kind = .navigation, .key = .{ .action = .page_config }, .description = "Config page" },
+    .{ .kind = .navigation, .key = .{ .action = .repo_picker }, .description = "switch repository" },
+    .{ .kind = .navigation, .key = .{ .text = "Tab" }, .description = "focus file tree / diff" },
+    .{ .kind = .navigation, .key = .{ .text = "Home / End" }, .description = "first / last file" },
+};
+
+const help_common_global_actions = [_]HelpItem{
+    .{ .key = .{ .action = .help }, .description = "open / close help" },
     .{ .key = .{ .text = "q" }, .description = "quit" },
 };
 
+const help_common_global_navigation = [_]HelpItem{
+    .{ .kind = .navigation, .key = .{ .action = .page_changes }, .description = "Changes page" },
+    .{ .kind = .navigation, .key = .{ .action = .page_repository }, .description = "Repository page" },
+    .{ .kind = .navigation, .key = .{ .action = .page_history }, .description = "History page" },
+    .{ .kind = .navigation, .key = .{ .action = .page_compare }, .description = "Compare page" },
+    .{ .kind = .navigation, .key = .{ .action = .page_config }, .description = "Config page" },
+    .{ .kind = .navigation, .key = .{ .action = .repo_picker }, .description = "switch repository" },
+};
+
+const help_common_global_items = help_common_global_actions ++
+    [_]HelpItem{help_group_separator} ++ help_common_global_navigation;
+
 const help_placeholder_sections = [_]HelpSection{
-    .{ .title = "Global", .items = &help_placeholder_items },
+    .{ .title = "Global", .items = &help_common_global_items },
 };
 
 const help_compare_items = [_]HelpItem{
-    .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
     .{ .key = .{ .text = "m" }, .description = "change comparison base" },
-    .{ .key = .{ .action = .reload }, .description = "refresh comparison" },
-    .{ .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
-    .{ .key = .{ .text = "q" }, .description = "quit" },
+    help_group_separator,
+    .{ .kind = .navigation, .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
 };
+
+const help_compare_global_items = help_common_global_actions ++ [_]HelpItem{
+    .{ .key = .{ .action = .reload }, .description = "refresh comparison" },
+    .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
+    help_group_separator,
+} ++ help_common_global_navigation;
 
 const help_history_items = [_]HelpItem{
-    .{ .key = .{ .action = .branch_switch }, .description = "checkout keeps diff; open worktree resets it" },
-    .{ .key = .{ .text = "Row" }, .description = "Commit · Date · Author · Type · [Refs] Subject" },
-    .{ .key = .{ .text = "Tab / Shift+Tab" }, .description = "cycle History / detail / files focus" },
-    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "navigate the focused pane" },
-    .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "move one visible page" },
-    .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last focused row" },
-    .{ .key = .{ .text = "Space" }, .description = "start / clear a range from History focus" },
-    .{ .key = .{ .text = "Enter" }, .description = "open selected diff / load older commits" },
-    .{ .key = .{ .action = .copy_history_detail }, .description = "copy commit detail / range summary" },
+    .{ .key = .{ .text = "Space" }, .description = "start / clear range (History)" },
+    .{ .key = .{ .text = "Enter" }, .description = "open diff / load older commits" },
+    .{ .key = .{ .action = .copy_history_detail }, .description = "copy commit / range detail" },
     .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize History pane" },
-    .{ .key = .{ .text = "m" }, .description = "select commits from an accepted diff" },
-    .{ .key = .{ .action = .reload }, .description = "recheck and reload exact current HEAD" },
-    .{ .key = .{ .text = "/" }, .description = "search diff; commit search unavailable" },
-    .{ .key = .{ .text = "Esc" }, .description = "cancel load/range or return to accepted diff" },
-    .{ .key = .{ .text = "q" }, .description = "quit" },
+    .{ .key = .{ .text = "m" }, .description = "select commits again" },
+    .{ .key = .{ .action = .search }, .description = "search diff (not commits)" },
+    .{ .key = .{ .text = "Esc" }, .description = "cancel / back to accepted diff" },
+    help_group_separator,
+    .{ .kind = .navigation, .key = .{ .text = "Tab / Shift+Tab" }, .description = "focus History / detail / files" },
+    .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "navigate the focused pane" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "move one visible page" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last focused row" },
 };
 
+const help_history_global_items = help_common_global_actions ++ [_]HelpItem{
+    .{ .key = .{ .action = .reload }, .description = "recheck and reload current HEAD" },
+    .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
+    help_group_separator,
+} ++ help_common_global_navigation;
+
 const help_history_marker_items = [_]HelpItem{
-    .{ .key = .{ .text = history_view.PickerMarker.range_selected }, .description = "commit included in the selected range" },
-    .{ .key = .{ .text = history_view.PickerMarker.merge }, .description = "merge commit" },
-    .{ .key = .{ .text = history_view.PickerMarker.root }, .description = "root commit" },
-    .{ .key = .{ .text = history_view.PickerMarker.unavailable_parent }, .description = "first parent unavailable" },
+    .{ .kind = .information, .key = .{ .text = history_view.PickerMarker.range_selected }, .description = "commit in selected range" },
+    .{ .kind = .information, .key = .{ .text = history_view.PickerMarker.merge }, .description = "merge commit" },
+    .{ .kind = .information, .key = .{ .text = history_view.PickerMarker.root }, .description = "root commit" },
+    .{ .kind = .information, .key = .{ .text = history_view.PickerMarker.unavailable_parent }, .description = "first parent unavailable" },
 };
 
 const help_history_sections = [_]HelpSection{
     .{ .title = "History", .items = &help_history_items },
-    .{ .title = "Markers", .items = &help_history_marker_items },
-    .{ .title = "Diff", .items = &help_diff_navigation_items },
+    .{ .title = "Commit markers", .items = &help_history_marker_items },
+    .{ .title = "Global", .items = &help_history_global_items },
+    .{ .title = "Diff", .items = &help_diff_items },
 };
 
 const help_compare_sections = [_]HelpSection{
     .{ .title = "Compare", .items = &help_compare_items },
-    .{ .title = "Diff", .items = &help_diff_navigation_items },
+    .{ .title = "Global", .items = &help_compare_global_items },
+    .{ .title = "Diff", .items = &help_diff_items },
 };
 
-const help_repository_global_items = [_]HelpItem{
-    .{ .key = .{ .action = .page_changes }, .description = "Changes page" },
-    .{ .key = .{ .action = .page_repository }, .description = "Repository page" },
-    .{ .key = .{ .action = .page_history }, .description = "History page" },
-    .{ .key = .{ .action = .page_compare }, .description = "Compare page" },
-    .{ .key = .{ .action = .page_config }, .description = "Config page" },
-    .{ .key = .{ .action = .help }, .description = "open / close help" },
+const help_repository_global_items = help_common_global_actions ++ [_]HelpItem{
     .{ .key = .{ .action = .reload }, .description = "force reload" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
-    .{ .key = .{ .action = .repo_picker }, .description = "switch repository" },
-    .{ .key = .{ .text = "q" }, .description = "quit" },
-};
+    help_group_separator,
+} ++ help_common_global_navigation;
 
 const help_repository_tree_items = [_]HelpItem{
-    .{ .key = .{ .text = "Tab" }, .description = "focus tree / source" },
-    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move selection" },
     .{ .key = .{ .text = "Enter / Space" }, .description = "toggle directory" },
-    .{ .key = .{ .text = "Home / End" }, .description = "first / last tree row" },
-    .{ .key = .{ .text = "h / l" }, .description = "scroll tree horizontally" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .action = .changed_file_filter }, .description = "cycle file filter" },
-    .{ .key = .{ .action = .toggle_sidebar }, .description = "show / hide tree" },
-    .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize tree" },
+    .{ .key = .{ .action = .toggle_sidebar }, .description = "show / hide file tree" },
+    .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize file tree" },
+    help_group_separator,
+    .{ .kind = .navigation, .key = .{ .text = "Tab" }, .description = "focus file tree / source" },
+    .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "move selection" },
+    .{ .kind = .navigation, .key = .{ .text = "Home / End" }, .description = "first / last file tree row" },
+    .{ .kind = .navigation, .key = .{ .text = "h / l" }, .description = "scroll file tree horizontally" },
 };
 
 const help_repository_source_items = [_]HelpItem{
-    .{ .key = .{ .pair = .{ .left = .previous_file, .right = .next_file } }, .description = "previous / next file (source focus)" },
-    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move one source row" },
-    .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last source row" },
-    .{ .key = .{ .pair = .{ .left = .half_page_up, .right = .half_page_down } }, .description = "half page up / down" },
-    .{ .key = .{ .pair = .{ .left = .page_backward, .right = .page_forward } }, .description = "page backward / forward" },
-    .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page up / down" },
-    .{ .key = .{ .text = "Home / End" }, .description = "first / last source row" },
-    .{ .key = .{ .text = "h / l" }, .description = "scroll source horizontally" },
-    .{ .key = .{ .action = .search }, .description = "search source" },
-    .{ .key = .{ .text = "n / N / p" }, .description = "next / previous source match" },
-    .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
     .{ .key = .{ .text = "V" }, .description = "begin line selection" },
     .{ .key = .{ .text = "y / Esc" }, .description = "copy / clear selection" },
     .{ .key = .{ .text = "Y" }, .description = "copy selected code with context" },
+    .{ .key = .{ .action = .search }, .description = "search source" },
+    .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
+    help_group_separator,
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .previous_file, .right = .next_file } }, .description = "previous / next file (source)" },
+    .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "move one source row" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last source row" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .half_page_up, .right = .half_page_down } }, .description = "half page up / down" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_backward, .right = .page_forward } }, .description = "page backward / forward" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page up / down" },
+    .{ .kind = .navigation, .key = .{ .text = "Home / End" }, .description = "first / last source row" },
+    .{ .kind = .navigation, .key = .{ .text = "h / l" }, .description = "scroll source horizontally" },
+    .{ .kind = .navigation, .key = .{ .text = "n / N / p" }, .description = "next / previous source match" },
 };
 
 const help_repository_sections = [_]HelpSection{
-    .{ .title = "Global", .items = &help_repository_global_items },
-    .{ .title = "Tree", .items = &help_repository_tree_items },
+    .{ .title = "File tree", .items = &help_repository_tree_items },
     .{ .title = "Source", .items = &help_repository_source_items },
-    .{ .title = "Mouse", .items = &help_mouse_items },
+    .{ .title = "Global", .items = &help_repository_global_items },
 };
 
 const help_sidebar_items = [_]HelpItem{
-    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "move selection" },
     .{ .key = .{ .text = "Enter" }, .description = "toggle directory" },
-    .{ .key = .{ .text = "←/→" }, .description = "collapse / expand directory" },
-    .{ .key = .{ .text = "h / l" }, .description = "scroll file tree horizontally" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
     .{ .key = .{ .action = .changed_file_filter }, .description = "cycle file filter" },
-    .{ .key = .{ .text = "Space" }, .description = "stage / unstage file or directory" },
     .{ .key = .{ .action = .mark_reviewed }, .description = "mark reviewed" },
     .{ .key = .{ .pair = .{ .left = .hide_reviewed, .right = .toggle_line_numbers } }, .description = "hide reviewed / line numbers" },
-    .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize sidebar" },
+    .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize file tree" },
+    help_group_separator,
+    .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "move selection" },
+    .{ .kind = .navigation, .key = .{ .text = "←/→" }, .description = "collapse / expand directory" },
+    .{ .kind = .navigation, .key = .{ .text = "h / l" }, .description = "scroll file tree horizontally" },
 };
 
-const help_diff_navigation_items = [_]HelpItem{
-    .{ .key = .{ .pair = .{ .left = .previous_file, .right = .next_file } }, .description = "previous / next file (diff focus)" },
-    .{ .key = .{ .text = "↑/↓ j/k" }, .description = "scroll" },
-    .{ .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last source row" },
-    .{ .key = .{ .pair = .{ .left = .half_page_up, .right = .half_page_down } }, .description = "half page up / down" },
-    .{ .key = .{ .pair = .{ .left = .page_backward, .right = .page_forward } }, .description = "page backward / forward" },
-    .{ .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page scroll" },
-    .{ .key = .{ .text = "←/→" }, .description = "horizontal scroll" },
-    .{ .key = .{ .text = "Enter" }, .description = "fold / unfold hunk" },
+const help_diff_items = [_]HelpItem{
+    .{ .key = .{ .text = "V" }, .description = "begin line selection" },
+    .{ .key = .{ .text = "y" }, .description = "", .dynamic = .copy_line },
+    .{ .key = .{ .text = "Y" }, .description = "", .dynamic = .copy_hunk },
     .{ .key = .{ .action = .search }, .description = "search diff" },
     .{ .key = .{ .action = .toggle_display_mode }, .description = "unified / side-by-side" },
     .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
-    .{ .key = .{ .text = "J / K" }, .description = "next / previous hunk" },
-    .{ .key = .{ .text = "n / p" }, .description = "next / previous match or hunk" },
-    .{ .key = .{ .text = "N" }, .description = "previous search match when query is active" },
-    .{ .key = .{ .text = "y" }, .description = "", .dynamic = .copy_line },
-    .{ .key = .{ .text = "Y" }, .description = "", .dynamic = .copy_hunk },
-};
-
-const help_changes_diff_items = [_]HelpItem{
-    .{ .key = .{ .text = "Space" }, .description = "stage / unstage hunk" },
-};
-
-const help_mouse_items = [_]HelpItem{
-    .{ .key = .{ .text = "wheel" }, .description = "scroll pane under pointer" },
-    .{ .key = .{ .text = "click" }, .description = "focus pane / select sidebar row" },
+    .{ .key = .{ .text = "Enter" }, .description = "fold / unfold hunk" },
+    help_group_separator,
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .previous_file, .right = .next_file } }, .description = "previous / next file (diff focus)" },
+    .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "scroll" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last source row" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .half_page_up, .right = .half_page_down } }, .description = "half page up / down" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_backward, .right = .page_forward } }, .description = "page backward / forward" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page scroll" },
+    .{ .kind = .navigation, .key = .{ .text = "←/→" }, .description = "horizontal scroll" },
+    .{ .kind = .navigation, .key = .{ .text = "J / K" }, .description = "next / previous hunk" },
+    .{ .kind = .navigation, .key = .{ .text = "n / p" }, .description = "next / previous match or hunk" },
+    .{ .kind = .navigation, .key = .{ .text = "N" }, .description = "previous search match when query is active" },
 };
 
 const help_left_sections = [_]HelpSection{
+    .{ .title = "Git commands", .items = &help_git_command_items },
     .{ .title = "Global", .items = &help_global_items },
-    .{ .title = "Sidebar", .items = &help_sidebar_items },
 };
 
 const help_right_sections = [_]HelpSection{
-    .{ .title = "Diff", .items = &help_diff_navigation_items },
-    .{ .title = "Changes diff", .items = &help_changes_diff_items },
-    .{ .title = "Mouse", .items = &help_mouse_items },
+    .{ .title = "File tree", .items = &help_sidebar_items },
+    .{ .title = "Diff", .items = &help_diff_items },
 };
 
 const help_all_sections = [_]HelpSection{
+    .{ .title = "Git commands", .items = &help_git_command_items },
     .{ .title = "Global", .items = &help_global_items },
-    .{ .title = "Sidebar", .items = &help_sidebar_items },
-    .{ .title = "Diff", .items = &help_diff_navigation_items },
-    .{ .title = "Changes diff", .items = &help_changes_diff_items },
-    .{ .title = "Mouse", .items = &help_mouse_items },
+    .{ .title = "File tree", .items = &help_sidebar_items },
+    .{ .title = "Diff", .items = &help_diff_items },
 };

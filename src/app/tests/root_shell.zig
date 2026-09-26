@@ -1728,7 +1728,7 @@ test "help overlay wheel redraw changes once skips at edge and reverses" {
     };
 
     var ctx: chasen.Ctx(App.Msg) = .{};
-    const max_scroll = app_view.helpMaxScroll(layoutSize(&app), app.active_page);
+    const max_scroll = app_view.helpMaxScroll(layoutSize(&app), .{ .page = app.active_page, .keymap = app.keymap });
     try std.testing.expect(max_scroll > 0);
     app.overlay.help_scroll = max_scroll - 1;
     const content = app_shell_layout.contentRect(app.terminal_size);
