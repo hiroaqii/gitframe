@@ -36,8 +36,8 @@ pub const BuildResult = struct {
 /// Builds editor argv from GitFrame config or `$VISUAL` / `$EDITOR` / `vi`.
 ///
 /// Configured argv is expanded into owned strings because placeholders can
-/// produce new arguments. Env fallback keeps the previous borrow-and-append
-/// behavior but is wrapped in the same owned result so App has one deinit path.
+/// produce new arguments. Env fallback borrows command tokens and owns a
+/// prefixed file operand when needed. Both paths use the same deinit contract.
 pub fn build(
     allocator: std.mem.Allocator,
     user_config: config.EditorConfig,
@@ -62,12 +62,12 @@ fn buildConfigured(
 
     var has_path = false;
     var argv = try allocator.alloc([]const u8, template.len);
+    errdefer allocator.free(argv);
     var owned_args = try allocator.alloc(?[]u8, template.len);
     @memset(owned_args, null);
     errdefer {
         freeOwnedArgs(allocator, owned_args);
         allocator.free(owned_args);
-        allocator.free(argv);
     }
 
     for (template, 0..) |arg, index| {
@@ -98,6 +98,12 @@ fn buildFromEnvironment(
     errdefer allocator.free(owned_args);
     @memset(owned_args, null);
     @memcpy(argv, legacy);
+
+    if (pathNeedsPrefix(target.path)) {
+        const path = try std.fmt.allocPrint(allocator, "./{s}", .{target.path});
+        argv[argv.len - 1] = path;
+        owned_args[argv.len - 1] = path;
+    }
 
     return .{
         .argv = argv,
@@ -135,6 +141,7 @@ fn expandArgument(
 
 fn writePlaceholder(writer: *std.Io.Writer, placeholder: []const u8, target: Target) BuildError!void {
     if (std.mem.eql(u8, placeholder, "{path}")) {
+        if (pathNeedsPrefix(target.path)) writer.writeAll("./") catch return error.OutOfMemory;
         writer.writeAll(target.path) catch return error.OutOfMemory;
     } else if (std.mem.eql(u8, placeholder, "{line}")) {
         writer.print("{d}", .{target.line orelse 1}) catch return error.OutOfMemory;
@@ -145,6 +152,12 @@ fn writePlaceholder(writer: *std.Io.Writer, placeholder: []const u8, target: Tar
     } else {
         return error.UnknownPlaceholder;
     }
+}
+
+/// A leading '+' is a vi-style command and '-' may introduce an option.
+/// './' keeps these relative paths literal without changing explicit argv flags.
+fn pathNeedsPrefix(path: []const u8) bool {
+    return path.len > 0 and (path[0] == '+' or path[0] == '-');
 }
 
 fn legacyArgv(env_map: ?*std.process.Environ.Map, target_path: []const u8, out: *[max_argv][]const u8) []const []const u8 {
@@ -244,4 +257,62 @@ test "configured argv rejects empty command" {
         .repo_root = "/repo",
         .path = "src/main.zig",
     }));
+}
+
+test "editor argv construction releases every allocation failure" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, configured: bool) !void {
+            var editor_config: config.EditorConfig = .{};
+            editor_config.argv[0] = "nvim";
+            editor_config.argv[1] = "+{line}";
+            editor_config.argv[2] = "{path}:{column}";
+            editor_config.argv_len = if (configured) 3 else 0;
+            var result = try build(allocator, editor_config, null, .{
+                .repo_root = "/repo",
+                .path = "+file.zig",
+                .line = 42,
+                .column = 7,
+            });
+            defer result.deinit(allocator);
+        }
+    };
+    for ([_]bool{ false, true }) |configured| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{configured});
+    }
+}
+
+test "editor file operands stay literal in configured and environment argv" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("VISUAL", "nvim --clean +42");
+    var editor_config: config.EditorConfig = .{};
+    editor_config.argv[0] = "nvim";
+    editor_config.argv[1] = "--clean";
+    editor_config.argv[2] = "+{line}";
+    editor_config.argv[3] = "{path}";
+    editor_config.argv_len = 4;
+
+    for ([_]struct { path: []const u8, expected: []const u8 }{
+        .{ .path = "+call writefile(['executed'],'marker')", .expected = "./+call writefile(['executed'],'marker')" },
+        .{ .path = "--help", .expected = "./--help" },
+        .{ .path = "space name.txt", .expected = "space name.txt" },
+        .{ .path = "quote'\".txt", .expected = "quote'\".txt" },
+        .{ .path = "src/main.zig", .expected = "src/main.zig" },
+        .{ .path = "./+already-prefixed", .expected = "./+already-prefixed" },
+        .{ .path = "/repo/-absolute", .expected = "/repo/-absolute" },
+    }) |case| {
+        for ([_]config.EditorConfig{ .{}, editor_config }) |settings| {
+            var result = try build(std.testing.allocator, settings, &env, .{
+                .repo_root = "/repo",
+                .path = case.path,
+                .line = 42,
+            });
+            defer result.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 4), result.argv.len);
+            try std.testing.expectEqualStrings("nvim", result.argv[0]);
+            try std.testing.expectEqualStrings("--clean", result.argv[1]);
+            try std.testing.expectEqualStrings("+42", result.argv[2]);
+            try std.testing.expectEqualStrings(case.expected, result.argv[3]);
+        }
+    }
 }

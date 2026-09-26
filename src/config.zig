@@ -194,8 +194,10 @@ pub fn resolvePathsFromValues(
     xdg_state_home: ?[]const u8,
     home: ?[]const u8,
 ) !Paths {
+    const config_path = try joinConfigPath(allocator, xdg_config_home, home);
+    errdefer if (config_path) |path| allocator.free(path);
     return .{
-        .config = try joinConfigPath(allocator, xdg_config_home, home),
+        .config = config_path,
         .state = try joinStatePath(allocator, xdg_state_home, home),
     };
 }
@@ -761,6 +763,16 @@ test "resolvePaths returns null paths when HOME and XDG are missing" {
 
     try std.testing.expect(paths.config == null);
     try std.testing.expect(paths.state == null);
+}
+
+test "resolvePaths releases partial paths on allocation failure" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var paths = try resolvePathsFromValues(allocator, "/xdg/config", "/xdg/state", null);
+            defer paths.deinit(allocator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "loadConfig uses defaults when path is missing" {

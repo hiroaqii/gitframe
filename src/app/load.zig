@@ -1668,13 +1668,13 @@ fn addStatusStats(allocator: std.mem.Allocator, stats_map: *StatusStatsMap, key:
 
 fn statusStatsMapToList(allocator: std.mem.Allocator, stats_map: StatusStatsMap) ![]git_status.StatusLineStats {
     var line_stats = try allocator.alloc(git_status.StatusLineStats, stats_map.count());
+    var index: usize = 0;
     errdefer {
-        for (line_stats) |entry| allocator.free(entry.path_key);
+        for (line_stats[0..index]) |entry| allocator.free(entry.path_key);
         allocator.free(line_stats);
     }
 
     var iterator = stats_map.iterator();
-    var index: usize = 0;
     while (iterator.next()) |entry| : (index += 1) {
         line_stats[index] = .{
             .path_key = try allocator.dupe(u8, entry.key_ptr.*),
@@ -1683,6 +1683,34 @@ fn statusStatsMapToList(allocator: std.mem.Allocator, stats_map: StatusStatsMap)
     }
     std.mem.sort(git_status.StatusLineStats, line_stats, {}, statusLineStatsLessThan);
     return line_stats;
+}
+
+test "status stats list owns copied paths and cleans up allocation failures" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, stats_map: StatusStatsMap) !void {
+            const list = try statusStatsMapToList(allocator, stats_map);
+            defer {
+                for (list) |entry| allocator.free(entry.path_key);
+                allocator.free(list);
+            }
+            try std.testing.expectEqual(stats_map.count(), list.len);
+            for (list, 0..) |entry, index| {
+                const original = stats_map.getEntry(entry.path_key).?;
+                try std.testing.expect(entry.path_key.ptr != original.key_ptr.*.ptr);
+                try std.testing.expectEqualDeep(original.value_ptr.*, entry.stats);
+                if (index > 0) try std.testing.expect(std.mem.lessThan(u8, list[index - 1].path_key, entry.path_key));
+            }
+        }
+    };
+    const paths = [_][]const u8{ "b.zig", "a.zig", "c.zig" };
+    for ([_]usize{ 0, 1, 3 }) |count| {
+        var stats_map: StatusStatsMap = .{};
+        defer stats_map.deinit(std.testing.allocator);
+        for (paths[0..count], 0..) |path, index| {
+            try stats_map.put(std.testing.allocator, path, .{ .added = index + 1 });
+        }
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{stats_map});
+    }
 }
 
 fn statusLineStatsLessThan(_: void, lhs: git_status.StatusLineStats, rhs: git_status.StatusLineStats) bool {
