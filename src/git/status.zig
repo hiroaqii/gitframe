@@ -1,6 +1,5 @@
 const std = @import("std");
 const diff_file = @import("../diff/file.zig");
-const path_key = @import("../path_key.zig");
 
 pub const ParseError = error{
     InvalidRecord,
@@ -50,7 +49,8 @@ pub const StatusLineStats = struct {
     pub fn eql(self: StatusLineStats, other: StatusLineStats) bool {
         return std.mem.eql(u8, self.path_key, other.path_key) and
             self.stats.added == other.stats.added and
-            self.stats.removed == other.stats.removed;
+            self.stats.removed == other.stats.removed and
+            self.stats.complete == other.stats.complete;
     }
 };
 
@@ -87,10 +87,10 @@ pub const StatusEntry = struct {
 
     /// Canonical key for cross-model state.
     ///
-    /// Porcelain paths are normally repo-relative already, but keep the same
-    /// defensive normalization rules as diff file keys.
+    /// Porcelain -z supplies raw repository-relative bytes, without diff prefixes.
     pub fn canonicalPathKey(self: StatusEntry) ?[]const u8 {
-        return path_key.canonicalRepoPath(self.path);
+        if (self.path.len == 0 or self.path[0] == '/') return null;
+        return self.path;
     }
 
     pub fn eql(self: StatusEntry, other: StatusEntry) bool {
@@ -298,14 +298,14 @@ test "parse porcelain v1 z modified entries" {
     try std.testing.expect(doc.entries[1].isStaged());
 }
 
-test "status entry canonical key normalizes defensive path shapes" {
+test "status entry canonical key retains raw path components" {
     const prefixed: StatusEntry = .{
         .path = "a/src/main.zig",
         .raw = .{ ' ', 'M' },
         .index = .unmodified,
         .worktree = .modified,
     };
-    try std.testing.expectEqualStrings("src/main.zig", prefixed.canonicalPathKey().?);
+    try std.testing.expectEqualStrings("a/src/main.zig", prefixed.canonicalPathKey().?);
 
     const dev_null: StatusEntry = .{
         .path = "/dev/null",

@@ -11,7 +11,7 @@ const process_runner = @import("../process/runner.zig");
 pub const max_diff_bytes = 16 * 1024 * 1024;
 pub const max_status_bytes = 8 * 1024 * 1024;
 pub const max_repository_manifest_bytes = 16 * 1024 * 1024;
-pub const tracked_numstat_stdout_limit = 2 * 1024 * 1024;
+pub const tracked_numstat_stdout_limit = max_diff_bytes;
 pub const tracked_numstat_stderr_limit = 256 * 1024;
 pub const staged_diff_capture_limit = 4 * 1024 * 1024;
 
@@ -540,31 +540,67 @@ pub fn loadRepositoryFileStatus(allocator: std.mem.Allocator, io: std.Io, reques
 }
 
 pub fn loadTrackedNumstat(allocator: std.mem.Allocator, io: std.Io, request: TrackedNumstatRequest) git_command.Error!TrackedNumstatResult {
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &git_command.literal_pathspec_prefix);
-    try argv.append(allocator, "diff");
-    if (request.staged) try argv.append(allocator, "--cached");
-    try argv.append(allocator, "--no-renames");
-    try argv.append(allocator, "--numstat");
-    try argv.append(allocator, "-z");
-    try argv.append(allocator, "--");
-    for (request.paths) |path| try argv.append(allocator, path);
-
+    if (request.paths.len == 0) return .{ .ok = try allocator.dupe(u8, "") };
+    // Read one bounded snapshot for the side, then select byte-exact identities.
+    // Passing every path to Git can exceed both per-argument and total argv limits.
+    const prefix = git_command.literal_pathspec_prefix ++ [_][]const u8{ "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "-z" };
+    const staged = prefix ++ .{"--cached"};
     const result = try git_command.runCaptured(allocator, io, request.context, .{
-        .argv = argv.items,
+        .argv = if (request.staged) &staged else &prefix,
         .stdout_limit = .limited(tracked_numstat_stdout_limit),
         .stderr_limit = .limited(tracked_numstat_stderr_limit),
     });
+    defer result.deinit(allocator);
     switch (result.term) {
         .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .{ .ok = result.stdout };
+            const bytes = filterNumstat(allocator, result.stdout, request.paths) catch |err| return switch (err) {
+                error.InvalidNumstat => .unavailable,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+            return .{ .ok = bytes };
         },
         else => {},
     }
-    result.deinit(allocator);
     return .unavailable;
+}
+
+/// A --no-renames --numstat -z field. Path bytes are already raw, including TAB.
+/// Null counts denote binary content, not zero changed lines.
+pub const NumstatRecord = struct {
+    path: []const u8,
+    counts: ?struct { added: usize, removed: usize },
+
+    pub fn parse(field: []const u8) error{InvalidNumstat}!NumstatRecord {
+        const first = std.mem.indexOfScalar(u8, field, '\t') orelse return error.InvalidNumstat;
+        const second = std.mem.indexOfScalarPos(u8, field, first + 1, '\t') orelse return error.InvalidNumstat;
+        const added = field[0..first];
+        const removed = field[first + 1 .. second];
+        const path = field[second + 1 ..];
+        if (path.len == 0) return error.InvalidNumstat;
+        return .{
+            .path = path,
+            .counts = if (std.mem.eql(u8, added, "-") and std.mem.eql(u8, removed, "-")) null else .{
+                .added = std.fmt.parseInt(usize, added, 10) catch return error.InvalidNumstat,
+                .removed = std.fmt.parseInt(usize, removed, 10) catch return error.InvalidNumstat,
+            },
+        };
+    }
+};
+
+fn filterNumstat(allocator: std.mem.Allocator, bytes: []const u8, paths: []const []const u8) ![]u8 {
+    var targets: std.StringHashMapUnmanaged(void) = .empty;
+    defer targets.deinit(allocator);
+    for (paths) |path| try targets.put(allocator, path, {});
+    var selected: std.ArrayList(u8) = .empty;
+    errdefer selected.deinit(allocator);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = std.mem.indexOfScalarPos(u8, bytes, offset, 0) orelse return error.InvalidNumstat;
+        const record = try NumstatRecord.parse(bytes[offset..end]);
+        if (targets.contains(record.path)) try selected.appendSlice(allocator, bytes[offset .. end + 1]);
+        offset = end + 1;
+    }
+    return selected.toOwnedSlice(allocator);
 }
 
 pub fn loadStagedDiff(allocator: std.mem.Allocator, io: std.Io, request: StagedDiffRequest) git_command.Error!StagedDiffResult {
@@ -1334,4 +1370,16 @@ test "repository path history rejects HEAD movement across the query" {
     defer outcome.deinit(allocator);
     try std.testing.expect(!hook.failed);
     try std.testing.expect(outcome == .unavailable);
+}
+
+test "numstat filtering keeps exact raw identities and rejects incomplete records" {
+    const allocator = std.testing.allocator;
+    const bytes = "2\t1\ta/file\x003\t0\tfile\x00-\t-\tbinary\x000\t0\ttab\tline\n*.txt\x00";
+    const selected = try filterNumstat(allocator, bytes, &.{ "a/file", "a/file", "tab\tline\n*.txt" });
+    defer allocator.free(selected);
+    try std.testing.expectEqualStrings("2\t1\ta/file\x000\t0\ttab\tline\n*.txt\x00", selected);
+    try std.testing.expect((try NumstatRecord.parse("-\t-\tbinary")).counts == null);
+    for ([_][]const u8{ "1\t0\tunterminated", "x\t1\tfile\x00", "1\t0\t\x00", "-\t0\tfile\x00" }) |malformed| {
+        try std.testing.expectError(error.InvalidNumstat, filterNumstat(allocator, malformed, &.{"file"}));
+    }
 }

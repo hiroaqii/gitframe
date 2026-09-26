@@ -96,7 +96,7 @@ pub fn pageHeaderLineStats(surface: diff_surface.ReadSurface) ?file_tree.Stats {
     };
     for (loaded.tree.nodes) |node| {
         if (node.kind != .repo_root) continue;
-        if (node.stats.added == 0 and node.stats.removed == 0) return null;
+        if (node.stats.complete and node.stats.added == 0 and node.stats.removed == 0) return null;
         return node.stats;
     }
     return null;
@@ -590,18 +590,17 @@ pub fn drawStatusTitlePath(
     stats: ?file_tree.Stats,
     palette: theme.Palette,
 ) !void {
-    if (stats) |line_stats| {
-        if (line_stats.added != 0 or line_stats.removed != 0) {
-            const suffix = try std.fmt.allocPrint(surface.frameAllocator(), " +{d} -{d}", .{ line_stats.added, line_stats.removed });
-            const suffix_width = chasen.text.displayWidth(suffix);
-            const path_width = surface.size().width -| @as(u16, @intCast(@min(suffix_width, std.math.maxInt(u16))));
-            if (path_width > 8) {
-                var path_surface = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
-                try draw.copyTailClippedTextAt(&path_surface, 0, 0, path, statusPaneTitleStyle(palette));
-                try drawStatusLineStats(surface, @intCast(path_width), line_stats, palette);
-                return;
-            }
-        }
+    const line_stats = stats orelse file_tree.Stats{ .complete = false };
+    const suffix_width = if (line_stats.complete)
+        std.fmt.count(" +{d} -{d}", .{ line_stats.added, line_stats.removed })
+    else
+        " +? -?".len;
+    const path_width = surface.size().width -| @as(u16, @intCast(@min(suffix_width, std.math.maxInt(u16))));
+    if (path_width > 8) {
+        var path_surface = surface.child(.{ .col = 0, .row = 0, .width = path_width, .height = 1 });
+        try draw.copyTailClippedTextAt(&path_surface, 0, 0, path, statusPaneTitleStyle(palette));
+        try drawStatusLineStats(surface, @intCast(path_width), line_stats, palette);
+        return;
     }
     try draw.copyTailClippedTextAt(surface, 0, 0, path, statusPaneTitleStyle(palette));
 }
@@ -615,14 +614,14 @@ fn drawStatusLineStats(surface: *chasen.Surface, col: u16, stats: file_tree.Stat
     const metadata_style = palette.style(.muted);
     try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
     cursor +|= 1;
-    const added = try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added});
+    const added = if (stats.complete) try std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added}) else "+?";
     try draw.copyClippedTextAt(surface, cursor, 0, added, .{ .fg = palette.color(.success), .bold = true });
     cursor +|= @intCast(chasen.text.displayWidth(added));
     if (cursor < surface.size().width) {
         try draw.copyClippedTextAt(surface, cursor, 0, " ", metadata_style);
         cursor +|= 1;
     }
-    const removed = try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed});
+    const removed = if (stats.complete) try std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed}) else "-?";
     try draw.copyClippedTextAt(surface, cursor, 0, removed, .{ .fg = palette.color(.danger), .bold = true });
 }
 

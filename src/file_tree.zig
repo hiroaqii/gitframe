@@ -552,7 +552,7 @@ fn statusLineStats(document: git_status.StatusDocument, key: []const u8) Stats {
     for (document.line_stats) |entry| {
         if (std.mem.eql(u8, entry.path_key, key)) return entry.stats;
     }
-    return .{};
+    return .{ .complete = false };
 }
 
 pub fn stagePresenceFromEntry(entry: git_status.StatusEntry) StagePresence {

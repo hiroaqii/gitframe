@@ -310,9 +310,9 @@ const PageBarStatsText = struct {
 };
 
 fn pageBarStatsText(surface: *chasen.Surface, stats: file_tree.Stats) ?PageBarStatsText {
-    if (stats.added == 0 and stats.removed == 0) return null;
-    const added = std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added}) catch return null;
-    const removed = std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed}) catch return null;
+    if (stats.complete and stats.added == 0 and stats.removed == 0) return null;
+    const added = if (stats.complete) std.fmt.allocPrint(surface.frameAllocator(), "+{d}", .{stats.added}) catch return null else "+?";
+    const removed = if (stats.complete) std.fmt.allocPrint(surface.frameAllocator(), "-{d}", .{stats.removed}) catch return null else "-?";
     const added_width = chasen.text.displayWidth(added);
     return .{
         .added = added,
@@ -4138,4 +4138,37 @@ test "commit input renders maximum drafts and logical lines beyond u16" {
         }
         try std.testing.expectEqual(revision, harness.commit_panel.draft_revision);
     }
+}
+
+test "line stats presentation distinguishes unknown totals from known zero" {
+    const allocator = std.testing.allocator;
+    const Case = struct { stats: ?file_tree.Stats, text: []const u8 };
+    for ([_]Case{
+        .{ .stats = null, .text = "+? -?" },
+        .{ .stats = .{}, .text = "+0 -0" },
+        .{ .stats = .{ .added = 3, .removed = 1 }, .text = "+3 -1" },
+        .{ .stats = .{ .added = 3, .complete = false }, .text = "+? -?" },
+    }) |case| {
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(40, 1);
+        defer surface.deinit();
+        try @import("diff_surface/view.zig").drawStatusTitlePath(&surface.surface, "file.txt", case.stats, .default());
+        const snapshot = try surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, case.text) != null);
+        const stats = case.stats orelse file_tree.Stats{ .complete = false };
+        if (!stats.complete) {
+            const header = pageBarStatsText(&surface.surface, stats).?;
+            try std.testing.expectEqualStrings("+?", header.added);
+            try std.testing.expectEqualStrings("-?", header.removed);
+        }
+    }
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    var status = try @import("../git/status.zig").StatusBundle.parseOwned(allocator, "?? known\x00?? unknown\x00");
+    defer status.deinit();
+    try status.attachLineStats(&.{.{ .path_key = "known", .stats = .{ .added = 2 } }});
+    const tree = try file_tree.buildWithOptions(arena.allocator(), .{ .files = &.{} }, status.document, .{ .root = .{ .name = "repo" } });
+    try std.testing.expectEqual(@as(usize, 2), tree.nodes[0].stats.added);
+    try std.testing.expect(!tree.nodes[0].stats.complete);
 }

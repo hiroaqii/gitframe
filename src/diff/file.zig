@@ -5,10 +5,13 @@ const diff_parser = @import("parser.zig");
 pub const Stats = struct {
     added: usize = 0,
     removed: usize = 0,
+    /// False when any contributing line count could not be obtained.
+    complete: bool = true,
 
     pub fn add(self: *Stats, other: Stats) void {
         self.added += other.added;
         self.removed += other.removed;
+        self.complete = self.complete and other.complete;
     }
 };
 

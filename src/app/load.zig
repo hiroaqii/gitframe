@@ -1566,15 +1566,20 @@ fn collectTrackedStatusLineStats(
     }
     if (paths.items.len == 0) return;
 
-    const result = git_read.loadTrackedNumstat(allocator, io, .{
+    const result = try git_read.loadTrackedNumstat(allocator, io, .{
         .context = context,
         .paths = paths.items,
         .staged = side == .staged,
-    }) catch return;
+    });
     defer result.deinit(allocator);
     switch (result) {
-        .ok => |bytes| try parseNumstatZIntoMap(allocator, bytes, stats_map),
-        .unavailable => {},
+        .ok => |bytes| {
+            // An absent path in a successful snapshot has no changes on this side.
+            // Binary records below explicitly replace that known zero with unknown.
+            for (paths.items) |path| try addStatusStats(allocator, stats_map, path, .{});
+            try parseNumstatZIntoMap(allocator, bytes, stats_map);
+        },
+        .unavailable => return error.StatsUnavailable,
     }
 }
 
@@ -1583,28 +1588,13 @@ fn parseNumstatZIntoMap(allocator: std.mem.Allocator, bytes: []const u8, stats_m
     while (offset < bytes.len) {
         const field = nextZField(bytes, &offset) orelse break;
         if (field.len == 0) continue;
-        const parsed = parseNumstatField(field) orelse continue;
-        const key = path_key_mod.canonicalRepoPath(parsed.path) orelse continue;
-        try addStatusStats(allocator, stats_map, key, parsed.stats);
+        const parsed = try git_read.NumstatRecord.parse(field);
+        const stats: file_tree.Stats = if (parsed.counts) |counts|
+            .{ .added = counts.added, .removed = counts.removed }
+        else
+            .{ .complete = false };
+        try addStatusStats(allocator, stats_map, parsed.path, stats);
     }
-}
-
-const NumstatField = struct {
-    path: []const u8,
-    stats: file_tree.Stats,
-};
-
-fn parseNumstatField(field: []const u8) ?NumstatField {
-    const first_tab = std.mem.indexOfScalar(u8, field, '\t') orelse return null;
-    const second_tab = std.mem.indexOfScalarPos(u8, field, first_tab + 1, '\t') orelse return null;
-    const added_text = field[0..first_tab];
-    const removed_text = field[first_tab + 1 .. second_tab];
-    if (std.mem.eql(u8, added_text, "-") or std.mem.eql(u8, removed_text, "-")) return null;
-    const added = std.fmt.parseInt(usize, added_text, 10) catch return null;
-    const removed = std.fmt.parseInt(usize, removed_text, 10) catch return null;
-    const path = field[second_tab + 1 ..];
-    if (path.len == 0) return null;
-    return .{ .path = path, .stats = .{ .added = added, .removed = removed } };
 }
 
 fn collectUntrackedStatusLineStats(
@@ -3552,13 +3542,14 @@ test "addedFileLineCount uses diff stats semantics" {
     try std.testing.expectEqual(@as(usize, 1), addedFileLineCount("\n"));
 }
 
-test "parseNumstatZIntoMap parses single-path records and ignores binary records" {
+test "parseNumstatZIntoMap preserves raw paths and marks binary counts unknown" {
     var stats_map: StatusStatsMap = .empty;
     defer deinitStatusStatsMap(std.testing.allocator, &stats_map);
 
     try parseNumstatZIntoMap(std.testing.allocator, "3\t1\tsrc/a.zig\x00-\t-\tbin.dat\x00", &stats_map);
 
-    try std.testing.expectEqual(@as(usize, 1), stats_map.count());
+    try std.testing.expectEqual(@as(usize, 2), stats_map.count());
+    try std.testing.expect(!stats_map.get("bin.dat").?.complete);
     const stats = stats_map.get("src/a.zig") orelse return error.ExpectedStats;
     try std.testing.expectEqual(@as(usize, 3), stats.added);
     try std.testing.expectEqual(@as(usize, 1), stats.removed);
@@ -4589,4 +4580,92 @@ test "stats-only repository read pins descriptors across leaf and directory subs
         try std.testing.expectEqualStrings("inside\n", bytes);
         try std.testing.expectError(error.InvalidPath, readRepoFileLimited(allocator, io, repo, selected, 1024));
     }
+}
+
+test "status numstat handles oversized path lists and publishes no partial totals on failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    try tmp.dir.createDir(io, "a", .default_dir);
+    for ([_][]const u8{ "a/victim.txt", "victim.txt", "binary" }) |path| {
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "base\n" });
+    }
+    try runTestGit(io, &.{ "git", "add", "--all" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/victim.txt", .data = "one\ntwo\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim.txt", .data = "one\ntwo\nthree\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary", .data = "\x00binary" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty.txt", .data = "" });
+    try runTestGit(io, &.{ "git", "add", "--all" }, tmp.dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim.txt", .data = "one\ntwo\nthree\nfour\n" });
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+
+    // Same real reader and selected file, with 7.5 MB of additional synthetic
+    // selectors. Old argv enumeration failed before Git could run this query.
+    const names = try allocator.alloc(u8, 42_000 * 180);
+    defer allocator.free(names);
+    const paths = try allocator.alloc([]const u8, 42_002);
+    defer allocator.free(paths);
+    for (paths[0..42_000], 0..) |*path, index| {
+        const name = names[index * 180 ..][0..180];
+        @memset(name, 'x');
+        _ = try std.fmt.bufPrint(name[0..8], "{d:0>8}", .{index});
+        path.* = name;
+    }
+    paths[42_000] = "a/victim.txt";
+    paths[42_001] = "a/victim.txt";
+    const small = try git_read.loadTrackedNumstat(allocator, io, .{ .context = context, .paths = &.{"a/victim.txt"}, .staged = true });
+    defer small.deinit(allocator);
+    const large = try git_read.loadTrackedNumstat(allocator, io, .{ .context = context, .paths = paths, .staged = true });
+    defer large.deinit(allocator);
+    try std.testing.expect(small == .ok and large == .ok);
+    try std.testing.expectEqualStrings("2\t1\ta/victim.txt\x00", large.ok);
+    try std.testing.expectEqualStrings(small.ok, large.ok);
+
+    var loaded = runStatusLoadWithOrigin("/fixture", context, .foreground, allocator, io);
+    defer loaded.deinit(allocator);
+    try std.testing.expect(loaded == .loaded);
+    const document = loaded.loaded.document;
+    try std.testing.expectEqualDeep(file_tree.Stats{ .added = 2, .removed = 1 }, statusLineStatsForTest(document, "a/victim.txt").?);
+    try std.testing.expectEqualDeep(file_tree.Stats{ .added = 4, .removed = 1 }, statusLineStatsForTest(document, "victim.txt").?);
+    try std.testing.expect(!statusLineStatsForTest(document, "binary").?.complete);
+    try std.testing.expectEqualDeep(file_tree.Stats{}, statusLineStatsForTest(document, "empty.txt").?);
+
+    const Hook = struct {
+        var cached_reads: usize = 0;
+        var rejected_reads: usize = 0;
+        fn spawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            var numstat = false;
+            var cached = false;
+            for (options.argv) |arg| {
+                if (std.mem.eql(u8, arg, "--numstat")) numstat = true;
+                if (std.mem.eql(u8, arg, "--cached")) cached = true;
+            }
+            if (numstat) {
+                if (!cached) {
+                    rejected_reads += 1;
+                    return error.SystemResources;
+                }
+                cached_reads += 1;
+            }
+            return std.testing.io.vtable.processSpawn(userdata, options);
+        }
+    };
+    Hook.cached_reads = 0;
+    Hook.rejected_reads = 0;
+    var vtable = io.vtable.*;
+    vtable.processSpawn = Hook.spawn;
+    const wrapped: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var failed_stats = runStatusLoadWithOrigin("/fixture", context, .foreground, allocator, wrapped);
+    defer failed_stats.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), Hook.cached_reads);
+    try std.testing.expectEqual(@as(usize, 1), Hook.rejected_reads);
+    try std.testing.expect(failed_stats == .loaded);
+    try std.testing.expectEqual(document.entries.len, failed_stats.loaded.document.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), failed_stats.loaded.document.line_stats.len);
+    try std.testing.expect(!document.eql(failed_stats.loaded.document));
 }
