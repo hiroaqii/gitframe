@@ -452,7 +452,7 @@ test "Changes page header admits only exact-root branch snapshots" {
     try std.testing.expect(pageHeaderPresentation(context) == null);
 }
 
-test "changes active file filter uses compact discoverability row" {
+test "changes file filter uses compact discoverability row including all" {
     var page_state: changes_page.ChangesPageState = .{
         .review_display = .{ .changed_file_filter = .modified },
     };
@@ -489,7 +489,7 @@ test "changes active file filter uses compact discoverability row" {
     );
     const all_snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(all_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, all_snapshot, "Files") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all_snapshot, "Files [all]  (F: filter)") != null);
 }
 
 test "changes reviewed and file filters retain combined status" {

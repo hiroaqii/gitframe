@@ -1211,8 +1211,6 @@ pub fn drawSidebarDetailRow(
         try draw.copyClippedTextAt(surface, 1, row, "hiding reviewed", palette.style(.prompt));
         return;
     }
-    if (filter == .all) return;
-
     const mode = try std.fmt.allocPrint(surface.frameAllocator(), "Files [{s}]", .{filter.shortLabel()});
     try draw.copyClippedTextAt(surface, 1, row, mode, palette.boldStyle(.accent));
 
