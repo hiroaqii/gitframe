@@ -197,7 +197,7 @@ pub const Controller = struct {
             },
         };
 
-        var argv = editor.build(ctx.allocator(), self.user_config.editor, self.env_map, .{
+        var argv = editor.build(ctx.allocator(), ctx.io(), self.user_config.editor, self.env_map, .{
             .repo_root = target.repo_root,
             .path = target.path,
             .line = target.line,
@@ -206,6 +206,10 @@ pub const Controller = struct {
             error.OutOfMemory => return err,
             error.EmptyArgv => {
                 self.diagnostics.changes.set("editor command is empty", .{});
+                return;
+            },
+            error.NoEditorFound => {
+                self.setEffectStatus(.{ .page = origin }, "no editor found in PATH (nvim, vim, vi); set VISUAL or EDITOR", .{});
                 return;
             },
             error.MissingPathPlaceholder, error.UnknownPlaceholder, error.TooManyArguments => {

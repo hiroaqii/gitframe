@@ -40,6 +40,7 @@ const ShellHarness = struct {
     repo_epoch: u64 = 0,
     pages: ShellPages = .{},
     user_config: config_mod.Config = .{},
+    env_map: ?*std.process.Environ.Map = null,
     status: app_state.StatusMessage = .{},
     overlay: app_state.OverlayState = .{},
     shell_state: shell_effects.State = .{},
@@ -68,7 +69,7 @@ const ShellHarness = struct {
         return .{
             .state = &self.shell_state,
             .user_config = &self.user_config,
-            .env_map = null,
+            .env_map = self.env_map,
             .origins = self.origins(),
             .diagnostics = .{
                 .shell = &self.status,
@@ -382,6 +383,9 @@ test "clipboard completion rejects unknown id and superseded page instance" {
 }
 
 test "openSelectedFileInEditor blocks while git action is pending" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("VISUAL", "test-editor");
     const ready: changes_content.EditorTargetResult = .{ .ready = .{
         .repo_root = "/repo",
         .path = "src/main.zig",
@@ -390,7 +394,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
 
     // Action exclusivity and target diagnostics reject before allocation.
     {
-        var app: ShellHarness = .{};
+        var app: ShellHarness = .{ .env_map = &env };
         var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
 
         try app.shellEffects().requestEditor(
@@ -414,7 +418,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
 
     // Invalid and empty configured commands retain the existing diagnostics.
     {
-        var app: ShellHarness = .{};
+        var app: ShellHarness = .{ .env_map = &env };
         var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
         app.user_config.editor.argv[0] = "nvim";
         app.user_config.editor.argv[1] = "{unknown}";
@@ -431,9 +435,23 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     }
 
+    // Missing automatic candidates leave the TUI active with no queued command.
+    {
+        var app: ShellHarness = .{ .active_page = .repository };
+        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator, ._io = std.testing.io };
+        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().repositoryOrigin());
+        try std.testing.expectEqualStrings(
+            "no editor found in PATH (nvim, vim, vi); set VISUAL or EDITOR",
+            app.pages.repository.status.text(),
+        );
+        try std.testing.expectEqualStrings("", app.pages.changes.status.text());
+        try std.testing.expect(app.shell_state.editor_foreground == null);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
+    }
+
     // Queue saturation is diagnosed without committing editor correlation.
     {
-        var app: ShellHarness = .{};
+        var app: ShellHarness = .{ .env_map = &env };
         var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
         defer ctx.runtimeClearPendingEffectCopies();
         _ = try ctx.terminal().runForegroundCommand(.{
@@ -452,7 +470,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
 
     // Allocation failure leaves both runtime queue and owner correlation empty.
     {
-        var app: ShellHarness = .{};
+        var app: ShellHarness = .{ .env_map = &env };
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
         var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = failing.allocator() };
 
@@ -464,7 +482,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     }
     {
-        var app: ShellHarness = .{};
+        var app: ShellHarness = .{ .env_map = &env };
         // The two editor.build allocations succeed; the runtime queue's first
         // argv-copy allocation fails before correlation is committed.
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
@@ -481,7 +499,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     // Queue success commits the exact id. A mismatch is state-preserving; the
     // exact active completion clears first and requests one Changes reload.
     {
-        var app: ShellHarness = .{};
+        var app: ShellHarness = .{ .env_map = &env };
         var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
         defer ctx.runtimeClearPendingEffectCopies();
         const origin = app.shellEffects().changesOrigin();
@@ -526,7 +544,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     // Same-instance inactive completion retains its origin diagnostic, while
     // a reopened Changes instance consumes the terminal silently as stale.
     {
-        var app: ShellHarness = .{ .active_page = .repository };
+        var app: ShellHarness = .{ .active_page = .repository, .env_map = &env };
         app.shell_state.editor_foreground = .{
             .request_id = .{ .id = 80 },
             .origin = app.shellEffects().changesOrigin(),
