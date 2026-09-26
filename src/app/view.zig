@@ -1930,19 +1930,19 @@ fn showBodyInputCursor(surface: *chasen.Surface, body: *const app_commit_panel.B
     view_primitives.showInputCursor(surface, 0, @intCast(visible_line_index), line, body.cursorLinePrefix().len);
 }
 
-fn bodyVisibleStartLine(body: *const app_commit_panel.BodyText, text_rows: u16) u16 {
+fn bodyVisibleStartLine(body: *const app_commit_panel.BodyText, text_rows: u16) usize {
     const total_lines = body.lineCount();
     if (text_rows == 0 or total_lines <= text_rows) return 0;
     const cursor_line = body.cursorLineIndex();
     if (cursor_line < text_rows) return 0;
-    return @intCast(cursor_line - text_rows + 1);
+    return cursor_line - text_rows + 1;
 }
 
-fn bodyActiveLineIndex(body: *const app_commit_panel.BodyText, start_line: u16, text_rows: u16) ?u16 {
+fn bodyActiveLineIndex(body: *const app_commit_panel.BodyText, start_line: usize, text_rows: u16) ?u16 {
     if (text_rows == 0) return null;
 
     const cursor_line = body.cursorLineIndex();
-    if (cursor_line < start_line or cursor_line >= @as(usize, start_line) + text_rows) return null;
+    if (cursor_line < start_line or cursor_line - start_line >= text_rows) return null;
     return @intCast(cursor_line - start_line);
 }
 
@@ -4088,3 +4088,54 @@ const help_all_sections = [_]HelpSection{
     .{ .title = "File tree", .items = &help_sidebar_items },
     .{ .title = "Diff", .items = &help_diff_items },
 };
+
+test "commit input renders maximum drafts and logical lines beyond u16" {
+    const allocator = std.testing.allocator;
+    const Case = struct { pattern: []const u8, bytes: usize };
+    for ([_]Case{
+        .{ .pattern = "\n", .bytes = 65534 },
+        .{ .pattern = "\n", .bytes = 65535 },
+        .{ .pattern = "\n", .bytes = 65536 },
+        .{ .pattern = "x", .bytes = app_commit_panel.max_message_bytes },
+        .{ .pattern = "界e\u{301}\t", .bytes = app_commit_panel.max_message_bytes },
+    }) |case| {
+        const bytes = try allocator.alloc(u8, case.bytes / case.pattern.len * case.pattern.len);
+        defer allocator.free(bytes);
+        var offset: usize = 0;
+        while (offset < bytes.len) : (offset += case.pattern.len) @memcpy(bytes[offset..][0..case.pattern.len], case.pattern);
+        var harness: ShellViewTestHarness = .{};
+        harness.commit_panel = .init(allocator);
+        defer harness.commit_panel.deinit();
+        harness.commit_panel.open(.commit);
+        harness.commit_panel.enter();
+        harness.commit_panel.paste(bytes);
+        try std.testing.expectEqualStrings(bytes, harness.commit_panel.body.slice());
+        try std.testing.expect(harness.commit_panel.commit_error == null);
+        const revision = harness.commit_panel.draft_revision;
+
+        var panel: chasen.testing.TestSurface = undefined;
+        try panel.init(80, 24);
+        defer panel.deinit();
+        try viewCommitPanel(harness.context(), &panel.surface);
+        try std.testing.expect(panel.screen.cursor_vis);
+        try std.testing.expect(panel.screen.cursor.col < 80 and panel.screen.cursor.row < 24);
+        if (case.pattern[0] == '\n') {
+            try std.testing.expectEqual(case.bytes + 1, harness.commit_panel.body.lineCount());
+            const indicator = try std.fmt.allocPrint(allocator, "{d}/{d}", .{ case.bytes + 1, case.bytes + 1 });
+            defer allocator.free(indicator);
+            const snapshot = try panel.snapshot(allocator);
+            defer allocator.free(snapshot);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, indicator) != null);
+        }
+        for ([_]u16{ 1, 2, 80 }) |width| {
+            var body_surface: chasen.testing.TestSurface = undefined;
+            try body_surface.init(width, 24);
+            defer body_surface.deinit();
+            try viewCommitBody(&harness.commit_panel.body, &body_surface.surface, true, .default());
+            showBodyInputCursor(&body_surface.surface, &harness.commit_panel.body);
+            try std.testing.expect(body_surface.screen.cursor_vis);
+            try std.testing.expect(body_surface.screen.cursor.col < width and body_surface.screen.cursor.row < 24);
+        }
+        try std.testing.expectEqual(revision, harness.commit_panel.draft_revision);
+    }
+}
