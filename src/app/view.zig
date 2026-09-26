@@ -220,7 +220,6 @@ fn viewBody(app: Context, surface: *chasen.Surface) !void {
         .repository => repository_view.view(app.repository, surface),
         .history => if (app.history) |history| history_view.view(history, surface) else viewPlaceholderPage(app.active_page, app.has_active_repo, app.theme, surface),
         .compare => compare_view.view(app.compare, surface),
-        .config => viewPlaceholderPage(app.active_page, app.has_active_repo, app.theme, surface),
     };
 }
 
@@ -230,7 +229,6 @@ fn activePageHeaderPresentation(app: Context, allocator: std.mem.Allocator) ?pag
         .repository => repository_view.pageHeaderPresentation(app.repository),
         .history => if (app.history) |history| history_view.pageHeaderPresentation(history, allocator) else null,
         .compare => compare_view.pageHeaderPresentation(app.compare),
-        .config => null,
     };
 }
 
@@ -239,7 +237,7 @@ fn activePageHeaderLineStats(app: Context) ?file_tree.Stats {
         .changes => changes_view.pageHeaderLineStats(app.changes),
         .compare => compare_view.pageHeaderLineStats(app.compare),
         .history => if (app.history) |history| history_view.pageHeaderLineStats(history) else null,
-        .repository, .config => null,
+        .repository => null,
     };
 }
 
@@ -534,7 +532,7 @@ const FooterProjection = struct {
 /// drift away from the mouse hit target.
 pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     if (app.command_line != null) return null;
-    if (width == 0 or app.active_page == .config) return null;
+    if (width == 0) return null;
     if (app.action.spinnerPresentation() != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
 
@@ -2031,10 +2029,6 @@ fn footerHints(app: Context, key_buffers: *[footer_hint_capacity][16]u8) FooterH
             appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
             appendFooterAction(app, &result, key_buffers, .help, "help", .help);
         },
-        .config => {
-            appendFooterAction(app, &result, key_buffers, .repo_picker, "switch repo", .repository_switch);
-            appendFooterAction(app, &result, key_buffers, .help, "help", .help);
-        },
     }
     return result;
 }
@@ -2214,7 +2208,6 @@ fn helpColumnsForPage(help_page: page.Id) struct { left: []const HelpSection, ri
             .right = &.{ help_history_sections[1], help_history_sections[3] },
         },
         .compare => .{ .left = help_compare_sections[0..2], .right = help_compare_sections[2..] },
-        .config => .{ .left = &help_placeholder_sections, .right = &.{} },
     };
 }
 
@@ -2224,7 +2217,6 @@ fn helpSectionsForPage(help_page: page.Id) []const HelpSection {
         .repository => &help_repository_sections,
         .history => &help_history_sections,
         .compare => &help_compare_sections,
-        .config => &help_placeholder_sections,
     };
 }
 
@@ -2298,7 +2290,7 @@ fn helpItemLayout(help: HelpContext, width: u16, item: HelpItem, key_buffer: *[4
         .description_row = 0,
         .rows = 1,
     };
-    const preferred_col = @max(@as(u16, if (help.page == .config) 12 else 18), chasen.text.displayWidth(key) +| 1);
+    const preferred_col = @max(@as(u16, 18), chasen.text.displayWidth(key) +| 1);
     // On very narrow surfaces, keep the full key above its description.
     const description_col: u16 = if (preferred_col < width) preferred_col else 0;
     const description_row = if (description_col == 0) ui.Paragraph.init(.{ .text = key }).lineCount(width) else 0;
@@ -2351,7 +2343,7 @@ fn effectiveHelpDiffMode(app: Context) diff_render.DisplayMode {
             )
         else
             .unified,
-        .repository, .config => .unified,
+        .repository => .unified,
     };
 }
 
@@ -2801,14 +2793,6 @@ test "footer normal-mode hints match the decided page lists" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "m: select commits") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit history") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "120x32") != null);
-
-    context = harness.context();
-    context.active_page = .config;
-    hints = footerHints(context, &key_buffers);
-    try expectFooterHintItems(&hints, &.{
-        ui.key_hint.item("R", "switch repo"),
-        ui.key_hint.item("?", "help"),
-    });
 }
 
 test "History picker footer keeps diff actions and range state without the local Space hint" {
@@ -3048,7 +3032,7 @@ test "page bar renders repository context after tabs and omits it in compact mod
 
     const snapshot = try wide.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Config ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, " Config ") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "HEAD feature/page-header ↑2") != null);
     try wide.expectCellText(119, shell_layout.page_bar_label_row, " ");
     try std.testing.expect(page.tabAtColumn(wide.surface.size().width, page.tabExtent() + 1) == null);
@@ -3185,14 +3169,6 @@ test "page bar remote actions follow configured keys and width fallback" {
     try std.testing.expectEqualStrings("(Ctrl+s: push)", fallback.text);
 }
 
-test "Config page header never borrows another page repository context" {
-    var harness: ShellViewTestHarness = .{};
-    var context = harness.context();
-    context.active_page = .config;
-    try std.testing.expect(activePageHeaderPresentation(context, std.testing.allocator) == null);
-    try std.testing.expect(activePageHeaderLineStats(context) == null);
-}
-
 fn expectFullPageBarRule(surface: *const chasen.Surface, palette: theme.Palette) !void {
     for (0..surface.size().width) |col| {
         const cell = surface.readCell(@intCast(col), shell_layout.page_bar_rule_row) orelse
@@ -3267,7 +3243,6 @@ test "help popup uses two columns at 120 columns and one at 80 columns" {
         }
         try std.testing.expect(found_columns);
     }
-    try std.testing.expect(!helpUsesTwoColumns(content, .config));
 }
 
 test "help popup reserves a footer row for its legend and scroll status" {
@@ -3377,7 +3352,7 @@ test "diff Help copy keys and vocabulary follow the keymap and effective mode" {
                     &history.diff.viewer,
                     context.history.?.layout,
                 ),
-                .repository, .config => unreachable,
+                .repository => unreachable,
             };
             try std.testing.expectEqual(canonical_mode, effectiveHelpDiffMode(context));
 
@@ -3483,7 +3458,7 @@ test "help popup uses effective document navigation labels and reaches its tail 
     try viewHelpPopup(context, &tail.surface);
     const tail_snapshot = try tail.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(tail_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "Config page") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "Config page") == null);
     try std.testing.expect(std.mem.indexOf(u8, tail_snapshot, "switch repository") != null);
 
     for ([_]page.Id{ .changes, .compare, .history }) |help_page| {
@@ -3529,7 +3504,7 @@ test "help popup uses effective document navigation labels and reaches its tail 
 
 test "page help puts local shortcuts before Global navigation and quit" {
     var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 120, .height = 32 } };
-    for ([_]page.Id{ .repository, .history, .compare, .config }) |help_page| {
+    for ([_]page.Id{ .repository, .history, .compare }) |help_page| {
         harness.overlay.openHelpForPage(help_page);
         var context = harness.context();
         context.active_page = help_page;
@@ -3548,14 +3523,14 @@ test "page help puts local shortcuts before Global navigation and quit" {
         const sections = helpColumnsForPage(help_page).left;
         for (sections, 0..) |section, index| {
             if (!std.mem.eql(u8, section.title, "Global")) continue;
-            try std.testing.expect(if (help_page == .config) index == 0 else index > 0);
-            harness.overlay.help_scroll = if (index == 0) 0 else rowsForSections(helpContext(context), if (help_page == .config) helpContentSize(harness.terminal_size).width else (helpContentSize(harness.terminal_size).width - help_column_gap) / 2, sections[0..index]) + 1;
+            try std.testing.expect(index > 0);
+            harness.overlay.help_scroll = rowsForSections(helpContext(context), (helpContentSize(harness.terminal_size).width - help_column_gap) / 2, sections[0..index]) + 1;
             break;
         }
         try viewHelpPopup(context, &popup.surface);
         const global_snapshot = try popup.snapshot(std.testing.allocator);
         defer std.testing.allocator.free(global_snapshot);
-        for ([_][]const u8{ "Global", "Changes page", "Repository page", "History page", "Compare page", "Config page", "switch repository", "open / close help", "quit" }) |label| {
+        for ([_][]const u8{ "Global", "Changes page", "Repository page", "History page", "Compare page", "switch repository", "open / close help", "quit" }) |label| {
             try std.testing.expect(std.mem.indexOf(u8, global_snapshot, label) != null);
         }
     }
@@ -3912,7 +3887,6 @@ const help_global_items = [_]HelpItem{
     .{ .kind = .navigation, .key = .{ .action = .page_repository }, .description = "Repository page" },
     .{ .kind = .navigation, .key = .{ .action = .page_history }, .description = "History page" },
     .{ .kind = .navigation, .key = .{ .action = .page_compare }, .description = "Compare page" },
-    .{ .kind = .navigation, .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .kind = .navigation, .key = .{ .action = .repo_picker }, .description = "switch repository" },
     .{ .kind = .navigation, .key = .{ .text = "Tab" }, .description = "focus file tree / diff" },
     .{ .kind = .navigation, .key = .{ .text = "Home / End" }, .description = "first / last file" },
@@ -3928,15 +3902,7 @@ const help_common_global_navigation = [_]HelpItem{
     .{ .kind = .navigation, .key = .{ .action = .page_repository }, .description = "Repository page" },
     .{ .kind = .navigation, .key = .{ .action = .page_history }, .description = "History page" },
     .{ .kind = .navigation, .key = .{ .action = .page_compare }, .description = "Compare page" },
-    .{ .kind = .navigation, .key = .{ .action = .page_config }, .description = "Config page" },
     .{ .kind = .navigation, .key = .{ .action = .repo_picker }, .description = "switch repository" },
-};
-
-const help_common_global_items = help_common_global_actions ++
-    [_]HelpItem{help_group_separator} ++ help_common_global_navigation;
-
-const help_placeholder_sections = [_]HelpSection{
-    .{ .title = "Global", .items = &help_common_global_items },
 };
 
 const help_compare_items = [_]HelpItem{

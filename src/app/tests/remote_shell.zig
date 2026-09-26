@@ -231,7 +231,6 @@ fn remoteWorkflow(app: *App) workflow_remote.Controller {
             .repository => origins.repository(),
             .history => origins.history(),
             .compare => origins.compare(),
-            else => null,
         },
         .repository_status = &app.pages.repository.status,
         .history_status = &app.pages.history.status,

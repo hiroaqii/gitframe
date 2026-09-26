@@ -378,7 +378,6 @@ pub const Controller = struct {
                 .repository => self.diagnostics.repository.set(fmt, args),
                 .history => if (self.diagnostics.history) |status| status.set(fmt, args) else self.diagnostics.shell.set(fmt, args),
                 .compare => self.diagnostics.compare.set(fmt, args),
-                .config => self.diagnostics.shell.set(fmt, args),
             },
             .history_preview => if (self.diagnostics.history) |status| status.set(fmt, args) else self.diagnostics.shell.set(fmt, args),
             .shell_surface => self.diagnostics.shell.set(fmt, args),

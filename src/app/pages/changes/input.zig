@@ -89,7 +89,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         return changes_message.fromShared(diff_surface_input.documentNavigationMsg(action, diff_focused) orelse return null);
     }
     return switch (action) {
-        .page_changes, .page_repository, .page_compare, .page_config => null,
+        .page_changes, .page_repository, .page_compare => null,
         .help, .reload => null,
         .search => .enter_search,
         .file_search => .enter_file_search,

@@ -66,7 +66,6 @@ const PageStates = struct {
     repository: repository_page.RepositoryPageState = .{},
     history: history_page.HistoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
-    config: page.LazyPlaceholder = .{},
 };
 
 const ExecutionContext = union(enum) {
@@ -238,7 +237,6 @@ pub const App = struct {
             .repository = &self.pages.repository,
             .history = &self.pages.history,
             .compare = &self.pages.compare,
-            .config_page = &self.pages.config,
             .repo = self.repoSessionView(),
             .source = self.config.source,
             .body_size = self.shellLayout().bodySize(),
@@ -310,7 +308,7 @@ pub const App = struct {
             .history => self.pages.history.current_view == .diff and
                 !self.pages.history.diff.search.mode and
                 !self.pages.history.diff.file_search.mode,
-            .repository, .config => false,
+            .repository => false,
         };
         if (!reachable) return 0;
 
@@ -423,7 +421,6 @@ pub const App = struct {
                 .repository => origins.repository(),
                 .history => origins.history(),
                 .compare => origins.compare(),
-                else => null,
             },
             .repository_status = &self.pages.repository.status,
             .history_status = &self.pages.history.status,
@@ -765,7 +762,6 @@ pub const App = struct {
                 .repository => self.repositoryCoordinator().requestReload(.manual),
                 .history => self.historyCoordinator().refresh(self.allocator orelse ctx.allocator()),
                 .compare => try self.compareCoordinator().refresh(ctx),
-                .config => self.status.set("reload is not available on this page yet", .{}),
             },
             .auto_reload_tick => try self.changesRead().autoReloadTick(ctx),
             .focus_lost => {
@@ -776,7 +772,6 @@ pub const App = struct {
                     .repository => self.pages.repository.clearLiveSelectionPreservingViewport(self.shellLayout().bodySize()),
                     .history => self.pages.history.diff.selection_owner = .none,
                     .compare => self.pages.compare.diff.selection_owner = .none,
-                    .config => {},
                 }
             },
             .git_action_spinner_tick => if (self.actionLifecycle().tick(ctx)) self.redraw_plan.requestSkip(),
@@ -1671,7 +1666,6 @@ pub const App = struct {
             .repository => &self.pages.repository.status,
             .history => &self.pages.history.status,
             .compare => &self.pages.compare.status,
-            .config => null,
         };
     }
 
@@ -1681,7 +1675,6 @@ pub const App = struct {
             .repository => &self.pages.repository.status,
             .history => &self.pages.history.status,
             .compare => &self.pages.compare.status,
-            .config => null,
         };
     }
 
@@ -1777,7 +1770,6 @@ pub const App = struct {
                     completion.generation,
                 )) self.pages.history.diff.pinned_selection_basis = null;
             },
-            .config => {},
         }
     }
 
@@ -1827,7 +1819,6 @@ pub const App = struct {
             .repository => effects.repositoryOrigin(),
             .history => effects.historyOrigin(),
             .compare => effects.compareOrigin(),
-            .config => return,
         };
         const queued = effects.queueClipboardAccepted(ctx, .{
             .origin = .{ .page = origin },
@@ -2101,6 +2092,6 @@ test "command line keeps input across resize and cancels on focus or page transi
 
     app.updateCommandLine(.open);
     try std.testing.expect(app.commandLineView() != null);
-    try app.update(.{ .switch_page = .config }, &tc.ctx);
+    try app.update(.{ .switch_page = .compare }, &tc.ctx);
     try std.testing.expect(app.commandLineView() == null);
 }

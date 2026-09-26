@@ -778,7 +778,6 @@ pub const Controller = struct {
             .repository => .repository,
             .history => .{ .history = result.result == .ok },
             .compare => .compare,
-            else => unreachable,
         } };
     }
 
@@ -879,7 +878,6 @@ pub const Controller = struct {
             .repository => self.repository_status,
             .history => self.history_status,
             .compare => self.compare_status,
-            else => unreachable,
         };
     }
 

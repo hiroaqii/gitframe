@@ -19,9 +19,10 @@ test "stash routing respects effective binding and existing input owners" {
     try std.testing.expect(input.keyToMsg(.{}, capital_s).?.stash == .open_list);
     try std.testing.expect((input.keyToMsg(.{}, .{ .codepoint = 's', .mods = .{ .shift = true } }) orelse return error.TestUnexpectedResult).stash == .open_list);
     for ([_]input.KeyContext{
-        .{ .active_page = .repository },               .{ .active_page = .history },                           .{ .active_page = .compare },          .{ .active_page = .config },
-        .{ .help_mode = true },                        .{ .branch_switch_mode = true },                        .{ .remote_error_mode = true },        .{ .changes = .{ .search_mode = true } },
-        .{ .changes = .{ .file_search_mode = true } }, .{ .changes = .{ .selection_owner = .keyboard_line } }, .{ .active_selection_gesture = true }, .{ .commit_panel_mode = true },
+        .{ .active_page = .repository },          .{ .active_page = .history },                  .{ .active_page = .compare },
+        .{ .help_mode = true },                   .{ .branch_switch_mode = true },               .{ .remote_error_mode = true },
+        .{ .changes = .{ .search_mode = true } }, .{ .changes = .{ .file_search_mode = true } }, .{ .changes = .{ .selection_owner = .keyboard_line } },
+        .{ .active_selection_gesture = true },    .{ .commit_panel_mode = true },
     }) |context| {
         if (input.keyToMsg(context, s)) |msg| try std.testing.expect(msg != .stash);
         if (input.keyToMsg(context, capital_s)) |msg| try std.testing.expect(msg != .stash);

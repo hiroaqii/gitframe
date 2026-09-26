@@ -49,7 +49,6 @@ pub const Controller = struct {
     repository: *repository_page.RepositoryPageState,
     history: *history_page.HistoryPageState,
     compare: *compare_page.ComparePageState,
-    config_page: *page.LazyPlaceholder,
     repo: repo_session.View,
     source: diff_source.SourceMode,
     body_size: chasen.Size,
@@ -79,7 +78,7 @@ pub const Controller = struct {
                 self.history.activate(allocator, self.repo.epoch(), self.repo.activeIdentity());
                 break :blk .history_refresh;
             },
-            .repository, .config => .none,
+            .repository => .none,
         };
     }
 
@@ -144,10 +143,6 @@ pub const Controller = struct {
             .compare => blk: {
                 _ = self.compare.activate(self.repo.epoch());
                 break :blk .compare_refresh;
-            },
-            .config => blk: {
-                self.config_page.ensureInitialized();
-                break :blk .none;
             },
         };
     }

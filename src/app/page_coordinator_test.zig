@@ -34,7 +34,6 @@ const PageStates = struct {
     repository: repository_page.RepositoryPageState = .{},
     history: history_page.HistoryPageState = .{},
     compare: compare_page.ComparePageState = .{},
-    config: page.LazyPlaceholder = .{},
 };
 
 const TestApp = struct {
@@ -56,7 +55,6 @@ const TestApp = struct {
             .repository = &self.pages.repository,
             .history = &self.pages.history,
             .compare = &self.pages.compare,
-            .config_page = &self.pages.config,
             .repo = self.repo_session.view(),
             .source = self.config.source,
             .body_size = self.body_size,
@@ -241,25 +239,25 @@ test "Compare transient owners block transitions" {
         .focus = .{ .hunk_index = 0, .line_index = 1 },
         .moved = true,
     } };
-    try requestPageSwitchForTest(&app, &ctx, .config);
+    try requestPageSwitchForTest(&app, &ctx, .repository);
     try std.testing.expectEqual(page.Id.compare, app.active_page);
     try std.testing.expectEqualStrings("finish Compare mouse selection before switching pages", app.status.text());
 
     app.pages.compare.diff.selection_owner = .none;
     _ = app.pages.compare.beginBasePicker(allocator).?;
-    try requestPageSwitchForTest(&app, &ctx, .config);
+    try requestPageSwitchForTest(&app, &ctx, .repository);
     try std.testing.expectEqual(page.Id.compare, app.active_page);
     try std.testing.expectEqualStrings("close Compare base picker before switching pages", app.status.text());
 
     app.pages.compare.closeBasePicker(allocator);
     app.pages.compare.diff.search.mode = true;
-    try requestPageSwitchForTest(&app, &ctx, .config);
+    try requestPageSwitchForTest(&app, &ctx, .repository);
     try std.testing.expectEqual(page.Id.compare, app.active_page);
     try std.testing.expectEqualStrings("finish Compare search before switching pages", app.status.text());
 
     app.pages.compare.diff.search.mode = false;
-    try requestPageSwitchForTest(&app, &ctx, .config);
-    try std.testing.expectEqual(page.Id.config, app.active_page);
+    try requestPageSwitchForTest(&app, &ctx, .repository);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
 }
 
 test "Compare retained selection survives page transitions and clears on repository replacement" {
@@ -304,8 +302,8 @@ test "Compare retained selection survives page transitions and clears on reposit
     const retained_pin = app.pages.compare.diff.pinned_selection_basis.?;
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator };
 
-    try requestPageSwitchForTest(&app, &ctx, .config);
-    try std.testing.expectEqual(page.Id.config, app.active_page);
+    try requestPageSwitchForTest(&app, &ctx, .repository);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 

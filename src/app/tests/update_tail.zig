@@ -527,6 +527,7 @@ fn expectCompareInactiveCompletionOrder(order: CompareInactiveCompletionOrder) !
         .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) } },
     };
     defer app.pages.compare.deinit(allocator);
+    defer app.pages.repository.deinit(allocator);
     defer app.repo_session.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
@@ -534,8 +535,11 @@ fn expectCompareInactiveCompletionOrder(order: CompareInactiveCompletionOrder) !
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
     defer clearPendingStatusAndDiffTasks(&ctx, allocator);
 
-    try app.update(.{ .switch_page = .config }, &ctx);
-    try std.testing.expectEqual(page.Id.config, app.active_page);
+    try app.update(.{ .switch_page = .repository }, &ctx);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    // The destination page queues its own reads, separate from Compare's
+    // completion/re-entry ordering exercised below.
+    clearPendingRepositoryTasks(&ctx, allocator);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
     app.status.set("visible page sentinel", .{});
 
@@ -549,7 +553,7 @@ fn expectCompareInactiveCompletionOrder(order: CompareInactiveCompletionOrder) !
             'b',
         ) } } }, &ctx);
         try std.testing.expect(ctx.redrawWasSuppressed());
-        try std.testing.expectEqual(page.Id.config, app.active_page);
+        try std.testing.expectEqual(page.Id.repository, app.active_page);
         try std.testing.expectEqualStrings("visible page sentinel", app.status.text());
         try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.compare.basis.?.target.head_oid.slice());
     }

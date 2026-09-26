@@ -124,9 +124,9 @@ pub fn disposition(active: page.Id, target: page.Id, snapshot: Snapshot) Disposi
 test "page-local blockers are independent" {
     try std.testing.expectEqual(
         Disposition{ .blocked = .compare_base_picker },
-        disposition(.compare, .config, .{ .compare_base_picker = true }),
+        disposition(.compare, .repository, .{ .compare_base_picker = true }),
     );
-    try std.testing.expectEqual(Disposition.allowed, disposition(.compare, .config, .{}));
+    try std.testing.expectEqual(Disposition.allowed, disposition(.compare, .repository, .{}));
 }
 
 test "same-page requests remain unchanged even while blocked" {
@@ -169,9 +169,8 @@ test "every blocker prevents transitions between independent pages" {
     const directions = [_]struct { active: page.Id, target: page.Id }{
         .{ .active = .changes, .target = .repository },
         .{ .active = .repository, .target = .compare },
-        .{ .active = .compare, .target = .config },
-        .{ .active = .config, .target = .history },
-        .{ .active = .config, .target = .changes },
+        .{ .active = .compare, .target = .history },
+        .{ .active = .history, .target = .changes },
     };
 
     try std.testing.expectEqual(std.meta.fields(Blocker).len, cases.len);

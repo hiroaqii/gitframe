@@ -108,7 +108,7 @@ pub const Member = enum {
 
 /// The diff pages which may own this lifecycle.
 ///
-/// Keeping this narrower than `page.Id` prevents Repository or Config request
+/// Keeping this narrower than `page.Id` prevents Repository request
 /// identities from being admitted accidentally.
 pub const Owner = enum {
     changes,

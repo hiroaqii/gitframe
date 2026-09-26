@@ -5,7 +5,6 @@ pub const Id = enum {
     repository,
     history,
     compare,
-    config,
 
     pub fn label(self: Id) []const u8 {
         return switch (self) {
@@ -13,7 +12,6 @@ pub const Id = enum {
             .repository => "Repository",
             .history => "History",
             .compare => "Compare",
-            .config => "Config",
         };
     }
 
@@ -23,12 +21,11 @@ pub const Id = enum {
             .repository => "Repository browser is not initialized",
             .history => "Commit history is not loaded",
             .compare => "Compare: not loaded",
-            .config => "Configuration viewer is not initialized",
         };
     }
 };
 
-pub const all = [_]Id{ .changes, .repository, .history, .compare, .config };
+pub const all = [_]Id{ .changes, .repository, .history, .compare };
 
 /// Scheduling identity shared by every page-owned asynchronous read.
 ///
@@ -105,22 +102,12 @@ pub fn tabExtent() u16 {
     return last.col +| last.width;
 }
 
-/// A non-Changes page slot remains allocation-free until its owner replaces
-/// this placeholder with real state.
-pub const LazyPlaceholder = struct {
-    initialized: bool = false,
-
-    pub fn ensureInitialized(self: *LazyPlaceholder) void {
-        self.initialized = true;
-    }
-};
-
 test "page vocabulary has stable visible order" {
+    try std.testing.expectEqual(@as(usize, 4), all.len);
     try std.testing.expectEqualStrings("Changes", all[0].label());
     try std.testing.expectEqualStrings("Repository", all[1].label());
     try std.testing.expectEqualStrings("History", all[2].label());
     try std.testing.expectEqualStrings("Compare", all[3].label());
-    try std.testing.expectEqualStrings("Config", all[4].label());
 }
 
 test "History and Compare request identities are distinct" {
@@ -133,13 +120,6 @@ test "History and Compare request identities are distinct" {
     try std.testing.expect(changes.origin != compare.origin);
     try std.testing.expect(changes.origin != history.origin);
     try std.testing.expect(history.origin != compare.origin);
-}
-
-test "placeholder is lazy" {
-    var placeholder: LazyPlaceholder = .{};
-    try std.testing.expect(!placeholder.initialized);
-    placeholder.ensureInitialized();
-    try std.testing.expect(placeholder.initialized);
 }
 
 test "page bar hit testing excludes margins and gaps" {
@@ -156,8 +136,8 @@ test "page bar hit testing excludes margins and gaps" {
 }
 
 test "page bar context starts after fixed tabs and remains a non-target" {
-    const config = tab(.config);
-    try std.testing.expectEqual(config.col + config.width, tabExtent());
+    const compare = tab(.compare);
+    try std.testing.expectEqual(compare.col + compare.width, tabExtent());
     try std.testing.expect(tabAtColumn(80, tabExtent()) == null);
     try std.testing.expect(tabAtColumn(80, tabExtent() + 1) == null);
 }

@@ -232,19 +232,16 @@ pub fn keyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
             return .{ .stash = .open };
         };
     }
-    if (context.active_page != .config) {
-        if (context.keymap.spec(.branch_switch)) |spec| if (spec.matches(routing_key)) {
-            const selection_owned = switch (context.active_page) {
-                .changes => context.changes.selection_owner != .none,
-                .repository => context.repository.selection_owner != .none,
-                .history => context.history.common.selection_owner != .none,
-                .compare => context.compare.common.selection_owner != .none,
-                else => unreachable,
-            };
-            if (selection_owned or context.active_selection_gesture) return null;
-            return .request_branch_switch;
+    if (context.keymap.spec(.branch_switch)) |spec| if (spec.matches(routing_key)) {
+        const selection_owned = switch (context.active_page) {
+            .changes => context.changes.selection_owner != .none,
+            .repository => context.repository.selection_owner != .none,
+            .history => context.history.common.selection_owner != .none,
+            .compare => context.compare.common.selection_owner != .none,
         };
-    }
+        if (selection_owned or context.active_selection_gesture) return null;
+        return .request_branch_switch;
+    };
 
     // Repository configured actions claim the canonical logical key even
     // when their current precondition or page handler returns no message.
@@ -311,7 +308,6 @@ fn selectionKeyToMsg(context: KeyContext, key: chasen.Key) ?app_message.Msg {
             key,
         ) orelse return null },
         .history => .{ .history = history_input.selectionKeyToMsg(context.history, key) orelse return null },
-        .config => null,
     };
 }
 
@@ -321,7 +317,6 @@ fn pageForKey(effective: keymap.Effective, key: chasen.Key) ?page.Id {
         .{ .action = .page_repository, .id = .repository },
         .{ .action = .page_history, .id = .history },
         .{ .action = .page_compare, .id = .compare },
-        .{ .action = .page_config, .id = .config },
     };
     for (bindings) |binding| {
         const spec = effective.spec(binding.action) orelse continue;
@@ -553,7 +548,7 @@ fn expectMsg(expected: app_message.Msg, actual: app_message.Msg) !void {
 
 test "root page routing respects modes and remapped keys" {
     try expectMsg(.{ .switch_page = .changes }, keyToMsg(.{}, .{ .codepoint = '1' }).?);
-    try expectMsg(.{ .switch_page = .config }, keyToMsg(.{}, .{ .codepoint = '5' }).?);
+    try std.testing.expect(keyToMsg(.{}, .{ .codepoint = '5' }) == null);
     try std.testing.expectEqual(changesMsg(.{ .search_insert = '2' }), keyToMsg(.{ .changes = .{ .search_mode = true } }, .{ .codepoint = '2' }).?);
     try expectMsg(.{ .commit_panel_insert = '3' }, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = '3' }).?);
     try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{}, .{ .codepoint = '2', .mods = .{ .ctrl = true } }));
@@ -1603,7 +1598,4 @@ test "branch switch routing honors effective keys and existing input owners" {
         .repository = .{ .keymap = effective },
         .repository_command_available = true,
     }, .{ .codepoint = ':' }).?);
-    for ([_]page.Id{.config}) |id| {
-        if (keyToMsg(.{ .active_page = id }, b)) |msg| try std.testing.expect(msg != .request_branch_switch);
-    }
 }

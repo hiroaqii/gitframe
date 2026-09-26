@@ -1041,7 +1041,7 @@ test "Changes re-entry queues one revalidation behind an older read and leaving 
     try std.testing.expectEqual(@as(?u64, second_activation), app.pages.changes.activation.revalidation_requested);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
 
-    try requestPageSwitchForTest(&app, &ctx, .config);
+    try requestPageSwitchForTest(&app, &ctx, .repository);
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
     try std.testing.expect(app.pages.changes.activation.revalidation_requested == null);
 }
@@ -1710,7 +1710,7 @@ test "Changes canonical publication page transition retires generic page exits" 
     var roots = try TestRepoPair.init();
     defer roots.deinit();
 
-    for ([_]page.Id{ .history, .compare, .config }, 0..) |target, index| {
+    for ([_]page.Id{ .history, .compare }, 0..) |target, index| {
         var app = try canonicalPublicationTestApp(allocator, roots.a);
         defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
@@ -2820,7 +2820,6 @@ fn canonicalPageTransitionMessage(
                 .repository => '2',
                 .history => '3',
                 .compare => '4',
-                .config => '5',
             },
         } }),
         .page_bar => blk: {

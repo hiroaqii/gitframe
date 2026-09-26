@@ -355,7 +355,7 @@ pub const View = struct {
             .changes => .{ .changes = self.changes.selection_owner },
             .history => .{ .history = self.history.selection_owner orelse return null },
             .compare => .{ .compare = self.compare.selection_owner },
-            .repository, .config => null,
+            .repository => null,
         };
     }
 

@@ -93,7 +93,6 @@ fn classifyPage(captured: PageOrigin, current: Snapshot) Liveness {
         .repository => captured.activation_id == current.repository_activation_id,
         .history => captured.activation_id == current.history_activation_id,
         .compare => captured.activation_id == current.compare_activation_id,
-        .config => true,
     };
     if (captured.repo_epoch != current.repo_epoch or !activation_matches) return .stale;
     return if (captured.page_id == current.active_page) .live_active else .live_inactive;
@@ -124,10 +123,6 @@ test "repository selection inactive page accepts same-instance clipboard complet
     try @import("std").testing.expectEqual(
         Liveness.stale,
         classify(.{ .page = .{ .page_id = .repository, .repo_epoch = 4, .activation_id = 6 } }, current),
-    );
-    try @import("std").testing.expectEqual(
-        Liveness.live_inactive,
-        classify(.{ .page = .{ .page_id = .config, .repo_epoch = 4, .activation_id = 999 } }, current),
     );
 
     var history_current = current;

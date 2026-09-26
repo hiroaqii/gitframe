@@ -1156,7 +1156,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
 
     // The transition snapshot comes from the live History owner, not a hand-
     // written policy value.
-    try app.update(.{ .switch_page = .config }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx);
     try std.testing.expectEqual(page.Id.history, app.active_page);
     try std.testing.expectEqualStrings(
         "finish History mouse selection before switching pages",
@@ -1196,12 +1196,12 @@ test "History accepted diff runs one root interaction and transition sequence" {
     try std.testing.expect(app.pages.history.diff.pinned_selection_basis == null);
 
     app.pages.history.diff.search.mode = true;
-    try app.update(.{ .switch_page = .config }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx);
     try std.testing.expectEqual(page.Id.history, app.active_page);
     try std.testing.expectEqualStrings("finish History search before switching pages", app.status.text());
     app.pages.history.diff.search.mode = false;
     app.pages.history.diff.file_search.mode = true;
-    try app.update(.{ .switch_page = .config }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx);
     try std.testing.expectEqual(page.Id.history, app.active_page);
     try std.testing.expectEqualStrings("finish History file search before switching pages", app.status.text());
     app.pages.history.diff.file_search.mode = false;
@@ -1218,8 +1218,8 @@ test "History accepted diff runs one root interaction and transition sequence" {
         .generation = 9,
         .request = .{ .initial = .reset },
     } };
-    try app.update(.{ .switch_page = .config }, &ctx);
-    try std.testing.expectEqual(page.Id.config, app.active_page);
+    try app.update(.{ .switch_page = .repository }, &ctx);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
 
     app.active_page = .history;
     _ = app.pages.history.activation.activate(0, .immutable, .unavailable, .unavailable);
@@ -1231,8 +1231,8 @@ test "History accepted diff runs one root interaction and transition sequence" {
         .generation = 10,
         .request = request,
     } };
-    try app.update(.{ .switch_page = .config }, &ctx);
-    try std.testing.expectEqual(page.Id.config, app.active_page);
+    try app.update(.{ .switch_page = .repository }, &ctx);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
 }
 
 test "History picker replaces preview immediately and fences detail clipboard completion" {
@@ -1894,7 +1894,6 @@ test "footer status click copies full page diagnostic across shared screens" {
             .repository => &app.pages.repository.status,
             .history => &app.pages.history.status,
             .compare => &app.pages.compare.status,
-            .config => unreachable,
         };
         page_status.set("{s}", .{status_text});
 
@@ -2113,7 +2112,7 @@ test "normal and help commit keys open the panel only on Changes" {
         .display_path = "/repo",
         .canonical_root = "/repo",
     };
-    for ([_]page.Id{ .changes, .repository, .history, .compare, .config }) |active_page| {
+    for ([_]page.Id{ .changes, .repository, .history, .compare }) |active_page| {
         for ([_]bool{ false, true }) |help_open| {
             for ([_]bool{ false, true }) |remapped| {
                 var app: App = .{
