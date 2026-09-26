@@ -1400,9 +1400,7 @@ fn drawHeaderLine(
             "{s}{s}{s}",
             .{ mode_toggle_hint_prefix, binding, mode_toggle_hint_suffix },
         );
-        var hint_style = headerMetadataStyle(styles);
-        hint_style.dim = true;
-        try draw.copyClippedTextAt(surface, region.col, 0, hint, hint_style);
+        try draw.copyClippedTextAt(surface, region.col, 0, hint, headerMetadataStyle(styles));
     }
 
     if (header_selected) {
@@ -2154,7 +2152,7 @@ const RenderStyles = struct {
         return .{
             .palette = palette,
             .file_header = .{ .bold = true, .fg = palette.color(.accent) },
-            .hunk = .{ .dim = true, .fg = palette.color(.diff_metadata) },
+            .hunk = palette.style(.diff_metadata),
             .selected_hunk = .{ .fg = palette.color(.diff_hunk) },
             .staged_hunk_header = .{ .fg = palette.color(.staged) },
             .hunk_guide = .{ .bold = true, .fg = palette.color(.diff_hunk) },
@@ -2200,7 +2198,7 @@ test "display mode falls back to unified on narrow panes" {
     try std.testing.expectEqualStrings("side-by-side", modeLabel(90, .side_by_side));
 }
 
-test "display mode header renders a dim configurable toggle hint" {
+test "display mode header renders a readable configurable toggle hint" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
         .old_path = "a/src/main.zig",
@@ -2230,7 +2228,7 @@ test "display mode header renders a dim configurable toggle hint" {
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "unified  (z: toggle)") != null);
     try std.testing.expect(!surface.surface.readCell(mode.col, 0).?.style.dim);
-    try std.testing.expect(surface.surface.readCell(hint.col + 2, 0).?.style.dim);
+    try std.testing.expect(!surface.surface.readCell(hint.col + 2, 0).?.style.dim);
     try std.testing.expect(layout.path_target.?.col + layout.path_target.?.width <= hint.col);
 }
 
@@ -3699,11 +3697,11 @@ test "hunkHeaderStyle colors current hunk from exact stage state" {
     try std.testing.expect(staged.bg.eql(.default));
 }
 
-test "hunkHeaderStyle dims unselected hunk header" {
+test "hunkHeaderStyle preserves metadata color without dimming unselected headers" {
     const styles = RenderStyles.fromPalette(.default());
     const style = hunkHeaderStyle(null, styles);
 
-    try std.testing.expect(style.dim);
+    try std.testing.expect(!style.dim);
     try std.testing.expect(style.fg.eql(styles.hunk.fg));
 }
 
@@ -4815,9 +4813,8 @@ test "review diff cursor covers metadata binary and hunk rows only while active"
     defer hunk.deinit();
     try renderFile(&hunk.surface, text_file, .{ .cursor_offset = 1, .palette = palette, .hunk_stages = .all_staged });
     try expectBgRange(&hunk.surface, body_start_row + 1, 0, 80, palette.color(.pane_cursor_bg));
-    // A hunk header without highlighted_hunk remains metadata-dim; this is
-    // cursor ownership, not stage-owned body dimming.
-    try std.testing.expect(hunk.surface.readCell(2, body_start_row + 1).?.style.dim);
+    // A hunk header without highlighted_hunk remains readable under the cursor.
+    try std.testing.expect(!hunk.surface.readCell(2, body_start_row + 1).?.style.dim);
 
     var binary: chasen.testing.TestSurface = undefined;
     try binary.init(80, 5);

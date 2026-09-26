@@ -277,7 +277,7 @@ pub fn stateBodyStyle(tone: StateTone, palette: theme.Palette) chasen.TextStyle 
 }
 
 pub fn stateHintStyle(palette: theme.Palette) chasen.TextStyle {
-    return .{ .fg = palette.color(.muted), .dim = true };
+    return palette.style(.muted);
 }
 
 pub fn firstLine(text: []const u8) []const u8 {
@@ -578,10 +578,7 @@ pub fn renderStatusBody(
     args: diff_surface.RenderProjectedBodyArgs,
 ) !void {
     try drawStatusTitlePath(args.surface, path, stats, args.palette);
-    try draw.copyClippedTextAt(args.surface, 0, 2, message, .{
-        .fg = args.palette.color(.muted),
-        .dim = !args.pane_active,
-    });
+    try draw.copyClippedTextAt(args.surface, 0, 2, message, args.palette.style(.muted));
 }
 
 pub fn drawStatusTitlePath(
@@ -1217,9 +1214,7 @@ pub fn drawSidebarDetailRow(
     const hint_col = 1 +| @as(u16, @intCast(chasen.text.displayWidth(mode))) +| 2;
     if (hint_col >= size.width) return;
     const hint = try std.fmt.allocPrint(surface.frameAllocator(), "({s}: filter)", .{binding});
-    var hint_style = palette.style(.muted);
-    hint_style.dim = true;
-    try draw.copyClippedTextAt(surface, hint_col, row, hint, hint_style);
+    try draw.copyClippedTextAt(surface, hint_col, row, hint, palette.style(.muted));
 }
 
 pub fn drawSidebarRow(

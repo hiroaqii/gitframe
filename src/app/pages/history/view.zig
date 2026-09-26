@@ -858,14 +858,12 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
     }
 
     if (pane_active and page.load_state != .loading and !page.catalog.moreRowSelected()) {
-        var hint_style = context.palette.style(.muted);
-        hint_style.dim = true;
         try drawClipped(
             surface,
             row_prefix_width,
             1,
             if (page.draft.isRange()) "Space: clear range" else "Space: start range",
-            hint_style,
+            context.palette.style(.muted),
         );
     }
 
@@ -1514,7 +1512,7 @@ test "History preview three pane renders focus structured detail and flat files"
     try std.testing.expect(std.mem.indexOf(u8, binary_snapshot, "Changed files (2) +21 -30") != null);
 }
 
-test "History range hint stays dim and fixed above commits only while usable" {
+test "History range hint stays readable and fixed above commits only while usable" {
     const oid = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
     var records = [_]git_history.Record{.{
         .oid = oid,
@@ -1564,7 +1562,7 @@ test "History range hint stays dim and fixed above commits only while usable" {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, hint) != null);
             try rendered.expectCellText(row_prefix_width, 1, "S");
             const cell = rendered.surface.readCell(row_prefix_width, 1).?;
-            try std.testing.expect(cell.style.dim);
+            try std.testing.expect(!cell.style.dim);
             try std.testing.expect(cell.style.fg.eql(palette.color(.muted)));
         } else {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space:") == null);

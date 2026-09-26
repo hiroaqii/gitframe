@@ -325,7 +325,7 @@ fn viewStatusOnlyPane(app: Context, surface: *chasen.Surface, entry: git_status.
         .none, .primary => {},
     }
 
-    try changes_body_render.renderStatusOnlyFallback(&content, entry, app.selectedStatusLineStats(), active, app.theme);
+    try changes_body_render.renderStatusOnlyFallback(&content, entry, app.selectedStatusLineStats(), app.theme);
 }
 
 fn projectedBodyRenderArgs(
@@ -476,7 +476,7 @@ test "changes file filter uses compact discoverability row including all" {
     try std.testing.expect(mode_cell.style.fg.eql(context.theme.color(.accent)));
     try std.testing.expect(mode_cell.style.bold);
     try std.testing.expect(hint_cell.style.fg.eql(context.theme.color(.muted)));
-    try std.testing.expect(hint_cell.style.dim);
+    try std.testing.expect(!hint_cell.style.dim);
 
     page_state.review_display.changed_file_filter = .all;
     ts.surface.clearAll();
@@ -1282,7 +1282,7 @@ test "status-only header keeps semantic statistics and metadata when inactive" {
     const active_body = active.surface.readCell(0, 2) orelse return error.ExpectedActiveStatusBodyCell;
     const inactive_body = inactive.surface.readCell(0, 2) orelse return error.ExpectedInactiveStatusBodyCell;
     try std.testing.expect(!active_body.style.dim);
-    try std.testing.expect(inactive_body.style.dim);
+    try std.testing.expect(!inactive_body.style.dim);
 }
 
 test "status-only fallback preserves conflict suffix outside resolver rendering" {

@@ -77,7 +77,6 @@ pub fn renderStatusOnlyFallback(
     surface: *chasen.Surface,
     entry: git_status.StatusEntry,
     stats: ?file_tree.Stats,
-    active: bool,
     palette: theme.Palette,
 ) !void {
     const path = entry.canonicalPathKey() orelse entry.path;
@@ -87,18 +86,15 @@ pub fn renderStatusOnlyFallback(
         "status: {s}{s}",
         .{ statusName(entry.index), statusSuffix(entry) },
     );
-    try draw.copyClippedTextAt(surface, 0, 2, status_text, .{
-        .fg = palette.color(.muted),
-        .dim = !active,
-    });
+    try draw.copyClippedTextAt(surface, 0, 2, status_text, palette.style(.muted));
     switch (file_tree.stagePresenceFromEntry(entry)) {
         .staged_only => {
-            try draw.copyClippedTextAt(surface, 0, 4, "This file is staged.", .{ .fg = palette.color(.muted), .dim = !active });
-            try draw.copyClippedTextAt(surface, 0, 5, "Loading staged diff preview.", .{ .fg = palette.color(.muted), .dim = !active });
+            try draw.copyClippedTextAt(surface, 0, 4, "This file is staged.", palette.style(.muted));
+            try draw.copyClippedTextAt(surface, 0, 5, "Loading staged diff preview.", palette.style(.muted));
         },
         else => {
-            try draw.copyClippedTextAt(surface, 0, 4, "No diff is available for this file yet.", .{ .fg = palette.color(.muted), .dim = !active });
-            try draw.copyClippedTextAt(surface, 0, 5, "Loading generated changes preview if available.", .{ .fg = palette.color(.muted), .dim = !active });
+            try draw.copyClippedTextAt(surface, 0, 4, "No diff is available for this file yet.", palette.style(.muted));
+            try draw.copyClippedTextAt(surface, 0, 5, "Loading generated changes preview if available.", palette.style(.muted));
         },
     }
 }

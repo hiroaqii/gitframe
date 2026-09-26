@@ -140,10 +140,8 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         if (size.height > 1) {
             _ = left.copyTextAt(1, 1, mode_header, context.palette.boldStyle(.accent)) catch {};
             if (tree_header.len > mode_header.len) {
-                var shortcut_style = context.palette.style(.muted);
-                shortcut_style.dim = true;
                 const shortcut_col: u16 = @intCast(1 + chasen.text.displayWidth(mode_header));
-                _ = left.copyTextAt(shortcut_col, 1, tree_header[mode_header.len..], shortcut_style) catch {};
+                _ = left.copyTextAt(shortcut_col, 1, tree_header[mode_header.len..], context.palette.style(.muted)) catch {};
             }
         }
         if (layout.tree_width < size.width) {
@@ -2883,7 +2881,7 @@ test "repository filter discoverability header follows effective keymap and clip
         try std.testing.expect(!mode_cell.style.dim);
         try std.testing.expect(shortcut_cell.style.fg.eql(palette.color(.muted)));
         try std.testing.expect(!shortcut_cell.style.bold);
-        try std.testing.expect(shortcut_cell.style.dim);
+        try std.testing.expect(!shortcut_cell.style.dim);
     }
 
     var config: keymap.Config = .{};

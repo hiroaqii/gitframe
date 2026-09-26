@@ -1007,7 +1007,7 @@ fn viewRepoPicker(app: Context, surface: *chasen.Surface) !void {
         app.repo_picker_has_recent,
     );
     const list_title_style: chasen.TextStyle = if (app.repo_picker.input_mode == .path_input)
-        .{ .fg = app.theme.color(.muted), .dim = true }
+        app.theme.style(.muted)
     else
         app.theme.boldStyle(.accent);
     try draw.copyClippedTextAt(&content, 0, layout.list_title_row, list_title, list_title_style);
@@ -1562,14 +1562,12 @@ fn viewBranchSwitchPopup(app: Context, surface: *chasen.Surface) !void {
     if (selected_branch) |branch| {
         const action = branch.action(state.current_branch);
         if (body_end > 3) {
-            var note_style = app.theme.style(.muted);
-            note_style.dim = true;
             const note = switch (action) {
                 .close => "Current branch; no changes.",
                 .checkout => "Carry uncommitted changes to target; abort if unsafe.",
                 .open_worktree => "Leave uncommitted changes here; open target worktree.",
             };
-            try draw.copyClippedTextAt(&content, 0, 3, note, note_style);
+            try draw.copyClippedTextAt(&content, 0, 3, note, app.theme.style(.muted));
         }
         if (body_end > 4) {
             if (action == .open_worktree) {
@@ -3775,7 +3773,7 @@ test "branch switch popup renders relative times and selected exact commit detai
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "3d ago") != null);
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "* main") != null);
     try std.testing.expect(std.mem.indexOf(u8, known_snapshot, "Carry uncommitted changes to target; abort if unsafe.") != null);
-    try std.testing.expect(known.surface.readCell(14, 10).?.style.dim);
+    try std.testing.expect(!known.surface.readCell(14, 10).?.style.dim);
     try std.testing.expectEqual(app.theme.boldStyle(.prompt), known.surface.readCell(16, 15).?.style);
 
     app.branch_switch.branches[0].worktree_path = try allocator.dupe(u8, "/workspace/linked tree");
