@@ -86,6 +86,29 @@ pub const BuildOptions = struct {
     stable_order: ?StableOrderOptions = null,
 };
 
+// Bound external diff/status trees before recursive sorting. The synthetic
+// repository root adds one display level, but does not add a path component.
+pub const max_path_depth: usize = 128;
+pub const max_path_bytes: usize = 4096;
+pub const max_path_components: usize = 1_000_000;
+pub const max_nodes: usize = 100_000;
+
+const PathBudget = struct {
+    remaining_components: usize = max_path_components,
+
+    fn consume(self: *PathBudget, path: []const u8) !void {
+        if (path.len > max_path_bytes) return error.TreePathTooLong;
+        const depth = std.mem.count(u8, path, "/");
+        if (depth > max_path_depth) return error.TreeTooDeep;
+        if (depth + 1 > self.remaining_components) return error.TreeTooManyComponents;
+        self.remaining_components -= depth + 1;
+    }
+};
+
+fn checkNodeCapacity(count: usize) !void {
+    if (count >= max_nodes) return error.TreeTooManyNodes;
+}
+
 pub const Node = struct {
     kind: Kind,
     name: []const u8,
@@ -232,6 +255,8 @@ pub fn buildWithOptions(
     status_document: ?git_status.StatusDocument,
     options: BuildOptions,
 ) !FileTree {
+    if (document.files.len > max_nodes) return error.TreeTooManyNodes;
+    var path_budget: PathBudget = .{};
     var rows: std.ArrayList(RowSource) = .empty;
     defer rows.deinit(allocator);
 
@@ -251,6 +276,7 @@ pub fn buildWithOptions(
 
     for (document.files, 0..) |file, file_index| {
         const path = displayPath(file);
+        try path_budget.consume(path);
         const path_key = diff_file.canonicalPathKey(file) orelse path;
         const status_entry = if (status_document) |doc|
             if (status_index.get(path_key)) |index| doc.entries[index] else null
@@ -277,6 +303,8 @@ pub fn buildWithOptions(
             const key = entry.canonicalPathKey() orelse continue;
             if (diff_keys.contains(key)) continue;
 
+            try checkNodeCapacity(rows.items.len);
+            try path_budget.consume(key);
             const path = try allocator.dupe(u8, key);
             try rows.append(allocator, .{
                 .name = baseName(path),
@@ -301,6 +329,7 @@ pub fn buildWithOptions(
 
     for (rows.items) |row| {
         try ensureDirectoryNodes(allocator, &nodes, &directory_index, row.path, row.stats);
+        try checkNodeCapacity(nodes.items.len);
         try nodes.append(allocator, .{
             .kind = .file,
             .name = row.name,
@@ -405,6 +434,7 @@ fn prependRootNode(
     status_document: ?git_status.StatusDocument,
 ) !void {
     if (nodes.items.len == 0) return;
+    try checkNodeCapacity(nodes.items.len);
 
     var stats: Stats = .{};
     for (nodes.items) |node| {
@@ -475,6 +505,7 @@ fn ensureDirectoryNodes(
         if (slash > start) {
             const dir_path = path[0..slash];
             const dir_index = directory_index.get(dir_path) orelse blk: {
+                try checkNodeCapacity(nodes.items.len);
                 try nodes.append(allocator, .{
                     .kind = .directory,
                     .name = path[start..slash],
@@ -1166,4 +1197,41 @@ test "expandAncestors reveals nested file path" {
 
     try std.testing.expect(!isCollapsed(&collapsed, "src"));
     try std.testing.expect(!isCollapsed(&collapsed, "src/lib"));
+}
+
+test "diff tree bounds depth path components and materialized nodes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var deep_path: [max_path_depth * 2 + 3]u8 = undefined;
+    for (&deep_path, 0..) |*byte, index| byte.* = if (index % 2 == 0) 'x' else '/';
+    var file: diff_parser.FileDiff = .{ .header = "", .new_path = deep_path[0 .. max_path_depth * 2 + 1], .metadata = &.{}, .hunks = &.{} };
+    const document: diff_parser.DiffDocument = .{ .files = (&file)[0..1] };
+    const deep = try buildWithOptions(allocator, document, null, .{ .root = .{ .name = "repo" } });
+    try std.testing.expectEqual(max_path_depth + 2, deep.nodes.len);
+    try std.testing.expectEqual(max_path_depth + 1, deep.nodes[deep.nodes.len - 1].depth);
+    file.new_path = &deep_path;
+    try std.testing.expectError(error.TreeTooDeep, build(allocator, document));
+    const long_path = try allocator.alloc(u8, max_path_bytes + 1);
+    @memset(long_path, 'x');
+    file.new_path = long_path[0..max_path_bytes];
+    _ = try build(allocator, document);
+    file.new_path = long_path;
+    try std.testing.expectError(error.TreePathTooLong, build(allocator, document));
+
+    // Exercise the aggregate component limit with shared deep prefixes, so it
+    // is independent of the materialized-node limit.
+    const repeated = try allocator.alloc(diff_parser.FileDiff, max_path_components / (max_path_depth + 1) + 1);
+    file.new_path = deep_path[0 .. max_path_depth * 2 + 1];
+    @memset(repeated, file);
+    _ = try build(allocator, .{ .files = repeated[0 .. repeated.len - 1] });
+    try std.testing.expectError(error.TreeTooManyComponents, build(allocator, .{ .files = repeated }));
+
+    const wide = try allocator.alloc(diff_parser.FileDiff, max_nodes + 1);
+    file.new_path = "file";
+    @memset(wide, file);
+    const allowed = try build(allocator, .{ .files = wide[0..max_nodes] });
+    try std.testing.expectEqual(max_nodes, allowed.nodes.len);
+    try std.testing.expectError(error.TreeTooManyNodes, build(allocator, .{ .files = wide }));
+    try std.testing.expectError(error.TreeTooManyNodes, buildWithOptions(allocator, .{ .files = wide[0..max_nodes] }, null, .{ .root = .{ .name = "repo" } }));
 }

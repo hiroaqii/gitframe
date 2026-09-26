@@ -4529,3 +4529,12 @@ test "History preview reader failure releases its duplicated root and stays unde
         return error.ExpectedClosedRootCapability;
     } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 }
+
+test "external patch bundle rejects overflowing coordinates and deep paths" {
+    try std.testing.expectError(error.InvalidHunkRange, buildLoadedBundle(std.testing.allocator, "@@ -4294967295 +4294967295 @@\n context\n"));
+    var path: [(file_tree.max_path_depth + 1) * 2 + 1]u8 = undefined;
+    for (&path, 0..) |*byte, index| byte.* = if (index % 2 == 0) 'x' else '/';
+    const patch = try std.fmt.allocPrint(std.testing.allocator, "--- a/{s}\n+++ b/{s}\n@@ -1 +1 @@\n-old\n+new\n", .{ path, path });
+    defer std.testing.allocator.free(patch);
+    try std.testing.expectError(error.TreeTooDeep, buildLoadedBundle(std.testing.allocator, patch));
+}

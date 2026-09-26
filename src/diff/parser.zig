@@ -239,41 +239,26 @@ const Parser = struct {
     }
 
     fn parseHunkLine(self: *Parser, line: []const u8) ParseError!void {
-        // An empty line inside a hunk is a context line. A final trailing
-        // newline is filtered by Parser.parse before it reaches this point.
-        if (line.len == 0) {
-            try self.appendHunkLine(.context, line, self.old_line, self.new_line);
-            self.old_line += 1;
-            self.new_line += 1;
-            self.current_hunk.?.old_seen += 1;
-            self.current_hunk.?.new_seen += 1;
-            return;
-        }
-
+        // Empty interior lines are context; Parser.parse discards the final LF.
+        if (line.len == 0) return self.appendHunkLine(.context, line, self.old_line, self.new_line);
         switch (line[0]) {
-            ' ' => {
-                try self.appendHunkLine(.context, line[1..], self.old_line, self.new_line);
-                self.old_line += 1;
-                self.new_line += 1;
-                self.current_hunk.?.old_seen += 1;
-                self.current_hunk.?.new_seen += 1;
-            },
-            '+' => {
-                try self.appendHunkLine(.added, line[1..], null, self.new_line);
-                self.new_line += 1;
-                self.current_hunk.?.new_seen += 1;
-            },
-            '-' => {
-                try self.appendHunkLine(.removed, line[1..], self.old_line, null);
-                self.old_line += 1;
-                self.current_hunk.?.old_seen += 1;
-            },
-            '\\' => try self.appendHunkLine(.metadata, line, null, null),
+            ' ' => try self.appendHunkLine(.context, line[1..], self.old_line, self.new_line),
+            '+' => try self.appendHunkLine(.added, line[1..], null, self.new_line),
+            '-' => try self.appendHunkLine(.removed, line[1..], self.old_line, null),
             else => try self.appendHunkLine(.metadata, line, null, null),
         }
     }
 
     fn appendHunkLine(self: *Parser, kind: DiffLine.Kind, text: []const u8, old_line: ?u32, new_line: ?u32) ParseError!void {
+        // Validate actual consumption too: a malformed body may exceed its header.
+        if (old_line != null) {
+            self.old_line = std.math.add(u32, self.old_line, 1) catch return error.InvalidHunkRange;
+            self.current_hunk.?.old_seen = std.math.add(u32, self.current_hunk.?.old_seen, 1) catch return error.InvalidHunkRange;
+        }
+        if (new_line != null) {
+            self.new_line = std.math.add(u32, self.new_line, 1) catch return error.InvalidHunkRange;
+            self.current_hunk.?.new_seen = std.math.add(u32, self.current_hunk.?.new_seen, 1) catch return error.InvalidHunkRange;
+        }
         try self.current_hunk.?.lines.append(self.allocator, .{
             .kind = kind,
             .text = text,
@@ -349,17 +334,16 @@ const LineRange = struct {
 fn parseRange(part: []const u8, expected_prefix: u8) ParseError!LineRange {
     if (part.len < 2 or part[0] != expected_prefix) return error.InvalidHunkRange;
     const body = part[1..];
-    if (std.mem.indexOfScalar(u8, body, ',')) |comma| {
-        return .{
-            .start = std.fmt.parseInt(u32, body[0..comma], 10) catch return error.InvalidHunkRange,
-            .count = std.fmt.parseInt(u32, body[comma + 1 ..], 10) catch return error.InvalidHunkRange,
-        };
-    }
-
-    return .{
+    const range: LineRange = if (std.mem.indexOfScalar(u8, body, ',')) |comma| .{
+        .start = std.fmt.parseInt(u32, body[0..comma], 10) catch return error.InvalidHunkRange,
+        .count = std.fmt.parseInt(u32, body[comma + 1 ..], 10) catch return error.InvalidHunkRange,
+    } else .{
         .start = std.fmt.parseInt(u32, body, 10) catch return error.InvalidHunkRange,
         .count = 1,
     };
+    // Consumers use the exclusive end as well as individual line numbers.
+    _ = std.math.add(u32, range.start, range.count) catch return error.InvalidHunkRange;
+    return range;
 }
 
 fn parsePath(raw: []const u8) ?[]const u8 {
@@ -564,4 +548,20 @@ test "parse cleans partial allocations on error" {
     ;
 
     try std.testing.expectError(error.InvalidHunkHeader, parse(std.testing.allocator, text));
+}
+
+test "parse checks declared and consumed coordinate boundaries" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        "@@ -4294967295 +4294967295 @@\n context\n",
+        "@@ -1 +4294967295,2 @@\n",
+        "@@ -4294967295,2 +1 @@\n",
+        "@@ -4294967296,0 +1 @@\n",
+        "@@ -4294967294 +1,2 @@\n context\n-overrun\n",
+        "@@ -1,2 +4294967294 @@\n context\n+overrun\n",
+    }) |text| try std.testing.expectError(error.InvalidHunkRange, parse(allocator, text));
+    const valid = try parse(allocator, "@@ -4294967294 +4294967294 @@\n context\n@@ -4294967295,0 +4294967295,0 @@\n");
+    defer valid.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 4294967294), valid.files[0].hunks[0].lines[0].new_line.?);
+    try std.testing.expectEqual(@as(usize, 2), valid.files[0].hunks.len);
 }
